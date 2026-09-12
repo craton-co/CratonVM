@@ -1,0 +1,172 @@
+name: JIT differential (nightly)
+
+# The slow half of docs/testing/jit-differential.md. The PR lane
+# (`difftest-jit-paths` in ci.yml) gates the six seed programs across the
+# execution-path modes on a debug build; this runs the bytecode differential
+# fuzzer over a FIXED seed range on a release build, across stress axes the PR
+# lane cannot afford, and runs the path gate over the ~200-program generated
+# opcode corpus.
+#
+# Every job compares CratonVM against ITSELF — the interpreter (`nojit`) is the
+# oracle — so no HotSpot run and no ledger row is involved. JDK 25 is installed
+# only because the build and the launcher's boot image need it.
+#
+# The seed range is fixed on purpose: a red night must be reproducible on the
+# next night and locally with the same command. Widen it with
+# workflow_dispatch rather than by rotating seeds by date.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seed_start:
+        description: 'First fuzz-jit seed'
+        required: false
+        default: '1'
+      count:
+        description: 'Seeds per axis'
+        required: false
+        default: '400'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # IR verifier lanes (jit/src/ir_verify.rs). Off by default in a release
+  # build; a rejection is a silent fallback to the single-pass backend unless
+  # CRATONVM_DBG_IR_COMPILES makes `ir_verify_reject` print it, which is what
+  # `--fail-on-ir-verify-reject` looks for.
+  CRATONVM_JIT_VERIFY_IR: '1'
+  CRATONVM_JIT_VERIFY_TYPES: '1'
+  CRATONVM_JIT_VERIFY_FRAME_STATES: '1'
+  CRATONVM_JIT_VERIFY_MEMORY_CHAIN: '1'
+  CRATONVM_JIT_VERIFY_ARENA_ORDER: '1'
+  CRATONVM_DBG_IR_COMPILES: '1'
+
+jobs:
+  fuzz-jit:
+    name: fuzz-jit (${{ matrix.axis }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The execution paths, plus the moving young-gen collector.
+          - axis: default
+            modes: nojit,direct-emit,ir-jit,osr-eager,forced-deopt,moving-gc
+            extra: ''
+          # Every JIT mode under a GC every 64 KiB allocated. The reference
+          # runs without it (extra env is applied to non-reference modes only).
+          - axis: gc-stress
+            modes: nojit,direct-emit,ir-jit,osr-eager,forced-deopt,moving-gc
+            extra: '--extra-env CRATONVM_DBG_GC_STRESS=65536'
+          # Eager deopt layered on the modes that do not already set it
+          # (`forced-deopt` does, so it is not repeated here).
+          - axis: deopt-eager
+            modes: nojit,direct-emit,ir-jit,osr-eager,moving-gc
+            extra: '--extra-env CRATONVM_DEOPT_EAGER=1 --extra-env CRATONVM_DEOPT_REAL=1 --extra-env CRATONVM_DEOPT_VERIFY=1'
+          # Major-49 classes: no StackMapTable, so the verifier takes the
+          # type-inference path and the decoded interpreter joins the matrix.
+          - axis: classfile-49
+            modes: nojit,interp-decoded,ir-jit,osr-eager,forced-deopt
+            extra: '--class-version 49'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: jit-differential-nightly
+
+      - name: Set up JDK 25 (build and boot image)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build cratonvm + difftest (release)
+        run: cargo build --release -p cratonvm-cli -p cratonvm-difftest
+
+      - name: Run the bytecode differential fuzzer
+        shell: bash
+        env:
+          CRATONVM_BIN: target/release/cratonvm
+          SEED_START: ${{ github.event.inputs.seed_start || '1' }}
+          SEED_COUNT: ${{ github.event.inputs.count || '400' }}
+          MODES: ${{ matrix.modes }}
+          EXTRA: ${{ matrix.extra }}
+          AXIS: ${{ matrix.axis }}
+        run: |
+          set -euo pipefail
+          case "$SEED_START$SEED_COUNT" in
+            *[!0-9]*) echo "seed_start and count must be integers"; exit 2 ;;
+          esac
+          # $EXTRA is intentionally unquoted: it is a fixed flag list from the
+          # matrix above, never user input.
+          # shellcheck disable=SC2086
+          target/release/cratonvm-difftest fuzz-jit \
+            --seed "$SEED_START" --count "$SEED_COUNT" \
+            --modes "$MODES" $EXTRA \
+            --fail-on-ir-verify-reject \
+            --out "target/jitfuzz-failures/$AXIS"
+
+      - name: Upload failing programs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jitfuzz-failures-${{ matrix.axis }}
+          path: target/jitfuzz-failures
+          if-no-files-found: ignore
+
+  path-gate-opcodes:
+    name: path-gate (generated opcode corpus)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: jit-differential-nightly
+
+      - name: Set up JDK 25 (javac for the corpus, build and boot image)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build cratonvm + difftest (release)
+        run: cargo build --release -p cratonvm-cli -p cratonvm-difftest
+
+      - name: Generate the opcode corpus
+        run: target/release/cratonvm-difftest gen-opcodes --out target/difftest-opcodes
+
+      - name: Path gate over the opcode corpus
+        env:
+          CRATONVM_BIN: target/release/cratonvm
+        run: |
+          target/release/cratonvm-difftest path-gate \
+            --corpus target/difftest-opcodes \
+            --known difftest/path-gate-known.json \
+            --fail-on-ir-verify-reject
+
+      # GC stress exported for the whole step applies to EVERY mode, the
+      # reference included (it is not a mode knob, so the runner does not
+      # clear it): the comparison is interpreter-under-stress against
+      # each JIT path under the same stress.
+      - name: Path gate over the seeds under GC stress
+        if: always()
+        env:
+          CRATONVM_BIN: target/release/cratonvm
+          CRATONVM_DBG_GC_STRESS: '65536'
+        run: |
+          target/release/cratonvm-difftest path-gate \
+            --corpus difftest/seeds \
+            --known difftest/path-gate-known.json \
+            --fail-on-ir-verify-reject

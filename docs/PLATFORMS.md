@@ -96,9 +96,14 @@ the `cuda-oxide` crate is not on the critical path.
 The interpreter ([`vm/src/runtime/interpreter.rs`](../vm/src/runtime/interpreter.rs)),
 classloader, GC ([`gc/src/`](../gc/src/)), and JFR
 ([`jfr/src/`](../jfr/src/)) crates are platform-neutral. The JIT
-([`jit/src/`](../jit/src/)) targets x86-64 only — ARM64 is on the roadmap
-but not implemented. Without an x86-64 host the JIT is automatically
-disabled (interpreter-only).
+([`jit/src/`](../jit/src/)) compiles on x86-64. On AArch64 a separate, much
+smaller backend (`jit/src/aarch64_backend.rs`) exists but is **off by
+default**: set `CRATONVM_JIT_ARM64=1` (or `CRATONVM_JIT=arm64`) to enable it.
+It compiles only leaf methods -- arithmetic, locals, conversions, compares,
+branches and switches, with no call, field, array, allocation, monitor or
+exception -- and has not been proven on hardware; see
+[`jit/aarch64-parity.md`](jit/aarch64-parity.md). On every other architecture,
+and on AArch64 without that switch, the JIT is disabled (interpreter-only).
 
 ## Test coverage by platform
 

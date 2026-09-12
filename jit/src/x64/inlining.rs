@@ -42,7 +42,7 @@ pub fn inline_live_slot_clamps() -> u64 {
 /// binary. Turning it off reinstates a wrong-address store; it is not a
 /// supported configuration.
 fn inline_live_slot_clamp_disabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP")
 }
 
 /// How many reservations the open-inline-locals floor MOVED — i.e. how many
@@ -79,7 +79,7 @@ pub fn inline_locals_floor_bumps() -> u64 {
 /// and one of them is not this one. Turning THIS one off reinstates a store
 /// onto a live enclosing local; it is not a supported configuration.
 pub(super) fn inline_locals_floor_disabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR")
 }
 
 /// DIAGNOSTIC (`CRATONVM_DBG_JIT_LOCALS_FLOOR=1`): one line per reservation the
@@ -98,7 +98,7 @@ pub(super) fn dbg_note_locals_floor(
     outcome: &str,
     compiler: &super::Compiler,
 ) {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_LOCALS_FLOOR").is_none() {
+    if !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_LOCALS_FLOOR") {
         return;
     }
     eprintln!(
@@ -209,7 +209,7 @@ pub(super) fn dbg_note_locals_floor(
 fn inline_call_map_at_return_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_CALL_MAP_AT_RETURN").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_INLINE_CALL_MAP_AT_RETURN")
     })
 }
 
@@ -311,7 +311,7 @@ fn restamp_call_oop_map_at_return(
     // today without the `jit-method-stats` wiring. One line per spliced direct
     // call is the same order of volume as the per-method `[oopcov]` lines
     // `driver.rs` already prints under this key.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOPCOV").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OOPCOV") {
         eprintln!(
             "[oopcov] inline-direct-call-map {} return_off={} census={:?}",
             INLINE_CALL_MAP_AT_RETURN_NAMES
@@ -557,7 +557,7 @@ pub(crate) const INLINE_FRAME_MAX_BCI: usize = 65_536;
 fn inline_miss_edge_poison_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_MISS_EDGE_POISON").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_INLINE_MISS_EDGE_POISON")
     })
 }
 
@@ -568,7 +568,7 @@ fn inline_miss_edge_poison_disabled() -> bool {
 /// it -- so the flag surface grows by exactly one name.
 fn inline_frame_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC"))
 }
 
 /// Census of the miss-edge poison, index-parallel with
@@ -764,9 +764,7 @@ impl NpeTrapMap {
 #[allow(dead_code)]
 pub fn npe_trap_lines_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NPE_TRAP_LINES").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_NPE_TRAP_LINES"))
 }
 
 /// Record the trap site of one inline null check and return its key, or `0`
@@ -1101,9 +1099,7 @@ thread_local! {
 #[allow(dead_code)]
 pub fn inline_frame_map_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_FRAME_MAP").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_INLINE_FRAME_MAP"))
 }
 
 /// Open a recording session for one compile. Anything left over from an
@@ -1564,7 +1560,7 @@ impl Compiler {
         // no prior count of them anywhere. Named per splice under
         // `CRATONVM_DBG_JITC` rather than guessed at.
         if (self.deopt_points.len() > deopt_points_checkpoint || published_unreadable_stub)
-            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+            && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC")
         {
             eprintln!(
                 "[cratonvm-jitc] inline-splice {}.{}{} at pc={pc} published {} point(s): {}",
@@ -1611,7 +1607,7 @@ impl Compiler {
             // says a planned splice was thrown away without saying by what, and
             // that has stood as an open question on the netty exhaustive-loop
             // pages since 2026-08-18.
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                 let (bail_pc, bail_op) = bailed_at;
                 if bail_pc == usize::MAX {
                     eprintln!(
@@ -2795,6 +2791,15 @@ impl Compiler {
                         op == 0xb0 || self.stack_oop_marks.last().copied().unwrap_or(false);
                     // Pop callee's return value → push onto caller stack
                     self.pop_to_rax();
+                    if op == 0xac {
+                        // JVMS §6.5 `ireturn` narrowing, at the splice's return
+                        // join: the callee's own compiled body would narrow in
+                        // its epilogue, and splicing it must not lose that — an
+                        // inlined `()Z` returning 2 is 0 to its caller. Each
+                        // `ireturn` of a branchy callee comes through here.
+                        let tag = crate::narrowed_int_return_tag(&site.descriptor);
+                        self.emit_narrow_int_return(tag);
+                    }
                     // Reclaim the callee's locals AND its merge region, back to
                     // the depth the CALLER's operand stack reached when this
                     // invoke's arguments were popped. `save_spill` is the
@@ -3119,7 +3124,11 @@ impl Compiler {
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
                             self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                                                                                     // `<clinit>` on first touch: a safepoint. See the
+                                                                                     // top-level 0xb2 arm.
+                            self.emit_pre_safepoint_spill();
                             self.emit_call_absolute(self.helpers.getstatic);
+                            self.emit_oop_map_for_safepoint();
                             // jit-linewrapper-flushtype-npe fix (2026-07-17):
                             // see the matching fix + comment at the top-level
                             // 0xb2 arm -- same helper, same missing
@@ -3182,7 +3191,11 @@ impl Compiler {
                         self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
                         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
                         self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                        // `<clinit>` on first touch: a safepoint. See the
+                        // top-level 0xb2 arm.
+                        self.emit_pre_safepoint_spill();
                         self.emit_call_absolute(helper_fn);
+                        self.emit_oop_map_for_safepoint();
                         // jit-putstatic-clinit-gap fix (2026-07-17): the
                         // helper now runs `<clinit>` on first touch before
                         // writing and, on failure, returns the `i64::MIN`

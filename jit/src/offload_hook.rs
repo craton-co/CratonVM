@@ -104,11 +104,7 @@ fn table() -> &'static RwLock<FxHashSet<Key>> {
 /// `(vm, class, method index)`, so this runs once per caller method rather
 /// than once per call.
 pub fn note_kernel(class_name: &str, method_name: &str, descriptor: &str) {
-    let key: Key = (
-        class_name.into(),
-        method_name.into(),
-        descriptor.into(),
-    );
+    let key: Key = (class_name.into(), method_name.into(), descriptor.into());
     let mut t = table().write();
     if t.insert(key) {
         // Published only after the entry is visible, so a reader that sees
@@ -153,11 +149,7 @@ pub fn is_kernel(class_name: &str, method_name: &str, descriptor: &str) -> bool 
     // it is consulted once per compiled dispatch, which under `--gpu` is
     // already a helper call several probes deep, and once per call site at
     // compile time.
-    let key: Key = (
-        class_name.into(),
-        method_name.into(),
-        descriptor.into(),
-    );
+    let key: Key = (class_name.into(), method_name.into(), descriptor.into());
     table().read().contains(&key)
 }
 
@@ -175,9 +167,8 @@ pub fn is_kernel(class_name: &str, method_name: &str, descriptor: &str) -> bool 
 /// predicate exists to not depend on. So `)I`/`)J` are admitted on shape and
 /// the analyzer sorts them out later, at a moment when it can.
 fn could_ever_dispatch(descriptor: &str) -> bool {
-    let shape_ok = descriptor.ends_with(")V")
-        || descriptor.ends_with(")I")
-        || descriptor.ends_with(")J");
+    let shape_ok =
+        descriptor.ends_with(")V") || descriptor.ends_with(")I") || descriptor.ends_with(")J");
     if !shape_ok {
         return false;
     }
@@ -311,7 +302,11 @@ mod tests {
         reset_for_test();
         arm(1024);
         assert!(!is_kernel("bench/GpuCompute", "heavy", "([I[I[I)V"));
-        assert!(keeps_dispatch_helper("bench/GpuCompute", "heavy", "([I[I[I)V"));
+        assert!(keeps_dispatch_helper(
+            "bench/GpuCompute",
+            "heavy",
+            "([I[I[I)V"
+        ));
         reset_for_test();
     }
 

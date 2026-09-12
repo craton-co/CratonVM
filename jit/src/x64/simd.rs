@@ -37,6 +37,21 @@ impl Compiler {
         // 0x44, 0x89: MOV EAX, R11D;  SUB EAX, R10D; SHR EAX, 3
         self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
         self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
+                                            // Entered with i >= n the difference is zero or negative, and an
+                                            // unsigned SHR of a negative difference is ~2^29 chunks — every one
+                                            // of them past the array. Clamp to zero on the SIGNED flags of the
+                                            // SUB (JGE honours OF, so a wrapped `n - i` still reads as n < i),
+                                            // leaving the scalar loop's own `i < n` test to run zero iterations.
+        self.buf.emit(&[0x7D, 0x02]); // JGE +2
+        self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX
+                                      // Neither the vector batches nor the scalar cleanup below poll for a
+                                      // safepoint, so bound the span exactly as the bulk-byte pre-headers
+                                      // do: past `MAX_BULK_BYTE_LOOP_SPAN` elements, skip the whole
+                                      // pre-header and let the original loop, which polls, do the work.
+                                      // Nothing Java-visible has changed yet at this point.
+        self.buf.emit_byte(0x3D); // CMP EAX, imm32
+        self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
+        let span_skip_patch = self.emit_jcc_rel32_patch(0x87); // JA .preheader_end
         self.buf.emit(&[0xC1, 0xE8, 0x03]); // SHR EAX, 3
         self.buf.emit(&[0x41, 0x89, 0xC0]); // MOV R8D, EAX — chunk count
         self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
@@ -59,9 +74,31 @@ impl Compiler {
         self.buf.emit(&[0x48, 0x05]); // ADD RAX, imm32
         self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
 
+        // The lanes are 64-bit. The detector admits the `long` accumulator
+        // shape (`s = a[i] + s` after `i2l`), and 32-bit lanes plus a 32-bit
+        // horizontal sum wrapped at 2^32 before the result was sign-extended
+        // into the long: eight `Integer.MAX_VALUE` elements summed to -8.
+        // Each 8-int chunk is widened as two 4-int halves (VPMOVSXDQ reads a
+        // 128-bit memory operand), so every lane holds a sign-extended int and
+        // the accumulator cannot wrap before 2^31 chunks. The low 32 bits of
+        // the 64-bit total are exactly the wrapped `int` sum, so the int
+        // accumulator arm below needs no separate path.
         let simd_loop_start = self.buf.pos();
-        // VPADDD YMM0, YMM0, [RAX]
-        self.emit_vpaddd_ymm_mem(0, 0, RAX, 0);
+        for half_disp in [0i32, 16] {
+            // VPMOVSXDQ YMM1, [RAX + half_disp]   VEX.256.66.0F38.WIG 25 /r
+            self.emit_vex3(true, true, true, 0x02, false, 0, true, 1);
+            self.buf.emit_byte(0x25);
+            if half_disp == 0 {
+                self.buf.emit_byte(0x08); // mod=00 reg=YMM1 rm=RAX
+            } else {
+                self.buf.emit_byte(0x48); // mod=01 reg=YMM1 rm=RAX
+                self.buf.emit_byte(half_disp as u8); // Cast: disp8 16, in range
+            }
+            // VPADDQ YMM0, YMM0, YMM1             VEX.256.66.0F.WIG D4 /r
+            self.emit_vex2(true, 0, true, 1);
+            self.buf.emit_byte(0xD4);
+            self.buf.emit_byte(0xC1); // mod=11 reg=YMM0 rm=YMM1
+        }
         // ADD RAX, 32  (advance by 8 ints × 4 bytes)
         self.buf.emit(&[0x48, 0x83, 0xC0, 0x20]);
         // DEC R8D
@@ -72,17 +109,28 @@ impl Compiler {
         self.buf.emit_byte(0x85);
         self.buf.emit(&rel.to_le_bytes());
 
-        // --- Horizontal reduction: YMM0 → EAX ---
-        self.emit_horizontal_sum_ymm0_to_eax();
+        // --- Horizontal reduction: four qword lanes of YMM0 → RAX ---
+        // VEXTRACTI128 XMM1, YMM0, 1           VEX.256.66.0F3A.W0 39 /r ib
+        self.emit_vex3(true, true, true, 0x03, false, 0, true, 1);
+        self.buf.emit(&[0x39, 0xC1, 0x01]); // mod=11 reg=YMM0 rm=XMM1, imm8=1
+                                            // VPADDQ XMM0, XMM0, XMM1              VEX.128.66.0F.WIG D4 /r
+        self.emit_vex2(true, 0, false, 1);
+        self.buf.emit(&[0xD4, 0xC1]);
+        // VPSHUFD XMM1, XMM0, 0x4E — high qword into the low lane
+        self.emit_vex2(true, 0, false, 1);
+        self.buf.emit(&[0x70, 0xC8, 0x4E]); // mod=11 reg=XMM1 rm=XMM0
+                                            // VPADDQ XMM0, XMM0, XMM1
+        self.emit_vex2(true, 0, false, 1);
+        self.buf.emit(&[0xD4, 0xC1]);
+        // VMOVQ RAX, XMM0                      VEX.128.66.0F.W1 7E /r
+        self.emit_vex3(true, true, true, 0x01, true, 0, false, 1);
+        self.buf.emit(&[0x7E, 0xC0]);
 
         // VZEROUPPER
         self.emit_vzeroupper();
 
         // Add SIMD result to accumulator
         if acc_is_long {
-            // MOVSXD RAX, EAX
-            self.rex_w();
-            self.buf.emit(&[0x63, 0xC0]);
             // ADD [RBP + acc_offset], RAX (64-bit add to long local)
             self.rex_w();
             self.buf.emit_byte(0x01); // ADD r/m64, r64
@@ -121,6 +169,11 @@ impl Compiler {
         // Recompute: EAX = (R11D - R10D) >> 3 << 3; R10D += EAX
         self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
         self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
+                                            // The same signed clamp as the chunk count: for i > n, `(n - i) & ~7`
+                                            // is a NEGATIVE multiple of 8, which would restart the scalar tail
+                                            // below i and read a[i - 8k] — before the array.
+        self.buf.emit(&[0x7D, 0x02]); // JGE +2
+        self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX
         self.buf.emit(&[0x83, 0xE0, 0xF8]); // AND EAX, ~7 (round down to multiple of 8)
         self.buf.emit(&[0x41, 0x01, 0xC2]); // ADD R10D, EAX
 
@@ -163,6 +216,8 @@ impl Compiler {
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                                                                // .preheader_end: an over-long span falls through to the original loop.
+        self.patch_rel32_to_here(span_skip_patch);
     }
 
     /// Emit one checked matrix-dot element and advance R10D.
@@ -405,211 +460,6 @@ impl Compiler {
         }
     }
 
-    /// Emit a vectorized double-array sum loop using AVX2 VADDPD.
-    /// Processes 4 doubles per iteration (256-bit YMM registers).
-    /// Assumes: RCX = array base ptr, R10D = start index, R11D = bound.
-    /// Result: sum added to double local via frame slot.
-    pub(super) fn emit_simd_fp_array_sum(&mut self, acc_local_offset: i32) {
-        // --- Compute number of SIMD iterations ---
-        // chunk_count = (n - i) / 4 (4 doubles per YMM register)
-        self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
-        self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
-        self.buf.emit(&[0xC1, 0xE8, 0x02]); // SHR EAX, 2 (divide by 4)
-        self.buf.emit(&[0x41, 0x89, 0xC0]); // MOV R8D, EAX — chunk count
-        self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
-                                            // JZ to scalar cleanup (patch later)
-        self.buf.emit_byte(0x0F);
-        self.buf.emit_byte(0x84);
-        let simd_skip_patch = self.buf.pos();
-        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-
-        // --- SIMD loop: accumulate 4 doubles per iteration ---
-        // VPXOR YMM0, YMM0, YMM0 — zero accumulator
-        self.emit_vpxor_ymm(0, 0, 0);
-
-        // Compute base address: RAX = RCX + R10 * 8 + HEADER_SIZE
-        // (double elements are 8 bytes each)
-        self.buf.emit(&[0x4C, 0x89, 0xD0]); // MOV RAX, R10
-        self.buf.emit(&[0x48, 0xC1, 0xE0, 0x03]); // SHL RAX, 3 (i * 8)
-        self.buf.emit(&[0x48, 0x01, 0xC8]); // ADD RAX, RCX
-        self.buf.emit(&[0x48, 0x05]); // ADD RAX, imm32
-        self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
-
-        let simd_loop_start = self.buf.pos();
-        // VADDPD YMM0, YMM0, [RAX] — packed double add from memory
-        // VEX.256.66.0F.WIG 58 /r (mod=00, r/m=RAX)
-        self.emit_vex2(true, 0, true, 1); // R=1, vvvv=0 (YMM0), L=1 (256-bit), pp=01 (66)
-        self.buf.emit_byte(0x58); // ADDPD
-        self.buf.emit_byte(0x00); // ModRM: mod=00, reg=YMM0, rm=RAX
-
-        // ADD RAX, 32 (advance by 4 doubles × 8 bytes)
-        self.buf.emit(&[0x48, 0x83, 0xC0, 0x20]);
-        // DEC R8D
-        self.buf.emit(&[0x41, 0xFF, 0xC8]);
-        // JNZ simd_loop_start
-        let rel = (simd_loop_start as i32) - (self.buf.pos() as i32 + 6); // Cast: x86-64 rel32 displacement
-        self.buf.emit_byte(0x0F);
-        self.buf.emit_byte(0x85);
-        self.buf.emit(&rel.to_le_bytes());
-
-        // --- Horizontal reduction: YMM0 → XMM0 scalar double ---
-        // VEXTRACTF128 XMM1, YMM0, 1 — get high 128 bits
-        // VEX.256.66.0F3A.W0 19 /r imm8
-        self.emit_vex3(true, true, true, 0x03, false, 0, true, 1);
-        self.buf.emit_byte(0x19);
-        self.buf.emit_byte(0xC1); // ModRM: YMM0 → XMM1
-        self.buf.emit_byte(0x01); // imm8 = 1 (high lane)
-
-        // VADDPD XMM0, XMM0, XMM1 — add high to low (128-bit)
-        // VEX.128.66.0F.WIG 58 /r
-        self.emit_vex2(true, 0, false, 1); // L=0 (128-bit)
-        self.buf.emit_byte(0x58);
-        self.buf.emit_byte(0xC1); // ModRM: XMM0 = XMM0 + XMM1
-
-        // VSHUFPD XMM1, XMM0, XMM0, 1 — swap the two doubles in XMM0
-        // VEX.128.66.0F.WIG C6 /r imm8
-        self.emit_vex2(true, 0, false, 1);
-        self.buf.emit_byte(0xC6);
-        self.buf.emit_byte(0xC8); // ModRM: XMM1 = shuffle(XMM0, XMM0)
-        self.buf.emit_byte(0x01); // imm8 = 1
-
-        // VADDSD XMM0, XMM0, XMM1 — final scalar add
-        // VEX.LIG.F2.0F.WIG 58 /r
-        self.emit_vex2(true, 0, false, 3); // pp=11 (F2)
-        self.buf.emit_byte(0x58);
-        self.buf.emit_byte(0xC1); // XMM0 = XMM0 + XMM1
-
-        // VZEROUPPER
-        self.emit_vzeroupper();
-
-        // Add SIMD result to accumulator:
-        // MOVQ RAX, XMM0
-        self.emit_movq_rax_from_xmm(0);
-        // Load current acc into XMM1 from frame
-        self.emit_load_local(RCX, acc_local_offset);
-        self.emit_movq_xmm_from_gpr(1, RCX);
-        // MOVQ XMM0, RAX
-        self.emit_movq_xmm_from_rax(0);
-        // ADDSD XMM0, XMM1
-        self.buf.emit(&[0xF2, 0x0F, 0x58, 0xC1]);
-        // Direct MOVQ [rbp-acc_local_offset], XMM0 — keeps RAX free.
-        self.emit_movq_mem_rbp_from_xmm(acc_local_offset, 0);
-
-        // Update induction variable: i += chunks_processed * 4
-        self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
-        self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
-        self.buf.emit(&[0x83, 0xE0, 0xFC]); // AND EAX, ~3 (round down to multiple of 4)
-        self.buf.emit(&[0x41, 0x01, 0xC2]); // ADD R10D, EAX
-
-        // Patch the skip jump target
-        let after_simd = self.buf.pos();
-        let skip_rel = (after_simd as i32) - (simd_skip_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf.try_patch_i32(simd_skip_patch, skip_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
-
-        // --- Scalar cleanup loop ---
-        let scalar_loop_start = self.buf.pos();
-        // CMP R10D, R11D
-        self.buf.emit(&[0x45, 0x39, 0xDA]);
-        // JGE end
-        self.buf.emit_byte(0x0F);
-        self.buf.emit_byte(0x8D);
-        let scalar_end_patch = self.buf.pos();
-        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-
-        // Load arr[i] as double: MOVSD XMM0, [RCX + R10*8 + HEADER_SIZE]
-        // Use SIB: base=RCX, index=R10, scale=8
-        self.buf.emit(&[0xF2, 0x42, 0x0F, 0x10, 0x84, 0xD1]); // MOVSD XMM0, [RCX + R10*8 + disp32]
-        self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
-
-        // ADDSD to accumulator: load acc to XMM1, add, store back
-        self.emit_load_local(RAX, acc_local_offset);
-        self.emit_movq_xmm_from_rax(1);
-        // ADDSD XMM1, XMM0
-        self.buf.emit(&[0xF2, 0x0F, 0x58, 0xC8]);
-        self.emit_movq_mem_rbp_from_xmm(acc_local_offset, 1);
-
-        // INC R10D
-        self.buf.emit(&[0x41, 0xFF, 0xC2]);
-        // JMP scalar_loop_start
-        let rel2 = (scalar_loop_start as i32) - (self.buf.pos() as i32 + 5); // Cast: x86-64 rel32 displacement
-        self.buf.emit_byte(0xE9);
-        self.buf.emit(&rel2.to_le_bytes());
-
-        // Patch scalar end
-        let scalar_end = self.buf.pos();
-        let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
-    }
-
-    // -----------------------------------------------------------------------
-    // T17.Β.3 — Loop unswitch emission
-    // -----------------------------------------------------------------------
-
-    /// Emit the preheader evaluation for a loop-unswitch candidate
-    /// whose header starts at `header_pc`.
-    ///
-    /// The output is a single `MOV/LOAD + TEST`-style probe that
-    /// evaluates the invariant local and sets flags according to the
-    /// branch's semantics (ifeq / ifne / iflt / ifge / ifgt / ifle).
-    /// Execution never mutates any Java-visible state, so semantics
-    /// are strictly additive — the code compiled with unswitch
-    /// detection enabled produces the same final state as the
-    /// unmodified version.
-    ///
-    /// # Gate
-    ///
-    /// Detection already enforces `body_size <= MAX_UNSWITCH_BYTECODES`;
-    /// we reassert here so emission silently falls back to the
-    /// scalar path if the precondition is violated.
-    pub(super) fn emit_loop_unswitch_preheader(&mut self, header_pc: usize) {
-        // Clone to avoid aliasing self.
-        let candidate = self
-            .loop_unswitch_candidates
-            .iter()
-            .find(|c| c.header_pc == header_pc)
-            .cloned();
-        let Some(cand) = candidate else {
-            return;
-        };
-        // Defensive gate — detection already checks this, but we
-        // re-apply so the emission path is self-contained.
-        let body_size = cand.back_edge_pc.saturating_sub(cand.header_pc);
-        if body_size == 0 || body_size > MAX_UNSWITCH_BYTECODES {
-            return;
-        }
-
-        // Load the invariant local into EAX.
-        // Prefer a register-resident copy when the regalloc placed
-        // the local in a caller-saved GPR; otherwise fall back to
-        // the frame slot.
-        if let Some(reg) = self.reg_for_local(cand.invariant_local) {
-            self.emit_mov_reg_reg(RAX, reg);
-        } else {
-            self.emit_load_local(RAX, self.local_offset(cand.invariant_local));
-        }
-
-        // Set flags for the branch. For the unary-branch opcodes in
-        // scope (0x99..=0x9E), TEST EAX, EAX covers eq/ne and a CMP
-        // against 0 covers lt/ge/gt/le (TEST sets SF/ZF the same
-        // way, so we can use a single TEST for all six).
-        //
-        // TEST EAX, EAX — 85 C0
-        self.buf.emit(&[0x85, 0xC0]);
-
-        // No jump is emitted. The per-iteration branch inside the
-        // body will re-evaluate the predicate and take the correct
-        // side; the pre-evaluation primes the branch predictor so
-        // the in-loop check is ~always correctly predicted.
-        //
-        // The branch_op is captured for future body-duplication
-        // emission variants; consume it here to silence unused
-        // warnings and document the contract.
-        debug_assert!(
-            matches!(cand.branch_op, 0x99..=0x9E),
-            "detector rejects non-unary branches (0x99..=0x9E)"
-        );
-    }
-
     /// Emit a vectorized int-array element-wise loop:
     ///
     /// ```text
@@ -656,6 +506,13 @@ impl Compiler {
         // `i*4 + chunk_count + H` and the first VMOVDQU faults.
         self.buf.emit(&[0x45, 0x89, 0xD8]); // MOV R8D, R11D
         self.buf.emit(&[0x45, 0x29, 0xD0]); // SUB R8D, R10D
+                                            // Signed clamp for an i >= n entry; see `emit_simd_int_array_sum`.
+        self.buf.emit(&[0x7D, 0x03]); // JGE +3
+        self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D, R8D
+                                            // Poll-free span cap; see `emit_simd_int_array_sum`.
+        self.buf.emit(&[0x41, 0x81, 0xF8]); // CMP R8D, imm32
+        self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
+        let span_skip_patch = self.emit_jcc_rel32_patch(0x87); // JA .preheader_end
         self.buf.emit(&[0x41, 0xC1, 0xE8, 0x03]); // SHR R8D, 3
         self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
                                             // JZ to scalar remainder (patch later)
@@ -750,6 +607,9 @@ impl Compiler {
         // scalar remainder below dereferences.
         self.buf.emit(&[0x45, 0x89, 0xD8]); // MOV R8D, R11D
         self.buf.emit(&[0x45, 0x29, 0xD0]); // SUB R8D, R10D
+                                            // Signed clamp for i > n; see the recompute in `emit_simd_int_array_sum`.
+        self.buf.emit(&[0x7D, 0x03]); // JGE +3
+        self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D, R8D
         self.buf.emit(&[0x41, 0x83, 0xE0, 0xF8]); // AND R8D, ~7
         self.buf.emit(&[0x45, 0x01, 0xC2]); // ADD R10D, R8D
 
@@ -821,6 +681,8 @@ impl Compiler {
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                                                                // .preheader_end: an over-long span falls through to the original loop.
+        self.patch_rel32_to_here(span_skip_patch);
     }
 
     /// Emit a guarded `REP STOSB` preheader for a canonical zero-fill loop.

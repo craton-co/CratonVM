@@ -5,6 +5,12 @@
 //!
 //! These functions need access to `SharedVm` and other VM internals, so they
 //! live in the VM crate rather than the standalone JIT crate.
+//!
+//! Most helpers are a thin `extern "C"` shell around a `*_body` function run
+//! under [`crate::jit::helper_guard::contain`], so a panic in the body becomes
+//! the helper's failure sentinel instead of a process abort. That module lists
+//! which helpers are guarded, with which sentinel and policy, and which are
+//! deliberately not.
 
 use std::cell::Cell;
 
@@ -17,6 +23,7 @@ use cratonvm_types::{
     REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 
+use crate::jit::helper_guard::{contain, OnPanic};
 use crate::memory::vm_heap::VmHeap;
 use crate::runtime::redefine_state::{
     class_id_or_name_was_redefined, class_was_redefined, hierarchy_was_redefined,
@@ -91,7 +98,7 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
 //
 // What the default-OFF period cost, measured independently on 2026-07-27 (H2
 // `org/h2/` ban residuals): this flag gates the ONLY write of
-// `mic.cached_entry_ptr`, so with it off the inline MIC/PIC cascade the codegen
+// `mic.cached_entry_word`, so with it off the inline MIC/PIC cascade the codegen
 // emits can never open and every virtual call out of compiled code falls back
 // through `invoke_or_native` into the INTERPRETER. Compiling a method therefore
 // made its callees slower, and compiling more of a program made it slower
@@ -182,7 +189,7 @@ pub mod mic_prof {
 
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some())
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_MIC_PROF"))
     }
 
     /// `CRATONVM_DBG_MIC_TRACE` — the per-call `[DISP_TRACE]` line, separate
@@ -192,9 +199,7 @@ pub mod mic_prof {
     /// hundreds of megabytes of stderr.
     pub fn trace_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_TRACE").is_some()
-        })
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_MIC_TRACE"))
     }
 
     #[inline]
@@ -660,9 +665,7 @@ thread_local! {
 #[cfg(debug_assertions)]
 fn jit_borrow_site_capture_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_BORROW_SITES").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_BORROW_SITES"))
 }
 
 /// Debug-only: snapshot the borrow flag and clear it, so a nested JIT entry
@@ -931,7 +934,7 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         if if crate::runtime::env_cache::hot_lookup_cache() {
             crate::runtime::env_cache::dbg_shadow()
         } else {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some()
+            cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SHADOW")
         } {
             use std::sync::atomic::{AtomicBool, Ordering};
             static ONCE: AtomicBool = AtomicBool::new(false);
@@ -1161,9 +1164,7 @@ pub(crate) fn take_all_jit_signals(thread: &mut JvmThread) -> DrainedJitSignals 
 /// binary rather than a comparison across two builds.
 fn trap_frame_snapshot_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT"))
 }
 
 /// Snapshot the live compiled frames for a JIT-signalled NPE.
@@ -1240,6 +1241,53 @@ fn set_jit_pending_exception_with_bci(thread: &mut JvmThread, exc: ObjectRef, bc
 /// newly-precise case.
 pub(crate) fn stash_jit_pending_exception(thread: &mut JvmThread, exc: ObjectRef) {
     set_jit_pending_exception(thread, exc);
+}
+
+/// Stash a `java.lang.InternalError` naming a JIT runtime helper whose body
+/// panicked, for [`crate::jit::helper_guard::OnPanic::Throw`].
+///
+/// Returns whether a throwable was stashed. `vm_ptr` is the helper's own
+/// `SharedVm` argument, or `0` for a helper that takes none, in which case the
+/// process VM is used when exactly one is published. Nothing is stashed when no
+/// JIT thread is installed or the throwable cannot be built, and the guard then
+/// returns the bare sentinel: the same fallback [`jit_alloc_oom`] has.
+///
+/// Replaces an exception that was already pending. The helper that panicked did
+/// not finish whatever it was doing with that exception, and the panic is the
+/// report that has to reach Java.
+#[cold]
+pub(crate) fn stash_jit_helper_panic(vm_ptr: i64, helper: &'static str, detail: &str) -> bool {
+    // SAFETY: called only from `helper_guard::contain` on the thread that ran
+    // the guarded helper, after the helper's body has fully unwound, so every
+    // `JitThreadGuard` that body took has already been dropped.
+    let Some((thread, _guard)) = (unsafe { jit_thread_mut() }) else {
+        return false;
+    };
+    let process_vm = if vm_ptr == 0 {
+        crate::native::jni::process_vm_strict()
+    } else {
+        None
+    };
+    let vm: &SharedVm = match process_vm.as_deref() {
+        Some(vm) => vm,
+        // SAFETY: a non-zero `vm_ptr` is the `SharedVm` pointer compiled code
+        // handed the guarded helper, under that helper's own caller contract.
+        None if vm_ptr != 0 => unsafe { &*(vm_ptr as *const SharedVm) },
+        None => return false,
+    };
+    let message = format!("JIT runtime helper {helper} panicked: {detail}");
+    match crate::runtime::exceptions::create_exception_object(
+        vm,
+        thread,
+        "java/lang/InternalError",
+        Some(&message),
+    ) {
+        Ok(exc) => {
+            set_jit_pending_exception(thread, exc);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Forget the `athrow` bci carried by the pending exception, keeping the
@@ -1693,6 +1741,11 @@ pub extern "C" fn jit_dispatch_threw() -> i64 {
 /// `code` is truncated to `u8`; an out-of-range value maps to no message
 /// (`jit_action_message` returns `None`), never a panic.
 pub extern "C" fn jit_npe_with_action(code: i64) {
+    jit_npe_with_action_body(code)
+}
+
+/// Body of [`jit_npe_with_action`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+fn jit_npe_with_action_body(code: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache,
     // matching every other array/field helper's entry (the next GC must
     // re-scan after we deopt back out to the interpreter).
@@ -2404,7 +2457,7 @@ struct VirtualDispatchTarget {
 /// the hot dispatch path pays two slice compares + one bool load.
 pub(crate) fn cv_trace_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_TRACE_CLASSVALUE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_TRACE_CLASSVALUE"))
 }
 
 /// Residual-6 diagnosis: does this invoke-info describe the
@@ -2535,9 +2588,9 @@ const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
 ///    `HASHMAP_PUT_DIRECT_INFO`, `HASHMAP_GET_DIRECT_INFO`,
 ///    `CONCURRENT_HASHMAP_GET_DIRECT_INFO`, `STRING_LATIN1_LOWER_DIRECT_INFO`),
 ///    which is literally the SAME address in every VM in the process;
-///  * every other info lives in `JitCache::invoke_info_arena`, a per-VM arena
-///    freed when that VM's `JitCache` drops, so a later VM's arena can hand
-///    out the same address.
+///  * every other info is owned by the `CompiledMethod` that bakes it
+///    (`_jit_invoke_infos`) and freed with that artifact, so a later
+///    compilation — in this VM or another — can be handed the same address.
 ///
 /// What these memos hold is per-VM to the word: raw compiled entry pointers
 /// into one VM's code cache, receiver `ClassId`s, `NativeMethodId` census
@@ -2819,7 +2872,7 @@ fn site_alias_detect_enabled() -> bool {
     // spelling silently did nothing here, and `flags::with_thread_overrides`
     // could not arrange the probe in a test. Check 4 of
     // `tools/flag-census/check-surface.sh` names exactly this call site.
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SITE_ALIAS").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SITE_ALIAS"))
 }
 
 /// May a callee that declares an exception table be published into the
@@ -2907,7 +2960,7 @@ fn mic_publish_exception_table_callees() -> bool {
 fn mic_rust_entry_cache_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE")
     })
 }
 
@@ -3210,6 +3263,7 @@ unsafe fn resolve_callee_cached(
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4026,6 +4080,22 @@ pub unsafe extern "C" fn jit_service_callee_deopt(
     args_ptr: i64,
     num_args: i64,
 ) -> i64 {
+    let f = || jit_service_callee_deopt_body(vm_ptr, info_ptr, args_ptr, num_args);
+    contain(
+        "jit_service_callee_deopt",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_service_callee_deopt`], run under its panic guard.
+unsafe fn jit_service_callee_deopt_body(
+    vm_ptr: i64,
+    info_ptr: i64,
+    args_ptr: i64,
+    num_args: i64,
+) -> i64 {
     // Rust<->JIT boundary — same bookkeeping the dispatch helpers do.
     crate::jit::conservative_roots::note_jit_boundary();
     if vm_ptr == 0 || info_ptr == 0 {
@@ -4072,7 +4142,7 @@ pub unsafe extern "C" fn jit_service_callee_deopt(
             // to a method it did not invoke. Name it here rather than at the
             // sink, where the caller chain is already gone.
             if cratonvm_jit::deopt::has_last_deopt()
-                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some()
+                && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT")
             {
                 if let Some((key, bci)) = cratonvm_jit::deopt::peek_last_deopt_identity() {
                     eprintln!(
@@ -4399,7 +4469,7 @@ unsafe fn try_resume_trapped_callee(
     receiver_class_id: ClassId,
 ) -> Option<i64> {
     let trc = |why: &str, detail: &dyn std::fmt::Display| {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
             eprintln!("[cratonvm-deopt] callee-resume refused ({why}): {detail}");
         }
     };
@@ -4545,6 +4615,7 @@ unsafe fn try_resume_trapped_callee(
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4578,7 +4649,7 @@ unsafe fn try_resume_trapped_callee(
         }
     };
 
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
         eprintln!("[cratonvm-deopt] helper precise-resume of trapped callee {key} at bci={bci}");
     }
     if via_lambda_identity {
@@ -4947,9 +5018,7 @@ unsafe fn jit_drive_g1_concurrent_mark(vm: &SharedVm) {
 /// refusals.
 fn g1_jit_mark_driver_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_JIT_MARK_DRIVER").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_G1_JIT_MARK_DRIVER"))
 }
 
 #[inline]
@@ -4966,6 +5035,12 @@ unsafe fn jit_maybe_start_zgc_concurrent_mark(vm: &SharedVm) {
 }
 
 pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i64 {
+    let f = || jit_newarray_body(vm_ptr, atype, length);
+    contain("jit_newarray", OnPanic::Throw { vm_ptr }, 0, f)
+}
+
+/// Body of [`jit_newarray`], run under its panic guard.
+unsafe fn jit_newarray_body(vm_ptr: i64, atype: i64, length: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -5389,13 +5464,21 @@ unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i6
 /// 25.
 fn jit_post_tlab_hash_stamp() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_POST_TLAB_HASH_STAMP").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_POST_TLAB_HASH_STAMP"))
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_post_tlab_init(
+    vm_ptr: i64,
+    obj_ptr: i64,
+    class_id_raw: i64,
+    num_fields: i64,
+) -> i64 {
+    jit_post_tlab_init_body(vm_ptr, obj_ptr, class_id_raw, num_fields)
+}
+
+/// Body of [`jit_post_tlab_init`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_post_tlab_init_body(
     vm_ptr: i64,
     obj_ptr: i64,
     class_id_raw: i64,
@@ -5579,8 +5662,7 @@ fn dbg_tlabmiss(reason: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some())
-    {
+    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_TLABMISS")) {
         return;
     }
     static COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -5641,11 +5723,17 @@ fn stash_new_class_init_failure(
 fn new_class_init_memo_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO")
     })
 }
 
 pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fields: i64) -> i64 {
+    let f = || jit_new_object_body(vm_ptr, class_id_raw, num_fields);
+    contain("jit_new_object", OnPanic::Throw { vm_ptr }, 0, f)
+}
+
+/// Body of [`jit_new_object`], run under its panic guard.
+unsafe fn jit_new_object_body(vm_ptr: i64, class_id_raw: i64, num_fields: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -6077,6 +6165,12 @@ unsafe fn jit_resolve_cp_class(
 /// referencing class and constant-pool index of this `new` site.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_new_object_cp(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64 {
+    let f = || jit_new_object_cp_body(vm_ptr, holder_class_id, cp_idx);
+    contain("jit_new_object_cp", OnPanic::Throw { vm_ptr }, 0, f)
+}
+
+/// Body of [`jit_new_object_cp`], run under its panic guard.
+unsafe fn jit_new_object_cp_body(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64 {
     if vm_ptr == 0 {
         return 0;
     }
@@ -6135,6 +6229,12 @@ pub unsafe extern "C" fn jit_new_object_cp(vm_ptr: i64, holder_class_id: i64, cp
 /// referencing class and constant-pool index of this `ldc` site.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_ldc_class_cp(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64 {
+    let f = || jit_ldc_class_cp_body(vm_ptr, holder_class_id, cp_idx);
+    contain("jit_ldc_class_cp", OnPanic::Throw { vm_ptr }, 0, f)
+}
+
+/// Body of [`jit_ldc_class_cp`], run under its panic guard.
+unsafe fn jit_ldc_class_cp_body(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64 {
     if vm_ptr == 0 {
         return 0;
     }
@@ -6292,6 +6392,12 @@ unsafe fn record_ldc_reference(vm: &SharedVm, holder: ClassId, cp_idx: u16, obj:
 /// class and constant-pool index of this `ldc` site.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_ldc_string_cp(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64 {
+    let f = || jit_ldc_string_cp_body(vm_ptr, holder_class_id, cp_idx);
+    contain("jit_ldc_string_cp", OnPanic::Throw { vm_ptr }, 0, f)
+}
+
+/// Body of [`jit_ldc_string_cp`], run under its panic guard.
+unsafe fn jit_ldc_string_cp_body(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64 {
     if vm_ptr == 0 {
         return 0;
     }
@@ -6380,6 +6486,17 @@ pub unsafe extern "C" fn jit_ldc_string_cp(vm_ptr: i64, holder_class_id: i64, cp
 /// length already on the operand stack.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_anewarray_object_cp(
+    vm_ptr: i64,
+    holder_class_id: i64,
+    cp_idx: i64,
+    length: i64,
+) -> i64 {
+    let f = || jit_anewarray_object_cp_body(vm_ptr, holder_class_id, cp_idx, length);
+    contain("jit_anewarray_object_cp", OnPanic::Throw { vm_ptr }, 0, f)
+}
+
+/// Body of [`jit_anewarray_object_cp`], run under its panic guard.
+unsafe fn jit_anewarray_object_cp_body(
     vm_ptr: i64,
     holder_class_id: i64,
     cp_idx: i64,
@@ -6543,6 +6660,12 @@ fn jit_init_primitive_fields(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
 /// GC-blocked parking protocol. Returning the possibly remapped receiver gives
 /// generated code an unambiguous non-sentinel success value.
 pub unsafe extern "C" fn jit_monitor_enter(vm_ptr: i64, obj_ptr: i64) -> i64 {
+    let f = || jit_monitor_enter_body(vm_ptr, obj_ptr);
+    contain("jit_monitor_enter", OnPanic::Throw { vm_ptr }, i64::MIN, f)
+}
+
+/// Body of [`jit_monitor_enter`], run under its panic guard.
+unsafe fn jit_monitor_enter_body(vm_ptr: i64, obj_ptr: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 {
         set_jit_pending_npe();
@@ -6602,6 +6725,12 @@ fn stash_jit_monitor_error(
 /// run**, which is the bulk of the JIT's CPU deficit against `--nojit` on
 /// lock-dense code. The entries also pinned their objects as GC roots forever.
 pub unsafe extern "C" fn jit_monitor_exit(vm_ptr: i64, obj_ptr: i64) -> i64 {
+    let f = || jit_monitor_exit_body(vm_ptr, obj_ptr);
+    contain("jit_monitor_exit", OnPanic::Throw { vm_ptr }, i64::MIN, f)
+}
+
+/// Body of [`jit_monitor_exit`], run under its panic guard.
+unsafe fn jit_monitor_exit_body(vm_ptr: i64, obj_ptr: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 {
         set_jit_pending_npe();
@@ -6626,11 +6755,25 @@ pub unsafe extern "C" fn jit_anewarray_object(
     component_class_id_raw: i64,
     length: i64,
 ) -> i64 {
+    let f = || jit_anewarray_object_body(vm_ptr, component_class_id_raw, length);
+    contain("jit_anewarray_object", OnPanic::Throw { vm_ptr }, 0, f)
+}
+
+/// Body of [`jit_anewarray_object`], run under its panic guard.
+unsafe fn jit_anewarray_object_body(vm_ptr: i64, component_class_id_raw: i64, length: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
     jit_safepoint_flush_satb(vm_ptr);
+    // ZGC / G1 concurrent-mark start, exactly as `jit_newarray` and
+    // `jit_new_object` do. This allocator was the one path that skipped it, so
+    // an `Object[]`-heavy loop never started a concurrent cycle.
+    if vm_ptr != 0 {
+        // SAFETY: same provenance as the `&*(vm_ptr as *const SharedVm)` below.
+        jit_maybe_start_zgc_concurrent_mark(&*(vm_ptr as *const SharedVm));
+        jit_drive_g1_concurrent_mark(&*(vm_ptr as *const SharedVm));
+    }
     // BUGFIX: see `jit_newarray` — narrow length to int payload and sign-extend.
     // JLS only allows `int` array lengths; defensive against JIT slot patterns
     // that carry stale upper bits (e.g. NaN-boxed CompactValue raw bits).
@@ -6656,8 +6799,13 @@ pub unsafe extern "C" fn jit_anewarray_object(
     // without the retire, the heap walker steps into TLAB tail bytes
     // and mis-decodes them as object headers when GC fires from this
     // slow path.
-    let data_size =
-        cratonvm_types::array_data_size(length as usize, ArrayElementType::Reference).unwrap_or(0);
+    // W1-vm, as in `jit_newarray`: an overflowing size is an allocation that
+    // can never succeed. `unwrap_or(0)` probed with size 0, which always
+    // passes, and handed the impossible length onward.
+    let Ok(data_size) = cratonvm_types::array_data_size(length as usize, ArrayElementType::Reference)
+    else {
+        return jit_newarray_oom(vm, length as usize);
+    };
     let total_size = cratonvm_types::ARRAY_DATA_OFFSET + data_size;
     // Lock-free TLAB bump first — see the same arm in `jit_newarray` for why
     // this is the only path a JIT-compiled array allocation has, and what the
@@ -6738,6 +6886,11 @@ pub unsafe extern "C" fn jit_anewarray_object(
 // pointer to a byte/boolean array object. Null triggers a pending NPE + `i64::MIN`
 // deopt sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
+    jit_baload_body(array_ptr, index)
+}
+
+/// Body of [`jit_baload`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_baload_body(array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -6797,6 +6950,11 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
 // on the null path. The fragile "zeroed-by-happenstance argument register" ABI
 // coupling the previous comment described is gone with the shared-stub call.
 pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
+    jit_bastore_body(array_ptr, index, val)
+}
+
+/// Body of [`jit_bastore`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_bastore_body(array_ptr: i64, index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -6872,6 +7030,11 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
 // pointer to an int array object. Null triggers a pending NPE + `i64::MIN` deopt
 // sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
+    jit_iaload_body(array_ptr, index)
+}
+
+/// Body of [`jit_iaload`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_iaload_body(array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -6914,6 +7077,11 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
 // pointer to an int array object. Null aborts the process — see `jit_bastore` for
 // the rationale. Out-of-bounds is handled gracefully.
 pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
+    jit_iastore_body(array_ptr, index, val)
+}
+
+/// Body of [`jit_iastore`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_iastore_body(array_ptr: i64, index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -7361,9 +7529,7 @@ pub mod ref_load_census {
     #[inline]
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_REF_LOADS").is_some()
-        })
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_REF_LOADS"))
     }
 
     /// Count one reference-slot read at `slot`, one of the `*_ELEMENT` /
@@ -7563,7 +7729,7 @@ pub fn jit_ref_load_routes() -> (Option<u64>, u64) {
 fn zgc_jit_load_barrier_suppressed() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_NO_JIT_LOAD_BARRIER").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_ZGC_NO_JIT_LOAD_BARRIER")
     })
 }
 
@@ -7780,6 +7946,11 @@ unsafe fn jit_load_ref_slot(
 // pinned together by `let _: HelperFnAaload = jit_aaload;` further down this
 // file, which is why this change could not land half done.
 pub unsafe extern "C" fn jit_aaload(vm_ptr: i64, array_ptr: i64, index: i64) -> i64 {
+    jit_aaload_body(vm_ptr, array_ptr, index)
+}
+
+/// Body of [`jit_aaload`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_aaload_body(vm_ptr: i64, array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -8021,6 +8192,17 @@ unsafe fn aastore_store_is_refused(vm_ptr: i64, array_ptr: i64, val: i64) -> boo
 /// Called from JIT-compiled code. `vm_ptr` must be a valid `SharedVm` pointer.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_aastore_type_check(vm_ptr: i64, array_ptr: i64, val: i64) -> i64 {
+    let f = || jit_aastore_type_check_body(vm_ptr, array_ptr, val);
+    contain(
+        "jit_aastore_type_check",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_aastore_type_check`], run under its panic guard.
+unsafe fn jit_aastore_type_check_body(vm_ptr: i64, array_ptr: i64, val: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -8041,6 +8223,12 @@ pub unsafe extern "C" fn jit_aastore_type_check(vm_ptr: i64, array_ptr: i64, val
 }
 
 pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, val: i64) {
+    let f = || jit_aastore_body(vm_ptr, array_ptr, index, val);
+    contain("jit_aastore", OnPanic::Throw { vm_ptr }, (), f)
+}
+
+/// Body of [`jit_aastore`], run under its panic guard.
+unsafe fn jit_aastore_body(vm_ptr: i64, array_ptr: i64, index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -8177,6 +8365,12 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
     dim1: i64,
     dim2: i64,
 ) -> i64 {
+    let f = || jit_multianewarray_2d_body(vm_ptr, site, dim1, dim2);
+    contain("jit_multianewarray_2d", OnPanic::Throw { vm_ptr }, 0, f)
+}
+
+/// Body of [`jit_multianewarray_2d`], run under its panic guard.
+unsafe fn jit_multianewarray_2d_body(vm_ptr: i64, site: i64, dim1: i64, dim2: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -8236,6 +8430,11 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
 // pointer to any array object. Null triggers a pending NPE + `i64::MIN` deopt
 // sentinel (JVMS §arraylength requires NullPointerException on null).
 pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
+    jit_arraylength_body(array_ptr)
+}
+
+/// Body of [`jit_arraylength`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_arraylength_body(array_ptr: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -8558,9 +8757,9 @@ pub static GETFIELD_HELPER_CALLS: std::sync::atomic::AtomicU64 =
 fn getfield_census_counting_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_MIC_PROF")
             || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_METHOD_STATS").is_some()
-            || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETFIELD_RECEIVERS").is_some()
+            || cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_GETFIELD_RECEIVERS")
     })
 }
 
@@ -8583,9 +8782,7 @@ fn getfield_census_counting_enabled() -> bool {
 /// below, which is the sibling gate on the same path and was always cached.
 fn compact_inline_dbg() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE"))
 }
 
 /// `CRATONVM_DBG_NULL_FIELD_PROVENANCE=<internal/class/Name>` — when a
@@ -8689,9 +8886,7 @@ fn note_null_field_provenance(vm_ptr: i64, obj_ptr: i64, field_index: usize) {
 
 fn getfield_receiver_census_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETFIELD_RECEIVERS").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_GETFIELD_RECEIVERS"))
 }
 
 /// Snapshot of [`GETFIELD_HELPER_CALLS`] for the shutdown diagnostic.
@@ -9246,6 +9441,11 @@ pub fn membership_walks_by_site() -> Vec<(&'static str, u64)> {
 }
 
 pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
+    jit_getfield_body(vm_ptr, obj_ptr, field_index)
+}
+
+/// Body of [`jit_getfield`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_getfield_body(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
     // The JIT may set `GETFIELD_RECEIVER_PROVEN_OOP` to say it has already
     // proven this receiver is an oop; see that constant for why that is sound
     // and why it rides in the argument rather than in a second helper slot.
@@ -9916,7 +10116,7 @@ unsafe fn note_dropped_putfield(obj_ptr: i64, field_index: i64, why: &str, plaus
     } else {
         JIT_PUTFIELD_DROPPED_BAD_RECEIVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     };
-    if n >= 32 || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DROPPED_PUTFIELD").is_none() {
+    if n >= 32 || !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DROPPED_PUTFIELD") {
         return;
     }
     let (class, num_slots) = if plausible {
@@ -9967,6 +10167,11 @@ unsafe fn jit_putfield_slot_in_bounds(obj_ptr: i64, field_index: i64) -> bool {
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i64) {
+    jit_putfield_int_body(obj_ptr, field_index, val)
+}
+
+/// Body of [`jit_putfield_int`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_putfield_int_body(obj_ptr: i64, field_index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -10042,6 +10247,11 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: i64) {
+    jit_putfield_long_body(obj_ptr, field_index, val)
+}
+
+/// Body of [`jit_putfield_long`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_putfield_long_body(obj_ptr: i64, field_index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -10079,6 +10289,11 @@ pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val: i64) {
+    jit_putfield_float_body(obj_ptr, field_index, val)
+}
+
+/// Body of [`jit_putfield_float`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_putfield_float_body(obj_ptr: i64, field_index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -10117,6 +10332,11 @@ pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val:
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val: i64) {
+    jit_putfield_double_body(obj_ptr, field_index, val)
+}
+
+/// Body of [`jit_putfield_double`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_putfield_double_body(obj_ptr: i64, field_index: i64, val: i64) {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -10726,6 +10946,12 @@ pub unsafe extern "C" fn jit_resolve_static_base(
 }
 
 pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
+    let f = || jit_getstatic_body(vm_ptr, class_id_raw, field_index);
+    contain("jit_getstatic", OnPanic::Throw { vm_ptr }, i64::MIN, f)
+}
+
+/// Body of [`jit_getstatic`], run under its panic guard.
+unsafe fn jit_getstatic_body(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
     gs_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _gs_total = gs_prof::CycGuard::new(&gs_prof::CYC_TOTAL);
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
@@ -10946,9 +11172,7 @@ pub mod gs_prof {
 
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETSTATIC_PROF").is_some()
-        })
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_GETSTATIC_PROF"))
     }
 
     #[inline]
@@ -11119,6 +11343,17 @@ pub unsafe extern "C" fn jit_putstatic_int(
     field_index: i64,
     val: i64,
 ) -> i64 {
+    let f = || jit_putstatic_int_body(vm_ptr, class_id_raw, field_index, val);
+    contain("jit_putstatic_int", OnPanic::Throw { vm_ptr }, i64::MIN, f)
+}
+
+/// Body of [`jit_putstatic_int`], run under its panic guard.
+unsafe fn jit_putstatic_int_body(
+    vm_ptr: i64,
+    class_id_raw: i64,
+    field_index: i64,
+    val: i64,
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -11139,6 +11374,17 @@ pub unsafe extern "C" fn jit_putstatic_int(
 // class_id_raw and field_index were resolved at JIT compile time and refer to a valid static field.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_putstatic_long(
+    vm_ptr: i64,
+    class_id_raw: i64,
+    field_index: i64,
+    val: i64,
+) -> i64 {
+    let f = || jit_putstatic_long_body(vm_ptr, class_id_raw, field_index, val);
+    contain("jit_putstatic_long", OnPanic::Throw { vm_ptr }, i64::MIN, f)
+}
+
+/// Body of [`jit_putstatic_long`], run under its panic guard.
+unsafe fn jit_putstatic_long_body(
     vm_ptr: i64,
     class_id_raw: i64,
     field_index: i64,
@@ -11166,6 +11412,22 @@ pub unsafe extern "C" fn jit_putstatic_float(
     field_index: i64,
     val: i64,
 ) -> i64 {
+    let f = || jit_putstatic_float_body(vm_ptr, class_id_raw, field_index, val);
+    contain(
+        "jit_putstatic_float",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_putstatic_float`], run under its panic guard.
+unsafe fn jit_putstatic_float_body(
+    vm_ptr: i64,
+    class_id_raw: i64,
+    field_index: i64,
+    val: i64,
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -11188,6 +11450,22 @@ pub unsafe extern "C" fn jit_putstatic_float(
 // class_id_raw and field_index were resolved at JIT compile time and refer to a valid static field.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_putstatic_double(
+    vm_ptr: i64,
+    class_id_raw: i64,
+    field_index: i64,
+    val: i64,
+) -> i64 {
+    let f = || jit_putstatic_double_body(vm_ptr, class_id_raw, field_index, val);
+    contain(
+        "jit_putstatic_double",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_putstatic_double`], run under its panic guard.
+unsafe fn jit_putstatic_double_body(
     vm_ptr: i64,
     class_id_raw: i64,
     field_index: i64,
@@ -11221,12 +11499,58 @@ pub unsafe extern "C" fn jit_putstatic_object(
     field_index: i64,
     val: i64,
 ) -> i64 {
+    let f = || jit_putstatic_object_body(vm_ptr, class_id_raw, field_index, val);
+    contain(
+        "jit_putstatic_object",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_putstatic_object`], run under its panic guard.
+unsafe fn jit_putstatic_object_body(
+    vm_ptr: i64,
+    class_id_raw: i64,
+    field_index: i64,
+    val: i64,
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
-    if let Some(sentinel) = jit_putstatic_class_init_guard(vm, class_id_raw) {
+    // The class-init guard may run `<clinit>` — Java code, allocation, a
+    // moving collection — while the reference to store exists only as this
+    // raw argument. The compiled caller popped it off its operand stack to
+    // pass it, so no oop map names it either. Root it in the thread's pin
+    // list across the guard and re-read it afterwards, or the static would be
+    // written with a from-space address. The thread borrow is released before
+    // the guard, which takes its own.
+    let pin_idx = if val != 0 {
+        jit_thread_mut().map(|(thread, _guard)| {
+            let idx = thread.native_pin_roots.len();
+            thread
+                .native_pin_roots
+                .push(ObjectRef::from_raw(val as usize as *mut u8));
+            idx
+        })
+    } else {
+        None
+    };
+    let init_failed = jit_putstatic_class_init_guard(vm, class_id_raw);
+    let val = match pin_idx {
+        Some(idx) => match jit_thread_mut() {
+            Some((thread, _guard)) => {
+                let current = thread.native_pin_roots[idx].as_ptr() as usize as i64;
+                thread.native_pin_roots.truncate(idx);
+                current
+            }
+            None => val,
+        },
+        None => val,
+    };
+    if let Some(sentinel) = init_failed {
         return sentinel;
     }
     let class_id = ClassId::new(class_id_raw as u32);
@@ -12012,6 +12336,17 @@ pub unsafe extern "C" fn jit_checkcast(
     class_name_ptr: *const u8,
     class_name_len: i64,
 ) -> i64 {
+    let f = || jit_checkcast_body(vm_ptr, obj_ptr, class_name_ptr, class_name_len);
+    contain("jit_checkcast", OnPanic::Throw { vm_ptr }, i64::MIN, f)
+}
+
+/// Body of [`jit_checkcast`], run under its panic guard.
+unsafe fn jit_checkcast_body(
+    vm_ptr: i64,
+    obj_ptr: i64,
+    class_name_ptr: *const u8,
+    class_name_len: i64,
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -12243,6 +12578,17 @@ pub unsafe extern "C" fn jit_instanceof(
     class_name_ptr: *const u8,
     class_name_len: i64,
 ) -> i64 {
+    let f = || jit_instanceof_body(vm_ptr, obj_ptr, class_name_ptr, class_name_len);
+    contain("jit_instanceof", OnPanic::Throw { vm_ptr }, 0, f)
+}
+
+/// Body of [`jit_instanceof`], run under its panic guard.
+unsafe fn jit_instanceof_body(
+    vm_ptr: i64,
+    obj_ptr: i64,
+    class_name_ptr: *const u8,
+    class_name_len: i64,
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -12324,6 +12670,11 @@ pub unsafe extern "C" fn jit_throw_aioobe(
     array_ptr: i64,
     bytecode_pc: i64,
 ) -> i64 {
+    jit_throw_aioobe_body(index, length, array_ptr, bytecode_pc)
+}
+
+/// Body of [`jit_throw_aioobe`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_throw_aioobe_body(index: i64, length: i64, array_ptr: i64, bytecode_pc: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -12397,7 +12748,7 @@ mark_word={mark_word:#x}"
 fn aioobe3_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_AIOOBE3").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_AIOOBE3"))
 }
 
 /// RBC.6 — trace exception routing through `route_implicit_exc_through_callee`
@@ -12407,7 +12758,7 @@ fn aioobe3_dbg() -> bool {
 pub(crate) fn rbc6_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_RBC6"))
 }
 
 /// Direct-throw for `ArithmeticException` ("/ by zero") — the div-by-zero
@@ -12426,6 +12777,11 @@ pub(crate) fn rbc6_dbg() -> bool {
 // SAFETY: Called from JIT-compiled code at a div-by-zero guard. Sets two
 // thread-locals and returns a sentinel; no pointer dereferences.
 pub unsafe extern "C" fn jit_throw_arithmetic() -> i64 {
+    jit_throw_arithmetic_body()
+}
+
+/// Body of [`jit_throw_arithmetic`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_throw_arithmetic_body() -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -12503,6 +12859,11 @@ pub unsafe extern "C" fn jit_set_throw_bci(bci: i64) {
 }
 
 pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
+    jit_throw_exception_body(exc_ptr, bci)
+}
+
+/// Body of [`jit_throw_exception`]. Not panic-guarded: see `jit-leaf-helper-panics-still-abort-20260912.md`.
+unsafe fn jit_throw_exception_body(exc_ptr: i64, bci: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -12581,6 +12942,12 @@ pub unsafe extern "C" fn jit_local_handler_lookup(
     site_ptr: i64,
     out_exc: *mut i64,
 ) -> i64 {
+    let f = || jit_local_handler_lookup_body(vm_ptr, site_ptr, out_exc);
+    contain("jit_local_handler_lookup", OnPanic::Throw { vm_ptr }, -1, f)
+}
+
+/// Body of [`jit_local_handler_lookup`], run under its panic guard.
+unsafe fn jit_local_handler_lookup_body(vm_ptr: i64, site_ptr: i64, out_exc: *mut i64) -> i64 {
     if vm_ptr == 0 || site_ptr == 0 || out_exc.is_null() {
         return -1;
     }
@@ -13161,9 +13528,7 @@ fn note_site_cached_native_hit() {
 /// `batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
 pub(crate) fn native_site_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none()
-    })
+    *ON.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_NATIVE_SITE_CACHE"))
 }
 
 /// Non-leaf natives dispatched from a resolved call site this run.
@@ -14545,7 +14910,7 @@ fn handle_jit_dispatch_error(
             // `NoClassDefFoundError` reaches Java (see the matching hooks in
             // `runtime::exceptions`). Only the Rust backtrace names the JIT
             // dispatch site that could not resolve the class.
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LINKAGE_BT").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_LINKAGE_BT") {
                 let bt = std::backtrace::Backtrace::force_capture();
                 eprintln!("[DBG_LINKAGE_BT] jit NoClassDefFoundError {class_name}\n{bt}");
             }
@@ -15083,6 +15448,22 @@ unsafe fn try_compiled_offload(
 }
 
 pub unsafe extern "C" fn jit_invoke_dispatch(
+    vm_ptr: i64,
+    info_ptr: i64,
+    args_ptr: i64,
+    num_args: i64,
+) -> i64 {
+    let f = || jit_invoke_dispatch_body(vm_ptr, info_ptr, args_ptr, num_args);
+    contain(
+        "jit_invoke_dispatch",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_invoke_dispatch`], run under its panic guard.
+unsafe fn jit_invoke_dispatch_body(
     vm_ptr: i64,
     info_ptr: i64,
     args_ptr: i64,
@@ -17753,7 +18134,13 @@ pub unsafe extern "C" fn jit_varhandle_read_direct<const SLOT: usize>(
     vh: i64,
     receiver: i64,
 ) -> i64 {
-    varhandle_read_direct_impl(vm_ptr, vh, receiver, SLOT)
+    let f = || varhandle_read_direct_impl(vm_ptr, vh, receiver, SLOT);
+    contain(
+        "jit_varhandle_read_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
 }
 
 /// Addresses of every [`jit_varhandle_read_direct`] monomorphisation, in slot
@@ -17959,7 +18346,13 @@ pub unsafe extern "C" fn jit_varhandle_write_direct<const SLOT: usize>(
     receiver: i64,
     value: i64,
 ) {
-    varhandle_write_direct_impl(vm_ptr, vh, receiver, value, SLOT)
+    let f = || varhandle_write_direct_impl(vm_ptr, vh, receiver, value, SLOT);
+    contain(
+        "jit_varhandle_write_direct",
+        OnPanic::Throw { vm_ptr },
+        (),
+        f,
+    )
 }
 
 /// Addresses of every [`jit_varhandle_write_direct`] monomorphisation, in slot
@@ -18209,7 +18602,13 @@ pub unsafe extern "C" fn jit_varhandle_cas_direct<const SLOT: usize>(
     expected: i64,
     new_val: i64,
 ) -> i64 {
-    varhandle_cas_direct_impl(vm_ptr, vh, receiver, expected, new_val, SLOT)
+    let f = || varhandle_cas_direct_impl(vm_ptr, vh, receiver, expected, new_val, SLOT);
+    contain(
+        "jit_varhandle_cas_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
 }
 
 /// Addresses of every [`jit_varhandle_cas_direct`] monomorphisation, in slot
@@ -18770,6 +19169,17 @@ pub unsafe extern "C" fn jit_indy_bridge(
     args_ptr: *const i64,
     arg_count: i64,
 ) -> i64 {
+    let f = || jit_indy_bridge_body(vm_ptr, site_ptr, args_ptr, arg_count);
+    contain("jit_indy_bridge", OnPanic::Throw { vm_ptr }, i64::MIN, f)
+}
+
+/// Body of [`jit_indy_bridge`], run under its panic guard.
+unsafe fn jit_indy_bridge_body(
+    vm_ptr: i64,
+    site_ptr: i64,
+    args_ptr: *const i64,
+    arg_count: i64,
+) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     // `CRATONVM_DBG_JITC=1` — what the bridge was handed and what it answered.
@@ -18857,6 +19267,17 @@ pub unsafe extern "C" fn jit_indy_bridge(
 
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) -> i64 {
+    let f = || jit_integer_value_of_direct_body(vm_ptr, value);
+    contain(
+        "jit_integer_value_of_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_integer_value_of_direct`], run under its panic guard.
+unsafe fn jit_integer_value_of_direct_body(vm_ptr: i64, value: i64) -> i64 {
     // Same Rust<->JIT boundary bookkeeping as `jit_invoke_dispatch`: the
     // per-thread conservative-scan cache must be invalidated, and a callee
     // that allocates may enter the GC barrier, so the SATB queue is flushed.
@@ -18865,7 +19286,16 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
     let value = value as i32;
-    if !(-128..=127).contains(&value) {
+    // Outside the box cache, where `valueOf` must return a FRESH object. The
+    // cache's upper end is `-Djava.lang.Integer.IntegerCache.high`, not 127:
+    // this helper used to allocate for everything past 127, so with `high=1000`
+    // `Integer.valueOf(500) == Integer.valueOf(500)` was true interpreted and
+    // false once the caller compiled. Until the native has resolved this VM's
+    // bound, every value above 127 takes the native path, which resolves it.
+    let beyond_cache = value < -128
+        || cratonvm_native_builtins::lang_math::integer_cache_high_for(vm.vm_identity)
+            .is_some_and(|high| value > high);
+    if beyond_cache {
         let vm_key = vm.vm_identity;
         let cached_class = INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
             cache
@@ -19051,6 +19481,17 @@ static INTEGER_INT_VALUE_INFO: JitInvokeInfo = JitInvokeInfo {
 ///
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
+    let f = || jit_integer_int_value_direct_body(vm_ptr, receiver);
+    contain(
+        "jit_integer_int_value_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_integer_int_value_direct`], run under its panic guard.
+unsafe fn jit_integer_int_value_direct_body(vm_ptr: i64, receiver: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
@@ -19160,6 +19601,17 @@ thread_local! {
 ///
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i64 {
+    let f = || jit_long_value_of_direct_body(vm_ptr, value);
+    contain(
+        "jit_long_value_of_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_long_value_of_direct`], run under its panic guard.
+unsafe fn jit_long_value_of_direct_body(vm_ptr: i64, value: i64) -> i64 {
     // Same Rust<->JIT boundary bookkeeping as `jit_invoke_dispatch`.
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
@@ -19318,6 +19770,17 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
 ///
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
+    let f = || jit_long_long_value_direct_body(vm_ptr, receiver);
+    contain(
+        "jit_long_long_value_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_long_long_value_direct`], run under its panic guard.
+unsafe fn jit_long_long_value_direct_body(vm_ptr: i64, receiver: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
@@ -19597,6 +20060,17 @@ pub unsafe extern "C" fn jit_dbb_put_byte_direct(
     index: i64,
     value: i64,
 ) -> i64 {
+    let f = || jit_dbb_put_byte_direct_body(vm_ptr, receiver, index, value);
+    contain(
+        "jit_dbb_put_byte_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_dbb_put_byte_direct`], run under its panic guard.
+unsafe fn jit_dbb_put_byte_direct_body(vm_ptr: i64, receiver: i64, index: i64, value: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
         // A null receiver at an `invokevirtual` this intrinsic replaced, so
@@ -19656,6 +20130,17 @@ pub unsafe extern "C" fn jit_dbb_put_byte_direct(
 /// # Safety
 /// Called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_dbb_get_byte_direct(vm_ptr: i64, receiver: i64, index: i64) -> i64 {
+    let f = || jit_dbb_get_byte_direct_body(vm_ptr, receiver, index);
+    contain(
+        "jit_dbb_get_byte_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_dbb_get_byte_direct`], run under its panic guard.
+unsafe fn jit_dbb_get_byte_direct_body(vm_ptr: i64, receiver: i64, index: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
         // A null receiver at an `invokevirtual` this intrinsic replaced, so
@@ -19729,6 +20214,17 @@ static MD_UPDATE_BYTE_INFO: JitInvokeInfo = JitInvokeInfo {
 /// # Safety
 /// Called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_md_update_byte_direct(vm_ptr: i64, receiver: i64, value: i64) -> i64 {
+    let f = || jit_md_update_byte_direct_body(vm_ptr, receiver, value);
+    contain(
+        "jit_md_update_byte_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_md_update_byte_direct`], run under its panic guard.
+unsafe fn jit_md_update_byte_direct_body(vm_ptr: i64, receiver: i64, value: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
         // A null receiver at an `invokevirtual` this intrinsic replaced, so
@@ -19827,6 +20323,22 @@ static PRECONDITIONS_CHECK_INDEX_INFO: JitInvokeInfo = JitInvokeInfo {
 ///
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_preconditions_check_index_direct(
+    vm_ptr: i64,
+    index: i64,
+    length: i64,
+    formatter: i64,
+) -> i64 {
+    let f = || jit_preconditions_check_index_direct_body(vm_ptr, index, length, formatter);
+    contain(
+        "jit_preconditions_check_index_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_preconditions_check_index_direct`], run under its panic guard.
+unsafe fn jit_preconditions_check_index_direct_body(
     vm_ptr: i64,
     index: i64,
     length: i64,
@@ -19936,6 +20448,17 @@ static BUFFER_SESSION_INFO: JitInvokeInfo = JitInvokeInfo {
 /// # Safety
 /// Called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_buffer_session_direct(vm_ptr: i64, receiver: i64) -> i64 {
+    let f = || jit_buffer_session_direct_body(vm_ptr, receiver);
+    contain(
+        "jit_buffer_session_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_buffer_session_direct`], run under its panic guard.
+unsafe fn jit_buffer_session_direct_body(vm_ptr: i64, receiver: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if receiver == 0 {
         set_jit_pending_npe();
@@ -20037,6 +20560,17 @@ pub fn jit_funnel_bypass_count() -> u64 {
 ///
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_thread_current_thread_direct(vm_ptr: i64) -> i64 {
+    let f = || jit_thread_current_thread_direct_body(vm_ptr);
+    contain(
+        "jit_thread_current_thread_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_thread_current_thread_direct`], run under its panic guard.
+unsafe fn jit_thread_current_thread_direct_body(vm_ptr: i64) -> i64 {
     // Same Rust<->JIT boundary bookkeeping as every other direct helper: the
     // per-thread conservative-scan cache must be invalidated. No SATB flush —
     // the fast arm below cannot allocate or enter the GC barrier, and the
@@ -20413,6 +20947,17 @@ pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
     receiver: i64,
     key: i64,
 ) -> i64 {
+    let f = || jit_concurrent_hashmap_get_direct_body(vm_ptr, receiver, key);
+    contain(
+        "jit_concurrent_hashmap_get_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_concurrent_hashmap_get_direct`], run under its panic guard.
+unsafe fn jit_concurrent_hashmap_get_direct_body(vm_ptr: i64, receiver: i64, key: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
@@ -20516,6 +21061,17 @@ pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
 ///
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key: i64) -> i64 {
+    let f = || jit_hashmap_get_direct_body(vm_ptr, receiver, key);
+    contain(
+        "jit_hashmap_get_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_hashmap_get_direct`], run under its panic guard.
+unsafe fn jit_hashmap_get_direct_body(vm_ptr: i64, receiver: i64, key: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -20675,6 +21231,22 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     _value: i64,
     locale: i64,
 ) -> i64 {
+    let f = || jit_string_latin1_to_lower_direct_body(vm_ptr, source, _value, locale);
+    contain(
+        "jit_string_latin1_to_lower_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_string_latin1_to_lower_direct`], run under its panic guard.
+unsafe fn jit_string_latin1_to_lower_direct_body(
+    vm_ptr: i64,
+    source: i64,
+    _value: i64,
+    locale: i64,
+) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
@@ -20781,6 +21353,17 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
     key: i64,
     value: i64,
 ) -> i64 {
+    let f = || jit_hashmap_put_direct_body(vm_ptr, receiver, key, value);
+    contain(
+        "jit_hashmap_put_direct",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_hashmap_put_direct`], run under its panic guard.
+unsafe fn jit_hashmap_put_direct_body(vm_ptr: i64, receiver: i64, key: i64, value: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
@@ -21555,6 +22138,17 @@ fn call_matcher_native_raw(
 /// receiver method and only retain the Java-mandated boxed Double result.
 // SAFETY: called by the JIT peephole for Dist private numeric kernels.
 pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, index: i64) -> i64 {
+    let f = || jit_lambda_int_to_double_body(vm_ptr, proxy_raw, index);
+    contain(
+        "jit_lambda_int_to_double",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_lambda_int_to_double`], run under its panic guard.
+unsafe fn jit_lambda_int_to_double_body(vm_ptr: i64, proxy_raw: i64, index: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
@@ -21780,6 +22374,31 @@ unsafe fn install_lambda_inline_cache(
                 class_name,
             );
         }
+    }
+}
+
+/// Withdraw what a dispatch just published into its inline caches if a class
+/// redefinition landed while it was resolving the target.
+///
+/// `jit_invoke_virtual_mic` stamps the MIC with the redefinition epoch BEFORE
+/// it resolves and publishes. A redefinition that lands between the stamp and
+/// the publication is invisible to that stamp, and the published entry is then
+/// served by the inline machine-code cascade, which never re-enters the helper
+/// to notice. Re-reading the epoch after publishing closes the window: the
+/// entry is withdrawn, and the next miss finds the stamp stale, flushes and
+/// re-resolves against the redefined class.
+fn withdraw_ic_publication_if_redefined(
+    vm: &SharedVm,
+    epoch_at_resolution: u32,
+    mic: &JitMICSlot,
+    pic: Option<&JitPICSlot>,
+) {
+    if vm.jit.jit_cache.redefine_epoch() == epoch_at_resolution {
+        return;
+    }
+    mic.clear_compiled_entry();
+    if let Some(pic) = pic {
+        pic.clear_entries();
     }
 }
 
@@ -22214,6 +22833,24 @@ unsafe fn try_fast_lambda_int_to_double_apply(
 // matching the compiled method's extern "C" calling convention.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn jit_invoke_virtual_mic(
+    vm_ptr: i64,
+    info_ptr: i64,
+    args_ptr: i64,
+    num_args: i64,
+    mic_ptr: i64,
+    pic_ptr: i64,
+) -> i64 {
+    let f = || jit_invoke_virtual_mic_body(vm_ptr, info_ptr, args_ptr, num_args, mic_ptr, pic_ptr);
+    contain(
+        "jit_invoke_virtual_mic",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_invoke_virtual_mic`], run under its panic guard.
+unsafe fn jit_invoke_virtual_mic_body(
     vm_ptr: i64,
     info_ptr: i64,
     args_ptr: i64,
@@ -22717,7 +23354,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // A match means the slot was populated after the most recent redefinition
     // and is as trustworthy as any other inline cache. Steady state is one
     // relaxed load and a compare.
-    let epoch_now = cratonvm_jit::redefine_epoch();
+    let epoch_now = vm.jit.jit_cache.redefine_epoch();
     // Read first; write only when the epoch actually moved.
     //
     // This was an unconditional `swap`, i.e. a locked read-modify-write on the
@@ -22811,16 +23448,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             )
         } else {
             let pic = &*(pic_ptr as *const JitPICSlot);
+            let ways: [(u32, u64, bool); cratonvm_jit::JIT_PIC_ENTRIES] =
+                std::array::from_fn(|i| pic.way(i).unwrap_or((0, 0, false)));
             (
-                std::array::from_fn(|i| {
-                    pic.class_ids[i].load(std::sync::atomic::Ordering::Acquire)
-                }),
-                std::array::from_fn(|i| {
-                    pic.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire)
-                }),
-                std::array::from_fn(|i| {
-                    pic.needs_context[i].load(std::sync::atomic::Ordering::Acquire)
-                }),
+                std::array::from_fn(|i| ways[i].0),
+                std::array::from_fn(|i| ways[i].1),
+                std::array::from_fn(|i| ways[i].2),
             )
         };
         eprintln!(
@@ -22830,8 +23463,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             info.descriptor,
             cached_cid,
             receiver_cid,
-            mic.cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Acquire),
+            mic.cached_entry().0,
             pic_ptr,
             pic_classes,
             pic_entries,
@@ -22891,19 +23523,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     if cached_cid == receiver_cid && cached_cid != 0 && receiver_is_plain_object {
         mic.record_hit();
 
-        // Try the cached compiled entry pointer (true inline cache hit)
-        let entry = mic
-            .cached_entry_ptr
-            .load(std::sync::atomic::Ordering::Acquire);
+        // Try the cached compiled entry pointer (true inline cache hit). The
+        // entry and its ABI flag are decoded from ONE load of the tagged word,
+        // exactly as generated code does.
+        let (entry, needs_ctx) = mic.cached_entry();
         if direct_virtual_compiled_callee_entry_enabled() && entry != 0 && !redefine_jit_quiesced {
             // Direct call to the compiled callee — same ABI as `jit_invoke_dispatch`
             // uses after a JIT-cache hit (receiver + params in `args_slice`, optional
-            // leading `vm_ptr` when `cached_needs_context` is true).  **Do not** pass
+            // leading `vm_ptr` when the entry word's context tag is set).  **Do not** pass
             // `(vm_ptr, info_ptr, args_ptr, num_args)` here; that was a mis-invocation
             // that corrupts the stack and surfaces as Windows AV / Linux SIGSEGV.
-            let needs_ctx = mic
-                .cached_needs_context
-                .load(std::sync::atomic::Ordering::Acquire);
             // Register-table call straight off the raw arg slots — no `Value`
             // decode on this hot path. `try_call_compiled_entry` returns
             // `None` exactly when the callee has more args than the register
@@ -22984,7 +23613,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // rebuilt it twice via `values[1..].to_vec()` + a fresh prepend.)
         let full_args = decode_values();
 
-        // Try to compile callee for next time (populate cached_entry_ptr + needs_ctx).
+        // Try to compile callee for next time (populate the MIC's tagged entry word).
         //
         // VIRTUAL DISPATCH FIX: resolve the callee from the RECEIVER's class
         // (`class_name`, derived from `receiver_class_id` above), NOT from
@@ -23144,7 +23773,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 // the only writer that also resolves and RETAINS the callee's
                 // `Arc<CompiledMethod>` in the slot's `compiled_owner`.
                 //
-                // Until 2026-07-27 this branch stored `cached_entry_ptr`
+                // Until 2026-07-27 this branch stored the entry word
                 // directly, so a slot reached through the "class cached, target
                 // unresolved" shape (what `prepopulate` seeds and what
                 // `clear_compiled_entry` leaves behind after every
@@ -23183,6 +23812,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                         crate::vm::dispatch_policy(vm).is_jdk_only(),
                     );
                 }
+                withdraw_ic_publication_if_redefined(
+                    vm,
+                    epoch_now,
+                    mic,
+                    (pic_ptr != 0).then(|| &*(pic_ptr as *const JitPICSlot)),
+                );
             }
         }
 
@@ -23410,6 +24045,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 crate::vm::dispatch_policy(vm).is_jdk_only(),
             );
         }
+        withdraw_ic_publication_if_redefined(
+            vm,
+            epoch_now,
+            mic,
+            (pic_ptr != 0).then(|| &*(pic_ptr as *const JitPICSlot)),
+        );
     }
 
     // See the matching note in the cache-hit branch — `decode_values` already
@@ -23590,15 +24231,25 @@ impl DeoptimizationController {
             speculation_id: 0,
         };
 
-        // Record in deopt log and get recommended action
-        let tiered_key = cratonvm_jit::tiered::MethodKey {
-            class_name: class_name.to_string(),
-            method_name: method_name.to_string(),
-            descriptor: descriptor.to_string(),
-        };
+        // Record in deopt log and get recommended action. The class is resolved
+        // by name, for the reason the eviction below gives; resolving it up
+        // front lets the tiered manager's key carry the class identity its
+        // per-method state is keyed by.
+        let class_id = vm
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id(class_name)
+            .unwrap_or(cratonvm_types::ClassId::new(0));
+        let tiered_key = cratonvm_jit::tiered::MethodKey::with_class_id(
+            class_id,
+            class_name,
+            method_name,
+            descriptor,
+        );
         let action = vm.record_deoptimization(&method_key, event, &tiered_key);
 
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
             eprintln!(
                 "[cratonvm-deopt] {} reason={:?} bci={} action={:?}",
                 method_key, reason, bci, action
@@ -23621,8 +24272,9 @@ impl DeoptimizationController {
         // interpretation (347s/round vs a 63-72s/round fully-interpreted
         // baseline for the same benchmark -- docs/known-issues/tomcat-08-07/
         // silent-hang-no-signature-cluster.md, TestResponsePerformance).
-        let skip_eviction = reason == cratonvm_jit::deopt::DeoptReason::OsrExit
-            && action == cratonvm_jit::deopt::DeoptAction::Reinterpret;
+        // The predicate is shared with the tiered manager, which must drop the
+        // method's tier exactly when this evicts its body.
+        let skip_eviction = !cratonvm_jit::tiered::deopt_evicts_method_body(reason, action);
         if !skip_eviction {
             // `deoptimize` is a `&str`-keyed public API with ~20 call sites;
             // resolving the class globally by name here preserves this
@@ -23648,19 +24300,6 @@ impl DeoptimizationController {
         // so production VMs neither bump nor consult it (byte-identical).
         if cratonvm_jit::deopt_real_enabled() {
             vm.bump_compilation_epoch(&method_key);
-        }
-
-        // For class-check or receiver-type failures, also check the
-        // invalidation manager for dependent methods.
-        if matches!(
-            reason,
-            cratonvm_jit::deopt::DeoptReason::ReceiverTypeChanged
-                | cratonvm_jit::deopt::DeoptReason::ClassCheck
-                | cratonvm_jit::deopt::DeoptReason::ClassLoading
-        ) {
-            let mut inv_mgr = vm.jit.invalidation_manager.lock();
-            // Clear stale assumptions for the deoptimized method
-            inv_mgr.clear_assumptions(&method_key);
         }
 
         // If the deopt log recommends giving up, add to the JIT skip set.
@@ -23712,7 +24351,7 @@ impl DeoptimizationController {
                     enqueue_time_ms: now_ms,
                     osr_bci: None,
                 });
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                 eprintln!(
                     "[cratonvm-deopt] eager re-queue (RecompileAndReinterpret) {}",
                     method_key
@@ -23802,6 +24441,17 @@ impl DeoptimizationController {
 // (via jit_thread_mut) and the deoptimization controller to invalidate compiled code.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -> i64 {
+    let f = || jit_uncommon_trap_body(vm_ptr, reason, bci);
+    contain(
+        "jit_uncommon_trap",
+        OnPanic::Deopt,
+        DEOPT_ACTION_REINTERPRET,
+        f,
+    )
+}
+
+/// Body of [`jit_uncommon_trap`], run under its panic guard.
+unsafe fn jit_uncommon_trap_body(vm_ptr: i64, reason: i64, bci: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -23815,12 +24465,33 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
         return DEOPT_ACTION_REINTERPRET;
     }
     let vm = &*(vm_ptr as *const SharedVm);
+    // The x64 stub packs the trapping artifact's compile id into the high half
+    // of `reason` (0 when it had none to pass).
+    let compile_id = ((reason as u64) >> 32) as u32; // Cast: the high half is the id
+    let reason = reason & 0xFFFF_FFFF;
     let deopt_reason = reason_code_to_deopt_reason(reason);
 
-    // Try to determine the method being executed from the JIT thread context.
-    // If we can't determine the method, we still record the deopt but with a
-    // generic key.
-    let (class_name, method_name, descriptor) = {
+    // The method that TRAPPED. `thread.frames.last()` is not it: a compiled
+    // method pushes no interpreter frame, so that frame is its interpreted
+    // CALLER, and the deopt count, the cache eviction and the bail-list verdict
+    // all landed on the caller while the trapping artifact stayed installed and
+    // trapped again on every call. Resolve the artifact by compile id; the old
+    // guess remains only for a stub that had no id to pass.
+    let trapping = (compile_id != 0)
+        .then(|| cratonvm_jit::lookup_compile_id(compile_id))
+        .flatten()
+        .and_then(|cm_ptr| {
+            // SAFETY: the id was published by the artifact whose code is
+            // executing this trap, so the artifact is live for this call.
+            let cm = &*(cm_ptr as *const cratonvm_jit::CompiledMethod);
+            split_method_label(&cm.method_label)
+        });
+
+    // Otherwise determine the method from the JIT thread context. If we can't,
+    // we still record the deopt but with a generic key.
+    let (class_name, method_name, descriptor) = if let Some(identity) = trapping {
+        identity
+    } else {
         // The thread's current frame has the method info
         let default = (
             "unknown".to_string(),
@@ -23857,6 +24528,19 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
         cratonvm_jit::deopt::DeoptAction::MakeNotEntrant => DEOPT_ACTION_RECOMPILE,
         cratonvm_jit::deopt::DeoptAction::MakeNotCompilable => DEOPT_ACTION_BLACKLIST,
     }
+}
+
+/// `(class, method, descriptor)` from a compiled artifact's `method_label`,
+/// which is `<class>.<method>:<descriptor>` or `<class>.<method><descriptor>`.
+fn split_method_label(label: &str) -> Option<(String, String, String)> {
+    let open = label.find('(')?;
+    let head = label[..open].trim_end_matches(':');
+    let dot = head.rfind('.')?;
+    Some((
+        head[..dot].to_string(),
+        head[dot + 1..].to_string(),
+        label[open..].to_string(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -24260,7 +24944,7 @@ mod tests {
     #[test]
     fn native_site_cache_default_is_on_and_the_kill_switch_kills() {
         assert!(
-            cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none(),
+            !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_NATIVE_SITE_CACHE"),
             "this test asserts the DEFAULT; unset CRATONVM_JIT_NO_NATIVE_SITE_CACHE to run it"
         );
         assert!(
@@ -26683,6 +27367,17 @@ pub unsafe extern "C" fn jit_native_stack_floor() -> i64 {
 // compiled frame received at entry (same contract as `jit_invoke_dispatch`).
 #[no_mangle]
 pub unsafe extern "C" fn jit_self_call_stack_guard(vm_ptr: i64) -> i64 {
+    let f = || jit_self_call_stack_guard_body(vm_ptr);
+    contain(
+        "jit_self_call_stack_guard",
+        OnPanic::Throw { vm_ptr },
+        i64::MIN,
+        f,
+    )
+}
+
+/// Body of [`jit_self_call_stack_guard`], run under its panic guard.
+unsafe fn jit_self_call_stack_guard_body(vm_ptr: i64) -> i64 {
     // Rust<->JIT boundary — invalidate the per-thread JIT-scan cache (same
     // single TLS bump `jit_get_current_thread` performs on the inline-TLAB
     // fast path).
@@ -26963,41 +27658,18 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
             .unwrap_or(0),
     );
 
-    // §7/§10 — publish this VM's execution policy to the JIT BEFORE anything
-    // else here, and in particular before the first compilation.
+    // §7/§10 — the execution policy is NOT published to the JIT here.
     //
-    // Ordering is the whole point. `cratonvm_jit::set_jit_execution_policy`
-    // gates two compile-time mechanisms that would otherwise bake a native
-    // call into machine code with no policy check anywhere on the path: the
-    // thin direct-call helpers registered immediately below, and inline-cache
-    // publication of an unowned (native/builtin) entry pointer. A JIT decision
-    // is made once and then executes for the life of the artifact, so a
-    // callback bound before the policy arrives would keep running under a
-    // policy that forbids it. Setting it first makes that unrepresentable: no
-    // artifact of this VM is ever compiled under a policy other than the one
-    // it runs under.
-    //
-    // `process_vm()` is published by `Vm::new()` before any bytecode runs (see
-    // the `safepoint_flag_addr` note below, which relies on the same fact), and
-    // compilation only starts once the interpreter is executing bytecode — so
-    // by the time a real JIT compile can trigger this function, the policy is
-    // available. `None` (a unit test calling `build_helpers()` with no VM)
-    // leaves the JIT's latch untouched, which it already treats as
-    // `Compatible`; that is the pre-existing behaviour for such tests and the
-    // conservative direction is unavailable to us here anyway, since there is
-    // no VM to ask.
-    //
-    // The latch itself only ever moves toward strict, so this call can never
-    // relax a policy another VM in the same process already installed.
-    // The latch is still published, because `jit_entry_publishable` (the
-    // inline-cache publication refusal) has no VM handle and still reads it.
-    // That one is measured to never fire — every MIC/PIC publication takes its
-    // entry from `try_jit_compile_callee`, which has a live owner and returns
-    // early — so leaving it process-global refuses nothing in either VM.
-    // Everything the compile path decides is now threaded per-VM instead.
-    if let Some(shared) = vm_for_helpers {
-        cratonvm_jit::set_jit_execution_policy(shared.config.execution_policy());
-    }
+    // This spot used to call `cratonvm_jit::set_jit_execution_policy`, which
+    // latched a process-global `AtomicU8` with `fetch_max`: the first
+    // `--jdk-only` VM in a process made every later VM compile over-strict,
+    // and nothing could lower it. Every compile-time consumer of the policy
+    // now takes it as an argument from a site that holds this VM —
+    // `dispatch_policy(shared).is_jdk_only()` at the compile doors in
+    // `jit_bridge.rs`, and the `jit_entry_publishable` publication sites below
+    // — so the policy a compilation sees is always its own VM's, fixed for the
+    // VM's life. The latch and its setter were deleted on 2026-09-12; see
+    // `jit-compatibility-and-despec-state-per-vm-FIXED.md`.
 
     // `Integer.valueOf(I)` / `Integer.intValue()` thin direct-call helpers —
     // same no-ABI-change registration pattern as the savebase watch helpers
@@ -27457,6 +28129,11 @@ const _: () = {
     let _: HelperFnPutstaticDouble = jit_putstatic_double;
     let _: HelperFnPutstaticObject = jit_putstatic_object;
 
+    // Out-parameter helpers: the pointer argument is `*mut i64` on both sides.
+    let _: HelperFnFfmSegmentGet = jit_ffm_segment_get;
+    let _: HelperFnFfmSegmentSet = jit_ffm_segment_set;
+    let _: HelperFnLocalHandlerLookup = jit_local_handler_lookup;
+
     // Type checks.
     let _: HelperFnCheckcast = jit_checkcast;
     let _: HelperFnInstanceofCheck = jit_instanceof;
@@ -27506,6 +28183,12 @@ const _: () = {
 /// an immediate object address would become stale on the next invocation.
 #[no_mangle]
 pub extern "C" fn jit_ldc_string(vm_ptr: i64, bytes: *const u8, len: usize) -> i64 {
+    let f = || jit_ldc_string_body(vm_ptr, bytes, len);
+    contain("jit_ldc_string", OnPanic::Throw { vm_ptr }, 0, f)
+}
+
+/// Body of [`jit_ldc_string`], run under its panic guard.
+fn jit_ldc_string_body(vm_ptr: i64, bytes: *const u8, len: usize) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if vm_ptr == 0 || bytes.is_null() {
         return 0;
@@ -27546,6 +28229,17 @@ pub extern "C" fn jit_ldc_string(vm_ptr: i64, bytes: *const u8, len: usize) -> i
 // `emit_pre_safepoint_spill`.
 #[no_mangle]
 pub unsafe extern "C" fn jit_safepoint_slow_path() {
+    let f = || jit_safepoint_slow_path_body();
+    contain(
+        "jit_safepoint_slow_path",
+        OnPanic::Throw { vm_ptr: 0 },
+        (),
+        f,
+    )
+}
+
+/// Body of [`jit_safepoint_slow_path`], run under its panic guard.
+unsafe fn jit_safepoint_slow_path_body() {
     static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     crate::jit::conservative_roots::note_jit_boundary();
     // STRICT: parking against another VM's stop-the-world barrier is a hang
@@ -27557,9 +28251,7 @@ pub unsafe extern "C" fn jit_safepoint_slow_path() {
     };
     if let Some((thread, _guard)) = jit_thread_mut() {
         let hit = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if hit <= 16
-            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_SAFEPOINTS").is_some()
-        {
+        if hit <= 16 && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_SAFEPOINTS") {
             eprintln!(
                 "[jit-safepoint] cooperative slow-path hit={} thread_id={}",
                 hit, thread.thread_id.0
@@ -28944,6 +29636,12 @@ pub unsafe extern "C" fn jit_ffm_segment_get(
     kind: i64,
     out: *mut i64,
 ) -> i64 {
+    let f = || jit_ffm_segment_get_body(seg, index, kind, out);
+    contain("jit_ffm_segment_get", OnPanic::Record, 0, f)
+}
+
+/// Body of [`jit_ffm_segment_get`], run under its panic guard.
+unsafe fn jit_ffm_segment_get_body(seg: i64, index: i64, kind: i64, out: *mut i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache.
     crate::jit::conservative_roots::note_jit_boundary();
     let Some(width) = ffm_kind_width(kind) else {
@@ -28992,6 +29690,12 @@ pub unsafe extern "C" fn jit_ffm_segment_get(
 /// # Safety
 /// Called from JIT-compiled code. `seg` is an object reference or 0.
 pub unsafe extern "C" fn jit_ffm_segment_set(seg: i64, index: i64, kind: i64, value: i64) -> i64 {
+    let f = || jit_ffm_segment_set_body(seg, index, kind, value);
+    contain("jit_ffm_segment_set", OnPanic::Record, 0, f)
+}
+
+/// Body of [`jit_ffm_segment_set`], run under its panic guard.
+unsafe fn jit_ffm_segment_set_body(seg: i64, index: i64, kind: i64, value: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     let Some(width) = ffm_kind_width(kind) else {
         cratonvm_native_builtins::ffm_fast::note_fast_consult(false);

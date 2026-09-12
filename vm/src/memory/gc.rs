@@ -178,23 +178,13 @@ pub fn unload_dead_class_metadata(
         shared
             .jit
             .tiered_manager
-            .invalidate_class(class.name.as_ref());
-        // And purge the broker: an unloaded class must lose its tracked
-        // requests as well as its epoch, so `purge_class` rather than
-        // `invalidate`. In-flight records are deliberately KEPT by that
-        // call so their pre-unload epoch refuses the body coming back.
-        let _ = shared
-            .jit
-            .compilation_broker
-            .lock()
-            .purge_class(class.name.as_ref());
+            .invalidate_class(class.id, class.name.as_ref());
         shared.jit.deopt_log.lock().clear_class(class.name.as_ref());
         jit_entries_retired += shared
             .jit
             .jit_cache
             .invalidate_unloaded_class(class.id, class.name.as_ref());
     }
-    shared.jit.invalidation_manager.lock().clear_all();
     // Same reason as `jit_alloc_class_cache` above: the multianewarray
     // per-site plans are keyed by a class id and hold component class ids,
     // and a recycled id would hand a site the wrong component classes.

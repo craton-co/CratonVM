@@ -40,7 +40,6 @@ pub fn inline_array_declines() -> Vec<(&'static str, u64)> {
         .unwrap_or_default()
 }
 
-
 /// Reference-store sites that received the GATED inline barrier sequence.
 ///
 /// A count needs a denominator to be readable: zero here means either that no
@@ -51,8 +50,7 @@ static GATED_REF_STORE_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 /// Reference-store sites that asked for the gated sequence and were declined —
 /// compiled with the full-helper path instead.
-static UNGATED_REF_STORE_SITES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static UNGATED_REF_STORE_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn note_gated_ref_store() {
     GATED_REF_STORE_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1545,7 +1543,7 @@ impl Compiler {
         );
         // Compact object: set GC_FLAG_COMPACT (bit 2) in the gc_flags byte.
         if let Some(body) = compact_body {
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE") {
                 eprintln!(
                     "[compact-inline] new class_id={class_id_raw} body={body} total={total_size}"
                 );
@@ -1941,7 +1939,8 @@ impl Compiler {
         // MOV DWORD [R11 + ARRAY_LENGTH_OFFSET], ECX
         self.buf.emit(&[0x41, 0x89, 0x4B]);
         // Cast: bounded by the disp8 screen above.
-        self.buf.emit_byte(cratonvm_types::ARRAY_LENGTH_OFFSET as u8);
+        self.buf
+            .emit_byte(cratonvm_types::ARRAY_LENGTH_OFFSET as u8);
         // The mark word, taken from the constructor the allocator itself calls
         // rather than re-derived here: `kind`, `element_type`, `gc_age` and
         // `gc_flags` live in bits 48..63, and `GC_FLAG_HEADER` must be among
@@ -2296,8 +2295,8 @@ impl Compiler {
         self.load_slot_to_reg(RDX, val_slot);
         self.emit_test_r8_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT);
         let legacy_shape = self.emit_jcc_rel32_patch(0x84); // JZ → the 16-byte cell
-        // COMPACT: a reference field is the bare 8-byte pointer at the cell
-        // base, which is what the guarded inline `getfield` reads back.
+                                                            // COMPACT: a reference field is the bare 8-byte pointer at the cell
+                                                            // base, which is what the guarded inline `getfield` reads back.
         self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
         let shaped = self.emit_jmp_rel32_patch();
         // LEGACY: the uniform 16-byte `Value` cell — tag qword (the dword tag

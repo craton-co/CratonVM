@@ -2023,18 +2023,25 @@ pub(super) fn find_loop_hoists(
             continue;
         }
 
-        // Conservative safety: skip if loop contains aastore (0x53) which could
-        // invalidate a hoisted Object[] element by modifying the array contents.
-        let mut has_aastore = false;
+        // Conservative safety: the hoisted `m[r]` is read once in the
+        // pre-header, so nothing inside the loop may be able to store into
+        // `m`. An `aastore` (0x53) is the direct way; any invoke (0xb6-0xba)
+        // is the indirect one — the callee can `m[r] = ...`, or reach
+        // `System.arraycopy`, `Arrays.fill`, a VarHandle or `Unsafe` store —
+        // and a `monitorenter`/`monitorexit` (0xc2/0xc3) marks a region
+        // where another thread's store is expected to become visible. The
+        // arithmetic LICM (`licm_int::find_arith_loop_hoists`) already
+        // refuses call-bearing loops for the same reason.
+        let mut element_may_change = false;
         let mut check_pc = header;
         while check_pc < loop_end {
-            if code[check_pc] == 0x53 {
-                has_aastore = true;
+            if matches!(code[check_pc], 0x53 | 0xb6..=0xba | 0xc2 | 0xc3) {
+                element_may_change = true;
                 break;
             }
             check_pc += bytecode_len_at(code, check_pc);
         }
-        if has_aastore {
+        if element_may_change {
             continue;
         }
 

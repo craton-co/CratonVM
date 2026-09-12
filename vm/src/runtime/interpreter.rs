@@ -1999,7 +1999,7 @@ pub fn execute(
         // sealed for the reason it computes — it was re-running, not running
         // once per method.
         //
-        // Stamped with `redefine_epoch()` because a stale PASS is unsafe in a
+        // Stamped with this VM's `JitCache::redefine_epoch()` because a stale PASS is unsafe in a
         // way a stale seal is not: see `JitRealm::jit_gate_pass`.
         // Keyed on `ClassId`, not on the class name the negative set uses — see
         // `JitRealm::jit_gate_pass` for why the name is safe there and unsafe
@@ -2009,7 +2009,7 @@ pub fn execute(
         {
             None
         } else {
-            let epoch = cratonvm_jit::redefine_epoch();
+            let epoch = shared.jit.jit_cache.redefine_epoch();
             shared
                 .jit
                 .jit_gate_pass
@@ -2121,7 +2121,7 @@ pub fn execute(
                 cratonvm_jit::note_jit_gate_pass_fill();
                 shared.jit.jit_gate_pass.write().insert(
                     (class_id, gate_pass_key.0.clone(), gate_pass_key.1.clone()),
-                    (cratonvm_jit::redefine_epoch(), is_interface_default),
+                    (shared.jit.jit_cache.redefine_epoch(), is_interface_default),
                 );
             }
             (
@@ -2182,8 +2182,8 @@ pub fn execute(
         // from redefining with *byte-identical* bytecode.
         //
         // It was also protecting nothing. `redefine_class` already evicts
-        // every compiled artifact — `jit_cache.write().clear_all()` plus
-        // `invalidate_jit_for_class` in `vm_exec.rs` — so no code compiled
+        // every compiled artifact — `jit_cache.write().clear_all()` in
+        // `vm_exec.rs` — so no code compiled
         // from the old body can survive the redefinition, and a later
         // compilation necessarily reads the current (agent-woven) bytecode
         // out of the class store. Blocking recompilation on top of a full
@@ -2354,21 +2354,28 @@ pub fn execute(
                     // permanently-uncompiled. Opt-out (`CRATONVM_BG_COMPILE=0`) falls
                     // through to the historical eager/inline paths below.
                     if crate::runtime::env_cache::bg_compile() {
-                        let invoc_key = {
-                            let mut h = 0u32;
-                            for &b in method_name.as_bytes() {
-                                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: u8 → u32
-                            }
-                            for &b in method_descriptor.as_bytes() {
-                                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: u8 → u32
-                            }
-                            // Widening: u32 → u64 (value preserved)
-                            ((class_id.as_u32() as u64) << 32) | (h as u64)
-                        };
+                        // The canonical key, shared with every other door that
+                        // counts this method. This used to be an open-coded
+                        // 32-bit `31 * h` hash, under which overloads merged.
+                        let invoc_key = cratonvm_jit_api::invoc_key_parts(
+                            class_id.as_u32(),
+                            method_name,
+                            method_descriptor,
+                        );
                         let n = shared.jit.profile_store.increment_invocation(invoc_key);
-                        if n >= crate::runtime::env_cache::jit_invocation_threshold() {
+                        let threshold = crate::runtime::env_cache::jit_invocation_threshold();
+                        // The stride every dispatch door uses. This door had
+                        // none and consulted the manager on EVERY invocation
+                        // past the threshold: a global mutex and a freshly
+                        // built key per call, for a method that may never
+                        // compile at all.
+                        const JIT_RETRY_STRIDE: u32 = 64;
+                        if n >= threshold
+                            && (n == threshold || (n - threshold) % JIT_RETRY_STRIDE == 0)
+                        {
                             ensure_bg_compiler_started(shared);
-                            let tiered_key = crate::jit::tiered::MethodKey::new(
+                            let tiered_key = crate::jit::tiered::MethodKey::with_class_id(
+                                class_id,
                                 class_name_str.as_str(),
                                 method_name,
                                 method_descriptor,
@@ -2401,19 +2408,12 @@ pub fn execute(
                     // IR-incompatible bodies), then re-fetch the cached body. The
                     // single-pass block below is unreached while the flag is set.
                     if c2_first_call_enabled() {
-                        let invoc_key = {
-                            let mut h = 0u32;
-                            for &b in method_name.as_bytes() {
-                                // Widening: smaller value -> u32 (value fits)
-                                h = h.wrapping_mul(31).wrapping_add(b as u32);
-                            }
-                            for &b in method_descriptor.as_bytes() {
-                                // Widening: smaller value -> u32 (value fits)
-                                h = h.wrapping_mul(31).wrapping_add(b as u32);
-                            }
-                            // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
-                            ((class_id.as_u32() as u64) << 32) | (h as u64)
-                        };
+                        // The canonical key; see the background-compile twin above.
+                        let invoc_key = cratonvm_jit_api::invoc_key_parts(
+                            class_id.as_u32(),
+                            method_name,
+                            method_descriptor,
+                        );
                         let n = shared.jit.profile_store.increment_invocation(invoc_key);
                         if n < crate::runtime::env_cache::jit_invocation_threshold() {
                             c2_not_hot = true; // defer, do NOT seal (counter must keep running)
@@ -2448,6 +2448,16 @@ pub fn execute(
                     // from before the first constant-pool read.
                     // `compile_gate::admit` asks all of them; the token owns
                     // the epoch witness and must outlive the resolution below.
+                    //
+                    // x86-64 ONLY. This door reaches `x64::compile_with_param_slots`
+                    // directly, so on any other architecture it would publish
+                    // x86-64 bytes as the method's entry point. Other targets
+                    // compile through `jit::try_compile`, which selects their
+                    // backend. `cfg!` rather than `#[cfg]`, so the rest of this
+                    // path stays type-checked everywhere and is not dead code.
+                    if cfg!(not(target_arch = "x86_64")) {
+                        return None;
+                    }
                     let admission = cratonvm_jit::compile_gate::admit(
                         &class_name_str,
                         method_name,
@@ -3421,8 +3431,9 @@ pub fn execute(
                         // method_key — bakes this method's identity into its
                         // deopt snapshots (resume sinks verify it before
                         // resuming a stashed frame). Also enables the per-bci
-                        // de-spec consult (inert in production).
+                        // de-spec consult against this VM's registry.
                         &format!("{class_name_arc}.{method_name_arc}:{descriptor_arc}"),
+                        Some(&shared.jit.despec_registry),
                         indy_info,
                         Some(elidable_init_pcs),
                     )?;
@@ -3740,6 +3751,7 @@ pub fn execute(
                                         descriptor_facts_cache: std::sync::OnceLock::new(),
                                         intercept_shape_cache: std::sync::OnceLock::new(),
                                         interp_invocations: std::sync::atomic::AtomicU32::new(0),
+                                        tiering_settled: std::sync::atomic::AtomicU32::new(0),
                                         native_callback_cache: std::sync::OnceLock::new(),
                                         invoc_key: std::sync::OnceLock::new(),
                                         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4176,6 +4188,7 @@ pub fn execute(
                                         let cached =
                                             Arc::new(CachedBytecodeMethod {
                                                 declaring_class_id: class_id,
+                                                tiering_settled: std::sync::atomic::AtomicU32::new(0),
                                                 class_name: Arc::from(class_name_str.as_str()),
                                                 method_name: Arc::from(method_name),
                                                 method_descriptor: Arc::from(method_descriptor),
@@ -5175,7 +5188,8 @@ pub fn pop_and_recycle_frame_with_reason(
                 let crossed_now = total.saturating_sub(f.backward_count / 32) < threshold;
                 if crossed_now || total % 64 == 0 {
                     ensure_bg_compiler_started(shared);
-                    let tiered_key = crate::jit::tiered::MethodKey::new(
+                    let tiered_key = crate::jit::tiered::MethodKey::with_class_id(
+                        f.class_id,
                         f.class_name(),
                         f.method_name(),
                         f.method_descriptor(),
@@ -5451,7 +5465,8 @@ pub(crate) fn try_osr_with_backoff(
             // compile (idempotent), and back off so we re-probe later rather
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
-            let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
+            // Loader-aware: OSR denials and the in-flight slot are per class.
+            let key = crate::jit::tiered::MethodKey::with_class_id(frame_class_id, cn, mn, md);
             // An artifact this same path already published, which reports
             // `can_osr_enter(entry_pc) == false`, will report that forever:
             // `osr_pc_to_native[entry_pc]` is a pure function of the bytecode
@@ -5477,7 +5492,7 @@ pub(crate) fn try_osr_with_backoff(
             //
             // Strictly a waste-elimination change: it removes compiles, never
             // adds compiled execution. The loop runs interpreted either way.
-            if crate::jit::tiered::is_osr_denied(&key) || published_but_unenterable {
+            if shared.jit.tiered_manager.is_osr_denied(&key) || published_but_unenterable {
                 // Counted, because this path is why `osr_entered=0` can appear
                 // next to `osr_refused_entry=0` and a non-zero `osr=` compile
                 // count — a combination that reads like "OSR was never even

@@ -12,6 +12,16 @@ pipeline, a real deoptimization framework, and a second (AArch64) target.
 
 ### Module size
 
+> **The figures in this table and the paragraphs under it are historical.**
+> `wc -l` on 2026-09-12: `jit/src/*.rs` is 174,861 lines across 33 files, and
+> about 268,000 with `jit/src/x64/`. `jit/src/x64.rs` is now a 3,640-line module
+> root, since the single-pass emitter was split into `jit/src/x64/*`
+> (`x64/bytecode_walk.rs` holds the per-opcode walk). The largest single file
+> is `jit/src/lib.rs` at 42,693 lines. Other current sizes: `ir.rs` 14,537,
+> `ir_lower.rs` 30,296, `ir_optimize.rs` 9,073, `ir_schedule.rs` 4,080,
+> `escape_analysis.rs` 6,560, `aarch64.rs` 2,445, `aarch64_backend.rs` 9,772.
+> For the current file layout see the JIT section of `ARCHITECTURE.md`.
+
 | Location | Lines | Role |
 |---|---|---|
 | `jit/src/` (crate `cratonvm-jit`) | **81,903** across 17 files | codegen backends, IR pipeline, tiering, deopt |

@@ -211,13 +211,16 @@ Scope: process-global mutable state reachable from `vm/src/`. Severity classes:
 | V24 | `JNI_NATIVE_METHODS`, `DIRECT_BUFFERS`, `JNI_TABLE_PTR` | `vm/src/native/jni.rs:4730, :6279, :6881` | `RegisterNatives` bindings, direct-buffer addresses, the leaked JNI function table | process (JNI ABI) | PROCESS for the table; the binding map is keyed by a hash that embeds per-VM class identity ⇒ latent CONTAMINATION | no — §6 |
 | V25 | `env_cache::MemoSlot` (≈25 sites) | `vm/src/runtime/env_cache.rs` | latched env-var-derived gates | process config | PROCESS-by-design, **P1 caveat**: the first VM latches; `VmConfig` differences between VMs are invisible to these gates unless `flags::overrides_active()` | no — see P1 note below |
 | V26 | `FLAGS` | `types/src/flags.rs:1906` | the entire `VmFlags` set | process config | **FIRST-WINS** — this is the root of P1. Two VMs cannot have disjoint flags | no — out of scope, §5 |
+| V27 | `BACKGROUND_COMPILER` / `BACKGROUND_COMPILER_INIT` | `jit/src/tiered.rs` (was) | the one compile-worker handle, started through a `std::sync::Once` against whichever manager asked first | per-VM | **FIRST-WINS** — a second VM's `ensure_background_compiler` was a no-op, so its queue was never drained and it never tiered up | **YES** (2026-09-12) — the handle lives on `TieredCompilationManager::background`; each manager starts its own C1 and C2 lane workers and joins them when dropped |
+| V28 | `osr_deny_list` | `jit/src/tiered.rs` (was) | `HashSet<MethodKey>` of name-keyed OSR denials | per-VM | **CONTAMINATION** — one VM's (or one loader's) failed OSR compile denied OSR for every same-named method in the process, permanently | **YES** (2026-09-12) — `CompilerCore::osr_denied`, keyed by a loader-aware `MethodKey` and stamped with the install epoch |
+| V29 | `JIT_BAIL_LIST`, `JIT_BAIL_REASONS`, `OSR_ENTRY_REJECTS` → `JIT_VERDICTS` | `jit/src/lib.rs` | negative compile verdicts keyed by (class, method, descriptor) names | per-VM ideally | CONTENTION — still process-wide (callers hold names, not a VM), so two VMs share verdicts about same-named methods; the worst case is a delayed compile | partial (2026-09-12) — unified into one store whose entries verify full names, expire with the redefine / install epoch and are cleared on unload and redefinition |
 
-Counts: **31 entries** (S1–S5 + V1–V26).
+Counts: **34 entries** (S1–S5 + V1–V29).
 
-* **13 CONTAMINATION** — S1, S2, S3, S4, V1, V3, V4, V5, V6, V7, V8, V11, V13
-  (plus V24, latent).
-* **8 FIRST-WINS** — S5, V2, V9, V10, V12, V20, V21, V26.
-* **4 CONTENTION** — V15, V16, V17, V19.
+* **14 CONTAMINATION** — S1, S2, S3, S4, V1, V3, V4, V5, V6, V7, V8, V11, V13,
+  V28 (plus V24, latent).
+* **9 FIRST-WINS** — S5, V2, V9, V10, V12, V20, V21, V26, V27.
+* **5 CONTENTION** — V15, V16, V17, V19, V29.
 * **6 PROCESS / already correct** — V14, V18, V22, V23, V24, V25.
 
 Disposition of this pass:
@@ -517,3 +520,27 @@ thread-local that outlives a VM, answer three questions:
 
 And: there is exactly one VM-identity notion — `SharedVm::vm_identity` /
 `NativeContext::vm_identity()` / `VmId`. Do not add a second.
+
+---
+
+## 8. JIT code memory and its bookkeeping (2026-09-12)
+
+Not part of §2's counts. Compiled code is the one subsystem where most of the
+state is process-scoped on purpose: executable pages are an OS resource, and an
+OS thread can run compiled code belonging to more than one VM, so anything that
+decides "may this body be freed?" has to see every thread in the process.
+
+| # | State | Where | Holds | Scope | Verdict |
+|---|-------|-------|-------|-------|---------|
+| J1 | `JitCache`: shards, flush barrier, invalidation log, `generation()`, `redefine_epoch()` | `jit/src/lib.rs` (`JitRealm::jit_cache`) | compiled bodies by key, and "has this VM's cache changed?" | per-VM | per-VM. The generation the interpreter's negative memos compare against and the redefinition epoch inline caches stamp were process-global (`JIT_CACHE_GENERATION`, `REDEFINE_EPOCH`), so one VM's compile or redefinition flushed every VM's memos and inline caches. **FIXED**: both are fields of the cache. |
+| J2 | `JIT_CACHE_GENERATION` | `jit/src/lib.rs` | count of every cache's publications and invalidations | process | PROCESS. Kept for the per-thread raw-entry dispatch memos in `vm/src/jit/helpers.rs` (`flush_raw_entry_dispatch_caches`): they live in thread-locals that outlive a VM and are keyed `(vm_identity, info)`, so a process count can only over-flush them. |
+| J3 | `JIT_INSTALL_EPOCH`, `JIT_INVALIDATION_EPOCH` | `jit/src/lib.rs` | stamps taken when a compilation begins | process counter, per-cache gate | PROCESS. Monotonic counters: another VM's bump only makes a stamp older. The gates that compare against them (`flush_barrier`, the invalidation log) are per cache. |
+| J4 | executable mappings, `COMMITTED_JIT_CODE_BYTES`, the code-cache cap | `jit/src/lib.rs`, `jit/src/platform.rs` | OS pages | process | PROCESS, with one CONTENTION: the cap is shared, so one VM's code counts against another's (`jit_code_cache_at_capacity`). |
+| J5 | retirement queue (`DEFERRED_JIT_OWNERS`), `ACTIVE_JIT_EXECUTIONS`, `JIT_THREADS`, `JIT_RETIRE_GENERATION` / `JIT_GRACED_GENERATION`, reclamation counters | `jit/src/lib.rs` | owners awaiting grace; per-thread in-JIT records | process | PROCESS by necessity (a grace period must cover every thread that could be inside a body). |
+| J6 | code-range registry, region list, `JIT_ENTRY_OWNERS`, compile-id table, `JIT_NAME_RANGES`, implicit-null ranges | `jit/src/lib.rs`, `jit/src/implicit_null.rs` | metadata for signal handlers, stack walkers and pointer validation | process | PROCESS. Keyed by code address (or a compile id bound to one), which is unique while mapped; every entry is withdrawn before its buffer is unmapped, and a released compile id is reissued only after grace. |
+| J7 | `TYPECHECK_NAME_INTERN` / `TYPECHECK_TARGET_BY_SITE` | `jit/src/lib.rs` | leaked names keyed by `(name, ClassId)` | per-VM ideally | CONTENTION. A `ClassId` is per-VM (Fact 1), so `jit_typecheck_resolve` re-verifies that the recorded id names the site's class in its own VM before trusting it (the `frame.rs` pattern). Leaks one string per distinct pair. |
+
+Rule for this subsystem: bookkeeping may be process-global only if it is keyed
+by a code address that is unique while mapped, or if it is a monotonic counter
+whose gate lives per VM. Anything that answers "has *this VM* changed?" belongs
+on that VM's `JitCache`.

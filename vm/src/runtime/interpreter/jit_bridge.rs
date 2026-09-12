@@ -77,7 +77,7 @@ pub(super) fn dbg_osr_recompile_reason(
     method_descriptor: &str,
     entry_pc: usize,
 ) {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_none() {
+    if !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
         return;
     }
     let why = match cached_osr {
@@ -267,9 +267,7 @@ fn osr_stage_get() -> &'static str {
 /// one binary, both answers.
 fn osr_pc_refresh_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_PC_REFRESH").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_OSR_PC_REFRESH"))
 }
 
 /// One interpreter frame that compiled code is running right now.
@@ -392,6 +390,26 @@ pub(crate) fn live_osr_continuation_artifact(frame_index: usize) -> Option<usize
     })
 }
 
+/// The `int`-family value a compiled method returned, narrowed to its
+/// descriptor's type.
+///
+/// JVMS §6.5 `ireturn`: a method whose return type is `boolean`, `byte`,
+/// `char` or `short` returns its value truncated to that type (`boolean` to
+/// bit 0). The interpreter does this at `ireturn`; neither JIT tier does, so a
+/// compiled body fed non-javac bytecode (`iconst_2; ireturn` from a `Z` method)
+/// handed the interpreter a 2. Narrowing at the bridge is where the compiled
+/// value re-enters interpreted code.
+fn narrow_int_return(ret_type: u8, raw: i64) -> i32 {
+    // Casts: the JIT ABI returns every int-family value in the i64 register.
+    match ret_type {
+        b'Z' => (raw & 1) as i32,
+        b'B' => i32::from(raw as i8),
+        b'C' => i32::from(raw as u16),
+        b'S' => i32::from(raw as i16),
+        _ => raw as i32,
+    }
+}
+
 pub(super) fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -402,10 +420,23 @@ pub(super) fn compile_osr_artifact(
     max_locals: usize,
     entry_pc: usize,
 ) -> Option<Arc<crate::jit::CompiledMethod>> {
-    let osr_key = crate::jit::tiered::MethodKey::new(&class_name, &method_name, &method_descriptor);
+    // x86-64 ONLY: this door calls `x64::compile_with_param_slots` directly,
+    // and no other backend publishes OSR entry points. On any other target it
+    // would publish x86-64 bytes. `cfg!` keeps the body type-checked there.
+    if cfg!(not(target_arch = "x86_64")) {
+        return None;
+    }
+    // Loader-aware, and asked of this VM's manager: OSR denials belong to a
+    // class identity and expire when the install epoch moves.
+    let osr_key = crate::jit::tiered::MethodKey::with_class_id(
+        class_id,
+        class_name.as_str(),
+        method_name.as_str(),
+        method_descriptor.as_str(),
+    );
     osr_stage("entry");
     cratonvm_types::osr_refusal_census::note_attempt();
-    if crate::jit::tiered::is_osr_denied(&osr_key) {
+    if shared.jit.tiered_manager.is_osr_denied(&osr_key) {
         return None;
     }
     // The two whole-method vetoes that must also stop a CACHED artifact from
@@ -944,7 +975,7 @@ pub(super) fn compile_osr_artifact(
                         class_name, method_name, method_descriptor
                     );
                 }
-                crate::jit::tiered::mark_osr_denied(osr_key.clone());
+                shared.jit.tiered_manager.mark_osr_denied(osr_key.clone());
                 return None;
             }
 
@@ -1077,10 +1108,9 @@ pub(super) fn compile_osr_artifact(
                         );
                         if let Some((c_off, c_ref)) = slot {
                             compact_field_info.push((pc, c_off as u32, c_ref));
-                        } else if cratonvm_types::flags::runtime_var_os(
+                        } else if cratonvm_types::flags::runtime_flag_on(
                             "CRATONVM_DBG_COMPACT_INLINE",
                         )
-                        .is_some()
                         {
                             // ENGAGEMENT CENSUS. A `None` here is not a missing
                             // optimisation, it is a *helper call on every access*:
@@ -1120,7 +1150,7 @@ pub(super) fn compile_osr_artifact(
                 shared.jit.profile_store.get_profile(&profile_key)
             };
             // Same `"<class>.<method>:<descriptor>"` key the deopt log and
-            // `method_epochs` use; see `despec_contains`.
+            // `method_epochs` use; see `DespecRegistry::contains`.
             let osr_despec_key = format!("{class_name}.{method_name}:{method_descriptor}");
 
             // Resolve invokes — collect info under lock, then compile callees after release
@@ -1442,7 +1472,7 @@ pub(super) fn compile_osr_artifact(
                                         pc,
                                         guard_class_id,
                                     );
-                                let by_despec = cratonvm_jit::deopt::despec_contains(
+                                let by_despec = shared.jit.despec_registry.contains(
                                     &osr_despec_key,
                                     pc as u32,
                                 );
@@ -1580,7 +1610,7 @@ pub(super) fn compile_osr_artifact(
                         } else {
                             cratonvm_jit::JitIntrinsic::FfmSegmentSetAtIndex.as_entry()
                         };
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM").is_some() {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_FFM") {
                             eprintln!(
                                 "[ffm] REGISTERED(bridge) {target_class}.{mn}{desc} @pc={pc} kind={invoke_kind}"
                             );
@@ -2641,7 +2671,7 @@ pub(super) fn compile_osr_artifact(
                 // ~4.6x apart on a call-dense loop — see
                 // `docs/known-issues/netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`.
                 let dbg_bind =
-                    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_BIND").is_some();
+                    cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR_BIND");
                 if let Some((callee_pin, entry, needs_ctx)) = compiled_callee {
                     baked_callee_pins.push(callee_pin);
                     let refuse_dispatch = crate::jit::jit_direct_call_requires_dispatch(
@@ -3249,9 +3279,10 @@ pub(super) fn compile_osr_artifact(
                 // this method's identity (the resume sinks verify a stashed
                 // frame's `method_key` before resuming it; an empty key would
                 // force every OSR-frame deopt onto the imprecise safe-reject
-                // path). Also enables the per-bci de-spec consult, which is
-                // inert in production (empty registry).
+                // path). Also enables the per-bci de-spec consult below.
                 &format!("{class_name}.{method_name}:{method_descriptor}"),
+                // This VM's de-spec registry — per VM, never another VM's.
+                Some(&shared.jit.despec_registry),
                 indy_info,
                 Some(elidable_init_pcs),
             );
@@ -3451,7 +3482,7 @@ pub(super) fn route_osr_exception_out_of_artifact(
     method_descriptor: &str,
     exc: ObjectRef,
 ) -> OsrExceptionExit {
-    let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some();
+    let trace = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT");
     let precise = match cratonvm_jit::deopt::take_exceptional_frame() {
         Some(rframe)
             if deopt_frame_matches_method(&rframe, class_name, method_name, method_descriptor) =>
@@ -3960,7 +3991,7 @@ pub(super) fn try_osr(
     // it: a future trigger passing some other pc must be refused, not silently
     // entered at a bci the interpreter is not standing on.
     if entry_pc != frame.pc {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR") {
             eprintln!(
                 "[cratonvm-osr] REFUSE {}.{}{} entry_pc={} != frame.pc={} \
                  (OsrEntryState::pc must be the frame's current pc)",
@@ -3969,7 +4000,7 @@ pub(super) fn try_osr(
         }
         return None;
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR") {
         eprintln!(
             "[cratonvm-osr] enter {}.{}{} entry_pc={} num_locals={} locals={:?} tags={:?}",
             &*class_name_arc,
@@ -4034,11 +4065,14 @@ pub(super) fn try_osr(
             cratonvm_jit::metrics::record_osr_event("osr_refused_entry");
             let permanent = cratonvm_jit::osr_refusal_is_permanent(&b);
             if permanent {
-                crate::jit::mark_osr_entry_rejected(
+                // `_by`: a refusal that depends on compile-time state expires
+                // when that state is flushed, instead of standing for good.
+                crate::jit::mark_osr_entry_rejected_by(
                     &class_name,
                     &method_name,
                     &method_descriptor,
                     entry_pc,
+                    &b,
                 );
             }
             if crate::runtime::env_cache::dbg_jitc() {
@@ -4167,7 +4201,7 @@ pub(super) fn try_osr(
         {
             let now = cratonvm_gc::gc_quiescence::depth();
             if now > _qd0 + 1
-                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some()
+                && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_CORRUPT_FRAMES")
             {
                 eprintln!(
                     "[quiesce-leak] OSR site leaked: depth before={} after={} (expected {})",
@@ -4225,7 +4259,7 @@ pub(super) fn try_osr(
     // OSR→interpreter handoff without expanding the OSR signature
     // (`Option<Option<Value>>`, no error channel).
     if let Some(exc) = crate::jit::helpers::take_jit_pending_exception(thread) {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR") {
             let cid = shared.mem.heap.class_id_of(exc);
             let cname = shared
                 .classes
@@ -4520,7 +4554,7 @@ pub(super) fn try_osr(
             let exit_site = compiled.classify_osr_exit_site(rframe.bci);
             cratonvm_jit::metrics::record_osr_event(exit_site.metric());
             if matches!(exit_site, cratonvm_jit::osr_exit::OsrExitSite::Unrecorded)
-                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some()
+                && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT")
             {
                 eprintln!(
                     "[cratonvm-deopt] OSR-exit at bci={} which {}.{}{} records neither an \
@@ -4544,7 +4578,7 @@ pub(super) fn try_osr(
                 deopt_frame_matches_method(&rframe, &class_name, &method_name, &method_descriptor);
             if !identity_ok {
                 despeculate_stashed_frame_method(shared, &rframe);
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                     eprintln!(
                         "[cratonvm-deopt] OSR-exit stash identity mismatch (frame={} bci={}) \
                          for {}.{}{} — safe reject",
@@ -4587,7 +4621,7 @@ pub(super) fn try_osr(
                     .is_some()
                 })
             {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                     eprintln!(
                         "[cratonvm-deopt] OSR-exit TRANSFER {}.{}{} entry_pc={} resume_bci={}",
                         &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, rframe.bci
@@ -4619,7 +4653,7 @@ pub(super) fn try_osr(
             // Reaching here after a committed body would mean that invariant
             // broke. Do not add a resume path for it — the fix belongs at
             // admission, where nothing has run yet.
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                 eprintln!(
                     "[cratonvm-deopt] OSR-exit bail rejected (continue interpreting) {}.{}{} entry_pc={}",
                     &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
@@ -4658,7 +4692,7 @@ pub(super) fn try_osr(
         // case above, so the interpreter resumes THIS frame from where it
         // was instead of reinterpreting the `i64::MIN` sentinel as a value.
         if deopt_signaled {
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                 eprintln!(
                     "[cratonvm-deopt] OSR-exit bail rejected (uncommon trap, no frame) {}.{}{} entry_pc={}",
                     &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
@@ -4674,7 +4708,7 @@ pub(super) fn try_osr(
     let ret_type = crate::jit::return_type(&method_descriptor);
     match ret_type {
         b'V' => Some(None),
-        b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Some(Value::Int(result_i64 as i32))), // Cast: JIT ABI -- i64 register convention
+        b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Some(Value::Int(narrow_int_return(ret_type, result_i64)))),
         b'J' => Some(Some(Value::Long(result_i64))),
         b'F' => Some(Some(Value::Float(f32::from_bits(result_i64 as u32)))), // Cast: JIT ABI -- i64 register convention
         b'D' => Some(Some(Value::Double(f64::from_bits(result_i64 as u64)))), // Cast: JIT ABI -- i64 register convention
@@ -4747,10 +4781,21 @@ pub(super) fn resweep_held_deferred_new_retries(shared: &SharedVm, on_class_defi
                     "[cratonvm-jitc] deferred-new RE-OFFERED {class_name}.{method_name}{descriptor} — its class has loaded"
                 );
             }
+            // The held list records names only, so resolve the class the way
+            // this file's other by-name doors do. A key without the class's
+            // identity would not match the state the invocation hooks built,
+            // and the retry would take a second in-flight slot beside it.
+            let class_id = shared
+                .classes
+                .class_manager
+                .read()
+                .get_loaded_class_id(&class_name)
+                .unwrap_or(ClassId::new(0));
             shared
                 .jit
                 .tiered_manager
-                .request_deferred_new_retry(&crate::jit::tiered::MethodKey::new(
+                .request_deferred_new_retry(&crate::jit::tiered::MethodKey::with_class_id(
+                    class_id,
                     &*class_name,
                     &*method_name,
                     &*descriptor,
@@ -4816,7 +4861,7 @@ pub(super) fn resolve_jit_new_site(
         // escape analysis, so every allocation in it survives. Name the class
         // that could not be resolved: "the method bailed" is not actionable,
         // "Short2 was not found from VolumeShort2's loader" is.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_COMPILES") {
             // Separate the two ways this lookup fails: the holder has no loader
             // id at all, versus the class simply not being visible from that
             // loader. `find_class_by_name` is the context-free probe, so a hit
@@ -5499,7 +5544,7 @@ pub(super) fn resolve_cp_class_for_owner(
 fn jit_loader_blind_cp_resolve() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE")
     })
 }
 
@@ -5582,9 +5627,7 @@ pub(super) fn resolve_jit_elidable_init_loading(
 /// uncached-invocation path. Default-OFF → behaviour byte-for-byte unchanged.
 fn jit_sync_methods_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SYNC_METHODS").is_some()
-    })
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_SYNC_METHODS"))
 }
 
 /// Try to JIT-compile a method and return the upgraded cache target.
@@ -6309,6 +6352,7 @@ pub(super) fn compile_optimizing_artifact(
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -6744,6 +6788,8 @@ pub(super) fn compile_optimizing_artifact(
 
             // whether a thin direct-call helper may shadow real bytecode.
             Some(&intrinsic_resolver),
+            // This VM's per-bci de-spec registry.
+            Some(&shared.jit.despec_registry),
         )?;
         let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
         let needs_ctx = compiled.needs_context();
@@ -6980,6 +7026,8 @@ pub(super) fn compile_optimizing_artifact(
 
         // whether a thin direct-call helper may shadow real bytecode.
         Some(&intrinsic_resolver),
+        // This VM's per-bci de-spec registry.
+        Some(&shared.jit.despec_registry),
     )?;
     Some(compiled)
 }
@@ -6989,6 +7037,29 @@ pub(super) fn compile_optimizing_artifact(
 /// as the bytecode entry it's replacing.  Saves one
 /// `class_manager.read()` round-trip on the hot promotion path.
 pub(super) fn try_jit_upgrade_with_gate(
+    shared: &SharedVm,
+    cached: &Arc<CachedBytecodeMethod>,
+    gate: RedefineGate,
+) -> Option<CachedInvokeTarget> {
+    // Panic containment for the inline upgrade door; see `try_jit_compile_callee`.
+    match cratonvm_jit::tiered::contain_compile_panic(|| {
+        try_jit_upgrade_with_gate_uncontained(shared, cached, gate)
+    }) {
+        Ok(target) => target,
+        Err(payload) => {
+            note_contained_mutator_compile_panic(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+                &*payload,
+            );
+            None
+        }
+    }
+}
+
+/// [`try_jit_upgrade_with_gate`] without panic containment.
+fn try_jit_upgrade_with_gate_uncontained(
     shared: &SharedVm,
     cached: &Arc<CachedBytecodeMethod>,
     gate: RedefineGate,
@@ -7441,6 +7512,52 @@ pub fn try_jit_compile_callee(
     descriptor: &str,
     optimize: bool,
 ) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
+    // The mutator-thread compile door, with its panics contained the way the
+    // background workers' are (`cratonvm_jit::tiered::contain_compile_panic`).
+    // Without this a codegen panic unwound through the interpreter frame that
+    // asked for the callee.
+    match cratonvm_jit::tiered::contain_compile_panic(|| {
+        try_jit_compile_callee_uncontained(shared, class_name, method_name, descriptor, optimize)
+    }) {
+        Ok(compiled) => compiled,
+        Err(payload) => {
+            note_contained_mutator_compile_panic(class_name, method_name, descriptor, &*payload);
+            None
+        }
+    }
+}
+
+/// A compile panic caught on a mutator thread: bail-list the method so no door
+/// asks for it again, count it under the workers' `worker_panic` scheduling
+/// event, and warn once per process.
+fn note_contained_mutator_compile_panic(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    payload: &(dyn std::any::Any + Send),
+) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    cratonvm_jit::mark_jit_bail_listed(class_name, method_name, descriptor);
+    cratonvm_jit::metrics::record_scheduling_event(cratonvm_jit::metrics::SCHEDULING_EVENTS[6]);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "cratonvm::jit",
+            "compile of {class_name}.{method_name}{descriptor} panicked on a mutator thread and \
+             was contained: {}. The method is bail-listed and keeps running interpreted; later \
+             contained panics are counted under the `worker_panic` scheduling event.",
+            cratonvm_jit::tiered::panic_payload_message(payload),
+        );
+    }
+}
+
+/// [`try_jit_compile_callee`] without panic containment.
+fn try_jit_compile_callee_uncontained(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    optimize: bool,
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     use std::sync::atomic::Ordering;
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
@@ -7591,7 +7708,7 @@ pub fn try_jit_compile_callee(
 /// "`hit_entry=0` forever" unfalsifiable. Each now names itself.
 fn callee_probe_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CALLEE_PROBE").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_CALLEE_PROBE"))
 }
 
 fn callee_probe_note(why: &str, class_name: &str, method_name: &str, descriptor: &str) {
@@ -8050,6 +8167,7 @@ pub(super) fn try_jit_compile_callee_slow(
         descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         interp_invocations: std::sync::atomic::AtomicU32::new(0),
+        tiering_settled: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -8794,6 +8912,8 @@ pub(super) fn try_jit_compile_callee_slow(
 
         // whether a thin direct-call helper may shadow real bytecode.
         Some(&intrinsic_resolver),
+        // This VM's per-bci de-spec registry.
+        Some(&shared.jit.despec_registry),
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
@@ -9075,6 +9195,11 @@ pub(super) fn try_jit_compile_callee_slow(
 /// program (a `main()` loop that never crosses the invocation threshold) still
 /// starts the worker.
 pub(super) fn ensure_bg_compiler_started(shared: &SharedVm) {
+    // One atomic load once this VM's workers are running. The `Weak` below
+    // takes the `self_arc` read lock, and every tier-up stride used to pay it.
+    if shared.jit.tiered_manager.compiler_active() {
+        return;
+    }
     let weak_vm: std::sync::Weak<SharedVm> =
         shared.self_arc.read().as_ref().cloned().unwrap_or_default();
     crate::jit::tiered::ensure_background_compiler(&shared.jit.tiered_manager, || {
@@ -9084,6 +9209,45 @@ pub(super) fn ensure_bg_compiler_started(shared: &SharedVm) {
             },
         )
     });
+}
+
+/// Offer one tier-up stride of `cached`'s method to the tiered manager, and
+/// return the tier it queued a compile at, if any.
+///
+/// The door every interpreter tier-up hook goes through. It checks the call
+/// site's `tiering_settled` stamp first: a method the manager has already said
+/// it can do nothing more for -- declined by policy, out of compile retries,
+/// already at C2 -- used to take the manager's global `methods` mutex and
+/// allocate three `String`s for its key at every stride, for the life of the
+/// process. Now it costs one relaxed load and one atomic compare until
+/// something (a deopt, an unload, a redefinition, a policy change) moves the
+/// manager's generation. The key it builds shares the cached method's
+/// `Arc<str>`s and carries the declaring class's identity, so same-named
+/// classes in different loaders keep separate tiering state.
+///
+/// Starting the worker stays the caller's job, because the `CRATONVM_BG_COMPILE=0`
+/// paths consult the manager without one.
+pub(super) fn offer_invocation_to_tiered_manager(
+    shared: &SharedVm,
+    cached: &cratonvm_jit_api::CachedBytecodeMethod,
+    invocation_count: u64,
+) -> Option<crate::jit::tiered::CompilationTier> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let manager = &shared.jit.tiered_manager;
+    if manager.tiering_settled(cached.tiering_settled.load(Relaxed)) {
+        return None;
+    }
+    let key = crate::jit::tiered::MethodKey::with_class_id(
+        cached.declaring_class_id,
+        Arc::clone(&cached.class_name),
+        Arc::clone(&cached.method_name),
+        Arc::clone(&cached.method_descriptor),
+    );
+    let verdict = manager.on_method_invocation_settling(&key, invocation_count);
+    cached
+        .tiering_settled
+        .store(verdict.settled_generation, Relaxed);
+    verdict.recommended
 }
 
 /// wire-tiered-manager Step 5: resolve the inputs the off-thread OSR compile
@@ -9218,12 +9382,25 @@ pub fn supersede_census() -> (u64, u64, u64) {
 
 pub(super) fn fetch_osr_compile_inputs(
     shared: &SharedVm,
+    class_id: ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
 ) -> Option<(ClassId, std::sync::Arc<[u8]>, u16)> {
     let cm = shared.classes.class_manager.read();
-    let class_id = cm.get_loaded_class_id(class_name)?;
+    // The task's own class identity first: resolving by name alone returns
+    // `None` when two loaders define the name, and would otherwise compile
+    // whichever copy the name lookup picked. The name is the fallback for a
+    // key built without an id.
+    let class_id = if class_id.as_u32() != 0
+        && cm
+            .get_class(class_id)
+            .is_some_and(|class| class.name.as_ref() == class_name)
+    {
+        class_id
+    } else {
+        cm.get_loaded_class_id(class_name)?
+    };
     let class = cm.get_class(class_id)?;
     let method = class
         .methods
@@ -9255,7 +9432,7 @@ pub(super) fn promote_scalar_selfrec_to_ir(
     key: &crate::jit::tiered::MethodKey,
 ) -> bool {
     let Some((class_id, padded, _)) =
-        fetch_osr_compile_inputs(shared, &key.class_name, &key.method_name, &key.descriptor)
+        fetch_osr_compile_inputs(shared, key.class_id, &key.class_name, &key.method_name, &key.descriptor)
     else {
         return false;
     };
@@ -9325,7 +9502,11 @@ pub(super) fn background_compile_task(
         // about this method. Charge it to neither counter.
         None => return fail(0),
     };
-    if named_class_was_redefined(&shared, &task.method_key.class_name) {
+    if crate::runtime::redefine_state::class_id_or_name_was_redefined(
+        &shared,
+        task.method_key.class_id.as_u32(),
+        &task.method_key.class_name,
+    ) {
         // A retransformed target remains interpreted for now. This is a
         // per-class decline; unrelated background tasks continue compiling.
         return declined(0);
@@ -9341,7 +9522,7 @@ pub(super) fn background_compile_task(
     // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
     // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
     // remaining force-interpret lever, applied in `jit::try_compile`.
-    if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
+    if task.osr_bci.is_some() && shared.jit.tiered_manager.is_osr_denied(&task.method_key) {
         return declined(0);
     }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier)
@@ -9371,6 +9552,7 @@ pub(super) fn background_compile_task(
         let start = std::time::Instant::now();
         let published = if let Some((class_id, padded, max_locals)) = fetch_osr_compile_inputs(
             &shared,
+            task.method_key.class_id,
             &task.method_key.class_name,
             &task.method_key.method_name,
             &task.method_key.descriptor,
@@ -9390,24 +9572,42 @@ pub(super) fn background_compile_task(
             false
         };
         if !published {
-            // The compile inputs and policy are stable for the life of this
-            // loaded method. Prevent a failed background artifact from being
-            // re-enqueued forever now that pending work no longer consumes the
-            // frame's permanent-rejection budget.
+            // Which failures deny OSR, and which are retried.
             //
-            // Surface the denial under the existing compile-trace flag: this
-            // is a PERMANENT, process-lifetime decision that silently leaves
-            // the method's loops interpreted forever (a once-invoked harness
-            // main with the hot loop inline runs ~8x slow with zero other
-            // diagnostics — found the hard way, perf/halfgap-20260717).
+            // This used to deny OSR for the method on ANY unpublished result,
+            // for the rest of the process. Most ways a background OSR compile
+            // comes back empty are transient: the class manager could not hand
+            // over the inputs this time (`fetch_osr_compile_inputs` returned
+            // `None`), the code cache was full, a redefinition landed
+            // mid-compile, a callee had not loaded yet. Denying on those turned
+            // one unlucky compile into a method whose loops stayed interpreted
+            // forever (a once-invoked harness main with the hot loop inline ran
+            // ~8x slow with zero other diagnostics, perf/halfgap-20260717).
+            //
+            // So a failure is a failed compile -- it spends one of the method's
+            // `MAX_TIER_FAIL_RETRIES` and the next hot back-edge asks again,
+            // which also bounds the re-enqueue loop the old denial existed to
+            // stop -- unless the compiler recorded a verdict the loaded bytecode
+            // cannot change by bail-listing the method. Only then is OSR denied,
+            // and that denial still expires when the install epoch moves.
+            let permanent = cratonvm_jit::is_jit_bail_listed(
+                &task.method_key.class_name,
+                &task.method_key.method_name,
+                &task.method_key.descriptor,
+            );
             if crate::runtime::env_cache::dbg_jitc() {
                 eprintln!(
-                    "[cratonvm-jitc] OSR-compile FAILED {}.{}{} osr_bci={} stage={} — method marked OSR-denied for the rest of this process",
+                    "[cratonvm-jitc] OSR-compile FAILED {}.{}{} osr_bci={} stage={} — {}",
                     task.method_key.class_name,
                     task.method_key.method_name,
                     task.method_key.descriptor,
                     osr_bci,
                     osr_stage_get(),
+                    if permanent {
+                        "bail-listed: OSR denied until the install epoch moves"
+                    } else {
+                        "transient: counted as a failed compile and retried"
+                    },
                 );
                 eprintln!(
                     "[cratonvm-jitc]   …and the bail this method last recorded: {}",
@@ -9419,7 +9619,13 @@ pub(super) fn background_compile_task(
                     .unwrap_or_else(|| "none recorded".to_string()),
                 );
             }
-            crate::jit::tiered::mark_osr_denied(task.method_key.clone());
+            if permanent {
+                shared
+                    .jit
+                    .tiered_manager
+                    .mark_osr_denied(task.method_key.clone());
+                return declined(start.elapsed().as_millis() as u64);
+            }
         }
         return CompileOutcome {
             // Widening: smaller integer -> 64-bit (zero/sign-extended).
@@ -9456,6 +9662,7 @@ pub(super) fn background_compile_task(
         .then(|| {
             let (class_id, _, _) = fetch_osr_compile_inputs(
                 &shared,
+                task.method_key.class_id,
                 &task.method_key.class_name,
                 &task.method_key.method_name,
                 &task.method_key.descriptor,
@@ -9541,6 +9748,7 @@ pub(super) fn background_compile_task(
             let jit_cache = shared.jit.jit_cache.read();
             fetch_osr_compile_inputs(
                 &shared,
+                task.method_key.class_id,
                 &task.method_key.class_name,
                 &task.method_key.method_name,
                 &task.method_key.descriptor,
@@ -9649,6 +9857,7 @@ pub(super) fn background_compile_task(
         && crate::runtime::env_cache::c2_supersede()
         && fetch_osr_compile_inputs(
             &shared,
+            task.method_key.class_id,
             &task.method_key.class_name,
             &task.method_key.method_name,
             &task.method_key.descriptor,
@@ -9687,15 +9896,12 @@ pub(super) fn background_compile_task(
             .jit
             .jit_skip_set
             .read()
-            // The skip-set is keyed by `Arc<str>` and `MethodKey` holds
-            // `String`, so the probe has to materialise a key. Three small
-            // allocations on a path that runs once per FAILED compile task —
-            // not per invocation — which is the whole reason this check can
-            // afford to be here at all.
+            // The skip-set and `MethodKey` both hold `Arc<str>`, so the probe
+            // key is three reference-count bumps.
             .contains(&(
-                std::sync::Arc::from(task.method_key.class_name.as_str()),
-                std::sync::Arc::from(task.method_key.method_name.as_str()),
-                std::sync::Arc::from(task.method_key.descriptor.as_str()),
+                task.method_key.class_name.clone(),
+                task.method_key.method_name.clone(),
+                task.method_key.descriptor.clone(),
             ))
             || cratonvm_jit::is_jit_bail_listed(
                 &task.method_key.class_name,
@@ -11557,6 +11763,68 @@ pub(super) fn jit_saved_args_to_values(
     out
 }
 
+/// Roots the reference arguments `execute_jit_call` popped off the caller's
+/// operand stack, for the whole native activation.
+///
+/// Once popped they are no longer interpreter roots, yet the saved copies are
+/// used AFTER the compiled call returns: re-pushed for a whole-method re-run,
+/// and decoded into handler locals after an exception object was allocated.
+/// The call itself can collect, so a moving young collection handed those
+/// paths pre-move addresses. Each reference is pushed into `native_pin_roots`
+/// as it is popped (its index in `arg_pins`, `usize::MAX` for a
+/// non-reference) and re-read through [`pinned_saved_arg`]; this guard
+/// releases the window on every return path. It is declared before
+/// `JitSynchronizedMonitorGuard`, whose pin sits above this window, so that
+/// guard drops first.
+pub(super) struct JitArgPinGuard {
+    pub(super) thread: *mut JvmThread,
+    pub(super) base: usize,
+}
+
+impl Drop for JitArgPinGuard {
+    fn drop(&mut self) {
+        // SAFETY: `thread` came from the exclusive `&mut JvmThread` of the
+        // enclosing activation, which outlives this guard — the same aliasing
+        // discipline `JitSynchronizedMonitorGuard` relies on.
+        let thread = unsafe { &mut *self.thread };
+        if thread.native_pin_roots.len() > self.base {
+            thread.native_pin_roots.truncate(self.base);
+        }
+    }
+}
+
+/// Saved argument `i`, with a pinned reference re-read at its current
+/// (possibly relocated) address. See [`JitArgPinGuard`].
+pub(super) fn pinned_saved_arg(
+    thread: &JvmThread,
+    saved_args: &[(CompactValue, u8)],
+    arg_pins: &[usize],
+    i: usize,
+) -> (CompactValue, u8) {
+    let (cv, kind) = saved_args[i];
+    match arg_pins.get(i).and_then(|&pin| thread.native_pin_roots.get(pin)) {
+        // Cast: heap address to the compact reference encoding.
+        Some(obj) => (CompactValue::object(obj.as_ptr() as usize as u64), kind),
+        None => (cv, kind),
+    }
+}
+
+/// [`jit_saved_args_to_values`] over the saved arguments with every pinned
+/// reference re-read first.
+pub(super) fn jit_saved_args_to_values_pinned(
+    cached: &CachedBytecodeMethod,
+    saved_args: &[(CompactValue, u8)],
+    np: usize,
+    thread: &JvmThread,
+    arg_pins: &[usize],
+) -> Vec<Value> {
+    let mut current = saved_args.to_vec();
+    for (i, slot) in current.iter_mut().enumerate().take(np) {
+        *slot = pinned_saved_arg(thread, saved_args, arg_pins, i);
+    }
+    jit_saved_args_to_values(cached, &current, np)
+}
+
 /// Owns the implicit monitor of a JIT-entered `ACC_SYNCHRONIZED` method.
 ///
 /// Compiled code has no interpreter frame on which to keep `monitor_on_exit`,
@@ -11729,6 +11997,10 @@ pub(super) fn execute_jit_call(
         [(CompactValue::zero(), 0u8); JIT_ABI_MAX_JAVA_ARGS];
     // ONE forward scan, hoisted out of this per-argument loop.
     let param_tags = ParamTags::for_method(&cached);
+    // Reference arguments are rooted as they leave the operand stack; see
+    // `JitArgPinGuard`, armed immediately after this loop.
+    let args_pin_base = thread.native_pin_roots.len();
+    let mut arg_pins = [usize::MAX; JIT_ABI_MAX_JAVA_ARGS];
     for i in (0..np).rev() {
         let (cv, kind) = thread.frames[frame_idx].stack.pop_with_kind_unchecked();
         saved_args[i] = (cv, kind);
@@ -11738,6 +12010,10 @@ pub(super) fn execute_jit_call(
             param_tags.get_with_receiver(&cached.method_descriptor, i)
         };
         let v = decode_arg_kind_aware(cv, kind, desc_byte);
+        if let Value::Object(Some(obj)) = &v {
+            arg_pins[i] = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(*obj);
+        }
         jit_args[i] = match v {
             // Widening: i32 -> i64 (sign-extended, JVM i2l)
             Value::Int(x) => x as i64,
@@ -11753,6 +12029,10 @@ pub(super) fn execute_jit_call(
         };
     }
 
+    let _arg_pin_guard = JitArgPinGuard {
+        thread: thread as *mut JvmThread,
+        base: args_pin_base,
+    };
     let mut synchronized_args = cached
         .is_synchronized
         .then(|| jit_saved_args_to_values(cached, &saved_args, np));
@@ -11883,10 +12163,10 @@ pub(super) fn execute_jit_call(
             // `i64::MIN`-collision fix) so it cannot leak to the next JIT
             // call. The dispatch helper that stashed this exception also set
             // the deopt flag before returning `i64::MIN`.
-            let exc_locals = synchronized_args.as_deref().map_or_else(
-                || jit_saved_args_to_values(cached, &saved_args, np),
-                |args| args.to_vec(),
-            );
+            // Decoded through the argument pins: the compiled call, and the
+            // exception allocation, may have moved a reference argument.
+            let exc_locals =
+                jit_saved_args_to_values_pinned(cached, &saved_args, np, thread, &arg_pins);
             let throw_pc = jit_local_athrow_pc_kind(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared,
@@ -11985,10 +12265,9 @@ pub(super) fn execute_jit_call(
                     exc,
                     npe_snapshot,
                 );
-                let exc_locals = synchronized_args.as_deref().map_or_else(
-                    || jit_saved_args_to_values(cached, &saved_args, np),
-                    |args| args.to_vec(),
-                );
+                // Through the argument pins; see the signal-exception arm.
+                let exc_locals =
+                    jit_saved_args_to_values_pinned(cached, &saved_args, np, thread, &arg_pins);
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -12047,10 +12326,9 @@ pub(super) fn execute_jit_call(
                     exc,
                     trap_snapshot,
                 );
-                let exc_locals = synchronized_args.as_deref().map_or_else(
-                    || jit_saved_args_to_values(cached, &saved_args, np),
-                    |args| args.to_vec(),
-                );
+                // Through the argument pins; see the signal-exception arm.
+                let exc_locals =
+                    jit_saved_args_to_values_pinned(cached, &saved_args, np, thread, &arg_pins);
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -12104,10 +12382,9 @@ pub(super) fn execute_jit_call(
                     exc,
                     trap_snapshot,
                 );
-                let exc_locals = synchronized_args.as_deref().map_or_else(
-                    || jit_saved_args_to_values(cached, &saved_args, np),
-                    |args| args.to_vec(),
-                );
+                // Through the argument pins; see the signal-exception arm.
+                let exc_locals =
+                    jit_saved_args_to_values_pinned(cached, &saved_args, np, thread, &arg_pins);
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -12183,7 +12460,8 @@ pub(super) fn execute_jit_call(
                 // re-pushed as `KIND_UNKNOWN` would be re-read by its NaN-box
                 // sub-tag on the slow path, which is how a double carrying a
                 // NaN payload lost it across a deopt.
-                let (cv, kind) = saved_args[i];
+                // Through the argument pins: a reference may have moved.
+                let (cv, kind) = pinned_saved_arg(thread, &saved_args, &arg_pins, i);
                 thread.frames[frame_idx]
                     .stack
                     .push_with_kind_unchecked(cv, kind);
@@ -12254,7 +12532,8 @@ pub(super) fn execute_jit_call(
         // underflow (len 0 → usize::MAX index).
         for i in 0..np {
             // See the sibling restore above: bits AND mark.
-            let (cv, kind) = saved_args[i];
+            // Through the argument pins: a reference may have moved.
+            let (cv, kind) = pinned_saved_arg(thread, &saved_args, &arg_pins, i);
             thread.frames[frame_idx]
                 .stack
                 .push_with_kind_unchecked(cv, kind);
@@ -12289,7 +12568,7 @@ pub(super) fn execute_jit_call(
         b'B' | b'C' | b'S' | b'Z' => {
             thread.frames[frame_idx]
                 .stack
-                .push_unchecked(Value::Int(result as i32)); // Cast: JIT ABI -- i64 register convention
+                .push_unchecked(Value::Int(narrow_int_return(return_type, result)));
         }
         b'[' | b'L' => {
             if result == 0 {
@@ -12740,7 +13019,7 @@ pub(super) fn execute_jit_call_decoded(
         b'I' | b'B' | b'C' | b'S' | b'Z' => {
             thread.frames[frame_idx]
                 .stack
-                .push_unchecked(Value::Int(result as i32)); // Cast: JIT ABI -- i64 register convention
+                .push_unchecked(Value::Int(narrow_int_return(return_type, result)));
         }
         b'J' => {
             thread.frames[frame_idx]
@@ -13094,7 +13373,7 @@ pub(super) fn execute_jit_call_oneshot(
 
     // Normal return — convert, never push.
     Ok(Some(match return_type {
-        b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Value::Int(result as i32)), // Cast: JIT ABI -- i64 register convention
+        b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Value::Int(narrow_int_return(return_type, result))),
         b'J' => Some(Value::Long(result)),
         b'F' => Some(Value::Float(f32::from_bits(result as u32))), // Cast: JIT ABI -- i64 register convention
         b'D' => Some(Value::Double(f64::from_bits(result as u64))), // Cast: JIT ABI -- i64 register convention

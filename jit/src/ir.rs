@@ -608,7 +608,10 @@ pub enum Op {
     /// the interpreter re-runs the call and raises the NPE, or dispatches to
     /// the override that made the guard fail. `AtomicLong` and friends are not
     /// final, which is why the guard is not optional.
-    Unbox { op: UnboxOp, class_id: u32 },
+    Unbox {
+        op: UnboxOp,
+        class_id: u32,
+    },
 
     // ── Dead / removed ───────────────────────────────────────────────
     /// Placeholder for a removed node (inputs cleared, not referenced).
@@ -1598,6 +1601,11 @@ struct SpliceFrame {
     saved_locals: Vec<NodeId>,
     saved_stack: Vec<NodeId>,
     returns_value: bool,
+    /// The callee's JVMS §6.5 `ireturn` narrowing
+    /// ([`crate::narrowed_int_return_tag`] of its `method_key`), applied to the
+    /// value each of its `ireturn`s hands back. `None` for `I` and for a
+    /// fixture with no key.
+    return_narrow: Option<u8>,
     /// This body has more than one reachable `return`, so a `return` is NOT a
     /// splice exit: it is an edge into the continuation built at [`Self::end`].
     /// Decided once, by the pre-scan in [`IrBuilder::build`], from the same
@@ -4624,8 +4632,7 @@ fn ir_string_intrinsics_enabled() -> bool {
 /// `BigDecimal` run.
 fn string_intrinsic_reporting() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE
-        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_STRING").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_STRING"))
 }
 
 /// Builds an IR `Graph` from JVM bytecode by abstract-interpreting
@@ -4808,6 +4815,12 @@ pub struct IrBuilder {
     /// for a build that splices nothing — the default, and the value every
     /// hand-built/test graph keeps.
     spliced_bodies_pure: bool,
+    /// JVMS §6.5 `ireturn` narrowing for THIS method's own return type
+    /// ([`crate::narrowed_int_return_tag`]), set by
+    /// [`Self::set_return_descriptor`]. `None` — narrow nothing — for `I`, for
+    /// every non-int return, and for a hand-built/test builder that never said.
+    /// A spliced callee's `ireturn` uses its own frame's tag instead.
+    return_narrow: Option<u8>,
     pub tdigest_scalar_kernel: bool,
     /// inc 26/35: resolved `ldc2_w` (0x14) constant values (`pc → (bits, is_double)`).
     /// Set by [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to
@@ -4877,6 +4890,14 @@ pub struct IrBuilder {
     /// [`Self::set_string_layout`]; see the section above this struct for
     /// which of its fields are read and why publishing once is sound.
     string_layout: Option<crate::StringFieldLayout>,
+    /// `(value, type)` → the lowest-id `Op::Const` node of that value and
+    /// type, for every node below [`Self::const_intern_upto`]. What
+    /// [`Self::iconst`] and [`Self::aconst_null`] dedupe against, in place of
+    /// the arena scan each call used to make. See [`Self::interned_const`] for
+    /// how it stays true of a graph that changes under it.
+    const_intern: HashMap<(i64, IrType), NodeId>,
+    /// How far into `graph.nodes` [`Self::const_intern`] has indexed.
+    const_intern_upto: usize,
 }
 
 thread_local! {
@@ -5082,6 +5103,7 @@ impl IrBuilder {
             invoke_labels: HashMap::new(),
             method_label: None,
             spliced_bodies_pure: true,
+            return_narrow: None,
             tdigest_scalar_kernel: false,
             ldc2w_info: HashMap::new(),
             wide_field_long: false,
@@ -5093,6 +5115,8 @@ impl IrBuilder {
             instanceof_info: HashMap::new(),
             checkcast_info: HashMap::new(),
             string_layout: published_string_layout(),
+            const_intern: HashMap::new(),
+            const_intern_upto: 0,
         }
     }
 
@@ -5100,6 +5124,15 @@ impl IrBuilder {
     /// be called before [`Self::build`]; an `ldc2_w` pc not present bails.
     pub fn set_ldc2w_info(&mut self, info: HashMap<usize, (i64, bool)>) {
         self.ldc2w_info = info;
+    }
+
+    /// JVMS §6.5: narrow this method's `ireturn`s to its declared int-category
+    /// return type (`Z` as if by `& 1`, `B`/`C`/`S` by truncation and
+    /// extension). `descriptor` is the method's own descriptor; a method key
+    /// works too (see [`crate::narrowed_int_return_tag`]). Must be called
+    /// before [`Self::build`]. A builder that never calls it narrows nothing.
+    pub fn set_return_descriptor(&mut self, descriptor: &str) {
+        self.return_narrow = crate::narrowed_int_return_tag(descriptor);
     }
 
     /// COV-03: admit `J` / `F`+`D` instance-field accesses, from the same two
@@ -5361,7 +5394,8 @@ impl IrBuilder {
             // negative, which makes the pair exactly the unsigned test the
             // single-pass region spells `CMP; JAE`.
             let zero = self.iconst(0);
-            let non_negative = self.add_data(Op::Cmp(CmpOp::Ge), IrType::Int, vec![index, zero], pc);
+            let non_negative =
+                self.add_data(Op::Cmp(CmpOp::Ge), IrType::Int, vec![index, zero], pc);
             self.graph.add(
                 Op::Guard { bci: pc },
                 IrType::Void,
@@ -5470,10 +5504,18 @@ impl IrBuilder {
     /// information, so the φ fell back to `Int`) but whose back-edge value is a
     /// reference is retyped `Ref` and becomes a GC root.
     ///
-    /// Never downgrades: memory/control φs are bookkeeping tokens and are left
-    /// alone, and if the widened input list no longer joins, the previously
-    /// derived type is kept (and the conflict reported) rather than replaced by
-    /// the fallback.
+    /// Memory/control φs are bookkeeping tokens and are left alone.
+    ///
+    /// When the widened input list no longer joins, the φ takes
+    /// [`PHI_TYPE_FALLBACK`], exactly as a conflict at creation does, and so
+    /// does every φ that merges it. It used to KEEP the entry-edge type, which
+    /// was not the conservative choice when that type was `Ref`: javac reuses
+    /// a slot for a dead `Object` before the loop and an `int`/`long`/`double`
+    /// inside it, the header φ stayed `Ref`, and the lowering then published
+    /// the slot as a GC root at every safepoint and tagged it `StackSlotRef` in
+    /// deopt frames — a raw long or double handed to the collector as an oop.
+    /// A conflicting merge is legal only for a slot that is dead at the header
+    /// (verified bytecode cannot read it), so the fallback costs nothing.
     fn retype_phi(&mut self, phi: NodeId) {
         let current = match self.graph.node_opt(phi) {
             Some(node) => node.ty,
@@ -5485,7 +5527,27 @@ impl IrBuilder {
         let inputs = self.graph.nodes[phi as usize].inputs.clone();
         match self.graph.phi_data_type_checked(&inputs) {
             Ok(ty) => self.graph.nodes[phi as usize].ty = ty,
-            Err(why) => report_phi_type_fallback(&why),
+            Err(why) => {
+                report_phi_type_fallback(&why);
+                if current != PHI_TYPE_FALLBACK {
+                    self.graph.nodes[phi as usize].ty = PHI_TYPE_FALLBACK;
+                    // A φ merging this one was typed from the old type. The
+                    // fallback is absorbing (a φ already at it is not
+                    // revisited), so this terminates.
+                    let dependants: Vec<NodeId> = (0..self.graph.nodes.len())
+                        .filter(|&n| {
+                            let node = &self.graph.nodes[n];
+                            n != phi as usize
+                                && node.op == Op::Phi
+                                && node.inputs.iter().skip(1).any(|&i| i == phi)
+                        })
+                        .map(|n| n as NodeId)
+                        .collect();
+                    for dependant in dependants {
+                        self.retype_phi(dependant);
+                    }
+                }
+            }
         }
     }
 
@@ -5658,12 +5720,7 @@ impl IrBuilder {
         } else {
             vec![self.pop()]
         };
-        let node = self.add_data(
-            Op::ScalarIntrinsic(sop),
-            sop.result_type(),
-            inputs,
-            pc,
-        );
+        let node = self.add_data(Op::ScalarIntrinsic(sop), sop.result_type(), inputs, pc);
         self.push(node);
         note_scalar_intrinsic_lowered();
         true
@@ -5753,6 +5810,10 @@ impl IrBuilder {
         let returns_value = site.returns_value;
         let receiver_is_arg0 = site.receiver_is_arg0;
         let arg_local_slots = site.arg_local_slots.clone();
+        // The CALLEE's return type, not the caller's: an inlined `()Z` body
+        // returning 2 must hand its caller 0, exactly as its own compiled
+        // body would have.
+        let return_narrow = crate::narrowed_int_return_tag(&site.method_key);
 
         if self.splice.len() >= MAX_IR_SPLICE_DEPTH {
             return None;
@@ -5865,6 +5926,7 @@ impl IrBuilder {
             saved_locals,
             saved_stack,
             returns_value,
+            return_narrow,
             multi_return,
             exits: Vec::new(),
             exit_bci: pc,
@@ -6037,8 +6099,7 @@ impl IrBuilder {
             // constants now. See `ir_lower`'s `const_seeds` loop.
             MULTI_RETURN_SPLICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             MULTI_RETURN_EDGES.fetch_add(ctrls.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            self.graph
-                .add(Op::Merge, IrType::Control, ctrls, Some(bci))
+            self.graph.add(Op::Merge, IrType::Control, ctrls, Some(bci))
         };
         self.ctrl = ctrl;
 
@@ -6046,9 +6107,7 @@ impl IrBuilder {
         if mems.iter().any(|&m| m != mems[0]) {
             let mut inputs = vec![ctrl];
             inputs.extend_from_slice(&mems);
-            self.mem = self
-                .graph
-                .add(Op::Phi, IrType::Memory, inputs, Some(bci));
+            self.mem = self.graph.add(Op::Phi, IrType::Memory, inputs, Some(bci));
         } else {
             self.mem = mems[0];
         }
@@ -6148,6 +6207,34 @@ impl IrBuilder {
         self.graph.add(op, ty, inputs, Some(pc))
     }
 
+    /// JVMS §6.5 `ireturn` narrowing of `val` to `tag`
+    /// ([`crate::narrowed_int_return_tag`]), built from exactly the nodes the
+    /// `iand` (`Z`, `x & 1`), `i2b`, `i2c` and `i2s` arms build — no new op, no
+    /// new lowering, and the fold passes see a shape they already know.
+    fn narrow_int_return(&mut self, val: NodeId, tag: Option<u8>, pc: usize) -> NodeId {
+        match tag {
+            Some(b'Z') => {
+                let one = self.iconst(1);
+                self.add_data(Op::And, IrType::Int, vec![val, one], pc)
+            }
+            Some(b'B') => {
+                let c = self.iconst(24);
+                let shl = self.add_data(Op::Shl, IrType::Int, vec![val, c], pc);
+                self.add_data(Op::Shr, IrType::Int, vec![shl, c], pc)
+            }
+            Some(b'C') => {
+                let mask = self.iconst(0xFFFF);
+                self.add_data(Op::And, IrType::Int, vec![val, mask], pc)
+            }
+            Some(b'S') => {
+                let c = self.iconst(16);
+                let shl = self.add_data(Op::Shl, IrType::Int, vec![val, c], pc);
+                self.add_data(Op::Shr, IrType::Int, vec![shl, c], pc)
+            }
+            _ => val,
+        }
+    }
+
     fn iconst(&mut self, val: i64) -> NodeId {
         // Check if we already have this constant (simple dedup).
         //
@@ -6157,12 +6244,66 @@ impl IrBuilder {
         // back for every later `iconst(0)` — an integer comparison operand
         // would then be published as a live oop, and `Op::Cmp` would widen to
         // a 64-bit compare on it.
-        for (i, node) in self.graph.nodes.iter().enumerate() {
-            if node.op == Op::Const(val) && node.ty == IrType::Int {
-                return i as NodeId;
-            }
+        if let Some(id) = self.interned_const(val, IrType::Int) {
+            return id;
         }
         self.graph.add(Op::Const(val), IrType::Int, vec![], None)
+    }
+
+    /// The lowest-id `Op::Const(val)` node typed `ty`, or `None` — the answer
+    /// the arena scan [`Self::iconst`] and [`Self::aconst_null`] used to make
+    /// on every call, from [`Self::const_intern`] instead.
+    ///
+    /// # Why the map cannot go stale
+    ///
+    /// * **New nodes** — including a constant added through `self.graph`
+    ///   directly rather than through a helper — are indexed on the next call:
+    ///   everything from [`Self::const_intern_upto`] to the end of the arena is
+    ///   scanned once, and `or_insert` keeps the LOWEST id per key, which is the
+    ///   one the scan's first match returned.
+    /// * **A killed node** (`Graph::kill` rewrites the op to `Op::Dead`; it is
+    ///   the only op rewrite in this file) fails the re-check on a hit, and the
+    ///   full scan decides instead and repairs the entry. Nothing ever turns a
+    ///   node INTO a constant, so a node below a valid entry that was not a
+    ///   match when indexed is not one now.
+    /// * **A shorter arena** than has been indexed means the arena was replaced
+    ///   or truncated, which the builder does not do today; the index is
+    ///   rebuilt from scratch rather than trusted.
+    fn interned_const(&mut self, val: i64, ty: IrType) -> Option<NodeId> {
+        if self.graph.nodes.len() < self.const_intern_upto {
+            self.const_intern.clear();
+            self.const_intern_upto = 0;
+        }
+        for id in self.const_intern_upto..self.graph.nodes.len() {
+            let node = &self.graph.nodes[id];
+            if let Op::Const(v) = node.op {
+                self.const_intern
+                    .entry((v, node.ty))
+                    .or_insert(id as NodeId);
+            }
+        }
+        self.const_intern_upto = self.graph.nodes.len();
+
+        let id = *self.const_intern.get(&(val, ty))?;
+        if matches!(self.graph.nodes.get(id as usize), Some(n) if n.op == Op::Const(val) && n.ty == ty)
+        {
+            return Some(id);
+        }
+        match self
+            .graph
+            .nodes
+            .iter()
+            .position(|n| n.op == Op::Const(val) && n.ty == ty)
+        {
+            Some(found) => {
+                self.const_intern.insert((val, ty), found as NodeId);
+                Some(found as NodeId)
+            }
+            None => {
+                self.const_intern.remove(&(val, ty));
+                None
+            }
+        }
     }
 
     /// `aconst_null` — the null reference, as a `Ref`-typed `Op::Const(0)`.
@@ -6174,10 +6315,8 @@ impl IrBuilder {
     /// be 64-bit. Deduped separately from the integer constants; see
     /// [`Self::iconst`].
     fn aconst_null(&mut self) -> NodeId {
-        for (i, node) in self.graph.nodes.iter().enumerate() {
-            if node.op == Op::Const(0) && node.ty == IrType::Ref {
-                return i as NodeId;
-            }
+        if let Some(id) = self.interned_const(0, IrType::Ref) {
+            return id;
         }
         self.graph.add(Op::Const(0), IrType::Ref, vec![], None)
     }
@@ -6938,9 +7077,7 @@ impl IrBuilder {
                         let Some(decoded) = body_verified.instruction_at(p) else {
                             return ir_build_bail(line!(), base + p);
                         };
-                        if body_reachable.contains(&p)
-                            && matches!(body.get(p), Some(0xac..=0xb1))
-                        {
+                        if body_reachable.contains(&p) && matches!(body.get(p), Some(0xac..=0xb1)) {
                             reachable_returns += 1;
                         }
                         p = decoded.next_pc as usize;
@@ -7422,6 +7559,49 @@ impl IrBuilder {
                     );
                     self.push(r);
                     pc += 1;
+                }
+                // wide — the 16-bit-index forms of the local loads, local
+                // stores and `iinc`. Same node-graph mechanics as the narrow
+                // arms (a load pushes the local's node, a store replaces it,
+                // `iinc` adds an `Int` constant); only the operand width
+                // differs. `jit_scan` accepted `wide`, so `ir_compatible`
+                // admitted its methods and the build refused them at the
+                // catch-all. `wide ret` stays refused, like `ret`.
+                0xc4 => {
+                    if pc + 3 >= code.len() {
+                        return ir_build_bail(line!(), pc);
+                    }
+                    let sub = code[pc + 1];
+                    let idx = u16::from_be_bytes([code[pc + 2], code[pc + 3]]) as usize;
+                    if idx >= self.locals.len() {
+                        return ir_build_bail(line!(), pc);
+                    }
+                    match sub {
+                        // iload lload fload dload aload
+                        0x15..=0x19 => {
+                            self.push(self.locals[idx]);
+                            pc += 4;
+                        }
+                        // istore lstore fstore dstore astore
+                        0x36..=0x3a => {
+                            let val = self.pop();
+                            self.locals[idx] = val;
+                            pc += 4;
+                        }
+                        // iinc with a 16-bit signed increment
+                        0x84 => {
+                            if pc + 5 >= code.len() {
+                                return ir_build_bail(line!(), pc);
+                            }
+                            let inc = i64::from(i16::from_be_bytes([code[pc + 4], code[pc + 5]]));
+                            let old = self.locals[idx];
+                            let c = self.iconst(inc);
+                            let r = self.add_data(Op::Add, IrType::Int, vec![old, c], pc);
+                            self.locals[idx] = r;
+                            pc += 6;
+                        }
+                        _ => return ir_build_bail(line!(), pc),
+                    }
                 }
                 // iinc
                 0x84 => {
@@ -8781,6 +8961,139 @@ impl IrBuilder {
                     pc += 1;
                 }
 
+                // pop2, swap, dup_x2, dup2_x1, dup2_x2 — the rest of the JVMS
+                // stack shuffles, on the same one-entry-per-VALUE model as
+                // `dup_x1` and `dup2` above: a category-2 value is one entry,
+                // its category is read from the node's type, and a shape the
+                // verifier cannot produce (a category-2 value where the form
+                // needs category 1) is refused, never guessed.
+                //
+                // `jit_scan` accepted all five, so `ir_compatible` admitted
+                // their methods and the build then refused them at the
+                // catch-all after doing the partial work.
+                0x58 | 0x5f | 0x5b | 0x5d | 0x5e => {
+                    macro_rules! is_cat2 {
+                        ($v:expr) => {
+                            matches!(
+                                self.graph.nodes[$v as usize].ty,
+                                IrType::Long | IrType::Double
+                            )
+                        };
+                    }
+                    macro_rules! pop_value {
+                        () => {
+                            match self.pop_opt() {
+                                Some(v) => v,
+                                None => return ir_build_bail(line!(), pc),
+                            }
+                        };
+                    }
+                    macro_rules! pop_cat1 {
+                        () => {{
+                            let v = pop_value!();
+                            if is_cat2!(v) {
+                                return ir_build_bail(line!(), pc);
+                            }
+                            v
+                        }};
+                    }
+                    match op {
+                        // pop2: one category-2 value, or two category-1 values.
+                        0x58 => {
+                            let v1 = pop_value!();
+                            if !is_cat2!(v1) {
+                                let _ = pop_cat1!();
+                            }
+                        }
+                        // swap: `.., v2, v1` -> `.., v1, v2`, both category 1.
+                        0x5f => {
+                            let v1 = pop_cat1!();
+                            let v2 = pop_cat1!();
+                            self.push(v1);
+                            self.push(v2);
+                        }
+                        // dup_x2: v1 is category 1.
+                        //   form 1: `.., v3, v2, v1` -> `.., v1, v3, v2, v1`
+                        //   form 2: `.., v2(cat2), v1` -> `.., v1, v2, v1`
+                        0x5b => {
+                            let v1 = pop_cat1!();
+                            let v2 = pop_value!();
+                            if is_cat2!(v2) {
+                                self.push(v1);
+                                self.push(v2);
+                                self.push(v1);
+                            } else {
+                                let v3 = pop_cat1!();
+                                self.push(v1);
+                                self.push(v3);
+                                self.push(v2);
+                                self.push(v1);
+                            }
+                        }
+                        // dup2_x1:
+                        //   form 1: `.., v3, v2, v1` -> `.., v2, v1, v3, v2, v1`
+                        //   form 2: `.., v2, v1(cat2)` -> `.., v1, v2, v1`
+                        0x5d => {
+                            let v1 = pop_value!();
+                            if is_cat2!(v1) {
+                                let v2 = pop_cat1!();
+                                self.push(v1);
+                                self.push(v2);
+                                self.push(v1);
+                            } else {
+                                let v2 = pop_cat1!();
+                                let v3 = pop_cat1!();
+                                self.push(v2);
+                                self.push(v1);
+                                self.push(v3);
+                                self.push(v2);
+                                self.push(v1);
+                            }
+                        }
+                        // dup2_x2:
+                        //   form 1: `.., v4, v3, v2, v1` -> `.., v2, v1, v4, v3, v2, v1`
+                        //   form 2: `.., v3, v2, v1(cat2)` -> `.., v1, v3, v2, v1`
+                        //   form 3: `.., v3(cat2), v2, v1` -> `.., v2, v1, v3, v2, v1`
+                        //   form 4: `.., v2(cat2), v1(cat2)` -> `.., v1, v2, v1`
+                        _ => {
+                            let v1 = pop_value!();
+                            if is_cat2!(v1) {
+                                let v2 = pop_value!();
+                                if is_cat2!(v2) {
+                                    self.push(v1);
+                                    self.push(v2);
+                                    self.push(v1);
+                                } else {
+                                    let v3 = pop_cat1!();
+                                    self.push(v1);
+                                    self.push(v3);
+                                    self.push(v2);
+                                    self.push(v1);
+                                }
+                            } else {
+                                let v2 = pop_cat1!();
+                                let v3 = pop_value!();
+                                if is_cat2!(v3) {
+                                    self.push(v2);
+                                    self.push(v1);
+                                    self.push(v3);
+                                    self.push(v2);
+                                    self.push(v1);
+                                } else {
+                                    let v4 = pop_cat1!();
+                                    self.push(v2);
+                                    self.push(v1);
+                                    self.push(v4);
+                                    self.push(v3);
+                                    self.push(v2);
+                                    self.push(v1);
+                                }
+                            }
+                        }
+                    }
+                    pc += 1;
+                }
+
                 // ifeq..ifle (0x99..0x9e) — compare int against zero
                 0x99..=0x9e => {
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
@@ -8957,6 +9270,19 @@ impl IrBuilder {
                 // returns an object was refused at its return.
                 0xac | 0xb0 => {
                     let val = self.pop();
+                    // JVMS §6.5 `ireturn` narrowing for a `Z`/`B`/`C`/`S`
+                    // return — never `areturn`. Inside a splice the tag is the
+                    // spliced callee's own, so it applies at every return edge
+                    // of that body, single- or multi-return alike.
+                    let val = if code[pc] == 0xac {
+                        let tag = match self.splice.last() {
+                            Some(frame) => frame.return_narrow,
+                            None => self.return_narrow,
+                        };
+                        self.narrow_int_return(val, tag, pc)
+                    } else {
+                        val
+                    };
                     // Inside a splice this is not a method exit: it hands the
                     // value back to the caller's operand stack and the walk
                     // resumes after the `invoke`. No `Op::Return`, and `ctrl`
@@ -10334,11 +10660,7 @@ mod scalar_intrinsic_recognizer_tests {
     /// two sets.
     #[test]
     fn the_site_trap_decision_is_claimable_exactly_once_and_is_not_the_refusal_memo() {
-        let h = crate::ir_method_memo_hash(
-            "cratonvm/test/SiteTrapDecisionProbe",
-            "claimed",
-            "()V",
-        );
+        let h = crate::ir_method_memo_hash("cratonvm/test/SiteTrapDecisionProbe", "claimed", "()V");
         assert!(claim_site_trap_decision(h), "the first claim must succeed");
         assert!(
             !claim_site_trap_decision(h),
@@ -10376,9 +10698,7 @@ mod scalar_intrinsic_recognizer_tests {
             try_ir_unbox_intrinsic("java/lang/Long", "longValue", "()J", 0).is_none(),
             "class_id 0 is 'unresolved' and must never be admitted",
         );
-        assert!(
-            try_ir_unbox_intrinsic("java/lang/Integer", "intValue", "()I", 0).is_none(),
-        );
+        assert!(try_ir_unbox_intrinsic("java/lang/Integer", "intValue", "()I", 0).is_none(),);
     }
 
     /// Only the two triples, and only with their exact descriptors. A
@@ -10406,13 +10726,33 @@ mod scalar_intrinsic_recognizer_tests {
             // absent because the H2 census does not name them, and a family
             // added without a site to exercise it is one whose first real
             // receiver is a user's.
-            ("java/util/concurrent/atomic/AtomicLong", "compareAndSet", "(JJ)Z"),
-            ("java/util/concurrent/atomic/AtomicLong", "getAndIncrement", "()J"),
-            ("java/util/concurrent/atomic/AtomicLong", "addAndGet", "(J)J"),
+            (
+                "java/util/concurrent/atomic/AtomicLong",
+                "compareAndSet",
+                "(JJ)Z",
+            ),
+            (
+                "java/util/concurrent/atomic/AtomicLong",
+                "getAndIncrement",
+                "()J",
+            ),
+            (
+                "java/util/concurrent/atomic/AtomicLong",
+                "addAndGet",
+                "(J)J",
+            ),
             ("java/util/concurrent/atomic/AtomicInteger", "get", "()I"),
-            ("java/util/concurrent/atomic/AtomicInteger", "getAndAdd", "(I)I"),
+            (
+                "java/util/concurrent/atomic/AtomicInteger",
+                "getAndAdd",
+                "(I)I",
+            ),
             // Right owner and name, wrong descriptor.
-            ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(I)I"),
+            (
+                "java/util/concurrent/atomic/AtomicLong",
+                "getAndAdd",
+                "(I)I",
+            ),
         ] {
             assert!(
                 try_ir_unbox_intrinsic(c, n, d, 7).is_none(),
@@ -10435,9 +10775,7 @@ mod scalar_intrinsic_recognizer_tests {
         match op {
             UnboxOp::LongValue => ("java/lang/Long", "longValue", "()J"),
             UnboxOp::IntValue => ("java/lang/Integer", "intValue", "()I"),
-            UnboxOp::AtomicLongGet => {
-                ("java/util/concurrent/atomic/AtomicLong", "get", "()J")
-            }
+            UnboxOp::AtomicLongGet => ("java/util/concurrent/atomic/AtomicLong", "get", "()J"),
             UnboxOp::AtomicIntIncrementAndGet => (
                 "java/util/concurrent/atomic/AtomicInteger",
                 "incrementAndGet",
@@ -10448,9 +10786,11 @@ mod scalar_intrinsic_recognizer_tests {
                 "decrementAndGet",
                 "()I",
             ),
-            UnboxOp::AtomicLongGetAndAdd => {
-                ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(J)J")
-            }
+            UnboxOp::AtomicLongGetAndAdd => (
+                "java/util/concurrent/atomic/AtomicLong",
+                "getAndAdd",
+                "(J)J",
+            ),
         }
     }
 
@@ -10724,7 +11064,8 @@ pub fn ir_splice_multi_return_enabled() -> bool {
     *ON.get_or_init(|| {
         ir_splice_branch_enabled()
             && matches!(
-                cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_MULTI_RETURN").as_deref(),
+                cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_MULTI_RETURN")
+                    .as_deref(),
                 Ok("1") | Ok("true") | Ok("on") | Ok("yes")
             )
     })
@@ -11195,8 +11536,8 @@ fn report_phi_type_fallback(why: &str) {
 }
 
 fn ir_bail_reporting() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
-        || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC")
+        || cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_COMPILES")
 }
 
 /// Check if a method (from its JitScanResult) is suitable for IR compilation.
@@ -11323,6 +11664,14 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // produces for the same method. It is a budget, not a lowering gap.
     if scan.invoke_ops.len() > IR_MAX_INVOKES {
         return ir_reject("scan.invoke_ops.len() > IR_MAX_INVOKES");
+    }
+    // `putstatic` has no IR lowering, and deliberately: a static reference
+    // write owes the SATB pre-barrier the single-pass `jit_putstatic_*` path
+    // carries. The builder refused it at its catch-all AFTER the partial graph
+    // build (and `c2_upgrade_would_engage` still answered yes); refuse it
+    // here instead.
+    if scan.has_putstatic {
+        return ir_reject("scan.has_putstatic");
     }
     // getfield/putfield. Raised 5 -> 64. Instance field access lowers to
     // `Op::Load`/`Op::Store` (optionally via the checked `jit_getfield`
@@ -12358,6 +12707,7 @@ mod tests {
             has_athrow: false,
             local_slot_ops: vec![],
             has_newarray: false,
+            has_putstatic: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
@@ -12383,6 +12733,7 @@ mod tests {
             has_athrow: false,
             local_slot_ops: vec![],
             has_newarray: false,
+            has_putstatic: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
@@ -12408,6 +12759,7 @@ mod tests {
             has_athrow: false,
             local_slot_ops: vec![],
             has_newarray: false,
+            has_putstatic: false,
             ldc_ops: vec![],
         };
         // Invokes: 5 -> 32 (direct-call slice) -> IR_MAX_INVOKES once inline
@@ -12451,6 +12803,12 @@ mod tests {
             .collect();
         assert!(!ir_compatible(&scan));
         scan.static_field_ops.clear();
+        scan.has_putstatic = true;
+        assert!(
+            !ir_compatible(&scan),
+            "putstatic has no IR lowering; refuse it up front"
+        );
+        scan.has_putstatic = false;
 
         // Object allocations stay the most conservative budget: a surviving
         // `Op::New` lowers through the shared stub, so the cap bounds real
@@ -12540,6 +12898,7 @@ mod tests {
             has_athrow: false,
             local_slot_ops: vec![],
             has_newarray: false,
+            has_putstatic: false,
             ldc_ops: vec![],
         };
         // jit-inlining-and-ir-calls: the bytecode budget rose from 200 — which
@@ -12577,6 +12936,7 @@ mod tests {
             has_athrow: false,
             local_slot_ops: vec![],
             has_newarray: false,
+            has_putstatic: false,
             ldc_ops: vec![],
         };
         // 2026-09-06: this assertion was inverted, deliberately. The IR
@@ -13017,12 +13377,15 @@ mod tests {
             "the late back-edge input must retype the loop-carried φ"
         );
 
-        // A late input that does NOT join keeps the already-derived type rather
-        // than downgrading it (and is reported, not silently applied).
+        // A late input that does NOT join drops the φ to the fallback. Keeping
+        // `Ref` published a slot holding an `int` (or a long/double) as a GC
+        // root; a conflicting merge is only legal for a dead slot, where the
+        // fallback is free.
         let stray = b.graph.add(Op::Const(3), IrType::Int, vec![], None);
         b.graph.nodes[phi as usize].inputs.push(stray);
         b.retype_phi(phi);
-        assert_eq!(b.graph.nodes[phi as usize].ty, IrType::Ref);
+        assert_eq!(b.graph.nodes[phi as usize].ty, PHI_TYPE_FALLBACK);
+        assert_ne!(b.graph.nodes[phi as usize].ty, IrType::Ref);
 
         // Memory φs are bookkeeping tokens and are never retyped as values.
         let mem_phi = b
@@ -13053,6 +13416,62 @@ mod tests {
         // The fallback is deliberately NOT `Ref`: an unprovable slot must not
         // be handed to the collector as an oop.
         assert_ne!(PHI_TYPE_FALLBACK, IrType::Ref);
+    }
+
+    // ── Constant interning ───────────────────────────────────────────
+
+    /// `iconst` / `aconst_null` hand back one node per `(value, type)`, and
+    /// the index they read gives the answer the arena scan it replaced gave —
+    /// the LOWEST-id live match — through every way the arena changes under
+    /// it during a build.
+    #[test]
+    fn constant_interning_returns_one_node_per_constant() {
+        let mut b = IrBuilder::new(1, 2);
+
+        let five = b.iconst(5);
+        assert_eq!(b.iconst(5), five, "the same constant is one node");
+        assert_eq!(b.graph.nodes[five as usize].op, Op::Const(5));
+        assert_eq!(b.graph.nodes[five as usize].ty, IrType::Int);
+
+        // The type is part of the identity, both ways round.
+        let null = b.aconst_null();
+        let zero = b.iconst(0);
+        assert_ne!(null, zero, "null is not the int zero");
+        assert_eq!(b.aconst_null(), null);
+        assert_eq!(b.iconst(0), zero);
+        let long_five = b.lconst(5);
+        assert_ne!(long_five, five);
+        assert_eq!(b.iconst(5), five, "a long 5 is not an int 5");
+
+        // A constant added behind the helpers' back is found, as the scan
+        // found it — and of two, the lower id wins, as the scan's first match
+        // did.
+        let seven_a = b.graph.add(Op::Const(7), IrType::Int, vec![], None);
+        let seven_b = b.graph.add(Op::Const(7), IrType::Int, vec![], None);
+        assert_eq!(b.iconst(7), seven_a);
+
+        // Killing the interned node: the next call must not return the dead
+        // one. With a live duplicate, the duplicate; with none, a new node.
+        b.graph.kill(seven_a);
+        assert_eq!(b.iconst(7), seven_b, "falls back to the surviving duplicate");
+        assert_eq!(b.iconst(7), seven_b, "and the repaired entry sticks");
+        b.graph.kill(five);
+        let five_again = b.iconst(5);
+        assert_ne!(five_again, five, "a dead node is never handed back");
+        assert_eq!(b.graph.nodes[five_again as usize].op, Op::Const(5));
+        assert_eq!(b.iconst(5), five_again);
+
+        // Every answer agrees with the scan the index replaced.
+        let scan = |g: &Graph, v: i64, ty: IrType| {
+            g.nodes
+                .iter()
+                .position(|n| n.op == Op::Const(v) && n.ty == ty)
+                .map(|i| i as NodeId)
+        };
+        for (v, ty) in [(5, IrType::Int), (0, IrType::Int), (7, IrType::Int), (0, IrType::Ref)] {
+            assert_eq!(b.interned_const(v, ty), scan(&b.graph, v, ty), "({v}, {ty:?})");
+        }
+        assert_eq!(b.interned_const(123, IrType::Int), None);
     }
 
     // ── Option-based id accessors ────────────────────────────────────
@@ -14239,5 +14658,123 @@ mod tests {
         ] {
             assert_eq!(op.memory_shape(), None, "{op:?}");
         }
+    }
+}
+
+/// The JVMS stack shuffles and `wide` forms the builder used to refuse at its
+/// catch-all after `ir_compatible` had admitted the method.
+#[cfg(test)]
+mod stack_shuffle_and_wide_tests {
+    use super::*;
+
+    fn builds(params: usize, locals: usize, code: &[u8], len: usize) -> bool {
+        IrBuilder::new(params, locals).build(code, len).is_some()
+    }
+
+    #[test]
+    fn every_category1_and_category2_shuffle_form_builds() {
+        // iload_0 iload_1 swap isub ireturn
+        assert!(
+            builds(2, 2, &[0x1a, 0x1b, 0x5f, 0x64, 0xac, 0, 0], 5),
+            "swap"
+        );
+        // iconst_1 iconst_2 pop2 iload_0 ireturn
+        assert!(
+            builds(1, 1, &[0x04, 0x05, 0x58, 0x1a, 0xac, 0, 0], 5),
+            "pop2 of two cat-1"
+        );
+        // lconst_1 pop2 iload_0 ireturn
+        assert!(
+            builds(1, 1, &[0x0a, 0x58, 0x1a, 0xac, 0, 0], 4),
+            "pop2 of one cat-2"
+        );
+        // iconst_1 iconst_2 iconst_3 dup_x2 pop pop pop ireturn
+        assert!(
+            builds(
+                0,
+                0,
+                &[0x04, 0x05, 0x06, 0x5b, 0x57, 0x57, 0x57, 0xac, 0, 0],
+                8
+            ),
+            "dup_x2 form 1"
+        );
+        // lconst_1 iconst_2 dup_x2 pop pop2 ireturn
+        assert!(
+            builds(0, 0, &[0x0a, 0x05, 0x5b, 0x57, 0x58, 0xac, 0, 0], 6),
+            "dup_x2 form 2"
+        );
+        // iconst_1 iconst_2 iconst_3 dup2_x1 pop2 pop pop2 iconst_0 ireturn
+        assert!(
+            builds(
+                0,
+                0,
+                &[0x04, 0x05, 0x06, 0x5d, 0x58, 0x57, 0x58, 0x03, 0xac, 0, 0],
+                9
+            ),
+            "dup2_x1 form 1"
+        );
+        // iconst_1 lconst_1 dup2_x1 pop2 pop pop2 iconst_0 ireturn
+        assert!(
+            builds(
+                0,
+                0,
+                &[0x04, 0x0a, 0x5d, 0x58, 0x57, 0x58, 0x03, 0xac, 0, 0],
+                8
+            ),
+            "dup2_x1 form 2"
+        );
+        // lconst_0 lconst_1 dup2_x2 pop2 pop2 pop2 iconst_0 ireturn
+        assert!(
+            builds(
+                0,
+                0,
+                &[0x09, 0x0a, 0x5e, 0x58, 0x58, 0x58, 0x03, 0xac, 0, 0],
+                8
+            ),
+            "dup2_x2 form 4"
+        );
+        // iconst_1 iconst_2 lconst_1 dup2_x2 pop2 pop2 pop pop iconst_0 ireturn
+        assert!(
+            builds(
+                0,
+                0,
+                &[0x04, 0x05, 0x0a, 0x5e, 0x58, 0x57, 0x57, 0x58, 0x03, 0xac, 0, 0],
+                10
+            ),
+            "dup2_x2 form 2"
+        );
+    }
+
+    /// A category-2 value where the form needs category 1 is not a shape the
+    /// verifier produces; the builder refuses rather than shuffling a guess.
+    #[test]
+    fn an_illegal_shuffle_shape_is_refused() {
+        // iconst_1 lconst_1 swap ...
+        assert!(!builds(
+            0,
+            0,
+            &[0x04, 0x0a, 0x5f, 0x57, 0x57, 0x03, 0xac, 0, 0],
+            7
+        ));
+    }
+
+    #[test]
+    fn wide_loads_stores_and_iinc_build() {
+        // wide iinc 0, +256 ; iload_0 ; ireturn
+        assert!(builds(
+            1,
+            1,
+            &[0xc4, 0x84, 0x00, 0x00, 0x01, 0x00, 0x1a, 0xac, 0, 0],
+            8
+        ));
+        // wide iload 0 ; wide istore 1 ; iload_1 ; ireturn
+        assert!(builds(
+            1,
+            2,
+            &[0xc4, 0x15, 0x00, 0x00, 0xc4, 0x36, 0x00, 0x01, 0x1b, 0xac, 0, 0],
+            10
+        ));
+        // wide iload 7 with only one local: out of range, refused.
+        assert!(!builds(1, 1, &[0xc4, 0x15, 0x00, 0x07, 0xac, 0, 0], 5));
     }
 }

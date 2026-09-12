@@ -16,17 +16,25 @@ JIT Compiler (user guide)](../user-guide/jit-compiler.md) covers operating it.
 
 The JIT has two ways to lower a method:
 
-1. **Single-pass emitter (default).** Bytecode is lowered directly to x86-64 in
-   one pass. This path is simple and compiles quickly, at the cost of limiting
-   cross-instruction optimization.
-2. **Sea-of-nodes IR pipeline (optional).** Methods that qualify go through:
+1. **Single-pass emitter.** Bytecode is lowered directly to x86-64 in one pass
+   (`x64::compile_with_param_slots` → `Compiler::compile_bytecode`). This path
+   is simple and compiles quickly, at the cost of limiting cross-instruction
+   optimization. The eager first-call compile always uses it, and so does every
+   compile the IR tier refuses.
+2. **Sea-of-nodes IR tier.** The optimizing tiers (`C2` and `FullProfile`, see
+   `tiered::tier_uses_optimized_backend`) and optimizing OSR entries try it,
+   when `ir::ir_compatible` admits the method:
 
    ```text
-   bytecode → IrBuilder → Graph → optimize → schedule → lower → x86-64
+   bytecode → IrBuilder → optimize → verify → schedule → lower (with linear-scan
+   register allocation) → x86-64 → ir_evidence::accept
    ```
 
    This decouples optimization from instruction selection, enabling broader
-   transformations. Methods that don't qualify fall back to the direct path.
+   transformations. The IR body replaces the single-pass one only when
+   `ir_evidence::accept` judges its transforms worth it
+   (`CRATONVM_C2_ACCEPT`, default `evidence`); on any refusal the method keeps
+   the single-pass body.
 
 Both front ends use `runtime_lowering` for stateful operations whose ABI must
 not drift between tiers: object allocation, the compact hashed

@@ -60,33 +60,7 @@ pub(super) fn inclusive_spec_bce_enabled() -> bool {
 pub(super) fn jit_no_spec_bce() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_SPEC_BCE").is_some())
-}
-
-/// Info about a loop's induction variable and bounds.
-///
-/// SUPERSEDED by [`crate::scev::CountedLoop`] — `analyze_bounds_elimination`
-/// no longer builds one. Kept because `analyze_loop_bound` (which returns it)
-/// is still exercised by the x64 test suite as the reference decoding of the
-/// two comparator shapes; nothing in the elision path reads it.
-#[allow(dead_code)]
-pub(super) struct LoopBoundsInfo {
-    /// The local variable that serves as the induction variable (incremented by iinc +1).
-    pub(super) induction_var: usize,
-    /// The local variable used as the upper bound in the loop condition.
-    /// If None, the bound is a constant.
-    pub(super) bound_local: Option<usize>,
-    /// Constant upper bound (if the bound is iconst/bipush/sipush).
-    #[allow(dead_code)]
-    pub(super) bound_const: Option<i32>,
-    /// Whether the loop comparator is *inclusive* of `bound` (`if_icmpgt` exit
-    /// or `if_icmple` continue, i.e. a `for (i = 0; i <= n; i++)` loop). When
-    /// true the induction variable reaches `bound` itself, so the maximum index
-    /// accessed is `bound`, requiring `array.length >= bound + 1`. The single
-    /// header guard only proves `array.length >= bound` (SECURITY FIX V17), so
-    /// BCE — both static and speculative — is REFUSED for inclusive loops to
-    /// avoid an off-by-one out-of-bounds heap access at `index == bound`.
-    pub(super) inclusive: bool,
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_SPEC_BCE"))
 }
 
 /// Speculative bounds check elimination: a deopt guard emitted at the loop header.
@@ -134,111 +108,6 @@ pub(super) struct SpeculativeBCEGuard {
     /// without this a runtime-NEGATIVE step walks the elided index below
     /// zero (an OOB write below the array base). `None` for `iinc iv, 1`.
     pub(super) step_local: Option<usize>,
-}
-
-/// How a loop's induction variable advances — the step provenance the
-/// speculative BCE guard needs to bound every elided index from below (no
-/// negative step) and above (no int wrap past the exit test).
-///
-/// SUPERSEDED by [`crate::scev::Stride`], which additionally carries non-unit
-/// and negative constant strides and the `isub` spelling. Retained only as the
-/// reference decoding the x64 test suite pins.
-#[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum IvStep {
-    /// Canonical `iinc iv, 1`.
-    UnitInc,
-    /// Canonical compound `iv += step` (`iload iv; iload step; iadd;
-    /// istore iv`); payload = the step's local index. The step's runtime
-    /// SIGN and magnitude are unknown at compile time — the preheader guard
-    /// must prove `0 <= step <= Integer.MAX_VALUE - bound` before any elided
-    /// access runs.
-    VarAdd(usize),
-}
-
-/// Prove how the induction variable `iv` advances inside `[header,
-/// back_edge_end)`. Returns `None` when the step shape is anything but the
-/// two canonical forms — the caller must then refuse every bounds-check
-/// elision for the loop (`find_induction_variable` alone admits `iadd;istore`
-/// IVs without identifying the step operand, which is not enough to reason
-/// about sign or wrap).
-///
-/// SUPERSEDED by [`crate::loop_analysis::find_iv_stride`].
-#[allow(dead_code)]
-pub(super) fn find_iv_step_provenance(
-    code: &[u8],
-    header: usize,
-    back_edge_end: usize,
-    iv: usize,
-) -> Option<IvStep> {
-    let mut unit_incs = 0usize;
-    let mut var_adds = 0usize;
-    let mut var_step: Option<usize> = None;
-    // PCs of the previous three instruction starts (linear order).
-    let mut prev: [Option<usize>; 3] = [None, None, None];
-    let mut pc = header;
-    while pc < back_edge_end {
-        let op = code[pc];
-        match op {
-            // iinc
-            0x84 => {
-                if code[pc + 1] as usize == iv {
-                    if code[pc + 2] as i8 == 1 {
-                        unit_incs += 1;
-                    } else {
-                        return None; // non-unit iinc — unsupported stride
-                    }
-                }
-            }
-            // wide istore/iinc aliasing the IV via a 2-byte index — unprovable.
-            0xc4 => {
-                if pc + 3 < back_edge_end {
-                    let real = code[pc + 1];
-                    // Widening: operand bytes -> usize index (value fits)
-                    let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
-                    if (real == 0x36 || real == 0x84) && idx == iv {
-                        return None;
-                    }
-                }
-            }
-            _ => {
-                // Widening: u8 operand/opcode-relative index -> usize
-                let istore_target = match op {
-                    0x36 => Some(code[pc + 1] as usize),
-                    0x3b..=0x3e => Some((op - 0x3b) as usize),
-                    _ => None,
-                };
-                if istore_target == Some(iv) {
-                    // Must be the canonical `iload iv; iload step; iadd;
-                    // istore iv` (javac's `iv += step`). Anything else —
-                    // including the commuted `step + iv` — is refused.
-                    let (Some(p1), Some(p2), Some(p3)) = (prev[0], prev[1], prev[2]) else {
-                        return None;
-                    };
-                    if code[p1] != 0x60 {
-                        return None;
-                    }
-                    let step = extract_iload_local(code, p2)?;
-                    let base = extract_iload_local(code, p3)?;
-                    if base != iv || step == iv {
-                        return None;
-                    }
-                    if var_step.is_some_and(|s| s != step) {
-                        return None;
-                    }
-                    var_step = Some(step);
-                    var_adds += 1;
-                }
-            }
-        }
-        prev = [Some(pc), prev[0], prev[1]];
-        pc += bytecode_len_at(code, pc);
-    }
-    match (unit_incs, var_adds, var_step) {
-        (1, 0, None) => Some(IvStep::UnitInc),
-        (0, 1, Some(step)) => Some(IvStep::VarAdd(step)),
-        _ => None,
-    }
 }
 
 /// Find induction variables in a loop body.
@@ -843,125 +712,6 @@ pub(super) fn find_induction_variable(
     None
 }
 
-/// Analyze the loop condition to find the upper bound.
-///
-/// Looks for patterns like:
-/// - `iload iv; iload bound; if_icmpge exit` → bound is in local `bound`
-/// - `iload iv; arraylength; if_icmpge exit` → bound is array length (implicit)
-///
-/// Returns LoopBoundsInfo if the pattern is recognized.
-///
-/// SUPERSEDED by `locate_exit_test` + [`crate::loop_analysis::decode_bound_expr`],
-/// which accept a constant / `arraylength` / field / `Math.min`-`max` limit as
-/// well as a bare local, and — unlike this function — *verify* that the branch
-/// they decode is really the loop's exit or back edge. Retained because the
-/// x64 test suite pins its inclusive/exclusive classification.
-#[allow(dead_code)]
-pub(super) fn analyze_loop_bound(
-    code: &[u8],
-    header: usize,
-    back_edge: usize,
-    back_edge_end: usize,
-    induction_var: usize,
-) -> Option<LoopBoundsInfo> {
-    // Pattern 1: Loop controlled by `goto header` at back_edge
-    // The loop condition is typically at the header or just before the goto
-    // Common Java for-loop pattern:
-    //   header: iload iv; iload bound; if_icmpge exit; ... ; goto header
-    //
-    // Pattern 2: Loop controlled by conditional branch at back_edge
-    //   header: ...; iload iv; iload bound; if_icmplt header
-
-    // Check if back_edge is a conditional branch (do-while pattern)
-    let back_op = code[back_edge];
-    if matches!(back_op, 0x99..=0xa4 | 0xc6 | 0xc7) {
-        // Conditional branch as back-edge — look for the comparison pattern just before
-        // We need: iload iv; iload bound; if_icmplt/le/etc header
-        // Scan backwards from back_edge to find the comparison setup
-        // This is simpler if we scan forward from header
-    }
-
-    // Scan the loop body looking for the comparison pattern with the induction variable
-    let mut pc = header;
-    while pc < back_edge_end {
-        // Match: iload <iv>; iload <bound>; if_icmpge/if_icmpgt <target>
-        // where <target> is outside the loop (exit condition)
-        let iv_local = match code[pc] {
-            0x1a if induction_var == 0 => Some(0usize),
-            0x1b if induction_var == 1 => Some(1),
-            0x1c if induction_var == 2 => Some(2),
-            0x1d if induction_var == 3 => Some(3),
-            // Widening: u8 -> wider int (bytecode operand byte, value fits)
-            0x15 if pc + 1 < back_edge_end && code[pc + 1] as usize == induction_var => {
-                // Widening: always safe
-                Some(induction_var)
-            }
-            _ => None,
-        };
-
-        if let Some(_iv) = iv_local {
-            let next_pc = if code[pc] == 0x15 { pc + 2 } else { pc + 1 };
-            if next_pc >= back_edge_end {
-                pc += bytecode_len_at(code, pc);
-                continue;
-            }
-
-            // Check if next instruction loads the bound
-            let (bound_local, after_bound) = match code[next_pc] {
-                0x1a => (Some(0usize), next_pc + 1),
-                0x1b => (Some(1), next_pc + 1),
-                0x1c => (Some(2), next_pc + 1),
-                0x1d => (Some(3), next_pc + 1),
-                0x15 if next_pc + 1 < back_edge_end => {
-                    (Some(code[next_pc + 1] as usize), next_pc + 2) // Widening: always safe
-                }
-                _ => (None, next_pc),
-            };
-
-            if let Some(bound) = bound_local {
-                if after_bound < back_edge_end && after_bound + 2 < back_edge_end {
-                    let cmp_op = code[after_bound];
-                    let offset =
-                        i16::from_be_bytes([code[after_bound + 1], code[after_bound + 2]]) as i32; // Widening: always safe
-                    let target = (after_bound as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-
-                    // Pattern A: Exit condition — if_icmpge/if_icmpgt with target OUTSIDE loop
-                    // e.g. `iload i; iload n; if_icmpge exit` at loop header.
-                    // `if_icmpgt` (0xa3) exits only when `iv > bound`, so the loop
-                    // body still runs at `iv == bound` → inclusive (index reaches
-                    // `bound`). `if_icmpge` (0xa2) exits at `iv == bound` →
-                    // exclusive (max index `bound - 1`).
-                    if matches!(cmp_op, 0xa2 | 0xa3) && (target > back_edge || target < header) {
-                        return Some(LoopBoundsInfo {
-                            induction_var,
-                            bound_local: Some(bound),
-                            bound_const: None,
-                            inclusive: cmp_op == 0xa3,
-                        });
-                    }
-
-                    // Pattern B: Continue condition — if_icmplt/if_icmple with target INSIDE loop
-                    // e.g. `iload i; iload n; if_icmplt loop_body` (standard javac for-loop pattern).
-                    // `if_icmple` (0xa4) continues while `iv <= bound`, so the body
-                    // runs at `iv == bound` → inclusive. `if_icmplt` (0xa1)
-                    // continues while `iv < bound` → exclusive.
-                    if matches!(cmp_op, 0xa1 | 0xa4) && target >= header && target <= back_edge {
-                        return Some(LoopBoundsInfo {
-                            induction_var,
-                            bound_local: Some(bound),
-                            bound_const: None,
-                            inclusive: cmp_op == 0xa4,
-                        });
-                    }
-                }
-            }
-        }
-        pc += bytecode_len_at(code, pc);
-    }
-
-    None
-}
-
 /// Soundly identify the `(array_local, index_local)` operands consumed by each
 /// array load/store in a counted loop, via operand-stack *producer* tracking.
 ///
@@ -1457,7 +1207,7 @@ fn negate_exit_cmp(cmp: ExitCmp) -> ExitCmp {
 /// `lookupswitch`, `jsr`/`ret`, `goto_w`/`jsr_w`). Sibling of
 /// `collect_i16_branch_targets`, which keeps only the targets; the entry-edge
 /// question below needs to know where an edge came *from*.
-fn branch_edges(code: &[u8], code_len: usize) -> Option<Vec<(usize, usize)>> {
+pub(super) fn branch_edges(code: &[u8], code_len: usize) -> Option<Vec<(usize, usize)>> {
     let mut edges = Vec::new();
     let code_len = code_len.min(code.len());
     let mut pc = 0usize;
@@ -2148,7 +1898,7 @@ pub(super) fn range_bce_enabled() -> bool {
     }
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_RANGE_BCE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_RANGE_BCE"))
 }
 
 /// Largest method this pass will analyse, in bytecode bytes.

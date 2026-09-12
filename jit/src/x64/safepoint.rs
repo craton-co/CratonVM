@@ -398,7 +398,7 @@ impl Compiler {
         // argument register, and args are already staged in ARG_REGS before
         // this call, so clobbering RAX here is safe. Gated off by default.
         if self.precise_maps && self.sp_id_slot_off != 0 {
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SPID").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SPID") {
                 eprintln!(
                     "[DBG_SPID] cur_bc_pc={} sp_id_slot_off={}",
                     self.cur_bc_pc, self.sp_id_slot_off
@@ -584,7 +584,7 @@ impl Compiler {
             self.pending_shadow_coverage_complete = true;
         }
         if self.precise_maps && self.sp_id_slot_off != 0 {
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SPID").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SPID") {
                 eprintln!(
                     "[DBG_SPID] cur_bc_pc={} sp_id_slot_off={} (metadata-only)",
                     self.cur_bc_pc, self.sp_id_slot_off
@@ -1726,8 +1726,7 @@ impl Compiler {
     fn oopmap_presence_only() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY")
-                .is_some()
+            cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY")
         })
     }
 
@@ -2140,8 +2139,7 @@ impl Compiler {
                 // where the map is actually built. The staged-argument state it
                 // refuses on has ALREADY been taken by this point, so it is
                 // passed in rather than re-read -- see `staged_args_unmapped`.
-                reg_oop_mask: self
-                    .live_oop_register_mask(staged_args_unmapped, call_oop_arg_regs),
+                reg_oop_mask: self.live_oop_register_mask(staged_args_unmapped, call_oop_arg_regs),
                 // The oracle a stale-word report needs to say "live". Taken
                 // through the shared accessor so the method-entry poll records
                 // its parameter mask rather than a `None` (see
@@ -2155,9 +2153,7 @@ impl Compiler {
                 // the value that already means "no claim". `frame_slot_offsets`
                 // (Stage 2 above) still names every window's locals; only this
                 // DIAGNOSTIC oracle abstains.
-                local_oop_mask: if self.local_oop_masks.is_empty()
-                    || self.local_oop_windows > 1
-                {
+                local_oop_mask: if self.local_oop_masks.is_empty() || self.local_oop_windows > 1 {
                     None
                 } else {
                     self.local_oop_mask_at_current_pc()
@@ -2624,7 +2620,5 @@ mod tests {
 /// decision and must not change under a running process.
 fn staged_arg_shadow_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_STAGED_ARG_SHADOW").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_STAGED_ARG_SHADOW"))
 }

@@ -220,9 +220,7 @@ fn deref_base_input(op: &Op) -> Option<usize> {
 /// The `(base, index)` pair a bounds check is against, if this op has one.
 fn bounds_pair(node_op: &Op, inputs: &[NodeId]) -> Option<(NodeId, NodeId)> {
     match node_op {
-        Op::ArrayLoad(_) | Op::ArrayStore(_) => {
-            Some((*inputs.get(2)?, *inputs.get(3)?))
-        }
+        Op::ArrayLoad(_) | Op::ArrayStore(_) => Some((*inputs.get(2)?, *inputs.get(3)?)),
         _ => None,
     }
 }
@@ -590,12 +588,7 @@ fn upper_bounds(graph: &Graph, schedule: &Schedule) -> Vec<UpperBound> {
 /// bound: an induction variable's non-negativity is proven THROUGH that same
 /// branch (see the module notes above), so the two halves cannot be decided
 /// independently.
-fn proven_non_negative(
-    graph: &Graph,
-    schedule: &Schedule,
-    v: NodeId,
-    guard_block: usize,
-) -> bool {
+fn proven_non_negative(graph: &Graph, schedule: &Schedule, v: NodeId, guard_block: usize) -> bool {
     let Some(node) = graph.nodes.get(v as usize) else {
         return false;
     };
@@ -1166,10 +1159,7 @@ mod tests {
             assert!(!enabled(), "the force must apply on this thread");
         }
         // Dropped: this thread sees the real gate again.
-        assert!(
-            enabled(),
-            "the force leaked past its guard on this thread"
-        );
+        assert!(enabled(), "the force leaked past its guard on this thread");
         // And it was never visible on another thread, whichever order the two
         // ran in.
         let elsewhere = std::thread::spawn(enabled).join().expect("probe thread");
@@ -1390,8 +1380,7 @@ mod tests {
     /// test that fails in that case.
     #[test]
     fn the_header_op_the_builder_actually_emits_is_recognised() {
-        let (g, sched, st) =
-            counted_loop_with_header(Op::Merge, CmpOp::Lt, 0, 1, true, true, true);
+        let (g, sched, st) = counted_loop_with_header(Op::Merge, CmpOp::Lt, 0, 1, true, true, true);
         let e = analyze(&g, &sched);
         assert!(
             e.bounds_elided(st) && e.bounds_range_proved(st),
@@ -1408,8 +1397,7 @@ mod tests {
     /// nothing here while every other test in this module stayed green.
     #[test]
     fn the_bound_is_read_off_the_false_edge_of_a_negated_test() {
-        let (g, sched, st) =
-            counted_loop_with_header(Op::Merge, CmpOp::Ge, 1, 1, true, true, true);
+        let (g, sched, st) = counted_loop_with_header(Op::Merge, CmpOp::Ge, 1, 1, true, true, true);
         let e = analyze(&g, &sched);
         assert!(
             e.bounds_elided(st) && e.bounds_range_proved(st),

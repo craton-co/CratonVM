@@ -18,7 +18,9 @@
 //! back to single-pass, making the comparison trivially identical), so an int
 //! corpus is exactly where the two backends genuinely differ.
 
-use cratonvm_jit::{try_compile, CachedBytecodeMethod, CompiledMethod, InlineSite, JitRuntimeHelpers};
+use cratonvm_jit::{
+    try_compile, CachedBytecodeMethod, CompiledMethod, InlineSite, JitRuntimeHelpers,
+};
 use cratonvm_types::{
     ClassId, ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
@@ -322,6 +324,7 @@ fn cached(
         descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         interp_invocations: std::sync::atomic::AtomicU32::new(0),
+        tiering_settled: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4372,13 +4375,7 @@ fn selfrec_more_args_than_entry_regs_still_compiles() {
 
         let name = format!("f{arity}");
         let descriptor = format!("({})I", "I".repeat(arity));
-        let cm = cached(
-            &name,
-            &descriptor,
-            code,
-            arity as u16,
-            arity as u16,
-        );
+        let cm = cached(&name, &descriptor, code, arity as u16, arity as u16);
         let (rname, rdesc) = (name.clone(), descriptor.clone());
         let resolver = move |cp: u16| -> Option<(String, String, String)> {
             if cp == 2 {
@@ -7440,6 +7437,7 @@ fn compile_inline_arm(
                 Some(&ir_inline_resolver), // 25 ir_inline_resolver  <- the point
                 false,                     // 26 jdk_only
                 None,                      // 27 intrinsic_resolver
+                None,                      // 28 despec
             )
         },
     )
@@ -7449,7 +7447,9 @@ fn compile_inline_arm(
 ///
 /// `iload_0; bipush 7; invokestatic #1; iconst_1; iadd; ireturn`
 fn inline_caller_code() -> Vec<u8> {
-    vec![0x1a, 0x10, 0x07, 0xb8, 0x00, 0x01, 0x04, 0x60, 0xac, 0x00, 0x00]
+    vec![
+        0x1a, 0x10, 0x07, 0xb8, 0x00, 0x01, 0x04, 0x60, 0xac, 0x00, 0x00,
+    ]
 }
 
 /// The gate can now SEE the flag: with a callee body available, turning

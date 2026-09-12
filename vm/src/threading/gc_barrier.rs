@@ -563,6 +563,11 @@ impl GcBarrier {
             ThreadExecState::NativeBlocked,
             "gc_barrier::enter_blocked",
         );
+        // Code reclamation: publish what this thread's stack can return into
+        // while it is blocked, so a thread parked inside compiled code no longer
+        // holds every retired body in the process. Withdrawn first thing in
+        // `BlockedGuard::drop` (or `finish_after`).
+        crate::jit::conservative_roots::note_blocking_transition_enter();
         BlockedGuard {
             barrier: self,
             pre_stw,
@@ -594,6 +599,9 @@ impl GcBarrier {
             ThreadExecState::NativeBlocked,
             "gc_barrier::mark_blocked_region_enter",
         );
+        // Code reclamation — see `enter_blocked`. Withdrawn by
+        // `mark_blocked_region_leave_after`.
+        crate::jit::conservative_roots::note_blocking_transition_enter();
         pre_stw
     }
 
@@ -622,6 +630,9 @@ impl GcBarrier {
     where
         F: FnOnce(),
     {
+        // Withdraw the blocked-stack summary before anything else: from here on
+        // this thread may run compiled code again.
+        crate::jit::conservative_roots::note_blocking_transition_leave();
         let mut inner = self.inner.lock();
         Self::wait_out_pause_locked(
             self.stw_requested.flag(),
@@ -1093,6 +1104,9 @@ impl<'a> BlockedGuard<'a> {
 
 impl Drop for BlockedGuard<'_> {
     fn drop(&mut self) {
+        // Withdraw the blocked-stack summary `enter_blocked` published before
+        // anything else: from here on this thread may run compiled code again.
+        crate::jit::conservative_roots::note_blocking_transition_leave();
         // Checked leave — identical contract to `mark_blocked_region_leave`:
         // wait out the active stop-the-world pause we were excluded from
         // (arriving or running would both be wrong) before re-entering the

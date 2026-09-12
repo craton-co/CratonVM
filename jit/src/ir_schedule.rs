@@ -312,12 +312,12 @@ fn op_is_sinkable(op: &Op) -> bool {
 /// natural loop is `v` plus everything that reaches `u` without passing
 /// through `v`. Same definition `ir_lower`'s poll placement rests on, computed
 /// here from `dom` rather than re-derived.
-fn loop_depths(blocks: &[Block], dom: &[Vec<bool>]) -> Vec<u32> {
+fn loop_depths(blocks: &[Block], dom: &Dominators) -> Vec<u32> {
     let n = blocks.len();
     let mut depth = vec![0u32; n];
     for u in 0..n {
         for &v in &blocks[u].successors {
-            if v >= n || !dominates(dom, v, u) {
+            if v >= n || !dom.dominates(v, u) {
                 continue;
             }
             if u == v {
@@ -347,15 +347,15 @@ fn loop_depths(blocks: &[Block], dom: &[Vec<bool>]) -> Vec<u32> {
 }
 
 /// The deepest block that dominates every block in `of`, or `None`.
-fn deepest_common_dominator(dom: &[Vec<bool>], of: &[usize], nb: usize) -> Option<usize> {
+fn deepest_common_dominator(dom: &Dominators, of: &[usize], nb: usize) -> Option<usize> {
     let mut best: Option<usize> = None;
     for cand in 0..nb {
-        if !of.iter().all(|&b| dominates(dom, cand, b)) {
+        if !of.iter().all(|&b| dom.dominates(cand, b)) {
             continue;
         }
         best = Some(match best {
             // Deeper means dominated by the other.
-            Some(cur) if dominates(dom, cur, cand) => cand,
+            Some(cur) if dom.dominates(cur, cand) => cand,
             Some(cur) => cur,
             None => cand,
         });
@@ -384,7 +384,7 @@ fn sink_pure_nodes(
     graph: &Graph,
     blocks: &mut [Block],
     node_to_block: &mut [usize],
-    dom: &[Vec<bool>],
+    dom: &Dominators,
 ) -> (usize, usize) {
     let nb = blocks.len();
     if nb < 2 {
@@ -440,7 +440,7 @@ fn sink_pure_nodes(
             blocks[b].nodes.push(id);
         }
     }
-    if retried && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SINK").is_some() {
+    if retried && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_SINK") {
         eprintln!("[ir-sink] equal-depth placement violated a safepoint; fell back to depth-only");
     }
     (moved, 0)
@@ -457,7 +457,7 @@ fn place_sunk_nodes(
     graph: &Graph,
     blocks: &[Block],
     node_to_block: &mut [usize],
-    dom: &[Vec<bool>],
+    dom: &Dominators,
     depth: &[u32],
     equal_depth: bool,
 ) -> usize {
@@ -553,12 +553,12 @@ fn place_sunk_nodes(
             // A node is only ever moved DOWN its own dominator path. When a use
             // sits in `early` itself this makes `late == early` and nothing
             // moves, which is the right answer: the value is needed here.
-            if !dominates(dom, early, late) {
+            if !dom.dominates(early, late) {
                 continue;
             }
             let mut best = early;
             for cand in 0..nb {
-                if !dominates(dom, early, cand) || !dominates(dom, cand, late) {
+                if !dom.dominates(early, cand) || !dom.dominates(cand, late) {
                     continue;
                 }
                 // Shallower loop nesting always wins: that is this pass's
@@ -575,7 +575,7 @@ fn place_sunk_nodes(
                 if equal_depth
                     && depth[cand] == depth[best]
                     && cand != best
-                    && dominates(dom, best, cand)
+                    && dom.dominates(best, cand)
                 {
                     best = cand;
                 }
@@ -640,7 +640,7 @@ fn safepoints_dominate_anchors(
     graph: &Graph,
     node_to_block: &[usize],
     original: &[usize],
-    dom: &[Vec<bool>],
+    dom: &Dominators,
     nb: usize,
 ) -> bool {
     let mut anchors: std::collections::HashMap<usize, Vec<usize>> =
@@ -670,7 +670,7 @@ fn safepoints_dominate_anchors(
             if original.get(v as usize) == Some(&vb) {
                 continue; // not moved by this pass
             }
-            if !anchor_blocks.iter().all(|&ab| dominates(dom, vb, ab)) {
+            if !anchor_blocks.iter().all(|&ab| dom.dominates(vb, ab)) {
                 return false;
             }
         }
@@ -1309,29 +1309,77 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
     }
 
     // Step 2: Find terminators for each block
-    // Walk control edges forward from each block head
-    for block_idx in 0..blocks.len() {
-        let head = blocks[block_idx].ctrl;
-        // Find nodes that use this control token
-        for (id, node) in graph.nodes.iter().enumerate() {
-            if node.op == Op::Dead {
-                continue;
+    //
+    // An `If` / `Return` / `Throw` terminates the block its control input
+    // heads. One pass over the graph, finding that block through
+    // `node_to_block`, rather than one whole-graph scan per block: that was
+    // O(blocks × nodes), which a method near the node cap pays in full. Nodes
+    // are visited in id order and a later match overwrites an earlier one, so a
+    // block two terminators name keeps the higher id, as the per-block scan
+    // did.
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if !matches!(node.op, Op::If | Op::Return | Op::Throw) {
+            continue;
+        }
+        let Some(&head) = node.inputs.first() else {
+            continue;
+        };
+        let Some(&block_idx) = node_to_block.get(head as usize) else {
+            continue;
+        };
+        // Only block heads have an entry yet, and no terminator is a head; the
+        // `ctrl` check makes that a fact here rather than an assumption.
+        if block_idx < blocks.len() && blocks[block_idx].ctrl == head {
+            blocks[block_idx].terminator = Some(id as NodeId);
+            node_to_block[id] = block_idx;
+        }
+    }
+
+    // Step 3 reads, per block, the projections of its `If` terminator and the
+    // merges its control feeds. Both are gathered here in ONE pass, for the
+    // same reason as Step 2. Each list is built in node-id order — the order
+    // the per-block scans visited them in — so the successor and predecessor
+    // lists below come out identical.
+    let num_blocks = blocks.len();
+    let mut if_projs: Vec<Vec<(u8, usize)>> = vec![Vec::new(); num_blocks];
+    let mut fed_merges: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+    for (id, node) in graph.nodes.iter().enumerate() {
+        match &node.op {
+            Op::Proj(which) => {
+                let Some(&term) = node.inputs.first() else {
+                    continue;
+                };
+                let Some(&tb) = node_to_block.get(term as usize) else {
+                    continue;
+                };
+                if tb >= num_blocks || blocks[tb].terminator != Some(term) || !is_if(graph, term)
+                {
+                    continue;
+                }
+                let succ_block = node_to_block[id];
+                if succ_block == usize::MAX {
+                    continue;
+                }
+                if_projs[tb].push((*which, succ_block));
             }
-            match &node.op {
-                Op::If => {
-                    if !node.inputs.is_empty() && node.inputs[0] == head {
-                        blocks[block_idx].terminator = Some(id as NodeId);
-                        node_to_block[id] = block_idx;
+            Op::Merge | Op::Region => {
+                for &head in node.inputs.iter() {
+                    let Some(&hb) = node_to_block.get(head as usize) else {
+                        continue;
+                    };
+                    if hb >= num_blocks || blocks[hb].ctrl != head {
+                        continue;
+                    }
+                    // A merge naming the same head twice is ONE successor (the
+                    // scan asked `inputs.contains(&head)`). This merge's inputs
+                    // are visited consecutively, so a repeat is always the
+                    // list's last entry.
+                    if fed_merges[hb].last() != Some(&id) {
+                        fed_merges[hb].push(id);
                     }
                 }
-                Op::Return | Op::Throw => {
-                    if !node.inputs.is_empty() && node.inputs[0] == head {
-                        blocks[block_idx].terminator = Some(id as NodeId);
-                        node_to_block[id] = block_idx;
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
     }
 
@@ -1365,18 +1413,10 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
                     // Sorting by the projection's own index makes the invariant
                     // a property of this code rather than of node-allocation
                     // order. It is a no-op on every graph the builder makes.
-                    let mut succs: Vec<(u8, usize)> = Vec::new();
-                    for (id, node) in graph.nodes.iter().enumerate() {
-                        let Op::Proj(which) = &node.op else { continue };
-                        if node.inputs.first().copied() != Some(term) {
-                            continue;
-                        }
-                        let succ_block = node_to_block[id];
-                        if succ_block == usize::MAX {
-                            continue;
-                        }
-                        succs.push((*which, succ_block));
-                    }
+                    //
+                    // `if_projs` holds them in node-id order; the sort is
+                    // stable, so equal indices keep that order as before.
+                    let mut succs: Vec<(u8, usize)> = std::mem::take(&mut if_projs[block_idx]);
                     succs.sort_by_key(|&(which, _)| which);
                     for (_which, succ_block) in succs {
                         if !blocks[block_idx].successors.contains(&succ_block) {
@@ -1397,20 +1437,16 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
 
         // For blocks without explicit terminator (fall-through via goto → merge),
         // check if the block's control feeds into a Merge/Region
-        let head = blocks[block_idx].ctrl;
-        for (id, node) in graph.nodes.iter().enumerate() {
-            if matches!(&node.op, Op::Merge | Op::Region) {
-                if node.inputs.contains(&head) {
-                    let succ_block = node_to_block[id];
-                    if succ_block != usize::MAX
-                        && succ_block != block_idx
-                        && !blocks[block_idx].successors.contains(&succ_block)
-                    {
-                        blocks[block_idx].successors.push(succ_block);
-                        if !blocks[succ_block].predecessors.contains(&block_idx) {
-                            blocks[succ_block].predecessors.push(block_idx);
-                        }
-                    }
+        // (`fed_merges`, gathered above.)
+        for &id in &fed_merges[block_idx] {
+            let succ_block = node_to_block[id];
+            if succ_block != usize::MAX
+                && succ_block != block_idx
+                && !blocks[block_idx].successors.contains(&succ_block)
+            {
+                blocks[block_idx].successors.push(succ_block);
+                if !blocks[succ_block].predecessors.contains(&block_idx) {
+                    blocks[succ_block].predecessors.push(block_idx);
                 }
             }
         }
@@ -1427,18 +1463,70 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
     // relation over the block CFG and use it to pick a dominated home block,
     // falling back to the entry block (which dominates everything) when no such
     // block exists. See `find_best_block`.
-    let dom = compute_dominators(&blocks);
-    for (id, node) in graph.nodes.iter().enumerate() {
-        if node_to_block[id] != usize::MAX || node.op == Op::Dead {
-            continue; // already placed or dead
+    //
+    // Inputs are placed BEFORE their users. `find_best_block` only sees inputs
+    // that already have a block, and this step used to visit nodes in id order
+    // — so an input with a HIGHER id than its user was silently ignored. Every
+    // graph the builder makes defines before it uses, but a pass that rewires
+    // an old node to a newer input does not (`reassociate_affine` is one), and
+    // the ignored input let the user land in a block the input's block does
+    // not dominate: a value read before its definition, which
+    // `verify_data_locations` then refuses. So each node is placed on the way
+    // OUT of a depth-first walk over its still-unplaced data inputs. On a graph
+    // whose inputs all have lower ids the walk never descends, and the
+    // placement — block and push order both — is exactly the id-order one.
+    let dom = Dominators::compute(&blocks);
+    let mut entered = vec![false; num_nodes];
+    let mut walk: Vec<(NodeId, usize)> = Vec::new();
+    for root in 0..num_nodes {
+        // Already placed, dead, or a control node (a block boundary, handled
+        // above) — or placed by an earlier root's walk.
+        if entered[root] || !awaits_placement(graph, &node_to_block, root) {
+            continue;
         }
-        if node.op.is_control() {
-            continue; // control nodes are block boundaries, already handled
+        entered[root] = true;
+        walk.push((root as NodeId, 0));
+        // Iterative, like `topo_sort_block`: a long operand chain must not
+        // recurse. Each frame is a node and the index of its next input edge.
+        while let Some(&(id, cursor)) = walk.last() {
+            let node = &graph.nodes[id as usize];
+            let mut next = cursor;
+            let mut descend: Option<NodeId> = None;
+            // A phi is pinned to its merge and reads its value inputs on the
+            // incoming edges, so `find_best_block` never consults them — and
+            // following them would walk a loop's back edge into its own body.
+            if !matches!(node.op, Op::Phi) {
+                while next < node.inputs.len() {
+                    let inp = node.inputs[next];
+                    next += 1;
+                    if inp == NO_NODE {
+                        continue;
+                    }
+                    let i = inp as usize;
+                    // An input already `entered` but not yet placed is on the
+                    // walk above this frame: a cycle through non-phi data
+                    // nodes, which well-formed SSA does not have. It is left
+                    // unplaced for this user, exactly as id order left it.
+                    if i < num_nodes && !entered[i] && awaits_placement(graph, &node_to_block, i) {
+                        entered[i] = true;
+                        descend = Some(inp);
+                        break;
+                    }
+                }
+            }
+            let top = walk.len() - 1;
+            walk[top].1 = next;
+            match descend {
+                Some(inp) => walk.push((inp, 0)),
+                None => {
+                    walk.pop();
+                    // Find a block dominated by all of this node's inputs' blocks.
+                    let block = find_best_block(graph, id, &node_to_block, &blocks, &dom);
+                    node_to_block[id as usize] = block;
+                    blocks[block].nodes.push(id);
+                }
+            }
         }
-        // Find a block dominated by all of this node's inputs' blocks.
-        let block = find_best_block(graph, id as NodeId, &node_to_block, &blocks, &dom);
-        node_to_block[id] = block;
-        blocks[block].nodes.push(id as NodeId);
     }
 
     // Step 4b: Sink pure nodes out of loops they are only used outside of.
@@ -1452,7 +1540,7 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
         if moved > 0 {
             crate::ir_evidence::note(crate::ir_evidence::Transform::SunkLate);
         }
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SINK").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_SINK") {
             eprintln!("[ir-sink] moved={moved} reverted_for_safepoints={reverted}");
         }
     }
@@ -1549,10 +1637,21 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
                 apply_order(&mut blocks, &mut node_to_block, &mut freq, &order);
             }
             Err(bailout) => {
-                // Not a compilation bailout: the method still compiles, it just
-                // keeps the order it already had. Recorded rather than counted,
-                // so the bailout table stays a table of *refused compiles*.
+                // Not a compilation bailout: the method still compiles.
+                // Recorded rather than counted, so the bailout table stays a
+                // table of *refused compiles*. Fall back to the plain reverse
+                // postorder before creation order, because creation order is
+                // the one that can emit a use before its definition.
                 layout.rejected = Some(bailout.to_string());
+                if rpo_layout_enabled() {
+                    if let Ok(order) = layout_blocks_rpo(&blocks, &opts.protected_regions) {
+                        layout.fallthrough_edges = count_fallthrough_edges(&blocks, &order);
+                        layout.fallthrough_weight = fallthrough_weight(&blocks, &freq, &order);
+                        layout.applied = true;
+                        RPO_LAYOUTS_APPLIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        apply_order(&mut blocks, &mut node_to_block, &mut freq, &order);
+                    }
+                }
             }
         }
     }
@@ -1562,10 +1661,13 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
     // permutation rather than trying to permute a matrix in place. Callers
     // (`Schedule::node_strictly_dominates_block`, the scalar-replacement deopt
     // producer) index it with post-layout indices.
+    //
+    // The published relation is the dense matrix its consumers index, built
+    // once here from whichever `Dominators` matches the final numbering.
     let dom = if layout.applied {
         compute_dominators(&blocks)
     } else {
-        dom
+        dom.to_matrix()
     };
 
     Schedule {
@@ -1588,77 +1690,268 @@ fn is_if(graph: &Graph, id: NodeId) -> bool {
     matches!(graph.nodes.get(id as usize), Some(n) if n.op == Op::If)
 }
 
-/// Compute, for every block, the set of blocks that dominate it.
+/// Does Step 4 of [`schedule_with_options`] still owe node `id` a block?
 ///
-/// Block 0 (the entry) is assumed to be the CFG entry: it dominates every
-/// block, and is dominated only by itself. We use the classic iterative
-/// data-flow formulation:
-///
-/// ```text
-///   dom(entry) = {entry}
-///   dom(b)     = {b} ∪ ( ⋂ over preds p of dom(p) )
-/// ```
-///
-/// iterated to a fixpoint. `dom[b]` is a bitset (one `bool` per block) where
-/// `dom[b][d]` is true iff block `d` dominates block `b`. This is O(B² · iters)
-/// in the worst case, but block counts in a single JIT'd method are small. For
-/// blocks unreachable from the entry (no path of predecessors back to block 0)
-/// the fixpoint leaves them dominated by "all blocks"; callers must therefore
-/// only rely on `dominates(a, b)` when both are reachable — `find_best_block`
-/// handles the unreachable/empty case by falling back to the entry block.
-fn compute_dominators(blocks: &[Block]) -> Vec<Vec<bool>> {
-    let n = blocks.len();
-    if n == 0 {
-        return Vec::new();
+/// True for a data node — not dead, not a control node — that has no block
+/// yet: exactly the nodes that step placed when it walked ids in order. An
+/// out-of-range id is never owed anything.
+fn awaits_placement(graph: &Graph, node_to_block: &[usize], id: usize) -> bool {
+    match (graph.nodes.get(id), node_to_block.get(id)) {
+        (Some(n), Some(&b)) => b == usize::MAX && n.op != Op::Dead && !n.op.is_control(),
+        _ => false,
     }
-    // Initialize: entry dominated only by itself; every other block tentatively
-    // dominated by all blocks (the conservative "top" of the lattice).
-    let mut dom: Vec<Vec<bool>> = vec![vec![true; n]; n];
-    dom[0] = vec![false; n];
-    dom[0][0] = true;
+}
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in 1..n {
-            // new_dom = {b} ∪ ( ⋂ over preds p of dom(p) )
-            let mut new_dom: Option<Vec<bool>> = None;
-            for &p in &blocks[b].predecessors {
-                if p >= n {
-                    continue;
-                }
-                if let Some(acc) = new_dom.as_mut() {
-                    for d in 0..n {
-                        acc[d] &= dom[p][d];
-                    }
-                } else {
-                    new_dom = Some(dom[p].clone());
-                }
-            }
-            // A block with no (in-range) predecessors keeps the "top" set; only
-            // tighten when we actually intersected predecessor sets.
-            let mut new_dom = match new_dom {
-                Some(v) => v,
-                None => continue,
-            };
-            new_dom[b] = true; // a block always dominates itself
-            if new_dom != dom[b] {
-                dom[b] = new_dom;
-                changed = true;
-            }
-        }
-    }
-    dom
+/// Compute, for every block, the set of blocks that dominate it, as the dense
+/// matrix [`Schedule::dom`] publishes.
+///
+/// `dom[b][d]` is true iff block `d` dominates block `b`. Block 0 (the entry)
+/// is assumed to be the CFG entry: it dominates every block, and is dominated
+/// only by itself. For blocks unreachable from the entry (no path of
+/// predecessors back to block 0) the row is "all blocks" — the value the
+/// classic iterative data-flow fixpoint this replaced left them at — so callers
+/// must only rely on `dominates(a, b)` when both are reachable;
+/// `find_best_block` handles the unreachable/empty case by falling back to the
+/// entry block.
+///
+/// Derived from [`Dominators`], which computes the relation in near-linear
+/// time. The matrix itself is still O(B²) memory because [`Schedule::dom`]'s
+/// consumers index it directly; it is built once per schedule, and the
+/// scheduler's own queries go to [`Dominators`] instead.
+fn compute_dominators(blocks: &[Block]) -> Vec<Vec<bool>> {
+    Dominators::compute(blocks).to_matrix()
 }
 
 /// True iff block `a` dominates block `b` (every path from the entry to `b`
-/// passes through `a`). Both indices must be in range.
+/// passes through `a`), read from a [`compute_dominators`] matrix. Both indices
+/// must be in range; an out-of-range index answers `false`.
 #[inline]
-fn dominates(dom: &[Vec<bool>], a: usize, b: usize) -> bool {
-    dom.get(b)
+fn dominates(matrix: &[Vec<bool>], a: usize, b: usize) -> bool {
+    matrix
+        .get(b)
         .and_then(|row| row.get(a))
         .copied()
         .unwrap_or(false)
+}
+
+/// [`Dominators`]' `idom` sentinel for a block the entry does not reach.
+const UNREACHED: usize = usize::MAX;
+
+/// The dominator relation over a block CFG, as an immediate-dominator tree.
+///
+/// Computed with Cooper, Harvey and Kennedy's iterative algorithm over reverse
+/// postorder ("A Simple, Fast Dominance Algorithm", 2001): each pass walks the
+/// blocks in RPO and intersects the predecessors' dominator-tree paths, which
+/// settles in two or three passes on the CFGs this tier builds. It replaced a
+/// dense bitset fixpoint that cost O(B²) per pass — a real cost on a method
+/// near the node cap, where the scheduler computes the relation twice.
+///
+/// Queries are O(1): the dominator tree is numbered by a depth-first walk, and
+/// `a` dominates `b` exactly when `b`'s pre/post interval nests inside `a`'s.
+///
+/// # Same answers as the fixpoint, unreachable blocks included
+///
+/// Reads `predecessors` only, as the fixpoint did, so a CFG whose successor
+/// and predecessor lists disagree gets the same relation from both. Block 0 is
+/// the entry. A block the entry does not reach is dominated by EVERY block —
+/// the fixpoint's top element, which it never tightened for such a block —
+/// and dominates no reachable one. The test module keeps the fixpoint as a
+/// reference and checks that the two agree.
+#[derive(Debug, Clone)]
+pub struct Dominators {
+    /// Immediate dominator per block. `idom[0] == 0`; [`UNREACHED`] for a
+    /// block the entry does not reach.
+    idom: Vec<usize>,
+    /// Pre-order number of each reachable block in the dominator tree.
+    pre: Vec<usize>,
+    /// Post-order number of each reachable block in the dominator tree.
+    post: Vec<usize>,
+}
+
+impl Dominators {
+    /// Compute the relation for `blocks`, whose entry is block 0.
+    ///
+    /// Total: never panics. An empty CFG yields an empty relation, and an
+    /// out-of-range predecessor index is ignored, as the fixpoint ignored it.
+    pub fn compute(blocks: &[Block]) -> Self {
+        let n = blocks.len();
+        let mut idom = vec![UNREACHED; n];
+        let mut pre = vec![0usize; n];
+        let mut post = vec![0usize; n];
+        if n == 0 {
+            return Dominators { idom, pre, post };
+        }
+
+        // Forward edges, derived from `predecessors` rather than read from
+        // `successors`: see "Same answers as the fixpoint" above.
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (b, blk) in blocks.iter().enumerate() {
+            for &p in &blk.predecessors {
+                if p < n {
+                    succs[p].push(b);
+                }
+            }
+        }
+
+        // Reverse postorder of the blocks reachable from the entry, by an
+        // iterative DFS (a long chain of blocks must not recurse).
+        let mut postorder: Vec<usize> = Vec::with_capacity(n);
+        let mut seen = vec![false; n];
+        let mut dfs: Vec<(usize, usize)> = vec![(0, 0)];
+        seen[0] = true;
+        while let Some(&(b, i)) = dfs.last() {
+            if i < succs[b].len() {
+                let top = dfs.len() - 1;
+                dfs[top].1 = i + 1;
+                let s = succs[b][i];
+                if !seen[s] {
+                    seen[s] = true;
+                    dfs.push((s, 0));
+                }
+            } else {
+                dfs.pop();
+                postorder.push(b);
+            }
+        }
+        let rpo: Vec<usize> = postorder.iter().rev().copied().collect();
+        let mut rpo_num = vec![usize::MAX; n];
+        for (k, &b) in rpo.iter().enumerate() {
+            rpo_num[b] = k;
+        }
+
+        // The entry finishes last, so it is `rpo[0]`; every other reachable
+        // block has its DFS parent — a predecessor — earlier in `rpo`, so the
+        // first pass already gives each of them an `idom`.
+        idom[0] = 0;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in rpo.iter().skip(1) {
+                let mut new_idom = UNREACHED;
+                for &p in &blocks[b].predecessors {
+                    // An unreached or not-yet-processed predecessor carries no
+                    // information: the fixpoint's top element is the identity
+                    // of its intersection, so skipping one is the same answer.
+                    if p >= n || idom[p] == UNREACHED {
+                        continue;
+                    }
+                    new_idom = if new_idom == UNREACHED {
+                        p
+                    } else {
+                        Self::intersect(&idom, &rpo_num, p, new_idom)
+                    };
+                }
+                if new_idom != UNREACHED && idom[b] != new_idom {
+                    idom[b] = new_idom;
+                    changed = true;
+                }
+            }
+        }
+
+        // Number the dominator tree: `a` dominates `b` iff
+        // `pre[a] <= pre[b] && post[b] <= post[a]`.
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &b in rpo.iter().skip(1) {
+            children[idom[b]].push(b);
+        }
+        let mut clock = 0usize;
+        pre[0] = clock;
+        clock += 1;
+        let mut walk: Vec<(usize, usize)> = vec![(0, 0)];
+        while let Some(&(b, i)) = walk.last() {
+            if i < children[b].len() {
+                let top = walk.len() - 1;
+                walk[top].1 = i + 1;
+                let c = children[b][i];
+                pre[c] = clock;
+                clock += 1;
+                walk.push((c, 0));
+            } else {
+                post[b] = clock;
+                clock += 1;
+                walk.pop();
+            }
+        }
+
+        Dominators { idom, pre, post }
+    }
+
+    /// The nearest common dominator of two processed blocks: walk whichever is
+    /// later in reverse postorder up its `idom` chain until the two meet.
+    fn intersect(idom: &[usize], rpo_num: &[usize], mut a: usize, mut b: usize) -> usize {
+        while a != b {
+            while rpo_num[a] > rpo_num[b] {
+                a = idom[a];
+            }
+            while rpo_num[b] > rpo_num[a] {
+                b = idom[b];
+            }
+        }
+        a
+    }
+
+    /// Number of blocks the relation covers.
+    pub fn len(&self) -> usize {
+        self.idom.len()
+    }
+
+    /// True for a relation over no blocks.
+    pub fn is_empty(&self) -> bool {
+        self.idom.is_empty()
+    }
+
+    /// The immediate dominator of `b`: `None` for the entry, for a block the
+    /// entry does not reach, and for an out-of-range index.
+    pub fn idom(&self, b: usize) -> Option<usize> {
+        match self.idom.get(b) {
+            Some(&d) if b != 0 && d != UNREACHED => Some(d),
+            _ => None,
+        }
+    }
+
+    /// True iff block `a` dominates block `b`. Reflexive.
+    ///
+    /// Exactly [`dominates`] over [`Self::to_matrix`]: `false` for an
+    /// out-of-range index, `true` for any `a` when `b` is unreachable, and
+    /// `false` when only `a` is.
+    #[inline]
+    pub fn dominates(&self, a: usize, b: usize) -> bool {
+        let (Some(&ia), Some(&ib)) = (self.idom.get(a), self.idom.get(b)) else {
+            return false;
+        };
+        if ib == UNREACHED {
+            return true;
+        }
+        if ia == UNREACHED {
+            return false;
+        }
+        self.pre[a] <= self.pre[b] && self.post[b] <= self.post[a]
+    }
+
+    /// The dense matrix [`Schedule::dom`] publishes: `m[b][d]` iff `d`
+    /// dominates `b`. O(B²) memory, filled by walking each block's `idom`
+    /// chain.
+    pub fn to_matrix(&self) -> Vec<Vec<bool>> {
+        let n = self.idom.len();
+        let mut matrix = Vec::with_capacity(n);
+        for b in 0..n {
+            if self.idom[b] == UNREACHED {
+                matrix.push(vec![true; n]);
+                continue;
+            }
+            let mut row = vec![false; n];
+            let mut d = b;
+            loop {
+                row[d] = true;
+                if d == 0 {
+                    break;
+                }
+                d = self.idom[d];
+            }
+            matrix.push(row);
+        }
+        matrix
+    }
 }
 
 /// Find the home block for a data node such that every one of its already-placed
@@ -1681,7 +1974,7 @@ fn find_best_block(
     id: NodeId,
     node_to_block: &[usize],
     blocks: &[Block],
-    dom: &[Vec<bool>],
+    dom: &Dominators,
 ) -> usize {
     let node = &graph.nodes[id as usize];
 
@@ -1722,7 +2015,7 @@ fn find_best_block(
     for &cand in &input_blocks {
         let dominated_by_all = input_blocks
             .iter()
-            .all(|&other| other == cand || dominates(dom, other, cand));
+            .all(|&other| other == cand || dom.dominates(other, cand));
         if dominated_by_all {
             // Among valid candidates prefer the one dominated by the most others
             // (i.e. the latest in dominance order). Since exactly one input block
@@ -2286,7 +2579,7 @@ fn profiled_taken_prob(
 pub fn compute_frequencies(
     graph: &Graph,
     blocks: &[Block],
-    dom: &[Vec<bool>],
+    dom: &Dominators,
     opts: &ScheduleOptions,
 ) -> BlockFrequencies {
     let n = blocks.len();
@@ -2314,7 +2607,7 @@ pub fn compute_frequencies(
     let mut loop_body: Vec<Option<Vec<bool>>> = vec![None; n];
     for (latch, blk) in blocks.iter().enumerate() {
         for &header in &blk.successors {
-            if header >= n || !dominates(dom, header, latch) {
+            if header >= n || !dom.dominates(header, latch) {
                 continue;
             }
             out.is_loop_header[header] = true;
@@ -2486,7 +2779,7 @@ pub fn compute_frequencies(
 /// Returns `(P(successors[0]), P(successors[1]))`.
 fn static_branch_probs(
     blocks: &[Block],
-    dom: &[Vec<bool>],
+    dom: &Dominators,
     loop_body: &[Option<Vec<bool>>],
     innermost: &[Option<usize>],
     freq: &BlockFrequencies,
@@ -2498,8 +2791,8 @@ fn static_branch_probs(
 
     // Back-edge heuristic: an edge to a header that dominates this block closes
     // a loop, and a loop is entered to be repeated.
-    let back0 = s0 < n && dominates(dom, s0, b);
-    let back1 = s1 < n && dominates(dom, s1, b);
+    let back0 = s0 < n && dom.dominates(s0, b);
+    let back1 = s1 < n && dom.dominates(s1, b);
     if back0 != back1 {
         let header = if back0 { s0 } else { s1 };
         let trip = freq.trip.get(header).copied().unwrap_or(DEFAULT_TRIP_COUNT);
@@ -4018,7 +4311,12 @@ mod tests {
             },
         ];
         let order = layout_blocks_rpo(&blocks, &[]).expect("a three-block chain must lay out");
-        let pos = |b: usize| order.iter().position(|&x| x == b).expect("every block placed");
+        let pos = |b: usize| {
+            order
+                .iter()
+                .position(|&x| x == b)
+                .expect("every block placed")
+        };
         assert_eq!(pos(0), 0, "the entry block stays at position 0");
         assert!(
             pos(2) < pos(1),
@@ -4067,14 +4365,286 @@ mod tests {
         let order = layout_blocks_rpo(&blocks, &[]).expect("a diamond must lay out");
         let mut seen = order.clone();
         seen.sort_unstable();
-        assert_eq!(seen, vec![0, 1, 2, 3], "order {order:?} is not a permutation");
+        assert_eq!(
+            seen,
+            vec![0, 1, 2, 3],
+            "order {order:?} is not a permutation"
+        );
         let pos = |b: usize| order.iter().position(|&x| x == b).unwrap();
-        assert!(pos(3) > pos(1) && pos(3) > pos(2), "the merge follows both arms");
+        assert!(
+            pos(3) > pos(1) && pos(3) > pos(2),
+            "the merge follows both arms"
+        );
     }
 
     /// An empty CFG is not an error, and must not be turned into one.
     #[test]
     fn rpo_layout_accepts_an_empty_block_list() {
-        assert_eq!(layout_blocks_rpo(&[], &[]).expect("empty is fine"), Vec::<usize>::new());
+        assert_eq!(
+            layout_blocks_rpo(&[], &[]).expect("empty is fine"),
+            Vec::<usize>::new()
+        );
+    }
+
+    // ── Dominators against the dense fixpoint they replaced ──────────────
+
+    /// The dense iterative fixpoint `compute_dominators` used to be, kept
+    /// verbatim as the reference [`Dominators`] must agree with — unreachable
+    /// blocks, out-of-range predecessors and all.
+    fn dense_dominators_reference(blocks: &[Block]) -> Vec<Vec<bool>> {
+        let n = blocks.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut dom: Vec<Vec<bool>> = vec![vec![true; n]; n];
+        dom[0] = vec![false; n];
+        dom[0][0] = true;
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 1..n {
+                let mut new_dom: Option<Vec<bool>> = None;
+                for &p in &blocks[b].predecessors {
+                    if p >= n {
+                        continue;
+                    }
+                    if let Some(acc) = new_dom.as_mut() {
+                        for d in 0..n {
+                            acc[d] &= dom[p][d];
+                        }
+                    } else {
+                        new_dom = Some(dom[p].clone());
+                    }
+                }
+                let mut new_dom = match new_dom {
+                    Some(v) => v,
+                    None => continue,
+                };
+                new_dom[b] = true;
+                if new_dom != dom[b] {
+                    dom[b] = new_dom;
+                    changed = true;
+                }
+            }
+        }
+        dom
+    }
+
+    /// A CFG of `n` blocks from an edge list, with both edge lists filled in
+    /// (the dominator math reads only `predecessors`; `successors` is there
+    /// so the fixture is a plausible CFG). An edge may name a block `>= n`,
+    /// which lands in `predecessors` only — the out-of-range case both
+    /// algorithms must ignore.
+    fn cfg(n: usize, edges: &[(usize, usize)]) -> Vec<Block> {
+        let mut blocks: Vec<Block> = (0..n).map(|id| blk(id, &[])).collect();
+        for &(from, to) in edges {
+            if to < n {
+                blocks[to].predecessors.push(from);
+            }
+            if from < n && to < n {
+                blocks[from].successors.push(to);
+            }
+        }
+        blocks
+    }
+
+    /// Both representations answer every `(a, b)` query the way the reference
+    /// matrix does, one index past the end included.
+    fn assert_dominators_match_reference(name: &str, blocks: &[Block]) {
+        let reference = dense_dominators_reference(blocks);
+        assert_eq!(
+            compute_dominators(blocks),
+            reference,
+            "{name}: matrix differs from the dense fixpoint"
+        );
+        let doms = Dominators::compute(blocks);
+        assert_eq!(doms.len(), blocks.len(), "{name}: relation size");
+        for a in 0..=blocks.len() {
+            for b in 0..=blocks.len() {
+                assert_eq!(
+                    doms.dominates(a, b),
+                    dominates(&reference, a, b),
+                    "{name}: dominates({a}, {b}) differs from the dense fixpoint"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chk_dominators_match_the_dense_fixpoint_on_hand_built_cfgs() {
+        assert_dominators_match_reference("empty", &[]);
+        assert_dominators_match_reference("single block", &cfg(1, &[]));
+        assert_dominators_match_reference(
+            "diamond",
+            &cfg(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]),
+        );
+        // 0 -> 1 (outer header) -> 2 (inner header) -> 3 (inner latch) -> 2,
+        // 2 -> 4 (outer latch) -> 1, 1 -> 5 (exit).
+        assert_dominators_match_reference(
+            "nested loops",
+            &cfg(
+                6,
+                &[(0, 1), (1, 2), (2, 3), (3, 2), (2, 4), (4, 1), (1, 5)],
+            ),
+        );
+        // A loop with two entries: neither 1 nor 2 dominates the other.
+        assert_dominators_match_reference(
+            "irreducible two-entry loop",
+            &cfg(4, &[(0, 1), (0, 2), (1, 2), (2, 1), (1, 3), (2, 3)]),
+        );
+        // Listed with the join BEFORE its arms, so block order is not RPO.
+        assert_dominators_match_reference(
+            "numbering is not reverse postorder",
+            &cfg(5, &[(0, 3), (0, 4), (3, 1), (4, 1), (1, 2)]),
+        );
+        assert_dominators_match_reference(
+            "self loop and a back edge to the entry",
+            &cfg(3, &[(0, 1), (1, 1), (1, 2), (2, 0)]),
+        );
+        // 3 has no predecessors; 4 <-> 5 is a cycle nothing enters; 5 also
+        // feeds the reachable 2, which must ignore it.
+        assert_dominators_match_reference(
+            "unreachable blocks",
+            &cfg(6, &[(0, 1), (1, 2), (4, 5), (5, 4), (5, 2), (3, 2)]),
+        );
+        assert_dominators_match_reference(
+            "out-of-range predecessor",
+            &cfg(3, &[(0, 1), (1, 2), (7, 2), (9, 1)]),
+        );
+        let chain: Vec<(usize, usize)> = (0..999).map(|b| (b, b + 1)).collect();
+        assert_dominators_match_reference("long chain", &cfg(1000, &chain));
+    }
+
+    /// Several hundred small CFGs from a fixed-seed generator, so the
+    /// agreement is not an artifact of the shapes someone thought to draw.
+    #[test]
+    fn chk_dominators_match_the_dense_fixpoint_on_generated_cfgs() {
+        // Numerical Recipes' LCG: deterministic, no dependency.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |bound: usize| -> usize {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % bound.max(1)
+        };
+        for case in 0..400 {
+            let n = 1 + next(24);
+            let m = next(3 * n + 1);
+            let edges: Vec<(usize, usize)> = (0..m).map(|_| (next(n), next(n))).collect();
+            assert_dominators_match_reference(&format!("generated case {case}"), &cfg(n, &edges));
+        }
+    }
+
+    #[test]
+    fn chk_idom_names_the_nearest_strict_dominator() {
+        let d = Dominators::compute(&cfg(5, &[(0, 1), (0, 2), (1, 3), (2, 3), (4, 3)]));
+        assert_eq!(d.idom(0), None, "the entry has no immediate dominator");
+        assert_eq!(d.idom(1), Some(0));
+        assert_eq!(d.idom(3), Some(0), "a join's idom is the branch, not an arm");
+        assert_eq!(d.idom(4), None, "an unreachable block has none");
+        assert_eq!(d.idom(5), None, "nor does an out-of-range index");
+    }
+
+    // ── Step 4 placement order ───────────────────────────────────────────
+
+    /// An old node rewired to read a NEWER one is placed where that input is
+    /// available, not where id order happened to leave it.
+    ///
+    /// Step 4 used to place nodes in id order, and `find_best_block` ignores
+    /// inputs that have no block yet. So `user` below — created first, then
+    /// pointed at `input` — saw only the parameter, went to the entry block,
+    /// and was emitted before the merge block that computes `input`: exactly
+    /// the def-after-use `verify_data_locations` refuses, and the shape
+    /// `reassociate_affine` leaves behind when it rewires an operand to a node
+    /// it just materialised.
+    #[test]
+    fn an_old_node_rewired_to_a_newer_input_is_placed_after_that_input() {
+        let mut g = bare_graph();
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let entry = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let p = g.add(Op::Param(0), IrType::Int, vec![], None);
+        // The OLD node, created before the value it will end up reading.
+        let user = g.add(Op::Add, IrType::Int, vec![p, p], None);
+        let if_node = g.add(Op::If, IrType::Control, vec![entry, p], Some(0));
+        let t = g.add(Op::Proj(0), IrType::Control, vec![if_node], Some(0));
+        let f = g.add(Op::Proj(1), IrType::Control, vec![if_node], Some(0));
+        let merge = g.add(Op::Merge, IrType::Control, vec![t, f], Some(1));
+        let one = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let two = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let phi = g.add(Op::Phi, IrType::Int, vec![merge, one, two], Some(1));
+        // The NEW input: it reads the phi, so it can only live in the merge.
+        let input = g.add(Op::Mul, IrType::Int, vec![phi, p], Some(1));
+        assert!(g.set_input(user, 0, input), "fixture: rewire the old node");
+        let ret = g.add(Op::Return, IrType::Void, vec![merge, user], Some(2));
+        g.entry = start;
+        g.exit = ret;
+        assert!(input > user, "fixture: the input must have the higher id");
+
+        let sched = schedule(&g);
+        let merge_block = sched.node_to_block[merge as usize];
+        let input_block = sched.node_to_block[input as usize];
+        let user_block = sched.node_to_block[user as usize];
+        assert_eq!(
+            input_block, merge_block,
+            "the input is placed with the phi it reads"
+        );
+        assert!(
+            dominates(&sched.dom, input_block, user_block),
+            "the input's block {input_block} must dominate the user's block {user_block}"
+        );
+        // Emission order: blocks in index order, then position in the block.
+        let emitted_at = |id: NodeId| -> (usize, usize) {
+            let b = sched.node_to_block[id as usize];
+            let pos = sched.blocks[b]
+                .nodes
+                .iter()
+                .position(|&x| x == id)
+                .expect("a placed node is listed in its block");
+            (b, pos)
+        };
+        assert!(
+            emitted_at(input) < emitted_at(user),
+            "the input {:?} must be emitted before its user {:?}",
+            emitted_at(input),
+            emitted_at(user),
+        );
+    }
+
+    /// The input-first walk is iterative: a chain whose every link reads a
+    /// HIGHER id — the walk's worst case, 20 000 frames deep — neither
+    /// overflows the stack nor places a link before its input.
+    #[test]
+    fn input_first_placement_survives_a_long_forward_chain() {
+        let mut g = bare_graph();
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let entry = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let depth = 20_000usize;
+        // Created with a placeholder input, then each link pointed at the next.
+        let links: Vec<NodeId> = (0..depth)
+            .map(|_| g.add(Op::Neg, IrType::Int, vec![NO_NODE], None))
+            .collect();
+        let p = g.add(Op::Param(0), IrType::Int, vec![], None);
+        for k in 0..depth {
+            let target = if k + 1 < depth { links[k + 1] } else { p };
+            assert!(g.set_input(links[k], 0, target));
+        }
+        let ret = g.add(Op::Return, IrType::Void, vec![entry, links[0]], None);
+        g.entry = start;
+        g.exit = ret;
+
+        let sched = schedule_with_options(&g, &ScheduleOptions::default());
+        let b0 = sched.node_to_block[links[0] as usize];
+        let mut pos = vec![usize::MAX; g.nodes.len()];
+        for (i, &id) in sched.blocks[b0].nodes.iter().enumerate() {
+            pos[id as usize] = i;
+        }
+        for k in 0..depth - 1 {
+            assert_eq!(sched.node_to_block[links[k] as usize], b0);
+            assert!(
+                pos[links[k + 1] as usize] < pos[links[k] as usize],
+                "link {k} is listed before the link it reads"
+            );
+        }
     }
 }

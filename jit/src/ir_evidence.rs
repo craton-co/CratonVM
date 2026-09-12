@@ -79,7 +79,6 @@
 //! distinction that keeps a plumbing mistake from silently disabling the whole
 //! tier.
 
-
 /// One transform. Values are bit positions, not a count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transform {
@@ -215,6 +214,44 @@ pub fn begin_compile() {
     STACK.with(|s| s.borrow_mut().push(CompileRecord::default()));
 }
 
+/// An armed compile that disarms itself if it is left without reaching
+/// [`take`].
+///
+/// [`begin_compile`] alone leaked: every bail between arming and the
+/// acceptance `take()` left its entry on the stack, and the next OUTER compile
+/// on the thread then popped that stale inner entry as its own, and was judged
+/// — and possibly memoised as refused — on another method's evidence. The
+/// scope records the stack depth it armed at and truncates back to it on drop;
+/// after a normal `take()` the stack is already there, so the drop does nothing.
+#[must_use = "dropping the scope immediately disarms the compile"]
+pub struct CompileScope {
+    depth: usize,
+}
+
+/// [`begin_compile`], returning the scope that disarms it on every exit.
+pub fn begin_compile_scope() -> CompileScope {
+    let depth = STACK.with(|s| {
+        let mut v = s.borrow_mut();
+        let depth = v.len();
+        v.push(CompileRecord::default());
+        depth
+    });
+    CompileScope { depth }
+}
+
+impl Drop for CompileScope {
+    fn drop(&mut self) {
+        // `try_with`: a scope dropped during thread teardown must not panic.
+        let _ = STACK.try_with(|s| {
+            if let Ok(mut v) = s.try_borrow_mut() {
+                if v.len() > self.depth {
+                    v.truncate(self.depth);
+                }
+            }
+        });
+    }
+}
+
 /// Record that `t` was applied to the compile running on this thread.
 ///
 /// A call with the slot un-armed is IGNORED rather than armed implicitly: the
@@ -246,8 +283,7 @@ pub fn note_blind_dispatch_in_splice() {
     STACK.with(|s| {
         if let Ok(mut v) = s.try_borrow_mut() {
             if let Some(rec) = v.last_mut() {
-                rec.blind_dispatches_in_splice =
-                    rec.blind_dispatches_in_splice.saturating_add(1);
+                rec.blind_dispatches_in_splice = rec.blind_dispatches_in_splice.saturating_add(1);
             }
         }
     });
@@ -451,10 +487,8 @@ pub fn accept(evidence: Option<CompileRecord>) -> bool {
 
 /// Bodies refused because their priced per-execution cost went UP, and the
 /// total nanoseconds-per-execution those refusals declined to publish.
-static REFUSED_COST_REGRESSION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static REGRESSION_NS_REFUSED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static REFUSED_COST_REGRESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REGRESSION_NS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `(bodies refused as a cost regression, ns/execution they would have added)`.
 ///
@@ -468,8 +502,7 @@ pub fn cost_regression_census() -> (u64, u64) {
     )
 }
 
-static REFUSED_BUT_SIMPLIFIED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static REFUSED_BUT_SIMPLIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REFUSED_AND_INERT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `(refused_but_the_optimizer_simplified, refused_and_the_optimizer_did_nothing)`.
@@ -618,7 +651,10 @@ mod tests {
         }
         let rec = take().expect("armed");
         assert!(rec.added_ns_per_execution() <= 0, "{rec:?}");
-        assert!(is_worth_publishing(rec), "a paid-for trade is still publishable");
+        assert!(
+            is_worth_publishing(rec),
+            "a paid-for trade is still publishable"
+        );
     }
 
     /// A blind dispatch in the method's OWN code is not this compile's doing --
@@ -844,8 +880,7 @@ pub fn take_last_verdict() -> Option<bool> {
 
 /// Supersedes abandoned because the optimizing body carried no evidence and a
 /// baseline body already existed.
-static SUPERSEDES_ABANDONED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SUPERSEDES_ABANDONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn note_supersede_abandoned() {
     SUPERSEDES_ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

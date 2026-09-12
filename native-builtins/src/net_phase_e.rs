@@ -7038,6 +7038,9 @@ fn re2_accept_into(
     }
     let deadline = (timeout_ms > 0)
         .then(|| std::time::Instant::now() + Duration::from_millis(timeout_ms as u64));
+    // The listener's raw handle, read under the registry lock on each pass, for
+    // the kernel wait below. A hint only — see `cratonvm_native_api::net_wait`.
+    let mut park_raw: Option<cratonvm_native_api::net_wait::RawSock> = None;
     let outcome = loop {
         {
             let mut reg = s2_registry().lock();
@@ -7045,6 +7048,7 @@ fn re2_accept_into(
                 Some(listener) => {
                     // Idempotent + cheap; keeps the socket pollable.
                     listener.set_nonblocking(true).ok();
+                    park_raw = Some(cratonvm_native_api::net_wait::raw_sock(&*listener));
                     match listener.accept() {
                         Ok(pair) => break AcceptOutcome::Accepted(pair),
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -7080,7 +7084,15 @@ fn re2_accept_into(
         // rewrites it, same as `re1_socket_read_stream`'s `buf`.
         let mut blocked_refs = [Value::Object(Some(ctx.read_native_pin(target_pin, target)))];
         ctx.begin_blocking_region();
-        std::thread::sleep(Duration::from_millis(10));
+        // A kernel wait for a pending connection, bounded by the same 10 ms, so
+        // the registry re-check cadence is unchanged but a connection arriving
+        // mid-wait is taken at once rather than after the rest of a fixed sleep.
+        match park_raw {
+            Some(raw) if cratonvm_native_api::net_wait::event_waits_enabled() => {
+                cratonvm_native_api::net_wait::wait_readable_raw(raw, 10);
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
         ctx.end_blocking_region_refs(&mut blocked_refs);
         target = match blocked_refs[0] {
             Value::Object(Some(o)) => o,
@@ -7297,7 +7309,8 @@ fn re2_bind_with_pending_options(
         return if wildcard {
             cratonvm_native_api::fd_table::open_tcp_dual_stack_listener(addr.port(), side.backlog)
         } else {
-            TcpListener::bind(addr)
+            // Was `TcpListener::bind`, which listens at std's 128 regardless.
+            cratonvm_native_api::net_wait::bind_tcp_listener(addr, side.backlog)
         };
     }
     let domain = match addr {
@@ -7325,9 +7338,9 @@ fn re2_bind_with_pending_options(
     }
     socket.bind(&addr.into())?;
     // `backlog` here is the OS listen queue; the Java-level value is recorded
-    // separately by the caller. -1 asks socket2 for the platform maximum,
-    // matching `TcpListener::bind`'s own choice.
-    socket.listen(side.backlog.max(0).max(50))?;
+    // separately by the caller. The JDK rule is `backlog < 1 ? 50 : backlog`;
+    // the `.max(50)` this replaces also raised a legitimate backlog of 10 to 50.
+    cratonvm_native_api::net_wait::listen_jdk(&socket, side.backlog)?;
     Ok(socket.into())
 }
 
@@ -19858,6 +19871,12 @@ struct ServerState {
     running: AtomicBool,
     handlers: Mutex<Vec<HttpHandlerEntry>>,
     bound_port: AtomicI32,
+    /// Handles on the kept-alive connections, so `stop()` can shut them. Each
+    /// connection thread parks in a read between requests; without this a
+    /// stopped server would leave them open until the idle interval, and a
+    /// pooling client would hand the next server's first request to a dead one.
+    conns: Mutex<HashMap<u64, TcpStream>>,
+    next_conn: AtomicU64,
 }
 
 fn server_registry() -> &'static Mutex<HashMap<i32, std::sync::Arc<ServerState>>> {
@@ -19940,16 +19959,121 @@ pub fn gc_update_re10_handler_refs(pointer_map: &cratonvm_types::PointerMap) {
 }
 
 struct PendingRequest {
-    stream: TcpStream,
+    /// The connection itself, on the one-shot path only: the dispatcher writes
+    /// the response to it and closes it (`re10_send_response`). `None` on a
+    /// kept-alive connection, whose own thread owns the socket and receives the
+    /// response through `reply`.
+    stream: Option<TcpStream>,
+    /// Endpoint addresses, captured when the connection was accepted so the
+    /// exchange can report them without the socket.
+    local: Option<SocketAddr>,
+    peer: Option<SocketAddr>,
     method: String,
     uri: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// Where the serialised response goes on a kept-alive connection. Dropping
+    /// it unanswered (a stopped server discarding its queue) wakes the
+    /// connection thread with an error, which closes the connection.
+    reply: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    /// The request allows the connection to persist: HTTP/1.1 without
+    /// `Connection: close`.
+    persistent: bool,
+    /// The request line said HTTP/1.1. Decides whether a closing response
+    /// announces `Connection: close` (see the dispatcher).
+    http11: bool,
 }
 
 fn request_queue() -> &'static Mutex<HashMap<i32, Vec<PendingRequest>>> {
     static INSTANCE: OnceLock<Mutex<HashMap<i32, Vec<PendingRequest>>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Signalled on every enqueue, so an idle dispatcher wakes for a request
+/// instead of finishing a fixed sleep first. See `re10_serve_loop_run`.
+fn request_queue_ready() -> &'static parking_lot::Condvar {
+    static CV: OnceLock<parking_lot::Condvar> = OnceLock::new();
+    CV.get_or_init(parking_lot::Condvar::new)
+}
+
+/// Queue a parsed request for the dispatchers and wake one.
+///
+/// `drop_if_stopped` is set on the keep-alive path: the check is made UNDER the
+/// queue lock, and `stop()` clears `running` before it removes the server's
+/// queue under the same lock, so a request can never be parked behind a
+/// dispatcher that has already exited. Dropping it drops its `reply` sender,
+/// which is what releases the connection thread waiting on it.
+fn re10_enqueue(server_id: i32, state: &ServerState, pending: PendingRequest, drop_if_stopped: bool) {
+    let mut q = request_queue().lock();
+    if drop_if_stopped && !state.running.load(Ordering::SeqCst) {
+        return;
+    }
+    q.entry(server_id).or_default().push(pending);
+    drop(q);
+    request_queue_ready().notify_one();
+}
+
+/// `CRATONVM_HTTPSRV_KEEPALIVE` (default ON). `=0` restores the one-shot
+/// server: `Connection: close` on every response, one parse thread per
+/// connection and one responder thread per response.
+fn httpsrv_keepalive_enabled() -> bool {
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_HTTPSRV_KEEPALIVE")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// How long a kept-alive connection may sit idle between requests: the JDK's
+/// own `sun.net.httpserver.idleInterval` default.
+const HTTPSRV_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+
+/// `Connection: close` anywhere in the request's `Connection` header(s).
+fn request_asks_close(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("connection")
+            && v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close"))
+    })
+}
+
+/// Total length of a chunked body's framing — through the terminating zero
+/// chunk, any trailer fields, and the final empty line — or `None` while any
+/// of it has yet to arrive.
+///
+/// `http_decode_chunked` stops at the zero-size chunk and does not report how
+/// much it consumed, which is right for a body that ends the connection and
+/// wrong for one followed by another request: the final CRLF and any trailers
+/// would be read as the start of the next request line.
+fn http_chunked_request_len(data: &[u8]) -> Option<usize> {
+    const MAX_CHUNK: usize = 64 * 1024 * 1024;
+    let mut pos = 0usize;
+    loop {
+        let nl = data[pos..].windows(2).position(|w| w == b"\r\n")?;
+        let line = std::str::from_utf8(&data[pos..pos + nl]).ok()?;
+        let size = line.split(';').next().unwrap_or("").trim();
+        if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let n = usize::from_str_radix(size, 16).ok().filter(|&n| n <= MAX_CHUNK)?;
+        pos += nl + 2;
+        if n == 0 {
+            loop {
+                let nl = data[pos..].windows(2).position(|w| w == b"\r\n")?;
+                pos += nl + 2;
+                if nl == 0 {
+                    return Some(pos);
+                }
+            }
+        }
+        if data.len() < pos + n + 2 {
+            return None;
+        }
+        pos += n + 2;
+    }
 }
 
 /// VULN-FIX [nb-net-phase-e]: configurable upper bound on the size of an inbound
@@ -19985,7 +20109,54 @@ fn http_reject_and_close(stream: &mut TcpStream, status: i32) {
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
+/// Parse one request from a connection that will be closed after it: the
+/// one-shot server's parser, unchanged in behaviour.
 fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
+    let local = stream.local_addr().ok();
+    let peer = stream.peer_addr().ok();
+    let parsed = parse_http_request_core(&mut stream, Vec::new(), false, false)?;
+    Some(PendingRequest {
+        stream: Some(stream),
+        local,
+        peer,
+        method: parsed.method,
+        uri: parsed.uri,
+        headers: parsed.headers,
+        body: parsed.body,
+        reply: None,
+        persistent: false,
+        http11: false,
+    })
+}
+
+/// One request, parsed; `leftover` is whatever arrived after it on the wire.
+struct ParsedRequest {
+    method: String,
+    uri: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    persistent: bool,
+    http11: bool,
+    leftover: Vec<u8>,
+}
+
+/// The request parser, over a borrowed connection.
+///
+/// * `carry` — bytes already read past the previous request (a pipelined
+///   request may be entirely in here);
+/// * `between_requests` — this is not the connection's first request, so the
+///   peer may legitimately send nothing: wait `HTTPSRV_KEEPALIVE_IDLE` for the
+///   next request to START, and close quietly if it never does;
+/// * `persistent_conn` — another request may follow on this connection, so the
+///   body must be framed exactly and the bytes after it returned rather than
+///   discarded. The one-shot path passes `false` and keeps every historical
+///   rule, including the ones that are only safe because the connection ends.
+fn parse_http_request_core(
+    stream: &mut TcpStream,
+    carry: Vec<u8>,
+    between_requests: bool,
+    persistent_conn: bool,
+) -> Option<ParsedRequest> {
     // The accept loop sets the LISTENER non-blocking; on Windows the accepted
     // stream inherits that mode, so a bare `read` returns WouldBlock the instant
     // the peer hasn't sent yet — which `Err(_) => return None` below would treat
@@ -19996,8 +20167,17 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     // the accepted stream BLOCKING so the read timeout below actually governs and
     // we wait for the request.
     stream.set_nonblocking(false).ok();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    let mut buf = Vec::with_capacity(4096);
+    let idle_wait = between_requests && carry.is_empty();
+    stream
+        .set_read_timeout(Some(if idle_wait {
+            HTTPSRV_KEEPALIVE_IDLE
+        } else {
+            Duration::from_secs(10)
+        }))
+        .ok();
+    let mut idle_armed = idle_wait;
+    let mut buf = carry;
+    buf.reserve(4096);
     let mut tmp = [0u8; 1024];
     // PERF [nb-net-phase-e]: scan only the newly-appended bytes for the
     // "\r\n\r\n" header terminator instead of re-running `buf.windows(4)` over
@@ -20009,11 +20189,24 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     // need not re-scan either. The detection result is identical to the original
     // full-buffer `windows(4).position(...)`.
     let mut scanned = 0usize;
-    let mut sep: Option<usize> = None;
-    loop {
+    // A pipelined request can already be complete in the carried bytes.
+    let mut sep: Option<usize> = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    if sep.is_none() {
+        scanned = buf.len().saturating_sub(3);
+    }
+    if !buf.is_empty() && !buf[0].is_ascii_uppercase() {
+        return None;
+    }
+    while sep.is_none() {
         match stream.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
+                if idle_armed {
+                    // The next request has started; the rest of it gets the
+                    // ordinary bound, not the idle interval.
+                    idle_armed = false;
+                    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                }
                 buf.extend_from_slice(&tmp[..n]);
                 // Fast-reject non-HTTP traffic: every HTTP request line starts
                 // with an uppercase-ASCII method token (GET/POST/PUT/...). A TLS
@@ -20051,7 +20244,7 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     let mut rl = req_line.splitn(3, ' ');
     let method = rl.next()?.to_string();
     let uri = rl.next()?.to_string();
-    let _ = rl.next()?;
+    let http11 = rl.next()?.trim().eq_ignore_ascii_case("HTTP/1.1");
     let mut headers = Vec::new();
     // VULN-FIX [nb-net-phase-e]: track Content-Length as an Option and DETECT
     // duplicate/conflicting declarations instead of silently letting the last
@@ -20100,14 +20293,14 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
                     Some(n) => match content_length {
                         Some(prev) if prev != n => {
                             // Conflicting duplicate Content-Length headers.
-                            http_reject_and_close(&mut stream, 400);
+                            http_reject_and_close(stream, 400);
                             return None;
                         }
                         _ => content_length = Some(n),
                     },
                     None => {
                         // Unparseable / list with differing values.
-                        http_reject_and_close(&mut stream, 400);
+                        http_reject_and_close(stream, 400);
                         return None;
                     }
                 }
@@ -20135,7 +20328,7 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
         if !last_is_chunked || chunked_count != 1 || !only_identity_or_chunked {
             // Unknown/unsupported transfer coding, or chunked applied more than
             // once / not last — reject instead of mis-framing the body.
-            http_reject_and_close(&mut stream, 400);
+            http_reject_and_close(stream, 400);
             return None;
         }
         // RFC 7230 §3.3.3 (3): if a message is received with BOTH a
@@ -20143,7 +20336,7 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
         // treated as suspect — a strong signal of request smuggling. Reject
         // outright rather than trusting either framing.
         if content_length.is_some() {
-            http_reject_and_close(&mut stream, 400);
+            http_reject_and_close(stream, 400);
             return None;
         }
         // The chunked body may not have fully arrived with the header (we read
@@ -20154,7 +20347,7 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
         // framing overhead, which is acceptable for a defensive upper bound.
         let mut raw = buf[sep + 4..].to_vec();
         if raw.len() > max_body {
-            http_reject_and_close(&mut stream, 413);
+            http_reject_and_close(stream, 413);
             return None;
         }
         // Completeness is decided by actually walking the chunk framing with the
@@ -20164,25 +20357,43 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
         // the full framing (through the terminating zero chunk) is present, so we
         // read more whenever it still errors — until we succeed, the peer closes,
         // the read times out, or we hit the byte cap.
+        let mut rest: Vec<u8> = Vec::new();
         let body = loop {
-            match http_decode_chunked(&raw) {
+            // On a connection that may carry another request the framing must
+            // be complete through its final CRLF, and whatever follows is the
+            // next request. The one-shot path keeps its historical rule.
+            let decoded = if persistent_conn {
+                match http_chunked_request_len(&raw) {
+                    Some(n) => {
+                        rest = raw[n..].to_vec();
+                        http_decode_chunked(&raw[..n])
+                    }
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "chunked body incomplete",
+                    )),
+                }
+            } else {
+                http_decode_chunked(&raw)
+            };
+            match decoded {
                 Ok(b) => break b,
                 Err(_) => match stream.read(&mut tmp) {
                     Ok(0) => {
                         // Peer closed before a complete, valid chunked body.
-                        http_reject_and_close(&mut stream, 400);
+                        http_reject_and_close(stream, 400);
                         return None;
                     }
                     Ok(n) => {
                         raw.extend_from_slice(&tmp[..n]);
                         if raw.len() > max_body {
-                            http_reject_and_close(&mut stream, 413);
+                            http_reject_and_close(stream, 413);
                             return None;
                         }
                     }
                     Err(_) => {
                         // Read timeout / I/O error with an incomplete body.
-                        http_reject_and_close(&mut stream, 400);
+                        http_reject_and_close(stream, 400);
                         return None;
                     }
                 },
@@ -20191,15 +20402,18 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
         // The decoded payload must itself stay within the cap (the raw cap bounds
         // framing + data, but enforce on the decoded size too, defensively).
         if body.len() > max_body {
-            http_reject_and_close(&mut stream, 413);
+            http_reject_and_close(stream, 413);
             return None;
         }
-        return Some(PendingRequest {
-            stream,
+        let persistent = http11 && !request_asks_close(&headers);
+        return Some(ParsedRequest {
             method,
             uri,
             headers,
             body,
+            persistent,
+            http11,
+            leftover: rest,
         });
     }
     let content_length = content_length.unwrap_or(0);
@@ -20207,7 +20421,7 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     // or allocate anything. Without this a remote peer could send a huge
     // Content-Length and stream gigabytes, exhausting process memory.
     if content_length > max_body {
-        http_reject_and_close(&mut stream, 413);
+        http_reject_and_close(stream, 413);
         return None;
     }
     // Any bytes already pulled in while reading the header also count toward the
@@ -20215,7 +20429,7 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
     // via a body that arrived in the same read as the header terminator.
     let leftover = &buf[sep + 4..];
     if leftover.len() > max_body {
-        http_reject_and_close(&mut stream, 413);
+        http_reject_and_close(stream, 413);
         return None;
     }
     // Allocate with bounded capacity (never the unbounded client value): we will
@@ -20233,22 +20447,36 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
                 if body.len() > max_body {
                     // Defensive: should be unreachable given the checks above,
                     // but never let the buffer grow past the cap.
-                    http_reject_and_close(&mut stream, 413);
+                    http_reject_and_close(stream, 413);
                     return None;
                 }
             }
             Err(_) => break,
         }
     }
-    if body.len() > content_length && content_length > 0 {
+    // Bytes past the body arrived with it. On a persistent connection they are
+    // the next request and go back to the caller. The one-shot rule below
+    // leaves them in a zero-length body, which is only harmless because that
+    // connection is about to close.
+    let leftover = if persistent_conn && body.len() > content_length {
+        let rest = body[content_length..].to_vec();
         body.truncate(content_length);
-    }
-    Some(PendingRequest {
-        stream,
+        rest
+    } else {
+        if body.len() > content_length && content_length > 0 {
+            body.truncate(content_length);
+        }
+        Vec::new()
+    };
+    let persistent = http11 && !request_asks_close(&headers);
+    Some(ParsedRequest {
         method,
         uri,
         headers,
         body,
+        persistent,
+        http11,
+        leftover,
     })
 }
 
@@ -20588,7 +20816,10 @@ fn re10_dispatch_pending(
     loop {
         let req_opt = {
             let mut q = request_queue().lock();
-            q.get_mut(&server_id).and_then(|v| v.pop())
+            // FIFO. `pop()` served the NEWEST request first, so under a burst
+            // the oldest waiter was the last one answered.
+            q.get_mut(&server_id)
+                .and_then(|v| if v.is_empty() { None } else { Some(v.remove(0)) })
         };
         let Some(req) = req_opt else { break };
         drained += 1;
@@ -20690,8 +20921,8 @@ fn re10_dispatch_pending(
                 // rule the field writes above follow. Storing local first also
                 // makes it reachable from the pinned exchange before the remote
                 // allocation can move it.
-                let local_sa = req.stream.local_addr().ok();
-                let remote_sa = req.stream.peer_addr().ok();
+                let local_sa = req.local;
+                let remote_sa = req.peer;
                 let local_val = match local_sa {
                     Some(sa) => {
                         let ip = sa.ip().to_string();
@@ -20840,7 +21071,10 @@ fn re10_dispatch_pending(
             }
             None => (404, b"Not Found".to_vec(), Vec::new(), 0),
         };
-        let stream = req.stream;
+        // Keep the connection only when it is a kept-alive connection AND the
+        // request allows it. Every response here is framed by Content-length
+        // (or is a HEAD, which has no body), so persistence is always safe.
+        let keep = req.reply.is_some() && req.persistent;
         let mut resp = Vec::with_capacity(128 + body_bytes.len());
         use std::io::Write as _;
         let _ = write!(&mut resp, "HTTP/1.1 {status} {}\r\n", http_reason(status));
@@ -20877,15 +21111,35 @@ fn re10_dispatch_pending(
             // case-sensitively against that exact spelling.
             let _ = write!(&mut resp, "Content-length: {}\r\n", body_bytes.len());
         }
-        resp.extend_from_slice(b"Connection: close\r\n\r\n");
+        // A persistent response carries no Connection header at all, as the
+        // real `ServerImpl` sends it (measured: `(none)` on HotSpot).
+        // Which closing responses say so, measured on HotSpot 25.0.3
+        // (`probes/HttpServerKeepAliveMatrixProbe.java`): an HTTP/1.0 exchange
+        // gets `Connection: close`; an HTTP/1.1 request that itself asked for
+        // `Connection: close` gets NO Connection header and is simply closed; a
+        // persistent response gets none. The one-shot path (no `reply`) keeps
+        // announcing the close it always performs.
+        if keep || (req.reply.is_some() && req.http11) {
+            resp.extend_from_slice(b"\r\n");
+        } else {
+            resp.extend_from_slice(b"Connection: close\r\n\r\n");
+        }
         if !is_head {
             resp.extend_from_slice(&body_bytes);
         }
-        // Write the response and close on a short-lived I/O thread (pure socket
-        // work, no VM context needed) so the dispatcher returns immediately to
-        // serve the next queued request instead of blocking on the per-connection
-        // lingering close.
-        re10_send_response(stream, resp);
+        match (req.reply, req.stream) {
+            // Kept-alive: the connection's own thread writes it, then either
+            // parses the next request or closes (see `re10_serve_connection`).
+            (Some(reply), _) => {
+                let _ = reply.send(resp);
+            }
+            // One-shot: write the response and close on a short-lived I/O thread
+            // (pure socket work, no VM context needed) so the dispatcher returns
+            // immediately to serve the next queued request instead of blocking
+            // on the per-connection lingering close.
+            (None, Some(stream)) => re10_send_response(stream, resp),
+            (None, None) => {}
+        }
     }
     Ok(drained)
 }
@@ -20902,20 +21156,98 @@ fn re10_send_response(mut stream: TcpStream, resp: Vec<u8>) {
     let _ = std::thread::Builder::new()
         .name("cratonvm-httpserver-resp".to_string())
         .spawn(move || {
-            use std::io::{Read as _, Write as _};
             let _ = stream.write_all(&resp);
             let _ = stream.flush();
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let mut drain = [0u8; 512];
-            loop {
-                match stream.read(&mut drain) {
-                    Ok(0) => break,
-                    Ok(_) => continue,
-                    Err(_) => break,
-                }
-            }
+            re10_lingering_close(stream);
         });
+}
+
+/// The graceful close both server paths end a connection with: FIN, then drain
+/// the read side until the peer closes, so Windows does not RST a peer still
+/// reading the response (see `re10_send_response`).
+fn re10_lingering_close(mut stream: TcpStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut drain = [0u8; 512];
+    loop {
+        match stream.read(&mut drain) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Serve one accepted connection for as long as it persists.
+///
+/// This is what makes the embedded server keep connections alive. It used to
+/// answer every request with `Connection: close`: measured with 1,500
+/// sequential requests, the server saw 1,500 distinct client ports where
+/// HotSpot's saw 1, and both JDK client stacks sat at ~2.5 ms per request
+/// against HotSpot's 0.1-0.3 ms. The connection owns this thread: it parses a
+/// request, hands it to the dispatchers, waits for the serialised response,
+/// writes it, and loops, carrying over any bytes that arrived past the request.
+///
+/// It ends on the peer closing, the idle interval passing with no new request,
+/// a request asking for `Connection: close` (lingering close, as the one-shot
+/// path does), a malformed request (already answered by the parser), or
+/// `stop()` shutting the socket.
+fn re10_serve_connection(server_id: i32, state: std::sync::Arc<ServerState>, mut stream: TcpStream) {
+    let local = stream.local_addr().ok();
+    let peer = stream.peer_addr().ok();
+    let conn_id = state.next_conn.fetch_add(1, Ordering::Relaxed);
+    if let Ok(handle) = stream.try_clone() {
+        state.conns.lock().insert(conn_id, handle);
+    }
+    let mut carry = Vec::new();
+    let mut between_requests = false;
+    let lingering = loop {
+        if !state.running.load(Ordering::SeqCst) {
+            break false;
+        }
+        let Some(parsed) = parse_http_request_core(
+            &mut stream,
+            std::mem::take(&mut carry),
+            between_requests,
+            true,
+        ) else {
+            break false;
+        };
+        between_requests = true;
+        carry = parsed.leftover;
+        let persistent = parsed.persistent;
+        let (reply, response) = std::sync::mpsc::channel::<Vec<u8>>();
+        re10_enqueue(
+            server_id,
+            &state,
+            PendingRequest {
+                stream: None,
+                local,
+                peer,
+                method: parsed.method,
+                uri: parsed.uri,
+                headers: parsed.headers,
+                body: parsed.body,
+                reply: Some(reply),
+                persistent,
+                http11: parsed.http11,
+            },
+            true,
+        );
+        let Ok(bytes) = response.recv() else {
+            break false;
+        };
+        if stream.write_all(&bytes).and_then(|()| stream.flush()).is_err() {
+            break false;
+        }
+        if !persistent {
+            break true;
+        }
+    };
+    state.conns.lock().remove(&conn_id);
+    if lingering {
+        re10_lingering_close(stream);
+    }
 }
 
 /// Synthetic Runnable whose `run()` drives the per-server HTTP dispatch loop on
@@ -21063,7 +21395,18 @@ fn re10_serve_loop_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let drained = re10_dispatch_pending(ctx, server_id)?;
         if drained == 0 {
             ctx.begin_blocking_region();
-            std::thread::sleep(Duration::from_millis(2));
+            if cratonvm_native_api::net_wait::event_waits_enabled() {
+                // Wake on the enqueue itself. The 2 ms sleep this replaces was
+                // paid by EVERY request of a sequential client, which always
+                // arrives to an empty queue. The bound only keeps `running`
+                // re-checked; `stop()` also notifies.
+                let mut q = request_queue().lock();
+                if q.get(&server_id).map_or(true, |v| v.is_empty()) {
+                    let _ = request_queue_ready().wait_for(&mut q, Duration::from_millis(50));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
             ctx.end_blocking_region();
         }
     }
@@ -21159,10 +21502,10 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
                 // this returns immediately). stop() takes the listener out from
                 // under us to close it synchronously, after which `as_ref()` is
                 // None and we exit.
-                let accepted = {
+                let (accepted, raw) = {
                     let guard = state_cl.listener.lock();
                     match guard.as_ref() {
-                        Some(l) => l.accept(),
+                        Some(l) => (l.accept(), cratonvm_native_api::net_wait::raw_sock(l)),
                         None => break,
                     }
                 };
@@ -21180,17 +21523,26 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
                         // testManyAsyncRequests. Parse is pure socket work and needs
                         // no VM context; the dispatcher thread(s) run the handler.
                         let sid = server_id;
+                        let conn_state = state_cl.clone();
                         let _ = std::thread::Builder::new()
                             .name(format!("cratonvm-httpserver-parse-{sid}"))
                             .spawn(move || {
-                                if let Some(pending) = parse_http_request(stream) {
-                                    let mut q = request_queue().lock();
-                                    q.entry(sid).or_default().push(pending);
+                                if httpsrv_keepalive_enabled() {
+                                    re10_serve_connection(sid, conn_state, stream);
+                                } else if let Some(pending) = parse_http_request(stream) {
+                                    re10_enqueue(sid, &conn_state, pending, false);
                                 }
                             });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1));
+                        // Kernel wait for the next connection. `stop()` takes
+                        // and closes the listener, which ends this wait at once
+                        // (the handle goes invalid) and the next pass exits.
+                        if cratonvm_native_api::net_wait::event_waits_enabled() {
+                            cratonvm_native_api::net_wait::wait_readable_raw(raw, 50);
+                        } else {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
                     }
                     Err(_) => break,
                 }
@@ -21207,12 +21559,15 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
 fn re10_open_listener(
     ctx: &mut dyn NativeContext,
     sa: ObjectRef,
+    backlog: i32,
 ) -> Result<(TcpListener, IpAddr, i32), MethodCallFailed> {
     let (host, port) = read_inet_socket_address(ctx, sa)?;
     let ip = resolve_host(&host)?;
     let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
-    let listener =
-        TcpListener::bind(addr).map_err(|e| ioex(format!("HttpServer bind {addr}: {e}")))?;
+    // `ServerImpl` binds with the caller's backlog (`< 1` meaning 50). This was
+    // `TcpListener::bind`, at std's 128 whatever `create(addr, backlog)` said.
+    let listener = cratonvm_native_api::net_wait::bind_tcp_listener(addr, backlog)
+        .map_err(|e| ioex(format!("HttpServer bind {addr}: {e}")))?;
     // Non-blocking so the accept loop polls `running` (and so it can be
     // closed promptly by stop()).
     listener.set_nonblocking(true).ok();
@@ -21254,6 +21609,8 @@ fn re10_alloc_server(
         running: AtomicBool::new(false),
         handlers: Mutex::new(Vec::new()),
         bound_port: AtomicI32::new(bound_port),
+        conns: Mutex::new(HashMap::new()),
+        next_conn: AtomicU64::new(0),
     });
     server_registry().lock().insert(server_id, state);
     let srv0 = try_alloc_concurrent_synthetic(ctx, class_name, 6)?;
@@ -21298,14 +21655,14 @@ pub(crate) fn re10_create_server(
     args: &[Value],
     class_name: &str,
 ) -> MethodCallResult {
-    // Backlog is advisory; `TcpListener::bind` uses the platform default.
-    let _backlog = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    // Handed to the listener; see `re10_open_listener`.
+    let backlog = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
     // `create(null, backlog)` is the documented way to obtain an UNBOUND
     // server ("If addr is null, then the bind method must be called to set
     // the address"). `obj_arg(args, 0)?` used to turn that into an NPE.
     let sa_arg = args.first().copied().unwrap_or(Value::Object(None));
     let bound = match sa_arg {
-        Value::Object(Some(sa)) => Some(re10_open_listener(ctx, sa)?),
+        Value::Object(Some(sa)) => Some(re10_open_listener(ctx, sa, backlog)?),
         _ => None,
     };
     let srv = re10_alloc_server(ctx, class_name, bound);
@@ -21367,8 +21724,8 @@ pub(crate) fn re10_bind_server(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         return Err(ioex("HttpServer.bind: server already bound"));
     }
     let sa = obj_arg(args, 1)?;
-    let _backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-    let (listener, bound_ip, bound_port) = re10_open_listener(ctx, sa)?;
+    let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let (listener, bound_ip, bound_port) = re10_open_listener(ctx, sa, backlog)?;
     *state.listener.lock() = Some(listener);
     state.bound_port.store(bound_port, Ordering::SeqCst);
     // Pin `this` across the address allocation (native stale-local family).
@@ -21628,7 +21985,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
                 let reg = server_registry().lock();
                 reg.get(&id).cloned()
             };
-            if let Some(state) = state {
+            if let Some(state) = &state {
                 state.running.store(false, Ordering::SeqCst);
                 // Close the OS listener NOW (drop it) so the port immediately
                 // refuses connections — a round-robin client must see a stopped
@@ -21637,6 +21994,20 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
                 state.listener.lock().take();
             }
             re10_dispatch_pending(ctx, id)?;
+            // Anything still queued is discarded under the queue lock, after
+            // `running` went false, so `re10_enqueue` cannot re-park a request
+            // behind the exiting dispatchers. Dropping those requests drops their
+            // reply senders, which releases their connection threads; the
+            // notify wakes idle dispatchers to see `running` and exit.
+            request_queue().lock().remove(&id);
+            request_queue_ready().notify_all();
+            if let Some(state) = &state {
+                // Kept-alive connections are parked in a read on their own
+                // threads. Shutting the socket ends that read; the thread exits.
+                for (_, conn) in state.conns.lock().drain() {
+                    let _ = conn.shutdown(std::net::Shutdown::Both);
+                }
+            }
             server_registry().lock().remove(&id);
         }
         ctx.set_field(this, HS_STARTED, Value::Int(0));
@@ -23574,6 +23945,83 @@ mod tests {
         assert_eq!(req.method, "GET");
         assert_eq!(req.uri, "/hi");
         assert!(req.headers.iter().any(|(k, v)| k == "Host" && v == "x"));
+    }
+
+    /// Writes `payload` in ONE write to a fresh loopback connection and returns
+    /// the server side, holding the client open until the returned handle is
+    /// dropped (so a parse sees the bytes, not an early EOF).
+    fn re10_pipelined(payload: &'static [u8]) -> (TcpStream, std::thread::JoinHandle<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(payload).unwrap();
+            c
+        });
+        let (stream, _) = listener.accept().unwrap();
+        (stream, client)
+    }
+
+    /// The one-shot parser's zero-length-body rule would swallow a pipelined
+    /// second request into the first request's body. The keep-alive parse must
+    /// hand it back instead, and the second parse must find it complete.
+    #[test]
+    fn re10_keepalive_parse_carries_a_pipelined_request_over() {
+        let (mut stream, client) =
+            re10_pipelined(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+        let first = parse_http_request_core(&mut stream, Vec::new(), false, true).unwrap();
+        assert_eq!(first.uri, "/a");
+        assert!(first.body.is_empty());
+        assert!(first.persistent);
+        let second = parse_http_request_core(&mut stream, first.leftover, true, true).unwrap();
+        assert_eq!(second.uri, "/b");
+        assert!(second.leftover.is_empty());
+        drop(client.join());
+    }
+
+    #[test]
+    fn re10_keepalive_parse_carries_over_after_a_content_length_body() {
+        let (mut stream, client) = re10_pipelined(
+            b"POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\n",
+        );
+        let first = parse_http_request_core(&mut stream, Vec::new(), false, true).unwrap();
+        assert_eq!(first.body, b"abc");
+        let second = parse_http_request_core(&mut stream, first.leftover, true, true).unwrap();
+        assert_eq!((second.method.as_str(), second.uri.as_str()), ("GET", "/b"));
+        drop(client.join());
+    }
+
+    #[test]
+    fn re10_keepalive_parse_carries_over_after_a_chunked_body() {
+        let (mut stream, client) = re10_pipelined(
+            b"POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /b HTTP/1.1\r\n\r\n",
+        );
+        let first = parse_http_request_core(&mut stream, Vec::new(), false, true).unwrap();
+        assert_eq!(first.body, b"abc");
+        let second = parse_http_request_core(&mut stream, first.leftover, true, true).unwrap();
+        assert_eq!(second.uri, "/b");
+        drop(client.join());
+    }
+
+    #[test]
+    fn re10_connection_close_and_http10_requests_are_not_persistent() {
+        let (mut stream, client) =
+            re10_pipelined(b"GET /a HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n");
+        assert!(!parse_http_request_core(&mut stream, Vec::new(), false, true).unwrap().persistent);
+        drop(client.join());
+        let (mut stream, client) = re10_pipelined(b"GET /a HTTP/1.0\r\n\r\n");
+        assert!(!parse_http_request_core(&mut stream, Vec::new(), false, true).unwrap().persistent);
+        drop(client.join());
+    }
+
+    #[test]
+    fn re10_chunked_request_len_requires_the_final_empty_line() {
+        assert_eq!(http_chunked_request_len(b"3\r\nabc\r\n0\r\n"), None);
+        // "3\r\n" + "abc\r\n" + "0\r\n" + "\r\n" = 3 + 5 + 3 + 2
+        assert_eq!(http_chunked_request_len(b"3\r\nabc\r\n0\r\n\r\n"), Some(13));
+        // "0\r\n" + "X-T: 1\r\n" + "\r\n" = 3 + 8 + 2; "NEXT" is the next request
+        assert_eq!(http_chunked_request_len(b"0\r\nX-T: 1\r\n\r\nNEXT"), Some(13));
+        assert_eq!(http_chunked_request_len(b"zz\r\n"), None);
     }
 
     // VULN-FIX [nb-net-phase-e] regression: an oversized advertised body must be

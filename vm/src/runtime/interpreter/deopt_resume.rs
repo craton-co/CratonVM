@@ -447,6 +447,7 @@ pub(super) fn resolve_inlined_callee(
         descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         interp_invocations: std::sync::atomic::AtomicU32::new(0),
+        tiering_settled: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -2004,9 +2005,10 @@ fn transfer_osr_exit_chain_into_live_frame(
 ///
 /// Step 9 follow-up (a): ALSO stamp the artifact's `DeoptEpochGuard` (baked into
 /// its frame-deopt stubs) with the same creation epoch and a stable pointer to
-/// the live-epoch cell, so `x64_deopt_entry` can short-circuit a superseded
-/// artifact BEFORE dereferencing the deopt box (the `CRATONVM_JIT_FREE_CODE=1`
-/// before-deref guard). No-op when no guard was emitted (`deopt_epoch_guard`
+/// the live-epoch cell. (`x64_deopt_entry` used it to short-circuit before
+/// dereferencing the deopt box under a `CRATONVM_JIT_FREE_CODE=1` mode that
+/// freed boxes under running frames; that mode is gone and the entry now
+/// ignores the guard.) No-op when no guard was emitted (`deopt_epoch_guard`
 /// null) — i.e. on every production artifact.
 #[inline]
 pub(super) fn stamp_compilation_epoch(
@@ -2030,39 +2032,6 @@ pub(super) fn stamp_compilation_epoch(
     }
 }
 
-/// deopt-osr Step 9 — resume a real-frame deopt under the epoch staleness
-/// guard, then drive de-speculation. Only reached under `CRATONVM_DEOPT_REAL`
-/// with `compiled.can_deopt_resume`, so it is inert in production.
-///
-/// 1. **Staleness guard.** The running artifact (`compiled`) carries the
-///    compilation epoch live when it was installed; the method's *live* epoch
-///    advances on every invalidation (`SharedVm::bump_compilation_epoch`). If
-///    the live epoch has moved past the artifact's, this compilation has been
-///    superseded — its baked `DeoptimizationPoint`s describe a speculation that
-///    has since been invalidated — so we do NOT resume its frame; we fall back
-///    to the safe whole-method re-run (returning `None`). This is the
-///    "assert the owning method's current epoch matches the box's creation
-///    epoch before following it" guard: a `DeoptimizationPoint` box is built
-///    during compilation (it cannot know the install-time epoch) and is
-///    reachable only through the artifact that baked it, so checking the
-///    artifact's `compilation_epoch` versions the box.
-/// 2. **Resume.** When the artifact is current, build + push the interpreter
-///    frame and resume at the trapping bci (`resume_real_ir_deopt`).
-/// 3. **De-speculation.** Record the deopt and drive the escalation policy
-///    (`DeoptimizationController::deoptimize`: log the event so the deopt rate
-///    is observable, evict so the next call recompiles, blacklist on repeated
-///    deopts), which also advances the live epoch. Run AFTER the resume
-///    decision so it only affects FUTURE invocations — the current frame,
-///    already resumed, is unaffected. The reason is recovered from the matching
-///    deopt point so OSR-exit events stay countable separately from guards.
-///
-/// Returns `Some` when the frame was resumed (caller returns it), `None` to
-/// fall through to the whole-method re-run.
-/// Legacy compatibility mirror. Ownership-safe reclamation keeps an executing
-/// artifact's reconstruction metadata alive, so stale frames remain resumable.
-pub(super) fn vm_jit_free_code_enabled() -> bool {
-    false
-}
 
 /// jit-invokedynamic-groovy-regression fix — does the stashed reconstructed
 /// frame belong to `cached`? The producer bakes the compiling method's
@@ -2204,6 +2173,31 @@ pub(super) fn despeculate_stashed_frame_method(
     );
 }
 
+/// deopt-osr Step 9 — resume a real-frame deopt under the epoch staleness
+/// guard, then drive de-speculation. Only reached under `CRATONVM_DEOPT_REAL`
+/// with `compiled.can_deopt_resume`, so it is inert in production.
+///
+/// 1. **Staleness guard.** The running artifact (`compiled`) carries the
+///    compilation epoch live when it was installed; the method's *live* epoch
+///    advances on every invalidation (`SharedVm::bump_compilation_epoch`). An
+///    artifact whose epoch is behind is superseded, but its frame is still
+///    resumed: the trapping frame owns its artifact, so the baked
+///    `DeoptimizationPoint` is valid and self-consistent with the code that
+///    trapped (the epochs version the speculation, not the frame layout).
+///    Only a redefinition of the declaring class, which invalidates the
+///    bytecode itself, falls back to the whole-method re-run (`None`).
+/// 2. **Resume.** Build + push the interpreter frame and resume at the
+///    trapping bci (`resume_real_ir_deopt`).
+/// 3. **De-speculation.** Record the deopt and drive the escalation policy
+///    (`DeoptimizationController::deoptimize`: log the event so the deopt rate
+///    is observable, evict so the next call recompiles, blacklist on repeated
+///    deopts), which also advances the live epoch. Run AFTER the resume
+///    decision so it only affects FUTURE invocations — the current frame,
+///    already resumed, is unaffected. The reason is recovered from the matching
+///    deopt point so OSR-exit events stay countable separately from guards.
+///
+/// Returns `Some` when the frame was resumed (caller returns it), `None` to
+/// fall through to the whole-method re-run.
 pub(super) fn real_frame_deopt_resume_and_despeculate(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -2244,19 +2238,18 @@ pub(super) fn real_frame_deopt_resume_and_despeculate(
         cached.class_name, cached.method_name, cached.method_descriptor
     );
     let live = shared.compilation_epoch_for(&method_key);
-    // Epoch freshness matters only in the `CRATONVM_JIT_FREE_CODE` A/B mode,
-    // where a superseded artifact's code and deopt boxes are actually freed.
-    // In the default retain-everything mode they are leaked for the process
-    // lifetime, and the snapshot is SELF-CONSISTENT with the (stale, still
-    // executing) code that trapped — the epochs version the speculation, not
-    // the frame layout — so resuming is sound once the identity check above
-    // passed (jit-invokedynamic-groovy-regression fix: skipping here forced
-    // the imprecise whole-method re-run for every trap arriving through a
-    // stale cached entry right after the first de-speculation, re-duplicating
-    // side effects). Class redefinition invalidates the bytecode itself, so
-    // it keeps the conservative skip in either mode.
+    // A superseded artifact still resumes. The trapping frame owns its
+    // artifact until it returns, so its code and deopt boxes are live, and the
+    // snapshot is SELF-CONSISTENT with the (stale, still executing) code that
+    // trapped — the epochs version the speculation, not the frame layout — so
+    // resuming is sound once the identity check above passed
+    // (jit-invokedynamic-groovy-regression fix: skipping here forced the
+    // imprecise whole-method re-run for every trap arriving through a stale
+    // cached entry right after the first de-speculation, re-duplicating side
+    // effects). Class redefinition invalidates the bytecode itself, so it keeps
+    // the conservative skip.
     let fresh = compiled.compilation_epoch >= live
-        || (!vm_jit_free_code_enabled() && !class_was_redefined(shared, cached.declaring_class_id));
+        || !class_was_redefined(shared, cached.declaring_class_id);
     let resumed = if fresh {
         resume_real_ir_deopt(shared, thread, cached, rframe)
     } else {
@@ -2291,8 +2284,8 @@ pub(super) fn real_frame_deopt_resume_and_despeculate(
     // whole-method blacklist. Before that escalation can fire, give the SINGLE
     // speculation site that keeps failing a chance to be dropped on its own: once
     // THIS bci has deopted `PER_BCI_DESPEC_LIMIT` times, record `(method, bci)` in
-    // the de-spec registry the optimizing backend consults
-    // (`despec_contains`), so the next compilation suppresses just that
+    // THIS VM's de-spec registry (`shared.jit.despec_registry`), which every
+    // compile this VM requests consults, so the next compilation suppresses just that
     // speculative guard (falling back to per-access bounds checks) and the method
     // stays compiled. A method whose deopts are spread across many bcis still
     // hits the per-method backstop; a method with one pathological site gets
@@ -2315,7 +2308,10 @@ pub(super) fn real_frame_deopt_resume_and_despeculate(
             .lock()
             .deopt_count_at_bci(&method_key, rframe.bci);
         if bci_deopts >= PER_BCI_DESPEC_LIMIT {
-            cratonvm_jit::deopt::despec_insert(&method_key, rframe.bci);
+            shared
+                .jit
+                .despec_registry
+                .insert(&method_key, rframe.bci);
             if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] per-bci de-spec: {} bci={} ({} deopts ≥ {}) — \
@@ -2366,6 +2362,7 @@ mod deopt_step3_tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -2393,6 +2390,7 @@ mod deopt_step3_tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -2866,9 +2864,7 @@ mod deopt_step3_tests {
     /// and deopt boxes are leaked, so its snapshot remains self-consistent
     /// with the code that trapped, and refusing forced the corrupting
     /// imprecise re-run for traps arriving through stale cached entries. The
-    /// conservative skip is retained only under `CRATONVM_JIT_FREE_CODE`
-    /// (which actually frees the boxes — not unit-testable here without a
-    /// racy global env mutation) and after class redefinition.
+    /// conservative skip is retained only after class redefinition.
     #[test]
     fn step9_stale_artifact_resumes_in_retain_mode() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -2891,13 +2887,12 @@ mod deopt_step3_tests {
     /// deopt-osr Step 9 follow-up (c): per-bci de-spec. After
     /// `PER_BCI_DESPEC_LIMIT` deopts at the SAME bci, the sink records
     /// `(method, bci)` in the de-spec registry the optimizing backend consults
-    /// (`despec_contains`) — so that ONE speculation is suppressed on the next
-    /// compile instead of the whole method being blacklisted. Fewer deopts, or a
-    /// different bci, do not de-spec.
+    /// (`DespecRegistry::contains`) — so that ONE speculation is suppressed on
+    /// the next compile instead of the whole method being blacklisted. Fewer
+    /// deopts, or a different bci, do not de-spec. The registry is this test's
+    /// own `SharedVm`'s, so no other test can see or perturb it.
     #[test]
     fn step9_fuc_per_bci_despec_after_limit() {
-        // A test-unique method key so the process-global de-spec registry cannot
-        // collide with other parallel tests.
         let cached = Arc::new(CachedBytecodeMethod {
             declaring_class_id: cratonvm_types::ClassId::new(0),
             class_name: Arc::from("DespecFuC"),
@@ -2915,13 +2910,13 @@ mod deopt_step3_tests {
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            tiering_settled: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
             quickened: std::sync::OnceLock::new(),
         });
         let key = "DespecFuC.loop:()V";
-        cratonvm_jit::deopt::despec_clear_for_test();
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
@@ -2943,7 +2938,7 @@ mod deopt_step3_tests {
             };
             let _ =
                 real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &rf);
-            let despec_now = cratonvm_jit::deopt::despec_contains(key, 5);
+            let despec_now = shared.jit.despec_registry.contains(key, 5);
             if n < 4 {
                 assert!(
                     !despec_now,
@@ -2954,8 +2949,13 @@ mod deopt_step3_tests {
             }
         }
         // A different bci on the same method is unaffected — de-spec is per-site.
-        assert!(!cratonvm_jit::deopt::despec_contains(key, 9));
-        cratonvm_jit::deopt::despec_clear_for_test();
+        assert!(!shared.jit.despec_registry.contains(key, 9));
+        // And a second VM in the same process inherits none of it.
+        let other = SharedVm::new(VmConfig::default());
+        assert!(
+            !other.jit.despec_registry.contains(key, 5),
+            "a second VM must not inherit the first VM's despeculation"
+        );
     }
 
     /// jit-invokedynamic-groovy-regression fix — the frame-identity parser:

@@ -1020,8 +1020,13 @@ fn header_offset_emission_site_inventory_matches_the_doc() {
     // the shared cold pad above it does, and spells the constant through the
     // same checked `disp8_const` narrowing. A third site, still build-checked.
     let cases: [(&str, &str, usize); 7] = [
-        ("HEADER_SIZE", " as u8", 22),
-        ("HEADER_SIZE", " as i32", 13),
+        // 2026-09-12: 22 -> 21. The IEEE `CRC32` range fold was deleted with
+        // the never-registered intrinsic variants; its byte load was a site.
+        ("HEADER_SIZE", " as u8", 21),
+        // 2026-09-12: 13 -> 11. The vectorised `double[]` sum was retired (it
+        // reordered strict IEEE additions); its pre-header base and its
+        // scalar-tail displacement were two of these sites.
+        ("HEADER_SIZE", " as i32", 11),
         // 2026-09-11: +3 for the STRINGBUILDER_ACCESS / inline-`newarray`
         // work in `objects.rs` — the array allocator's disp8 screen and its
         // shape store, and the append body's capacity load. All three are
@@ -1050,7 +1055,6 @@ fn header_offset_emission_site_inventory_matches_the_doc() {
         );
     }
 }
-
 
 /// The array bounds check and its cold stub are ONE contract, split across two
 /// files, and neither half is correct alone.

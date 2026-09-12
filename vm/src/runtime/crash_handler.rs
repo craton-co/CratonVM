@@ -363,6 +363,17 @@ pub fn jit_state_lines(fault_pc: Option<usize>) -> Vec<String> {
             }
         }
     }
+    // A contained helper panic leaves the process running on a declined or
+    // thrown answer; a crash that follows one should say so. Both readers are
+    // non-blocking (an atomic load and a `try_lock`).
+    let contained = crate::jit::helper_guard::jit_helper_panic_count();
+    if contained > 0 {
+        let recent = crate::jit::helper_guard::jit_helper_recent_panics();
+        lines.push(format!(
+            "jit: runtime helper panics contained: {contained} (recent: {})",
+            if recent.is_empty() { "unavailable".to_string() } else { recent.join(", ") }
+        ));
+    }
     lines
 }
 
@@ -1906,6 +1917,16 @@ pub fn install_crash_handler() {
         // the one-report-per-process guard below, silently suppressing the
         // report for a later real crash. See `crate::runtime::native_oom`.
         if crate::runtime::native_oom::is_native_oom_panic(panic_info) {
+            return;
+        }
+        // A panic inside a JIT compile is caught one frame up and turned into a
+        // declined compile (`cratonvm_jit::tiered::contain_compile_panic`). Like
+        // the heap-exhaustion unwind above it is not a crash, and writing a
+        // report for it would latch the guard below, leaving the next REAL
+        // crash with no report. Chain to the previous hook so the panic message
+        // itself is still printed.
+        if cratonvm_jit::tiered::compile_panic_is_contained() {
+            prev(panic_info);
             return;
         }
         // Prevent recursive entry if the handler itself panics.

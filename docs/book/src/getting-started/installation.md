@@ -43,7 +43,7 @@ CratonVM builds with the standard Rust toolchain.
 
 **Prerequisites**
 
-- **Rust 1.80 or newer** — install via [rustup.rs](https://rustup.rs).
+- **Rust 1.88 or newer** — install via [rustup.rs](https://rustup.rs).
 - **A JDK (17+) is optional** — needed only to compile Java test classes and to
   boot against a real `java.base`. CratonVM runs standalone without one.
 - **Visual Studio Build Tools** (Windows only) — for the MSVC toolchain and

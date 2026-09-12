@@ -227,6 +227,57 @@ pub(crate) fn materialize_virtual_objects(
 
     let mut scope = TempRootScope::new(thread);
 
+    // Root every ORDINARY reference the frame holds before the first shell
+    // allocation, and re-read them once the allocations are done.
+    //
+    // Both callers take the frame out of the deopt stash first, so from here
+    // its `Object(addr)` locals, stack slots and monitor objects — and the
+    // `Object(addr)` field recipes inside the virtual objects — are raw
+    // addresses no root set names. Phase 1 allocates, and a moving young
+    // collection there left all of them pointing at from-space: Phase 2 then
+    // stored stale addresses into the new shells' fields and the resumed frame
+    // got stale locals. The pins ride the same window as the shell pins, so
+    // `keep_pins` extends them to the caller's frame push exactly as it does
+    // the shells.
+    enum RefSite {
+        Local(usize),
+        Stack(usize),
+        Monitor(usize),
+        Field { id: usize, index: usize },
+    }
+    let mut ref_pins: Vec<(RefSite, usize)> = Vec::new();
+    {
+        let mut pin = |scope: &mut TempRootScope<'_>, site: RefSite, addr: u64| {
+            if let Some(obj) = object_ref_from_addr(addr) {
+                let idx = scope.thread().native_pin_roots.len();
+                scope.thread().native_pin_roots.push(obj);
+                ref_pins.push((site, idx));
+            }
+        };
+        for (i, fv) in frame.locals.iter().enumerate() {
+            if let FrameValue::Object(addr) = fv {
+                pin(&mut scope, RefSite::Local(i), *addr);
+            }
+        }
+        for (i, fv) in frame.stack.iter().enumerate() {
+            if let FrameValue::Object(addr) = fv {
+                pin(&mut scope, RefSite::Stack(i), *addr);
+            }
+        }
+        for (i, m) in frame.monitors.iter().enumerate() {
+            if let FrameValue::Object(addr) = &m.object {
+                pin(&mut scope, RefSite::Monitor(i), *addr);
+            }
+        }
+        for (&id, state) in &states {
+            for (index, fv) in state.field_values.iter().enumerate() {
+                if let FrameValue::Object(addr) = fv {
+                    pin(&mut scope, RefSite::Field { id, index }, *addr);
+                }
+            }
+        }
+    }
+
     // Phase 1: a pinned shell per distinct id (ordered for determinism). Record
     // the pin index so post-(stress-)GC addresses can be read back from the
     // in-place-forwarded pin set.
@@ -268,6 +319,22 @@ pub(crate) fn materialize_virtual_objects(
             // in place.
             let t = scope.thread();
             maybe_gc_forced_pub_at(shared, t, "deopt-materialize");
+        }
+    }
+
+    // Re-read the ordinary references at their post-allocation addresses. No GC
+    // runs after this point, so the rewritten values stay valid.
+    for (site, pin) in ref_pins {
+        let addr = scope.thread().native_pin_roots[pin].as_ptr() as usize as u64;
+        match site {
+            RefSite::Local(i) => frame.locals[i] = FrameValue::Object(addr),
+            RefSite::Stack(i) => frame.stack[i] = FrameValue::Object(addr),
+            RefSite::Monitor(i) => frame.monitors[i].object = FrameValue::Object(addr),
+            RefSite::Field { id, index } => {
+                if let Some(state) = states.get_mut(&id) {
+                    state.field_values[index] = FrameValue::Object(addr);
+                }
+            }
         }
     }
 

@@ -7,7 +7,7 @@
 //!
 //! `jit_invoke_virtual_mic`'s emitted cascade is the reason an ordinary
 //! `invokeinterface` costs ~12 ns in this VM: it compares the receiver's class
-//! id against the slot's, loads `cached_entry_ptr`, and CALLs it with the
+//! id against the slot's, loads `cached_entry_word`, and CALLs it with the
 //! caller's own argument registers — never leaving compiled code. For a named
 //! class the Rust helper is entered ONCE per call site
 //! (`mic_calls=1` across 2 200 000 dispatches, measured with
@@ -501,6 +501,13 @@ pub fn lambda_adapter_entry(
     cm.method_label = format!("lambda-adapter->{impl_entry:#x}");
     let arc = Arc::new(cm);
     let entry = arc.entry_ptr() as usize;
+    // Profiler/debugger symbols (perf map, jitdump, GDB); no-op unless enabled.
+    crate::code_events::publish(entry, arc.code_len(), || {
+        crate::code_events::with_tier_suffix(
+            &arc.method_label,
+            crate::code_events::CodeTier::Stub("lambda-adapter"),
+        )
+    });
     crate::register_jit_entry_owner_for_adapter(entry, &arc);
     map.insert(key, arc);
     Some(entry)
@@ -528,10 +535,26 @@ pub fn adapters_reaching(targets: &HashSet<usize>) -> Vec<usize> {
 
 /// Drop thunks whose entries are being invalidated, so a later call site does
 /// not resurrect one that names evicted code.
+///
+/// A forgotten thunk is marked `retired` and handed to the retirement queue,
+/// the same path a method body takes. Marked, it is refused by
+/// `prepare_for_publication` and by the MIC/PIC installers, so a caller
+/// compiled after this point cannot bake it. Queued, its mapping is freed only
+/// once no thread can still be executing it, instead of on the spot when the
+/// map's `Arc` was the last one.
 pub fn forget_adapters(entries: &HashSet<usize>) {
-    adapters()
-        .lock()
-        .retain(|_, cm| !entries.contains(&(cm.entry_ptr() as usize)));
+    let mut forgotten = Vec::new();
+    adapters().lock().retain(|_, cm| {
+        let keep = !entries.contains(&(cm.entry_ptr() as usize));
+        if !keep {
+            forgotten.push(Arc::clone(cm));
+        }
+        keep
+    });
+    for cm in forgotten {
+        cm.retired.store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::defer_jit_owner(Some(cm));
+    }
 }
 
 #[cfg(test)]
@@ -746,6 +769,36 @@ mod tests {
         let mut buffer = ExecutableBuffer::new(64).expect("executable memory");
         buffer.emit(&[0xC3]); // RET
         Arc::new(CompiledMethod::new(buffer))
+    }
+
+    /// A forgotten thunk is retired, so nothing compiled later can bake or
+    /// install it, and it leaves the map.
+    #[test]
+    fn a_forgotten_adapter_is_retired_not_just_unmapped() {
+        let owner = dummy_impl();
+        let entry = lambda_adapter_entry(0x8000_0201, &owner, b"I", 1)
+            .expect("a one-int-capture thunk is emitted");
+        let thunk = adapters()
+            .lock()
+            .values()
+            .find(|cm| cm.entry_ptr() as usize == entry)
+            .cloned()
+            .expect("the thunk is cached");
+        assert!(!thunk.retired.load(std::sync::atomic::Ordering::SeqCst));
+
+        forget_adapters(&HashSet::from([entry]));
+
+        assert!(
+            thunk.retired.load(std::sync::atomic::Ordering::SeqCst),
+            "a forgotten thunk must be marked retired"
+        );
+        assert!(
+            !adapters()
+                .lock()
+                .values()
+                .any(|cm| cm.entry_ptr() as usize == entry),
+            "a forgotten thunk must leave the cache"
+        );
     }
 
     /// **Compressed oops must NOT stop a reference capture being thunked.**
