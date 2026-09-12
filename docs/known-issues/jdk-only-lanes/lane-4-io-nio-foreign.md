@@ -420,6 +420,15 @@ that mistake twice.
   vectors differing between the two --jdk-only arms:  none
 ```
 
+**Re-taken on the MERGE**, not carried over: `origin/dev` moved 49 commits
+under this wave, two of them other lanes' retirement tables. The merged binary
+(`0b491dce8`) reproduces the branch numbers to the line -- `L4FfmLayoutSweep`
+12 differing lines in `--jdk-only` and 48 in compatible, `FfmSegmentSweep` 40,
+the other two probes 0 -- and the `--jdk-only` corpus is 133 passed / 0 failed
+on it as well. The kind-map amendment and the probe A/B above were taken on the
+pre-merge binary and are unchanged by it; the stub ratchet was RE-MEASURED,
+because its three baselines moved twice while this wave was in flight.
+
 **137 refusals, 0 survivors**, and the control says why it mattered. Same probe,
 `--jdk-only --explain-jdk-only --jdk-only-report`:
 
