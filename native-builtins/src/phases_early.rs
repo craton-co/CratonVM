@@ -8638,6 +8638,79 @@ pub(crate) fn fjp_key(o: ObjectRef) -> usize {
     o.as_ptr() as usize
 }
 
+/// The bits `ForkJoinTask`'s write-once `status` word carries, verbatim from
+/// `javap -p java.util.concurrent.ForkJoinTask` on 17, 21 and 25 — the three
+/// images agree on all three values.
+///
+/// `DONE` is `1 << 31`, which is why every reader in the JDK spells the test
+/// `status < 0` rather than a mask.
+const FJT_STATUS_DONE: i32 = 1 << 31;
+const FJT_STATUS_ABNORMAL: i32 = 1 << 16;
+const FJT_STATUS_THROWN: i32 = 1 << 17;
+
+/// Stamp the REAL `ForkJoinTask.status` word to agree with what the side table
+/// has just recorded.
+///
+/// # Why a side table needed this and why the field is reachable now
+///
+/// The comment on [`fjp_state`] explains the side table: under a real layout
+/// `ctx.get_field(this, 1)` is not `done`, so fork/join/invoke all re-invoked
+/// `compute()`. That is an argument against reaching the field BY INDEX and it
+/// was silent about reaching it by NAME — `get_field_by_name` resolves `status`
+/// on the real class, and `apps/probes/L5FjStatus.java` reads the same field
+/// back through core reflection to prove the write landed rather than assuming
+/// it did.
+///
+/// # What this does and does not fix
+///
+/// It makes a COMPLETED task look completed to the JDK's own model, so the
+/// real `doExec()` — whose first act is `if ((s = status) >= 0)` — declines to
+/// run a body this VM has already run, and so bytecode that reads `isDone()` /
+/// `isCompletedAbnormally()` / `getException()` without passing through a
+/// native agrees with the natives that do.
+///
+/// It is NOT a claim. Nothing here marks a task as taken BEFORE its body runs,
+/// so two runners that start together still both run it; §3a's race has a
+/// window this narrows rather than closes. Stamping `DONE` early would close it
+/// and would also make `isDone()` true for a task that is still running, which
+/// is a different contract and a different change.
+///
+/// Never clears a bit. The real word is write-once per bit (`setDone()` is a
+/// bitwise OR, `trySetCancelled` stamps `DONE|ABNORMAL`), and a VM that could
+/// clear `ABNORMAL` would manufacture exactly the fabricated success W6-9
+/// removed from `fjp_state_set_done`.
+///
+/// Silent on a receiver with no such field: the synthetic-JDK carrier does not
+/// declare `status`, and `set_field_by_name` drops a store whose field the
+/// class does not have. There is nothing to agree with there — the side table
+/// is the only model in that mode.
+pub(crate) fn fjp_stamp_real_status(ctx: &mut dyn NativeContext, task: ObjectRef, bits: i32) {
+    let current = match ctx.get_field_by_name(task, "status") {
+        Value::Int(v) => v,
+        // No `status` field, or one that is not an int: the synthetic carrier.
+        _ => return,
+    };
+    if current & bits == bits {
+        return;
+    }
+    ctx.set_field_by_name(task, "status", Value::Int(current | bits));
+}
+
+/// `fjp_state_cancel` plus the matching stamp, for the six `cancel(Z)Z`
+/// registrations that all do the same two things.
+///
+/// The real `cancel` is `trySetCancelled()`, which ORs `DONE | ABNORMAL`.
+/// `THROWN` is deliberately absent: a cancelled task has no throwable, and
+/// `getException()` on one answers a `CancellationException` the JDK
+/// manufactures from `ABNORMAL` without `THROWN`.
+pub(crate) fn fjp_cancel_and_stamp(ctx: &mut dyn NativeContext, task: ObjectRef) -> bool {
+    let cancelled = fjp_state_cancel(task);
+    if cancelled {
+        fjp_stamp_real_status(ctx, task, FJT_STATUS_DONE | FJT_STATUS_ABNORMAL);
+    }
+    cancelled
+}
+
 /// Returns `(done, cached_result)` for the given task. If the task has
 /// never been seen, returns `(false, Value::Object(None))`.
 pub(crate) fn fjp_state_get(o: ObjectRef) -> (bool, Value) {
@@ -9230,7 +9303,7 @@ fn fjp_compute_and_complete(
         }
     };
     live_task = ctx.read_native_pin(task_pin, live_task);
-    let outcome = fjp_complete_from_outcome(live_task, outcome);
+    let outcome = fjp_complete_from_outcome(ctx, live_task, outcome);
     ctx.unpin_native_roots(task_pin);
     (live_task, outcome)
 }
@@ -9258,16 +9331,23 @@ pub(crate) fn fjp_compute_for_submit(
 /// `Err(InternalError)` is a VM-level failure rather than something the task
 /// "completed with", so it is passed through without touching the table.
 fn fjp_complete_from_outcome(
+    ctx: &mut dyn NativeContext,
     task: ObjectRef,
     outcome: Result<Value, MethodCallFailed>,
 ) -> Result<Value, MethodCallFailed> {
     match outcome {
         Ok(value) => {
             fjp_state_set_done(task, value);
+            fjp_stamp_real_status(ctx, task, FJT_STATUS_DONE);
             Ok(value)
         }
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
             fjp_state_set_thrown(task, exc);
+            fjp_stamp_real_status(
+                ctx,
+                task,
+                FJT_STATUS_DONE | FJT_STATUS_ABNORMAL | FJT_STATUS_THROWN,
+            );
             Err(MethodCallFailed::ExceptionThrown(exc))
         }
         Err(other) => Err(other),
@@ -9286,7 +9366,8 @@ fn fjp_compute_void(
         ctx.invoke_virtual(task, "compute", "()V", &[]).map(|_| ())
     };
     let live_task = ctx.read_native_pin(task_pin, task);
-    let outcome = fjp_complete_from_outcome(live_task, outcome.map(|()| Value::Object(None)));
+    let outcome =
+        fjp_complete_from_outcome(ctx, live_task, outcome.map(|()| Value::Object(None)));
     ctx.unpin_native_roots(task_pin);
     (live_task, outcome.map(|_| ()))
 }
@@ -9522,6 +9603,7 @@ fn fjp_complete_body(
         // `result` for the ordinary path, which is the same value.
         fjp_state_set_raw_result(this, val);
         fjp_state_set_done(this, val);
+        fjp_stamp_real_status(ctx, this, FJT_STATUS_DONE);
         return Ok(());
     }
     // `setRawResult` runs arbitrary bytecode and can allocate, so both the
@@ -9536,10 +9618,16 @@ fn fjp_complete_body(
     let recorded = match outcome {
         Ok(_) => {
             fjp_state_set_done(live_this, live_val);
+            fjp_stamp_real_status(ctx, live_this, FJT_STATUS_DONE);
             Ok(())
         }
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
             fjp_state_set_thrown(live_this, exc);
+            fjp_stamp_real_status(
+                ctx,
+                live_this,
+                FJT_STATUS_DONE | FJT_STATUS_ABNORMAL | FJT_STATUS_THROWN,
+            );
             Ok(())
         }
         // A VM-level failure is not something the task "completed with".
@@ -9664,7 +9752,7 @@ fn fjp_run_callable_as_task(
             .map(|v| v.unwrap_or(Value::Object(None)))
     };
     let live_task = ctx.read_native_pin(task_pin, task);
-    let recorded = fjp_complete_from_outcome(live_task, outcome);
+    let recorded = fjp_complete_from_outcome(ctx, live_task, outcome);
     ctx.unpin_native_roots(callable_pin);
     match recorded {
         Ok(_) | Err(MethodCallFailed::ExceptionThrown(_)) => Ok(live_task),
@@ -9720,7 +9808,7 @@ fn fjp_run_runnable_as_task(
     };
     let live_task = ctx.read_native_pin(task_pin, task);
     let result = read_pinned_object_value(ctx, result_pin, fixed_result);
-    let recorded = fjp_complete_from_outcome(live_task, outcome.map(|_| result));
+    let recorded = fjp_complete_from_outcome(ctx, live_task, outcome.map(|_| result));
     ctx.unpin_native_roots(runnable_pin);
     match recorded {
         Ok(_) | Err(MethodCallFailed::ExceptionThrown(_)) => Ok(live_task),
@@ -10183,9 +10271,9 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let threw = fjp_state_thrown(this).is_some();
         Ok(Some(Value::Int(i32::from(done && (cancelled || threw)))))
     });
-    r.register(fjt, "cancel", "(Z)Z", |_ctx, args| {
+    r.register(fjt, "cancel", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+        Ok(Some(Value::Int(i32::from(fjp_cancel_and_stamp(ctx, this)))))
     });
     r.register(fjt, "complete", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10264,9 +10352,9 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let (done, _) = fjp_state_get(this);
         Ok(Some(Value::Int(if done { 1 } else { 0 })))
     });
-    r.register(rt, "cancel", "(Z)Z", |_ctx, args| {
+    r.register(rt, "cancel", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+        Ok(Some(Value::Int(i32::from(fjp_cancel_and_stamp(ctx, this)))))
     });
     r.register(rt, "complete", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10321,9 +10409,9 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let (done, _) = fjp_state_get(this);
         Ok(Some(Value::Int(if done { 1 } else { 0 })))
     });
-    r.register(ra, "cancel", "(Z)Z", |_ctx, args| {
+    r.register(ra, "cancel", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+        Ok(Some(Value::Int(i32::from(fjp_cancel_and_stamp(ctx, this)))))
     });
     // KEEP: `RecursiveAction.getRawResult()` returns null in the real JDK too —
     // the class exists precisely for tasks whose `compute()` is void, so there
@@ -10902,9 +10990,9 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let (_, cancelled) = fjp_state_flags(this);
         Ok(Some(Value::Int(i32::from(cancelled))))
     });
-    r.register(fjt, "cancel", "(Z)Z", |_ctx, args| {
+    r.register(fjt, "cancel", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+        Ok(Some(Value::Int(i32::from(fjp_cancel_and_stamp(ctx, this)))))
     });
     r.register(fjt, "complete", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -10970,9 +11058,9 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let (done, _) = fjp_state_get(this);
         Ok(Some(Value::Int(if done { 1 } else { 0 })))
     });
-    r.register(rt, "cancel", "(Z)Z", |_ctx, args| {
+    r.register(rt, "cancel", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+        Ok(Some(Value::Int(i32::from(fjp_cancel_and_stamp(ctx, this)))))
     });
     r.register(rt, "complete", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -11007,9 +11095,9 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let (done, _) = fjp_state_get(this);
         Ok(Some(Value::Int(if done { 1 } else { 0 })))
     });
-    r.register(ra, "cancel", "(Z)Z", |_ctx, args| {
+    r.register(ra, "cancel", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+        Ok(Some(Value::Int(i32::from(fjp_cancel_and_stamp(ctx, this)))))
     });
     // KEEP: `RecursiveAction.getRawResult()` returns null in the real JDK too —
     // the class exists precisely for tasks whose `compute()` is void, so there
