@@ -2059,7 +2059,49 @@ use cratonvm_types::compat::CompatibilityMode;
 ///
 /// +19 every time, over controls 254 rows apart. That is what makes the
 /// delta a property of this branch rather than of a tree.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2911;
+/// # Lane 4 wave 3, 2026-09-12 — 28 table rows, THIRTY-TWO registrations
+///
+/// The group half of `jdk/internal/foreign/layout/`:
+/// `RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES`, 28 triples over `StructLayoutImpl`,
+/// `UnionLayoutImpl`, `SequenceLayoutImpl` and `PaddingLayoutImpl`.
+///
+/// ```text
+///   arm             OFF             ON              delta
+///   (default)   2884 / 13617    2916 / 13617        +32 / 0
+///   management  2911 / 13985    2943 / 13985        +32 / 0
+///   synthetic   2884 / 13652    2916 / 13652        +32 / 0
+/// ```
+///
+/// **+32 against a 28-row table, and the four are not a discrepancy.** THE UNIT
+/// HERE IS ONE REGISTRATION; the table's unit is one triple. `byteSize` and
+/// `byteAlignment` on `StructLayoutImpl` and `UnionLayoutImpl` are each
+/// registered TWICE, from two neighbouring loops in
+/// `native-builtins/src/phases_late/foreign_ffm.rs`, so one shadows the other
+/// and both are re-tagged. The same distinction the `--dump-native-registry`
+/// census makes, and the same one wave 2's `51 table row(s)` against 71 moving
+/// registrations made.
+///
+/// **The OFF column was PRINTED, not inferred from a `<=` pass**, and it
+/// reproduces the three stub constants this wave found here exactly. It names
+/// the four group CLASSES rather than the prefix: the prefix would have
+/// un-retired wave 2's 137 value-layout rows as well, and an OFF column that
+/// undoes a NEIGHBOUR's wave is not this wave's before-number -- it read as a
+/// 24-row probe improvement that is not this table's. The arm report prints
+/// `7 + 7 + 8 + 6 = 28 table row(s)`, which is the receipt that it armed this
+/// table and not that one.
+///
+/// **Re-measured on the merge**, and that mattered twice: the three stub
+/// baselines moved under this wave while it was in flight (2865 -> 2884,
+/// 2892 -> 2911), so the `+32` is identical each time only because it was
+/// measured each time rather than added.
+///
+/// **The `MEASURED_TOTAL_REGISTRATIONS_*` move is NOT this wave's.** All three
+/// read 8 above the constants in BOTH columns -- 13977 -> 13985,
+/// 13609 -> 13617, 13644 -> 13652 -- so the drift arrived with the same merge
+/// that moved the stub baselines and is recorded here rather than absorbed. A
+/// wave that changed them would show a total moving between its OWN two
+/// columns, and none of these does.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2943;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2338,7 +2380,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2911;
 ///
 /// +19 every time, over controls 254 rows apart. That is what makes the
 /// delta a property of this branch rather than of a tree.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2884;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2916;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2539,7 +2581,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2884;
 ///
 /// +19 every time, over controls 254 rows apart. That is what makes the
 /// delta a property of this branch rather than of a tree.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2884;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2916;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2599,7 +2641,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2884;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13977;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13985;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2612,7 +2654,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13977;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13609;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13617;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2638,7 +2680,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13609;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13644;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13652;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

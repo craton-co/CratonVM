@@ -672,10 +672,15 @@ moving registrations made.
 
 ```text
   arm             OFF             ON              delta
-  (default)   2865 / 13609    2897 / 13609        +32 / 0
-  management  2892 / 13977    2924 / 13977        +32 / 0
-  synthetic   2865 / 13644    2897 / 13644        +32 / 0
+  (default)   2884 / 13617    2916 / 13617        +32 / 0
+  management  2911 / 13985    2943 / 13985        +32 / 0
+  synthetic   2884 / 13652    2916 / 13652        +32 / 0
 ```
+
+Re-measured on the merge with `origin/dev`, not carried over: the three stub
+baselines moved under this wave while it was in flight (2865 -> 2884,
+2892 -> 2911), so the `+32` is identical each time only because it was measured
+each time rather than added.
 
 The OFF column names the four CLASSES, not the prefix: the prefix would have
 un-retired wave 2's 137 value-layout rows as well, and **an OFF column that
