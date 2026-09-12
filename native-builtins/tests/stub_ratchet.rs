@@ -2257,10 +2257,20 @@ use cratonvm_types::compat::CompatibilityMode;
 /// same sitting, and PASSED at the constants this line replaces.
 ///
 /// ```text
+///   FIRST derivation, control 0ad29ab00
 ///                       no-mgmt   mgmt   syn-jdk   total registrations
-///   control  0ad29ab00     3832   3859      3832   13593 / 13961 / 13628
-///   trial    this wave     3913   3940      3913   13593 / 13961 / 13628
+///   control                3832   3859      3832   13593 / 13961 / 13628
+///   trial                  3913   3940      3913   13593 / 13961 / 13628
+///
+///   SECOND, on the LANDING tree after a sibling lane re-froze these arms
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control  f33bceb7d     3863   3890      3863   13586 / 13954 / 13621
+///   trial                  3944   3971      3944   13586 / 13954 / 13621
 /// ```
+///
+/// +81 in both sittings, on controls 31 rows apart, and the totals identical
+/// within each. The number below is the SECOND one, measured -- not the first
+/// one plus the sibling's delta.
 ///
 /// The total not moving in any arm is the reading this file asks for: every
 /// added stub row is an existing `Bridge` relabelled, none is a new fake.
@@ -2658,10 +2668,20 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3971;
 /// same sitting, and PASSED at the constants this line replaces.
 ///
 /// ```text
+///   FIRST derivation, control 0ad29ab00
 ///                       no-mgmt   mgmt   syn-jdk   total registrations
-///   control  0ad29ab00     3832   3859      3832   13593 / 13961 / 13628
-///   trial    this wave     3913   3940      3913   13593 / 13961 / 13628
+///   control                3832   3859      3832   13593 / 13961 / 13628
+///   trial                  3913   3940      3913   13593 / 13961 / 13628
+///
+///   SECOND, on the LANDING tree after a sibling lane re-froze these arms
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control  f33bceb7d     3863   3890      3863   13586 / 13954 / 13621
+///   trial                  3944   3971      3944   13586 / 13954 / 13621
 /// ```
+///
+/// +81 in both sittings, on controls 31 rows apart, and the totals identical
+/// within each. The number below is the SECOND one, measured -- not the first
+/// one plus the sibling's delta.
 ///
 /// The total not moving in any arm is the reading this file asks for: every
 /// added stub row is an existing `Bridge` relabelled, none is a new fake.
@@ -2928,10 +2948,20 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3944;
 /// same sitting, and PASSED at the constants this line replaces.
 ///
 /// ```text
+///   FIRST derivation, control 0ad29ab00
 ///                       no-mgmt   mgmt   syn-jdk   total registrations
-///   control  0ad29ab00     3832   3859      3832   13593 / 13961 / 13628
-///   trial    this wave     3913   3940      3913   13593 / 13961 / 13628
+///   control                3832   3859      3832   13593 / 13961 / 13628
+///   trial                  3913   3940      3913   13593 / 13961 / 13628
+///
+///   SECOND, on the LANDING tree after a sibling lane re-froze these arms
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   control  f33bceb7d     3863   3890      3863   13586 / 13954 / 13621
+///   trial                  3944   3971      3944   13586 / 13954 / 13621
 /// ```
+///
+/// +81 in both sittings, on controls 31 rows apart, and the totals identical
+/// within each. The number below is the SECOND one, measured -- not the first
+/// one plus the sibling's delta.
 ///
 /// The total not moving in any arm is the reading this file asks for: every
 /// added stub row is an existing `Bridge` relabelled, none is a new fake.
