@@ -2092,6 +2092,45 @@ frames of new methods fall back to the return-address decode in root scans"
     id
 }
 
+/// A compile id reserved for a compilation still in progress.
+///
+/// Dropping it releases the id. A compile that bails after reserving (an
+/// overflowed buffer, an unallocated slot, any refusal) therefore returns its
+/// id instead of leaving the slot reserved for the life of the process. The
+/// finalizer moves the id into the `CompiledMethod` with [`Self::hand_off`],
+/// whose own `Drop` releases it from then on.
+#[derive(Debug)]
+pub(crate) struct CompileIdReservation(u32);
+
+impl CompileIdReservation {
+    /// Reserve an id; see [`reserve_compile_id`] for when this holds `0`.
+    pub(crate) fn reserve() -> Self {
+        Self(reserve_compile_id())
+    }
+
+    /// No identity: the prologue publishes nothing for this compile.
+    pub(crate) fn none() -> Self {
+        Self(0)
+    }
+
+    /// The reserved id, `0` when there is none.
+    pub(crate) fn id(&self) -> u32 {
+        self.0
+    }
+
+    /// Give the id to the artifact that will own it. This reservation holds
+    /// `0` afterwards, so dropping it releases nothing.
+    pub(crate) fn hand_off(&mut self) -> u32 {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for CompileIdReservation {
+    fn drop(&mut self) {
+        release_compile_id(self.0);
+    }
+}
+
 /// Reservations [`reserve_compile_id`] refused because no id was available.
 pub fn compile_id_exhaustions() -> u64 {
     COMPILE_ID_EXHAUSTIONS.load(std::sync::atomic::Ordering::Relaxed)
@@ -37552,6 +37591,29 @@ mod tests {
         // (A parallel test may already have been reissued the id once graced,
         // so the assertion is only that it no longer names this body.)
         assert_ne!(lookup_compile_id(id), Some(fake_cm));
+    }
+
+    /// A reservation owns its id until it is handed off. Handed off, the id
+    /// stays reserved when the reservation drops (the artifact releases it);
+    /// an empty reservation releases nothing. The drop-before-hand-off path is
+    /// `release_compile_id`, pinned above; asserting it here would race a
+    /// parallel test reissuing the id once graced.
+    #[test]
+    fn a_handed_off_compile_id_outlives_its_reservation() {
+        use std::sync::atomic::Ordering::Acquire;
+        let mut reservation = CompileIdReservation::reserve();
+        let id = reservation.hand_off();
+        assert_ne!(id, 0, "a fresh process table has ids to issue");
+        assert_eq!(reservation.id(), 0, "hand_off leaves nothing to release");
+        drop(reservation);
+        let slot = compile_id_slot(id).expect("a reserved id has a slot");
+        assert_eq!(
+            slot.load(Acquire),
+            COMPILE_ID_RESERVED,
+            "dropping a handed-off reservation must not release the artifact's id"
+        );
+        release_compile_id(id);
+        drop(CompileIdReservation::none());
     }
 
     #[test]

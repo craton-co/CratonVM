@@ -912,7 +912,7 @@ struct Lowerer<'a> {
     /// owning the innermost RBP without decoding the call that created the
     /// frame. Both 0 when unavailable → nothing is published.
     inline_cm_tls_disp: usize,
-    compile_id: u32,
+    compile_id: crate::CompileIdReservation,
     /// `jit_service_callee_deopt` — services a compiled callee's `i64::MIN`
     /// deopt sentinel at the megamorphic stub's inline call site, so the
     /// callee's stashed frame is resumed there instead of escaping to the
@@ -1687,9 +1687,9 @@ impl<'a> Lowerer<'a> {
             compile_id: if crate::x64::inline_rbp_tls_disp() != 0
                 && crate::x64::inline_cm_tls_disp() != 0
             {
-                crate::reserve_compile_id()
+                crate::CompileIdReservation::reserve()
             } else {
-                0
+                crate::CompileIdReservation::none()
             },
             service_callee_deopt: helpers.service_callee_deopt,
             branch_hints,
@@ -4284,7 +4284,7 @@ impl<'a> Lowerer<'a> {
         self.buf.emit_byte(0x25); // SIB: [disp32] absolute
         self.buf
             .emit(&(self.inline_cm_tls_disp as u32).to_le_bytes());
-        self.buf.emit(&self.compile_id.to_le_bytes());
+        self.buf.emit(&self.compile_id.id().to_le_bytes());
     }
 
     /// Cache `*mut JvmThread` in its reserved slot.
@@ -19092,8 +19092,9 @@ pub(crate) fn lower_inner_with_scopes(
     }
 
     // Carry the identity the prologue encoded, so publication can bind it to
-    // the artifact this buffer becomes.
-    let compile_id = lowerer.compile_id;
+    // the artifact this buffer becomes. It stays a reservation until the
+    // artifact exists: the overflow refusal below drops it, releasing the id.
+    let mut compile_id = lowerer.compile_id;
     let mut buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
     // non-panicking: on capacity exhaustion it sets a sticky `overflowed` flag
@@ -19123,7 +19124,7 @@ pub(crate) fn lower_inner_with_scopes(
     let _code_size = buf.pos();
 
     let mut cm = CompiledMethod::new(buf);
-    cm.compile_id = compile_id;
+    cm.compile_id = compile_id.hand_off();
     cm.deopt_points = deopt_points;
     // Published unconditionally since 2026-09-09.
     //

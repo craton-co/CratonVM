@@ -2848,7 +2848,9 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // caller lookup answered with the enclosing class. The optimizing backend
     // never had the bug: `ir_lower.rs` assigns `cm.compile_id` at its own
     // finalize, which is the line this mirrors.
-    cm.compile_id = compiler.compile_id;
+    // Handed off, not copied: a compile that bails before this line drops
+    // the reservation, which releases the id.
+    cm.compile_id = compiler.compile_id.hand_off();
     // Stage A.2 (precise oop maps, B-K fix) — a method is "fully precisely
     // covered" only when EVERY GC-capable safepoint that flushed its
     // register-locals (`safepoint_pcs`) also recorded a precise oop map

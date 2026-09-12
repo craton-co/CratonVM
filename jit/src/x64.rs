@@ -1365,7 +1365,7 @@ struct Compiler {
     /// This compilation's identity, reserved BEFORE codegen because the
     /// immediate must be encoded into the prologue while the `CompiledMethod`
     /// that will own it does not exist yet. 0 → publish nothing.
-    compile_id: u32,
+    compile_id: crate::CompileIdReservation,
     /// Step 1 debug self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`) —
     /// when set AND inline frame-record is active, also emit the verify call.
     verify_inline_frame_record: bool,
@@ -2551,9 +2551,9 @@ impl Compiler {
             0
         };
         let compile_id = if inline_cm_tls_disp != 0 {
-            crate::reserve_compile_id()
+            crate::CompileIdReservation::reserve()
         } else {
-            0
+            crate::CompileIdReservation::none()
         };
         let verify_inline_frame_record = verify_inline_frame_record_enabled();
         let shadow_enabled = shadow_stack_maps_enabled();

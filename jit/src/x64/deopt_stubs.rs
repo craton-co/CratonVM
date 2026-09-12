@@ -2252,7 +2252,7 @@ impl Compiler {
                 // (0 when none was reserved). A compiled method pushes no
                 // interpreter frame, so without it the helper could only name
                 // the interpreted CALLER as the method that trapped.
-                let trap_reason_word = (reason as u64) | (u64::from(self.compile_id) << 32); // Cast: reason code is a small non-negative value
+                let trap_reason_word = (reason as u64) | (u64::from(self.compile_id.id()) << 32); // Cast: reason code is a small non-negative value
                                                                                              // vm_ptr is in the heap_local (frame slot) — load it first
                 #[cfg(target_os = "windows")]
                 {
