@@ -890,11 +890,7 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         let class_name = "jdk/internal/misc/Unsafe";
         let unsafe_obj = try_alloc_concurrent_synthetic(ctx, class_name, 0)?;
         ctx.set_static_field_by_name(class_name, "theUnsafe", Value::Object(Some(unsafe_obj)));
-        ctx.set_static_field_by_name(
-            class_name,
-            "ADDRESS_SIZE",
-            Value::Int(UNSAFE_ADDRESS_SIZE),
-        );
+        ctx.set_static_field_by_name(class_name, "ADDRESS_SIZE", Value::Int(UNSAFE_ADDRESS_SIZE));
         Ok(None)
     });
     r.register(
