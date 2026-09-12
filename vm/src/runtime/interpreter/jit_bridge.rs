@@ -402,6 +402,12 @@ pub(super) fn compile_osr_artifact(
     max_locals: usize,
     entry_pc: usize,
 ) -> Option<Arc<crate::jit::CompiledMethod>> {
+    // x86-64 ONLY: this door calls `x64::compile_with_param_slots` directly,
+    // and no other backend publishes OSR entry points. On any other target it
+    // would publish x86-64 bytes. `cfg!` keeps the body type-checked there.
+    if cfg!(not(target_arch = "x86_64")) {
+        return None;
+    }
     let osr_key = crate::jit::tiered::MethodKey::new(&class_name, &method_name, &method_descriptor);
     osr_stage("entry");
     cratonvm_types::osr_refusal_census::note_attempt();
