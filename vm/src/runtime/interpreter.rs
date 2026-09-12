@@ -4187,6 +4187,7 @@ pub fn execute(
                                         let cached =
                                             Arc::new(CachedBytecodeMethod {
                                                 declaring_class_id: class_id,
+                                                tiering_settled: std::sync::atomic::AtomicU32::new(0),
                                                 class_name: Arc::from(class_name_str.as_str()),
                                                 method_name: Arc::from(method_name),
                                                 method_descriptor: Arc::from(method_descriptor),

@@ -19778,9 +19778,11 @@ mod tests {",
             body.contains("fn publish_gp_from_slot"),
             "the scanned region no longer contains the publish helpers — the              test module boundary moved"
         );
+        // Whitespace-insensitive: rustfmt re-wraps method chains.
+        let squashed: String = body.split_whitespace().collect();
         assert!(
-            body.contains("ir_phi_home_publish_guard_enabled()")
-                && body.contains("self.home_dropped.get(c.phi as usize)"),
+            squashed.contains("ir_phi_home_publish_guard_enabled()")
+                && squashed.contains("self.home_dropped.get(c.phiasusize)"),
             "the dropped-home publish guard is gone from `emit_phi_copies`; a              phi whose home was dropped would be published from a word nothing              wrote"
         );
         // The PHI publishes only. Every other `publish_*_from_slot` call in

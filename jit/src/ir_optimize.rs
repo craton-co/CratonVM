@@ -3291,6 +3291,82 @@ fn eliminate_write_only_stores(graph: &mut Graph) {
 
 /// Remove nodes not reachable from the exit (Return), from any other
 /// side-effecting root, or from a safepoint snapshot.
+/// Is an `op` with no consumer still observable, so dead-node elimination must
+/// keep it?
+///
+/// Exhaustive on purpose -- see the call site in [`eliminate_dead_nodes`].
+fn is_dce_root(op: &Op) -> bool {
+    match op {
+        // Program exits: every `Return`, not just `graph.exit` (see the call
+        // site), and a throw, whose exception input must stay reachable.
+        Op::Return | Op::Throw => true,
+        // Memory effects and calls: their token or result may have no reader.
+        Op::Store(_) | Op::Call { .. } | Op::LambdaIntToDouble => true,
+        // cov-01: `ldc <Class>` and `getstatic` can run `<clinit>` and throw;
+        // `ldc <String>` interns, which `==` on a later literal observes.
+        Op::ConstString { .. } | Op::ConstClass { .. } | Op::LoadStatic { .. } => true,
+        // Reads that throw: NullPointerException, an out-of-bounds index,
+        // ClassCastException, or a null unboxing receiver. An unused
+        // `a.length` or `o.f` still owes its exception.
+        Op::Load(_)
+        | Op::ArrayLoad(_)
+        | Op::ArrayStore(_)
+        | Op::ArrayLength
+        | Op::CheckCast { .. }
+        | Op::Unbox { .. } => true,
+        // Allocation can run `<clinit>` (`new`), throw
+        // NegativeArraySizeException (`newarray`) or OutOfMemoryError. Scalar
+        // replacement retires the allocations it removes by marking them
+        // `Op::Dead` itself; it does not rely on this pass.
+        Op::New { .. } | Op::NewArray { .. } => true,
+        // Monitors: deleting one of a pair is an IllegalMonitorStateException,
+        // and deleting both is unplanned lock elision.
+        Op::MonitorEnter | Op::MonitorExit => true,
+        // A guard exists for the deopt it takes; it produces no value.
+        Op::Guard { .. } => true,
+        // Control structure is kept by reachability from the roots above.
+        Op::Start | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Phi => false,
+        // Pure values. `Div`/`Rem` owe ArithmeticException through the guard
+        // the builder anchors beside them, not through the node itself.
+        Op::Const(_)
+        | Op::ConstF(_)
+        | Op::Param(_)
+        | Op::InstanceOf { .. }
+        | Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Rem
+        | Op::Neg
+        | Op::And
+        | Op::Or
+        | Op::Xor
+        | Op::Shl
+        | Op::Shr
+        | Op::UShr
+        | Op::Cmp(_)
+        | Op::LCmp
+        | Op::FCmp { .. }
+        | Op::I2L
+        | Op::L2I
+        | Op::I2F
+        | Op::I2D
+        | Op::L2F
+        | Op::L2D
+        | Op::F2I
+        | Op::F2L
+        | Op::F2D
+        | Op::D2I
+        | Op::D2L
+        | Op::D2F
+        | Op::I2B
+        | Op::I2C
+        | Op::I2S
+        | Op::ScalarIntrinsic(_)
+        | Op::Dead => false,
+    }
+}
+
 fn eliminate_dead_nodes(graph: &mut Graph) {
     if graph.exit == NO_NODE {
         return;
@@ -3354,52 +3430,17 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
     // array through the same deopt guard, and that throw is the observable
     // effect. `int n = a.length;` with `n` unused still has to NPE; deleting it
     // is not a faster answer, it is a dropped exception.
+    //
+    // The root set is decided by `is_dce_root`, an exhaustive match: a new
+    // `Op` does not compile until someone says whether deleting an unconsumed
+    // one is observable. The old allowlist silently made every unlisted op
+    // removable, which is how `getfield`, `checkcast`, `new` and `unbox` --
+    // all of which can throw -- came to be deleted when their value was unused.
     let mut worklist: Vec<NodeId> = graph
         .nodes
         .iter()
         .enumerate()
-        .filter(|(_, n)| {
-            matches!(
-                n.op,
-                Op::Return
-                    // cov-07: a throw is an observable program exit exactly
-                    // like a return — see the seeding comment above `Op::
-                    // Return`. Its exception-ref INPUT is what must stay
-                    // reachable (deleting the throw would silently turn
-                    // `throw e;` into nothing).
-                    | Op::Throw
-                    | Op::Store(_)
-                    | Op::Call { .. }
-                    // cov-01: all three are observable side effects whose value
-                    // may have no consumer. `ldc <Class>` and `getstatic` can
-                    // run `<clinit>` and throw; `ldc <String>` interns, which
-                    // is observable through `==` on a later literal. Deleting
-                    // one because nothing reads its result would drop the
-                    // class initialisation Java owes at that bytecode.
-                    | Op::ConstString { .. }
-                    | Op::ConstClass { .. }
-                    | Op::LoadStatic { .. }
-                    | Op::ArrayLoad(_)
-                    | Op::ArrayStore(_)
-                    | Op::ArrayLength
-                    // Monitors are observable side effects and must be roots.
-                    // Without this, DCE deletes a `monitorenter` whose result
-                    // nobody reads — lock elision by liveness sweep, with no
-                    // plan, no escape proof and no balance check, which is
-                    // exactly what `escape_analysis`' all-or-nothing elision
-                    // exists to prevent. Deleting only one of a pair is an
-                    // IllegalMonitorStateException.
-                    | Op::MonitorEnter
-                    | Op::MonitorExit
-                    // A guard's whole purpose is the deopt it takes when its
-                    // condition fails; it produces no value, so nothing else
-                    // roots it. Deleting the zero-divisor guard the builder
-                    // anchors at an `idiv`/`ldiv` would silently drop the
-                    // ArithmeticException that division owes — see
-                    // `IrBuilder::add_div_zero_guard`.
-                    | Op::Guard { .. }
-            )
-        })
+        .filter(|(_, n)| is_dce_root(&n.op))
         .map(|(id, _)| id as NodeId)
         .collect();
     if worklist.is_empty() {

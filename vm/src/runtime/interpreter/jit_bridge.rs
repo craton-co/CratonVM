@@ -9853,15 +9853,12 @@ pub(super) fn background_compile_task(
             .jit
             .jit_skip_set
             .read()
-            // The skip-set is keyed by `Arc<str>` and `MethodKey` holds
-            // `String`, so the probe has to materialise a key. Three small
-            // allocations on a path that runs once per FAILED compile task —
-            // not per invocation — which is the whole reason this check can
-            // afford to be here at all.
+            // The skip-set and `MethodKey` both hold `Arc<str>`, so the probe
+            // key is three reference-count bumps.
             .contains(&(
-                std::sync::Arc::from(task.method_key.class_name.as_str()),
-                std::sync::Arc::from(task.method_key.method_name.as_str()),
-                std::sync::Arc::from(task.method_key.descriptor.as_str()),
+                task.method_key.class_name.clone(),
+                task.method_key.method_name.clone(),
+                task.method_key.descriptor.clone(),
             ))
             || cratonvm_jit::is_jit_bail_listed(
                 &task.method_key.class_name,

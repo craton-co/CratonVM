@@ -8589,7 +8589,7 @@ mod tests {
         ];
         let result = compile_with("(II)I", 2, 3, &code);
         assert_eq!(eval_int_method(&result, &[100, 5]), 85);
-        assert_eq!(eval_int_method(&result, &[0, -15]), 0);
+        assert_eq!(eval_int_method(&result, &[0, -15]), 5); // 0 - (-15 + 10)
     }
 
     /// A stack deeper than the seven scratch registers keeps every operand, in

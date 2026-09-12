@@ -581,6 +581,42 @@ pub(crate) fn handler_has_unsafe_local_read(
                     propagated |= 1u64 << slot;
                 }
             }
+            // wide <load|store|iinc|ret> <u16 index> — the same reads and
+            // writes with a 16-bit slot. Without this arm a `wide iload 70`
+            // or a `wide iinc` of an unassigned slot read as safe.
+            0xc4 => {
+                if pc + 3 < code.len() {
+                    let real = code[pc + 1];
+                    let slot = u32::from(u16::from_be_bytes([code[pc + 2], code[pc + 3]]));
+                    let is_safe = slot < 64 && (safe & (1u64 << slot)) != 0;
+                    match real {
+                        0x15..=0x19 | 0xa9 => unsafe_read = !is_safe,
+                        0x36..=0x3a => {
+                            if slot < 64 {
+                                propagated |= 1u64 << slot;
+                            }
+                        }
+                        0x84 => {
+                            unsafe_read = !is_safe;
+                            if slot < 64 {
+                                propagated |= 1u64 << slot;
+                            }
+                        }
+                        _ => unsafe_read = true,
+                    }
+                } else {
+                    unsafe_read = true;
+                }
+            }
+            // ret reads its return-address local.
+            0xa9 => {
+                if pc + 1 < code.len() {
+                    let slot = code[pc + 1] as u32;
+                    unsafe_read = slot >= 64 || (safe & (1u64 << slot)) == 0;
+                } else {
+                    unsafe_read = true;
+                }
+            }
             0x84 => {
                 // iinc — reads then writes the same slot.
                 if pc + 1 < code.len() {
@@ -2308,6 +2344,24 @@ pub fn regalloc_invariants_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wide_local_read_in_a_handler_is_decoded() {
+        // wide iload 5; ireturn -- slot 5 is not safe on entry.
+        let code = [0xc4, 0x15, 0x00, 0x05, 0xac];
+        assert!(handler_has_unsafe_local_read(&code, code.len(), 0, 0));
+        assert!(!handler_has_unsafe_local_read(&code, code.len(), 0, 1 << 5));
+        // wide istore 5; wide iinc 5 1; wide iload 5; ireturn -- the store
+        // makes the later reads safe.
+        let code = [
+            0x03, 0xc4, 0x36, 0x00, 0x05, 0xc4, 0x84, 0x00, 0x05, 0x00, 0x01, 0xc4, 0x15, 0x00,
+            0x05, 0xac,
+        ];
+        assert!(!handler_has_unsafe_local_read(&code, code.len(), 0, 0));
+        // wide iinc 70 1 reads a slot the mask cannot name.
+        let code = [0xc4, 0x84, 0x00, 70, 0x00, 0x01, 0xb1];
+        assert!(handler_has_unsafe_local_read(&code, code.len(), 0, u64::MAX));
+    }
 
     // T1.1.22-25 — invariant checker unit tests.
     //

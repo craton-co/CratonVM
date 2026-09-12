@@ -6587,7 +6587,7 @@ pub fn c2_upgrade_would_engage(
             return false;
         }
     }
-    if !ir::ir_compatible(&scan) {
+    if !ir::ir_compatible_sized(&scan, code_len) {
         return false;
     }
     let fp_free = !method_uses_fp(code, code_len, descriptor);
@@ -6621,7 +6621,7 @@ pub fn scalar_selfrec_ir_would_engage(code: &[u8], code_len: usize, descriptor: 
     {
         return false;
     }
-    ir::ir_compatible(&scan)
+    ir::ir_compatible_sized(&scan, code_len)
         && !method_uses_category2(code, code_len, descriptor)
         && !method_uses_fp(code, code_len, descriptor)
 }
@@ -24802,6 +24802,8 @@ fn try_compile_inner(
             "optimize=false — the C1/fast tier was requested, not C2".to_string()
         } else if moving_young_disables_optimizing_tier() {
             "moving-young relocates compiled frames".to_string()
+        } else if code_len > ir::IR_MAX_BYTECODE_SIZE {
+            format!("bytecode length {code_len} exceeds IR_MAX_BYTECODE_SIZE")
         } else if !ir::ir_compatible(&scan) {
             // `ir_compatible` has already printed the refused conjunct.
             "ir_compatible refused (conjunct named above)".to_string()
@@ -24951,7 +24953,8 @@ fn try_compile_inner(
         // the runtime veto lifts and this gate re-arms together with it — and
         // `moving_young_disables_optimizing_tier` then announces itself again.
         && !moving_young_disables_optimizing_tier()
-        && ir::ir_compatible(&scan)
+        // The byte budget applies to every optimizing door, not just OSR.
+        && ir::ir_compatible_sized(&scan, code_len)
         // PERF-01. The single-pass backend has three bulk-byte loop lowerings
         // the IR tier does not: it replaces a scalar `boolean[]`/`byte[]`
         // element loop with a vectorised pre-header. Where those fire, an IR
