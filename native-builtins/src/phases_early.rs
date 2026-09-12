@@ -22215,15 +22215,31 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__ctor_cat);
-    r.register(
-        lr,
-        "getLevel",
-        "()Ljava/util/logging/Level;",
-        |ctx, args| lr_get(ctx, args, "level", 0),
-    );
-    r.register(lr, "getMessage", "()Ljava/lang/String;", |ctx, args| {
-        lr_get(ctx, args, "message", 1)
-    });
+    // `getLevel` and `getMessage` are NOT registered here -- deleted
+    // 2026-09-12 with `getSequenceNumber` below and the two `Handler` rows
+    // further down. All five triples are entries in `RETIRED_SHADOW_TRIPLES`,
+    // and all five retirements were INERT: the ambient category of this
+    // function is `Intrinsic`, `Intrinsic` is allowed under `--jdk-only`, and
+    // `--jdk-only` refuses only the honest stubs on the same triples. A refusal
+    // is not a removal, so the refused stub left THESE bodies in the slot and
+    // the real JDK bytecode the retirement exists to reach never ran.
+    //
+    // The note above `Handler.setLevel` had this written down -- "the
+    // `java/util/logging/` shadow retirement does not reach it either" -- and
+    // W7-25 and W7-56 had each lifted other rows out of this block into
+    // `Bridge` for the same reason. What was missing was an instrument, not a
+    // diagnosis: `stub_ratchet.rs`'s `no_retired_triple_survives_the_strict_boot`
+    // is one line of set arithmetic over the strict boot's own registry.
+    //
+    // DELETED rather than re-tagged `Bridge` the way W7-25 and W7-56 did,
+    // for two measured reasons. First, these five are already dead in
+    // compatible mode in all three feature arms -- a later registration
+    // (`lib.rs`, `reflect_annotations.rs`, `logmanager.rs`, `nio_native.rs`)
+    // owns every one of the slots -- so deleting changes nothing a compatible
+    // run does. Second, the kind-map gate fires on a CHANGED kind and
+    // explicitly tolerates a removed row (`scripts/jdk-only-kind-map.py`:
+    // "removed rows pass and are reported"), so a re-tag would owe an
+    // ~11,900-line baseline re-freeze that a deletion does not.
     r.register(lr, "setMessage", "(Ljava/lang/String;)V", |ctx, args| {
         lr_set(ctx, args, "message", 1)
     });
@@ -22364,9 +22380,8 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)V",
         |ctx, args| lr_set(ctx, args, "resourceBundleName", 8),
     );
-    r.register(lr, "getSequenceNumber", "()J", |ctx, args| {
-        lr_get(ctx, args, "sequenceNumber", 9)
-    });
+    // `getSequenceNumber` is NOT registered here -- see the note on `getLevel`
+    // and `getMessage` above. `setSequenceNumber` below is NOT retired and stays.
     r.register(lr, "setSequenceNumber", "(J)V", |ctx, args| {
         lr_set(ctx, args, "sequenceNumber", 9)
     });
@@ -22425,44 +22440,30 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // state. That explains the difference; it does not license deriving any
     // other row from it. G21-1, G15-1 §2, HANDOFF-20260814 §5.
     //
-    // In `Compatible` this registration does not own the slot --
-    // `reflect_annotations.rs:370` overwrites it and already carries this
-    // contract (MEASURED: `owns_slot=false inv=0` here, `owns_slot=true inv=11`
-    // there). `--jdk-only` never runs `register_synthetic_overrides`, so THIS
-    // body is the only one, and it owns the slot (MEASURED: `kind=intrinsic
-    // owns_slot=true overwrote=null inv=12`). The `java/util/logging/` shadow
-    // retirement does not reach it either: `retired_shadow.rs:445` lists the
-    // triple, but that retag fires only on an effective category of `Bridge`
-    // and this function's ambient category is `Intrinsic`.
-    r.register(
-        handler,
-        "setLevel",
-        "(Ljava/util/logging/Level;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if matches!(args.get(1), None | Some(Value::Object(None))) {
-                return Err(RuntimeError::NullPointerException { message: None }.into());
-            }
-            if handler_real_layout(ctx, this) {
-                ctx.set_field_by_name(this, "logLevel", args[1]);
-            } else {
-                ctx.set_field(this, 0, args[1]);
-            }
-            Ok(Some(Value::Object(None)))
-        },
-    );
-    r.register(
-        handler,
-        "getLevel",
-        "()Ljava/util/logging/Level;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if handler_real_layout(ctx, this) {
-                return Ok(Some(ctx.get_field_by_name(this, "logLevel")));
-            }
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
+    // THE `setLevel` AND `getLevel` NATIVES ARE GONE from this file as of
+    // 2026-09-12, deleted with the three `LogRecord` rows above. The contract
+    // above survives its registration because it is about the CONTRACT, which
+    // the real bytecode now has to satisfy and which the next person tempted to
+    // add a null check to a JUL setter needs to read. It is still under test:
+    // `jul_handler_set_level_*` in this file's `t2_tests` now score
+    // `reflect_annotations::register_annotation_overrides`, the registration
+    // that owns the slot in compatible mode and carries the same measurement.
+    //
+    // What the old note here said, and why it was the bug rather than the
+    // rationale: "In `Compatible` this registration does not own the slot --
+    // `reflect_annotations.rs` overwrites it (MEASURED: `owns_slot=false inv=0`
+    // here, `owns_slot=true inv=11` there). `--jdk-only` never runs
+    // `register_synthetic_overrides`, so THIS body is the only one, and it owns
+    // the slot (MEASURED: `kind=intrinsic owns_slot=true overwrote=null
+    // inv=12`). The `java/util/logging/` shadow retirement does not reach it
+    // either: `retired_shadow.rs` lists the triple, but that retag fires only on
+    // an effective category of `Bridge` and this function's ambient category is
+    // `Intrinsic`."
+    //
+    // Every clause of that is true and together they describe an INERT
+    // retirement: the row is tabled, the census reports no surviving stub, and
+    // the native still dispatches. Dead in compatible mode, sole owner in
+    // strict mode -- the exact inverse of what the table asks for.
     // W2: `Handler.close()`/`flush()` are ABSTRACT in the real JDK. An abstract
     // method takes the `check_override` branch, which marks the site native
     // regardless and caches by RECEIVER class, so these two no-ops did not just
@@ -26810,6 +26811,41 @@ mod t2_tests {
         r
     }
 
+    /// The registry that owns `Handler.setLevel` / `getLevel` in COMPATIBLE mode.
+    ///
+    /// This file registered both until 2026-09-12 and its registrations were
+    /// dead: `reflect_annotations::register_annotation_overrides` runs later and
+    /// overwrote them in every feature arm. They were deleted because, being
+    /// `Intrinsic`, they SURVIVED the `java/util/logging/` retirement's refusal
+    /// under `--jdk-only` and kept the real bytecode from running.
+    ///
+    /// The contract did not move with them, so neither do the two tests below:
+    /// they now score the body that actually dispatches, which carries the same
+    /// 2026-08-13 HotSpot measurement in its own comment.
+    fn jul_owner_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        crate::reflect_annotations::register_annotation_overrides(&mut r);
+        r
+    }
+
+    /// The owning body reads and writes `logLevel` BY NAME, where the deleted one
+    /// chose by layout and fell back to slot 0. So the mock has to declare the
+    /// field, or `set_field_by_name` silently no-ops and the assertion below
+    /// would be reading a slot nothing ever wrote.
+    fn jul_declare_log_level(ctx: &MockNativeContext, class_id: ClassId) {
+        ctx.set_declared_fields(
+            class_id,
+            vec![cratonvm_native_api::FieldMetadata {
+                name: "logLevel".to_string(),
+                descriptor: "Ljava/util/logging/Level;".to_string(),
+                access_flags: 0,
+                slot_index: 0,
+                declaring_class_id: class_id,
+                is_static: false,
+            }],
+        );
+    }
+
     fn jul_find(
         r: &NativeMethodRegistry,
         class: &str,
@@ -26855,7 +26891,7 @@ mod t2_tests {
     /// already there.
     #[test]
     fn jul_handler_set_level_null_is_refused_before_the_store() {
-        let r = jul_registry();
+        let r = jul_owner_registry();
         let set_level = jul_find(
             &r,
             "java/util/logging/Handler",
@@ -26871,6 +26907,7 @@ mod t2_tests {
 
         let mut ctx = mock_ctx();
         let handler = ctx.alloc_object(ClassId::new(0), 1);
+        jul_declare_log_level(&ctx, ClassId::new(0));
         let level = ctx.alloc_object(ClassId::new(1), 0);
         set_level(
             &mut ctx,
@@ -26899,7 +26936,7 @@ mod t2_tests {
     /// The happy path still stores, so the guard cannot be a blanket refusal.
     #[test]
     fn jul_handler_set_level_still_stores_a_real_level() {
-        let r = jul_registry();
+        let r = jul_owner_registry();
         let set_level = jul_find(
             &r,
             "java/util/logging/Handler",
@@ -26915,6 +26952,7 @@ mod t2_tests {
 
         let mut ctx = mock_ctx();
         let handler = ctx.alloc_object(ClassId::new(0), 1);
+        jul_declare_log_level(&ctx, ClassId::new(0));
         let warning = ctx.alloc_object(ClassId::new(1), 0);
         let all = ctx.alloc_object(ClassId::new(1), 0);
 

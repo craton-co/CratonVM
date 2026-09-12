@@ -1285,7 +1285,39 @@ pub(super) fn execute_invoke_kind(
     //
     // Costs one byte compare per non-special invoke on a name the caller has
     // already resolved; the body is reached only when the invariant is broken.
+    // ... and an array-typed call site whose receiver is NULL owes the same
+    // JEP 358 message every other `invokevirtual` owes. The receiver-driven
+    // `match` below has a `Value::Object(None)` arm that builds it; the
+    // array-typed branch is chosen BEFORE that match is reached, so a null
+    // array receiver used to skip the null check entirely and fall through to
+    // dispatch. `Object.clone()` is on `force_native_over_real_jdk_bytecode`'s
+    // list, so it reached `native_object_clone`, whose own null arm can only
+    // say `clone on null` — it is inside a native and has no bytecode context
+    // to name the expression from. MEASURED on JDK 25.0.3+9, BOTH modes:
+    //
+    //   static String[] sa;  sa.clone()
+    //     HotSpot   Cannot invoke "[Ljava.lang.String;.clone()"
+    //                 because "NpeCloneProbe.sa" is null
+    //     was       clone on null
+    //
+    // `arraylength` and `aaload` on the same null field were already right, so
+    // this was the one null-deref opcode family on an array that was not.
     if !is_special && method_class_name.starts_with('[') {
+        if matches!(args.first(), Some(Value::Object(None))) {
+            let npe_msg = helpful_npe_invoke_message(
+                shared,
+                thread,
+                frame_idx,
+                &method_class_name,
+                &method_name,
+                &method_descriptor,
+                num_params,
+            );
+            return Err(RuntimeError::NullPointerException {
+                message: Some(npe_msg),
+            }
+            .into());
+        }
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
             if shared.mem.heap.kind_of(recv) != cratonvm_types::ObjectKind::Array {
                 crate::memory::reclaim_guard::report_impossible_dispatch_terminal(

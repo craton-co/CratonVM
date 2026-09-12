@@ -1296,6 +1296,70 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // same tables answers `true` for exactly the two `java/time/` rows this
     // wave adds and `false` for everything else, as before.
     "java/time/",
+    // 2026-09-10, lane T wave 1. The 62 throwable-family classes, spelled OUT
+    // rather than collapsed to `java/lang/`, `java/io/` and `java/net/`.
+    //
+    // Lane 0 §4 asks for "the narrowest prefix that covers your entry", and the
+    // reason is not tidiness: this list is a SECOND guard, deliberately
+    // redundant with the tables, and `a_prefix_alone_retires_nothing` asserts
+    // that `java/lang/ref/Reference.clear()V` is not admitted by it. A blanket
+    // `java/lang/` would keep that test green and delete the guard for the next
+    // reader. Class names ARE the narrowest prefixes here, and the entries
+    // already covered by `java/text/` and `java/util/` are not repeated.
+    //
+    // Cost: the predicate's early-out is a linear `starts_with` scan, so this
+    // takes it from 7 entries to 52 -- roughly 13k registrations x 52 failed
+    // prefix compares at boot, once.
+    "java/io/EOFException",
+    "java/io/FileNotFoundException",
+    "java/io/IOException",
+    "java/io/NotSerializableException",
+    "java/io/UncheckedIOException",
+    "java/io/UnsupportedEncodingException",
+    "java/lang/AbstractMethodError",
+    "java/lang/ArithmeticException",
+    "java/lang/ArrayIndexOutOfBoundsException",
+    "java/lang/AssertionError",
+    "java/lang/ClassCastException",
+    "java/lang/ClassNotFoundException",
+    "java/lang/CloneNotSupportedException",
+    "java/lang/Error",
+    "java/lang/Exception",
+    "java/lang/ExceptionInInitializerError",
+    "java/lang/IllegalAccessError",
+    "java/lang/IllegalAccessException",
+    "java/lang/IllegalArgumentException",
+    "java/lang/IllegalStateException",
+    "java/lang/IncompatibleClassChangeError",
+    "java/lang/IndexOutOfBoundsException",
+    "java/lang/InstantiationException",
+    "java/lang/InternalError",
+    "java/lang/InterruptedException",
+    "java/lang/LinkageError",
+    "java/lang/MatchException",
+    "java/lang/NegativeArraySizeException",
+    "java/lang/NoClassDefFoundError",
+    "java/lang/NoSuchFieldError",
+    "java/lang/NoSuchFieldException",
+    "java/lang/NoSuchMethodError",
+    "java/lang/NoSuchMethodException",
+    "java/lang/NullPointerException",
+    "java/lang/NumberFormatException",
+    "java/lang/OutOfMemoryError",
+    "java/lang/ReflectiveOperationException",
+    "java/lang/RuntimeException",
+    "java/lang/SecurityException",
+    "java/lang/StackOverflowError",
+    "java/lang/StringIndexOutOfBoundsException",
+    "java/lang/Throwable",
+    "java/lang/TypeNotPresentException",
+    "java/lang/UnsatisfiedLinkError",
+    "java/lang/UnsupportedOperationException",
+    "java/lang/VerifyError",
+    "java/lang/reflect/InaccessibleObjectException",
+    "java/lang/reflect/InvocationTargetException",
+    "java/net/MalformedURLException",
+    "java/net/UnknownHostException",
     // 2026-09-11, L1 wave 5. NARROW, the way lane 7's two are and for the same
     // reason: `sun/util/` is a large tree whose locale-provider half this lane
     // has measured as NOT retirable (see `RETIRED_SHADOW_L1_ZI_TRIPLES`'s doc
@@ -2902,6 +2966,3490 @@ static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane T, wave 1 — the throwable family, retired whole: **906 triples over the
+/// 62 classes of `THROWABLE_FAMILY_CLASSES`**, 2026-09-10.
+///
+/// A fourth table rather than entries merged into a sibling, for the reason the
+/// second and third give for existing: this was adjudicated by a different
+/// SCOPE, and the scope is the part worth seeing at a glance.
+///
+/// # Why the scope is the CLASS SET and not the registrar
+///
+/// The lane owns *cross-cutting registrars*, and the throwable family is
+/// thirteen call sites in two files
+/// (`native-builtins/src/lang_misc.rs::register_throwable_subclass_natives` and
+/// `lib.rs::register_exception_extras_natives`) producing 872 of the lane's
+/// 1,100 rows. But the instrument that priced this wave —
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` — is keyed on the **receiver's class**, not
+/// on the registering file, which the census records only as
+/// `#[track_caller]` provenance. A registrar-scoped table would therefore retire
+/// a set the arm never measured, and would leave a MIXTURE behind: 34 rows on
+/// the same 62 classes come from a third registrar
+/// (`reflect_annotations.rs`, `InvocationTargetException`) and from `lib.rs`
+/// rows outside the two loops. `H0-4`'s standing finding is that
+/// uniform-native works, uniform-bytecode works, and the mixture is the
+/// configuration with evidence against it.
+///
+/// So the table is every LIVE (`owns_slot`) `Bridge` registration on those 62
+/// classes whose image target carries a `Code` attribute, declared or
+/// inherited — 906 of the 1,026 registered rows on them. The 120 that are not
+/// here are not oversights:
+///
+/// ```text
+///   115  superseded (owns_slot=false) -- covered anyway: the retirement is
+///        per-TRIPLE and `register`'s re-tag fires at every ordinal
+///     2  bucket D, ACC_NATIVE in the image -- §1.5 says `Bridge` is CORRECT:
+///        Throwable.fillInStackTrace(I) and NullPointerException
+///        .getExtendedNPEMessage()
+///     2  bucket F, no such method on JDK 25 -- Throwable.getStackTraceDepth()
+///        and .getStackTraceElement(I), a JDK 8 pair the image dropped
+///     1  already SyntheticStub
+/// ```
+///
+/// # What it costs and what it buys
+///
+/// Every one of the 1,021 registrations of these 906 triples is an ambient
+/// `register()` under a `set_category(Bridge)` scope — `kind_stated: false`,
+/// `kind_chosen: true` on all of them — so the re-tag in
+/// [`NativeMethodRegistry::register`](crate::registry::NativeMethodRegistry::register)
+/// reaches every one and there is no registration left to survive. That is the
+/// prediction; the refusal/survivor count in the wave's record is the
+/// measurement.
+///
+/// # The two defects the arm found, both of which had to be fixed FIRST
+///
+/// Armed over the 62 classes on the 64-probe promoted corpus, this wave started
+/// at **10 differing lines against HotSpot across two probes**, from two root
+/// causes — and both turned out to be present-tense defects in BOTH
+/// compatibility modes rather than artefacts of the arming:
+///
+///  * `Throwable.fillInStackTrace()` reported ITSELF as the throw site. The
+///    public no-arg form is real bytecode in every mode; only the private
+///    `fillInStackTrace(int)` it calls is a native, and that native captured
+///    the whole stack including the `Throwable.fillInStackTrace` frame above
+///    it. HotSpot's `fill_in_stack_trace` skips two prefixes of the innermost
+///    end — `fillInStackTrace*` frames, then `<init>` frames, in both cases
+///    only where the throwable `is_a` the frame's holder — and
+///    `stackwalker::trim_throwable_fill_frames` now does the same. The second
+///    prefix is what makes the `<init>` rows in this table retirable at all:
+///    once they yield, `Throwable.<init>` and its whole `super(...)` chain are
+///    ordinary Java frames sitting on top of the throw site.
+///  * `String[] a = null; a.clone()` answered `NullPointerException: clone on
+///    null` where HotSpot names the array type and the null expression. An
+///    array-typed call site is dispatched by a branch chosen BEFORE the
+///    interpreter's null-receiver arm, so the JEP 358 message was never built
+///    and `Object.clone`'s forced native — which has no bytecode context to
+///    name an expression from — answered instead.
+///
+/// `regression-suite/src/RThrowableFillFrames.java` is the vector for both.
+/// Neither is visible without arming something: nothing in the tree called
+/// `fillInStackTrace()` explicitly, and nothing cloned a null array.
+static RETIRED_SHADOW_LT_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/io/EOFException", "<init>", "()V"),
+    ("java/io/EOFException", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/io/EOFException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/io/EOFException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/EOFException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    ("java/io/EOFException", "getMessage", "()Ljava/lang/String;"),
+    (
+        "java/io/EOFException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/io/EOFException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/EOFException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/io/EOFException", "printStackTrace", "()V"),
+    (
+        "java/io/EOFException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    ("java/io/EOFException", "toString", "()Ljava/lang/String;"),
+    ("java/io/FileNotFoundException", "<init>", "()V"),
+    (
+        "java/io/FileNotFoundException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/io/FileNotFoundException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/io/FileNotFoundException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/FileNotFoundException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/FileNotFoundException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/FileNotFoundException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/io/FileNotFoundException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/FileNotFoundException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/io/FileNotFoundException", "printStackTrace", "()V"),
+    (
+        "java/io/FileNotFoundException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/io/FileNotFoundException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/io/IOException", "<init>", "()V"),
+    ("java/io/IOException", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/io/IOException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    ("java/io/IOException", "<init>", "(Ljava/lang/Throwable;)V"),
+    (
+        "java/io/IOException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    ("java/io/IOException", "getCause", "()Ljava/lang/Throwable;"),
+    (
+        "java/io/IOException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    ("java/io/IOException", "getMessage", "()Ljava/lang/String;"),
+    (
+        "java/io/IOException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/io/IOException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/IOException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/io/IOException", "printStackTrace", "()V"),
+    (
+        "java/io/IOException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    ("java/io/IOException", "toString", "()Ljava/lang/String;"),
+    ("java/io/NotSerializableException", "<init>", "()V"),
+    (
+        "java/io/NotSerializableException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/io/NotSerializableException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/io/NotSerializableException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/NotSerializableException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/NotSerializableException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/NotSerializableException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/io/NotSerializableException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/NotSerializableException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/io/NotSerializableException", "printStackTrace", "()V"),
+    (
+        "java/io/NotSerializableException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/io/NotSerializableException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/UncheckedIOException",
+        "<init>",
+        "(Ljava/io/IOException;)V",
+    ),
+    (
+        "java/io/UncheckedIOException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/io/IOException;)V",
+    ),
+    (
+        "java/io/UncheckedIOException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/io/UncheckedIOException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/UncheckedIOException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/UncheckedIOException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/UncheckedIOException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/io/UncheckedIOException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/UncheckedIOException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/io/UncheckedIOException", "printStackTrace", "()V"),
+    (
+        "java/io/UncheckedIOException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/io/UncheckedIOException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/io/UnsupportedEncodingException", "<init>", "()V"),
+    (
+        "java/io/UnsupportedEncodingException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/io/UnsupportedEncodingException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/io/UnsupportedEncodingException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/UnsupportedEncodingException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/UnsupportedEncodingException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/UnsupportedEncodingException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/io/UnsupportedEncodingException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/UnsupportedEncodingException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/io/UnsupportedEncodingException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/io/UnsupportedEncodingException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/io/UnsupportedEncodingException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/AbstractMethodError", "<init>", "()V"),
+    (
+        "java/lang/AbstractMethodError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/AbstractMethodError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/AbstractMethodError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/AbstractMethodError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/AbstractMethodError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/AbstractMethodError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/AbstractMethodError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/AbstractMethodError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/AbstractMethodError", "printStackTrace", "()V"),
+    (
+        "java/lang/AbstractMethodError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/AbstractMethodError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/ArithmeticException", "<init>", "()V"),
+    (
+        "java/lang/ArithmeticException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/ArithmeticException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/ArithmeticException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ArithmeticException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ArithmeticException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ArithmeticException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/ArithmeticException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ArithmeticException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/ArithmeticException", "printStackTrace", "()V"),
+    (
+        "java/lang/ArithmeticException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/ArithmeticException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/ArrayIndexOutOfBoundsException", "<init>", "()V"),
+    ("java/lang/ArrayIndexOutOfBoundsException", "<init>", "(I)V"),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/AssertionError", "<init>", "()V"),
+    ("java/lang/AssertionError", "<init>", "(C)V"),
+    ("java/lang/AssertionError", "<init>", "(D)V"),
+    ("java/lang/AssertionError", "<init>", "(F)V"),
+    ("java/lang/AssertionError", "<init>", "(I)V"),
+    ("java/lang/AssertionError", "<init>", "(J)V"),
+    (
+        "java/lang/AssertionError",
+        "<init>",
+        "(Ljava/lang/Object;)V",
+    ),
+    (
+        "java/lang/AssertionError",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    ("java/lang/AssertionError", "<init>", "(Z)V"),
+    (
+        "java/lang/AssertionError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/AssertionError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/AssertionError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/AssertionError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/AssertionError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/AssertionError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/AssertionError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/AssertionError", "printStackTrace", "()V"),
+    (
+        "java/lang/AssertionError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/AssertionError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/ClassCastException", "<init>", "()V"),
+    (
+        "java/lang/ClassCastException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/ClassCastException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/ClassCastException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ClassCastException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ClassCastException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ClassCastException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/ClassCastException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ClassCastException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/ClassCastException", "printStackTrace", "()V"),
+    (
+        "java/lang/ClassCastException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/ClassCastException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/ClassNotFoundException", "<init>", "()V"),
+    (
+        "java/lang/ClassNotFoundException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/ClassNotFoundException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/ClassNotFoundException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/ClassNotFoundException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ClassNotFoundException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ClassNotFoundException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ClassNotFoundException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/ClassNotFoundException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ClassNotFoundException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/ClassNotFoundException", "printStackTrace", "()V"),
+    (
+        "java/lang/ClassNotFoundException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/ClassNotFoundException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/CloneNotSupportedException", "<init>", "()V"),
+    (
+        "java/lang/CloneNotSupportedException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/Error", "<init>", "()V"),
+    ("java/lang/Error", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/lang/Error",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    ("java/lang/Error", "<init>", "(Ljava/lang/Throwable;)V"),
+    (
+        "java/lang/Error",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    ("java/lang/Error", "getCause", "()Ljava/lang/Throwable;"),
+    (
+        "java/lang/Error",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/Error", "getMessage", "()Ljava/lang/String;"),
+    (
+        "java/lang/Error",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/Error",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/Error",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/Error", "printStackTrace", "()V"),
+    (
+        "java/lang/Error",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    ("java/lang/Error", "toString", "()Ljava/lang/String;"),
+    ("java/lang/Exception", "<init>", "()V"),
+    ("java/lang/Exception", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/lang/Exception",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    ("java/lang/Exception", "<init>", "(Ljava/lang/Throwable;)V"),
+    (
+        "java/lang/Exception",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    ("java/lang/Exception", "getCause", "()Ljava/lang/Throwable;"),
+    (
+        "java/lang/Exception",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/Exception", "getMessage", "()Ljava/lang/String;"),
+    (
+        "java/lang/Exception",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/Exception",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/Exception",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/Exception", "printStackTrace", "()V"),
+    (
+        "java/lang/Exception",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    ("java/lang/Exception", "toString", "()Ljava/lang/String;"),
+    ("java/lang/ExceptionInInitializerError", "<init>", "()V"),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/IllegalAccessError", "<init>", "()V"),
+    (
+        "java/lang/IllegalAccessError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/IllegalAccessError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/IllegalAccessError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IllegalAccessError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IllegalAccessError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IllegalAccessError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/IllegalAccessError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IllegalAccessError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/IllegalAccessError", "printStackTrace", "()V"),
+    (
+        "java/lang/IllegalAccessError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/IllegalAccessError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/IllegalAccessException", "<init>", "()V"),
+    (
+        "java/lang/IllegalAccessException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/IllegalAccessException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/IllegalAccessException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IllegalAccessException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IllegalAccessException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IllegalAccessException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/IllegalAccessException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IllegalAccessException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/IllegalAccessException", "printStackTrace", "()V"),
+    (
+        "java/lang/IllegalAccessException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/IllegalAccessException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/IllegalArgumentException", "<init>", "()V"),
+    (
+        "java/lang/IllegalArgumentException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/IllegalArgumentException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/IllegalStateException", "<init>", "()V"),
+    (
+        "java/lang/IllegalStateException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/IllegalStateException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/IllegalStateException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/IllegalStateException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/IllegalStateException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IllegalStateException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IllegalStateException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IllegalStateException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/IllegalStateException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IllegalStateException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/IllegalStateException", "printStackTrace", "()V"),
+    (
+        "java/lang/IllegalStateException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/IllegalStateException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/IncompatibleClassChangeError", "<init>", "()V"),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/IndexOutOfBoundsException", "<init>", "()V"),
+    ("java/lang/IndexOutOfBoundsException", "<init>", "(I)V"),
+    ("java/lang/IndexOutOfBoundsException", "<init>", "(J)V"),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/IndexOutOfBoundsException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/InstantiationException", "<init>", "()V"),
+    (
+        "java/lang/InstantiationException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/InstantiationException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/InstantiationException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/InstantiationException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/InstantiationException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/InstantiationException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/InstantiationException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/InstantiationException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/InstantiationException", "printStackTrace", "()V"),
+    (
+        "java/lang/InstantiationException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/InstantiationException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/InternalError", "<init>", "()V"),
+    ("java/lang/InternalError", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/lang/InternalError",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/InternalError",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/InternalError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/InternalError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/InternalError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/InternalError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/InternalError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/InternalError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/InternalError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/InternalError", "printStackTrace", "()V"),
+    (
+        "java/lang/InternalError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/InternalError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/InterruptedException", "<init>", "()V"),
+    (
+        "java/lang/InterruptedException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/InterruptedException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/InterruptedException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/InterruptedException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/InterruptedException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/InterruptedException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/InterruptedException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/InterruptedException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/InterruptedException", "printStackTrace", "()V"),
+    (
+        "java/lang/InterruptedException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/InterruptedException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/LinkageError", "<init>", "()V"),
+    ("java/lang/LinkageError", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/lang/LinkageError",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/LinkageError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/LinkageError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/LinkageError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/LinkageError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/LinkageError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/LinkageError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/LinkageError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/LinkageError", "printStackTrace", "()V"),
+    (
+        "java/lang/LinkageError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    ("java/lang/LinkageError", "toString", "()Ljava/lang/String;"),
+    (
+        "java/lang/MatchException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/MatchException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/MatchException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/MatchException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/MatchException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/MatchException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/MatchException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/MatchException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/MatchException", "printStackTrace", "()V"),
+    (
+        "java/lang/MatchException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/MatchException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/NegativeArraySizeException", "<init>", "()V"),
+    (
+        "java/lang/NegativeArraySizeException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/NoClassDefFoundError", "<init>", "()V"),
+    (
+        "java/lang/NoClassDefFoundError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/NoClassDefFoundError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/NoClassDefFoundError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NoClassDefFoundError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NoClassDefFoundError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NoClassDefFoundError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/NoClassDefFoundError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NoClassDefFoundError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/NoClassDefFoundError", "printStackTrace", "()V"),
+    (
+        "java/lang/NoClassDefFoundError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/NoClassDefFoundError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/NoSuchFieldError", "<init>", "()V"),
+    (
+        "java/lang/NoSuchFieldError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/NoSuchFieldError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/NoSuchFieldError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NoSuchFieldError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NoSuchFieldError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NoSuchFieldError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/NoSuchFieldError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NoSuchFieldError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/NoSuchFieldError", "printStackTrace", "()V"),
+    (
+        "java/lang/NoSuchFieldError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/NoSuchFieldError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/NoSuchFieldException", "<init>", "()V"),
+    (
+        "java/lang/NoSuchFieldException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/NoSuchFieldException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/NoSuchFieldException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NoSuchFieldException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NoSuchFieldException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NoSuchFieldException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/NoSuchFieldException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NoSuchFieldException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/NoSuchFieldException", "printStackTrace", "()V"),
+    (
+        "java/lang/NoSuchFieldException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/NoSuchFieldException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/NoSuchMethodError", "<init>", "()V"),
+    (
+        "java/lang/NoSuchMethodError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/NoSuchMethodError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/NoSuchMethodError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NoSuchMethodError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NoSuchMethodError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NoSuchMethodError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/NoSuchMethodError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NoSuchMethodError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/NoSuchMethodError", "printStackTrace", "()V"),
+    (
+        "java/lang/NoSuchMethodError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/NoSuchMethodError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/NoSuchMethodException", "<init>", "()V"),
+    (
+        "java/lang/NoSuchMethodException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/NoSuchMethodException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/NoSuchMethodException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NoSuchMethodException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NoSuchMethodException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NoSuchMethodException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/NoSuchMethodException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NoSuchMethodException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/NoSuchMethodException", "printStackTrace", "()V"),
+    (
+        "java/lang/NoSuchMethodException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/NoSuchMethodException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/NullPointerException", "<init>", "()V"),
+    (
+        "java/lang/NullPointerException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/NullPointerException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/NullPointerException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NullPointerException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NullPointerException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NullPointerException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/NullPointerException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NullPointerException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/NullPointerException", "printStackTrace", "()V"),
+    (
+        "java/lang/NullPointerException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/NullPointerException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/NumberFormatException", "<init>", "()V"),
+    (
+        "java/lang/NumberFormatException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/NumberFormatException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/NumberFormatException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NumberFormatException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NumberFormatException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/NumberFormatException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/NumberFormatException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/NumberFormatException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/NumberFormatException", "printStackTrace", "()V"),
+    (
+        "java/lang/NumberFormatException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/NumberFormatException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/OutOfMemoryError", "<init>", "()V"),
+    (
+        "java/lang/OutOfMemoryError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/OutOfMemoryError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/OutOfMemoryError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/OutOfMemoryError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/OutOfMemoryError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/OutOfMemoryError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/OutOfMemoryError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/OutOfMemoryError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/OutOfMemoryError", "printStackTrace", "()V"),
+    (
+        "java/lang/OutOfMemoryError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/OutOfMemoryError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/ReflectiveOperationException", "<init>", "()V"),
+    (
+        "java/lang/ReflectiveOperationException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/ReflectiveOperationException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/RuntimeException", "<init>", "()V"),
+    (
+        "java/lang/RuntimeException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/RuntimeException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/RuntimeException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/RuntimeException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/RuntimeException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/RuntimeException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/RuntimeException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/RuntimeException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/RuntimeException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/RuntimeException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/RuntimeException", "printStackTrace", "()V"),
+    (
+        "java/lang/RuntimeException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/RuntimeException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/SecurityException", "<init>", "()V"),
+    (
+        "java/lang/SecurityException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/SecurityException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/SecurityException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/SecurityException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/SecurityException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/SecurityException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/SecurityException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/SecurityException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/SecurityException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/SecurityException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/SecurityException", "printStackTrace", "()V"),
+    (
+        "java/lang/SecurityException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/SecurityException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/StackOverflowError", "<init>", "()V"),
+    (
+        "java/lang/StackOverflowError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/StackOverflowError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/StackOverflowError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/StackOverflowError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/StackOverflowError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/StackOverflowError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/StackOverflowError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/StackOverflowError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/StackOverflowError", "printStackTrace", "()V"),
+    (
+        "java/lang/StackOverflowError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/StackOverflowError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/StringIndexOutOfBoundsException", "<init>", "()V"),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "<init>",
+        "(I)V",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/StringIndexOutOfBoundsException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/Throwable", "<init>", "()V"),
+    ("java/lang/Throwable", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/lang/Throwable",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    ("java/lang/Throwable", "<init>", "(Ljava/lang/Throwable;)V"),
+    (
+        "java/lang/Throwable",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    ("java/lang/Throwable", "getCause", "()Ljava/lang/Throwable;"),
+    (
+        "java/lang/Throwable",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/Throwable", "getMessage", "()Ljava/lang/String;"),
+    (
+        "java/lang/Throwable",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/Throwable",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/Throwable",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/Throwable", "printStackTrace", "()V"),
+    (
+        "java/lang/Throwable",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    ("java/lang/Throwable", "toString", "()Ljava/lang/String;"),
+    (
+        "java/lang/TypeNotPresentException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/TypeNotPresentException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/TypeNotPresentException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/TypeNotPresentException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/TypeNotPresentException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/TypeNotPresentException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/TypeNotPresentException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/TypeNotPresentException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/TypeNotPresentException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/TypeNotPresentException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/TypeNotPresentException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/UnsatisfiedLinkError", "<init>", "()V"),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/UnsatisfiedLinkError", "printStackTrace", "()V"),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/UnsatisfiedLinkError",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/UnsupportedOperationException", "<init>", "()V"),
+    (
+        "java/lang/UnsupportedOperationException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/UnsupportedOperationException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/VerifyError", "<init>", "()V"),
+    ("java/lang/VerifyError", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/lang/VerifyError",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/VerifyError",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/VerifyError",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/VerifyError",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/VerifyError",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/VerifyError",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/VerifyError",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/lang/VerifyError", "printStackTrace", "()V"),
+    (
+        "java/lang/VerifyError",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    ("java/lang/VerifyError", "toString", "()Ljava/lang/String;"),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "<init>",
+        "()V",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/reflect/InaccessibleObjectException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "<init>",
+        "()V",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "<init>",
+        "(Ljava/lang/Throwable;Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "getTargetException",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/lang/reflect/InvocationTargetException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/net/MalformedURLException", "<init>", "()V"),
+    (
+        "java/net/MalformedURLException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/net/MalformedURLException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/net/MalformedURLException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/net/MalformedURLException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/net/MalformedURLException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/net/MalformedURLException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/net/MalformedURLException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/net/MalformedURLException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/net/MalformedURLException", "printStackTrace", "()V"),
+    (
+        "java/net/MalformedURLException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/net/MalformedURLException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/net/UnknownHostException", "<init>", "()V"),
+    (
+        "java/net/UnknownHostException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/net/UnknownHostException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/net/UnknownHostException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/net/UnknownHostException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/net/UnknownHostException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/net/UnknownHostException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/net/UnknownHostException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/net/UnknownHostException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/net/UnknownHostException", "printStackTrace", "()V"),
+    (
+        "java/net/UnknownHostException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/net/UnknownHostException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/text/ParseException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/text/ParseException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/text/ParseException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/text/ParseException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/text/ParseException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/text/ParseException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/text/ParseException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/text/ParseException", "printStackTrace", "()V"),
+    (
+        "java/text/ParseException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/text/ParseException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/ConcurrentModificationException", "<init>", "()V"),
+    (
+        "java/util/ConcurrentModificationException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/ConcurrentModificationException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/FormatterClosedException", "<init>", "()V"),
+    (
+        "java/util/FormatterClosedException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/FormatterClosedException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/FormatterClosedException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/FormatterClosedException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/FormatterClosedException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/FormatterClosedException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/FormatterClosedException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/FormatterClosedException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/util/FormatterClosedException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/FormatterClosedException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/InputMismatchException", "<init>", "()V"),
+    (
+        "java/util/InputMismatchException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/InputMismatchException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/InputMismatchException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/InputMismatchException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/InputMismatchException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/InputMismatchException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/InputMismatchException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/InputMismatchException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/util/InputMismatchException", "printStackTrace", "()V"),
+    (
+        "java/util/InputMismatchException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/InputMismatchException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/MissingResourceException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/NoSuchElementException", "<init>", "()V"),
+    (
+        "java/util/NoSuchElementException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/NoSuchElementException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/NoSuchElementException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/NoSuchElementException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/NoSuchElementException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/NoSuchElementException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/NoSuchElementException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/NoSuchElementException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/NoSuchElementException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/NoSuchElementException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    ("java/util/NoSuchElementException", "printStackTrace", "()V"),
+    (
+        "java/util/NoSuchElementException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/NoSuchElementException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "<init>",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/concurrent/BrokenBarrierException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "<init>",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/concurrent/CancellationException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/concurrent/CompletionException", "<init>", "()V"),
+    (
+        "java/util/concurrent/CompletionException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/concurrent/CompletionException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/concurrent/ExecutionException", "<init>", "()V"),
+    (
+        "java/util/concurrent/ExecutionException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/concurrent/ExecutionException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "<init>",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/concurrent/RejectedExecutionException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    ("java/util/concurrent/TimeoutException", "<init>", "()V"),
+    (
+        "java/util/concurrent/TimeoutException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/concurrent/TimeoutException",
+        "addSuppressed",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/util/concurrent/TimeoutException",
+        "getCause",
+        "()Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/TimeoutException",
+        "getLocalizedMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/TimeoutException",
+        "getMessage",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/TimeoutException",
+        "getStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+    ),
+    (
+        "java/util/concurrent/TimeoutException",
+        "getSuppressed",
+        "()[Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/TimeoutException",
+        "initCause",
+        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+    ),
+    (
+        "java/util/concurrent/TimeoutException",
+        "printStackTrace",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/TimeoutException",
+        "printStackTrace",
+        "(Ljava/io/PrintStream;)V",
+    ),
+    (
+        "java/util/concurrent/TimeoutException",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+];
+
 /// Lane 7's wave, 2026-09-10: the two triples that stop
 /// `jdk/internal/loader/BuiltinClassLoader` from linking under `--jdk-only`.
 ///
@@ -3264,11 +6812,10 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// is **13253 rows, 0 diffs**, every ordered pair of a boundary corpus through
 /// every binary operation.
 ///
-/// ## Nine of the 24 are HELD BACK, and each half has its own cause
+/// ## All 24 are retired. Nine were held, and the RULE that held them expired
 ///
-/// With all 24 retired, the probe-tree A/B on two binaries — control
-/// `db988f6a76365f1f` without this table, trial `06307f0eca53c714` with it, same
-/// tree otherwise — reads:
+/// Wave 1 retired ten and held fourteen. With all 24 retired the probe-tree A/B
+/// on two binaries had read:
 ///
 /// ```text
 ///   BigIntegerSweep   control (no table, JIT on)    0 differing lines
@@ -3277,18 +6824,19 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// ```
 ///
 /// A positive delta is the one result that is a reason not to retire, so the
-/// nine are held per-TRIPLE — the same instrument the `java/util/logging` wave
-/// used for `Logger.log`'s eighth overload — and each is named:
+/// nine were held per-TRIPLE and the hold was generalised to a rule. Both halves
+/// are now closed, and for different reasons: one was a real defect, the other a
+/// contract that had never been checked against the oracle.
 ///
-/// **`add`, `subtract`, `multiply` — a SURVIVOR.** All three are registered
-/// twice. `phases_late.rs` owns the slot as a `Bridge`; `math_bignum.rs`
-/// registered an `Intrinsic` first and owns no slot, so it is *dead in
-/// compatible mode and never dispatched*. Refusing the `Bridge` under
-/// `--jdk-only` does not reach bytecode — it wakes the dead loser, which
+/// **`add`, `subtract`, `multiply` -- a SURVIVOR, and a real defect.** All three
+/// were registered twice. `phases_late.rs` owns the slot as a `Bridge`;
+/// `math_bignum.rs` registered an `Intrinsic` first which owned no slot and was
+/// *dead in compatible mode in all three feature arms*. Refusing the `Bridge`
+/// under `--jdk-only` did not reach bytecode -- it woke the dead loser, which
 /// returns **null** for a null argument where the real body throws:
 ///
 /// ```text
-///   --jdk-only-report, BigIntegerSweep run:
+///   --jdk-only-report, BigIntegerSweep run, before the fix:
 ///     27 synthetic-native-registered refusals on the retired classes
 ///      3 of them carrying a survivor
 ///        add       survivor=intrinsic@native-builtins/src/math_bignum.rs:1404
@@ -3296,46 +6844,52 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 ///        multiply  survivor=intrinsic@native-builtins/src/math_bignum.rs:1416
 /// ```
 ///
-/// This is the `refused is not retired` check earning its place: the probe rows
-/// moved, so the wave *looked* measurable, and the retirement was inert.
-/// Retiring these three means removing the dead `math_bignum.rs` registrations
-/// first, which changes nothing in compatible mode because they own no slot.
+/// Fixed 2026-09-12 by deleting the three dead registrations, which changes
+/// nothing in compatible mode because they own no slot there. The same shape had
+/// shipped in the `java/util/logging` wave a month earlier and was fixed in the
+/// same change. `stub_ratchet.rs`'s `no_retired_triple_survives_the_strict_boot`
+/// is the gate that makes it impossible to ship a third time: one line of set
+/// arithmetic over the strict boot's registry, asking which of its surviving rows
+/// these tables claim.
 ///
-/// **`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT DROPPED the
-/// message; blocker cleared 2026-09-11.** These do reach bytecode, and
-/// interpreted they are HotSpot-exact. Once the real body was JIT-compiled the
-/// `NullPointerException` arrived with no message at all. It was not a
-/// `BigInteger` fact — `probes/L2JitNpeProbe.java` asks six null-deref shapes
-/// cold and hot with no JDK class involved and every one of them lost its
-/// message when hot. Fixed and retired as
-/// `docs/internal/fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`,
-/// pinned by `vm/tests/jit_npe_message_hot_equals_cold.rs`.
+/// **The other eleven -- the rule's premise was false.** Interpreted they were
+/// HotSpot-exact; once the real body was JIT-compiled the `NullPointerException`
+/// arrived with no message. The VM-side defect was real and was fixed by
+/// `0d013f359`. The *rule* built on top of it was not: asked of the oracle at the
+/// same heat, HotSpot drops the message too.
 ///
-/// They are STILL HELD, and not by this reason: the rule below is structural —
-/// every reference-argument row — and lifting it needs the `BigIntegerSweep`
-/// measurement with the JIT on that put it there, which is lane 2's to take.
+/// ```text
+///   probes/L2BigIntNpe14.java -- 15 null-argument rows, cold then 200k warm
+///     HotSpot 25.0.4+7, default flags         9 of 15 hot rows answer a bare
+///                                             `null`, and WHICH nine differs
+///                                             between runs of the same class file
+///     HotSpot -XX:-OmitStackTraceInFastThrow  0 of 15; hot == cold, all helpful
+/// ```
 ///
-/// ## ...and the held set is every REFERENCE-argument row, not a list of six
+/// `OmitStackTraceInFastThrow` is on by default and lets C2 throw a preallocated
+/// exception carrying neither message nor stack trace. So "hot equals cold" was
+/// never the JDK contract, and the run-to-run instability that made the hold
+/// structural rather than empirical is the ORACLE's instability, reproduced. The
+/// stable contract is the interpreted message -- identical under both oracle
+/// configurations -- and this VM matches it on all 30 rows in both modes, never
+/// taking the fast-throw latitude. Record:
+/// `docs/internal/jdk-only/lane-2-biginteger-held-rows-and-inert-retirements-FIXED-20260912.md`.
 ///
-/// The six above are what regressed on the 24-triple binary. On the 13-triple
-/// one, `remainder` and friends were correct and `modInverse` and `modPow`
-/// regressed instead — the same defect surfacing on different rows, because
-/// which bodies the JIT has compiled by the time the probe's null section runs
-/// is not fixed between runs. Reading one run's diff and holding exactly the
-/// rows in it would be freezing a coin flip.
-///
-/// So the hold is structural rather than empirical: **a row is exposed if its
-/// real body can dereference a null reference ARGUMENT**, and wave 1 retires
-/// only signatures that take none. That is the twelve rows of `divide`,
-/// `modInverse`, `modPow`, `add`, `subtract`, `multiply`, `remainder`, `mod`,
-/// `gcd`, `and`, `or`, `xor` held for the JIT reason or the survivor reason,
-/// plus the two `byte[]` constructors, which the sweep never asks with null and
-/// so cannot vouch for either way.
-///
-/// What remains is ten value-shaped rows — `bitCount`, `bitLength`,
+/// The ten value-shaped rows of wave 1 -- `bitCount`, `bitLength`,
 /// `intValueExact`, `isProbablePrime`, `longValueExact`, `not`, `shiftLeft`,
-/// `shiftRight`, `testBit`, `toByteArray` — and they are 0-diff over the whole
+/// `shiftRight`, `testBit`, `toByteArray` -- remain 0-diff over the whole
 /// 13253-row sweep with the JIT on.
+///
+/// **Seven rows removed on the 2026-09-11 catch-up merge with lane T**:
+/// `ExceptionInInitializerError`'s two constructors and `initCause`,
+/// `NullPointerException(String)`, `Throwable.initCause`, and
+/// `UnsatisfiedLinkError`'s two constructors were claimed by BOTH this table
+/// and `RETIRED_SHADOW_LT_TRIPLES` — `no_triple_is_claimed_by_two_tables`
+/// caught it. Lane T's page dates its claim 2026-09-10, a day before this
+/// page's own "blocker cleared 2026-09-11"; per that test's own rule, the
+/// later claim is the duplicate. These seven java/lang/ Throwable-family rows
+/// are lane T's to keep — they are seven of the 783 in
+/// `RETIRED_SHADOW_LT_TRIPLES` and were never independently measured here.
 ///
 /// # `java/lang/Package.getPackages()` left this table on 2026-09-11
 ///
@@ -3347,25 +6901,9 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Character", "isJavaLetter", "(C)Z"),
     ("java/lang/Character", "isJavaLetterOrDigit", "(C)Z"),
     ("java/lang/Character", "isSpace", "(C)Z"),
-    ("java/lang/ExceptionInInitializerError", "<init>", "()V"),
-    (
-        "java/lang/ExceptionInInitializerError",
-        "<init>",
-        "(Ljava/lang/String;)V",
-    ),
-    (
-        "java/lang/ExceptionInInitializerError",
-        "initCause",
-        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
-    ),
     ("java/lang/IllegalThreadStateException", "<init>", "()V"),
     (
         "java/lang/IllegalThreadStateException",
-        "<init>",
-        "(Ljava/lang/String;)V",
-    ),
-    (
-        "java/lang/NullPointerException",
         "<init>",
         "(Ljava/lang/String;)V",
     ),
@@ -3378,17 +6916,6 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Package", "equals", "(Ljava/lang/Object;)Z"),
     ("java/lang/Package", "hashCode", "()I"),
     ("java/lang/StringUTF16", "getChars", "([BII[CI)V"),
-    (
-        "java/lang/Throwable",
-        "initCause",
-        "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
-    ),
-    ("java/lang/UnsatisfiedLinkError", "<init>", "()V"),
-    (
-        "java/lang/UnsatisfiedLinkError",
-        "<init>",
-        "(Ljava/lang/String;)V",
-    ),
     ("java/lang/VirtualMachineError", "<init>", "()V"),
     (
         "java/lang/VirtualMachineError",
@@ -3455,12 +6982,64 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/management/MemoryUsage", "getInit", "()J"),
     ("java/lang/management/MemoryUsage", "getMax", "()J"),
     ("java/lang/management/MemoryUsage", "getUsed", "()J"),
+    ("java/math/BigInteger", "<init>", "(I[B)V"),
+    ("java/math/BigInteger", "<init>", "([B)V"),
+    (
+        "java/math/BigInteger",
+        "add",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "and",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "bitCount", "()I"),
     ("java/math/BigInteger", "bitLength", "()I"),
+    (
+        "java/math/BigInteger",
+        "divide",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "gcd",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "intValueExact", "()I"),
     ("java/math/BigInteger", "isProbablePrime", "(I)Z"),
     ("java/math/BigInteger", "longValueExact", "()J"),
+    (
+        "java/math/BigInteger",
+        "mod",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "modInverse",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "modPow",
+        "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "multiply",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "not", "()Ljava/math/BigInteger;"),
+    (
+        "java/math/BigInteger",
+        "or",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "remainder",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     (
         "java/math/BigInteger",
         "shiftLeft",
@@ -3471,8 +7050,18 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
         "shiftRight",
         "(I)Ljava/math/BigInteger;",
     ),
+    (
+        "java/math/BigInteger",
+        "subtract",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "testBit", "(I)Z"),
     ("java/math/BigInteger", "toByteArray", "()[B"),
+    (
+        "java/math/BigInteger",
+        "xor",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
 ];
 
 /// Lane L1 wave 1, 2026-09-10: the six `java/util` families whose state is
@@ -6717,6 +10306,14 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // `the_tables_const_lists_every_table_the_predicate_consults` exists to
     // catch, and it is what caught it.
     RETIRED_SHADOW_L1_TRIPLES,
+    // And again, one merge later, for exactly the same reason: lane T's table
+    // and this const were also written on branches that never saw each other,
+    // so the 2026-09-11 merge resolved both files and left 906 more rows off
+    // the list. Two lanes in two days is the shape of the defect rather than
+    // an accident of one -- a const that enumerates tables drifts from the
+    // predicate that consults them every time a lane lands, and only this
+    // guard closes the gap.
+    RETIRED_SHADOW_LT_TRIPLES,
     // And again on 2026-09-11, one merge later, for lanes L0 and L3 -- same
     // mechanism, same silence. This const arrived on `dev` while L0's and L3's
     // tables were being written on this branch, so neither file conflicted and
@@ -7660,82 +11257,59 @@ mod tests {
                  adding a third."
             );
         }
-        // The nine BigInteger triples held back, and WHY each is held. A
-        // re-add has to move the blocker first, and the blocker is not in this
-        // file: `add`/`subtract`/`multiply` need the dead `math_bignum.rs`
-        // registrations gone, the other six need the JIT to stop dropping the
-        // helpful-NPE message. Both are measured; see this table's doc comment.
-        for m in ["add", "subtract", "multiply"] {
-            assert!(
-                !triple_is_retired_shadow(
-                    "java/math/BigInteger",
-                    m,
-                    "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
-                ),
-                "BigInteger.{m} was retired, but an older math_bignum.rs \
-                 Intrinsic still owns the slot after the refusal — the \
-                 retirement is INERT and the survivor returns null for a null \
-                 argument where the real body throws."
-            );
-        }
-        for m in [
-            "remainder",
-            "mod",
-            "gcd",
-            "and",
-            "or",
-            "xor",
-            "divide",
-            "modInverse",
-        ] {
-            assert!(
-                !triple_is_retired_shadow(
-                    "java/math/BigInteger",
-                    m,
-                    "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
-                ),
-                "BigInteger.{m} was retired. It reaches bytecode correctly \
-                 INTERPRETED, and loses its NullPointerException message once \
-                 the body is JIT-compiled."
-            );
-        }
-        for (m, d) in [
-            (
-                "modPow",
-                "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-            ),
-            ("<init>", "([B)V"),
-            ("<init>", "(I[B)V"),
-        ] {
-            assert!(
-                !triple_is_retired_shadow("java/math/BigInteger", m, d),
-                "BigInteger.{m}{d} was retired. Wave 1's rule is structural: a \
-                 row whose real body can dereference a null reference ARGUMENT \
-                 is exposed to the JIT's dropped NullPointerException message, \
-                 and which rows show it varies run to run."
-            );
-        }
-
-        // Wave 1's rule, asserted over the TABLE rather than over a list of
-        // names, so a row added later has to satisfy it too. Only the parameter
-        // list is examined: `toByteArray()[B` returns an array and takes
-        // nothing, and reading the whole descriptor would reject it.
-        for (c, m, d) in RETIRED_SHADOW_L2_TRIPLES {
-            if *c != "java/math/BigInteger" {
-                continue;
-            }
-            let params = d
-                .split_once('(')
-                .and_then(|(_, rest)| rest.split_once(')'))
-                .map(|(p, _)| p)
-                .unwrap_or("");
-            assert!(
-                !params.contains('L') && !params.contains('['),
-                "{c}.{m}{d} takes a reference parameter. Until the JIT carries \
-                 the helpful-NPE message into compiled code, such a row \
-                 regresses the message it used to get from the native."
-            );
-        }
+        // **Wave 3, 2026-09-12: the fourteen held rows moved, and the RULE
+        // that held them was retired with them.**
+        //
+        // Wave 1 held every row whose real body can dereference a null
+        // reference ARGUMENT, because retiring such a row traded the native's
+        // constant `NullPointerException` message for a compiled body that
+        // arrived with no message at all -- and which rows showed it varied
+        // between runs, so the hold was made structural rather than copied out
+        // of one diff. `0d013f359` fixed the compiled-code message. Re-measuring
+        // did not confirm the rule; it refuted its PREMISE.
+        //
+        // `probes/L2BigIntNpe14.java` asks all fourteen rows with a null
+        // argument, cold and then after 200k warm iterations of the SAME method,
+        // on the oracle:
+        //
+        // ```text
+        //   HotSpot 25.0.4+7, default flags     9 of 15 hot rows answer a BARE
+        //                                       `null`, and WHICH nine differs
+        //                                       between runs (3 runs: subtract
+        //                                       dropped/dropped/helpful,
+        //                                       remainder dropped/helpful/
+        //                                       helpful, modPow flipped too)
+        //   HotSpot -XX:-OmitStackTraceInFastThrow
+        //                                       0 of 15 -- hot == cold, every
+        //                                       message helpful
+        // ```
+        //
+        // Losing the helpful message in compiled code is what HotSpot ITSELF
+        // does by default: `OmitStackTraceInFastThrow` lets C2 throw a
+        // preallocated exception carrying neither message nor stack trace, and
+        // the run-to-run variance wave 1 measured on this VM is the same
+        // variance the oracle shows. So "hot equals cold" was never the JDK
+        // contract, and a retired row answering a bare `null` when hot is
+        // HotSpot-FAITHFUL rather than regressed. The stable contract is the
+        // interpreted message, which is identical under both oracle
+        // configurations, and this VM reproduces it on all fourteen.
+        //
+        // What replaces the rule is the POPULATION. Lane 2 measured 24
+        // `BigInteger` triples; all 24 are retired. A 25th needs its own
+        // per-class corpus screen and probe-tree A/B, which is what this count
+        // is here to demand.
+        let bigint_rows = RETIRED_SHADOW_L2_TRIPLES
+            .iter()
+            .filter(|(c, _, _)| *c == "java/math/BigInteger")
+            .count();
+        assert_eq!(
+            bigint_rows, 24,
+            "lane 2 measured 24 `java/math/BigInteger` triples -- ten in wave 1, \
+             fourteen in wave 3 -- and this table holds {bigint_rows}. A row \
+             outside that set has been through neither the per-class corpus \
+             screen nor the probe-tree A/B; take both before changing this \
+             number."
+        );
 
         // The ten rows the image says are not shadows. Six are `<init>` on an
         // INTERFACE, which declares no constructor at all; the rest are a
@@ -9980,4 +13554,171 @@ Ljava/nio/channels/FileChannel;"
             "(JLjava/util/function/Function;Ljava/util/function/BiFunction;)Ljava/lang/Object;"
         ));
     }
+
+    /// Sorted, unique, binary-searched — same rule and same reason as its three
+    /// siblings: an out-of-order entry makes the predicate answer `false` for a
+    /// row that is present, which reads as "not retired" and is invisible in a
+    /// workload.
+    #[test]
+    fn the_lane_t_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_LT_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn every_lane_t_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_LT_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lane_t_table_is_disjoint_from_every_sibling() {
+        // `RETIRED_SHADOW_L2_TRIPLES` joined this list when lane 2 landed on
+        // 2026-09-10, and it is the one that had to be CHECKED rather than
+        // assumed: lane 2's prefix set is `java/lang/` and half the throwable
+        // family lives there. Measured at the merge — 906 lane-T triples over
+        // 62 classes, 13 lane-2 triples over `Character` and `BigInteger`,
+        // intersection EMPTY — which is lane 2's own page agreeing that a
+        // registrar spanning several lanes' prefixes is lane T's whole.
+        for t in RETIRED_SHADOW_LT_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_L2_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the lane-T table and an earlier one"
+            );
+        }
+    }
+
+    /// The four rows on the 62 classes this wave deliberately LEAVES standing,
+    /// each for a different reason, and each of which a class-scoped
+    /// "retire everything on these classes" would have taken.
+    ///
+    /// Written as an assertion rather than a comment because all four are the
+    /// same shape as the entries around them and nothing else in the tree says
+    /// why they are absent. Contract §1.5 makes two of them positively
+    /// CORRECT as `Bridge`; the other two match no method in the image, so
+    /// retiring them would trade a dead shadow for an `UnsatisfiedLinkError`.
+    #[test]
+    fn the_four_throwable_rows_that_are_not_shadows_stay_bridges() {
+        // Bucket D — declared ACC_NATIVE on JDK 25. §1.5 REQUIRES a `Bridge`.
+        assert!(!triple_is_retired_shadow(
+            "java/lang/Throwable",
+            "fillInStackTrace",
+            "(I)Ljava/lang/Throwable;"
+        ));
+        assert!(!triple_is_retired_shadow(
+            "java/lang/NullPointerException",
+            "getExtendedNPEMessage",
+            "()Ljava/lang/String;"
+        ));
+        // Bucket F — the JDK 8 pair `getOurStackTrace` used before JEP 259;
+        // JDK 25's `Throwable` declares neither.
+        assert!(!triple_is_retired_shadow(
+            "java/lang/Throwable",
+            "getStackTraceDepth",
+            "()I"
+        ));
+        assert!(!triple_is_retired_shadow(
+            "java/lang/Throwable",
+            "getStackTraceElement",
+            "(I)Ljava/lang/StackTraceElement;"
+        ));
+        // ... while the public no-arg `fillInStackTrace` — which is real
+        // bytecode calling the native above — is not registered at all, so it
+        // is not a row in either direction.
+        assert!(!triple_is_retired_shadow(
+            "java/lang/Throwable",
+            "fillInStackTrace",
+            "()Ljava/lang/Throwable;"
+        ));
+    }
+
+    /// The wave is CLASS-scoped, and the class set is `THROWABLE_FAMILY_CLASSES`
+    /// — nothing wider. `java/util/regex/PatternSyntaxException` and
+    /// `java/io/InvalidClassException` are the two throwables the registrar
+    /// deliberately excludes because they OVERRIDE `getMessage()`; a table that
+    /// reached them would retire a row that never existed, and a future widening
+    /// of the class list must not silently pick them up either.
+    #[test]
+    fn the_two_overriding_throwables_the_registrar_excludes_are_not_retired() {
+        for c in [
+            "java/util/regex/PatternSyntaxException",
+            "java/io/InvalidClassException",
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, "getMessage", "()Ljava/lang/String;"),
+                "{c} overrides getMessage and is not in the registrar's list"
+            );
+        }
+    }
+
+    /// Lane T added 50 CLASS NAMES to [`RETIRED_SHADOW_PREFIXES`] rather than
+    /// three package prefixes, and this is the lane-T half of
+    /// [`a_prefix_alone_retires_nothing`]: a non-throwable sibling of a retired
+    /// class must not be retired.
+    ///
+    /// # This test used to assert the PREFIX and had to stop
+    ///
+    /// It read `!RETIRED_SHADOW_PREFIXES.iter().any(|p| c.starts_with(p))` —
+    /// "`java/lang/` is not a prefix" — which was true on 2026-09-10 morning
+    /// and false by that evening, because lane 2 landed `"java/lang/"` and
+    /// `"java/math/"` as prefixes for its own table. That is legitimate: the
+    /// prefix list is a DOOR, not a decision, and `a_prefix_alone_retires_nothing`
+    /// is the test that says so. A guard written against the door fails when
+    /// another lane opens it for a table of its own, and it fails for a reason
+    /// that has nothing to say about lane T.
+    ///
+    /// So this asks the observable instead — `triple_is_retired_shadow` on real
+    /// registered methods of sibling classes — which is what a package-wide
+    /// lane-T prefix would actually have broken, and which no other lane's
+    /// widening can turn red on lane T's behalf.
+    #[test]
+    fn no_non_throwable_sibling_is_retired_by_lane_t() {
+        // Asks `RETIRED_SHADOW_LT_TRIPLES` directly, not the aggregate
+        // `triple_is_retired_shadow` predicate: this test's job is "lane T
+        // stayed inside its own scope", not "nothing else in the registry
+        // ever retires these classes". It used to ask the predicate, and
+        // `java/io/File.getName` broke it the day a SIBLING lane (io/nio)
+        // legitimately retired that class on its own table — a real
+        // retirement, correctly attributed to a different table, that this
+        // test had no business objecting to.
+        for (c, m, d) in [
+            ("java/lang/String", "intern", "()Ljava/lang/String;"),
+            (
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            ),
+            (
+                "java/lang/System",
+                "getProperty",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+            ),
+            ("java/lang/ref/Reference", "get", "()Ljava/lang/Object;"),
+            ("java/io/File", "getName", "()Ljava/lang/String;"),
+            ("java/net/URL", "openConnection", "()Ljava/net/URLConnection;"),
+        ] {
+            assert!(
+                RETIRED_SHADOW_LT_TRIPLES
+                    .binary_search(&(c, m, d))
+                    .is_err(),
+                "{c}.{m}{d} is in RETIRED_SHADOW_LT_TRIPLES, and no lane-T entry \
+                 should name that class"
+            );
+        }
+    }
+
 }
