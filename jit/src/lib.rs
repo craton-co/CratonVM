@@ -1952,26 +1952,143 @@ fn jit_code_ranges() -> &'static JitCodeRangeRegistry {
 // unbound — reserved but not published, or released on drop — resolves to
 // `None`, which leaves the caller with exactly the decode-and-fail-closed
 // behaviour it had before.
-static COMPILE_IDS: std::sync::OnceLock<std::sync::RwLock<Vec<usize>>> = std::sync::OnceLock::new();
+//
+// # Storage, recycling and exhaustion
+//
+// The table used to be a `RwLock<Vec<usize>>` that grew by one word per
+// compilation and never shrank, and whose lookup took the lock — from a root
+// scan that may run while a frozen peer holds it. Now:
+//
+// * slots live in fixed chunks of `AtomicUsize`, allocated on demand and never
+//   freed or moved, so a lookup is two atomic loads and no lock;
+// * a released id goes on a FIFO free list stamped with a retirement
+//   generation, and is reissued only once that generation is graced (every
+//   thread has been outside compiled code since). A mirror left holding the
+//   old id then cannot resolve it to the new body;
+// * the table bounds the ids LIVE at once, not the compilations in a run. When
+//   it is full, `reserve_compile_id` still returns 0, but counts it
+//   (`compile_id_exhaustions`) and says so once on stderr.
 
-fn compile_ids() -> &'static std::sync::RwLock<Vec<usize>> {
-    // Index 0 is never handed out: an unwritten or stale TLS slot reads as 0
-    // and must not resolve to a real method.
-    COMPILE_IDS.get_or_init(|| std::sync::RwLock::new(vec![0usize]))
+/// Ids per chunk of the compile-id table, as a shift.
+const COMPILE_ID_CHUNK_BITS: u32 = 12;
+const COMPILE_ID_CHUNK_LEN: usize = 1 << COMPILE_ID_CHUNK_BITS;
+/// Chunks the table can grow to: 4096 x 4096 ids live at once.
+const COMPILE_ID_CHUNK_COUNT: usize = 4096;
+
+/// A slot reserved by `reserve_compile_id` and not yet bound. Never a
+/// `CompiledMethod` address (those are aligned), and resolves to `None`.
+const COMPILE_ID_RESERVED: usize = 1;
+
+type CompileIdChunk = [std::sync::atomic::AtomicUsize; COMPILE_ID_CHUNK_LEN];
+
+/// `id -> CompiledMethod address`, with 0 for a free slot and
+/// [`COMPILE_ID_RESERVED`] for a reserved one.
+static COMPILE_ID_CHUNKS: [std::sync::atomic::AtomicPtr<CompileIdChunk>; COMPILE_ID_CHUNK_COUNT] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; COMPILE_ID_CHUNK_COUNT];
+
+/// Reservations refused because every id was live or not yet graced.
+static COMPILE_ID_EXHAUSTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The slot for `id`, if its chunk has been allocated.
+fn compile_id_slot(id: u32) -> Option<&'static std::sync::atomic::AtomicUsize> {
+    let chunk = COMPILE_ID_CHUNKS
+        .get((id >> COMPILE_ID_CHUNK_BITS) as usize)?
+        .load(std::sync::atomic::Ordering::Acquire);
+    if chunk.is_null() {
+        return None;
+    }
+    // SAFETY: a published chunk is a leaked `Box` that is never freed or moved.
+    let chunk: &'static CompileIdChunk = unsafe { &*chunk };
+    chunk.get(id as usize & (COMPILE_ID_CHUNK_LEN - 1))
+}
+
+/// Which ids may be issued next. Only `reserve_compile_id` and
+/// `release_compile_id` touch it, under its lock; lookups never do.
+struct CompileIdAllocator {
+    /// Next never-issued id. Starts at 1: an unwritten or stale TLS slot reads
+    /// as 0 and must not resolve to a real method.
+    next: u32,
+    /// One past the largest id the table can hold.
+    limit: u32,
+    /// Released ids, oldest first, each with the retirement generation stamped
+    /// when it was released.
+    free: std::collections::VecDeque<(u32, u64)>,
+}
+
+impl CompileIdAllocator {
+    fn new(limit: u32) -> Self {
+        Self {
+            next: 1,
+            limit,
+            free: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// The oldest released id whose stamp `graced` accepts, else a fresh id,
+    /// else `None`.
+    fn reserve(&mut self, graced: impl Fn(u64) -> bool) -> Option<u32> {
+        if let Some(&(id, stamp)) = self.free.front() {
+            if graced(stamp) {
+                self.free.pop_front();
+                return Some(id);
+            }
+        }
+        if self.next >= self.limit {
+            return None;
+        }
+        let id = self.next;
+        self.next += 1;
+        Some(id)
+    }
+
+    fn release(&mut self, id: u32, stamp: u64) {
+        self.free.push_back((id, stamp));
+    }
+}
+
+fn compile_id_allocator() -> &'static parking_lot::Mutex<CompileIdAllocator> {
+    static ALLOCATOR: OnceLock<parking_lot::Mutex<CompileIdAllocator>> = OnceLock::new();
+    ALLOCATOR.get_or_init(|| {
+        parking_lot::Mutex::new(CompileIdAllocator::new(
+            (COMPILE_ID_CHUNK_COUNT * COMPILE_ID_CHUNK_LEN) as u32,
+        ))
+    })
 }
 
 /// Reserve an identity for a compilation that has not produced its
 /// `CompiledMethod` yet. `0` means "no identity" — codegen then emits no
-/// publication and the scan keeps its old decode path for that method.
+/// publication and the scan keeps its old decode path for that method. It is
+/// returned only when every id is live or awaiting grace, and each such refusal
+/// is counted in [`compile_id_exhaustions`].
 pub fn reserve_compile_id() -> u32 {
-    let Ok(mut table) = compile_ids().write() else {
+    let mut allocator = compile_id_allocator().lock();
+    let Some(id) = allocator.reserve(retire_generation_is_graced) else {
+        drop(allocator);
+        if COMPILE_ID_EXHAUSTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            eprintln!(
+                "[jit-compile-id] every compile id is live or awaiting grace; compiled \
+frames of new methods fall back to the return-address decode in root scans"
+            );
+        }
         return 0;
     };
-    if table.len() >= u32::MAX as usize {
-        return 0;
+    let chunk = &COMPILE_ID_CHUNKS[(id >> COMPILE_ID_CHUNK_BITS) as usize];
+    if chunk.load(std::sync::atomic::Ordering::Acquire).is_null() {
+        // Allocated under the allocator lock, so no two reservations race to
+        // publish the same chunk.
+        let fresh: Box<CompileIdChunk> =
+            Box::new(std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)));
+        chunk.store(Box::into_raw(fresh), std::sync::atomic::Ordering::Release);
     }
-    table.push(0);
-    (table.len() - 1) as u32
+    if let Some(slot) = compile_id_slot(id) {
+        slot.store(COMPILE_ID_RESERVED, std::sync::atomic::Ordering::Release);
+    }
+    id
+}
+
+/// Reservations [`reserve_compile_id`] refused because no id was available.
+pub fn compile_id_exhaustions() -> u64 {
+    COMPILE_ID_EXHAUSTIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Bind a reserved id to the published artifact. Called once, at publication.
@@ -1979,36 +2096,41 @@ pub fn bind_compile_id(id: u32, cm_ptr: usize) {
     if id == 0 || cm_ptr == 0 {
         return;
     }
-    if let Ok(mut table) = compile_ids().write() {
-        if let Some(slot) = table.get_mut(id as usize) {
-            *slot = cm_ptr;
-        }
+    if let Some(slot) = compile_id_slot(id) {
+        slot.store(cm_ptr, std::sync::atomic::Ordering::Release);
     }
 }
 
-/// Clear a binding when its artifact is dropped. No frame of a dropped method
-/// can be live, so a later lookup answering `None` is the correct answer.
+/// Clear a binding when its artifact is dropped and queue the id for reuse. No
+/// frame of a dropped method can be live, so a later lookup answering `None` is
+/// the correct answer. The id is reissued only after grace (see above).
 pub fn release_compile_id(id: u32) {
     if id == 0 {
         return;
     }
-    if let Ok(mut table) = compile_ids().write() {
-        if let Some(slot) = table.get_mut(id as usize) {
-            *slot = 0;
-        }
+    let Some(slot) = compile_id_slot(id) else {
+        return;
+    };
+    let mut allocator = compile_id_allocator().lock();
+    // A slot already free was never reserved, or was released twice. Queueing
+    // it again would hand one id to two bodies.
+    if id >= allocator.next || slot.swap(0, std::sync::atomic::Ordering::AcqRel) == 0 {
+        return;
     }
+    // Stamped after the slot is cleared, so grace postdates the clear.
+    let stamp = bump_retire_generation();
+    allocator.release(id, stamp);
 }
 
 /// Resolve a published id to its `CompiledMethod` address, or `None` when the
-/// id is 0, out of range, or unbound.
+/// id is 0, out of range, reserved or unbound. Lock-free.
 pub fn lookup_compile_id(id: u32) -> Option<usize> {
     if id == 0 {
         return None;
     }
-    let table = compile_ids().read().ok()?;
-    match table.get(id as usize).copied() {
-        Some(0) | None => None,
-        Some(ptr) => Some(ptr),
+    match compile_id_slot(id)?.load(std::sync::atomic::Ordering::Acquire) {
+        0 | COMPILE_ID_RESERVED => None,
+        ptr => Some(ptr),
     }
 }
 
@@ -37059,6 +37181,38 @@ mod tests {
         assert!(jit_code_ranges_snapshot()
             .into_iter()
             .all(|(start, _)| !in_band(start)));
+    }
+
+    /// Compile ids are recycled, but only once the retirement generation stamped
+    /// at release has been graced. A mirror still holding a released id must
+    /// not resolve it to a different body. A full table is refused, not wrapped.
+    #[test]
+    fn compile_ids_are_recycled_only_after_grace() {
+        let mut ids = CompileIdAllocator::new(4);
+        assert_eq!(ids.reserve(|_| true), Some(1), "0 is never issued");
+        assert_eq!(ids.reserve(|_| true), Some(2));
+        ids.release(1, 10);
+        // Not graced yet: a fresh id is issued instead.
+        assert_eq!(ids.reserve(|stamp| stamp < 10), Some(3));
+        // Graced: the released id comes back, oldest first.
+        assert_eq!(ids.reserve(|stamp| stamp <= 10), Some(1));
+        ids.release(2, 11);
+        // The table is full and nothing is graced: refused.
+        assert_eq!(ids.reserve(|_| false), None);
+        assert_eq!(ids.reserve(|_| true), Some(2));
+        assert_eq!(ids.reserve(|_| true), None);
+
+        // The process table: reserve, bind, lock-free lookup, release.
+        let id = reserve_compile_id();
+        assert_ne!(id, 0);
+        assert_eq!(lookup_compile_id(id), None, "reserved but unbound");
+        let fake_cm = 0x7f3d_0000_1000usize;
+        bind_compile_id(id, fake_cm);
+        assert_eq!(lookup_compile_id(id), Some(fake_cm));
+        release_compile_id(id);
+        // (A parallel test may already have been reissued the id once graced,
+        // so the assertion is only that it no longer names this body.)
+        assert_ne!(lookup_compile_id(id), Some(fake_cm));
     }
 
     #[test]
