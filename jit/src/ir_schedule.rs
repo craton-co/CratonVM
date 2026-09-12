@@ -49,7 +49,7 @@
 //!    A natural loop's back edge — whose target dominates its source — is
 //!    retreating in *every* DFS, so it is polled in every layout.
 //! 3. **`blocks[0]` is the entry.** The layout pins it at position 0, so
-//!    [`compute_dominators`]' entry assumption and `find_best_block`'s fallback
+//!    [`Dominators`]' entry assumption and `find_best_block`'s fallback
 //!    are unchanged.
 //!
 //! Nothing else in `ir_lower` reads a block index as an ordering:
@@ -942,12 +942,16 @@ pub struct Schedule {
     pub blocks: Vec<Block>,
     /// Maps NodeId → block index.
     pub node_to_block: Vec<usize>,
-    /// Dominator relation over the block CFG: `dom[b][d]` is true iff block `d`
-    /// dominates block `b`. Retained from the scheduler's own
-    /// `compute_dominators` (it was previously dropped) so callers — notably the
-    /// guard-surviving scalar-replacement producer — can prove that a value's
-    /// defining block always executes before a deopt point.
-    pub dom: Vec<Vec<bool>>,
+    /// Dominator relation over the block CFG, indexed by the FINAL block
+    /// numbers: `dom.dominates(d, b)` is true iff block `d` dominates block
+    /// `b`. Kept so callers can prove that a value's defining block always runs
+    /// before a deopt point: the guard-surviving scalar-replacement producer
+    /// does, and so does `ir_check_elim`.
+    ///
+    /// It used to be published as a dense `Vec<Vec<bool>>` matrix, O(B²)
+    /// memory, built only because `ir_check_elim` indexed it. Every reader now
+    /// asks [`Dominators::dominates`], which answers the same in O(1).
+    pub dom: Dominators,
     /// Per-block execution frequency estimate, indexed by the *final* block
     /// index (i.e. permuted along with `blocks` when a layout is applied).
     /// Always populated — it costs one linear pass over a CFG whose block count
@@ -976,13 +980,7 @@ impl Schedule {
             Some(&b) if b != usize::MAX => b,
             _ => return false,
         };
-        nb != block
-            && self
-                .dom
-                .get(block)
-                .and_then(|row| row.get(nb))
-                .copied()
-                .unwrap_or(false)
+        nb != block && self.dom.dominates(nb, block)
     }
 }
 
@@ -1781,17 +1779,14 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
     }
 
     // The dominator relation is a property of the CFG, not of its numbering,
-    // but `dom` is *indexed* by block number — so recompute it after a
-    // permutation rather than trying to permute a matrix in place. Callers
-    // (`Schedule::node_strictly_dominates_block`, the scalar-replacement deopt
-    // producer) index it with post-layout indices.
-    //
-    // The published relation is the dense matrix its consumers index, built
-    // once here from whichever `Dominators` matches the final numbering.
+    // but `dom` answers by block number, so recompute it after a permutation
+    // rather than renumber it in place. Callers query it with post-layout
+    // indices: `Schedule::node_strictly_dominates_block`, the
+    // scalar-replacement deopt producer, and `ir_check_elim`.
     let dom = if layout.applied {
-        compute_dominators(&blocks)
+        Dominators::compute(&blocks)
     } else {
-        dom.to_matrix()
+        dom
     };
 
     Schedule {
@@ -1826,29 +1821,28 @@ fn awaits_placement(graph: &Graph, node_to_block: &[usize], id: usize) -> bool {
     }
 }
 
-/// Compute, for every block, the set of blocks that dominate it, as the dense
-/// matrix [`Schedule::dom`] publishes.
+/// Compute, for every block, the set of blocks that dominate it, as a dense
+/// matrix.
 ///
 /// `dom[b][d]` is true iff block `d` dominates block `b`. Block 0 (the entry)
 /// is assumed to be the CFG entry: it dominates every block, and is dominated
 /// only by itself. For blocks unreachable from the entry (no path of
 /// predecessors back to block 0) the row is "all blocks" — the value the
-/// classic iterative data-flow fixpoint this replaced left them at — so callers
-/// must only rely on `dominates(a, b)` when both are reachable;
-/// `find_best_block` handles the unreachable/empty case by falling back to the
-/// entry block.
+/// classic iterative data-flow fixpoint this replaced left them at.
 ///
-/// Derived from [`Dominators`], which computes the relation in near-linear
-/// time. The matrix itself is still O(B²) memory because [`Schedule::dom`]'s
-/// consumers index it directly; it is built once per schedule, and the
-/// scheduler's own queries go to [`Dominators`] instead.
+/// Test-only. [`Schedule::dom`] used to publish this O(B²) matrix. It
+/// publishes the [`Dominators`] instead, and the tests still use the matrix
+/// form to compare it against the dense fixpoint reference.
+#[cfg(test)]
 fn compute_dominators(blocks: &[Block]) -> Vec<Vec<bool>> {
     Dominators::compute(blocks).to_matrix()
 }
 
 /// True iff block `a` dominates block `b` (every path from the entry to `b`
-/// passes through `a`), read from a [`compute_dominators`] matrix. Both indices
-/// must be in range; an out-of-range index answers `false`.
+/// passes through `a`), read from a `compute_dominators` matrix. Both indices
+/// must be in range; an out-of-range index answers `false`. Test-only, like the
+/// matrix.
+#[cfg(test)]
 #[inline]
 fn dominates(matrix: &[Vec<bool>], a: usize, b: usize) -> bool {
     matrix
@@ -2079,9 +2073,13 @@ impl Dominators {
         self.pre[a] <= self.pre[b] && self.post[b] <= self.post[a]
     }
 
-    /// The dense matrix [`Schedule::dom`] publishes: `m[b][d]` iff `d`
-    /// dominates `b`. O(B²) memory, filled by walking each block's `idom`
-    /// chain.
+    /// The relation as a dense matrix: `m[b][d]` iff `d` dominates `b`. O(B²)
+    /// memory, filled by walking each block's `idom` chain.
+    ///
+    /// Test-only. It is what `Schedule::dom` published before the schedule
+    /// kept the [`Dominators`] itself, and the tests compare it against the
+    /// dense fixpoint reference.
+    #[cfg(test)]
     pub fn to_matrix(&self) -> Vec<Vec<bool>> {
         let n = self.idom.len();
         let mut matrix = Vec::with_capacity(n);
@@ -4835,7 +4833,7 @@ mod tests {
             "the input is placed with the phi it reads"
         );
         assert!(
-            dominates(&sched.dom, input_block, user_block),
+            sched.dom.dominates(input_block, user_block),
             "the input's block {input_block} must dominate the user's block {user_block}"
         );
         // Emission order: blocks in index order, then position in the block.
