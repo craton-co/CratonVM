@@ -616,7 +616,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-453 tokens.
+454 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1060,6 +1060,7 @@ export inherited from a parent shell.
 | `loader-blind-cp-resolve` | `CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE` |
 | `local-mask-fail-closed` | `CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED` |
 | `wide-local-oop-maps` | `CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS` |
+| `arm64` | `CRATONVM_JIT_ARM64` |
 | `arm64-safepoints` | `CRATONVM_JIT_ARM64_SAFEPOINTS` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
