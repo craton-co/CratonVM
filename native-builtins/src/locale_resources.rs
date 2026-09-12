@@ -2178,8 +2178,20 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // JVM default locale is German — but a requested locale with its own
     // matching file always wins over the fallback (so this only kicks in
     // when the primary chain found nothing beyond root).
+    //
+    // NOT for the JDK's own locale data (`sun.util.resources.*`,
+    // `sun.text.resources.*`). Those reach here from `LocaleData.getBundle` /
+    // `Bundles.of`, and `Bundles` has no fallback-locale step at all: its
+    // strategy's candidate list is the whole search. Applying the
+    // default-locale fallback to them appended the DEFAULT locale's candidates
+    // to the chain, and `try_class_bundle` returns the LAST existing candidate,
+    // so the default locale won over the requested one. Measured with the host
+    // default `ru_RU`: `DateFormatSymbols.getInstance(Locale.US)
+    // .getZoneStrings()` answered Russian names (and with default `en_US`,
+    // `getZoneStrings(new Locale("ru"))` answered English), where HotSpot
+    // answers each locale in its own language.
     let beyond_root = matched.as_ref().is_some_and(|(l, _)| !l.is_empty());
-    if !beyond_root {
+    if !beyond_root && !is_synthesized_locale_base(&bundle_name) {
         if let Some((f_lang, f_country, f_variant)) = resolve_fallback_locale(
             ctx,
             args,
@@ -2315,7 +2327,19 @@ fn maybe_prepend_tz_zone_id(
         return val;
     }
     let len = ctx.array_length(arr);
-    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len + 1);
+    // A `String[]`, as `handleGetObject`'s `new String[len + 1]` is: an untyped
+    // reference array reads back as `Object[]`, and
+    // `TimeZoneNameProviderImpl.getDisplayNameArray` `checkcast`s the value to
+    // `String[]`. `arr` and `key` cross the allocation, so pin them.
+    let arr_pin = ctx.pin_native_root(arr);
+    let _key_pin = ctx.pin_native_root(key);
+    let new_arr = match ctx.class_id_by_name("java/lang/String") {
+        Some(string_cid) => ctx.new_ref_array(string_cid, len + 1),
+        None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, len + 1),
+    };
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let key = ctx.read_native_pin(arr_pin + 1, key);
+    ctx.unpin_native_roots(arr_pin);
     ctx.set_array_element(new_arr, 0, Value::Object(Some(key)));
     for i in 0..len {
         let e = ctx.get_array_element(arr, i);

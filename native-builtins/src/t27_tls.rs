@@ -7374,74 +7374,23 @@ fn register_client_socket_mode_accessors(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    // The validation lives in the shared bodies, which ALSO apply the
+    // restriction. This registrar runs after `net_phase_e`'s and wins, and the
+    // first cut of it validated and then returned -- which silently dropped
+    // every client cipher/protocol restriction in the VM (Tomcat
+    // `TestSSLHostConfig{Cipher,Protocol,Compat}`). See
+    // `net_phase_e::ssl_socket_set_enabled_cipher_suites`.
     r.register(
         ss,
         "setEnabledCipherSuites",
         "([Ljava/lang/String;)V",
-        |ctx, args| {
-            // Null first, then membership: the order is observable, and
-            // `setEnabledCipherSuites(null)` reports "CipherSuites cannot be
-            // null" on HotSpot rather than complaining about a null suite.
-            let Some(Value::Object(Some(arr))) = args.get(1) else {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: "CipherSuites cannot be null".into(),
-                }
-                .into());
-            };
-            for i in 0..ctx.array_length(*arr) {
-                let name = match ctx.get_array_element(*arr, i) {
-                    Value::Object(Some(s)) => ctx.read_string(s),
-                    _ => None,
-                };
-                let name = name.unwrap_or_default();
-                if !SUPPORTED_CIPHER_SUITE_NAMES.contains(&name.as_str()) {
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("Unsupported CipherSuite: {name}"),
-                    }
-                    .into());
-                }
-            }
-            Ok(None)
-        },
+        crate::net_phase_e::ssl_socket_set_enabled_cipher_suites,
     );
     r.register(
         ss,
         "setEnabledProtocols",
         "([Ljava/lang/String;)V",
-        |ctx, args| {
-            let Some(Value::Object(Some(arr))) = args.get(1) else {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: "Protocols cannot be null".into(),
-                }
-                .into());
-            };
-            for i in 0..ctx.array_length(*arr) {
-                let name = match ctx.get_array_element(*arr, i) {
-                    Value::Object(Some(s)) => ctx.read_string(s),
-                    _ => None,
-                };
-                let name = name.unwrap_or_default();
-                // The protocol names this stack reports through
-                // `getSupportedProtocols`, plus the legacy spellings JSSE
-                // still names. Anything else is a caller's typo, and HotSpot
-                // says so rather than ignoring it.
-                const KNOWN: &[&str] = &[
-                    "TLSv1.3",
-                    "TLSv1.2",
-                    "TLSv1.1",
-                    "TLSv1",
-                    "SSLv3",
-                    "SSLv2Hello",
-                ];
-                if !KNOWN.contains(&name.as_str()) {
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("Unsupported protocol: {name}"),
-                    }
-                    .into());
-                }
-            }
-            Ok(None)
-        },
+        crate::net_phase_e::ssl_socket_set_enabled_protocols,
     );
     r.set_category(__prev_cat);
 }
