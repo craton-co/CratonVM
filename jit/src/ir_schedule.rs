@@ -202,6 +202,71 @@ fn sink_late_enabled() -> bool {
     }
 }
 
+/// Also take the LATEST block at equal loop depth, and read a phi's value
+/// input on its own edge -- **default OFF**; `CRATONVM_JIT_IR_SINK_EQUAL_DEPTH=1`
+/// arms it.
+///
+/// [`sink_pure_nodes`]'s own doc records why the equal-depth half was left out:
+/// it is "a different trade with a different risk", and leaving it out kept the
+/// pass attributable to the one thing it claims. The partial unroller is the
+/// case that makes the trade worth taking, and
+/// `internal/performance/c2-the-partial-unroller-20260911.md` §5 is the
+/// measurement that says so: every copy of an unrolled body sits at the SAME
+/// loop depth as the header, so the strict-decrease rule moves none of them,
+/// all `factor` copies are computed above the first test, and the carried
+/// values spill. That page counts 69 memory operands of 180 in the unrolled
+/// loop against **zero** in the rolled one.
+///
+/// The second half is not a separate option because it is not separable. A
+/// phi's value input is used **on its edge** -- in the matching predecessor
+/// block -- not in the phi's own block. Attributing it to the phi's block makes
+/// a loop header a use site for every carried value, which pins all of them
+/// above the body whatever the depth rule then decides. Equal-depth sinking
+/// without the edge rule therefore moves nothing in a loop, which is the only
+/// place it was built to help.
+///
+/// Read LIVE, deliberately. `ir_per_copy_frames_enabled` documents the trap
+/// this flag would otherwise walk into: the first version of THAT flag cached
+/// in a `OnceLock`, the matrix test ran the OFF arm first, and both arms
+/// reported byte-identical code.
+fn sink_equal_depth_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SINK_EQUAL_DEPTH").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+    )
+}
+
+/// The block a CONTROL node belongs to, walking up `inputs[0]` until a node
+/// that actually heads a block is reached.
+///
+/// A `Merge`/`Region`/`Start`/`Proj` heads its block and is found on the first
+/// step; an `If` does not, and resolves to the block whose terminator it is.
+/// Same walk `regalloc::ls_ctrl_block_of` makes against a finished
+/// [`Schedule`], written here against the in-progress `blocks` + `node_to_block`
+/// pair because this pass runs before one exists.
+fn ctrl_block_of(
+    graph: &Graph,
+    blocks: &[Block],
+    node_to_block: &[usize],
+    mut ctrl: NodeId,
+) -> Option<usize> {
+    for _ in 0..graph.nodes.len() {
+        if ctrl == NO_NODE {
+            return None;
+        }
+        let blk = *node_to_block.get(ctrl as usize)?;
+        if blk != usize::MAX && blocks.get(blk).map(|b| b.ctrl) == Some(ctrl) {
+            return Some(blk);
+        }
+        let node = graph.nodes.get(ctrl as usize)?;
+        match node.inputs.first() {
+            Some(&next) if next != ctrl => ctrl = next,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// May `op` be moved to a different block without changing what the method
 /// does?
 ///
@@ -301,23 +366,20 @@ fn deepest_common_dominator(dom: &[Vec<bool>], of: &[usize], nb: usize) -> Optio
 /// Move each pure node to the shallowest loop nesting on the dominator path
 /// between where its inputs put it and where its uses need it.
 ///
-/// **Only when the depth strictly decreases.** The classic schedule-late also
-/// prefers the latest block at equal depth, to shorten live ranges; that is a
-/// different trade with a different risk, and leaving it out keeps this pass's
-/// effect attributable to the one thing it claims — taking work out of loops.
+/// **Only when the depth strictly decreases** — unless
+/// [`sink_equal_depth_enabled`], which adds the other half of the classic
+/// schedule-late (prefer the latest block at equal depth, to shorten live
+/// ranges) together with the phi-edge use attribution it needs to reach a loop
+/// at all. That is a different trade with a different risk, which is why it is
+/// a flag and why the depth rule is what a failure falls back to rather than
+/// what it takes down with it.
 ///
 /// # The safepoint obligation, and why a failure reverts everything
 ///
-/// A frame state resolves a value it names from that value's HOME WORD, and the
-/// home is written wherever the node is emitted. So a node this pass moves must
-/// still dominate every block that could anchor a safepoint naming it —
-/// otherwise a deopt inside the loop reads a word nothing has written yet,
-/// which is the "confidently wrong value" failure this area produces.
-///
-/// The check is made against the FINAL placement, and a violation reverts the
-/// whole method rather than the offending node: reverting one node can break
-/// another's dominance (a use pulled back above a def that sank), so undoing
-/// the lot is the only revert that is obviously correct. `reverted` counts it.
+/// [`safepoints_dominate_anchors`] states it. The check is made against the
+/// FINAL placement; a violation first retries the placement WITHOUT the
+/// equal-depth rule, and reverts the whole method only if the depth rule alone
+/// cannot satisfy it either. `reverted` counts that.
 fn sink_pure_nodes(
     graph: &Graph,
     blocks: &mut [Block],
@@ -330,6 +392,76 @@ fn sink_pure_nodes(
     }
     let depth = loop_depths(blocks, dom);
     let original: Vec<usize> = node_to_block.to_vec();
+
+    // Read once per call, not once per process: `sink_equal_depth_enabled`
+    // documents why this may not be cached across compiles.
+    let equal_depth = sink_equal_depth_enabled();
+
+    let mut moved = place_sunk_nodes(graph, blocks, node_to_block, dom, &depth, equal_depth);
+    let mut ok =
+        moved == 0 || safepoints_dominate_anchors(graph, node_to_block, &original, dom, nb);
+    let mut retried = false;
+
+    // The equal-depth rule sinks strictly more nodes than the depth rule alone,
+    // so it has strictly more ways to violate the safepoint obligation — and
+    // the revert is whole-method. Falling straight back to "no sinking at all"
+    // would therefore let the NEW rule cost the OLD one its wins on any method
+    // that happens to name a sunk value in a deopt frame, which is a regression
+    // dressed as a conservative choice. Retry with the rule this pass shipped
+    // with instead, and revert only if THAT also fails.
+    if !ok && equal_depth {
+        node_to_block.copy_from_slice(&original);
+        moved = place_sunk_nodes(graph, blocks, node_to_block, dom, &depth, false);
+        ok = moved == 0 || safepoints_dominate_anchors(graph, node_to_block, &original, dom, nb);
+        retried = true;
+    }
+
+    if moved == 0 {
+        node_to_block.copy_from_slice(&original);
+        return (0, 0);
+    }
+    if !ok {
+        node_to_block.copy_from_slice(&original);
+        return (0, moved);
+    }
+
+    // Rebuild each block's data-node list from the placement. `topo_sort_block`
+    // runs after this and restores dependence order within every block.
+    let placed: Vec<NodeId> = blocks
+        .iter()
+        .flat_map(|b| b.nodes.iter().copied())
+        .collect();
+    for b in blocks.iter_mut() {
+        b.nodes.clear();
+    }
+    for id in placed {
+        let b = node_to_block[id as usize];
+        if b != usize::MAX && b < nb {
+            blocks[b].nodes.push(id);
+        }
+    }
+    if retried && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SINK").is_some() {
+        eprintln!("[ir-sink] equal-depth placement violated a safepoint; fell back to depth-only");
+    }
+    (moved, 0)
+}
+
+/// Choose a block for every sinkable node, writing the choice into
+/// `node_to_block`. Returns how many nodes it moved.
+///
+/// Split out of [`sink_pure_nodes`] so the equal-depth rule can be retried
+/// without it — see the fallback there. Makes no safepoint check of its own:
+/// the obligation is a property of the FINAL placement and is checked once, by
+/// [`safepoints_dominate_anchors`].
+fn place_sunk_nodes(
+    graph: &Graph,
+    blocks: &[Block],
+    node_to_block: &mut [usize],
+    dom: &[Vec<bool>],
+    depth: &[u32],
+    equal_depth: bool,
+) -> usize {
+    let nb = blocks.len();
     let mut moved = 0usize;
 
     // Iterated, because a node can only follow its uses: the `Add` feeding the
@@ -342,6 +474,54 @@ fn sink_pure_nodes(
             let ub = node_to_block[uid];
             if ub == usize::MAX || ub >= nb {
                 continue;
+            }
+            // A phi reads each value input ON ITS OWN EDGE. Attributing those
+            // reads to the phi's block makes a loop header a use site for every
+            // carried value and pins all of them above the body; attributing
+            // them to the matching predecessor is what lets a carried value
+            // sink to the copy that produces the next one. See
+            // `sink_equal_depth_enabled` for why this travels with the
+            // equal-depth rule rather than being its own switch.
+            //
+            // Falls back to the conservative whole-node attribution whenever
+            // the merge's arity does not match the phi's — an unmatched phi is
+            // a shape this pass does not model, and modelling it wrongly would
+            // sink a value past a reader.
+            if equal_depth && matches!(un.op, Op::Phi) {
+                let edges: Option<Vec<usize>> = un
+                    .input_opt(0)
+                    .and_then(|c| graph.nodes.get(c as usize))
+                    .filter(|m| matches!(m.op, Op::Merge | Op::Region))
+                    .filter(|m| m.inputs.len() + 1 == un.inputs.len())
+                    .map(|m| {
+                        m.inputs
+                            .iter()
+                            .map(|&c| {
+                                ctrl_block_of(graph, blocks, node_to_block, c).unwrap_or(usize::MAX)
+                            })
+                            .collect()
+                    });
+                if let Some(edges) = edges {
+                    for (k, &inp) in un.inputs.iter().skip(1).enumerate() {
+                        if inp == NO_NODE {
+                            continue;
+                        }
+                        // When the edge's block is unknown, fall back to the
+                        // phi's own block for THIS input rather than dropping
+                        // the use entirely — a dropped use is a node free to
+                        // sink below a reader.
+                        let eb = match edges[k] {
+                            e if e != usize::MAX && e < nb => e,
+                            _ => ub,
+                        };
+                        if let Some(v) = use_blocks.get_mut(inp as usize) {
+                            if !v.contains(&eb) {
+                                v.push(eb);
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
             for &inp in &un.inputs {
                 if inp == NO_NODE {
@@ -378,9 +558,24 @@ fn sink_pure_nodes(
             }
             let mut best = early;
             for cand in 0..nb {
-                if dominates(dom, early, cand)
-                    && dominates(dom, cand, late)
-                    && depth[cand] < depth[best]
+                if !dominates(dom, early, cand) || !dominates(dom, cand, late) {
+                    continue;
+                }
+                // Shallower loop nesting always wins: that is this pass's
+                // original claim and it is never traded away.
+                if depth[cand] < depth[best] {
+                    best = cand;
+                    continue;
+                }
+                // At equal depth, take the LATEST — the candidate the current
+                // best dominates. Every candidate here dominates `late`, which
+                // dominates every use, so this shortens the live range without
+                // moving the value below any reader. `cand != best` keeps the
+                // reflexive case from counting as a move.
+                if equal_depth
+                    && depth[cand] == depth[best]
+                    && cand != best
+                    && dominates(dom, best, cand)
                 {
                     best = cand;
                 }
@@ -395,26 +590,73 @@ fn sink_pure_nodes(
             break;
         }
     }
-    if moved == 0 {
-        return (0, 0);
-    }
+    moved
+}
 
-    // The safepoint obligation, against the final placement.
+/// Which `graph.safepoints` entry would `ir_lower` resolve for a deopt taken at
+/// this node?
+///
+/// Exactly `ir_lower::resolve_frame_state_for_site`'s rule, and it has to be:
+/// an anchor test that asks a broader question than the lowerer answers reports
+/// conflicts that cannot occur, and a narrower one misses conflicts that can.
+///
+/// * a node carrying a per-copy [`crate::ir::Node::frame_snapshot`] resolves to
+///   THAT snapshot, provided it still names the node's own bci;
+/// * every other node falls back to the first snapshot at its bci, which is the
+///   by-bci scan that was the only path before cloned regions existed.
+///
+/// The distinction is the whole reason an unrolled body can be scheduled per
+/// copy at all: after a clone there are `factor` nodes at one bci, and keying
+/// anchors by bci makes every copy's frame claim every copy's blocks — so a
+/// value sunk into copy 1 reads as failing to dominate copy 0 and the placement
+/// is thrown away. See `internal/performance/c2-per-copy-deopt-frames-20260911.md`.
+fn resolved_snapshot(graph: &Graph, n: &crate::ir::Node) -> Option<usize> {
+    let pc = n.bytecode_pc?;
+    if let Some(si) = n.frame_snapshot {
+        if graph.safepoints.get(si as usize).map(|s| s.bci) == Some(pc) {
+            return Some(si as usize);
+        }
+    }
+    graph.safepoints.iter().position(|s| s.bci == pc)
+}
+
+/// Does every value a safepoint names still dominate every block that could
+/// anchor that safepoint?
+///
+/// A frame state resolves a value it names from that value's HOME WORD, and the
+/// home is written wherever the node is emitted. So a node this pass moved must
+/// still dominate every block that could anchor a safepoint naming it —
+/// otherwise a deopt inside the loop reads a word nothing has written yet,
+/// which is the "confidently wrong value" failure this area produces.
+///
+/// A node still at its original block is skipped: this pass owes nothing for a
+/// placement it did not choose.
+///
+/// The answer is about the WHOLE method, and a violation reverts the whole
+/// method rather than the offending node: reverting one node can break
+/// another's dominance (a use pulled back above a def that sank), so undoing
+/// the lot is the only revert that is obviously correct.
+fn safepoints_dominate_anchors(
+    graph: &Graph,
+    node_to_block: &[usize],
+    original: &[usize],
+    dom: &[Vec<bool>],
+    nb: usize,
+) -> bool {
     let mut anchors: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
     for (nid, n) in graph.nodes.iter().enumerate() {
-        if let Some(pc) = n.bytecode_pc {
+        if let Some(si) = resolved_snapshot(graph, n) {
             let b = node_to_block[nid];
             if b != usize::MAX && b < nb {
-                anchors.entry(pc).or_default().push(b);
+                anchors.entry(si).or_default().push(b);
             }
         }
     }
-    let mut ok = true;
-    'check: for sp in &graph.safepoints {
-        let Some(anchor_blocks) = anchors.get(&sp.bci) else {
-            // No node carries this bci, so `build_deopt_points` finds no
-            // native anchor for it and emits no point at all.
+    for (si, sp) in graph.safepoints.iter().enumerate() {
+        let Some(anchor_blocks) = anchors.get(&si) else {
+            // No node resolves to this snapshot, so `build_deopt_points` finds
+            // no native anchor for it and emits no point at all.
             continue;
         };
         for &v in sp.locals.iter().chain(sp.stack.iter()) {
@@ -429,32 +671,11 @@ fn sink_pure_nodes(
                 continue; // not moved by this pass
             }
             if !anchor_blocks.iter().all(|&ab| dominates(dom, vb, ab)) {
-                ok = false;
-                break 'check;
+                return false;
             }
         }
     }
-    if !ok {
-        node_to_block.copy_from_slice(&original);
-        return (0, moved);
-    }
-
-    // Rebuild each block's data-node list from the placement. `topo_sort_block`
-    // runs after this and restores dependence order within every block.
-    let placed: Vec<NodeId> = blocks
-        .iter()
-        .flat_map(|b| b.nodes.iter().copied())
-        .collect();
-    for b in blocks.iter_mut() {
-        b.nodes.clear();
-    }
-    for id in placed {
-        let b = node_to_block[id as usize];
-        if b != usize::MAX && b < nb {
-            blocks[b].nodes.push(id);
-        }
-    }
-    (moved, 0)
+    true
 }
 
 /// Where a block's frequency estimate came from, and what it is.
@@ -2853,6 +3074,131 @@ mod tests {
             "Branching method should have 2+ blocks, got {}",
             sched.blocks.len()
         );
+    }
+
+    /// The equal-depth half of schedule-late: a pure node whose only use is in
+    /// a later block at the SAME loop depth moves there.
+    ///
+    /// `int f(int a, int b) { if (a != 0) return a + b; return 1; }` — the
+    /// `Add` is computed in the ENTRY block because that is where
+    /// `find_best_block` puts it (schedule-EARLY: the deepest block its inputs,
+    /// two parameters, dominate), and its only reader is the `Return` on the
+    /// taken arm. Both blocks are at depth 0, so the strict-decrease rule this
+    /// pass shipped with moves nothing; the equal-depth rule moves it to the
+    /// block that reads it, where it is also computed on one path instead of
+    /// both.
+    ///
+    /// **The sum is deliberately not stored to a local.** A local is named by
+    /// the deopt frame of every later bci, including the ones on the arm it did
+    /// not sink into, and [`safepoints_dominate_anchors`] then refuses the
+    /// placement — correctly, because a frame on that arm would read a word
+    /// nothing had written. That refusal is the pass working, not the rule
+    /// failing, and a test written on a local would assert the opposite of what
+    /// it looks like it asserts.
+    ///
+    /// Asserted as a DIFFERENCE between the two arms rather than as an absolute
+    /// block index, so a change in how the scheduler numbers blocks cannot make
+    /// this pass vacuously.
+    #[test]
+    fn equal_depth_sink_moves_a_pure_node_to_its_only_reader() {
+        // 0: iload_0   1: ifne +6 (-> 7)
+        // 4: iconst_1  5: ireturn   6: nop
+        // 7: iload_0   8: iload_1   9: iadd   10: ireturn
+        let code = [
+            0x1au8, 0x9a, 0x00, 0x06, 0x04, 0xac, 0x00, 0x1a, 0x1b, 0x60, 0xac, 0, 0,
+        ];
+
+        let block_of_add = |on: &str| -> (usize, usize) {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_SINK_EQUAL_DEPTH", Some(on))],
+                || {
+                    let builder = IrBuilder::new(2, 2);
+                    let mut graph = builder.build(&code, 11).expect("build failed");
+                    ir_optimize::optimize(&mut graph);
+                    let sched = schedule(&graph);
+                    let add = graph
+                        .nodes
+                        .iter()
+                        .position(|n| n.op == Op::Add)
+                        .expect("the method computes a + b");
+                    (sched.node_to_block[add], sched.blocks.len())
+                },
+            )
+        };
+
+        let (off, nblocks) = block_of_add("0");
+        let (on, _) = block_of_add("1");
+        assert!(nblocks >= 2, "branching method should have 2+ blocks");
+        assert_ne!(
+            on, off,
+            "the equal-depth rule did not move the Add out of block {off}"
+        );
+        assert_ne!(on, usize::MAX, "the Add must still be placed somewhere");
+        assert!(on < nblocks, "block index {on} out of range");
+    }
+
+    /// A value a deopt frame names on the arm it did NOT sink into keeps its
+    /// early placement — the obligation [`safepoints_dominate_anchors`] states.
+    ///
+    /// `int f(int a, int b) { int t = a + b; if (a == 0) return 1; return t; }`
+    /// is the same shape as the test above with one edit: the sum goes through
+    /// a LOCAL, so every snapshot from its store onwards names it, including
+    /// the one on the `return 1` arm. Sinking it into the other arm would let a
+    /// deopt there read a word nothing had written. The pass must decline, and
+    /// declining must cost nothing else — which is what the fallback to the
+    /// depth-only rule is for.
+    #[test]
+    fn a_value_a_frame_names_on_the_other_arm_does_not_sink() {
+        // 0: iload_0   1: iload_1   2: iadd   3: istore_2
+        // 4: iload_0   5: ifeq +5 (-> 10)
+        // 8: iload_2   9: ireturn   10: iconst_1  11: ireturn
+        let code = [
+            0x1au8, 0x1b, 0x60, 0x3d, 0x1a, 0x99, 0x00, 0x05, 0x1c, 0xac, 0x04, 0xac, 0, 0,
+        ];
+
+        let block_of_add = |on: &str| -> usize {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_SINK_EQUAL_DEPTH", Some(on))],
+                || {
+                    let builder = IrBuilder::new(2, 3);
+                    let mut graph = builder.build(&code, 12).expect("build failed");
+                    ir_optimize::optimize(&mut graph);
+                    let sched = schedule(&graph);
+                    let add = graph
+                        .nodes
+                        .iter()
+                        .position(|n| n.op == Op::Add)
+                        .expect("the method computes a + b");
+                    sched.node_to_block[add]
+                },
+            )
+        };
+
+        assert_eq!(
+            block_of_add("1"),
+            block_of_add("0"),
+            "a value the other arm's frame names must keep its early placement",
+        );
+    }
+
+    /// The flag is read LIVE, not cached in a `OnceLock`.
+    ///
+    /// `ir_per_copy_frames_enabled` records what a cached scheduling flag costs:
+    /// the matrix test ran the OFF arm first and both arms then reported
+    /// byte-identical code. Two calls in one process, different values, must
+    /// give different answers.
+    #[test]
+    fn equal_depth_flag_is_read_live() {
+        let read = |v: Option<&str>| {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_SINK_EQUAL_DEPTH", v)],
+                sink_equal_depth_enabled,
+            )
+        };
+        assert!(read(Some("1")));
+        assert!(!read(Some("0")));
+        assert!(!read(None), "default is OFF");
+        assert!(read(Some("1")), "a second read must still see the override");
     }
 
     #[test]
