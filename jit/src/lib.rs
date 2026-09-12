@@ -155,12 +155,17 @@ pub struct JitCodeRegion {
     /// list grows with every compiled method and `contains` is hit on every
     /// JIT call via `validate_code_ptr`.
     regions: Vec<(usize, usize)>,
+    /// [`REGIONS_EPOCH`] as of the last [`publish_region_snapshot`]. Unequal to
+    /// the live epoch means the snapshot lags the list; see
+    /// [`JIT_CODE_REGION_SNAPSHOT`] for why that is allowed in one direction.
+    published_epoch: u64,
 }
 
 impl JitCodeRegion {
     fn new() -> Self {
         Self {
             regions: Vec::new(),
+            published_epoch: 0,
         }
     }
 
@@ -171,7 +176,11 @@ impl JitCodeRegion {
         let idx = self.regions.partition_point(|&(s, _)| s < start);
         self.regions.insert(idx, (start, end));
         bump_regions_epoch();
-        publish_region_snapshot(self);
+        // Not republished. A region missing from the snapshot only sends
+        // `validate_code_ptr` to the locked lookup, which republishes then.
+        // Most buffers are compiled, published and called long before anyone
+        // validates into them, and a discarded compile is never validated at
+        // all, so one copy covers a whole burst instead of one per buffer.
     }
 
     fn deregister(&mut self, ptr: *const u8) {
@@ -179,15 +188,18 @@ impl JitCodeRegion {
         // Find the (unique) region with this start address and remove it,
         // preserving the sorted order.
         let lo = self.regions.partition_point(|&(s, _)| s < addr);
-        if lo < self.regions.len() && self.regions[lo].0 == addr {
-            self.regions.remove(lo);
+        if lo >= self.regions.len() || self.regions[lo].0 != addr {
+            // Nothing changed, so neither the epoch nor the snapshot moves.
+            return;
         }
-        // Bumped unconditionally, including when nothing was removed. A
-        // deregister that found nothing left the list unchanged, so the extra
-        // bump only costs the memo a refill -- and getting the "did it change?"
-        // predicate wrong in the other direction is a stale memo.
+        self.regions.remove(lo);
         bump_regions_epoch();
-        publish_region_snapshot(self);
+        // A removal IS republished eagerly, but only when the snapshot still
+        // names the region: a snapshot that lags by a removal would validate a
+        // pointer into an unmapped buffer, which is the one wrong answer.
+        if region_containing_in(&jit_code_region_snapshot().load(), addr).is_some() {
+            publish_region_snapshot(self);
+        }
     }
 
     fn contains(&self, ptr: *const u8) -> bool {
@@ -221,15 +233,14 @@ fn jit_code_regions() -> &'static Mutex<JitCodeRegion> {
 
 /// Generation of the JIT code region list.
 ///
-/// Bumped by [`JitCodeRegion::register`] and [`JitCodeRegion::deregister`],
-/// which are the ONLY two mutators and both run with `jit_code_regions()`'s
-/// lock held. So a reader that observes the same value at two moments has
-/// observed a region list that was byte-identical throughout -- which is the
-/// whole soundness argument for the per-thread memo in [`validate_code_ptr`].
+/// Bumped by [`JitCodeRegion::register`] and by a [`JitCodeRegion::deregister`]
+/// that removed something. Those are the only mutators, and both run with
+/// `jit_code_regions()`'s lock held. So a reader that observes the same value
+/// at two moments has observed a region list that was byte-identical
+/// throughout, and a snapshot stamped with the live value is exact.
 ///
-/// Starts at 0 and only ever rises, so `u64::MAX` is available as the memo's
-/// "never filled" sentinel: one bump per `ExecutableBuffer` create or drop, so
-/// reaching it would take 2^64 compiles.
+/// Starts at 0 and only ever rises: one bump per `ExecutableBuffer` create or
+/// drop.
 static REGIONS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Record that the region list changed. Called with the lock held.
@@ -331,9 +342,21 @@ pub fn code_ptr_memo_enabled() -> bool {
 /// read-copy-update, which is what `ArcSwap` is, and `JitCache::methods`
 /// already uses it for the identical shape one screen down.
 ///
-/// The snapshot is rebuilt under `jit_code_regions()`'s lock by whichever
-/// mutator changed the list, so a reader never sees a torn one and never takes
-/// a lock at all.
+/// The snapshot is rebuilt under `jit_code_regions()`'s lock, so a reader never
+/// sees a torn one and never takes a lock on a hit.
+///
+/// # It may lag by additions, never by removals
+///
+/// Rebuilding on every change copied the whole list per `ExecutableBuffer`
+/// create and drop, which is O(n) per compile and O(n^2) over a run. Now:
+///
+/// * a registration only bumps the epoch. The new region is absent from the
+///   snapshot, so a validation into it misses, takes the lock, finds it, and
+///   republishes (see [`validate_code_ptr`]). An absent region costs one slow
+///   lookup, never a wrong answer;
+/// * a deregistration republishes at once, but only if the snapshot still
+///   names the region. A snapshot holding a removed region would validate a
+///   pointer into an unmapped buffer.
 static JIT_CODE_REGION_SNAPSHOT: std::sync::OnceLock<arc_swap::ArcSwap<Vec<(usize, usize)>>> =
     std::sync::OnceLock::new();
 
@@ -341,9 +364,10 @@ fn jit_code_region_snapshot() -> &'static arc_swap::ArcSwap<Vec<(usize, usize)>>
     JIT_CODE_REGION_SNAPSHOT.get_or_init(|| arc_swap::ArcSwap::from_pointee(Vec::new()))
 }
 
-/// Republish the snapshot. Called with `jit_code_regions()`'s lock held, by the
-/// two mutators, so the copy taken here is of a list nobody is editing.
-fn publish_region_snapshot(regions: &JitCodeRegion) {
+/// Republish the snapshot. Called with `jit_code_regions()`'s lock held, so the
+/// copy taken here is of a list nobody is editing and the stamp is its epoch.
+fn publish_region_snapshot(regions: &mut JitCodeRegion) {
+    regions.published_epoch = REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     jit_code_region_snapshot().store(std::sync::Arc::new(regions.regions.clone()));
 }
 
@@ -363,9 +387,10 @@ fn publish_region_snapshot(regions: &JitCodeRegion) {
 /// `h2-update-path-throughput-RETIRED-20260821.md` calls
 /// "genuinely scaling rather than constant-factor work".
 ///
-/// The memo takes the lock out of the steady state without weakening the check:
-/// see [`CODE_PTR_MEMO`] for why an epoch match is a stronger statement than the
-/// locked lookup makes, not a weaker one.
+/// The lock-free snapshot ([`JIT_CODE_REGION_SNAPSHOT`]) takes the lock out of
+/// the steady state without weakening the check. It can lag the list only by
+/// regions added since it was built, and a miss falls through to the locked
+/// lookup, so every answer equals the locked one.
 pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
     if ptr.is_null() {
         return Err("null JIT code pointer");
@@ -387,16 +412,23 @@ pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
         if hit {
             return Ok(());
         }
-        // A miss here is not automatically an error: the snapshot is published
-        // by the mutators, and `JitCodeRegion::new()`'s empty initial value is
-        // live until the first `ExecutableBuffer` exists. Fall through to the
+        // A miss here is not automatically an error: registrations do not
+        // republish (see `JIT_CODE_REGION_SNAPSHOT`). Fall through to the
         // authoritative locked lookup rather than reporting a region that
         // exists as absent -- the snapshot is an accelerator, never the source
         // of truth.
     }
-    let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
+    let mut regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
     if !regions.contains(ptr) {
         return Err("JIT code pointer outside known code regions");
+    }
+    // Found under the lock but missed by the snapshot: it lags by an addition.
+    // Republish once, so the next call into any region registered since
+    // answers lock-free.
+    if code_ptr_memo_enabled()
+        && regions.published_epoch != REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+    {
+        publish_region_snapshot(&mut regions);
     }
     Ok(())
 }
@@ -550,10 +582,11 @@ impl std::error::Error for CompileError {}
 
 /// A buffer of executable machine code allocated via OS-level APIs.
 ///
-/// On platforms with W^X enforcement (macOS ARM64), the buffer starts in writable
-/// mode. Call [`finalize`](ExecutableBuffer::finalize) after emitting all code to
-/// transition to executable mode. On other platforms (Windows, Linux x86-64),
-/// the memory is always RWX and `finalize` is a no-op.
+/// Every platform enforces W^X (see `platform.rs`): the buffer is mapped
+/// read-write, and [`finalize`](ExecutableBuffer::finalize) flips it to
+/// read-execute (`VirtualProtect` to `PAGE_EXECUTE_READ` on Windows, `mprotect`
+/// to `PROT_READ | PROT_EXEC` on Linux/FreeBSD and macOS). Until then, a jump
+/// into it faults on instruction fetch.
 pub struct ExecutableBuffer {
     ptr: *mut u8,
     len: usize,
@@ -608,9 +641,13 @@ impl ExecutableBuffer {
         // free path) so the figure reflects live mappings.
         COMMITTED_JIT_CODE_BYTES.fetch_add(capacity, std::sync::atomic::Ordering::Relaxed);
         // Register this region for code pointer validation.
-        if let Ok(mut regions) = jit_code_regions().lock() {
-            regions.register(ptr, capacity);
-        }
+        // Poison is recovered, as everywhere else this lock is taken. Skipping
+        // the registration after an unrelated panic would make every
+        // `validate_code_ptr` into this buffer fail.
+        jit_code_regions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register(ptr, capacity);
         Some(Self {
             ptr,
             len: 0,
@@ -1143,9 +1180,12 @@ impl Drop for ExecutableBuffer {
         if self.ptr.is_null() {
             return;
         }
-        if let Ok(mut regions) = jit_code_regions().lock() {
-            regions.deregister(self.ptr);
-        }
+        // Poison is recovered here too. Skipping the deregistration would leave
+        // the region validating pointers into memory unmapped below.
+        jit_code_regions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .deregister(self.ptr);
         COMMITTED_JIT_CODE_BYTES.fetch_sub(self.capacity, std::sync::atomic::Ordering::Relaxed);
         // DIAG: `CRATONVM_DBG_JIT_UNMAP=1` names every code buffer as it is
         // unmapped. Paired with `CRATONVM_DBG=jitc` (which prints each
@@ -1771,21 +1811,106 @@ type JitCodeRange = (usize, usize, usize, std::sync::Weak<CompiledMethod>);
 /// Copy-on-write code-range registry.
 ///
 /// Readers take an atomically reference-counted immutable snapshot and never
-/// acquire the writer mutex. Registration/invalidation are rare compared with
-/// stack classification, so publishing a newly sorted snapshot keeps the hot
-/// lookup path both lock-free and O(log n).
+/// acquire the writer mutex, so the lookup path stays lock-free and O(log n).
 struct JitCodeRangeRegistry {
-    snapshot: arc_swap::ArcSwap<Vec<JitCodeRange>>,
+    snapshot: arc_swap::ArcSwap<JitCodeRangeSet>,
     writer: std::sync::Mutex<()>,
 }
 
 impl JitCodeRangeRegistry {
     fn new() -> Self {
         Self {
-            snapshot: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            snapshot: arc_swap::ArcSwap::from_pointee(JitCodeRangeSet::empty()),
             writer: std::sync::Mutex::new(()),
         }
     }
+}
+
+/// One immutable snapshot of the registry, split so a registration does not
+/// copy the whole table.
+///
+/// A single sorted `Vec` cloned per registration made every publication O(n),
+/// and N publications O(N^2). Now a registration copies only `recent`, which
+/// is capped at [`recent_code_range_capacity`] (about sqrt(n)), and shares
+/// `base` by `Arc`. When `recent` is full the two are merged into a new `base`,
+/// an O(n) step taken once per sqrt(n) registrations. That is O(sqrt(n))
+/// amortised per registration. A removal from `base` still rebuilds it; removals
+/// are paced by code reclamation, not by compilation.
+///
+/// Ranges are disjoint (each is a live executable buffer, and `Drop`
+/// unregisters before unmapping), so an address is covered by at most one
+/// entry across both halves.
+struct JitCodeRangeSet {
+    /// Sorted by start; shared unchanged between snapshots until a merge.
+    base: Arc<Vec<JitCodeRange>>,
+    /// Sorted by start; the registrations since the last merge.
+    recent: Vec<JitCodeRange>,
+}
+
+impl JitCodeRangeSet {
+    fn empty() -> Self {
+        Self {
+            base: Arc::new(Vec::new()),
+            recent: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.base.len() + self.recent.len()
+    }
+
+    /// The range covering `addr`, if any.
+    fn covering(&self, addr: usize) -> Option<&JitCodeRange> {
+        fn search(ranges: &[JitCodeRange], addr: usize) -> Option<&JitCodeRange> {
+            let candidate = ranges.partition_point(|(entry, _, _, _)| *entry <= addr);
+            let range = ranges.get(candidate.checked_sub(1)?)?;
+            (addr >= range.0 && addr < range.1).then_some(range)
+        }
+        search(&self.recent, addr).or_else(|| search(&self.base, addr))
+    }
+
+    /// Whether some range starts exactly at `entry`.
+    fn starts_at(&self, entry: usize) -> bool {
+        let hit = |ranges: &[JitCodeRange]| {
+            let at = ranges.partition_point(|(start, _, _, _)| *start < entry);
+            ranges.get(at).is_some_and(|range| range.0 == entry)
+        };
+        hit(&self.recent[..]) || hit(&self.base[..])
+    }
+
+    /// Visit every range in ascending start order.
+    fn for_each_sorted(&self, mut visit: impl FnMut(&JitCodeRange)) {
+        let (base, recent) = (&self.base[..], &self.recent[..]);
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < base.len() && j < recent.len() {
+            if base[i].0 <= recent[j].0 {
+                visit(&base[i]);
+                i += 1;
+            } else {
+                visit(&recent[j]);
+                j += 1;
+            }
+        }
+        base[i..].iter().for_each(&mut visit);
+        recent[j..].iter().for_each(&mut visit);
+    }
+
+    /// Every range except those starting at `skip`, merged into one sorted
+    /// `Vec` with spare room for one more.
+    fn merged_without(&self, skip: Option<usize>) -> Vec<JitCodeRange> {
+        let mut out = Vec::with_capacity(self.len() + 1);
+        self.for_each_sorted(|range| {
+            if Some(range.0) != skip {
+                out.push(range.clone());
+            }
+        });
+        out
+    }
+}
+
+/// Most registrations `recent` holds before it is merged into `base`.
+fn recent_code_range_capacity(base_len: usize) -> usize {
+    ((base_len as f64).sqrt() as usize).max(32)
 }
 
 static JIT_CODE_RANGES: std::sync::OnceLock<JitCodeRangeRegistry> = std::sync::OnceLock::new();
@@ -1896,12 +2021,11 @@ pub fn lookup_compile_id(id: u32) -> Option<usize> {
 /// That "cache" was write-only: it got clobbered and fully rebuilt every call
 /// regardless of whether the underlying set had changed since the previous
 /// call. Since `native_stack_has_jit_frame` runs on the per-native-call
-/// root-snapshot path (see the comment on that function) and the set of
-/// registered ranges only grows (compiled code is retained, not freed, per the
-/// `JIT_CODE_RANGES` doc comment above), this was an O(n log n) cost paid on
-/// EVERY native call, with n = total JIT-compiled methods ever registered —
-/// i.e. the cost of every native call grew as the process JIT-compiled more
-/// code, for the lifetime of the process. Exposed dramatically by the
+/// root-snapshot path (see the comment on that function), this was an
+/// O(n log n) cost paid on EVERY native call, with n = the registered ranges
+/// (which then only grew: compiled code was retained, not freed. Today a range
+/// is withdrawn when its body is reclaimed, and the generation advances only
+/// when the set actually changes). Exposed dramatically by the
 /// 2026-07-15 invoke-cache fix (this same file's caller-side history): making
 /// JDK-internal bytecode actually tier up to JIT (previously it barely did)
 /// multiplied the number of registered code ranges, which multiplied this
@@ -1949,46 +2073,88 @@ fn register_jit_code_range_inner(
         return;
     }
     let registry = jit_code_ranges();
-    if let Ok(_writer) = registry.writer.lock() {
-        let mut next = (**registry.snapshot.load()).clone();
-        // INSERT, do not push-then-sort. The snapshot this clone came from is
-        // already sorted by `start` — it is only ever written here and by
-        // `unregister_jit_code_range`, which retains in place — so the whole
-        // ordering work is placing ONE element. `sort_unstable_by_key` cannot
-        // see that: its almost-sorted fast path detects a run, and an element
-        // appended past the end of one is exactly the shape that defeats it, so
-        // every registration paid O(n log n) over the entire registry.
-        //
-        // It matters more than the old cost suggests, because the population is
-        // about to grow: `register_jit_code_range_inner` and its sorts were
-        // ~0.7% of the WebClient exchange profile with 155 compiled methods,
-        // and the whole point of the `invokedynamic` bridge is that far more
-        // methods stay compiled.
-        let range = (entry, entry.saturating_add(len), cm_ptr, owner);
-        let at = next.partition_point(|&(start, _, _, _)| start < entry);
-        next.insert(at, range);
-        registry.snapshot.store(std::sync::Arc::new(next));
-        // Release: any cached snapshot taken with Acquire after this point must
-        // see the push above (ordinary Mutex unlock already provides this, but
-        // the counter itself is read outside the lock by cache-check callers).
-        JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
+    // Poison is recovered: skipping a registration after an unrelated panic
+    // would hide this body from every root walker.
+    let _writer = registry.writer.lock().unwrap_or_else(|e| e.into_inner());
+    let current = registry.snapshot.load();
+    // INSERT, do not push-then-sort: both halves are already sorted by
+    // `start`, so the ordering work is placing ONE element. (A push-then-sort
+    // paid O(n log n) per registration; `register_jit_code_range_inner` and
+    // its sorts were ~0.7% of the WebClient exchange profile with 155
+    // compiled methods.)
+    let range = (entry, entry.saturating_add(len), cm_ptr, owner);
+    let next = if current.recent.len() < recent_code_range_capacity(current.base.len()) {
+        let mut recent = Vec::with_capacity(current.recent.len() + 1);
+        recent.extend(current.recent.iter().cloned());
+        let at = recent.partition_point(|(start, _, _, _)| *start < entry);
+        recent.insert(at, range);
+        JitCodeRangeSet {
+            base: Arc::clone(&current.base),
+            recent,
+        }
+    } else {
+        let mut base = current.merged_without(None);
+        let at = base.partition_point(|(start, _, _, _)| *start < entry);
+        base.insert(at, range);
+        JitCodeRangeSet {
+            base: Arc::new(base),
+            recent: Vec::new(),
+        }
+    };
+    registry.snapshot.store(Arc::new(next));
+    // Release: any cached snapshot taken with Acquire after this point must see
+    // the insertion above (the counter is read outside the lock by cache-check
+    // callers).
+    JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
-/// Remove every range with the given `entry` start. Normal cache eviction keeps
-/// ranges registered; this is used by explicit free-code diagnostics and tests.
-/// Stage 5.
+/// Remove every range starting at `entry`. Called from `CompiledMethod::drop`
+/// before the body's buffer is unmapped, and by tests.
+///
+/// Every dropped body calls this, including the many that never registered a
+/// range (registration is gated, see `JitCache::put`). So the absent case is
+/// answered from the lock-free snapshot, and neither copies the table nor
+/// advances [`jit_code_ranges_generation`]: advancing it for a no-op made every
+/// `native_stack_has_jit_frame` cache resnapshot after each reclamation.
 pub fn unregister_jit_code_range(entry: usize) {
     if entry == 0 {
         return;
     }
     let registry = jit_code_ranges();
-    if let Ok(_writer) = registry.writer.lock() {
-        let mut next = (**registry.snapshot.load()).clone();
-        next.retain(|(e, _, _, _)| *e != entry);
-        registry.snapshot.store(std::sync::Arc::new(next));
-        JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    // A range for `entry` can only be registered by a body that owns the
+    // buffer at `entry`, and that body is the one being dropped. So no
+    // registration of `entry` can race this check.
+    if !registry.snapshot.load().starts_at(entry) {
+        return;
     }
+    let _writer = registry.writer.lock().unwrap_or_else(|e| e.into_inner());
+    let current = registry.snapshot.load();
+    if !current.starts_at(entry) {
+        return;
+    }
+    let in_base = {
+        let at = current.base.partition_point(|(start, _, _, _)| *start < entry);
+        current.base.get(at).is_some_and(|range| range.0 == entry)
+    };
+    let next = if in_base {
+        // Rebuild `base` (merging `recent` into it on the way, which is free).
+        JitCodeRangeSet {
+            base: Arc::new(current.merged_without(Some(entry))),
+            recent: Vec::new(),
+        }
+    } else {
+        JitCodeRangeSet {
+            base: Arc::clone(&current.base),
+            recent: current
+                .recent
+                .iter()
+                .filter(|range| range.0 != entry)
+                .cloned()
+                .collect(),
+        }
+    };
+    registry.snapshot.store(Arc::new(next));
+    JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// Number of registered code ranges (Stage 5 diagnostic).
@@ -2027,18 +2193,17 @@ pub fn xt_jit_root_scan_enabled() -> bool {
 /// holds that very lock, so a `lookup_jit_code_range` call on it would
 /// deadlock the collector. The collector instead takes this snapshot ONCE
 /// (no thread suspended yet), then classifies every frozen peer against the
-/// returned copy with a lock-free range check. The set of ranges only grows
-/// during compilation and is withdrawn only after the last code owner drops.
+/// returned copy with a lock-free range check. Ranges are added as bodies are
+/// published and withdrawn when a body's last owner drops, before its buffer
+/// is unmapped.
 /// A momentarily-stale
 /// snapshot can only mis-classify a brand-new range as "not JIT" (handled
 /// conservatively by the snapshot-based mitigation), never the reverse.
 pub fn jit_code_ranges_snapshot() -> Vec<(usize, usize)> {
-    jit_code_ranges()
-        .snapshot
-        .load()
-        .iter()
-        .map(|(e, end, _, _)| (*e, *end))
-        .collect()
+    let ranges = jit_code_ranges().snapshot.load();
+    let mut out = Vec::with_capacity(ranges.len());
+    ranges.for_each_sorted(|(e, end, _, _)| out.push((*e, *end)));
+    out
 }
 
 /// Resolve the `CompiledMethod` pointer whose code range contains `addr`, or
@@ -2046,9 +2211,7 @@ pub fn jit_code_ranges_snapshot() -> Vec<(usize, usize)> {
 /// a lock-free binary search. Stage 5.
 pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
     let ranges = jit_code_ranges().snapshot.load();
-    let candidate = ranges.partition_point(|(entry, _, _, _)| *entry <= addr);
-    let (entry, end, cm, _) = ranges.get(candidate.checked_sub(1)?)?;
-    (addr >= *entry && addr < *end).then_some(*cm)
+    ranges.covering(addr).map(|(_, _, cm, _)| *cm)
 }
 
 /// `CRATONVM_JIT_ELIDE_TRIVIAL_CTOR=0` -- stop rewriting an elidable
@@ -2165,11 +2328,7 @@ pub fn jit_code_range_method_key(addr: usize) -> Option<String> {
 pub fn pin_jit_code_range_owner(addr: usize) -> Option<Arc<CompiledMethod>> {
     let entry = {
         let ranges = jit_code_ranges().snapshot.load();
-        let candidate = ranges.partition_point(|(entry, _, _, _)| *entry <= addr);
-        let (entry, end, _, owner) = ranges.get(candidate.checked_sub(1)?)?;
-        if addr < *entry || addr >= *end {
-            return None;
-        }
+        let (entry, _, _, owner) = ranges.covering(addr)?;
         // Fast path: the range was registered by `put`/`put_osr`, which carry
         // the owner. A live body upgrades with one atomic increment.
         if let Some(pinned) = owner.upgrade() {
@@ -2197,7 +2356,8 @@ pub fn pin_jit_code_range_owner(addr: usize) -> Option<Arc<CompiledMethod>> {
 pub fn snapshot_code_ranges_into(buf: &mut Vec<(usize, usize)>) {
     buf.clear();
     let ranges = jit_code_ranges().snapshot.load();
-    buf.extend(ranges.iter().map(|(e, end, _, _)| (*e, *end)));
+    buf.reserve(ranges.len());
+    ranges.for_each_sorted(|(e, end, _, _)| buf.push((*e, *end)));
 }
 
 /// DBG (spring-bug-11): code-range → method-name table for naming a JIT frame in
@@ -2471,9 +2631,10 @@ pub fn register_jit_method_name(entry: usize, len: usize, name: String) {
     if entry == 0 || len == 0 {
         return;
     }
-    if let Ok(mut v) = jit_name_ranges().lock() {
-        v.push((entry, entry + len, name));
-    }
+    jit_name_ranges()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((entry, entry + len, name));
 }
 
 /// Withdraw every name range starting at `entry`.
@@ -2491,9 +2652,11 @@ pub fn unregister_jit_method_name(entry: usize) {
     // Only when the registry was ever populated — `jit_names_enabled()` is the
     // usual reason it was not, and `get()` avoids creating it on the drop path.
     if let Some(lock) = JIT_NAME_RANGES.get() {
-        if let Ok(mut v) = lock.lock() {
-            v.retain(|(e, _, _)| *e != entry);
-        }
+        // Poison is recovered: a skipped withdrawal would name a recycled
+        // address after the dead body.
+        lock.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(e, _, _)| *e != entry);
     }
 }
 
@@ -2572,8 +2735,10 @@ pub enum JitRegionLookup {
 /// Linux are mapped `rw-` and so fault on instruction fetch exactly like an
 /// unmapped page. `try_lock`, so it is safe from a crash handler.
 pub fn jit_code_region_covering(addr: usize) -> JitRegionLookup {
-    let Ok(regions) = jit_code_regions().try_lock() else {
-        return JitRegionLookup::Locked;
+    let regions = match jit_code_regions().try_lock() {
+        Ok(regions) => regions,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return JitRegionLookup::Locked,
     };
     let idx = regions.regions.partition_point(|&(s, _)| s <= addr);
     if idx == 0 {
@@ -36847,6 +37012,53 @@ mod tests {
         assert!(region.contains(fake_ptr));
         region.deregister(fake_ptr);
         assert!(!region.contains(fake_ptr));
+    }
+
+    /// The registry is split into a shared `base` and a small `recent` half so a
+    /// registration does not copy the whole table. Every answer must still be
+    /// the answer one sorted table gives, across merges and across removals
+    /// from either half.
+    #[test]
+    fn code_ranges_answer_like_one_sorted_table_across_merges_and_removals() {
+        // A band no real mapping uses, so parallel tests cannot collide with it.
+        const BAND: usize = 0x7f3c_0000_0000;
+        const N: usize = 300;
+        let in_band = |start: usize| (BAND..BAND + N * 0x100).contains(&start);
+        let entry_of = |i: usize| BAND + i * 0x100;
+        // Register out of order, so both halves see interleaved inserts.
+        for i in (0..N).rev().step_by(2).chain((0..N).step_by(2)) {
+            register_jit_code_range(entry_of(i), 0x80, entry_of(i) + 1);
+        }
+        for i in 0..N {
+            assert_eq!(lookup_jit_code_range(entry_of(i) + 0x7c), Some(entry_of(i) + 1));
+            assert_eq!(lookup_jit_code_range(entry_of(i) + 0x80), None, "gap after {i}");
+        }
+        let band: Vec<(usize, usize)> = jit_code_ranges_snapshot()
+            .into_iter()
+            .filter(|(start, _)| in_band(*start))
+            .collect();
+        assert_eq!(band.len(), N);
+        assert!(band.windows(2).all(|w| w[0].0 < w[1].0), "snapshot must be sorted");
+        let mut buf = Vec::new();
+        snapshot_code_ranges_into(&mut buf);
+        assert!(buf.windows(2).all(|w| w[0].0 <= w[1].0), "copy must be sorted");
+
+        // Remove every third range: some live in `base`, the latest in `recent`.
+        for i in (0..N).step_by(3) {
+            unregister_jit_code_range(entry_of(i));
+            // Removing an absent range is a no-op, not a panic or a duplicate.
+            unregister_jit_code_range(entry_of(i));
+        }
+        for i in 0..N {
+            let expect = (i % 3 != 0).then_some(entry_of(i) + 1);
+            assert_eq!(lookup_jit_code_range(entry_of(i)), expect, "range {i}");
+        }
+        for i in 0..N {
+            unregister_jit_code_range(entry_of(i));
+        }
+        assert!(jit_code_ranges_snapshot()
+            .into_iter()
+            .all(|(start, _)| !in_band(start)));
     }
 
     #[test]
