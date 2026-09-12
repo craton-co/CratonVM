@@ -1566,3 +1566,38 @@ keeping:
 ```
 
 None of those is "9 probes move". Each names a function and a file.
+
+**Wave 6 closed one of those three and narrowed the other two.**
+
+```text
+  BreakIterator   CLOSED. The AbstractMethodError was the provider chain AND
+                  two natives on an abstract class. 17 retired, pin removed,
+                  probe matches HotSpot on all 30 rows.
+  JarFile         narrowed. The state model is still the retirement blocker,
+                  but the WRONG ANSWER it was carrying (`getAttributes` -> null
+                  for every entry of every jar) needed no state model and is
+                  fixed. And "the other producer is dead" is true only in the
+                  arm it was measured in.
+  HashMap's 77    unchanged, and now with the Hashtable half MEASURED: +0 over
+                  335 engagements on one probe, +10 on another, and the ten
+                  rows are views whose size() reads zero.
+```
+
+What wave 6 leaves for whoever takes this lane next, in the order this lane
+would take them:
+
+1. **`LinkedHashMap` (102)** — +8 armed with engagement, the smallest of the
+   four map deltas, and it unblocks eight `java/util/HashMap` rows for free.
+2. **`Hashtable`'s views (79)** — the hypothesis is written and takeable in
+   one binary: the views answer EMPTY armed because `size()` reads a count
+   the natives keep elsewhere, which is `map_resize`'s shape and not
+   `TreeMap`'s. A trial binary settles whether the +10 is that or dial
+   leakage; nothing else will.
+3. **`Date` / `sun/util/calendar/` (40)** — now CANDIDATES rather than
+   non-answers (+0 with reached=14 and 411). One trial binary each.
+4. **`JarFile`'s `ZipFile` state** (32) and **`TreeMap`'s node graph** (157)
+   — the two genuine rewrites, in that order, because `JarFile` is 32 rows
+   behind one constructor and `TreeMap` is 157 behind a red-black tree.
+5. **`CurrencyNames`** — +38 armed on the wave-6 workload, and the only
+   locale family whose curated path is doing work the image's own bundles
+   would have to replace. Unpriced.

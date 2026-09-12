@@ -769,4 +769,3 @@ fn the_jarfile_constructor_has_two_producers_and_this_says_which_wins() {
         rendered.join("\n")
     );
 }
-
