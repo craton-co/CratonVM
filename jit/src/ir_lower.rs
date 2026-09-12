@@ -24812,6 +24812,77 @@ mod tests {",
         assert_eq!(index.len(), distinct.len(), "one entry per distinct bci");
     }
 
+    // ── Bottom-tested (rotated) loops ────────────────────────────────────
+    //
+    // ECJ, Kotlin and Scala jump forward to a loop's test and branch back to
+    // its body. The IR builder refused every such method until it learned to
+    // walk one in reverse post-order. Each test compiles the shape through the
+    // whole IR pipeline and checks the answer the obvious Java gives. The byte
+    // layouts are annotated beside the same fixtures in `ir.rs`.
+
+    /// `int f(int n) { int s = 0; for (int i = 0; i < n; i++) s += i; return s; }`, ECJ-shaped.
+    #[test]
+    fn a_rotated_for_loop_compiles_via_ir_and_sums() {
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0xa7, 0x00, 0x0a, 0x1b, 0x1c, 0x60, 0x3c, 0x84, 0x02, 0x01,
+            0x1c, 0x1a, 0xa1, 0xff, 0xf7, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 21, 1, 3).expect("a rotated for loop compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        for (n, want) in [(0i64, 0i64), (1, 0), (5, 10), (10, 45), (-3, 0)] {
+            assert_eq!(f(n), want, "f({n})");
+        }
+    }
+
+    /// `int f(int n) { do { n = n - 3; } while (n > 0); return n; }`: the loop
+    /// header is pc 0.
+    #[test]
+    fn a_do_while_at_the_method_entry_compiles_via_ir() {
+        let code = [0x1a, 0x06, 0x64, 0x3b, 0x1a, 0x9d, 0xff, 0xfb, 0x1a, 0xac, 0, 0];
+        let cm = compile_via_ir(&code, 10, 1, 1).expect("a do/while at pc 0 compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        for (n, want) in [(10i64, -2i64), (0, -3), (3, 0), (1, -2), (-5, -8)] {
+            assert_eq!(f(n), want, "f({n})");
+        }
+    }
+
+    /// `int f(int n) { int c = 0; for (int i = 0; i < n; i++) for (int j = 0; j < i; j++) c += j; return c; }`:
+    /// a javac-shaped outer loop around an ECJ-shaped inner one.
+    #[test]
+    fn a_rotated_loop_nested_in_a_javac_loop_compiles_via_ir() {
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x1a, 0x03, 0x3e, 0xa7, 0x00, 0x0a,
+            0x1b, 0x1d, 0x60, 0x3c, 0x84, 0x03, 0x01, 0x1d, 0x1c, 0xa1, 0xff, 0xf7, 0x84, 0x02,
+            0x01, 0xa7, 0xff, 0xe7, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 34, 1, 4).expect("a nested rotated loop compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        // sum over i < n of (0 + 1 + ... + (i - 1))
+        for (n, want) in [(0i64, 0i64), (1, 0), (4, 4), (5, 10), (6, 20)] {
+            assert_eq!(f(n), want, "f({n})");
+        }
+    }
+
+    /// `int f(int n) { int s = 0; for (int i = 0; i < n; i++) { if ((i & 1) == 0) s += i; else s -= 1; } return s; }`,
+    /// ECJ-shaped: a forward if/else join inside a rotated body.
+    #[test]
+    fn a_rotated_loop_with_an_if_else_join_compiles_via_ir() {
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0xa7, 0x00, 0x16, 0x1c, 0x04, 0x7e, 0x9a, 0x00, 0x0a, 0x1b,
+            0x1c, 0x60, 0x3c, 0xa7, 0x00, 0x06, 0x84, 0x01, 0xff, 0x84, 0x02, 0x01, 0x1c, 0x1a,
+            0xa1, 0xff, 0xeb, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 33, 1, 3).expect("a rotated loop with an if/else compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        for (n, want) in [(0i64, 0i64), (1, 0), (2, -1), (3, 1), (5, 4), (6, 3)] {
+            assert_eq!(f(n), want, "f({n})");
+        }
+    }
+
     // do-while: the back-edge is an `if_icmplt` (not a goto), and the loop
     // header self-loops (the condition is at the bottom). Exercises the
     // if-as-back-edge path + a block whose true edge targets its own head.
