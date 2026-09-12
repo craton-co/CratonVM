@@ -16,15 +16,22 @@ This page takes that lane and reaches two results.
   assumes the carry took them. Admitting exactly that complement is **7.6%
   faster on `probes/FieldLoop.java` over a 0.0% floor**, with a *smaller*
   optimizing body, and free (1.000x, inside a 1.1% floor) on `FibCall.fib`.
-  Default OFF pending broader shapes; §6 says what it needs.
+  Default OFF pending broader shapes; §6a says what it needs.
 * **A retraction.** Admitting *constants* looked equally obvious, was built,
   compiled and passed 2 393 tests, and is **structurally incapable** of paying.
   §2 is why, and the reason was already written in the tree.
 
 The two together give a cost model the current rule does not have (§5), and it
-is the useful output of the page: a promoted value costs one save plus one
-restore **per epilogue**, and repays it **per execution of the reload it
-removes** — so residency pays in loops and washes on straight-line code.
+is the useful output of the page: a promoted value costs **two memory
+operations per call** — one save, one restore, *independent of the exit count* —
+and repays it **per execution of the reload it removes**. So residency is
+roughly free on straight-line code and pays in proportion to loop trip count.
+
+§5 reaches that by **failing to confirm its own first model**: a third probe,
+`probes/ManyExits.java`, was built specifically to be the shape where an
+epilogue-scaled cost should make this flag lose, and it came out neutral twice.
+The error in the first model is the useful part, and it is recorded rather than
+quietly replaced.
 
 Windows dev box under unrelated load from other worktrees; every timing is
 interleaved with a CONTROL arm and reports its own floor. Checksums identical on
@@ -180,7 +187,7 @@ times per call** — because it is read exactly once, by the phi at the loop bac
 edge, and that read is not the adjacent node. This is the budget page's "the
 parameter round-trips through memory", in a loop, removed.
 
-## 4. On `fib` it is free, and the reason is the epilogue count
+## 4. On `fib` it is free, and the static accounting looks worse than it is
 
 Same flag, same binary, the shape the budget page opened up:
 
@@ -207,68 +214,184 @@ disassemblies rather than estimated:
   disappear, and are paid for with twelve epilogue restores — three registers
   across four exits.
 
-Fifteen extra memory operations for three removed, and it costs **nothing
-measurable**, because all fifteen are on the prologue and the four exit paths:
-once per call, never in a loop, and `fib` has no loop. The transform is neutral
-here rather than harmful, which is the second-best outcome and worth having.
+Fifteen extra memory operations *emitted* for three removed, and it costs
+**nothing measurable** — because the fifteen are not what runs. Three are the
+prologue saves and twelve are restores spread across four epilogues, of which
+**exactly one executes per call**. The dynamic cost is three saves plus three
+restores, and `fib` recovers three stores and three reloads against it. A wash,
+which is what the clock says.
 
-## 5. The rule this gives, and why the register file makes it that shape
+That distinction is easy to state after the fact and this page did not have it
+until §5 went looking for the shape where the epilogue count should bite. It is
+worth reading §4 and §5 in that order for that reason.
+
+## 5. The cost model, the probe built to break it, and the correction
 
 **The residency register file is entirely callee-saved.** Five registers by
 default — RBX, R12–R15 — and `plan_register_residency` says so itself: *"every
 register in it is callee-saved and no fixed x86 operand names one"*. So a
-promoted value takes a register that must be saved on entry and **restored on
-every exit**. `fib` has four epilogues, each restoring the whole set:
+promoted value takes a register that must be saved on entry and restored before
+returning. `fib` has four epilogues, and each one restores the whole set:
 
 ```asm
 mov rbx,[rbp-0A8h] ; mov r13,[rbp-0B8h] ; mov r14,[rbp-0C0h] ; mov r15,[rbp-0C8h]
 add rsp,200h ; pop rbp ; ret          ; … and again, ×4
 ```
 
-Put the two measurements together and the trade has a shape:
+The first model this page wrote down read that as
 
-> **cost** = one save plus `N_epilogues` restores, paid **once per call**.
-> **benefit** = reloads removed, times **how often they execute**.
+> cost = one save plus `N_epilogues` restores, paid once per call
 
-The `static_uses >= 2` rule sees neither side. It counts static graph edges, so
-it cannot see the 20 000 executions of `FieldLoop`'s back edge, and it cannot
-see `fib`'s four exits either. That is why lifting it wholesale
-(`CRATONVM_JIT_IR_RESIDENCY_PAYS=0`) produced opposite signs on the two shapes —
-+4.8% on `fib`, −5.7% on `FieldLoop` — and why restricting the lift to the
-carry's complement gets the loop win **without** the `fib` loss.
+and predicted that a **loop-free method with more than four exits** should push
+the flag negative — nothing to repay a cost that grows with the exit count.
 
-`FieldLoop` is the confirming case for the cost side too: its optimizing body has
-**two** epilogues and already saves all five registers in *both* arms, so
-crossblock adds no new save at all and the cost term is zero.
+`probes/ManyExits.java` was written to be exactly that shape and nothing else:
+six values computed in the entry block, each read exactly once and each from a
+different later block (so all six are `single_use`, and none is reachable by
+`plan_carries`' one-node window), six returns, no loop. It compiles standalone
+— `full/ir ManyExits.pick(IIII)I`, six epilogues, not inlined — and the flag
+engages exactly as designed. Arm 0 uses **no** callee-saved register at all;
+arm 1 takes three:
 
-| | epilogues | new callee-saved saves | body | verdict |
-|---|---:|---:|---:|---|
-| `FieldLoop.sum` | 2 | **0** | 1052 → 1039 | **0.924x — faster** |
-| `FibCall.fib` | 4 | 3 | 788 → 883 | 1.000x — free |
+| | callee-saved saved | stores | loads | body |
+|---|---:|---:|---:|---:|
+| flag off | **0** | 50 | 47 | 1146 |
+| flag on | **3** (RBX, R14, R15) | 46 | **63** | 1242 |
 
-## 6. Status, and the obvious next step
+Three saves and **eighteen** restores — three registers across six exits —
+against four home stores removed. On the first model that is a clear loss.
 
-`CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` ships **default OFF**: one win and one
-neutral on two probes is evidence for the mechanism, not yet evidence for a
-default. What it needs before flipping is the regression suite and a
-`CratonBenchC2` checksum-parity run, and a third and fourth shape — in
-particular a loop-free method with *more* than four epilogues, which is where §5
-predicts it should finally lose.
-
-The next step §5 hands over is sharper than "try it on more shapes", though.
-The cost side is one save plus `N_epilogues` restores and the benefit side is
-loop-weighted, and **both quantities are already computed in this file**:
-`live.weight` is the loop-weighted use count `residency_pays_loop_weighted`
-reads, and the epilogue count is a property of the schedule. A rule of the form
+**It is not a loss. It is neutral, twice:**
 
 ```text
-admit when  live.weight[id]  >  1 + epilogue_count
+reps=60  n=200000  13 rounds   floor 6.6%   effect +0.7%   ratio 1.007x
+reps=120 n=200000  21 rounds   floor 4.0%   effect +0.2%   ratio 1.002x
 ```
 
-subsumes `static_uses >= 2`, the crossblock arm, and
-`CRATONVM_JIT_IR_LS_LOOP_WEIGHT` in one predicate that is actually counting the
-thing that decides the answer.
+**The model was wrong, and the error is worth more than the model.** Eighteen
+restores are emitted, but **exactly one epilogue executes per call.** The
+register file is saved once in the prologue and restored once on whichever exit
+is taken, whatever the static exit count. So:
 
+> **dynamic cost** = 2 memory operations per promoted register, **per call** —
+> one save, one restore — and it does **not** scale with the epilogue count.
+> **static size cost** = `1 + N_epilogues` per register, which is why both
+> loop-free bodies grew by ~95 bytes.
+> **benefit** = reloads and home stores removed, times **how often they
+> execute**.
+
+Under the corrected model all three probes fall out of one arithmetic, and the
+two neutral results are neutral for the *same* reason rather than by
+coincidence:
+
+| | epilogues | regs added | dynamic cost/call | removed | body | measured |
+|---|---:|---:|---:|---:|---:|---|
+| `FieldLoop.sum` | 2 | **0** (all 5 already saved) | **0** | reload+store **× 20 000** | 1052 → 1039 | **0.924x** |
+| `FibCall.fib` | 4 | 3 | 6 ops | 3 stores + 3 reloads | 788 → 883 | 1.000x |
+| `ManyExits.pick` | 6 | 3 | 6 ops | 4 stores + ~2 reloads | 1146 → 1242 | 1.002x |
+
+`fib` and `ManyExits` pay six operations and recover about six: a wash, at four
+exits and at six alike. `FieldLoop` pays **nothing** — its body already saves
+all five registers in both arms — and recovers a load and a store on every one
+of twenty thousand iterations.
+
+So the honest statement of the trade is simpler and less alarming than the one
+this page first reached: **residency is approximately free per call, and pays
+exactly to the extent that the reload it removes sits inside a loop.** The
+epilogue count is an icache and code-size concern, not a memory-traffic one.
+There is no exit count at which this flag becomes a loser, which is a stronger
+result for it than the page set out to prove — reached by trying to prove the
+opposite.
+
+## 6. What the rule should be, and why `LS_LOOP_WEIGHT` did not already do it
+
+The shipped rule is `static_uses >= 2`. Against the corrected model that form is
+right and its *inputs* are wrong twice over.
+
+**It counts static edges, not executions.** `CRATONVM_JIT_IR_LS_LOOP_WEIGHT`
+exists to fix precisely that, and it changes nothing measurable — which looks
+like a refutation and is not. `residency_pays_loop_weighted` asks
+`uses_freq >= def_freq * 2`, and for `FieldLoop`'s `i + 1`, **defined and used at
+the same loop depth**, that is `10 >= 20` — refused. A value whose definition is
+as hot as its use gets no help from loop weighting at all, and the induction
+variable is the archetype of that shape. This is why the loop-weight flag and the
+crossblock flag do not overlap despite appearing to address the same rule.
+
+**It prices a publish and a reload as equal.** That is the `>= 2`: one publish
+against one reload is called a wash. A publish is a register-to-register move —
+frequently zero cycles under renaming — and a reload is a memory load. They are
+not equal, and for a single-use value that is the entire trade. `plan_carries`
+already acts on that asymmetry for adjacent consumers; the crossblock arm is the
+same judgement applied to the values the carry cannot reach.
+
+So the successor rule is not "add an epilogue term" — §5 just retired that. It is
+to compare the two sides at their real prices, with `live.weight` on the benefit
+side, and to stop treating a register move as costing what a load costs.
+
+## 6a. Status
+
+`CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` ships **default OFF**. One win and two
+neutrals across three deliberately different shapes — a counted loop, a
+self-recursive call, and a six-exit branch tree — is good evidence for the
+mechanism and for the absence of a losing shape, but the shapes are all small
+probes.
+
+What it still needs before the default flips:
+
+* ~~A differential correctness soak~~ and ~~`CratonBench` /
+  `CratonBenchC2` checksum parity~~ — **both done, §6b.** No divergence, and
+  every checksum on both benchmarks is bit-identical.
+* **A large real body.** Everything measured here is under 1 300 bytes. The
+  register file is five deep and shared with `ir_reserve_carried_enabled`'s
+  pass, which takes what the main loop leaves; on a method with genuine register
+  pressure the crossblock arm spends that file earlier, and none of these probes
+  can show what that costs.
+## 6b. The correctness evidence, and exactly how much it covers
+
+A default-off JIT flag is flipped on evidence that turning it on changes no
+answer, which is what `tools/jit-flag-soak.sh` exists to produce.
+
+```text
+FLAGSOAK CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK=1 -XX:+UseGenerationalGC:
+  deterministic-and-agree=40  divergent=0  nondeterministic=0  failed-off=103
+```
+
+**`divergent=0` is the pass**, and `nondeterministic=0` means every workload that
+ran was reproducible under a fixed configuration — so none of the 40 excused
+itself. But that script's own instruction is to read both numbers, and
+`failed-off=103` is the bound: of 143 top-level classes in
+`vm/tests/resources/cratonvm`, **86 declare no `main` at all** (57 do), so most of
+the corpus is structurally unrunnable as a standalone workload and 17 more fail
+for their own reasons with the flag off. **This soak testifies about 40
+workloads, not 143.** It is evidence, and it is not a wide net.
+
+The benchmarks are the wider net, and both agree exactly:
+
+| | phases | checksums |
+|---|---:|---|
+| `CratonBench` (`-XX:+UseG1GC -Xmx8g`) | 7 | **7/7 identical** |
+| `CratonBenchC2` (`-Xmx4g`) | 3 | **3/3 identical** |
+
+`arithmetic 5000000003999999995`, `fib 701408733`, `sieve 9592`,
+`matrix 173943680`, `hashmap 1549999915000000`, `stringregex 5000050000`,
+`bintrees 68332206` — bit-identical with the flag on and off, plus 2 395 unit
+tests green.
+
+**No performance claim is made from those two runs**, and one of them is worth
+recording as a warning rather than a result. A single uncontrolled
+`CratonBenchC2` pair read `6103 ms` off against `3108 ms` on — an apparent 2x.
+Interleaved ten rounds per arm with a control arm, it is nothing:
+
+```text
+A (flag off) median 3211 ms   C (control) median 3326 ms
+B (flag on)  median 3204 ms
+noise floor 3.6%   effect -2.0%   VERDICT: UNMEASURABLE
+```
+
+The first pair was noise on a shared box, and it was noise in the flattering
+direction. That is the failure mode the control arm is for, and a 2x that
+evaporates under interleaving is a reminder that single-run benchmark pairs on
+this host are not evidence of anything.
 ## 7. What this says about the `fib` lane
 
 §4 is a negative result on `fib` and it belongs with the budget page's other
@@ -304,4 +427,12 @@ CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=FieldLoop.sum \
 bash tools/tier-ab/flag-ab.sh -Exe $EXE -Cp probes/out -Class FieldLoop \
   -Flag CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK -On 1 -Off 0 \
   -D probe.reps=3000 -D probe.n=20000 -Rounds 13
+
+# the falsification probe of section 5 -- loop-free, SIX epilogues
+javac -d probes/out probes/ManyExits.java
+bash tools/tier-ab/flag-ab.sh -Exe $EXE -Cp probes/out -Class ManyExits -Flag CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK -On 1 -Off 0 -D probe.reps=120 -D probe.n=200000 -Rounds 21
+
+# correctness, section 6b
+bash tools/jit-flag-soak.sh $EXE vm/tests/resources:cratonvm CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK=1
+$EXE -Xmx8g -XX:+UseG1GC -cp bench-classes CratonBench    # compare checksums
 ```
