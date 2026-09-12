@@ -616,7 +616,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-452 tokens.
+453 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -839,6 +839,7 @@ export inherited from a parent shell.
 | `ir-partial-unroll-factor` | `CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR` |
 | `ir-sink-equal-depth` | `CRATONVM_JIT_IR_SINK_EQUAL_DEPTH` |
 | `ir-residency-crossblock` | `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` |
+| `ir-residency-crossblock-budget` | `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK_BUDGET` |
 | `c2-accept` | `CRATONVM_C2_ACCEPT` |
 | `c2-accept-memo` | `CRATONVM_C2_ACCEPT_MEMO` |
 | `ir-unresolved-class-trap` | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` |
