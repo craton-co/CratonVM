@@ -1200,7 +1200,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-ctor-bind", on_key: None, off_key: Some("CRATONVM_NO_OSR_CTOR_BIND"), off_word: None, since: "2026-08-17" },
     E { group: Group::JIT, token: "real-new-site-flags", on_key: Some("CRATONVM_JIT_REAL_NEW_SITE_FLAGS"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::JIT, token: "deny", on_key: Some("CRATONVM_JIT_DENY"), off_key: None, off_word: None, since: "2026-07-03" },
-    E { group: Group::JIT, token: "deopt-real", on_key: Some("CRATONVM_DEOPT_REAL"), off_key: None, off_word: None, since: "2026-06-17" },
+    // Default-ON: `deopt_real_enabled()` reads an unset key as on and only `0`/
+    // `false`/`off`/`no` as off. With `off_word: None`, `-deopt-real` unset the key
+    // and so left precise resume ON, which is why this takes `"0"` (2026-09-12).
+    E { group: Group::JIT, token: "deopt-real", on_key: Some("CRATONVM_DEOPT_REAL"), off_key: None, off_word: Some("0"), since: "2026-06-17" },
     // The tier-up deopt sink's precise resume. Default-ON with a `0` opt-out:
     // off, the sink asks `can_deopt_resume` again and raises the hard
     // `InternalError: ... refusing side-effecting replay` an optimizing-tier

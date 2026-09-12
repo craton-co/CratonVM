@@ -1177,7 +1177,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DEFAULT_WATCHDOG_SEC` | THREADS | `CRATONVM_THREADS=default-watchdog-sec` | opt-in | off | behaviour | snapshot | vm-cli |
 | `CRATONVM_DEOPT_EAGER` | DBG | `CRATONVM_DBG=deopt-eager` | opt-in | off | diag | snapshot | difftest, jit |
 | `CRATONVM_DEOPT_EAGER_BCI` | DBG | `CRATONVM_DBG=deopt-eager-bci` | opt-in | off | diag | snapshot | jit |
-| `CRATONVM_DEOPT_REAL` | JIT | `CRATONVM_JIT=deopt-real` | opt-in | off | behaviour | snapshot | difftest, jit |
+| `CRATONVM_DEOPT_REAL` | JIT | `CRATONVM_JIT=deopt-real` | default-on | on | behaviour | snapshot | difftest, jit |
 | `CRATONVM_DEOPT_VERIFY` | DBG | `CRATONVM_DBG=deopt-verify` | opt-in | off | diag | snapshot | difftest, jit |
 | `CRATONVM_DIAG_HIB32` | DBG | `CRATONVM_DBG=diag-hib32` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DIAG_JAR_LIST` | DBG | `CRATONVM_DBG=diag-jar-list` | opt-in | off | diag | snapshot | types |
