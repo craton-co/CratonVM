@@ -56,8 +56,9 @@ would invent a number neither took. What they retire, exactly:
 
 ### Wave 6 — the acceptance, and the first tree taken in BOTH modes
 
-**THE ATTRIBUTION LADDER came first, and it is why this wave needed five
-binaries rather than two.** Each change answers a different question, and one
+**THE ATTRIBUTION LADDER came first, and it is why this wave needed seven
+binaries rather than two** — four for the ladder and two more pairs because
+dev moved twice under it. Each change answers a different question, and one
 trial binary could not have told them apart. Control
 `cratonvm-l1w6-base-20260911` is `origin/dev` at `8f09c89b9` untouched:
 
@@ -82,18 +83,37 @@ routing is now gated on `caller_is_app` — and the probe that caught it is in
 nobody's locale family. **A whole-tree differential is what makes a narrow
 fix safe to keep.**
 
-**THE ACCEPTANCE IS THE POST-MERGE PAIR.** dev moved 24 commits during this
-wave -- including two of the three files it touches and two re-freezes of the
-stub ratchet -- so the pre-merge control stopped being a control. Both
-binaries were rebuilt from one worktree, sequentially, and their sha256s
-differ:
+**THE ACCEPTANCE IS A POST-MERGE PAIR, AND THERE WERE TWO OF THEM.** dev
+moved 24 commits during this wave's first acceptance and 9 more during its
+second -- twice bringing re-freezes of the shared stub ratchet, and the
+second time a native-callee dispatch memo in the same two files this wave's
+pin removal lives in. A control one dev-step behind is not a control, so the
+pair was rebuilt each time, from one worktree, sequentially, with distinct
+sha256s. The corpus below was taken on the FIRST pair and is labelled with
+its revision; the tree and the ratchet were re-taken on the second.
 
 ```text
-  control  cratonvm-l1w6-base2-20260912   origin/dev d9fe011ff   0c64eb0825fb056c
-  trial    cratonvm-l1w6-t4-20260912      this merge 8e2c4b229   a3f625e012f512b5
+  pair 1   control cratonvm-l1w6-base2-20260912  origin/dev d9fe011ff  0c64eb0825
+           trial   cratonvm-l1w6-t4-20260912     this merge 8e2c4b229  a3f625e012
+  pair 2   control cratonvm-l1w6-base3-20260912  origin/dev fa891c6c6  6a665e70e2
+           trial   cratonvm-l1w6-t5-20260912     this merge 20d6e788b  3499cff6db
 ```
 
-166 probes (dev's merge brought five more), fresh oracle, `--jdk-only`:
+**Both pairs answer the same, and pair 2 is the one that counts** — it is the
+one whose control carries dev's native-callee dispatch memo, which landed in
+`vm_exec.rs` and `native_override.rs`, the two files this wave's pin removal
+lives in:
+
+```text
+  pair 2, --jdk-only, 166 probes    0 worse   3 better
+    L1BreakIterRealProbe      28 -> 0
+    L1LocaleProviderWorkload   8 -> 0
+    L1JarTextSweep            20 -> 18
+  base differing 44   trial differing 42
+```
+
+Pair 1, 166 probes (dev's merge brought five more), fresh oracle,
+`--jdk-only`:
 
 ```text
   0 worse   3 better
@@ -124,7 +144,9 @@ retirement change nothing in default mode** — a retired triple is re-tagged
 repairs that were never mode-gated: the real provider chain (`P.*`) and
 `JarEntry.attr`.
 
-CORPUS, both binaries, interleaved:
+CORPUS, both binaries, interleaved, on PAIR 1 (`d9fe011ff`) and not re-taken
+on pair 2 -- the tree and the ratchet were, and the corpus costs an hour per
+pair on a host at load 20:
 
 ```text
                               control      trial
@@ -162,7 +184,7 @@ is nobody's lane; this page has now recorded it twice.
 GATES, on the merged tree:
 
 ```text
-  native-api --lib                                   427 passed, 0 failed
+  native-api --lib                                   428 passed, 0 failed
   native-collections --lib                           147 passed, 0 failed
   native-builtins --test duplicate_registration_gate   8 passed, 0 failed
   native-builtins --lib, the wave's own six tests      6 passed, 0 failed
@@ -173,18 +195,26 @@ GATES, on the merged tree:
 RATCHET, re-measured on the merged tree and never carried across it:
 
 ```text
-  BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT   2728 -> 2747
-  BASELINE_SYNTHETIC_STUBS_MANAGEMENT      2755 -> 2774
-  BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK   2728 -> 2747
+  BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT   2865 -> 2884
+  BASELINE_SYNTHETIC_STUBS_MANAGEMENT      2892 -> 2911
+  BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK   2865 -> 2884
 ```
 
 `+19` on every arm, and the account is nineteen rows in two tables: all
 seventeen of `java/text/BreakIterator`, plus `LocaleData.getBundle` and
-`JRELocaleProviderAdapter.getLocaleServiceProvider`. Measured TWICE across
-the merge — before it, this branch printed 2630/2641/2630 against dev's
-2611/2622/2611; dev then re-froze twice more for other lanes and the arms
-were RE-RUN rather than incremented, giving the same `+19` over a control
-117 rows higher.
+`JRELocaleProviderAdapter.getLocaleServiceProvider`. **THREE INDEPENDENT
+DERIVATIONS, none of them arithmetic** — dev re-froze these constants twice
+while this wave was in its acceptance runs, and each time the arms were
+re-run against the new tip rather than incremented:
+
+```text
+  control          no-mgmt   mgmt   syn-jdk     trial gives
+  8f09c89b9  GREEN    2611    2622     2611     2630 / 2641 / 2630
+  d9fe011ff  GREEN    2728    2755     2728     2747 / 2774 / 2747
+  fa891c6c6  GREEN    2865    2892     2865     2884 / 2911 / 2884
+```
+
++19 every time, over controls 254 rows apart.
 
 **161 probes, both modes, per probe, on the PRE-MERGE pair:**
 
@@ -1641,6 +1671,15 @@ is worth pricing before the retirement rows.
   `+10` on `L1EntrySetRouteProbe`. Engagement makes a green mean something; it
   does not make it mean everything. Bisect on at least one probe that
   exercises the family's VIEWS, because that is where the counts live.
+- **On a branch this busy, the acceptance is a moving target, and the fix is
+  to say WHICH tree each number was taken on.** dev moved 24 commits during
+  this wave's first acceptance and 9 more during its second, twice bringing
+  re-freezes of the shared stub ratchet and once bringing a dispatch memo in
+  the same two files this wave edits. The rule that survives it: re-run what
+  the merge can move (the ratchet is a shared constant, so ALWAYS), re-run
+  what the merge touched (dev's memo touches `vm_exec.rs`, so the tree), and
+  print the control's revision beside every number so the next reader can
+  tell a stale number from a wrong one.
 - **A `reached == 0` row is a request for a workload.** Six rows of this
   lane's locale bisection said nothing for two waves. One purpose-built probe
   turned five of them into answers -- two retirable, two measured blockers,
