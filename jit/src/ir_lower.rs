@@ -8671,6 +8671,12 @@ impl<'a> Lowerer<'a> {
                     target,
                     self.frame_record,
                 );
+                // Retract the push the map above emitted, exactly as
+                // `Op::New` does. Without it `lower_inner`'s push/reload
+                // balance check refused every method with a synchronized block
+                // — after emitting the whole body. The reload works through
+                // RCX, so the helper's RAX survives for the sentinel test.
+                self.emit_shadow_reload();
                 // `i64::MIN` means the helper published a pending Java
                 // exception (a null receiver takes the NPE path).
                 self.emit_mov_reg_imm64(RCX, i64::MIN as u64);
@@ -8685,13 +8691,21 @@ impl<'a> Lowerer<'a> {
                 let ok = self.buf.pos();
                 let rel = ok as i32 - (ok_patch as i32 + 4);
                 Self::patch_or_bail(&mut self.buf, ok_patch, rel);
-                // Store the possibly-REMAPPED reference back. A contended
-                // acquire can move the object while this thread is parked.
-                // Idempotent with the collector's own rewrite:
+                // Store the possibly-REMAPPED reference back — after ENTER only.
+                // A contended acquire can move the object while this thread is
+                // parked, and `jit_monitor_enter` returns the object. Idempotent
+                // with the collector's own rewrite:
                 // `conservative_roots::remap_one_jit_frame` rewrites published
-                // slots keyed on their CURRENT value, so if it already wrote
-                // the new address, writing the same address again is a no-op.
-                self.store_rax(obj_slot);
+                // slots keyed on their CURRENT value, so if it already wrote the
+                // new address, writing the same address again is a no-op.
+                //
+                // `jit_monitor_exit` returns `1` on success, not the object, so
+                // storing RAX after an exit overwrote the object's home with the
+                // address 1: a second `synchronized (this)` in the same method
+                // read `this` back as 1, and the oop map published it.
+                if matches!(node.op, Op::MonitorEnter) {
+                    self.store_rax(obj_slot);
+                }
             }
             Op::New {
                 class_id,
@@ -9005,8 +9019,18 @@ impl<'a> Lowerer<'a> {
                 // null, and two distinct objects 4 GiB apart would test equal
                 // to each other. Selected from the operand types, so an int
                 // compare keeps the shorter encoding.
-                let ref_cmp = matches!(self.graph.nodes[node.inputs[0] as usize].ty, IrType::Ref)
-                    || matches!(self.graph.nodes[node.inputs[1] as usize].ty, IrType::Ref);
+                //
+                // A `long` compare needs all 64 bits for the same reason: the
+                // builder's `ldiv`/`lrem` zero guard is `Cmp(Ne, divisor, 0L)`,
+                // and a 32-bit CMP saw a divisor of `1L << 32` as zero and
+                // deoptimised on every call.
+                let ref_cmp = matches!(
+                    self.graph.nodes[node.inputs[0] as usize].ty,
+                    IrType::Ref | IrType::Long
+                ) || matches!(
+                    self.graph.nodes[node.inputs[1] as usize].ty,
+                    IrType::Ref | IrType::Long
+                );
                 if ref_cmp {
                     // CMP RAX, RCX
                     self.buf.emit(&[0x48, 0x39, 0xC8]);
@@ -10898,9 +10922,15 @@ impl<'a> Lowerer<'a> {
                             Op::Cmp(cc) => {
                                 let a = cmp_node.inputs[0];
                                 let b = cmp_node.inputs[1];
-                                let ref_cmp =
-                                    matches!(self.graph.nodes[a as usize].ty, IrType::Ref)
-                                        || matches!(self.graph.nodes[b as usize].ty, IrType::Ref);
+                                // 64-bit for `Ref` and `Long` operands; see the
+                                // unfused `Op::Cmp` arm.
+                                let ref_cmp = matches!(
+                                    self.graph.nodes[a as usize].ty,
+                                    IrType::Ref | IrType::Long
+                                ) || matches!(
+                                    self.graph.nodes[b as usize].ty,
+                                    IrType::Ref | IrType::Long
+                                );
                                 // Both already in registers: compare them
                                 // there. A fused compare is the one arm that
                                 // may do this without owing anything else — it
@@ -20562,15 +20592,29 @@ mod tests {").next().unwrap_or(src);
         }
         let mut helpers = no_helpers();
         helpers.monitor_enter = fake_monitor as *const () as usize;
-        helpers.monitor_exit = fake_monitor as *const () as usize;
+        // The real `jit_monitor_exit` returns 1 on success, NOT the object.
+        // A fake that echoed `obj` for exit as well hid the lowering writing
+        // that return value back into the object's home slot.
+        extern "C" fn fake_monitor_exit(_vm: i64, _obj: i64) -> i64 {
+            1
+        }
+        helpers.monitor_exit = fake_monitor_exit as *const () as usize;
         let cm = lower(&graph, &schedule, 1, 1, &helpers)
             .expect("a monitor graph with a helper must compile");
-        let target = (fake_monitor as *const () as usize).to_le_bytes();
         let bytes = cm.code_bytes();
-        let calls = bytes.windows(8).filter(|w| *w == target).count();
+        let calls_to = |f: usize| {
+            let target = f.to_le_bytes();
+            bytes.windows(8).filter(|w| *w == target).count()
+        };
         assert_eq!(
-            calls, 2,
-            "monitorenter and monitorexit must each call the helper"
+            calls_to(fake_monitor as *const () as usize),
+            1,
+            "monitorenter must call the enter helper"
+        );
+        assert_eq!(
+            calls_to(fake_monitor_exit as *const () as usize),
+            1,
+            "monitorexit must call the exit helper"
         );
     }
     /// COV-03 — build the one-line `void set(Corpus o, X v) { o.f = v; }` graph

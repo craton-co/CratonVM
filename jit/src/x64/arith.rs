@@ -516,6 +516,17 @@ impl Compiler {
         let offset = i16::from_be_bytes([code[next_op_pc + 1], code[next_op_pc + 2]]) as i32; // Widening: always safe
         let target_pc = (next_op_pc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
 
+        // Mirror the regular `if_icmp*` arm: flush scratch (including the
+        // callee-saved-oop flush), then poll on a backward branch. The fusion
+        // skipped both, so `do { work(); } while (i++ < 1000);` — or kotlinc's
+        // `for (i in 0 until 100)` over a call-free body — had a back edge with
+        // no safepoint poll at all, and a stop-the-world collection waited for
+        // the whole loop.
+        self.flush_scratch_registers();
+        if target_pc <= next_op_pc {
+            self.emit_safepoint_poll();
+        }
+
         // Values left below value1 must be flushed to canonical frame slots
         // for the taken edge (the merge-target revival reconstructs them from
         // canonical offsets; the regular if_icmp handler does the same).

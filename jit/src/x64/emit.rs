@@ -193,6 +193,46 @@ impl Compiler {
         self.buf.emit(&bytes[..len]);
     }
 
+    /// MOVUPS [rbp - offset], XMMn — all 128 bits into a 16-byte frame slot.
+    ///
+    /// The callee-saved XMM save. Win64 preserves the whole of XMM6-XMM15, so
+    /// the 64-bit `emit_movq_mem_rbp_from_xmm` is not a save at all for a
+    /// caller that holds a vector there. Encoding: `[REX.R] 0F 11 /r`; no
+    /// alignment requirement, so the slot needs no padding.
+    pub(super) fn emit_movups_mem_rbp_from_xmm(&mut self, offset: i32, xmm: u8) {
+        let Ok(d) = Disp::encode_for_base(-(offset as i64), RBP) else {
+            self.buf
+                .mark_codegen_unencodable("frame-displacement-unencodable");
+            return;
+        };
+        if xmm >= 8 {
+            self.buf.emit_byte(0x44); // REX.R (RBP needs no REX.B)
+        }
+        self.buf.emit_byte(0x0F);
+        self.buf.emit_byte(0x11);
+        self.buf.emit_byte(d.modrm(xmm, RBP));
+        let (bytes, len) = d.bytes();
+        self.buf.emit(&bytes[..len]);
+    }
+
+    /// MOVUPS XMMn, [rbp - offset] — the restore paired with
+    /// [`Self::emit_movups_mem_rbp_from_xmm`]. Encoding: `[REX.R] 0F 10 /r`.
+    pub(super) fn emit_movups_xmm_from_mem_rbp(&mut self, xmm: u8, offset: i32) {
+        let Ok(d) = Disp::encode_for_base(-(offset as i64), RBP) else {
+            self.buf
+                .mark_codegen_unencodable("frame-displacement-unencodable");
+            return;
+        };
+        if xmm >= 8 {
+            self.buf.emit_byte(0x44);
+        }
+        self.buf.emit_byte(0x0F);
+        self.buf.emit_byte(0x10);
+        self.buf.emit_byte(d.modrm(xmm, RBP));
+        let (bytes, len) = d.bytes();
+        self.buf.emit(&bytes[..len]);
+    }
+
     /// MOVSD XMMdst, XMMsrc — move scalar double between XMM registers.
     pub(super) fn emit_movsd_xmm_xmm(&mut self, dst: u8, src: u8) {
         // F2 [REX] 0F 10 modrm — MOVSD dst, src

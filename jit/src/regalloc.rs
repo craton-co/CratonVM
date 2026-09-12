@@ -4405,6 +4405,13 @@ fn ir_op_is_safepoint(op: &Op) -> bool {
             // mirror on first touch, same as the three above.
             | Op::InstanceOf { .. }
             | Op::CheckCast { .. }
+            // `ir_lower` publishes an oop map before each of these: a
+            // contended monitor acquire parks the thread for a whole
+            // collection, and `jit_aastore` allocates its
+            // `ArrayStoreException`.
+            | Op::MonitorEnter
+            | Op::MonitorExit
+            | Op::ArrayStore(crate::ir::MemKind::Ref)
     )
 }
 
@@ -4459,6 +4466,14 @@ fn ir_op_is_call(op: &Op) -> bool {
             // helper calls above.
             | Op::InstanceOf { .. }
             | Op::CheckCast { .. }
+            // `emit_monitor_stub` calls `jit_monitor_enter`/`jit_monitor_exit`,
+            // and a reference `ArrayStore` is `MOV RAX, jit_aastore ; CALL RAX`;
+            // all three return into the body. They were missing, so a
+            // float/double interval in a caller-saved XMM (XMM2-5 on both ABIs,
+            // XMM2-7 on System V) was not split across the Rust helper.
+            | Op::MonitorEnter
+            | Op::MonitorExit
+            | Op::ArrayStore(crate::ir::MemKind::Ref)
     )
 }
 
@@ -7597,6 +7612,10 @@ mod linear_scan_tests {
             // `jit_getfield` / `jit_putfield_int`.
             Op::Load(crate::ir::MemKind::Double),
             Op::Store(crate::ir::MemKind::Int),
+            // `jit_monitor_enter` / `jit_monitor_exit` / `jit_aastore`.
+            Op::MonitorEnter,
+            Op::MonitorExit,
+            Op::ArrayStore(crate::ir::MemKind::Ref),
         ] {
             assert!(
                 ir_op_is_call(&op),

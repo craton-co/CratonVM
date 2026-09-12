@@ -18369,3 +18369,30 @@ fn review_simd_int_sum_into_a_long_does_not_wrap_at_32_bits() {
         assert_eq!(result, value as i64 * len as i64, "len={len} value={value}"); // Cast: expected long sum
     }
 }
+
+/// Callee-saved XMM save slots are 16 bytes (the whole Win64 non-volatile
+/// register) and tile the save area exactly: the first ends where the GPR
+/// save area above begins, each follows the previous with no gap or overlap,
+/// and the last ends where the region below (`xmm_saved_base + n * 16`) begins.
+/// A frame depth `d` names a word spanning `[rbp - d, rbp - d + 8)`.
+#[test]
+fn review_xmm_save_slots_tile_the_save_area() {
+    assert_eq!(XMM_SAVE_SLOT_BYTES, 16);
+    let span = |depth: i32, width: i32| (-depth, -depth + width);
+    for base in [8, 40, 104] {
+        for n in 1..=8usize {
+            let slots: Vec<(i32, i32)> = (0..n)
+                .map(|i| span(xmm_save_slot_offset(base, i), XMM_SAVE_SLOT_BYTES))
+                .collect();
+            // Top of the first slot == bottom of the 8-byte word at depth `base - 8`,
+            // the lowest word the area above may own.
+            assert_eq!(slots[0].1, span(base - 8, 8).0, "base={base}");
+            for w in slots.windows(2) {
+                assert_eq!(w[1].1, w[0].0, "slots must be contiguous, base={base} n={n}");
+            }
+            // Bottom of the last slot == top of the first word of the region below.
+            let below = base + n as i32 * XMM_SAVE_SLOT_BYTES; // Cast: n <= 8
+            assert_eq!(slots[n - 1].0, span(below, 8).1, "base={base} n={n}");
+        }
+    }
+}

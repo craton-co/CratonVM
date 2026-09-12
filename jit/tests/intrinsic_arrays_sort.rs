@@ -223,10 +223,20 @@ fn resolve(descriptor: &str) -> Option<usize> {
 }
 
 /// The shared edge-case input matrix: empty, single, sorted, reverse,
-/// duplicates, negatives, and a longer mixed run that exceeds any plausible
-/// "tiny array" threshold (the intrinsic has no threshold — it must sort
-/// arrays of every length correctly).
+/// duplicates, negatives, and runs on both sides of the 47-element cut-over
+/// between the emitted insertion sort and the emitted heapsort.
 fn input_cases() -> Vec<Vec<i64>> {
+    // Deterministic pseudo-random values with negatives and duplicates, so the
+    // heapsort sees unordered input of every length it is chosen for.
+    let noise = |n: usize, seed: u64| -> Vec<i64> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((x >> 33) as i64 % 2001) - 1000 // Cast: 31-bit value, fits
+            })
+            .collect()
+    };
     vec![
         vec![],
         vec![42],
@@ -238,6 +248,18 @@ fn input_cases() -> Vec<Vec<i64>> {
         vec![-1, -2, -3],
         (0..40).rev().collect(),
         vec![7, -3, 7, 7, -3, 0, 100, -100, 50, 50, 1, -1],
+        // The insertion/heapsort boundary: 47 stays on insertion sort.
+        noise(47, 1),
+        noise(48, 2),
+        noise(49, 3),
+        (0..64).rev().collect(),
+        (0..64).collect(),
+        vec![5; 100],
+        noise(100, 4),
+        noise(1_000, 5),
+        // Large enough that the old O(n^2) insertion sort (~2x10^8 moves)
+        // would dominate the test's runtime; the heapsort is ~3x10^5.
+        noise(20_000, 6),
     ]
 }
 

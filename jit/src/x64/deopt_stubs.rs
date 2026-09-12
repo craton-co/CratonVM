@@ -2251,8 +2251,17 @@ impl Compiler {
                 #[cfg(target_os = "windows")]
                 {
                     // Windows x64: arg1=RCX, arg2=RDX, arg3=R8
-                    // Load vm_ptr from heap_local_offset into RCX
-                    self.emit_load_local(RCX, self.heap_local_offset);
+                    // Load vm_ptr from heap_local_offset into RCX — only when
+                    // the method HAS a heap local. Without one
+                    // `heap_local_offset` is 0 and `[rbp-0]` is the caller's
+                    // saved RBP, which `jit_uncommon_trap` (it rejects only 0)
+                    // would dereference as a `SharedVm`. Pass the null it does
+                    // check for instead, as the local-handler stubs do.
+                    if self.needs_heap {
+                        self.emit_load_local(RCX, self.heap_local_offset);
+                    } else {
+                        self.buf.emit(&[0x31, 0xC9]); // XOR ECX, ECX
+                    }
                     // MOV RDX, reason (immediate)
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RDX as u8); // MOV r64, imm64 // Cast: x86-64 register encoding
@@ -2264,8 +2273,13 @@ impl Compiler {
                 #[cfg(not(target_os = "windows"))]
                 {
                     // SysV: arg1=RDI, arg2=RSI, arg3=RDX
-                    // Load vm_ptr from heap_local_offset into RDI
-                    self.emit_load_local(RDI, self.heap_local_offset);
+                    // Load vm_ptr from heap_local_offset into RDI (null when
+                    // the method has no heap local; see the Windows arm).
+                    if self.needs_heap {
+                        self.emit_load_local(RDI, self.heap_local_offset);
+                    } else {
+                        self.buf.emit(&[0x31, 0xFF]); // XOR EDI, EDI
+                    }
                     // MOV RSI, reason (immediate)
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RSI as u8); // Cast: x86-64 register encoding

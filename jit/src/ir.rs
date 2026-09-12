@@ -5470,10 +5470,18 @@ impl IrBuilder {
     /// information, so the φ fell back to `Int`) but whose back-edge value is a
     /// reference is retyped `Ref` and becomes a GC root.
     ///
-    /// Never downgrades: memory/control φs are bookkeeping tokens and are left
-    /// alone, and if the widened input list no longer joins, the previously
-    /// derived type is kept (and the conflict reported) rather than replaced by
-    /// the fallback.
+    /// Memory/control φs are bookkeeping tokens and are left alone.
+    ///
+    /// When the widened input list no longer joins, the φ takes
+    /// [`PHI_TYPE_FALLBACK`], exactly as a conflict at creation does, and so
+    /// does every φ that merges it. It used to KEEP the entry-edge type, which
+    /// was not the conservative choice when that type was `Ref`: javac reuses
+    /// a slot for a dead `Object` before the loop and an `int`/`long`/`double`
+    /// inside it, the header φ stayed `Ref`, and the lowering then published
+    /// the slot as a GC root at every safepoint and tagged it `StackSlotRef` in
+    /// deopt frames — a raw long or double handed to the collector as an oop.
+    /// A conflicting merge is legal only for a slot that is dead at the header
+    /// (verified bytecode cannot read it), so the fallback costs nothing.
     fn retype_phi(&mut self, phi: NodeId) {
         let current = match self.graph.node_opt(phi) {
             Some(node) => node.ty,
@@ -5485,7 +5493,27 @@ impl IrBuilder {
         let inputs = self.graph.nodes[phi as usize].inputs.clone();
         match self.graph.phi_data_type_checked(&inputs) {
             Ok(ty) => self.graph.nodes[phi as usize].ty = ty,
-            Err(why) => report_phi_type_fallback(&why),
+            Err(why) => {
+                report_phi_type_fallback(&why);
+                if current != PHI_TYPE_FALLBACK {
+                    self.graph.nodes[phi as usize].ty = PHI_TYPE_FALLBACK;
+                    // A φ merging this one was typed from the old type. The
+                    // fallback is absorbing (a φ already at it is not
+                    // revisited), so this terminates.
+                    let dependants: Vec<NodeId> = (0..self.graph.nodes.len())
+                        .filter(|&n| {
+                            let node = &self.graph.nodes[n];
+                            n != phi as usize
+                                && node.op == Op::Phi
+                                && node.inputs.iter().skip(1).any(|&i| i == phi)
+                        })
+                        .map(|n| n as NodeId)
+                        .collect();
+                    for dependant in dependants {
+                        self.retype_phi(dependant);
+                    }
+                }
+            }
         }
     }
 
@@ -13017,12 +13045,15 @@ mod tests {
             "the late back-edge input must retype the loop-carried φ"
         );
 
-        // A late input that does NOT join keeps the already-derived type rather
-        // than downgrading it (and is reported, not silently applied).
+        // A late input that does NOT join drops the φ to the fallback. Keeping
+        // `Ref` published a slot holding an `int` (or a long/double) as a GC
+        // root; a conflicting merge is only legal for a dead slot, where the
+        // fallback is free.
         let stray = b.graph.add(Op::Const(3), IrType::Int, vec![], None);
         b.graph.nodes[phi as usize].inputs.push(stray);
         b.retype_phi(phi);
-        assert_eq!(b.graph.nodes[phi as usize].ty, IrType::Ref);
+        assert_eq!(b.graph.nodes[phi as usize].ty, PHI_TYPE_FALLBACK);
+        assert_ne!(b.graph.nodes[phi as usize].ty, IrType::Ref);
 
         // Memory φs are bookkeeping tokens and are never retyped as values.
         let mem_phi = b

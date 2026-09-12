@@ -5776,20 +5776,21 @@ unsafe fn emit_osr_trampoline(
     }
 
     // HIB-CV-20: spill the caller's callee-saved XMM registers to the same slots
-    // the epilogue restores them from (`alloc_used_xmms` at xmm_saved_base + i*8,
-    // matching `emit_movq_mem_rbp_from_xmm`). The old trampoline skipped XMM
-    // spills entirely, so on Windows (where XMM6–XMM15 are callee-saved) a method
-    // that used a callee-saved XMM had the caller's value restored from an
-    // uninitialised slot. Encoding: 66 [REX.R] 0F D6 /r with a disp32 [rbp-off].
+    // the epilogue restores them from (`x64::xmm_save_slot_offset`, matching
+    // `emit_movups_mem_rbp_from_xmm`). The old trampoline skipped XMM spills
+    // entirely, so on Windows (where XMM6–XMM15 are callee-saved) a method that
+    // used a callee-saved XMM had the caller's value restored from an
+    // uninitialised slot. All 128 bits, in 16-byte slots: a 64-bit save paired
+    // with the zero-extending restore cleared the caller's upper half.
+    // Encoding: [REX.R] 0F 11 /r (MOVUPS m128, xmm) with a disp32 [rbp-off].
     if let Some(xmms) = callee_saved_xmms {
         for (i, &xmm) in xmms.iter().enumerate() {
-            let neg_off = -(xmm_saved_base + i as i32 * 8);
-            tramp.emit_byte(0x66);
+            let neg_off = -crate::x64::xmm_save_slot_offset(xmm_saved_base, i);
             if xmm >= 8 {
                 tramp.emit_byte(0x44); // REX.R (base RBP needs no REX.B)
             }
             tramp.emit_byte(0x0F);
-            tramp.emit_byte(0xD6);
+            tramp.emit_byte(0x11);
             tramp.emit_byte(0x85 | ((xmm & 7) << 3)); // mod=10, reg=xmm&7, rm=rbp(5)
             tramp.emit(&neg_off.to_le_bytes());
         }

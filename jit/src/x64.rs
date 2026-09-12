@@ -401,6 +401,27 @@ pub const LOCAL_XMMS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 /// Rust caller with its non-volatile state destroyed. The pool is the
 /// volatile subset on Windows; exhaustion falls back to a frame spill in
 /// `flush_xmm0_slots`, so the smaller pool costs a store, never correctness.
+/// Bytes in one callee-saved XMM save slot: the whole 128-bit register.
+///
+/// Win64 preserves all of XMM6-XMM15, not their low quadword. The single-pass
+/// prologue used to save 8 bytes with `MOVQ` and restore with a `MOVQ` that
+/// zero-extends, so a caller holding a vector in XMM8+ got its upper half
+/// back cleared. (The IR tier has saved 16 bytes with `MOVUPS` all along.)
+pub(crate) const XMM_SAVE_SLOT_BYTES: i32 = 16;
+
+/// The `[rbp - offset]` depth of callee-saved XMM save slot `i`, for a save
+/// area starting at `xmm_saved_base`.
+///
+/// Frame depths here name the LOW byte of an 8-byte word that extends upward,
+/// so the first 16-byte slot starts 8 bytes deeper than `xmm_saved_base` and
+/// ends exactly where the GPR save area above it begins; slot `n - 1` ends
+/// where `xmm_saved_base + n * XMM_SAVE_SLOT_BYTES` begins. The prologue, both
+/// epilogues and the OSR trampoline all go through this one function.
+pub(crate) fn xmm_save_slot_offset(xmm_saved_base: i32, i: usize) -> i32 {
+    // Cast: a callee-saved XMM index, at most 8.
+    xmm_saved_base + i as i32 * XMM_SAVE_SLOT_BYTES + (XMM_SAVE_SLOT_BYTES - 8)
+}
+
 #[cfg(target_os = "windows")]
 const SCRATCH_XMMS: [u8; 4] = [2, 3, 4, 5];
 #[cfg(not(target_os = "windows"))]
@@ -2734,8 +2755,9 @@ impl Compiler {
         let num_reg_locals = local_assignments.iter().filter(|a| a.is_some()).count()
             + xmm_assignments.iter().filter(|a| a.is_some()).count();
         let callee_saved_size = alloc_used_regs.len() as i32 * 8; // Cast: x86-64 immediate encoding
-                                                                  // XMM save slots: 8 bytes each (we store the 64-bit value via MOVQ through RAX)
-        let xmm_saved_size = alloc_used_xmms.len() as i32 * 8; // Cast: x86-64 immediate encoding
+        // XMM save slots: 16 bytes each, the whole register (see
+        // `XMM_SAVE_SLOT_BYTES`).
+        let xmm_saved_size = alloc_used_xmms.len() as i32 * XMM_SAVE_SLOT_BYTES; // Cast: x86-64 immediate encoding
 
         // Callee-saved registers are saved using MOV into frame slots (not PUSH)
         // to keep RSP stable after SUB RSP. This ensures shadow space is at [RSP..RSP+31].

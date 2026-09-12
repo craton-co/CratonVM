@@ -140,7 +140,8 @@ impl Compiler {
         };
         // Cast: register counts, all far below i32::MAX.
         let callee_saved_hi = self.callee_saved_base + self.alloc_used_regs.len() as i32 * 8;
-        let xmm_saved_hi = self.xmm_saved_base + self.alloc_used_xmms.len() as i32 * 8;
+        let xmm_saved_hi =
+            self.xmm_saved_base + self.alloc_used_xmms.len() as i32 * super::XMM_SAVE_SLOT_BYTES;
         crate::FrameLayout {
             // Cast: local counts are bounded by the classfile format.
             java_locals_hi: (self.num_locals as i32 + 1) * 8,
@@ -426,13 +427,14 @@ impl Compiler {
         }
 
         // Save callee-saved XMM registers (used for float/double locals).
-        // Direct `MOVQ [rbp-offset], XMM` — avoids the RAX round-trip so
-        // ABI args that landed in RAX-adjacent regs aren't disturbed and
-        // the prologue is 3 bytes smaller per saved XMM.
+        // Direct `MOVUPS [rbp-offset], XMM` — all 128 bits, into a 16-byte
+        // slot. Win64 makes the whole of XMM6-XMM15 non-volatile; the old
+        // 64-bit `MOVQ` save, paired with a `MOVQ` restore that zero-extends,
+        // returned the caller's register with its upper half cleared.
         let used_xmms = self.alloc_used_xmms.clone();
         for (i, &xmm) in used_xmms.iter().enumerate() {
-            let offset = self.xmm_saved_base + i as i32 * 8; // Cast: x86-64 immediate encoding
-            self.emit_movq_mem_rbp_from_xmm(offset, xmm);
+            let offset = super::xmm_save_slot_offset(self.xmm_saved_base, i);
+            self.emit_movups_mem_rbp_from_xmm(offset, xmm);
         }
 
         // Layout of caller-passed args:
@@ -855,13 +857,12 @@ impl Compiler {
             self.emit_load_local(reg, offset);
         }
         // Restore callee-saved XMM registers.
-        // Direct `MOVQ XMMn, [rbp-offset]` — no GPR scratch needed, so
-        // RAX (return value) and R11 are both preserved. Each restore
-        // shrinks from ~9 bytes (MOV+MOVQ) to ~6 bytes (single MOVQ).
+        // Direct `MOVUPS XMMn, [rbp-offset]` — all 128 bits (see the prologue);
+        // no GPR scratch needed, so RAX (return value) and R11 are preserved.
         let used_xmms = self.alloc_used_xmms.clone();
         for (i, &xmm) in used_xmms.iter().enumerate() {
-            let offset = self.xmm_saved_base + i as i32 * 8; // Cast: x86-64 immediate encoding
-            self.emit_movq_xmm_from_mem_rbp(xmm, offset);
+            let offset = super::xmm_save_slot_offset(self.xmm_saved_base, i);
+            self.emit_movups_xmm_from_mem_rbp(xmm, offset);
         }
         let fs = self.frame_size;
         self.emit_add_rsp_imm(fs);
@@ -900,9 +901,9 @@ impl Compiler {
         }
         let used_xmms = self.alloc_used_xmms.clone();
         for (i, &xmm) in used_xmms.iter().enumerate() {
-            let offset = self.xmm_saved_base + i as i32 * 8; // Cast: x86-64 immediate encoding
-                                                             // Direct `MOVQ XMMn, [rbp-offset]` (see emit_epilogue notes).
-            self.emit_movq_xmm_from_mem_rbp(xmm, offset);
+            // Direct `MOVUPS XMMn, [rbp-offset]`, all 128 bits (see emit_epilogue).
+            let offset = super::xmm_save_slot_offset(self.xmm_saved_base, i);
+            self.emit_movups_xmm_from_mem_rbp(xmm, offset);
         }
         let fs = self.frame_size;
         self.emit_add_rsp_imm(fs);

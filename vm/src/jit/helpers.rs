@@ -11226,7 +11226,37 @@ pub unsafe extern "C" fn jit_putstatic_object(
     crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
-    if let Some(sentinel) = jit_putstatic_class_init_guard(vm, class_id_raw) {
+    // The class-init guard may run `<clinit>` — Java code, allocation, a
+    // moving collection — while the reference to store exists only as this
+    // raw argument. The compiled caller popped it off its operand stack to
+    // pass it, so no oop map names it either. Root it in the thread's pin
+    // list across the guard and re-read it afterwards, or the static would be
+    // written with a from-space address. The thread borrow is released before
+    // the guard, which takes its own.
+    let pin_idx = if val != 0 {
+        jit_thread_mut().map(|(thread, _guard)| {
+            let idx = thread.native_pin_roots.len();
+            thread
+                .native_pin_roots
+                .push(ObjectRef::from_raw(val as usize as *mut u8));
+            idx
+        })
+    } else {
+        None
+    };
+    let init_failed = jit_putstatic_class_init_guard(vm, class_id_raw);
+    let val = match pin_idx {
+        Some(idx) => match jit_thread_mut() {
+            Some((thread, _guard)) => {
+                let current = thread.native_pin_roots[idx].as_ptr() as usize as i64;
+                thread.native_pin_roots.truncate(idx);
+                current
+            }
+            None => val,
+        },
+        None => val,
+    };
+    if let Some(sentinel) = init_failed {
         return sentinel;
     }
     let class_id = ClassId::new(class_id_raw as u32);

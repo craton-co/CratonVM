@@ -5316,7 +5316,16 @@ impl Compiler {
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                     self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
                     self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                    // `jit_getstatic` runs `<clinit>` on first touch — arbitrary
+                    // Java, so allocation and a collection. That is a safepoint
+                    // like any call: spill the register homes and publish a map
+                    // for THIS program point. Without the bracket a register-
+                    // homed reference local was unreported, and the sp-id slot
+                    // still named the previous safepoint's map, which could
+                    // claim complete coverage for a frame it no longer described.
+                    self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.getstatic);
+                    self.emit_oop_map_for_safepoint();
                     // jit-linewrapper-flushtype-npe fix (2026-07-17): the
                     // helper now runs `<clinit>` on first touch and, on
                     // failure, stashes the Java exception and returns the
@@ -5408,7 +5417,10 @@ impl Compiler {
                     self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // class_id // Cast: x86-64 immediate encoding
                     self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // field_index // Cast: x86-64 immediate encoding
                     self.load_slot_to_reg(ARG_REGS[3], val_slot); // value
+                    // `<clinit>` on first touch, as for `getstatic`: a safepoint.
+                    self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(helper_fn);
+                    self.emit_oop_map_for_safepoint();
                     // jit-putstatic-clinit-gap fix (2026-07-17): see the
                     // matching comment at the inlined-callee 0xb3 arm above —
                     // same helper, same new fallible-`<clinit>` sentinel.
@@ -8259,19 +8271,26 @@ impl Compiler {
                             || callee_entry == crate::JitIntrinsic::ArraysSortByte.as_entry()
                         {
                             // Phase 4b — java.util.Arrays.sort(prim[]) inline
-                            // insertion sort. Void return: nothing is pushed.
+                            // sort. Void return: nothing is pushed.
                             //
                             // The matcher (try_resolve_intrinsic ARRAYS_SORT
                             // region) registers only the five integral
-                            // single-arg overloads. Insertion sort is O(n^2)
-                            // but provably correct for EVERY length — empty,
-                            // single, sorted, reverse, duplicates, negatives.
-                            // There is deliberately no runtime "bail to native
-                            // for large arrays": once the call site resolves
-                            // to this intrinsic there is no native call left
-                            // to fall through to, so bailing would silently
-                            // leave a long array unsorted. Correctness wins
-                            // over the constant factor (roadmap §3.4).
+                            // single-arg overloads. Up to 47 elements — the
+                            // JDK's own insertion-sort cut-over — this is an
+                            // insertion sort; past that, an in-place heapsort,
+                            // O(n log n) and still allocation-free. The
+                            // insertion sort used to run for EVERY length:
+                            // O(n^2), so a compiled `Arrays.sort` of a million
+                            // ints took minutes instead of tens of milliseconds
+                            // and stalled every thread waiting on a safepoint
+                            // for all of it.
+                            //
+                            // Neither loop polls for a safepoint, and neither
+                            // may: the array base lives in R8, which no oop map
+                            // names, so a moving collection inside the loop
+                            // would leave it pointing at from-space. Heapsort
+                            // bounds that window to O(n log n) work, which is
+                            // what a native sort costs anyway.
                             //
                             // All work uses caller-saved scratch only
                             // (RAX/RCX/RDX/R8/R9/R10/R11) — `flush_scratch_
@@ -8334,6 +8353,11 @@ impl Compiler {
                             // MOV R9D, [R8 + ARRAY_LENGTH_OFFSET]  (45 8B 48 dd)
                             // (32-bit load zero-extends n into R9.)
                             self.buf.emit(&[0x45, 0x8B, 0x48, len_off]);
+                            // CMP R9, 47  (49 83 F9 2F) ; JG .heapsort
+                            // n is a zero-extended array length, so the signed
+                            // compare is exact.
+                            self.buf.emit(&[0x49, 0x83, 0xF9, 0x2F]);
+                            let heapsort_patch = self.emit_jcc_rel32_patch(0x8F);
                             // MOV R10D, 1   (41 BA 01 00 00 00) — i = 1
                             self.buf.emit(&[0x41, 0xBA, 0x01, 0x00, 0x00, 0x00]);
 
@@ -8468,6 +8492,97 @@ impl Compiler {
 
                             // .done: the top-of-loop JGE lands here.
                             self.patch_rel32_to_here(done_patch);
+                            // JMP .end — skip the heapsort.
+                            self.buf.emit_byte(0xE9);
+                            let end_patch = self.buf.pos();
+                            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+
+                            // .heapsort: n > 47. Floyd's bottom-up heap
+                            // construction, then repeated extraction of the
+                            // maximum. Same register file as above, plus:
+                            //   R10 = heap build cursor / extraction end
+                            //   R11 = sift root
+                            //   RDX = sift child
+                            // RAX/RCX hold element values, loaded to 64 bits by
+                            // `emit_load`, so the signed 64-bit CMPs order every
+                            // element kind exactly as the insertion sort does.
+                            self.patch_rel32_to_here(heapsort_patch);
+                            macro_rules! jmp_back {
+                                ($s:ident, $label:expr) => {{
+                                    $s.buf.emit_byte(0xE9);
+                                    let here = $s.buf.pos();
+                                    // Widening: usize offset -> i64 for rel math
+                                    let rel = ($label as i64) - (here as i64 + 4);
+                                    // Truncation: i64 -> i32 (rel32 within one method)
+                                    $s.buf.emit(&(rel as i32).to_le_bytes());
+                                }};
+                            }
+                            // Sift a[R11] down within [0, limit). `$limit_rm` is
+                            // the ModRM byte of `CMP RDX, limit` (limit = R9 → CA,
+                            // limit = R10 → D2) under REX 4C.
+                            macro_rules! sift_down {
+                                ($s:ident, $limit_rm:expr) => {{
+                                    let sift_loop = $s.buf.pos();
+                                    // LEA RDX, [R11 + R11 + 1] — child = 2*root + 1
+                                    $s.buf.emit(&[0x4B, 0x8D, 0x54, 0x1B, 0x01]);
+                                    $s.buf.emit(&[0x4C, 0x39, $limit_rm]); // CMP RDX, limit
+                                    let sift_done = $s.emit_jcc_rel32_patch(0x8D); // JGE
+                                    emit_load(&mut $s.buf, RAX, RDX); // RAX = a[child]
+                                    $s.buf.emit(&[0x48, 0xFF, 0xC2]); // INC RDX
+                                    $s.buf.emit(&[0x4C, 0x39, $limit_rm]); // CMP RDX, limit
+                                    let no_right = $s.emit_jcc_rel32_patch(0x8D); // JGE .left
+                                    emit_load(&mut $s.buf, RCX, RDX); // RCX = a[child + 1]
+                                    $s.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                                    let left_not_smaller = $s.emit_jcc_rel32_patch(0x8D); // JGE .left
+                                    $s.buf.emit(&[0x48, 0x89, 0xC8]); // MOV RAX, RCX
+                                    $s.buf.emit_byte(0xE9); // JMP .have_child
+                                    let have_child = $s.buf.pos();
+                                    $s.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                                    // .left: the left child is the larger one.
+                                    $s.patch_rel32_to_here(no_right);
+                                    $s.patch_rel32_to_here(left_not_smaller);
+                                    $s.buf.emit(&[0x48, 0xFF, 0xCA]); // DEC RDX
+                                    // .have_child: RDX = larger child, RAX = its value.
+                                    $s.patch_rel32_to_here(have_child);
+                                    emit_load(&mut $s.buf, RCX, R11); // RCX = a[root]
+                                    $s.buf.emit(&[0x48, 0x39, 0xC1]); // CMP RCX, RAX
+                                    let in_order = $s.emit_jcc_rel32_patch(0x8D); // JGE .sift_done
+                                    emit_store(&mut $s.buf, RAX, R11); // a[root] = a[child]
+                                    emit_store(&mut $s.buf, RCX, RDX); // a[child] = old a[root]
+                                    $s.buf.emit(&[0x49, 0x89, 0xD3]); // MOV R11, RDX
+                                    jmp_back!($s, sift_loop);
+                                    $s.patch_rel32_to_here(sift_done);
+                                    $s.patch_rel32_to_here(in_order);
+                                }};
+                            }
+                            // Build: for start in (0..n/2).rev() { sift(start, n) }
+                            self.buf.emit(&[0x4D, 0x89, 0xCA]); // MOV R10, R9
+                            self.buf.emit(&[0x49, 0xD1, 0xEA]); // SHR R10, 1
+                            let build_loop = self.buf.pos();
+                            self.buf.emit(&[0x4D, 0x85, 0xD2]); // TEST R10, R10
+                            let build_done = self.emit_jcc_rel32_patch(0x84); // JZ
+                            self.buf.emit(&[0x49, 0xFF, 0xCA]); // DEC R10
+                            self.buf.emit(&[0x4D, 0x89, 0xD3]); // MOV R11, R10
+                            sift_down!(self, 0xCA);
+                            jmp_back!(self, build_loop);
+                            self.patch_rel32_to_here(build_done);
+                            // Extract: for end in (1..n).rev() { swap(0, end); sift(0, end) }
+                            self.buf.emit(&[0x4D, 0x89, 0xCA]); // MOV R10, R9
+                            let extract_loop = self.buf.pos();
+                            self.buf.emit(&[0x49, 0xFF, 0xCA]); // DEC R10
+                            self.buf.emit(&[0x4D, 0x85, 0xD2]); // TEST R10, R10
+                            let sorted = self.emit_jcc_rel32_patch(0x8E); // JLE
+                            self.buf.emit(&[0x45, 0x31, 0xDB]); // XOR R11D, R11D
+                            emit_load(&mut self.buf, RAX, R11); // RAX = a[0]
+                            emit_load(&mut self.buf, RCX, R10); // RCX = a[end]
+                            emit_store(&mut self.buf, RCX, R11); // a[0] = a[end]
+                            emit_store(&mut self.buf, RAX, R10); // a[end] = old a[0]
+                            sift_down!(self, 0xD2);
+                            jmp_back!(self, extract_loop);
+                            self.patch_rel32_to_here(sorted);
+
+                            // .end
+                            self.patch_rel32_to_here(end_patch);
                             // Void method — nothing pushed; `ret_type` is 'V'.
                             let _ = ret_type;
                         }
