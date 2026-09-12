@@ -1685,6 +1685,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-licm-before-unroll", on_key: Some("CRATONVM_JIT_IR_LICM_BEFORE_UNROLL"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-poll-outline", on_key: Some("CRATONVM_JIT_IR_POLL_OUTLINE"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-load-cse", on_key: Some("CRATONVM_JIT_IR_LOAD_CSE"), off_key: None, off_word: None, since: "2026-09-11" },
+    E { group: Group::JIT, token: "ir-load-cse-alias", on_key: Some("CRATONVM_JIT_IR_LOAD_CSE_ALIAS"), off_key: None, off_word: None, since: "2026-09-12" },
     E { group: Group::JIT, token: "ir-licm-hoist-counted", on_key: Some("CRATONVM_JIT_IR_LICM_HOIST_COUNTED"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-per-copy-frames", on_key: Some("CRATONVM_JIT_IR_PER_COPY_FRAMES"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-partial-unroll", on_key: Some("CRATONVM_JIT_IR_PARTIAL_UNROLL"), off_key: None, off_word: None, since: "2026-09-11" },

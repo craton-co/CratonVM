@@ -385,6 +385,29 @@ pub fn report_at_exit() {
         // — a fact about the workload, not a broken pass.
         let load_cse = cratonvm_jit::ir_optimize::ir_load_cse_census();
         eprintln!("[c2-supersede] ir redundant reads removed: {load_cse}");
+        // Inline field-read sites, split by whether the site before it in the
+        // same block had already run the layout-epoch guard and the per-object
+        // compactness test. `later` is the population a CSE of those two could
+        // serve; `elided` beside it is what the receiver null-check CSE
+        // ALREADY serves, which is the comparison that says whether the
+        // remaining guards are worth the work.
+        // Why a workload has few inline field sites has two very different
+        // answers — the code reads few fields, or the inline path refused most
+        // of them — and only this distinguishes them.
+        let declines = cratonvm_jit::metrics::ir_getfield_declines();
+        if !declines.is_empty() {
+            let joined: Vec<String> =
+                declines.iter().map(|(n, v)| format!("{n}={v}")).collect();
+            eprintln!(
+                "[c2-supersede] ir getfield inline declines: {}",
+                joined.join(" ")
+            );
+        }
+        let (first_site, later_site) = cratonvm_jit::ir_lower::ir_field_site_census();
+        let (seeded, elided, emitted) = cratonvm_jit::metrics::ir_receiver_null_check_counts();
+        eprintln!(
+            "[c2-supersede] ir inline field sites: first-in-block={first_site} later-in-block={later_site}; receiver null checks: seeded={seeded} elided={elided} emitted={emitted}"
+        );
         // Speculation. A zero with `CRATONVM_JIT_IR_SPECULATE=1` means no
         // branch in this workload was one-sided over the sample — a fact about
         // the program, not about the pass — and that is precisely what a bare
