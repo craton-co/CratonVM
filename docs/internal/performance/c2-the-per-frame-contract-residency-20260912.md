@@ -9,7 +9,7 @@ fix it:
 > largest term in §2 and it is an architectural property of the lowerer, not a
 > missing peephole.
 
-This page takes that lane and reaches two results.
+This page takes that lane and reaches three results.
 
 * **`CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` — a win where the register file has
   slack, and a loss where it does not.** Single-use values that
@@ -19,11 +19,16 @@ This page takes that lane and reaches two results.
   optimizing body, and free on `FibCall.fib` and `ManyExits.pick`. But on
   `probes/RegPressure.java`, which oversubscribes the five-register file, it is
   **5.4% to 12.5% SLOWER** — §6c. **Default OFF, for that measured reason.**
+* **An occupancy term (`…_CROSSBLOCK_BUDGET`, default ON) — §6d.** Makes the
+  admission outbid the loop-carried value it displaces. Keeps the win, makes the
+  12.5% case byte-identical to not running at all — and still does not close the
+  lane, because the two probes it must separate have *identical* weights and
+  prices. **Loop weight is provably not the discriminating variable.**
 * **A retraction.** Admitting *constants* looked equally obvious, was built,
   compiled and passed 2 393 tests, and is **structurally incapable** of paying.
   §2 is why, and the reason was already written in the tree.
 
-The two together give a cost model the current rule does not have (§5), and it
+The first two give a cost model the current rule does not have (§5), and that
 is the useful output of the page: a promoted value costs **two memory
 operations per call** — one save, one restore, *independent of the exit count* —
 and repays it **per execution of the reload it removes**. So residency is
@@ -349,8 +354,9 @@ What it still needs before the default flips:
 * ~~A differential correctness soak~~ and ~~`CratonBench` /
   `CratonBenchC2` checksum parity~~ — **both done, §6b.** No divergence, and
   every checksum on both benchmarks is bit-identical.
-* ~~A large real body.~~ **Done, and it is the one that answers the
-  question — §6c.** `probes/RegPressure.java` oversubscribes the five-register
+* ~~A large real body.~~ **Done, §6c** — and the occupancy term it asks for is
+  built and measured in **§6d**.
+* ~~A large real body (original wording).~~ **§6c.** `probes/RegPressure.java` oversubscribes the five-register
   file, and the flag is **5.4% to 12.5% SLOWER** there, above the floor, three
   runs out of three. The default stays OFF for that reason now, not for want of
   evidence.
@@ -445,10 +451,16 @@ and on this probe that value is read every iteration. `static_uses >= 2` cannot
 see that either, so the successor rule §6 proposes needs a third term — an
 occupancy check — and not just better-priced first two.
 
+**That term was then built — §6d.** It eliminates this section's 12.5% case
+outright (with it on, `mix` compiles to the same bytes as the arm that admits
+nothing) and keeps §3's win. It does **not** close the lane: `mixNarrow` still
+loses 6.7%, and §6d shows why no rule of that shape can fix it.
+
 **`CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` therefore stays default OFF, now for a
 measured reason rather than for want of evidence.** The mechanism is sound and
 the loop win in §3 is real, but it is not safe to hand out a shared five-register
-file on a rule that never asks whether anything else needed it.
+file on a rule that never asks whether anything else needed it. §6d makes it ask,
+which removes this section's worst case and still leaves the flag OFF.
 
 ### The measurement error that nearly hid this, and how to not repeat it
 
@@ -490,6 +502,95 @@ new probe, both cheap:
 `FieldLoop`, `FibCall` and `ManyExits` were checked against both and are
 unaffected: each publishes a `full/ir` body at its measured settings, and each
 publishes a *different* one per arm.
+## 6d. The occupancy term, built twice — necessary, and not sufficient
+
+§6c ends by saying the successor rule needs an **occupancy term**: the flag may
+not take a register without asking what else wanted it.
+`CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK_BUDGET` (**default ON**, opt out with `=0`)
+is that term. It was built in two forms, and the second one is where the useful
+result is.
+
+### First form: a count. Too blunt, and it removed the win.
+
+```text
+budget = ir_gp_file().len() - |carried candidates|
+```
+
+Reserve what `ir_reserve_carried_enabled`'s pass will want, let the crossblock arm
+have the remainder. It does eliminate the `RegPressure` regression — and it
+eliminates the transform. `FieldLoop.sum` has **six** carried candidates against a
+five-register file, so the budget is zero there too and the body reverts to its
+slow 1052 bytes. Most loops have five or more carried candidates; a count makes
+the flag inert in exactly the place it works.
+
+### Second form: a displacement price, and it separates the two probes
+
+The carried pass serves its candidates in descending loop-weighted use count and
+stops when the file runs out, so the value a crossblock admission actually
+displaces is the **weakest one that would still have been served** —
+`carried_w[file_len - 1]` — and each further admission displaces the next one up.
+The bar rises as the file empties, which stops a run of cheap single-use values
+from evicting the whole carried set one register at a time.
+
+The comparison is `>=`, not `>`, and that is measured rather than chosen. On
+`FieldLoop` the carried weights are `[20, 11, 10, 10, 10, 10]`, so the price is
+10 — and the induction variable the whole transform exists to serve weighs
+exactly 10. Under `>` all ten candidates are refused and the win is gone.
+
+It works, on the bodies:
+
+| | crossblock OFF | crossblock, no budget | crossblock + budget |
+|---|---:|---:|---:|
+| `FieldLoop.sum` | 1052 | **1039** (the win) | **1039** — kept |
+| `RegPressure.mix` | 3164 | 3218 (**+12.5% slower**) | **3164** — byte-identical to OFF |
+
+The 12.5% regression is not merely reduced, it is **structurally impossible**:
+with the budget on, `mix` compiles to the same bytes as the arm that admits
+nothing. `carried_w` there is `[60, 21, 21, 21, 21, ...]`, so the price is 21
+against candidates weighing 10, and every one is refused.
+
+### And it is not sufficient. `mixNarrow` still loses.
+
+```text
+mixNarrow, budget ON   A 179.0 | C 179.0 | B 191.0 ms
+                       floor 0.0%   effect +6.7%   ratio 1.067x   SLOWER
+```
+
+**This is the interesting part of the section, because it is not a tuning
+failure.** `mixNarrow` and `FieldLoop.sum` are indistinguishable to any rule of
+this shape:
+
+| | carried weights | price | candidate weight | admitted | outcome |
+|---|---|---:|---:|---:|---|
+| `FieldLoop.sum` | `[20, 11, 10, 10, 10, 10]` | **10** | **10** | 3 | **0.924x — faster** |
+| `RegPressure.mixNarrow` | `[50, 21, 21, 11, 10, ...]` | **10** | **10** | 3 | **1.067x — slower** |
+
+Same price, same candidate weight, same number admitted, opposite sign. **Loop
+weight is provably not the discriminating variable**, and no a-priori scoring
+function over `live.weight` can separate these two probes, because on the inputs
+such a function reads they are the same probe.
+
+What differs is not any value's worth but the *total* contention around it —
+`FieldLoop.sum` carries one accumulator through a branchless body,
+`mixNarrow` carries three through a branch — and the effect of that shows up in
+the allocator's own output (`splits`, `scan_spills`) rather than in any weight.
+
+So the honest shape of the remaining work is a **feedback** rule, not a better
+score: admit, re-run or re-inspect the allocation, and keep the admission only if
+the result did not get worse. `plan_register_residency` today reads
+`alloc.segments` once and decides; asking the question the other way round is a
+larger change than this page should make on the strength of two probes.
+
+### Status
+
+* `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` — **still default OFF.** §6c's losing
+  shape is narrowed, not closed.
+* `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK_BUDGET` — **default ON.** It is a strict
+  improvement wherever the outer flag is enabled: it keeps the `FieldLoop` win,
+  makes `RegPressure.mix` byte-identical to not running at all, and is inert on
+  `FibCall.fib` and `ManyExits.pick` (no loop ⇒ fewer carried candidates than
+  registers ⇒ price 0 ⇒ nothing to outbid). Turning it off restores the
+  unbudgeted behaviour for anyone re-measuring §6c.
 ## 7. What this says about the `fib` lane
 
 §4 is a negative result on `fib` and it belongs with the budget page's other
