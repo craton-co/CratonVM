@@ -222,6 +222,73 @@ public class L4FfmLayoutSweep {
         t("vh.pad.byteOffset.throws", () -> MemoryLayout.paddingLayout(4)
                 .byteOffset(PathElement.groupElement("nope")));
 
+        // ---- the GROUP carriers' own identity ---------------------------
+        // `AbstractGroupLayout.equals`/`hashCode` read `kind` and `elements`,
+        // and `toString` reads `kind.delimTag` to choose `[a|b]` over `[ab]`.
+        // A union that prints like a struct is this lane's failure mode, so
+        // the delimiter is asked directly and not only through `toString`.
+        t("group.struct.equals.self", () -> MemoryLayout.structLayout(
+                ValueLayout.JAVA_INT.withName("b"), ValueLayout.JAVA_INT.withName("c")).equals(st));
+        t("group.struct.hash.self", () -> MemoryLayout.structLayout(
+                ValueLayout.JAVA_INT.withName("b"), ValueLayout.JAVA_INT.withName("c"))
+                .hashCode() == st.hashCode());
+        t("group.union.equals.self", () -> MemoryLayout.unionLayout(
+                ValueLayout.JAVA_INT.withName("u0"), ValueLayout.JAVA_LONG).equals(un));
+        t("group.union.hash.self", () -> MemoryLayout.unionLayout(
+                ValueLayout.JAVA_INT.withName("u0"), ValueLayout.JAVA_LONG)
+                .hashCode() == un.hashCode());
+        t("group.struct.ne.union", () -> st.equals(un));
+        t("group.struct.delimiter", () -> st.toString().contains("|"));
+        t("group.union.delimiter", () -> un.toString().contains("|"));
+        t("group.members.immutable", () -> {
+            try { st.memberLayouts().add(ValueLayout.JAVA_INT); return "added"; }
+            catch (Throwable e) { return e.getClass().getName(); }
+        });
+        t("group.members.list.class.isList", () -> java.util.List.class.isInstance(st.memberLayouts()));
+        t("group.members.get", () -> st.memberLayouts().get(1).byteSize());
+        t("group.members.stream.count", () -> st.memberLayouts().stream().count());
+        t("group.select.class", () -> cls(st.select(PathElement.groupElement("c"))));
+        t("group.hasNaturalAlignment", () -> st.byteAlignment() == 4);
+        t("group.withByteAlignment.class", () -> cls(st.withByteAlignment(8)));
+        t("group.withByteAlignment.n", () -> st.withByteAlignment(8).byteAlignment());
+        t("group.withByteAlignment.members", () -> st.withByteAlignment(8).memberLayouts().size());
+        t("seq.withElementCount", () -> sq.withElementCount(5).byteSize());
+        t("seq.flatten.class", () -> cls(MemoryLayout.sequenceLayout(2, sq).flatten()));
+        t("seq.equals.self", () -> MemoryLayout.sequenceLayout(3, ValueLayout.JAVA_INT).equals(sq));
+        t("pad.equals.self", () -> MemoryLayout.paddingLayout(4).equals(pad));
+        t("pad.hash.self", () -> MemoryLayout.paddingLayout(4).hashCode() == pad.hashCode());
+
+        // The six group rows nothing above reaches. `withName` at the WIDER
+        // static type is a covariant-return bridge with its own registration,
+        // and a row no probe invokes is a row the funnel must not take.
+        t("pad.byteAlignment", () -> pad.byteAlignment());
+        MemoryLayout stM = st, unM = un, sqM = sq;
+        t("group.struct.withName/M.class", () -> cls(stM.withName("m")));
+        t("group.struct.withName/M.members",
+                () -> ((GroupLayout) stM.withName("m")).memberLayouts().size());
+        t("group.union.withName/M.class", () -> cls(unM.withName("m")));
+        t("group.union.withName/M.members",
+                () -> ((GroupLayout) unM.withName("m")).memberLayouts().size());
+        t("group.seq.withName/M.class", () -> cls(sqM.withName("m")));
+        t("group.seq.withName/M.count", () -> ((SequenceLayout) sqM.withName("m")).elementCount());
+        t("group.union.byteOffset.u0", () -> un.byteOffset(PathElement.groupElement("u0")));
+        t("group.union.varHandle.isVarHandle", () -> java.lang.invoke.VarHandle.class
+                .isInstance(un.varHandle(PathElement.groupElement("u0"))));
+        // The KIND only, never the message: HotSpot's text for this one names
+        // the segment, and a segment's `toString` carries an identity hash.
+        // A row whose oracle changes between runs manufactures diffs for every
+        // later reader of this probe.
+        t("group.union.varHandle.roundtrip", () -> {
+            try {
+                java.lang.invoke.VarHandle vh = un.varHandle(PathElement.groupElement("u0"));
+                MemorySegment h = MemorySegment.ofArray(new int[2]);
+                vh.set(h, 0L, 0x61626364);
+                return Integer.toHexString(h.get(ValueLayout.JAVA_INT_UNALIGNED, 0));
+            } catch (Throwable e) {
+                return "THREW-KIND " + e.getClass().getName();
+            }
+        });
+
         System.out.println("L4FfmLayoutSweep DONE");
     }
 }
