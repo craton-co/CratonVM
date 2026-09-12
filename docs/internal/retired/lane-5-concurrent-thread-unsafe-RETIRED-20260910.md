@@ -1183,18 +1183,43 @@ retirement.** 67 + 13 = 80 of its registrations are retired. What is left:
   weakCompareAndExchangeObject    declared by NO supported image — deletions
 ```
 
-**2. The deletion worklist is 25 triples and it needs a census, not a table.**
-Registrations whose method is declared by none of 17, 21 and 25 — five on
-`sun/misc/Unsafe`, twenty on `jdk/internal/misc/Unsafe`, mostly the
-`weakCompareAndExchange*` family that the JDK renamed to `weakCompareAndSet*`.
-They shadow nothing and no caller on any supported image can name them, which is
-lane 0's bucket F. **Check the source before counting rows here**: several
-neighbours in the same position (`getReferencePlain`, `putReferencePlain`,
-`monitorEnter`, `monitorExit`, `defineAnonymousClass`) were deleted on
+**2. The deletion worklist is 19 triples / 22 registrations, and it is
+measured.** Registrations whose method is declared by NONE of 17, 21 and 25 —
+four on `sun/misc/Unsafe`, eighteen on `jdk/internal/misc/Unsafe`, mostly the
+`weakCompareAndExchange*` family the JDK renamed to `weakCompareAndSet*`. They
+shadow nothing and no caller on any supported image can name them, which is lane
+0's bucket F. Six source sites hold all 22:
+
+```text
+  unsafe_natives.rs:2150-2151   acquireFence/releaseFence, the `for class in
+                                &[u, u2]` loop -> 4 rows, BOTH classes
+  unsafe_jdk25.rs:270-272       addressSize0 / isBigEndian0 / unalignedAccess0,
+                                registered twice each -> 6 rows
+  unsafe_natives.rs:2203,2223   weakCompareAndExchange{Int,Long}{,Acquire,
+                                Release} -> 6 rows
+  unsafe_natives.rs:2247        weakCompareAndExchangeReference{,Acquire,
+                                Release} and ...Object -> 4 rows
+  unsafe_natives.rs:2250        the `ends_with("Object")` arm, sun/misc only ->
+                                compareAndExchangeObject and
+                                weakCompareAndExchangeObject -> 2 rows
+```
+
+Note the asymmetry that last arm creates: `compareAndExchangeObject` IS declared
+on `jdk/internal/misc/Unsafe` for 17 and 21, and is declared on
+`sun/misc/Unsafe` NOWHERE — so one loop iteration registers a live row and a
+dead one, and only the `sun/misc` half is a deletion.
+
+**Do not derive this list from the kind map.** Five neighbours in the same
+position (`getReferencePlain`, `putReferencePlain`, `monitorEnter`,
+`monitorExit`, `defineAnonymousClass`) were deleted from the source on
 2026-08-29 and `scripts/baselines/jdk-only-kind-map-25-linux.tsv` still carries
-rows for them, because that baseline is amended by hand and was never
-re-measured after the deletion. A worklist derived from the baseline alone will
-be padded with work already done.
+rows for them — it is hand-amended and nothing re-measures it. The 22 above come
+from a `--dump-native-registry` taken from the binary and intersected with the
+three images; the kind map's answer to the same question is 29.
+
+And check the SYNTHETIC-JDK arm before deleting: the fabricated image is a
+fourth image, and "no supported image declares it" is a statement about the
+other three.
 
 **3. `jdk/internal/misc/Unsafe`, per triple, minus the floor.** 68 of its
 methods are `ACC_NATIVE` on the image and stay `Bridge` forever (§1.5). Of the
