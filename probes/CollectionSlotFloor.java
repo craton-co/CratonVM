@@ -34,34 +34,42 @@ public class CollectionSlotFloor {
 
     public static void main(String[] args) {
         // Maps: buckets / size / capacity, plus growth past the initial table.
-        mapFamily("HashMap", new HashMap<String, String>());
-        mapFamily("Hashtable", new Hashtable<String, String>());
-        mapFamily("LinkedHashMap", new LinkedHashMap<String, String>());
-        mapFamily("ConcurrentHashMap", new java.util.concurrent.ConcurrentHashMap<String, String>());
-        mapFamily("TreeMap", new TreeMap<String, String>());
+        section("HashMap", () -> mapFamily("HashMap", new HashMap<String, String>()));
+        section("Hashtable", () -> mapFamily("Hashtable", new Hashtable<String, String>()));
+        section("LinkedHashMap", () -> mapFamily("LinkedHashMap", new LinkedHashMap<String, String>()));
+        section("ConcurrentHashMap",
+                () -> mapFamily("ConcurrentHashMap",
+                        new java.util.concurrent.ConcurrentHashMap<String, String>()));
+        section("TreeMap", () -> mapFamily("TreeMap", new TreeMap<String, String>()));
         // NOT through `mapFamily`: IdentityHashMap keys on reference identity, so
         // a lookup with an equal-but-distinct String is a legitimate miss there.
         // Its slots get their own check below.
-        identityMap();
+        section("IdentityHashMap", CollectionSlotFloor::identityMap);
 
-        setFamily("HashSet", new HashSet<String>());
-        setFamily("LinkedHashSet", new LinkedHashSet<String>());
-        setFamily("TreeSet", new TreeSet<String>());
+        section("HashSet", () -> setFamily("HashSet", new HashSet<String>()));
+        section("LinkedHashSet", () -> setFamily("LinkedHashSet", new LinkedHashSet<String>()));
+        section("TreeSet", () -> setFamily("TreeSet", new TreeSet<String>()));
 
-        listFamily("ArrayList", new ArrayList<String>());
-        listFamily("Vector", new Vector<String>());
-        listFamily("LinkedList", new LinkedList<String>());
-        listFamily("ArrayDeque", new ArrayDeque<String>());
-        listFamily("CopyOnWriteArrayList", new java.util.concurrent.CopyOnWriteArrayList<String>());
+        section("ArrayList", () -> listFamily("ArrayList", new ArrayList<String>()));
+        section("Vector", () -> listFamily("Vector", new Vector<String>()));
+        section("LinkedList", () -> listFamily("LinkedList", new LinkedList<String>()));
+        section("ArrayDeque", () -> listFamily("ArrayDeque", new ArrayDeque<String>()));
+        section("CopyOnWriteArrayList",
+                () -> listFamily("CopyOnWriteArrayList",
+                        new java.util.concurrent.CopyOnWriteArrayList<String>()));
 
         // LinkedHashMap's head/tail slots (3 and 4) are what make it ORDERED.
         // A lost write there reads as a HashMap with the right contents and the
         // wrong iteration order -- the quietest failure in this whole file.
-        LinkedHashMap<String, Integer> ordered = new LinkedHashMap<>();
-        for (int i = 0; i < 12; i++) ordered.put("k" + i, i);
-        StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String, Integer> e : ordered.entrySet()) sb.append(e.getValue()).append(',');
-        check("LinkedHashMap insertion order", "0,1,2,3,4,5,6,7,8,9,10,11,", sb.toString());
+        section("LinkedHashMap order", () -> {
+            LinkedHashMap<String, Integer> ordered = new LinkedHashMap<>();
+            for (int i = 0; i < 12; i++) ordered.put("k" + i, i);
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<String, Integer> e : ordered.entrySet()) {
+                sb.append(e.getValue()).append(',');
+            }
+            check("LinkedHashMap insertion order", "0,1,2,3,4,5,6,7,8,9,10,11,", sb.toString());
+        });
 
         // The EMPTY read path, for the sorted families.
         //
@@ -71,32 +79,75 @@ public class CollectionSlotFloor {
         // makes "never written" a state the readers have to handle rather than
         // a state they happen never to see -- and a reader that assumes an
         // array reads a fresh map as a crash or as garbage, not as empty.
-        emptySortedReads();
-        emptyConcurrentReads();
+        section("empty sorted reads", CollectionSlotFloor::emptySortedReads);
+        section("empty concurrent reads", CollectionSlotFloor::emptyConcurrentReads);
+
+        // The classes whose floor is SYNTHETIC-ONLY.
+        //
+        // `FLOOR_EXEMPT_CLASSES` (`classloading/src/class_manager.rs`) stops
+        // padding these to their fabricated slot count when they are defined
+        // from real class-file bytes, because their real layouts are narrower
+        // and padding cost them the compact layout for every slot. Dropping a
+        // floor fails SILENTLY -- an out-of-range `set_field` is dropped, not
+        // raised -- so this section drives each of them through the surface a
+        // lost write would take out, in BOTH modes: a native that still wrote
+        // a raw absolute slot past the real width would read back as an empty
+        // or a garbled collection here, not as an error anywhere.
+        section("floor-exempt families", CollectionSlotFloor::floorExemptFamilies);
 
         // EnumMap / EnumSet have their own floors.
-        EnumMap<Day, String> em = new EnumMap<>(Day.class);
-        em.put(Day.WED, "w");
-        em.put(Day.MON, "m");
-        check("EnumMap size", "2", String.valueOf(em.size()));
-        check("EnumMap get", "w", String.valueOf(em.get(Day.WED)));
-        check("EnumMap key order", "[MON, WED]", em.keySet().toString());
-        EnumSet<Day> es = EnumSet.of(Day.FRI, Day.MON);
-        check("EnumSet size", "2", String.valueOf(es.size()));
-        check("EnumSet contains", "true", String.valueOf(es.contains(Day.FRI)));
+        section("EnumMap/EnumSet", () -> {
+            EnumMap<Day, String> em = new EnumMap<>(Day.class);
+            em.put(Day.WED, "w");
+            em.put(Day.MON, "m");
+            check("EnumMap size", "2", String.valueOf(em.size()));
+            check("EnumMap get", "w", String.valueOf(em.get(Day.WED)));
+            check("EnumMap key order", "[MON, WED]", em.keySet().toString());
+            EnumSet<Day> es = EnumSet.of(Day.FRI, Day.MON);
+            check("EnumSet size", "2", String.valueOf(es.size()));
+            check("EnumSet contains", "true", String.valueOf(es.contains(Day.FRI)));
+        });
 
-        PriorityQueue<Integer> pq = new PriorityQueue<>(List.of(5, 1, 4, 2, 3));
-        check("PriorityQueue head", "1", String.valueOf(pq.peek()));
-        check("PriorityQueue size", "5", String.valueOf(pq.size()));
+        section("PriorityQueue", () -> {
+            PriorityQueue<Integer> pq = new PriorityQueue<>(List.of(5, 1, 4, 2, 3));
+            check("PriorityQueue head", "1", String.valueOf(pq.peek()));
+            check("PriorityQueue size", "5", String.valueOf(pq.size()));
+        });
 
-        StringJoiner sj = new StringJoiner(",", "[", "]");
-        sj.add("a").add("b");
-        check("StringJoiner", "[a,b]", sj.toString());
+        section("StringJoiner", () -> {
+            StringJoiner sj = new StringJoiner(",", "[", "]");
+            sj.add("a").add("b");
+            check("StringJoiner", "[a,b]", sj.toString());
+        });
 
         System.out.println(failures == 0 ? "PASS CollectionSlotFloor"
                                          : "FAIL CollectionSlotFloor (" + failures + ")");
         System.out.println("SLOTFLOOR_END");
         if (failures != 0) System.exit(1);
+    }
+
+    /**
+     * Run one section, and turn a THROW inside it into a recorded failure
+     * rather than the end of the run.
+     *
+     * Not defensiveness: the synthetic-JDK arm is the one that matters when a
+     * floor moves, and in that arm a class library gap several sections in
+     * used to take every section after it with it. `LinkedList.indexOf` is the
+     * standing example -- absent from the synthetic image, thrown at section
+     * six of fourteen, so the eight sections after it (including every
+     * floor-exempt family this file exists to cover) were never reached and
+     * their silence read as agreement. An ERROR row counts as a failure, so a
+     * section that starts throwing is still visible; it just no longer hides
+     * the ones behind it.
+     */
+    static void section(String name, Runnable body) {
+        try {
+            body.run();
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("  ERROR " + name + ": " + t.getClass().getName()
+                    + (t.getMessage() == null ? "" : ": " + t.getMessage()));
+        }
     }
 
     enum Day { MON, WED, FRI }
@@ -290,6 +341,92 @@ public class CollectionSlotFloor {
     /// must each install the segments themselves, and a path that reached its
     /// insert through the read-only lookup would silently store NOTHING and
     /// report success.
+    /**
+     * The six classes exempted from the synthetic slot floor in real-JDK mode,
+     * driven through the reads and writes that a lost raw-slot write removes.
+     *
+     * Each is filled, read back every way the class offers, mutated, and
+     * emptied. `Properties` additionally exercises the `defaults` chain, which
+     * is the one slot on that class a native resolves BY NAME with the
+     * fabricated model index as its fallback -- so it is where a wrong slot
+     * would show up first.
+     */
+    static void floorExemptFamilies() {
+        setFamily("CopyOnWriteArraySet", new java.util.concurrent.CopyOnWriteArraySet<String>());
+
+        listFamily("ConcurrentLinkedQueue", new java.util.concurrent.ConcurrentLinkedQueue<String>());
+        listFamily("ConcurrentLinkedDeque", new java.util.concurrent.ConcurrentLinkedDeque<String>());
+
+        // Queue/Deque ORDER, which `size`/`contains` cannot see. The four-slot
+        // fabricated model keeps a ring buffer, a head index, a count and a
+        // capacity; the real classes keep two `Node` references. A receiver
+        // carrying one shape and read through the other answers in FIFO order
+        // for a while and then stops.
+        java.util.concurrent.ConcurrentLinkedQueue<String> clq =
+                new java.util.concurrent.ConcurrentLinkedQueue<>();
+        for (int i = 0; i < 24; i++) clq.offer("q" + i);
+        check("CLQ peek", "q0", String.valueOf(clq.peek()));
+        StringBuilder clqOrder = new StringBuilder();
+        for (int i = 0; i < 24; i++) clqOrder.append(clq.poll()).append(',');
+        StringBuilder clqWant = new StringBuilder();
+        for (int i = 0; i < 24; i++) clqWant.append("q").append(i).append(',');
+        check("CLQ FIFO order", clqWant.toString(), clqOrder.toString());
+        check("CLQ drained", "true", String.valueOf(clq.isEmpty()));
+        check("CLQ poll when empty", "null", String.valueOf(clq.poll()));
+
+        java.util.concurrent.ConcurrentLinkedDeque<String> cld =
+                new java.util.concurrent.ConcurrentLinkedDeque<>();
+        for (int i = 0; i < 12; i++) cld.addLast("l" + i);
+        for (int i = 0; i < 12; i++) cld.addFirst("f" + i);
+        check("CLD size", "24", String.valueOf(cld.size()));
+        check("CLD peekFirst", "f11", String.valueOf(cld.peekFirst()));
+        check("CLD peekLast", "l11", String.valueOf(cld.peekLast()));
+        check("CLD pollFirst", "f11", String.valueOf(cld.pollFirst()));
+        check("CLD pollLast", "l11", String.valueOf(cld.pollLast()));
+        check("CLD after polls", "22", String.valueOf(cld.size()));
+
+        // ArrayDeque again, but through the DEQUE surface rather than as a
+        // plain Collection. Its fourth slot -- a count the natives used to
+        // keep beside the real `elements`/`head`/`tail` -- is gone, and the
+        // count is derived from `head`/`tail` the way the JDK derives it. A
+        // deque that wraps its ring buffer is where a derived count and a
+        // stored one disagree, so fill past the initial capacity.
+        ArrayDeque<String> dq = new ArrayDeque<>();
+        for (int i = 0; i < 40; i++) dq.addLast("d" + i);
+        for (int i = 0; i < 20; i++) dq.addFirst("h" + i);
+        check("ArrayDeque size after wrap", "60", String.valueOf(dq.size()));
+        check("ArrayDeque peekFirst", "h19", String.valueOf(dq.peekFirst()));
+        check("ArrayDeque peekLast", "d39", String.valueOf(dq.peekLast()));
+        int drained = 0;
+        while (dq.pollFirst() != null) drained++;
+        check("ArrayDeque drained count", "60", String.valueOf(drained));
+        check("ArrayDeque empty after drain", "true", String.valueOf(dq.isEmpty()));
+
+        // Properties: the map surface, and then the `defaults` chain.
+        Properties base = new Properties();
+        base.setProperty("shared", "from-defaults");
+        base.setProperty("only-in-base", "b");
+        Properties derived = new Properties(base);
+        derived.setProperty("shared", "from-derived");
+        derived.setProperty("only-in-derived", "d");
+        check("Properties own value", "from-derived", derived.getProperty("shared"));
+        check("Properties inherited value", "b", derived.getProperty("only-in-base"));
+        check("Properties missing", "null", String.valueOf(derived.getProperty("absent")));
+        check("Properties default arg", "fallback",
+                derived.getProperty("absent", "fallback"));
+        check("Properties size excludes defaults", "2", String.valueOf(derived.size()));
+        check("Properties containsKey", "true",
+                String.valueOf(derived.containsKey("only-in-derived")));
+        check("Properties keySet size", "2", String.valueOf(derived.keySet().size()));
+        derived.remove("only-in-derived");
+        check("Properties after remove", "1", String.valueOf(derived.size()));
+        Properties standalone = new Properties();
+        check("empty Properties size", "0", String.valueOf(standalone.size()));
+        check("empty Properties get", "null", String.valueOf(standalone.getProperty("k")));
+        standalone.setProperty("k", "v");
+        check("empty Properties then set", "v", standalone.getProperty("k"));
+    }
+
     static void emptyConcurrentReads() {
         java.util.concurrent.ConcurrentHashMap<String, String> m =
                 new java.util.concurrent.ConcurrentHashMap<>();

@@ -2575,13 +2575,13 @@ pub(super) fn try_invoke_cached_lambda_impl(
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
-    let frame = Frame::new_pooled_cached(
-        cached,
-        args,
-        &mut thread.locals_pool,
-        &mut thread.stacks_pool,
-    );
-    let out = execute_prebuilt_frame(shared, thread, frame).map(Some);
+    // In-place install rather than a by-value build: `execute_prebuilt_frame`
+    // pushes through `push_frame_and_fire_entry`, which harvests and trims the
+    // retired frame slot, so every interpreted lambda call used to destroy the
+    // slot the next interpreted call at that depth would have rebuilt itself
+    // in. See `install_and_run_cached_frame`.
+    let out = install_and_run_cached_frame(shared, thread, cached, args, Some("lambda-impl"))
+        .map(Some);
     // The INTERPRETED arm, and the one that matters most for a constant body:
     // a two-byte `iconst_1; ireturn` may never be nominated for compilation at
     // all, so the two compiled screens above would never see it.

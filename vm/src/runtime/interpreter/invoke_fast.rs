@@ -623,7 +623,7 @@ pub(super) fn execute_invokestatic_fast_door(
 /// Adding counting here would widen which methods reach the optimizing tier,
 /// which is a separate project with its own blast radius (see the "untaken
 /// levers" note on
-/// `docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`). A door
+/// `docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md`). A door
 /// must not change tier-up policy on its way past.
 ///
 /// An `invokespecial` site caches as either target shape depending on which

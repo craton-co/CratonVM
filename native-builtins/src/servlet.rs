@@ -8922,16 +8922,14 @@ fn s2_keys_as_set(
     selected_only: bool,
 ) -> Result<Value, MethodCallFailed> {
     let n = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
-    // GC-safety: `alloc_concurrent_synthetic`/`new_ref_array` below allocate
-    // and can trigger a collection that relocates `sel`/`set` (both read
-    // again after); pin both for the whole function.
+    // GC-safety: the set builder below allocates (a ref array, the set, the
+    // backing map, and a node per `add`) and can trigger a collection that
+    // relocates `sel`; pin it for the whole function.
     let sel_pin = ctx.pin_native_root(sel);
-    let mut set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
-    let set_pin = ctx.pin_native_root(set);
     let sel = ctx.read_native_pin(sel_pin, sel);
     let keys_v = ctx.get_field(sel, S2SEL_KEYS);
+    let mut ready: Vec<ObjectRef> = Vec::new();
     if let Value::Object(Some(keys_arr)) = keys_v {
-        let mut ready: Vec<ObjectRef> = Vec::new();
         for i in 0..n {
             if let Value::Object(Some(k)) = ctx.get_array_element(keys_arr, i) {
                 let rops = ctx.get_field(k, 3).as_int().unwrap_or(0);
@@ -8940,24 +8938,15 @@ fn s2_keys_as_set(
                 }
             }
         }
-        // GC-safety: `ready`'s elements were captured before `new_ref_array`
-        // below (which allocates); pin each and re-read the forwarded
-        // reference before writing it into the fresh array.
-        let ready_pins: Vec<_> = ready.iter().map(|&k| ctx.pin_native_root(k)).collect();
-        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ready.len());
-        set = ctx.read_native_pin(set_pin, set);
-        for (i, (&k, &pin)) in ready.iter().zip(ready_pins.iter()).enumerate() {
-            let k = ctx.read_native_pin(pin, k);
-            ctx.set_array_element(arr, i, Value::Object(Some(k)));
-        }
-        ctx.set_field(set, 0, Value::Object(Some(arr)));
-        ctx.set_field(set, 1, Value::Int(ready.len() as i32));
-    } else {
-        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
-        set = ctx.read_native_pin(set_pin, set);
-        ctx.set_field(set, 0, Value::Object(Some(arr)));
-        ctx.set_field(set, 1, Value::Int(0));
     }
+    // A REAL `java.util.HashSet`, through its own `<init>` and `add`.
+    //
+    // This used to write the key array to absolute slot 0 and a count to slot
+    // 1 -- the MAP layout on a class whose one real instance field is `map` --
+    // so a servlet container's `selector.selectedKeys().iterator()` walked a
+    // `map` holding an `Object[]` and saw no keys at all. `build_real_hash_set`
+    // pins every element across its own allocations.
+    let set = crate::build_real_hash_set(ctx, &ready)?;
     ctx.unpin_native_roots(sel_pin);
     Ok(Value::Object(Some(set)))
 }

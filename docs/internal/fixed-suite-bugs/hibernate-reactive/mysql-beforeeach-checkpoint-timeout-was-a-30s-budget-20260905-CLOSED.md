@@ -217,7 +217,7 @@ per-class bug page:
 * `docs/known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`
 * `../hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md` (the
   `CompletableFuture`/lambda-composition cost section)
-* `docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`
+* `docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md`
 
 **Do not re-open this page from a sharded MySQL run.** A 3-arm x 3-shard
 MySQL run is 9 concurrent JVMs each starting its own MySQL container; the

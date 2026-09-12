@@ -1097,7 +1097,13 @@ fn cache_get_mapped(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => {
             // Return empty set
             // See the `empty_hashmap` note: a fallback that writes no slot.
-            let s = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
+            // ONE, which is what the real class declares -- the allocator
+            // takes `max(n, real)`, so a fabricated stub still gets its three.
+            // A literal three here would be this file declaring the fabricated
+            // shape on a receiver that is real in real-JDK mode, which is what
+            // `t9d_floor_exempt_classes_have_no_oversized_factories` refuses
+            // for a class in `FLOOR_EXEMPT_CLASSES`.
+            let s = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
             return Ok(Some(Value::Object(Some(s))));
         }
     };
@@ -1110,7 +1116,11 @@ fn cache_get_mapped(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // data was null OR we just installed an empty one — return empty Set.
     let s = match ctx.new_object("java/util/HashSet").ok().flatten() {
         Some(Value::Object(Some(o))) => o,
-        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?,
+        // ONE for the same reason as the arm above: the width the real class
+        // declares, clamped up to the fabricated stub's by the allocator. The
+        // object goes straight into `HashSet.<init>` below and this arm writes
+        // no slot of it.
+        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?,
     };
     // GC-safety: the `<init>` invocation below can itself allocate; pin
     // `s` and re-read the forwarded reference before returning it.

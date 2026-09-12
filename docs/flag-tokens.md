@@ -616,7 +616,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-447 tokens.
+450 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -832,6 +832,7 @@ export inherited from a parent shell.
 | `ir-licm-before-unroll` | `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL` |
 | `ir-poll-outline` | `CRATONVM_JIT_IR_POLL_OUTLINE` |
 | `ir-load-cse` | `CRATONVM_JIT_IR_LOAD_CSE` |
+| `ir-load-cse-alias` | `CRATONVM_JIT_IR_LOAD_CSE_ALIAS` |
 | `ir-licm-hoist-counted` | `CRATONVM_JIT_IR_LICM_HOIST_COUNTED` |
 | `ir-per-copy-frames` | `CRATONVM_JIT_IR_PER_COPY_FRAMES` |
 | `ir-partial-unroll` | `CRATONVM_JIT_IR_PARTIAL_UNROLL` |
@@ -947,6 +948,7 @@ export inherited from a parent shell.
 | `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
 | `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
 | `door-sync` | `CRATONVM_JIT_NO_DOOR_SYNC` |
+| `cached-native-facts` | `CRATONVM_JIT_NO_CACHED_NATIVE_FACTS` |
 | `frame-emplace` | `CRATONVM_JIT_NO_FRAME_EMPLACE` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
@@ -1062,6 +1064,7 @@ export inherited from a parent shell.
 | `hot-lookup-cache` | `CRATONVM_JIT_HOT_LOOKUP_CACHE` |
 | `virtual-nominate-always` | `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS` |
 | `virtual-promote-java-util` | `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` |
+| `virtual-promote-handler-callee` | `CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE` |
 | `native-cf-postcomplete-skip` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` |
 | `native-cf-postcomplete-direct` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` |
 | `native-callback-memo` | `CRATONVM_NATIVE_CALLBACK_MEMO` |

@@ -7029,61 +7029,6 @@ fn jmx_attribute_not_found(ctx: &mut dyn NativeContext, attr: &str) -> MethodCal
     )
 }
 
-/// Fallback: build a synthetic 2-slot `java.util.HashSet` stand-in. Only used
-/// if a real `java.util.HashSet` cannot be constructed in this context (e.g. a
-/// unit-test mock with no JDK classes). A real query path always builds a real
-/// HashSet via [`build_real_hash_set`] — a synthetic stand-in's real `size()` /
-/// `iterator()` read its (empty) backing map, so callers see an empty set
-/// regardless of contents (the TC0622 defect).
-fn build_synthetic_hash_set(
-    ctx: &mut dyn NativeContext,
-    elems: &[ObjectRef],
-) -> Result<ObjectRef, MethodCallFailed> {
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
-    let backing = ctx.new_ref_array(ClassId::new(0), elems.len());
-    for (i, e) in elems.iter().enumerate() {
-        ctx.set_array_element(backing, i, Value::Object(Some(*e)));
-    }
-    ctx.set_field(set, 0, Value::Object(Some(backing)));
-    ctx.set_field(set, 1, Value::Int(elems.len() as i32));
-    ctx.set_field_by_name(set, "size", Value::Int(elems.len() as i32));
-    Ok(set)
-}
-
-/// Build a REAL `java.util.HashSet` and populate it via real `add(Object)`
-/// bytecode so `size()`, `iterator()`, `contains()`, `removeAll()` all behave.
-/// GC-safe: the elements are parked in a single ref-array and the set is pinned
-/// across the (allocating) `add` calls, so a moving collector can't strand them.
-/// Falls back to the synthetic stand-in only if the real class is unavailable.
-fn build_real_hash_set(
-    ctx: &mut dyn NativeContext,
-    elems: &[ObjectRef],
-) -> Result<ObjectRef, MethodCallFailed> {
-    // Park the elements in one heap array we can re-read across each add().
-    let arr = ctx.new_ref_array(ClassId::new(0), elems.len());
-    for (i, e) in elems.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Object(Some(*e)));
-    }
-    let base = ctx.pin_native_root(arr);
-    let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
-        Ok(Some(Value::Object(Some(s)))) => s,
-        _ => {
-            ctx.unpin_native_roots(base);
-            return Ok(build_synthetic_hash_set(ctx, elems)?);
-        }
-    };
-    let set_pin = ctx.pin_native_root(set);
-    for i in 0..elems.len() {
-        let arr_now = ctx.read_native_pin(base, arr);
-        let elem = ctx.get_array_element(arr_now, i);
-        let set_now = ctx.read_native_pin(set_pin, set);
-        let _ = ctx.invoke_virtual(set_now, "add", "(Ljava/lang/Object;)Z", &[elem]);
-    }
-    let result = ctx.read_native_pin(set_pin, set);
-    ctx.unpin_native_roots(base);
-    Ok(result)
-}
-
 /// Build a `javax.management.ObjectInstance(name, className)` for `bean` under
 /// `name`. `className` is the bean's runtime class (dotted), empty if unknown.
 fn build_object_instance(
@@ -7167,8 +7112,16 @@ fn mbs_query_set(
     let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
         Ok(Some(Value::Object(Some(s)))) => s,
         _ => {
-            // Real HashSet unavailable (test mock): best-effort unfiltered
-            // synthetic set of the original names, preserving prior behaviour.
+            // `new_object_initialized` refused (a unit-test mock with no JDK
+            // classes): best-effort UNFILTERED set of the original names,
+            // preserving prior behaviour. It is built through
+            // `crate::build_real_hash_set`, which allocates and invokes
+            // `<init>` itself -- the shape this arm used to fall back to wrote
+            // an element array at absolute slot 0 and a count at slot 1, which
+            // is the MAP layout on a class whose one real field is `map`, so
+            // every real `Set` method answered for an empty set. There is no
+            // mode in which that second shape was right, and its raw slot
+            // writes were part of what pinned `java/util/HashSet`'s slot floor.
             let s = ctx.read_native_pin(server_pin, server);
             let len = mbs_onames(ctx, s).map(|a| ctx.array_length(a)).unwrap_or(0);
             let mut elems = Vec::with_capacity(len);
@@ -7180,7 +7133,7 @@ fn mbs_query_set(
                 }
             }
             ctx.unpin_native_roots(server_pin);
-            return Ok(build_synthetic_hash_set(ctx, &elems)?);
+            return Ok(crate::build_real_hash_set(ctx, &elems)?);
         }
     };
     let set_pin = ctx.pin_native_root(set);
