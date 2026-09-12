@@ -10192,6 +10192,37 @@ fn publish_unrewritable_band_roots(
                 // whole of what this needs to do.
                 continue;
             }
+            // THE DEOPT `SavedRegisters` XMM IMAGE, on the OTHER half of the
+            // partition's argument: not "something rewrites it" but "nothing
+            // reads it as a reference", which is the same claim
+            // `band_slot_is_verifiable`'s dead-word arm spends and needs no
+            // rewriter behind it -- hence no `remap_covered` term here.
+            //
+            // The claim is checkable in one function. `deopt::try_resolve_value`
+            // touches `regs.xmm` from exactly two arms, `FrameValue::XmmFloat`
+            // and `FrameValue::XmmDouble`, and tags them `Float` and `Double`.
+            // The one arm that yields an `Object` out of the spilled register
+            // file, `FrameValue::RegisterRef`, reads `regs.gpr`. So a moved
+            // object named ONLY from this half is never dereferenced through
+            // it, and holding a megabyte-granular G1 region for it buys
+            // nothing.
+            //
+            // This is why the GPR half is REWRITTEN (see
+            // `register_image_remap_admits`) and this half is LET GO of: the
+            // two halves of one 256-byte region, with opposite arguments, and
+            // neither argument reaches the other's half.
+            //
+            // Measured on `probes/TvmProbe.java` under `-XX:+UseG1GC --Xmx 2g`:
+            // with the GPR half rewritten but this half still vetoing, the Eden
+            // region pinned for three objects totalling 200 bytes survived and
+            // two of forty rows stayed over threshold; every one of its
+            // `[bandword]` refusals sat in `[deopt_regs_base - 248,
+            // deopt_regs_base - 120)`.
+            if cm.frame_layout.is_deopt_saved_xmm_image(off) {
+                cratonvm_gc::gc_quiescence::add_movable_jit_root(qword);
+                MOVABLE_BAND_ROOTS.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             cratonvm_gc::gc_quiescence::add_unrewritable_jit_root(qword);
             published += 1;
             // `CRATONVM_DBG_JIT_ROOTSCAN=1` — WHICH unverifiable region this
@@ -10658,7 +10689,11 @@ fn vacated_region_bucket(region: &str) -> usize {
         "licm-ref-hoist" | "licm-arith" | "scalar-replaced-field" => 2,
         "callee-saved-gpr-image" | "callee-saved-xmm-image" => 3,
         "safepoint-gpr-spill-image" => 4,
-        "outgoing-args-or-deopt-regs" => 5,
+        // `deopt-saved-gpr-image` was carved out of the
+        // `outgoing-args-or-deopt-regs` bucket when its bounds became
+        // publishable; it shares the bucket so a census taken before and after
+        // that split still compares.
+        "outgoing-args-or-deopt-regs" | "deopt-saved-gpr-image" | "deopt-saved-xmm-image" => 5,
         "reserved-locals-tail" => 6,
         _ => 7,
     }
@@ -10995,6 +11030,29 @@ fn is_callee_saved_gpr_image(off: i32, layout: &cratonvm_jit::FrameLayout) -> bo
 #[inline]
 fn register_image_remap_admits(off: i32, layout: &cratonvm_jit::FrameLayout) -> bool {
     if is_callee_saved_gpr_image(off, layout) {
+        return true;
+    }
+    // THE FRAME-DEOPT `SavedRegisters` GPR IMAGE, on the same argument as the
+    // callee-saved image beside it: something RESUMES from these words.
+    //
+    // The deopt stub spills all sixteen GPRs into this region and hands its
+    // address to `x64_deopt_entry`, which reconstructs the interpreter frame by
+    // reading `gpr[r]` back (`deopt::resolve_value`, `FrameValue::Register`).
+    // A reference that moved while the frame sat in that region and was not
+    // rewritten is therefore reconstructed at its OLD address -- so admitting
+    // it here is a correctness completion, not only a pin optimisation.
+    //
+    // And it is what takes the pin off. `publish_unrewritable_band_roots` asks
+    // this predicate to decide movable-versus-unrewritable, so before this arm
+    // existed every word of the block vetoed its object and G1 held the whole
+    // MEGABYTE-granular region that object sat in. Measured on
+    // `probes/TvmProbe.java` (the standalone port of H2's `TestValueMemory`)
+    // under `-XX:+UseG1GC --Xmx 2g`: four of forty rows over the
+    // `used > memory * 3` threshold, every one of them pinning an Eden region
+    // for 200 bytes of objects named only from this block.
+    //
+    // The XMM half of the region is NOT admitted -- `deopt_gpr_lo` says why.
+    if layout.is_deopt_saved_gpr_image(off) {
         return true;
     }
     remap_all_unverifiable()

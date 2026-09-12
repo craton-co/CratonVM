@@ -25,8 +25,10 @@ The G1 row is not this page's subject and is not a regression from it — the
 predecessor page never ran that arm, and the number is identical on the binary
 before this work. It is conservative JIT-frame roots at region granularity, and
 it is now written down as
-`docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
-rather than left as a surprise for whoever runs the class next.
+`docs/internal/fixed-bugs/h2-testvaluememory-g1-conservative-jit-roots-RESOLVED-20260912.md`
+rather than left as a surprise for whoever runs the class next. (That page was
+retired on 2026-09-12; what survives its account is
+`docs/known-issues/gc/g1-pins-a-region-for-an-interior-array-cursor-20260912.md`.)
 
 ## A: the field-less object was byte-identical to a hole
 
@@ -216,7 +218,7 @@ metric, and not enough to threaten a 3x threshold.
 > The value cells are `ValueNull.INSTANCE` — one singleton, which is what
 > `size: 1` in the assertion message reports — so their layout cannot be the
 > cause. Measured in
-> `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`,
+> `docs/internal/fixed-bugs/h2-testvaluememory-g1-conservative-jit-roots-RESOLVED-20260912.md`,
 > which also prices what the JIT-on rows would cost with precise compiled-frame
 > roots.
 

@@ -5739,41 +5739,57 @@ impl Drop for G1Collector {
     }
 }
 
-/// `CRATONVM_GC_G1_MOVABLE_PINS=1` — let G1's pin set honour the
-/// movable/rewritable partition, as the generational path already does.
-/// **Default OFF.**
+/// `CRATONVM_GC_G1_MOVABLE_PINS=0` — stop letting G1's pin set honour the
+/// movable/rewritable partition, as it did before 2026-09-12.
+/// **Default ON**, i.e. a pin whose object is named only through words some
+/// channel rewrites is dropped, exactly as the generational path already does.
 ///
-/// # Correct, wired, and still not worth a default
+/// # Why it was off, and what changed
 ///
-/// Two things that once made it inert are fixed. The whole-cycle
-/// `coverage_incomplete` gate is gone from this path (see the comment at
-/// `honour_movable` for why that is the generational collector's question, not
-/// G1's), and `publish_unrewritable_band_roots` now publishes the verifiable
-/// half of the band partition instead of computing it and dropping it.
+/// It shipped off on 2026-09-09 for a measured reason: the filter was correct
+/// and wired, and it dropped **1 pin out of 34** on H2 `TestValueMemory`,
+/// because 4794 of ~5200 JIT roots arrived from the A5 unregistered-frame SPAN
+/// sweep, which has no per-frame layout and publishes neither half of the
+/// partition. A live GC behaviour change bought for one pin in thirty-four is
+/// risk without return.
 ///
-/// What did not change is the yield, and that is the number this default rests
-/// on. On H2 `TestValueMemory` Type 3 the filter drops **1 pin out of 34**:
+/// Two things moved since. The A5 sweep does not engage on this workload at
+/// all any more (`a5_sweeps=0` in `[bandpath]`), so the roots that starved the
+/// filter are gone; and the frame-deopt `SavedRegisters` GPR image is now
+/// REWRITTEN rather than vetoed (`register_image_remap_admits`), which is what
+/// the surviving pins were made of.
 ///
-/// ```text
-/// [g1][MOVPIN] snapshot=34 kept=33 movable_claimed=2 unrew_veto=7
-/// ```
+/// Measured on `probes/TvmProbe.java` — the standalone port of
+/// `org.h2.test.unit.TestValueMemory`, whose forty rows assert
+/// `used <= memory * 3` — under `-XX:+UseG1GC --Xmx 2g`, four arms of one
+/// binary run CONCURRENTLY so this host's load applies to all of them equally:
 ///
-/// and an A/B on the row itself lands inside this host's noise (on 10975/9972,
-/// off 8961/13005). The reason is not this filter: 4794 of ~5200 JIT roots come
-/// from the A5 unregistered-frame SPAN sweep, which has no per-frame layout and
-/// so publishes neither half of the partition — nothing here can act on roots
-/// that never made a claim. See the H2 page for that measurement.
+/// | arm | rows over threshold | worst row | sum of all rows |
+/// |---|---:|---:|---:|
+/// | neither | 4 | 3224 | 91988 |
+/// | this filter alone | 4 | 3224 | 91042 |
+/// | the remap widening alone | 3 | 3224 | 91790 |
+/// | **both** | **0** | **2537** | **59357** |
 ///
-/// So it ships off, for the same reason it shipped off the first time: a live
-/// GC behaviour change bought for one pin in thirty-four is risk without
-/// return. It is kept, correct and one flag away, for whoever gives the
-/// unregistered-frame band a layout.
+/// Read the first three rows before the fourth: **neither half does anything
+/// on its own**, and that is the whole argument for flipping this default
+/// together with the remap rather than separately. The filter has nothing to
+/// drop while every word vetoes its object, and the rewrite buys nothing while
+/// the consumer ignores the claim it publishes.
+///
+/// The fail-closed direction is unchanged and lives in the PUBLISHER:
+/// `publish_unrewritable_band_roots` claims movable only for words it can
+/// argue about, and one unverifiable sighting of an address vetoes every
+/// movable claim made for it elsewhere.
 fn g1_movable_pins_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(
         || match cratonvm_types::flags::runtime_var("CRATONVM_GC_G1_MOVABLE_PINS") {
-            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
-            Err(_) => false,
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
         },
     )
 }

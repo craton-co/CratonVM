@@ -2632,6 +2632,45 @@ pub struct FrameLayout {
     /// `0` means "not published" and must be read as "assume the whole region
     /// is `SavedRegisters`" — the conservative direction.
     pub outgoing_lo: i32,
+    /// The frame-deopt `SavedRegisters` GPR image, as a half-open `[lo, hi)`
+    /// range of `[rbp - off]` offsets, or `(0, 0)` when the frame reserved no
+    /// such region.
+    ///
+    /// Sixteen GPR slots, the SHALLOW half of the 256-byte `SavedRegisters`
+    /// region the deopt stub spills into (`emit_deopt_stubs`:
+    /// `gpr[r] -> [rbp - (deopt_regs_base - r*8)]`). The XMM half is
+    /// deliberately NOT included: a `double` whose bits happen to equal a live
+    /// object's base would be rewritten by a remap that admitted it, and an
+    /// XMM cannot hold a reference in the first place.
+    ///
+    /// # Why this needs its own range rather than `outgoing_lo`
+    ///
+    /// `region_name` buckets everything past `reg_spill_hi` as
+    /// `outgoing-args-or-deopt-regs`, and the two halves of that bucket want
+    /// OPPOSITE treatment. The outgoing reserve is uninitialised memory a
+    /// consumer may stop scanning; `SavedRegisters` is a register image the
+    /// deopt stub READS BACK, so a moved reference in it must be rewritten --
+    /// and once it is rewritten the word is movable rather than unrewritable,
+    /// which is what takes its object out of G1's pin set.
+    /// `register_image_remap_admits` is the consumer.
+    pub deopt_gpr_lo: i32,
+    pub deopt_gpr_hi: i32,
+    /// The frame-deopt `SavedRegisters` XMM image, as a half-open `[lo, hi)`
+    /// range of `[rbp - off]` offsets, or `(0, 0)` when the frame reserved no
+    /// such region.
+    ///
+    /// The DEEP half of the same 256-byte region as [`Self::deopt_gpr_lo`]
+    /// (`xmm[n] -> [rbp - (deopt_regs_base - 128 - n*8)]`), and it gets the
+    /// opposite treatment for a reason that can be checked in one function:
+    /// `deopt::try_resolve_value` reads `regs.xmm` from exactly two arms,
+    /// `FrameValue::XmmFloat` and `FrameValue::XmmDouble`, and tags them
+    /// `Float` and `Double`. `FrameValue::RegisterRef` -- the only arm that
+    /// yields an `Object` from the spilled register file -- reads `regs.gpr`.
+    /// **No reference is ever recovered from this half**, so a word here needs
+    /// no rewrite after a move, which is what lets the pin decision let go of
+    /// its object.
+    pub deopt_xmm_lo: i32,
+    pub deopt_xmm_hi: i32,
     /// Total frame size (`SUB RSP, frame_size`); the band is `[rbp - size, rbp)`.
     pub frame_size: i32,
 }
@@ -2660,6 +2699,27 @@ pub fn region_extent_census() -> (u64, u64, u64, u64) {
 }
 
 impl FrameLayout {
+    /// Whether `off` lands in the frame-deopt `SavedRegisters` GPR image.
+    ///
+    /// See [`Self::deopt_gpr_lo`]. `(0, 0)` -- no region reserved -- answers
+    /// `false`, which keeps every consumer on its pre-publication behaviour.
+    #[inline]
+    pub fn is_deopt_saved_gpr_image(&self, off: i32) -> bool {
+        self.deopt_gpr_hi > self.deopt_gpr_lo
+            && off >= self.deopt_gpr_lo
+            && off < self.deopt_gpr_hi
+    }
+
+    /// Whether `off` lands in the frame-deopt `SavedRegisters` XMM image.
+    /// See [`Self::deopt_xmm_lo`] for why this half is the one that can be let
+    /// go of rather than rewritten.
+    #[inline]
+    pub fn is_deopt_saved_xmm_image(&self, off: i32) -> bool {
+        self.deopt_xmm_hi > self.deopt_xmm_lo
+            && off >= self.deopt_xmm_lo
+            && off < self.deopt_xmm_hi
+    }
+
     /// Whether `off` names a slot that is only ever an IMAGE of a register.
     #[inline]
     pub fn is_register_image(&self, off: i32) -> bool {
@@ -2775,6 +2835,10 @@ impl FrameLayout {
             "callee-saved-xmm-image"
         } else if hit(self.reg_spill_lo, self.reg_spill_hi) {
             "safepoint-gpr-spill-image"
+        } else if hit(self.deopt_gpr_lo, self.deopt_gpr_hi) {
+            "deopt-saved-gpr-image"
+        } else if hit(self.deopt_xmm_lo, self.deopt_xmm_hi) {
+            "deopt-saved-xmm-image"
         } else if self.reg_spill_hi > 0 && off >= self.reg_spill_hi {
             "outgoing-args-or-deopt-regs"
         } else {
@@ -42054,5 +42118,99 @@ mod deferred_new_retry_gate_tests {
                 );
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod deopt_saved_register_range_tests {
+    use super::FrameLayout;
+
+    /// The geometry both backends publish, as the emitters write it:
+    /// `gpr[r] -> [rbp - (base - r*8)]` for `r` in `0..16` and
+    /// `xmm[n] -> [rbp - (base - 128 - n*8)]` for `n` in `0..16`, over one
+    /// 256-byte region whose DEEPEST offset is `base`.
+    fn layout_with_deopt_regs(base: i32) -> FrameLayout {
+        FrameLayout {
+            reg_spill_lo: base - 256 - 112,
+            reg_spill_hi: base - 256,
+            outgoing_lo: base,
+            deopt_gpr_lo: base - 15 * 8,
+            deopt_gpr_hi: base + 8,
+            deopt_xmm_lo: base - 248,
+            deopt_xmm_hi: base - 120,
+            frame_size: base + 64,
+            ..Default::default()
+        }
+    }
+
+    /// Every slot the deopt stub writes is classified, and the two halves do
+    /// not overlap. Written as a sweep rather than as endpoint assertions
+    /// because the failure this guards against is an off-by-one-slot at the
+    /// seam, where `gpr[15]` and `xmm[0]` meet.
+    #[test]
+    fn the_two_halves_partition_the_saved_registers_region() {
+        let base = 848;
+        let l = layout_with_deopt_regs(base);
+        for r in 0..16i32 {
+            let off = base - r * 8;
+            assert!(
+                l.is_deopt_saved_gpr_image(off),
+                "gpr[{r}] at off={off} must be in the GPR half",
+            );
+            assert!(
+                !l.is_deopt_saved_xmm_image(off),
+                "gpr[{r}] at off={off} must not also be in the XMM half",
+            );
+            assert_eq!(l.region_name(off), "deopt-saved-gpr-image");
+        }
+        for n in 0..16i32 {
+            let off = base - 128 - n * 8;
+            assert!(
+                l.is_deopt_saved_xmm_image(off),
+                "xmm[{n}] at off={off} must be in the XMM half",
+            );
+            assert!(
+                !l.is_deopt_saved_gpr_image(off),
+                "xmm[{n}] at off={off} must not also be in the GPR half",
+            );
+            assert_eq!(l.region_name(off), "deopt-saved-xmm-image");
+        }
+    }
+
+    /// The slot immediately outside each end is NOT claimed. The region is a
+    /// licence to treat words differently -- the GPR half gets a WRITE and the
+    /// XMM half gets its pin dropped -- so a range that runs one slot long
+    /// reaches storage neither argument covers.
+    #[test]
+    fn neither_half_claims_a_slot_outside_the_region() {
+        let base = 848;
+        let l = layout_with_deopt_regs(base);
+        assert!(!l.is_deopt_saved_gpr_image(base + 8), "one slot deeper than gpr[0]");
+        assert!(!l.is_deopt_saved_xmm_image(base + 8));
+        assert!(!l.is_deopt_saved_xmm_image(base - 256), "one slot past xmm[15]");
+        assert!(!l.is_deopt_saved_gpr_image(base - 256));
+        // Deliberately NOT asserted: which name `region_name` gives the slot
+        // between the blind spill's exclusive `reg_spill_hi` and `xmm[15]`.
+        // That seam is the catch-all's, both before and after this change, and
+        // pinning it in a test would be asserting the arithmetic of an
+        // unrelated reservation.
+    }
+
+    /// A frame that reserved no `SavedRegisters` region publishes `(0, 0)`, and
+    /// both predicates must read that as "absent" rather than as a range
+    /// containing 0 -- offset 0 is `[rbp]`, the saved caller frame pointer.
+    #[test]
+    fn an_unreserved_region_claims_nothing() {
+        let l = FrameLayout {
+            reg_spill_lo: 64,
+            reg_spill_hi: 176,
+            outgoing_lo: 176,
+            ..Default::default()
+        };
+        for off in [0, 8, 64, 176, 400, 848] {
+            assert!(!l.is_deopt_saved_gpr_image(off), "off={off}");
+            assert!(!l.is_deopt_saved_xmm_image(off), "off={off}");
+        }
+        assert_eq!(l.region_name(400), "outgoing-args-or-deopt-regs");
     }
 }
