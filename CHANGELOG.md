@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-12 `CopyOnWriteArraySet` was backed by a LinkedHashMap, and `removeIf` was the only method that said so
+
+`register_hashset_natives` mirrors the whole `java.util.HashSet` surface onto
+`CopyOnWriteArraySet`, on the stated premise that it is one of "HashSet's
+real-JDK subclasses that share the same `field 0 = backing map` layout". It is
+neither: it does not extend `HashSet`, and the ONE instance field the real class
+declares is `private final CopyOnWriteArrayList<E> al` — at exactly that slot 0.
+So `native_hs_init` stored a `LinkedHashMap` in a slot declared to hold a list.
+
+Nineteen methods, twenty registered triples, and `removeIf` in neither set — so
+its real body ran:
+
+```text
+  cowSet.removeIf(p)
+    -> NoSuchMethodError: java.util.LinkedHashMap.removeIf(java.util.function.Predicate)
+```
+
+Every other method looked correct because a native stood in front of it. Which
+ones are silent is a function of which triples the registrar happens to carry,
+which is why the guard below is the whole declared surface rather than the one
+method that broke.
+
+It cost the class its size as well. Retained heap against HotSpot on the same
+probe:
+
+```text
+  empty          112.0 -> 72.0     HotSpot 56.1     (2.00x -> 1.28x)
+  four entries   512.0 -> 120.0    HotSpot 88.3     (5.80x -> 1.36x)
+```
+
+The four-entry row is the larger half and had never been measured:
+`probes/CollectionShapeCause.java`'s filled table had no `CopyOnWriteArraySet`
+row, so a `LinkedHashMap` holding four entries — 488 bytes where HotSpot holds a
+six-element `Object[]` — was invisible. It has a row now.
+
+`cow_set_route` takes a real receiver to its own bytecode, method by method,
+from the top of each of the twenty natives — the placement `ksv_route` already
+uses, so the interface-level registrations (`java/util/Set.size()` and friends)
+are guarded by the same test as the exact-class ones. "Real" is a by-NAME
+question, not a mode flag: `is_real_cow_array_set` asks whether the receiver's
+class resolves `al`, so a fabricated stub keeps the map surface, where that
+surface IS the implementation. Delegation rather than a second implementation
+because the object underneath is already right — `CopyOnWriteArrayList` writes
+`lock` and `array` by name, runs the JDK's own constructor, and measures 48.0
+against HotSpot's 40.0. The one method that cannot go that way is `stream()`, a
+`Collection` default whose body builds a real `java.util.stream` pipeline; it
+takes the elements through the delegated `toArray()` and builds this VM's
+carrier, as every other `*_stream` native does.
+
+`probes/CowSetBacking.java` is the coverage that made the move safe — every
+method `javap -p` lists plus the four it inherits, asserting insertion ORDER
+throughout, because that is the observable separating a list-backed set from a
+hash-backed one. `vm/tests/cow_array_set_backing.rs` drives it as a gate and was
+mutation-checked: it FAILS on the pre-fix binary with exactly the
+`NoSuchMethodError` its message describes.
+
+Verified on both arms from the same commit: real-JDK `PASS CowSetBacking` and
+`PASS CollectionSlotFloor`, regression-suite 95/95, tier1 58/58;
+synthetic-JDK verdict-identical to an unchanged tree on both probes (the same 15
+and 14 outcomes, the same 127 `field index OOB`), which is the acceptance
+criterion rather than green.
+
 ### 2026-09-12 The synthetic slot floor was ONE number for TWO layouts, and six collection classes paid for it
 
 `synthetic_stub_fields` is read in two places that mean different things. It

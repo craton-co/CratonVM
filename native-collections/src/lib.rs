@@ -18482,6 +18482,177 @@ fn ts_source_remove(
     Ok(())
 }
 
+/// `java/util/concurrent/CopyOnWriteArraySet`, which is served by its OWN
+/// bytecode whenever the image declares it.
+const COW_SET_CLASS: &str = "java/util/concurrent/CopyOnWriteArraySet";
+
+/// Is `this` a `CopyOnWriteArraySet` that the IMAGE declares, rather than one
+/// this VM fabricated?
+///
+/// Asked by NAME, not by mode flag: the real class declares exactly one
+/// instance field, `al` (`Ljava/util/concurrent/CopyOnWriteArrayList;`), and a
+/// fabricated stub declares `_f0`/`_f1`. `resolve_field_index_by_class_id`
+/// therefore separates the two on the fact that actually matters — whether
+/// there is real bytecode under this receiver — and does it per RECEIVER, so a
+/// subclass is classified by what it really inherits. It is the same question
+/// [`hs_map_slot`] and `props_defaults_slot` ask about their own receivers.
+fn is_real_cow_array_set(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(this);
+    // Memoised per `(vm, class)` the way `hs_map_slot` is, and for the same
+    // reason: this sits in front of every method of the class, and the body
+    // below takes the class-manager lock twice.
+    thread_local! {
+        static MEMO: ClassMemo<usize> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let vm = ctx.vm_identity();
+    if let Some(v) = MEMO.with(|t| class_memo_get(t, vm, cid.as_u32())) {
+        return v == 1;
+    }
+    let Some(base) = ctx.class_id_by_name(COW_SET_CLASS) else {
+        // Not loaded at all, so nothing can be an instance of it. Not cached:
+        // `class_memo_get` keeps positives only, and the answer changes the
+        // moment the class arrives.
+        return false;
+    };
+    if cid != base && !ctx.is_subclass(cid, base) {
+        return false;
+    }
+    let real = ctx.resolve_field_index_by_class_id(cid, "al").is_some();
+    MEMO.with(|t| class_memo_put(t, vm, cid.as_u32(), usize::from(real)));
+    real
+}
+
+thread_local! {
+    /// Re-entrancy guard for [`cow_set_route`], holding the `(receiver, method)`
+    /// pairs whose delegation is in flight on this thread.
+    ///
+    /// `CopyOnWriteArraySet`'s own bodies delegate to `al`, a DIFFERENT
+    /// receiver, so a self-loop should not be reachable. "Should not" is the
+    /// reason this exists: the same reasoning held for
+    /// [`try_delegate_real_collection`] until a native registered under a real
+    /// JDK class name re-found itself, and the failure there is a stack
+    /// overflow rather than a wrong answer.
+    static COW_SET_GUARD: std::cell::RefCell<Vec<(usize, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run the receiver's OWN `CopyOnWriteArraySet` bytecode, when the receiver is
+/// a real one.
+///
+/// # Why this class leaves the HashSet surface
+///
+/// `register_hashset_natives` mirrors the whole `java.util.HashSet` surface
+/// onto `CopyOnWriteArraySet`, and `native_hs_init` gave it a `LinkedHashMap`
+/// backing at absolute slot 0. On the real class slot 0 is
+/// `al` (`Ljava/util/concurrent/CopyOnWriteArrayList;`) — its ONE instance
+/// field — so that is a map stored in a slot declared to hold a list, and it
+/// is not a theoretical mismatch:
+///
+/// ```text
+///   cowSet.removeIf(p)
+///     -> NoSuchMethodError: java.util.LinkedHashMap.removeIf(java.util.function.Predicate)
+/// ```
+///
+/// measured on `probes/CowSetBacking.java` before this change. `removeIf` is
+/// the one method of the nineteen the class declares that the mirror does NOT
+/// register, so its real body ran, read `al`, and found a map. Every other
+/// method looked correct only because a native stood in front of it.
+///
+/// It also cost the class its shape: a `LinkedHashMap` is 88 bytes empty on
+/// this VM where a `CopyOnWriteArrayList` is 48, so an empty
+/// `CopyOnWriteArraySet` retained 112 against HotSpot's 56.1 — the one
+/// collection left at 2.0x after the synthetic slot floor came off, and the
+/// only one whose excess was a different OBJECT rather than reference width.
+///
+/// # Why delegation rather than a second implementation
+///
+/// `CopyOnWriteArrayList` is already real-layout on this VM:
+/// `cowal_ensure_lock_and_array` writes `lock` and `array` BY NAME, its
+/// `<init>` override was deliberately removed so the JDK constructor runs, and
+/// it measures 48.0 against HotSpot's 40.0 — the best ratio in the collection
+/// table. So the JDK's own `CopyOnWriteArraySet` bodies, which are thin
+/// forwards to `al`, already have a working object underneath them. Writing a
+/// second implementation of nineteen forwards would be a second thing to keep
+/// in step with it.
+///
+/// Returns `None` — the caller keeps its own body — for a FABRICATED
+/// `CopyOnWriteArraySet`, where there is no bytecode to delegate to and the
+/// map-backed surface IS the implementation.
+/// The elements of a real `CopyOnWriteArraySet`, in iteration order, or `None`
+/// when `this` is not one.
+///
+/// For the handful of methods [`cow_set_route`] cannot take to bytecode. The
+/// route works by resolving the method on the receiver's own class, which is
+/// right for the nineteen `CopyOnWriteArraySet` declares and wrong for a
+/// `Collection` DEFAULT method: `stream()` resolves to `Collection.stream`,
+/// whose body builds a real `java.util.stream` pipeline over a real
+/// `Spliterator`, and this VM's streams are a synthetic carrier. So that one
+/// takes the elements and builds the carrier, which is what every other
+/// `*_stream` native in this file does.
+///
+/// Reads them through `toArray()`, which IS delegated — so the elements come
+/// from `al` by the same path everything else uses, rather than from a second
+/// reading of the receiver's slots.
+fn cow_set_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Vec<Value>> {
+    if !is_real_cow_array_set(ctx, this) {
+        return None;
+    }
+    // `invoke_virtual` runs Java and can complete a moving young GC; `this` is
+    // a bare Rust local. The elements are collected AFTER it returns and
+    // handed straight to a caller that pins them.
+    let this_pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(this_pin, this);
+    let elements = match ctx.invoke_virtual(this, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => {
+            let n = ctx.array_length(arr);
+            (0..n).map(|i| ctx.get_array_element(arr, i)).collect()
+        }
+        _ => Vec::new(),
+    };
+    ctx.unpin_native_roots(this_pin);
+    Some(elements)
+}
+
+fn cow_set_route(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &'static str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if !is_real_cow_array_set(ctx, this) {
+        return None;
+    }
+    let key = (this.as_ptr() as usize, method);
+    let reentered = COW_SET_GUARD.with(|g| {
+        let mut g = g.borrow_mut();
+        if g.contains(&key) {
+            true
+        } else {
+            g.push(key);
+            false
+        }
+    });
+    if reentered {
+        return None;
+    }
+    let cls = ctx.class_name_of_id(ctx.class_id_of_object(this));
+    let out = match cls {
+        // Bytecode-only, and on the RECEIVER's class: a subclass that overrides
+        // the method is entitled to its own body, and `invoke_special`'s
+        // native-first lookup would re-find the very native that called us.
+        Some(cls) => ctx.invoke_special_bytecode_only(&cls, method, descriptor, args),
+        None => Ok(None),
+    };
+    COW_SET_GUARD.with(|g| {
+        g.borrow_mut().retain(|k| *k != key);
+    });
+    Some(out)
+}
+
 /// Get the backing HashMap from a HashSet.
 fn is_hashset_native_backed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     hs_map_slot(ctx, this).is_some()
@@ -18540,7 +18711,16 @@ fn hs_map_slot_uncached(
     this: ObjectRef,
     cid: cratonvm_types::ClassId,
 ) -> Option<usize> {
-    let _ = this;
+    // A REAL `CopyOnWriteArraySet` keeps a `CopyOnWriteArrayList` in slot 0,
+    // not a map: slot 0 IS its `al` field. Answering `HS_FIELD_MAP` for one
+    // would hand every reader in this file a list to call `native_map_*` on,
+    // and would make `is_synthetic_backed_collection` claim a receiver this VM
+    // no longer backs. See [`cow_set_route`], which takes those receivers to
+    // their own bytecode; the FABRICATED stub keeps the map shape, because
+    // there the map surface is the implementation.
+    if is_real_cow_array_set(ctx, this) {
+        return None;
+    }
     for class_name in [
         "java/util/HashSet",
         "java/util/concurrent/CopyOnWriteArraySet",
@@ -19083,12 +19263,36 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
     // JDK semantics for `LinkedHashSet` differ only in iteration order
     // (insertion-order vs hash order), which our `make_set_of` /
     // `native_hs_iterator` already preserve via the synthetic backing
-    // map's bucket walk for the purposes of caller code. Same rationale
-    // for `EnumSet`, `CopyOnWriteArraySet`, and `ConcurrentSkipListSet`
-    // — applications that allocate them via the synthetic-stub path get
-    // a working contract, and applications that rely on their JDK
-    // bytecode keep working because the natives only override matching
-    // signatures.
+    // map's bucket walk for the purposes of caller code.
+    //
+    // `CopyOnWriteArraySet` IS STILL MIRRORED HERE AND IS NO LONGER SERVED BY
+    // IT on a real receiver, which is a distinction worth stating where the
+    // list is rather than only where the exception is.
+    //
+    // The premise above — "subclasses that share the same `field 0 = backing
+    // map` layout" — was never true of that class. It is not a `HashSet`
+    // subclass at all, and the one instance field the real one declares is
+    // `al` (`Ljava/util/concurrent/CopyOnWriteArrayList;`) sitting at exactly
+    // that slot 0. So `native_hs_init` put a `LinkedHashMap` where a list
+    // belongs, and the sentence that ends this comment in its original form —
+    // "applications that rely on their JDK bytecode keep working because the
+    // natives only override matching signatures" — is the half that gave it
+    // away: `removeIf` is one of the nineteen methods the class declares and
+    // one of the few this registrar does NOT register, so its JDK body ran,
+    // read `al`, and raised
+    // `NoSuchMethodError: java.util.LinkedHashMap.removeIf`.
+    //
+    // [`cow_set_route`] now takes a real `CopyOnWriteArraySet` to its own
+    // bytecode, method by method. The registrations stay because the
+    // FABRICATED stub still needs them: there the map surface is the
+    // implementation, and `is_real_cow_array_set` — a by-name test for `al` on
+    // the receiver's class — is what tells the two apart.
+    //
+    // Same original rationale still holds for `EnumSet` and
+    // `ConcurrentSkipListSet`: applications that allocate them via the
+    // synthetic-stub path get a working contract, and applications that rely
+    // on their JDK bytecode keep working because the natives only override
+    // matching signatures.
     const SET_CLASSES: &[&str] = &[
         "java/util/HashSet",
         "java/util/LinkedHashSet",
@@ -19350,6 +19554,17 @@ fn native_hs_init_capacity_load(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// input array is large enough we copy into it and write null at index
 /// `size` per spec; otherwise we fall back to a fresh allocation.
 fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(
+        ctx,
+        args,
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ) {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -19440,6 +19655,12 @@ fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// `containsAll`/`retainAll`/`removeAll` — which falls back to the
 /// collection's real `toArray()`.
 fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "hashCode", "()I") {
+        return r;
+    }
     if let Some(r) = ksv_route(ctx, args, native_ksv_hash_code) {
         return r;
     }
@@ -19471,6 +19692,12 @@ fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// LETSGO_S1: HashSet.equals — same size + every element of `this` is in
 /// `other` (`AbstractSet.equals` semantics).
 fn native_hs_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "equals", "(Ljava/lang/Object;)Z") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -19547,6 +19774,12 @@ fn native_hs_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// surfacing as `WELD-001301: @Produces is not a qualifier` (HIB-CV-25). The
 /// `_or_real` variant falls back to the collection's real `toArray()`.
 fn native_hs_contains_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "containsAll", "(Ljava/util/Collection;)Z") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -19682,6 +19915,12 @@ fn alloc_hs_backing(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) ->
 }
 
 fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "<init>", "()V") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -19716,6 +19955,12 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "size", "()I") {
+        return r;
+    }
     if let Some(r) = ksv_route(ctx, args, native_ksv_size) {
         return r;
     }
@@ -19742,6 +19987,12 @@ fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_hs_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "isEmpty", "()Z") {
+        return r;
+    }
     if let Some(r) = ksv_route(ctx, args, native_ksv_is_empty) {
         return r;
     }
@@ -19766,6 +20017,12 @@ fn native_hs_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "add", "(Ljava/lang/Object;)Z") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -19916,6 +20173,12 @@ pub fn try_native_hashset_remove(
 }
 
 fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "remove", "(Ljava/lang/Object;)Z") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -20093,6 +20356,12 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "contains", "(Ljava/lang/Object;)Z") {
+        return r;
+    }
     let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -20200,6 +20469,12 @@ fn native_hs_contains_pinned(
 }
 
 fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "clear", "()V") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -20466,6 +20741,12 @@ fn cow_set_snapshot_iterator(
 }
 
 fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "iterator", "()Ljava/util/Iterator;") {
+        return r;
+    }
     if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
         return r;
     }
@@ -20623,6 +20904,12 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "spliterator", "()Ljava/util/Spliterator;") {
+        return r;
+    }
     let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -20692,6 +20979,12 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "toArray", "()[Ljava/lang/Object;") {
+        return r;
+    }
     let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -20724,6 +21017,12 @@ fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "toString", "()Ljava/lang/String;") {
+        return r;
+    }
     let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -24379,6 +24678,12 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "forEach", "(Ljava/util/function/Consumer;)V") {
+        return r;
+    }
     // RULE F, ahead of the route — see the note in `native_al_for_each`.
     reject_null_functional(args.get(1))?;
     if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
@@ -30099,6 +30404,12 @@ fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return make_stream(ctx, &[]),
     };
     resync_view_set(ctx, &mut this)?;
+    // A real `CopyOnWriteArraySet` has no backing map to walk. `stream()` is
+    // the one method of its surface [`cow_set_route`] cannot delegate — see
+    // [`cow_set_elements`] — so build the carrier from its elements.
+    if let Some(elements) = cow_set_elements(ctx, this) {
+        return make_stream(ctx, &elements);
+    }
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return make_stream(ctx, &[]),
@@ -38878,6 +39189,12 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 /// HashSet.<init>(Collection) — copy elements from source into this set.
 fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "<init>", "(Ljava/util/Collection;)V") {
+        return r;
+    }
     // RULE C: `HashSet(Collection)` sizes its table from `c.size()`.
     reject_null_collection(args.get(1))?;
     let this = match args.first() {
@@ -49735,6 +50052,12 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_hs_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "addAll", "(Ljava/util/Collection;)Z") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -49797,6 +50120,12 @@ fn native_hs_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_hs_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "removeAll", "(Ljava/util/Collection;)Z") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
@@ -49911,6 +50240,12 @@ fn native_hs_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // A real `CopyOnWriteArraySet` is served by its own bytecode over the
+    // `CopyOnWriteArrayList` in `al`, not by this file's map surface.
+    // See [`cow_set_route`].
+    if let Some(r) = cow_set_route(ctx, args, "retainAll", "(Ljava/util/Collection;)Z") {
+        return r;
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
