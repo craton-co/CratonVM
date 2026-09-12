@@ -2210,22 +2210,26 @@ use cratonvm_types::compat::CompatibilityMode;
 /// across a merge is the mistake this file's own history keeps recording:
 ///
 /// ```text
-///   pre-merge (base bdb02d94e)          on the merge (62ae280f8)
-///   arm            OFF     ->  ON       OFF     ->  ON        delta
-///   (default)     2915     -> 2932     2948     -> 2965       +17
-///   management    2942     -> 2959     2975     -> 2992       +17
-///   synthetic     2915     -> 2932     2948     -> 2965       +17
+///   arm          base bdb02d94e   merge 62ae280f8   merge 0ad29ab00   delta
+///   (default)    2915 -> 2932     2948 -> 2965      3832 -> 3849      +17
+///   management   2942 -> 2959     2975 -> 2992      3859 -> 3876      +17
+///   synthetic    2915 -> 2932     2948 -> 2965      3832 -> 3849      +17
 /// ```
 ///
-/// Two independent derivations of the same +17, with the OFF column passing at
-/// whatever the constants were at that moment — which is what says the
-/// baselines were current on both trees and that nothing but this wave moves
-/// them. The second pair is what the constants below are set from; the first is
-/// kept because agreeing twice is the claim, not the number.
+/// THREE independent derivations of the same +17, each with the OFF column
+/// passing at whatever the constants were at that moment — which is what says
+/// the baselines were current on all three trees and that nothing but this wave
+/// moves them. The third column is a merge that took lane T's own table (+884
+/// in one go) straight through the middle of this one, and the +17 does not
+/// notice. The LAST pair is what the constants below are set from; the earlier
+/// two are kept because agreeing three times is the claim, not the number —
+/// subtracting would have made them agree by construction.
 ///
-/// **The totals fell in every arm and in BOTH columns — by 2 before the merge
-/// and by 13 on it** — so they are dev's, not this wave's: a re-tag moves a row
-/// between kinds and cannot change how many registrations exist.
+/// **The totals fell in every arm and in BOTH columns — by 2 before the first
+/// merge and by 13 on it, and not at all on the second** — so they are dev's,
+/// not this wave's: a re-tag moves a row between kinds and cannot change how
+/// many registrations exist. Lane T's +884 on the second merge is the same
+/// statement from the other side: 884 more stubs, total unchanged.
 /// `MEASURED_TOTAL_REGISTRATIONS_*` are documentation rather than assertions,
 /// which is exactly why they go stale, so they are re-frozen here with the stub
 /// baselines rather than left to drift another wave. Same shape as wave 3's 8.
@@ -2237,7 +2241,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// above): the total not moving at all is the cleanest of the four readings
 /// -- every added SyntheticStub row is an existing Bridge relabelled, zero new
 /// registrations, exactly what a table landing on a fresh `dev` predicts.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3859;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3876;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2608,7 +2612,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3859;
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 /// # 2948 → 3832, 2026-09-12 — see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]'s
 /// account of this same merge; `+884` here too, total unchanged 13606 -> 13606.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3832;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3849;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2848,7 +2852,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3832;
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 /// # 2948 → 3832, 2026-09-12 — see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]'s
 /// account of this same merge; `+884` here too, total unchanged 13641 -> 13641.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3832;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3849;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
