@@ -109,8 +109,9 @@ not move. The relevant declarations:
 * `CompiledMethod::_jit_invoke_infos: Vec<Box<JitInvokeInfo>>` (`lib.rs:1435`)
 * `CompiledMethod::_jit_strings: Vec<Box<str>>` (`lib.rs:1432`)
 * `CompiledMethod::_deopt_point_boxes: Vec<Box<DeoptimizationPoint>>` (`lib.rs:1574`)
-* `JitCache::string_arena: Mutex<Vec<Pin<Box<str>>>>`,
-  `JitCache::invoke_info_arena: Mutex<Vec<Pin<Box<JitInvokeInfo>>>>`
+
+(`JitCache::string_arena` / `invoke_info_arena` also used to be listed here.
+They had no callers and were deleted on 2026-09-12.)
 
 The compile-time staging vectors have the same shape: `owned_mic_slots:
 Vec<Box<JitMICSlot>>` / `owned_pic_slots` in `try_compile_inner`,
@@ -136,11 +137,13 @@ argument: all copies live in the same artifact, and the slot is owned by that
 artifact's `_jit_pic_slots`. There is no configuration in which one copy
 outlives another.
 
-**What is *not* proven here.** The arenas are append-only and never compacted;
-`JitCache::string_arena` / `invoke_info_arena` in particular are per-VM and grow
-for the process lifetime, because a `CompiledMethod` stores raw `*const u8` into
-them and nothing tracks which artifact interned what. That is a documented leak
-(see the long `TODO(round-8)` on `impl CompiledMethod`), not a safety defect.
+**What is *not* proven here.** Every per-artifact arena above is dropped with
+its artifact. The process-wide intern tables are not: `intern_typecheck_target`
+leaks one string per distinct `(class name, resolved ClassId)` and
+`TYPECHECK_TARGET_BY_SITE` one row per such string, because the emitted code
+and the runtime helper recover the resolved id from the name pointer. Interning
+by name only would need the per-site id carried in the artifact and passed by
+the emitters. That is a bounded leak, not a safety defect.
 
 ---
 
@@ -167,14 +170,19 @@ impl body):
 
 Not by this `Drop` — by the queue in front of it. Every retirement site hands
 the artifact to `defer_jit_owner`, which drops it immediately only when
-`ACTIVE_JIT_EXECUTIONS.is_zero()` and otherwise queues it until
-`jit_execution_leave` observes zero. The sites are: `JitCache::put` and
-`put_osr` (superseded body), `invalidate_matching` (both maps),
-`clear_all`, the four inline-cache eviction paths
-(`JitMICSlot::clear_compiled_entry`, `JitPICSlot::install`'s refresh and LFU
-arms, `clear_entries`, `invalidate_targets`), and every
-`cratonvm_jit::RetainedCode` drop, which is how the two `vm/`-side per-thread
-dispatch caches in §1.2 release their keep-alive.
+`ACTIVE_JIT_EXECUTIONS.is_zero()` and otherwise queues it, stamped with a
+retirement generation, until `drain_deferred_jit_owners` can show every thread
+is outside it: the striped sum reads zero, or per-thread evidence (depth zero,
+back at depth zero since the stamp, or parked in a blocking transition with a
+stack summary that does not name the body). See
+`docs/jit/code-cache-lifecycle.md` §"The quiescence signals". The sites are:
+`JitCache::put` and `put_osr` (superseded body), `invalidate_matching` (both
+maps) and `clear_all` (all through `retire_withdrawn_body`), the inline-cache
+withdrawal paths (`JitMICSlot::update` replacing an owner and
+`clear_compiled_entry`; `JitPICSlot`'s retired ways and megamorphic entries,
+`clear_entries`, `invalidate_targets`; a PIC way is written once and never
+evicted), and every `cratonvm_jit::RetainedCode` drop, which is how the two
+`vm/`-side per-thread dispatch caches in §1.2 release their keep-alive.
 
 The queue is the backstop; the primary argument is ownership. A thread inside a
 compiled body always holds an owning `Arc<CompiledMethod>` for it, so a
@@ -182,8 +190,9 @@ reference count reaching zero is itself a proof that no thread is inside.
 `published_code_free_audit().1` counts every release that reached the OS without
 the queue's authorisation and must be zero.
 
-`drain_deferred_jit_owners_if_quiescent` takes the queue lock **before**
-reading the quiescence counter and holds it across both. That ordering is the
+`drain_deferred_jit_owners` (formerly `drain_deferred_jit_owners_if_quiescent`)
+takes the queue lock **before** reading the quiescence counter or the
+per-thread records, and holds it across both. That ordering is the
 correctness argument, not a performance choice: reading `is_zero()` first would
 let a thread observe zero at `t0`, be descheduled while a peer enters JIT at
 `t1` and a third unpublishes-and-queues a body at `t2 > t1`, then resume and

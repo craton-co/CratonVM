@@ -28,41 +28,68 @@ Nothing in this document requires reading a log line.
 
 ## The retirement protocol
 
-Three phases. Only the middle one is new.
+The protocol lives in `jit/src/lib.rs`. `vm/src/jit/code_cache_lifecycle.rs`
+reports on it: `pending_retirements()`, `sweep_if_quiescent()` and
+`code_cache_lifecycle_raw()` read or drive the real queue. (An earlier
+revision described a vm-side model queue with its own sweep; that model's
+counters were never fed by the real installs and retirements, and the two
+were joined on 2026-09-12.)
 
 | Phase | Who | What |
 |---|---|---|
-| 1. Unpublish | the caller, **before** `retire()` | Remove the body from the compiled-method cache, every inline cache, every external dispatch cache, and every baked direct-call target. After this, no *new* activation can begin. |
-| 2. Grace period | `CodeCacheLifecycle::sweep` | Wait until every thread has been outside compiled code at some instant *after* phase 1. |
-| 3. Reclaim | `CodeCacheLifecycle::sweep` | Drop the queued owner **outside** the queue lock; the last `Arc<CompiledMethod>` unmaps the body. |
+| 1. Unpublish | the withdrawing site, **before** `defer_jit_owner` | Remove the body from the `JitCache` shard maps (`retire_withdrawn_body`), from every inline-cache way (`CompiledMethod::retired` is set first, then the slot word is cleared under the slot's writer lock), from external dispatch caches (the cache generation), and from future baked direct calls (`prepare_for_publication` refuses a retired callee). After this, no *new* activation can begin. |
+| 2. Grace period | `defer_jit_owner` / `drain_deferred_jit_owners` | Queue the owner stamped with a retirement generation, and release it once every thread is shown to be outside it (below). |
+| 3. Reclaim | the same, **outside** the queue lock | Drop the owner; the last `Arc<CompiledMethod>` unmaps the body in `ExecutableBuffer::drop`, which counts it as reclaimed. |
 
-Phase 1 is not something this module can check, and the doc comment on `retire`
-says so plainly: it can prove *"no thread is currently inside compiled code"*,
-but only the caller can guarantee *"and no thread can enter this body again"*.
+Phase 1 is the caller's obligation: the queue can prove *"no thread is inside
+this body"*, but only the caller can guarantee *"and no thread can enter it
+again"*.
 
-### The quiescence signal
+### The quiescence signals
 
-**`GLOBAL_JIT_DEPTH`.** Not a second mechanism.
+Two, in order of cost.
 
-`docs/threading/thread-transition-states.md` §7.2 / §10.3 establish that
-`CompiledUninterruptible` is recorded at `push_entry_full`, `pop_jit_entry` and
-`prune_returned_jit_entries`, and that the process-wide in-JIT depth is the
-striped counter `GLOBAL_JIT_DEPTH` in `vm/src/jit/conservative_roots.rs`.
-The sweep reads it through the existing predicate `any_thread_in_jit()`
-(`conservative_roots::any_thread_in_jit`). No new call site was added to the
-interpreter/JIT boundary, and no parallel count is maintained: the boundary
-already increments and decrements exactly the counter this protocol needs.
+**The fast path: `ACTIVE_JIT_EXECUTIONS` reads zero.** Every compiled-code
+activation is bracketed by `jit_execution_enter` / `jit_execution_leave`
+(`JitExecutionToken` records the stripe it incremented, so a decrement during
+thread-local teardown lands on the same stripe). When the striped sum reads
+zero with the queue lock held, everything queued is released. The argument is
+the next section.
 
-Two wake-up hooks were added, both in `vm/src/jit/conservative_roots.rs`, at the
-two places the depth can reach zero:
+**Per-thread evidence, when some thread is inside compiled code.** A thread
+parked in compiled code (blocked in a monitor, `Object.wait`, I/O, a sleep)
+kept the sum above zero indefinitely and stalled reclamation for the whole
+process. Each thread that enters compiled code therefore registers a
+`JitThreadQuiescence` record:
 
-* `pop_jit_entry` — the normal return from a compiled frame.
-* `prune_returned_jit_entries` — the self-heal for a leaked `JitEntryGuard`.
+* `depth` — its in-JIT nesting;
+* `quiescent_gen` — the retirement generation it observed the last time its
+  depth reached zero;
+* a **blocked-stack summary** — captured when the thread enters a blocking
+  transition (`gc_barrier::enter_blocked` and `mark_blocked_region_enter`, via
+  `conservative_roots::note_blocking_transition_enter` →
+  `jit_thread_blocked_enter`): the set of code buffers named by return
+  addresses in its stack band from the current SP to its outermost compiled
+  entry. It is invalidated if the thread re-enters compiled code inside the
+  window, and it gives up (and holds everything) past a 1 MiB band.
 
-Both are gated on `pending_retirements() != 0`, one relaxed load of a
-process-global `AtomicUsize`. With nothing queued — the overwhelmingly common
-case — that is the entire cost of the retirement machinery on the hottest
-boundary in the VM.
+`drain_deferred_jit_owners` takes the queue lock, collects every thread's
+evidence (`collect_thread_quiescence_evidence`), and releases each queued
+owner that every thread is shown to be outside: depth zero, or back at depth
+zero since the owner's stamp, or parked with a valid summary that does not
+name the owner's buffer. Everything else stays queued. Executions without a
+thread record (`UNTRACKED_JIT_EXECUTIONS`) hold the whole queue.
+
+Drains run from `defer_jit_owner`, from `jit_execution_leave` (on a leave that
+sees the sum at zero, and every `DRAIN_PUMP_INTERVAL` = 32 outermost leaves
+while the queue is non-empty), from `jit_code_cache_at_capacity` before it
+refuses a compile, and on demand from `reclaim_retired_jit_code()`. The same
+observations advance the graced generation that lets an inline-cache way be
+reused.
+
+A thread parked at a **safepoint** inside compiled code does not pass through
+the blocking transitions above, so it has no summary and holds the queue until
+it leaves. That is the fail-safe direction.
 
 ### Why one striped-sum zero read is a real grace period
 
@@ -76,10 +103,11 @@ answer does **not** mean every thread was out of JIT *simultaneously*. For a
    had in-JIT depth zero at `t`.
 2. A full walk returning `true` therefore yields, for *every* thread in the
    process, some instant at which that thread was outside compiled code.
-3. `sweep` takes the queue lock **first** and performs the walk **while holding
-   it**. Every queued body was therefore unpublished strictly before the walk
-   began, so each thread's witness instant is after every queued body's
-   unpublication.
+3. `drain_deferred_jit_owners` takes the queue lock **first** and performs the
+   walk **while holding it**. Every queued body was therefore unpublished
+   strictly before the walk began, so each thread's witness instant is after
+   every queued body's unpublication. (`defer_jit_owner`'s unlocked fast path is
+   sound for the same reason: its caller unpublished the body before calling.)
 4. A thread outside compiled code at its witness instant can only re-enter
    through a dispatch surface, and every such surface was cleared in phase 1.
    So it cannot be executing any of them.
@@ -96,35 +124,36 @@ inside compiled code** by the cross-thread STW takeover
 (`vm/src/jit/xt_root_scan.rs`). It cannot run any cooperative handshake, so no
 "ask every thread to acknowledge" protocol can complete while it is frozen.
 
-It does not need to. A frozen peer's `push_entry_full` already incremented
-`GLOBAL_JIT_DEPTH` and its matching `pop_jit_entry` has not run, so the depth
-stays elevated for as long as it is frozen and the sweep simply does not
-reclaim. The same holds for the **helper window** (a compiled frame that called
-a Rust helper): the chain depth stays elevated across the helper even though the
-peer's `Rip` is outside every JIT range. That is the over-approximating half of
-the §10.4 classifier split, and over-approximation is the correct polarity for
-"may I free this?", exactly as it is for "may I relocate?".
+It does not need to. A frozen peer entered compiled code through
+`jit_execution_enter` and has not left, so its depth stays elevated for as long
+as it is frozen. An OS freeze does not pass through a blocking transition, so
+it has no stack summary either: it provides no evidence, and every owner it
+might be inside stays queued. The same holds for the **helper window** (a
+compiled frame that called a Rust helper): the depth stays elevated across the
+helper even though the peer's `Rip` is outside every JIT range. That is the
+over-approximating polarity, which is the correct one for "may I free this?",
+exactly as it is for "may I relocate?".
 
-This protocol therefore adds a **third** consumer of the depth-based classifier,
-alongside `refresh_moving_young_coverage_for_collection` and `gc_quiescence`.
-§10.4's warning applies unchanged: if `any_thread_in_jit()` is ever narrowed to
+§10.4's warning applies unchanged: if the in-JIT depth is ever narrowed to
 `Rip`-based classification, this protocol loses the helper window and starts
 freeing bodies whose frames are still live.
 
 ### Fail-safe
 
-If quiescence cannot be established the body is **retained** and counted as
-deferred. A leak is a bug; freeing live code is a crash.
+If quiescence cannot be established for an owner, it is **retained** and the
+drain is counted. A leak is a bug; freeing live code is a crash.
 
-The counters exist so the leak is *visible*. A permanently wedged entry chain
-shows up as a `deferred_bytes` that never falls and a `max_deferral_sweeps` that
-climbs, and the report says so in words:
+The counters exist so the leak is *visible*
+(`cratonvm_jit::jit_code_reclamation_stats()`): a permanently wedged thread
+shows up as `queued_bytes` that never falls while `drains_deferred` climbs.
+`drains_quiescent` and `drains_by_thread_evidence` say which signal released
+what. `cratonvm_jit::jit_retirement_queue_len()` is the queue length.
 
-```
-[JIT] code-cache retirement: RETAINED 3 bodies / 12288 bytes (0.2500 of live) —
-quiescence unproven, oldest deferred 41 sweeps. Retention is the fail-safe:
-a leak is a bug, freeing live code is a crash.
-```
+Independently of the queue, `ExecutableBuffer::drop` records every unmap
+(`record_code_free`), and `recent_code_free_covering` lets the crash handler
+say whether a faulting address was inside a buffer released recently.
+`published_code_free_audit().1` counts published bodies released without the
+queue's authorisation and must stay zero.
 
 ---
 
@@ -170,6 +199,24 @@ order:
 ## Counter inventory
 
 Monotone unless marked *gauge*.
+
+**Which of these the process report fills.** `code_cache_lifecycle_raw()`
+copies these from `cratonvm_jit::jit_code_reclamation_stats()`:
+
+| Report field | Real source |
+|---|---|
+| `installs`, `installed_bytes`, `installed_code_bytes` | `installed_*`, counted when a body is published (`ExecutableBuffer::mark_published`) |
+| `retirements`, `retired_bytes` | `withdrawn_bodies` / `withdrawn_bytes` (`retire_withdrawn_body`: superseded, invalidated or flushed) |
+| `reclaimed_bodies`, `reclaimed_bytes`, `reclaimed_code_bytes` | `reclaimed_*`, counted when a published buffer is unmapped |
+| `sweeps`, `sweeps_deferred` | `drains`, `drains_deferred` |
+| `deferred_bodies`, `deferred_bytes` | `queued_owners`, `queued_bytes` (gauges) |
+| `capacity_bytes` | `jit_code_cache_cap_bytes()` |
+
+The other fields below (`recompilations`, `methods_compiled`,
+`retirements_by_reason`, `deferrals`, `max_deferral_sweeps`, the allocation
+failures and free extents) are kept by the `CodeCacheLifecycle` model type for
+its own tests and read zero in the process report until something real feeds
+them.
 
 ### Installation
 
@@ -290,43 +337,19 @@ made to pin. Any new long-lived holder of an `Arc<CompiledMethod>` that backs a
 raw entry must be a `cratonvm_jit::RetainedCode`, not a bare `Arc`;
 `published_code_free_audit().1` is the check, and it must stay zero.
 
-### 2. `ExecutableBuffer::new` is the install accounting point
+### 2. ~~`ExecutableBuffer::new` is the install accounting point~~ — DONE, differently
 
-It already bumps `COMMITTED_JIT_CODE_BYTES` and registers the region. Add,
-after the `Some(Self { .. })` is decided:
+The counters moved into `jit/src/lib.rs` (the first option this section
+proposed), and the vm report re-reads them. Installs are counted at
+publication (`mark_published`), not at allocation, so a discarded compile is
+not an install. Still open: allocation failures (`alloc_executable` refusing,
+and `ExecutableBuffer::overflowed` as a size-estimate overrun) are not counted.
 
-```rust
-cratonvm_vm::jit::code_cache_lifecycle::record_install(method, BodyExtent { .. });
-```
+### 3. ~~`impl Drop for ExecutableBuffer` is the reclaim accounting point~~ — DONE
 
-…except the `jit` crate cannot depend on `vm`. Two options, in preference
-order:
-
-* **Move the counters into `jit/src/`** and re-export them from
-  `vm/src/jit/code_cache_lifecycle.rs`. The quiescence probe stays on the vm
-  side (it is `conservative_roots`' predicate), passed in as a function pointer
-  at VM startup — the same shape `cratonvm_jit::xt_jit_root_scan_enabled`
-  already uses to mirror a vm-side gate.
-* **Call from the vm-side install driver** instead: the `Arc<CompiledMethod>`
-  publication point in `vm/src/runtime/interpreter.rs` / `jit_integration.rs`,
-  which is where the method identity is available anyway. `ExecutableBuffer::new`
-  does not know which method it is for.
-
-The second is smaller and is what the counters were shaped for
-(`record_install` takes a `MethodId`).
-
-**Also here:** `platform::alloc_executable(capacity)?` returns `None` on OS
-refusal and `new` propagates it. That `?` is the
-`record_allocation_failure(capacity, alloc_failure::OS_REFUSED)` site, and the
-sticky `ExecutableBuffer::overflowed` flag is the
-`alloc_failure::SIZE_ESTIMATE_OVERRUN` site — a compile that bails because
-codegen outran its size estimate is a *refused allocation*, and today it is
-indistinguishable from every other `try_compile` bail.
-
-### 3. `impl Drop for ExecutableBuffer` is the reclaim accounting point
-
-It calls `record_code_free(ptr, capacity, ACTIVE_JIT_EXECUTIONS.get(), flags)`.
-Route the bytes into `reclaimed_bytes` / `reclaimed_bodies`.
+It calls `record_code_free(ptr, capacity, ACTIVE_JIT_EXECUTIONS.get(), flags)`,
+and for a published buffer also counts `reclaimed_bodies` / `reclaimed_bytes` /
+`reclaimed_code_bytes`.
 
 **Do not** treat a non-zero active count as the protocol violation — an earlier
 revision of this section said to, and it is wrong in both directions. The count
@@ -340,14 +363,14 @@ The violation is `CODE_FREE_PUBLISHED && !CODE_FREE_AUTHORISED`, which
 `ExecutableBuffer::drop` now records into `published_code_free_audit()` and the
 crash handler prints in words. Aggregate *that*.
 
-### 4. `JitCache::put` / `JitCache::put_osr` are the retire sites
+### 4. ~~`JitCache::put` / `JitCache::put_osr` are the retire sites~~ — DONE, without reasons
 
-Both already call `defer_jit_owner(superseded.map(|(_, cm)| cm))`. That is the
-`retire_reason::SUPERSEDED` call, and it is the one that makes
-`recompilations` and `retirements_by_reason` agree.
-The `defer_jit_owner` calls in the monomorphic/polymorphic/megamorphic
-inline-cache eviction paths (`compiled_owner`/`compiled_owners`/
-`mega_compiled_owners` takes) are `retire_reason::CACHE_PRESSURE`.
+`put`, `put_osr`, `invalidate_matching` and `clear_all` hand withdrawn bodies to
+`retire_withdrawn_body`, which counts `withdrawn_bodies` / `withdrawn_bytes` and
+defers the owner. Inline-cache withdrawals (`clear_compiled_entry`, retired PIC
+ways) defer their owner references without counting a withdrawal, since the
+body itself is withdrawn once, from the cache. Still open: no reason split
+(`retirements_by_reason`), and no `recompilations` count.
 
 ### 5. `vm/src/runtime/jit_integration.rs` — the model cache
 
@@ -393,13 +416,16 @@ shows no execution of partial or reclaimed code"* — needs, in addition:
    `recent_code_free_covering` + the crash handler already print the verdict.
 2. **The frozen-peer schedule.** Force a cross-thread STW takeover
    (`CRATONVM_XT_JIT_ROOT_SCAN=1`) *concurrently* with invalidation, so the
-   sweep is asked to reclaim while a peer is OS-frozen mid-body. Assert
-   `sweeps_deferred` rises and `reclaimed_bytes` does not.
+   drain is asked to reclaim while a peer is OS-frozen mid-body. Assert
+   `drains_deferred` rises and `reclaimed_bytes` does not.
 3. **The wedged-chain schedule.** Leak a `JitEntryGuard` deliberately and assert
-   that reclamation stops (`max_deferral_sweeps` climbs, nothing is freed) and
-   then resumes after `prune_returned_jit_entries` heals the chain. This is the
-   test that distinguishes "the fail-safe works" from "the fail-safe is stuck
-   on".
+   that reclamation of what that thread may be inside stops (`queued_bytes`
+   does not fall) and then resumes after `prune_returned_jit_entries` heals the
+   chain. This is the test that distinguishes "the fail-safe works" from "the
+   fail-safe is stuck on". (The parked-thread half — a thread blocked inside
+   compiled code holds only what its stack names — is covered by
+   `a_thread_parked_in_compiled_code_holds_only_what_its_stack_names` in
+   `jit/src/lib.rs`.)
 4. **Partial code.** Nothing here tests the *install* half against a concurrent
    reader, because the install-ordering check is a validator over a recorded
    sequence, not an observation of one. Proving "no execution of partial code"
@@ -415,9 +441,12 @@ shows no execution of partial or reclaimed code"* — needs, in addition:
 
 ## Related
 
-* `vm/src/jit/code_cache_lifecycle.rs` — the implementation and its tests.
-* `vm/src/jit/conservative_roots.rs` — `GLOBAL_JIT_DEPTH`, `any_thread_in_jit`,
-  and the two sweep wake-up hooks.
+* `jit/src/lib.rs` — `defer_jit_owner`, `drain_deferred_jit_owners`,
+  `JitThreadQuiescence`, `jit_code_reclamation_stats`.
+* `vm/src/jit/code_cache_lifecycle.rs` — the report, and the model type's tests.
+* `vm/src/jit/conservative_roots.rs` — `note_blocking_transition_enter` /
+  `_leave` (blocked-stack summaries) and the prune wake-up;
+  `vm/src/threading/gc_barrier.rs` calls them.
 * `docs/threading/thread-transition-states.md` §7.2, §10.3, §10.4 — where
   `CompiledUninterruptible` is recorded, and why the two in-JIT classifiers are
   deliberately mismatched.

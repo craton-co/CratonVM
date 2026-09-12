@@ -807,15 +807,14 @@ pub fn despec_clear_for_test() {
 /// trampoline can decide — **before dereferencing the box** — whether the
 /// speculation it bakes has been superseded by a later invalidation.
 ///
-/// Why a separate cell rather than a field on the box: the box describes the
-/// speculation and must be dereferenced to reconstruct the interpreter frame.
-/// Under the `CRATONVM_JIT_FREE_CODE=1` A/B mode an evicted artifact's
-/// `DeoptimizationPoint` boxes can be freed; reading the epoch *from* the box
-/// would itself be the use-after-free we are trying to avoid. This guard is
-/// retained independently of the artifact (see [`crate::CompiledMethod`]'s
-/// `Drop`), so `x64_deopt_entry` reads the live epoch and the artifact's
-/// creation epoch from here without touching the box at all when the artifact is
-/// stale. ("bake a stable live-epoch cell pointer alongside the box.")
+/// Why a separate cell rather than a field on the box: it was built for a
+/// `CRATONVM_JIT_FREE_CODE=1` A/B mode in which an evicted artifact's
+/// `DeoptimizationPoint` boxes could be freed under a running frame, so reading
+/// the epoch *from* the box would itself have been the use-after-free. That mode
+/// is gone (an executing artifact owns its boxes until it returns), and
+/// `x64_deopt_entry` no longer short-circuits on this guard. It is still leaked
+/// independently of the artifact and still stamped, so the stub ABI and the
+/// VM-side staleness check keep a stable cell to read.
 ///
 /// Stamped once by the VM at install time (`SharedVm`/`stamp_compilation_epoch`)
 /// under `deopt_real_enabled()`; on every production artifact it stays
@@ -1627,14 +1626,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Legacy compatibility gate. Code reclamation is now ownership-safe in every
-/// configuration: an executing artifact owns its deopt metadata until return,
-/// so a superseded frame remains reconstructable and must not be forced into a
-/// side-effect-replaying whole-method fallback.
-fn jit_free_code_enabled() -> bool {
-    false
-}
-
 /// Take (and clear) the frame most recently reconstructed by a deopt.
 pub fn take_last_deopt() -> Option<ReconstructedFrame> {
     LAST_DEOPT.with(|c| c.borrow_mut().take())
@@ -2305,15 +2296,11 @@ pub extern "C" fn ir_deopt_entry(
 /// call. STASH ONLY — no resume yet (that is Step 4).
 ///
 /// deopt-osr Step 9 follow-up (a): a 4th arg, `epoch_guard`, carries the
-/// stable, retained [`DeoptEpochGuard`] baked alongside the box. Before
-/// dereferencing `point`, the entry consults the guard: if the artifact has been
-/// superseded (its creation epoch is older than the method's live epoch), the
-/// baked speculation is stale, so it stashes a sentinel "re-run" frame
-/// (out-of-range bci ⇒ the VM resume path rejects it and re-runs the method)
-/// **without touching `point` at all** — the before-deref check the
-/// `CRATONVM_JIT_FREE_CODE=1` mode needs (where the box may have been freed).
-/// `epoch_guard` is null on every production artifact (the VM stamps it only
-/// under `deopt_real_enabled()`), so the check is inert there.
+/// stable, retained [`DeoptEpochGuard`] baked alongside the box. It is accepted
+/// and ignored: the before-deref short-circuit it fed existed only for the
+/// deleted `CRATONVM_JIT_FREE_CODE=1` mode (see the body). `epoch_guard` is null
+/// on every production artifact anyway (the VM stamps it only under
+/// `deopt_real_enabled()`).
 ///
 /// # Safety
 /// `point` and `regs` must be non-null and valid for the trapping frame, and
@@ -2326,49 +2313,19 @@ pub extern "C" fn x64_deopt_entry(
     regs: *const SavedRegisters,
     epoch_guard: *const DeoptEpochGuard,
 ) -> i64 {
-    // Before-deref staleness short-circuit — ONLY when `CRATONVM_JIT_FREE_CODE`
-    // is set (the A/B mode that actually frees artifacts and their deopt-point
-    // boxes on eviction). In the default retain-everything mode the box is
-    // leaked for the process lifetime (see `CompiledMethod`'s Drop), and a
-    // superseded artifact's snapshot is still SELF-CONSISTENT with the machine
-    // state of the (retained, still-executing) code that trapped — the epochs
-    // version the SPECULATION, not the frame layout. Short-circuiting here for
-    // retained code stashed an identity-less `bci == u32::MAX` sentinel that
-    // forced every post-supersession trap onto the imprecise whole-method
-    // re-run — re-introducing the side-effect duplication for exactly the
-    // methods that keep getting dispatched via stale cached entries after
-    // their first de-speculation (jit-invokedynamic-groovy-regression fix).
-    if !epoch_guard.is_null() && jit_free_code_enabled() {
-        // SAFETY: a non-null `epoch_guard` is a retained `DeoptEpochGuard`
-        // (process-lifetime, see `CompiledMethod`'s Drop) — valid to read.
-        let guard = unsafe { &*epoch_guard };
-        if guard.is_superseded() {
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
-                eprintln!(
-                    "[cratonvm-deopt] x64 frame-deopt SUPERSEDED (creation_epoch={} < live) — \
-                     skipping reconstruction, routing to safe re-run",
-                    guard
-                        .creation_epoch
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
-            }
-            // Stash a sentinel so the VM treats this as deopt-and-re-run
-            // (take_last_deopt is Some), never as a real i64::MIN return. The
-            // out-of-range bci makes the resume path fail → safe whole-method
-            // re-run. No `point` deref.
-            LAST_DEOPT.with(|c| {
-                *c.borrow_mut() = Some(ReconstructedFrame {
-                    method_key: String::new(),
-                    bci: u32::MAX,
-                    locals: Vec::new(),
-                    stack: Vec::new(),
-                    monitors: Vec::new(),
-                    caller_frames: Vec::new(),
-                })
-            });
-            return i64::MIN;
-        }
-    }
+    // No staleness short-circuit, even for a superseded guard. The trapping
+    // frame is executing its artifact, and an executing artifact owns its deopt
+    // boxes until it returns (the retirement queue reclaims a body only once no
+    // thread can be inside it). So the box is valid, and a superseded
+    // artifact's snapshot is still SELF-CONSISTENT with the machine state of the
+    // code that trapped: the epochs version the SPECULATION, not the frame
+    // layout. A short-circuit here stashed an identity-less `bci == u32::MAX`
+    // sentinel that forced every post-supersession trap onto the imprecise
+    // whole-method re-run, duplicating side effects
+    // (jit-invokedynamic-groovy-regression fix). It survived only under a
+    // `CRATONVM_JIT_FREE_CODE=1` mode that freed boxes under running frames, and
+    // was deleted with that mode. `epoch_guard` stays in the stub ABI.
+    let _ = epoch_guard;
     if point.is_null() || regs.is_null() {
         return i64::MIN;
     }
@@ -2451,18 +2408,14 @@ mod x64_deopt_entry_tests {
     }
 
     /// deopt-osr Step 9 follow-up (a), REVISED by the
-    /// jit-invokedynamic-groovy-regression identity fix: in the default
-    /// retain-everything mode (`CRATONVM_JIT_FREE_CODE` unset — which unit
-    /// tests must assume, since mutating a process-global env var races
-    /// parallel tests) a SUPERSEDED guard NO LONGER short-circuits — the
-    /// artifact's code and deopt boxes are leaked for the process lifetime,
-    /// so the box is valid and its snapshot is self-consistent with the
-    /// (stale, still-executing) code that trapped. The entry must proceed to
-    /// a normal reconstruction; short-circuiting here stashed an
-    /// identity-less `bci == u32::MAX` sentinel that forced every
-    /// post-supersession trap onto the corrupting imprecise re-run. (The
-    /// before-deref short-circuit still exists under `CRATONVM_JIT_FREE_CODE`
-    /// — not unit-covered, by the env-race constraint above.)
+    /// jit-invokedynamic-groovy-regression identity fix: a SUPERSEDED guard
+    /// does not short-circuit. The trapping frame owns its artifact, so the
+    /// box is valid and its snapshot is self-consistent with the (stale,
+    /// still-executing) code that trapped. The entry must proceed to a normal
+    /// reconstruction; short-circuiting here stashed an identity-less
+    /// `bci == u32::MAX` sentinel that forced every post-supersession trap
+    /// onto the corrupting imprecise re-run. (The short-circuit survived under
+    /// a `CRATONVM_JIT_FREE_CODE=1` mode, since deleted.)
     #[test]
     fn superseded_guard_still_reconstructs_in_retain_mode() {
         use std::sync::atomic::{AtomicU64, Ordering};

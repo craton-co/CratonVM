@@ -2535,9 +2535,9 @@ const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
 ///    `HASHMAP_PUT_DIRECT_INFO`, `HASHMAP_GET_DIRECT_INFO`,
 ///    `CONCURRENT_HASHMAP_GET_DIRECT_INFO`, `STRING_LATIN1_LOWER_DIRECT_INFO`),
 ///    which is literally the SAME address in every VM in the process;
-///  * every other info lives in `JitCache::invoke_info_arena`, a per-VM arena
-///    freed when that VM's `JitCache` drops, so a later VM's arena can hand
-///    out the same address.
+///  * every other info is owned by the `CompiledMethod` that bakes it
+///    (`_jit_invoke_infos`) and freed with that artifact, so a later
+///    compilation — in this VM or another — can be handed the same address.
 ///
 /// What these memos hold is per-VM to the word: raw compiled entry pointers
 /// into one VM's code cache, receiver `ClassId`s, `NativeMethodId` census

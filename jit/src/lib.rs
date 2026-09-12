@@ -1042,12 +1042,6 @@ impl ExecutableBuffer {
     }
 }
 
-/// Legacy diagnostic retained for API compatibility. Executable mappings are
-/// now reclaimed with their last owning `Arc<CompiledMethod>`, so this remains
-/// zero in the ownership-tracked implementation.
-pub static RETAINED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 // ---------------------------------------------------------------------------
 // JIT code-cache cap (bounded growth)
 // ---------------------------------------------------------------------------
@@ -3376,9 +3370,11 @@ pub struct CompiledMethod {
     /// real-frame-deopt: boxed deopt points whose addresses are baked as
     /// imm64 into the guard/deopt-trampoline machine code. JIT code holds raw
     /// pointers into these boxes, so — like `_jit_invoke_infos` — they must
-    /// outlive the (retained) code; `Drop` leaks them alongside the other
-    /// code-referenced metadata. Stable heap addresses (`Box`) are required:
-    /// the `deopt_points` Vec above can realloc, these boxes never move.
+    /// live exactly as long as the code, and they do: they are dropped with
+    /// this artifact, which the retirement queue (`defer_jit_owner`) frees only
+    /// once no thread can still be executing it. Stable heap addresses (`Box`)
+    /// are required: the `deopt_points` Vec above can realloc, these boxes
+    /// never move.
     pub _deopt_point_boxes: Vec<Box<deopt::DeoptimizationPoint>>,
     /// NEW-12: precise oop maps indexed by native PC offset.
     ///
@@ -3396,10 +3392,11 @@ pub struct CompiledMethod {
     ///
     /// An empty `oop_maps` vector means "no precise coverage" and
     /// the root walker falls back to the conservative stack scan.
-    /// This is the current default for every compiled method because
-    /// the JIT compiler does not yet populate oop maps from its
-    /// simulated-stack type tracker; see the NEW-12 section of
-    /// `docs/roadmap.md` for the migration plan.
+    /// Both x64 compile paths populate it at GC-capable safepoints (the
+    /// single-pass `x64/safepoint.rs` and `ir_lower.rs`, installed by
+    /// `x64/driver.rs` and the IR finalize), as does the AArch64 backend; a
+    /// body is empty only when it has no such safepoint or its maps were
+    /// incomplete.
     pub oop_maps: Vec<OopMapEntry>,
     /// RBC.2 — `true` when this artifact was produced by the OSR compile
     /// path (which eagerly compiles invokestatic callees and wires direct
@@ -3558,9 +3555,11 @@ pub struct CompiledMethod {
     /// when a frame-deopt stub is emitted, which requires `deopt_real_enabled()`).
     /// The VM stamps it (creation epoch + stable live-epoch cell) at install via
     /// [`Self::stamp_deopt_epoch_guard`]; `x64_deopt_entry` then reads it BEFORE
-    /// dereferencing the box, so a superseded compilation never follows a stale
-    /// (possibly-freed, under `CRATONVM_JIT_FREE_CODE=1`) box. The pointed-to
-    /// guard is leaked (process-lifetime), so this raw pointer is always valid.
+    /// dereferencing the box. (The before-deref short-circuit that used this
+    /// belonged to a `CRATONVM_JIT_FREE_CODE=1` mode that freed boxes under a
+    /// running frame. That mode is gone: an executing artifact owns its boxes
+    /// until it returns.) The pointed-to guard is leaked (process-lifetime), so
+    /// this raw pointer is always valid.
     pub deopt_epoch_guard: *const crate::deopt::DeoptEpochGuard,
     /// This body is an `ACC_SYNCHRONIZED` method's, so entering it is only
     /// legal through a caller that supplies the implicit monitor.
@@ -16161,54 +16160,14 @@ fn compute_jit_key_hash(
 /// while eliminating the three `Arc<str>` clones the prior keyed-map
 /// implementation required on every lookup (PERF-P2).
 ///
-/// TODO(round-11, HIGH from round-7/9 cross-cutting): lock-free / sharded
-/// `JitCache` for the hot interpreter dispatch path.
-///
-/// Today the cache is wrapped in `parking_lot::RwLock<JitCache>` at the
-/// VM level (see `vm/src/vm/vm_init.rs::jit_cache`). Every JIT-dispatch
-/// site (~6 read sites across `interpreter.rs` + `helpers.rs`) acquires
-/// `.read()` to look up a compiled method by `(class, method, descriptor)`
-/// — fully serialised against the redefinition path that takes `.write()`.
-///
-/// Two viable migrations were considered for this round:
-///
-///   (A) **`arc-swap` snapshot**: store the methods map as
-///       `ArcSwap<FxHashMap<u64, (JitKey, Arc<CompiledMethod>)>>`; reads
-///       do `arc.load()` + lookup (fully lock-free, no shared dirty
-///       cacheline ping); writes clone the whole map, mutate, and
-///       `arc.store(new)`. Reads scale linearly; writes go O(N) in
-///       cache size but are rare (redefinition + class invalidation).
-///
-///   (B) **16-shard `RwLock`** like `ProfileStore` (round-11 HIGH-1):
-///       partition by `compute_jit_key_hash(...) & 15`. Contention
-///       drops by ~16× under multi-thread JIT warmup but readers still
-///       pay an uncontended rwlock acquire per dispatch.
-///
-/// **Why this is deferred:** the cache also owns two `Pin<Box<...>>`
-/// arenas (`string_arena`, `invoke_info_arena`) that hand out raw
-/// pointers to JIT-emitted code (`intern_string`, `intern_invoke_info`).
-/// Those pointers MUST stay valid for the lifetime of every cached
-/// `CompiledMethod` that holds them — arc-swap's "clone the map on
-/// write" model would either (1) keep the arenas in a separate
-/// non-swappable container (extra indirection on every intern), or
-/// (2) accumulate per-snapshot arenas that can only be reclaimed once
-/// the entire prior `Arc<FxHashMap>` is dropped (real cycles possible
-/// because `CompiledMethod` stores raw `*const u8` into the arena).
-/// Sharding the cache map across 16 shards also fragments the arenas:
-/// either each shard owns its own arena (16× the VirtualAlloc
-/// granularity tax — already a known issue, see the TODO below) or all
-/// shards share a global `Mutex<Arenas>` which re-introduces the
-/// bottleneck the sharding was supposed to remove.
-///
-/// **Plan for round-12:** combine this with the per-VM code-arena
-/// rework (the existing TODO below). Once `ExecutableBuffer` is
-/// arena-backed, the per-method intern arenas can be split off into a
-/// single `parking_lot::Mutex<JitArenas>` (cold-path only — intern is
-/// invoked at compile time, not at dispatch) and the dispatch-hot
-/// methods map can switch to either `ArcSwap` (preferred for read
-/// scalability) or 16-shard `RwLock` (preferred for write latency).
-/// Both depend on `CompiledMethod` no longer transitively pinning
-/// arena slots through raw pointers.
+/// Lookups are lock-free: the methods map is split into `JIT_CACHE_SHARDS`
+/// `ArcSwap` snapshots, and a publication copies only its own shard (see
+/// `docs/architecture/jit-cache-sharding-and-code-reclamation.md`). The
+/// per-cache `string_arena`/`invoke_info_arena` that once blocked this, and
+/// their `intern_string`/`intern_invoke_info` accessors, had no callers and
+/// were deleted: every by-pointer string or invoke record a body bakes is owned
+/// by that `CompiledMethod` (`_jit_strings`, `_jit_invoke_infos`), or leaked
+/// deliberately by an intern table whose key is the pointer.
 ///
 /// TODO(round-8, HIGH from round-7 jit #6): no pooling / LRU / coalescing
 /// of `ExecutableBuffer`s.  On Windows each compiled method calls
@@ -16298,8 +16257,6 @@ impl JitCacheShard {
 pub struct JitCache {
     shards: Box<[JitCacheShard]>,
     mutation: parking_lot::Mutex<()>,
-    string_arena: parking_lot::Mutex<Vec<Pin<Box<str>>>>,
-    invoke_info_arena: parking_lot::Mutex<Vec<Pin<Box<JitInvokeInfo>>>>,
     /// Highest [`JIT_INSTALL_EPOCH`] value this cache has been flushed at.
     ///
     /// An artifact whose [`CompiledMethod::install_epoch`] is below this began
@@ -17784,8 +17741,6 @@ impl JitCache {
         Self {
             shards,
             mutation: parking_lot::Mutex::new(()),
-            string_arena: parking_lot::Mutex::new(Vec::new()),
-            invoke_info_arena: parking_lot::Mutex::new(Vec::new()),
             // Never flushed: every artifact is at or above epoch 1.
             flush_barrier: std::sync::atomic::AtomicU64::new(0),
             inlined_class_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -17830,21 +17785,6 @@ impl JitCache {
     #[inline]
     fn shard_index(hash: u64) -> usize {
         (hash as usize) & (JIT_CACHE_SHARDS - 1)
-    }
-
-    pub fn intern_string(&self, s: String) -> (*const u8, usize) {
-        let boxed: Pin<Box<str>> = Pin::new(s.into_boxed_str());
-        let ptr = boxed.as_ptr();
-        let len = boxed.len();
-        self.string_arena.lock().push(boxed);
-        (ptr, len)
-    }
-
-    pub fn intern_invoke_info(&self, info: JitInvokeInfo) -> *const JitInvokeInfo {
-        let boxed = Pin::new(Box::new(info));
-        let ptr: *const JitInvokeInfo = &*boxed;
-        self.invoke_info_arena.lock().push(boxed);
-        ptr
     }
 
     /// Look up a compiled method by (class, method, descriptor).
@@ -40685,16 +40625,6 @@ mod tests {
         assert!(cache
             .get(&class, &method, &desc, cratonvm_types::ClassId::new(1))
             .is_none());
-    }
-
-    #[test]
-    fn test_jit_cache_intern_string() {
-        let mut cache = JitCache::new();
-        let (ptr, len) = cache.intern_string("hello".to_string());
-        assert!(!ptr.is_null());
-        assert_eq!(len, 5);
-        let s = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) };
-        assert_eq!(s, "hello");
     }
 
     /// A type-check site's `(ptr, len)` pair is the KEY of two thread-local
