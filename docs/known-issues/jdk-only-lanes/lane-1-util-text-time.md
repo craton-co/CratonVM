@@ -1201,6 +1201,30 @@ own `size` field, which both stores write — `tm_set_slot` mirrors it by name,
 and real bytecode maintains it. Where they agree, which is every map this
 crate's natives manage, the side table answers exactly as it always did.
 
+**Accepted twice, because `dev` moved 35 commits mid-wave** — and one of them
+was a sibling lane's fix to `TreeMap`'s declared reference fields, in the same
+function family. Both sittings are two binaries built from one tree, and the
+second is the landing one:
+
+```text
+                     f99c2e748          0a805f3fc (landing)
+  --jdk-only    0 worse / 2 better   0 worse / 1 better
+  DEFAULT       0 worse / 1 better   2 worse / 1 better
+  SUITE=all       136 / 136 both     trial 136/136, control 135/136
+  SUITE=core       95 /  95 both     95 / 95 both
+  control arm   0 worse / 0 better
+  stub ratchet  +156 x 3 arms        +156 x 3 arms (re-measured, not added)
+```
+
+The landing sitting's two "worse" rows are `ChmShadowSweep` (+12) and
+`ConcurrentStressSweep` (+2), and neither is this wave's. 20 INTERLEAVED pairs
+of `ChmShadowSweep` in default mode: **control 5/20 non-zero, trial 3/20**. The
+probe loses one of 800 concurrent `ConcurrentHashMap` writes about a fifth of
+the time on either binary; the battery's single sample caught the control
+clean. The control's own `SUITE=all` dropped `RMapGcStress` the same way while
+the trial passed 136/136. This is §11's control-arm rule paying for itself a
+second time in two waves.
+
 **156 triples**, every `owns_slot && kind == "bridge"` row under the two
 prefixes that is bucket A or B **on all three supported images**, censused
 separately rather than assumed from JDK 25. Seven rows are refused by all three

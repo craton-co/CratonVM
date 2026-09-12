@@ -8636,6 +8636,30 @@ static RETIRED_SHADOW_L1_HT_TRIPLES: &[(&str, &str, &str)] = &[
 /// The nine probes the battery skips for want of `--add-exports` were run by
 /// hand against both binaries: all five that compile read base 0 / trial 0.
 ///
+///
+/// # Re-taken on the landing tree
+///
+/// `origin/dev` moved 35 commits mid-wave, and one of them was a sibling
+/// lane's fix to `TreeMap`'s declared reference fields (`cached_tm_view`, the
+/// same function family). So the whole set was re-run against a control built
+/// from `0a805f3fc` itself:
+///
+/// ```text
+///   --jdk-only     164 probes   0 worse   1 better (NullArgMsgProbe -2)
+///   DEFAULT        164 probes   2 worse   1 better  <- both "worse" are flakes
+///   regression-suite SUITE=all   trial 136 / 136, control 135 / 136
+///   regression-suite SUITE=core   95 /  95 on both
+/// ```
+///
+/// The two default-mode rows are `ChmShadowSweep` (+12) and
+/// `ConcurrentStressSweep` (+2), and they are the same `ConcurrentHashMap`
+/// race the strict corpus prints as `T19_H6_CAS_DIAG`. Measured rather than
+/// asserted: 20 INTERLEAVED pairs of `ChmShadowSweep` in default mode give
+/// **control 5/20 non-zero, trial 3/20** — the probe loses one of 800
+/// concurrent writes about a fifth of the time on either binary, and the
+/// battery's single sample happened to catch the control clean. The control's
+/// own `SUITE=all` lost `RMapGcStress` in the same way while the trial passed
+/// 136/136.
 /// # Scope
 ///
 /// 156 rows: every `owns_slot && kind == "bridge"` registration under the two
@@ -14588,13 +14612,21 @@ Ljava/nio/channels/FileChannel;"
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             ),
             ("java/util/TreeSet", "add", "(Ljava/lang/Object;)Z"),
-            ("java/util/TreeMap$KeySet", "toArray", "()[Ljava/lang/Object;"),
+            (
+                "java/util/TreeMap$KeySet",
+                "toArray",
+                "()[Ljava/lang/Object;",
+            ),
             (
                 "java/util/TreeMap$EntrySet",
                 "toArray",
                 "()[Ljava/lang/Object;",
             ),
-            ("java/util/TreeMap$Values", "toArray", "()[Ljava/lang/Object;"),
+            (
+                "java/util/TreeMap$Values",
+                "toArray",
+                "()[Ljava/lang/Object;",
+            ),
         ] {
             assert!(
                 triple_is_retired_shadow(c, m, d),
