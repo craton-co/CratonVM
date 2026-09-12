@@ -1906,10 +1906,13 @@ is the measurement §11.4 was missing, and it converts the remaining item from
 > contract change, not a defect fix.
 
 Nobody should take that on as a retirement wave, and §9b.6 already says why the
-98 keep-listed rows cannot be expressed in a table at all. If it is taken, it is
-taken as a design change to the pool's completion model, with §3a's
-`L5FjDouble` and §9g's `L5FjStatus` as the instruments — both now exist and both
-have a recorded baseline.
+98 keep-listed rows cannot be expressed in a table at all. So it moves off this
+page too, next to §11.5's:
+[`docs/known-issues/jdk-only/forkjoin-completion-has-no-claim-20260912.md`](../../known-issues/jdk-only/forkjoin-completion-has-no-claim-20260912.md).
+If it is taken, it is taken as a design change to the pool's completion model,
+with §3a's `L5FjDouble` and §9g's `L5FjStatus` as the instruments — both exist
+and both have a recorded baseline, so the experiment is a re-run rather than a
+build-out.
 
 ### 11.5 `ScheduledThreadPoolExecutor` — moved to its own page
 
