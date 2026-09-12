@@ -667,6 +667,12 @@ struct Compiler {
     /// must be entered through the dispatch-aware path — same requirement,
     /// and the same reason, as `emitted_checkcast_throw`.
     emitted_aastore_throw: bool,
+    /// `jit_instanceof` resolves its target class on demand and pins the
+    /// receiver through `jit_thread_mut()` while it does; without a JIT thread
+    /// the pin is skipped and a moving collection during the class load leaves
+    /// the receiver stale. Forces the dispatch-aware entry like the two flags
+    /// above.
+    emitted_instanceof_call: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -2928,6 +2934,7 @@ impl Compiler {
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
             emitted_aastore_throw: false,
+            emitted_instanceof_call: false,
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),

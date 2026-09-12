@@ -11557,6 +11557,68 @@ pub(super) fn jit_saved_args_to_values(
     out
 }
 
+/// Roots the reference arguments `execute_jit_call` popped off the caller's
+/// operand stack, for the whole native activation.
+///
+/// Once popped they are no longer interpreter roots, yet the saved copies are
+/// used AFTER the compiled call returns: re-pushed for a whole-method re-run,
+/// and decoded into handler locals after an exception object was allocated.
+/// The call itself can collect, so a moving young collection handed those
+/// paths pre-move addresses. Each reference is pushed into `native_pin_roots`
+/// as it is popped (its index in `arg_pins`, `usize::MAX` for a
+/// non-reference) and re-read through [`pinned_saved_arg`]; this guard
+/// releases the window on every return path. It is declared before
+/// `JitSynchronizedMonitorGuard`, whose pin sits above this window, so that
+/// guard drops first.
+pub(super) struct JitArgPinGuard {
+    pub(super) thread: *mut JvmThread,
+    pub(super) base: usize,
+}
+
+impl Drop for JitArgPinGuard {
+    fn drop(&mut self) {
+        // SAFETY: `thread` came from the exclusive `&mut JvmThread` of the
+        // enclosing activation, which outlives this guard — the same aliasing
+        // discipline `JitSynchronizedMonitorGuard` relies on.
+        let thread = unsafe { &mut *self.thread };
+        if thread.native_pin_roots.len() > self.base {
+            thread.native_pin_roots.truncate(self.base);
+        }
+    }
+}
+
+/// Saved argument `i`, with a pinned reference re-read at its current
+/// (possibly relocated) address. See [`JitArgPinGuard`].
+pub(super) fn pinned_saved_arg(
+    thread: &JvmThread,
+    saved_args: &[(CompactValue, u8)],
+    arg_pins: &[usize],
+    i: usize,
+) -> (CompactValue, u8) {
+    let (cv, kind) = saved_args[i];
+    match arg_pins.get(i).and_then(|&pin| thread.native_pin_roots.get(pin)) {
+        // Cast: heap address to the compact reference encoding.
+        Some(obj) => (CompactValue::object(obj.as_ptr() as usize as u64), kind),
+        None => (cv, kind),
+    }
+}
+
+/// [`jit_saved_args_to_values`] over the saved arguments with every pinned
+/// reference re-read first.
+pub(super) fn jit_saved_args_to_values_pinned(
+    cached: &CachedBytecodeMethod,
+    saved_args: &[(CompactValue, u8)],
+    np: usize,
+    thread: &JvmThread,
+    arg_pins: &[usize],
+) -> Vec<Value> {
+    let mut current = saved_args.to_vec();
+    for (i, slot) in current.iter_mut().enumerate().take(np) {
+        *slot = pinned_saved_arg(thread, saved_args, arg_pins, i);
+    }
+    jit_saved_args_to_values(cached, &current, np)
+}
+
 /// Owns the implicit monitor of a JIT-entered `ACC_SYNCHRONIZED` method.
 ///
 /// Compiled code has no interpreter frame on which to keep `monitor_on_exit`,
@@ -11729,6 +11791,10 @@ pub(super) fn execute_jit_call(
         [(CompactValue::zero(), 0u8); JIT_ABI_MAX_JAVA_ARGS];
     // ONE forward scan, hoisted out of this per-argument loop.
     let param_tags = ParamTags::for_method(&cached);
+    // Reference arguments are rooted as they leave the operand stack; see
+    // `JitArgPinGuard`, armed immediately after this loop.
+    let args_pin_base = thread.native_pin_roots.len();
+    let mut arg_pins = [usize::MAX; JIT_ABI_MAX_JAVA_ARGS];
     for i in (0..np).rev() {
         let (cv, kind) = thread.frames[frame_idx].stack.pop_with_kind_unchecked();
         saved_args[i] = (cv, kind);
@@ -11738,6 +11804,10 @@ pub(super) fn execute_jit_call(
             param_tags.get_with_receiver(&cached.method_descriptor, i)
         };
         let v = decode_arg_kind_aware(cv, kind, desc_byte);
+        if let Value::Object(Some(obj)) = &v {
+            arg_pins[i] = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(*obj);
+        }
         jit_args[i] = match v {
             // Widening: i32 -> i64 (sign-extended, JVM i2l)
             Value::Int(x) => x as i64,
@@ -11753,6 +11823,10 @@ pub(super) fn execute_jit_call(
         };
     }
 
+    let _arg_pin_guard = JitArgPinGuard {
+        thread: thread as *mut JvmThread,
+        base: args_pin_base,
+    };
     let mut synchronized_args = cached
         .is_synchronized
         .then(|| jit_saved_args_to_values(cached, &saved_args, np));
@@ -11883,10 +11957,10 @@ pub(super) fn execute_jit_call(
             // `i64::MIN`-collision fix) so it cannot leak to the next JIT
             // call. The dispatch helper that stashed this exception also set
             // the deopt flag before returning `i64::MIN`.
-            let exc_locals = synchronized_args.as_deref().map_or_else(
-                || jit_saved_args_to_values(cached, &saved_args, np),
-                |args| args.to_vec(),
-            );
+            // Decoded through the argument pins: the compiled call, and the
+            // exception allocation, may have moved a reference argument.
+            let exc_locals =
+                jit_saved_args_to_values_pinned(cached, &saved_args, np, thread, &arg_pins);
             let throw_pc = jit_local_athrow_pc_kind(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared,
@@ -11985,10 +12059,9 @@ pub(super) fn execute_jit_call(
                     exc,
                     npe_snapshot,
                 );
-                let exc_locals = synchronized_args.as_deref().map_or_else(
-                    || jit_saved_args_to_values(cached, &saved_args, np),
-                    |args| args.to_vec(),
-                );
+                // Through the argument pins; see the signal-exception arm.
+                let exc_locals =
+                    jit_saved_args_to_values_pinned(cached, &saved_args, np, thread, &arg_pins);
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -12047,10 +12120,9 @@ pub(super) fn execute_jit_call(
                     exc,
                     trap_snapshot,
                 );
-                let exc_locals = synchronized_args.as_deref().map_or_else(
-                    || jit_saved_args_to_values(cached, &saved_args, np),
-                    |args| args.to_vec(),
-                );
+                // Through the argument pins; see the signal-exception arm.
+                let exc_locals =
+                    jit_saved_args_to_values_pinned(cached, &saved_args, np, thread, &arg_pins);
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -12104,10 +12176,9 @@ pub(super) fn execute_jit_call(
                     exc,
                     trap_snapshot,
                 );
-                let exc_locals = synchronized_args.as_deref().map_or_else(
-                    || jit_saved_args_to_values(cached, &saved_args, np),
-                    |args| args.to_vec(),
-                );
+                // Through the argument pins; see the signal-exception arm.
+                let exc_locals =
+                    jit_saved_args_to_values_pinned(cached, &saved_args, np, thread, &arg_pins);
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -12183,7 +12254,8 @@ pub(super) fn execute_jit_call(
                 // re-pushed as `KIND_UNKNOWN` would be re-read by its NaN-box
                 // sub-tag on the slow path, which is how a double carrying a
                 // NaN payload lost it across a deopt.
-                let (cv, kind) = saved_args[i];
+                // Through the argument pins: a reference may have moved.
+                let (cv, kind) = pinned_saved_arg(thread, &saved_args, &arg_pins, i);
                 thread.frames[frame_idx]
                     .stack
                     .push_with_kind_unchecked(cv, kind);
@@ -12254,7 +12326,8 @@ pub(super) fn execute_jit_call(
         // underflow (len 0 → usize::MAX index).
         for i in 0..np {
             // See the sibling restore above: bits AND mark.
-            let (cv, kind) = saved_args[i];
+            // Through the argument pins: a reference may have moved.
+            let (cv, kind) = pinned_saved_arg(thread, &saved_args, &arg_pins, i);
             thread.frames[frame_idx]
                 .stack
                 .push_with_kind_unchecked(cv, kind);

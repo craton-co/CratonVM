@@ -27311,7 +27311,14 @@ fn try_compile_inner(
                     // Publish the verdict for the VM's compile-task path,
                     // which is the only caller that can act on it. See
                     // `ir_evidence::take_last_verdict`.
-                    let accepted = selfrec_no_predecessor || ir_evidence::accept(evidence);
+                    // Only a body that LOWERED can be accepted. A refusal inside
+                    // `lower_inner` (a verifier or balance check, buffer
+                    // exhaustion) used to publish `accepted` from the evidence
+                    // alone, so the VM went ahead with the supersede: the
+                    // single-pass fall-through replaced an equal C1 body and
+                    // bumped the process-wide supersede epoch for nothing.
+                    let accepted = lowered.is_some()
+                        && (selfrec_no_predecessor || ir_evidence::accept(evidence));
                     ir_evidence::publish_verdict(accepted);
                     let lowered = match lowered {
                         Some(cm) if !accepted => {

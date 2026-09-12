@@ -1133,11 +1133,23 @@ impl Compiler {
         self.buf.emit(&i64::MIN.to_le_bytes());
         // CMP RAX, R11  — REX.WR + 39 /r + ModRM(11, R11, RAX).
         self.buf.emit(&[0x4C, 0x39, 0xD8]);
-        // JNE rel8 → skip the servicing call. Patched once the body length is
-        // known; the body is a fixed short sequence well inside rel8 range.
-        self.buf.emit(&[0x75, 0x00]);
-        let jne_patch = self.buf.pos() - 1;
-        let body_start = self.buf.pos();
+        // JNE rel32 → skip the servicing call.
+        let skip_patch = self.emit_jcc_rel32_patch(0x85);
+
+        // The servicing helper resumes the trapped callee's frame in the
+        // interpreter — Java code, so a collection can run inside it. This
+        // point sits AFTER the call site's own map was published and its shadow
+        // push reloaded, so the safepoint-id slot still names that CALL's map,
+        // which may claim complete moving-young coverage for registers that are
+        // no longer published anywhere. Clear the id to the "no map" sentinel
+        // so a collection here finds no map for this frame and fails closed
+        // instead of trusting a stale one. R11 held the compared sentinel and
+        // is otherwise free; no argument register is touched.
+        if self.precise_maps && self.sp_id_slot_off != 0 {
+            // Cast: the sentinel is `u32::MAX - 1`; see the prologue's store.
+            self.emit_mov_imm32_sx(R11, crate::x64::safepoint::SP_ID_UNSET_BC_PC as u32 as i32);
+            self.emit_store_local(self.sp_id_slot_off, R11);
+        }
 
         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
         // Cast: function pointer for JIT call target
@@ -1153,18 +1165,7 @@ impl Compiler {
         self.emit_mov_imm32_sx(ARG_REGS[3], n as i32);
         self.emit_call_absolute(helper);
 
-        // Widening: usize offset -> i64 (no truncation; for rel/displacement math)
-        let rel = (self.buf.pos() as i64) - (body_start as i64);
-        debug_assert!(
-            (0..=i64::from(i8::MAX)).contains(&rel),
-            "inline callee-deopt check body overflowed rel8 ({rel} bytes)"
-        );
-        // `u8::try_from` was the wrong range: it accepts 128..=255, which the
-        // CPU reads as a NEGATIVE rel8 — a backward branch into the body this
-        // jump exists to skip, i.e. the same shape as the PIC cascade's
-        // `JNE -128`. `patch_rel8_or_bail` range-checks against `i8` and marks
-        // the buffer (compile discarded) when it does not fit.
-        Self::patch_rel8_or_bail(&mut self.buf, jne_patch, rel);
+        self.patch_rel32_to_here(skip_patch);
     }
 
     /// Emit out-of-line bounds check failure stubs at the end of the method.
@@ -2247,6 +2248,12 @@ impl Compiler {
                 self.emit_epilogue();
             } else {
                 // Set up args for jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64)
+                //
+                // `reason` carries this artifact's compile id in its high half
+                // (0 when none was reserved). A compiled method pushes no
+                // interpreter frame, so without it the helper could only name
+                // the interpreted CALLER as the method that trapped.
+                let trap_reason_word = (reason as u64) | (u64::from(self.compile_id) << 32); // Cast: reason code is a small non-negative value
                 // vm_ptr is in the heap_local (frame slot) — load it first
                 #[cfg(target_os = "windows")]
                 {
@@ -2265,7 +2272,7 @@ impl Compiler {
                     // MOV RDX, reason (immediate)
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RDX as u8); // MOV r64, imm64 // Cast: x86-64 register encoding
-                    self.buf.emit(&(reason as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+                    self.buf.emit(&trap_reason_word.to_le_bytes()); // reason | compile id << 32
                                                                    // MOV R8, bci (immediate)
                     self.buf.emit(&[0x49, 0xB8 + (R8 as u8 - 8)]); // REX.WB + MOV r64, imm64 // Cast: x86-64 register encoding
                     self.buf.emit(&(bci as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
@@ -2283,7 +2290,7 @@ impl Compiler {
                     // MOV RSI, reason (immediate)
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RSI as u8); // Cast: x86-64 register encoding
-                    self.buf.emit(&(reason as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+                    self.buf.emit(&trap_reason_word.to_le_bytes()); // reason | compile id << 32
                                                                    // MOV RDX, bci (immediate)
                     self.rex_w();
                     self.buf.emit_byte(0xB8 + RDX as u8); // Cast: x86-64 register encoding

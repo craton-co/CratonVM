@@ -44,6 +44,14 @@ impl Compiler {
         // leaving the scalar loop's own `i < n` test to run zero iterations.
         self.buf.emit(&[0x7D, 0x02]); // JGE +2
         self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX
+        // Neither the vector batches nor the scalar cleanup below poll for a
+        // safepoint, so bound the span exactly as the bulk-byte pre-headers
+        // do: past `MAX_BULK_BYTE_LOOP_SPAN` elements, skip the whole
+        // pre-header and let the original loop, which polls, do the work.
+        // Nothing Java-visible has changed yet at this point.
+        self.buf.emit_byte(0x3D); // CMP EAX, imm32
+        self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
+        let span_skip_patch = self.emit_jcc_rel32_patch(0x87); // JA .preheader_end
         self.buf.emit(&[0xC1, 0xE8, 0x03]); // SHR EAX, 3
         self.buf.emit(&[0x41, 0x89, 0xC0]); // MOV R8D, EAX — chunk count
         self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
@@ -208,6 +216,8 @@ impl Compiler {
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+        // .preheader_end: an over-long span falls through to the original loop.
+        self.patch_rel32_to_here(span_skip_patch);
     }
 
     /// Emit one checked matrix-dot element and advance R10D.
@@ -568,6 +578,10 @@ impl Compiler {
         // Signed clamp for an i >= n entry; see `emit_simd_int_array_sum`.
         self.buf.emit(&[0x7D, 0x03]); // JGE +3
         self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D, R8D
+        // Poll-free span cap; see `emit_simd_int_array_sum`.
+        self.buf.emit(&[0x41, 0x81, 0xF8]); // CMP R8D, imm32
+        self.buf.emit(&MAX_BULK_BYTE_LOOP_SPAN.to_le_bytes());
+        let span_skip_patch = self.emit_jcc_rel32_patch(0x87); // JA .preheader_end
         self.buf.emit(&[0x41, 0xC1, 0xE8, 0x03]); // SHR R8D, 3
         self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
                                             // JZ to scalar remainder (patch later)
@@ -736,6 +750,8 @@ impl Compiler {
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf.try_patch_i32(scalar_end_patch, end_rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+        // .preheader_end: an over-long span falls through to the original loop.
+        self.patch_rel32_to_here(span_skip_patch);
     }
 
     /// Emit a guarded `REP STOSB` preheader for a canonical zero-fill loop.

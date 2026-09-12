@@ -14366,6 +14366,7 @@ impl Compiler {
                                                                        // before any GC-triggering CALL.
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.instanceof_check);
+                    self.emitted_instanceof_call = true;
                     // T1.1.2 — instanceof may resolve the target class
                     // on demand, allocating a Class mirror. Emit the
                     // oop map even though the return value is a

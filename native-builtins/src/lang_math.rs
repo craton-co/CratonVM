@@ -3150,6 +3150,18 @@ fn integer_cache_high() -> &'static parking_lot::Mutex<std::collections::HashMap
     INTEGER_CACHE_HIGH.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// The `IntegerCache.high` this VM's `Integer.valueOf` resolved, or `None` if
+/// no `valueOf` has run in it yet (the bound is resolved lazily, from the
+/// system property, on the first call).
+///
+/// For the JIT's thin `Integer.valueOf` helper, which allocates a fresh box
+/// only for a value outside the cache and must therefore agree with this
+/// native on where the cache ends. A caller that gets `None` must take the
+/// native path, which resolves and records the bound.
+pub fn integer_cache_high_for(vm_identity: usize) -> Option<i32> {
+    integer_cache_high().lock().get(&vm_identity).copied()
+}
+
 /// `IntegerCache.high`'s value from a raw property string, or `None` to keep
 /// the default.
 ///

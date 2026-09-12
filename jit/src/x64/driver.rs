@@ -2584,6 +2584,9 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         || compiler.emitted_checkcast_throw
         // A refused `aastore` stashes an ArrayStoreException the same way.
         || compiler.emitted_aastore_throw
+        // `jit_instanceof` pins its receiver through the JIT thread while it
+        // loads the target class; the thread-less entry left it unpinned.
+        || compiler.emitted_instanceof_call
         // BUG-1 companion — a direct (non-dispatch) self-recursive CALL site:
         // its stack guard stashes a catchable StackOverflowError near native
         // exhaustion and returns the i64::MIN sentinel, so the method MUST be

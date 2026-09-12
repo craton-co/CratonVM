@@ -18895,7 +18895,16 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
     let value = value as i32;
-    if !(-128..=127).contains(&value) {
+    // Outside the box cache, where `valueOf` must return a FRESH object. The
+    // cache's upper end is `-Djava.lang.Integer.IntegerCache.high`, not 127:
+    // this helper used to allocate for everything past 127, so with `high=1000`
+    // `Integer.valueOf(500) == Integer.valueOf(500)` was true interpreted and
+    // false once the caller compiled. Until the native has resolved this VM's
+    // bound, every value above 127 takes the native path, which resolves it.
+    let beyond_cache = value < -128
+        || cratonvm_native_builtins::lang_math::integer_cache_high_for(vm.vm_identity)
+            .is_some_and(|high| value > high);
+    if beyond_cache {
         let vm_key = vm.vm_identity;
         let cached_class = INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
             cache
@@ -23845,12 +23854,33 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
         return DEOPT_ACTION_REINTERPRET;
     }
     let vm = &*(vm_ptr as *const SharedVm);
+    // The x64 stub packs the trapping artifact's compile id into the high half
+    // of `reason` (0 when it had none to pass).
+    let compile_id = ((reason as u64) >> 32) as u32; // Cast: the high half is the id
+    let reason = reason & 0xFFFF_FFFF;
     let deopt_reason = reason_code_to_deopt_reason(reason);
 
-    // Try to determine the method being executed from the JIT thread context.
-    // If we can't determine the method, we still record the deopt but with a
-    // generic key.
-    let (class_name, method_name, descriptor) = {
+    // The method that TRAPPED. `thread.frames.last()` is not it: a compiled
+    // method pushes no interpreter frame, so that frame is its interpreted
+    // CALLER, and the deopt count, the cache eviction and the bail-list verdict
+    // all landed on the caller while the trapping artifact stayed installed and
+    // trapped again on every call. Resolve the artifact by compile id; the old
+    // guess remains only for a stub that had no id to pass.
+    let trapping = (compile_id != 0)
+        .then(|| cratonvm_jit::lookup_compile_id(compile_id))
+        .flatten()
+        .and_then(|cm_ptr| {
+            // SAFETY: the id was published by the artifact whose code is
+            // executing this trap, so the artifact is live for this call.
+            let cm = &*(cm_ptr as *const cratonvm_jit::CompiledMethod);
+            split_method_label(&cm.method_label)
+        });
+
+    // Otherwise determine the method from the JIT thread context. If we can't,
+    // we still record the deopt but with a generic key.
+    let (class_name, method_name, descriptor) = if let Some(identity) = trapping {
+        identity
+    } else {
         // The thread's current frame has the method info
         let default = (
             "unknown".to_string(),
@@ -23887,6 +23917,19 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
         cratonvm_jit::deopt::DeoptAction::MakeNotEntrant => DEOPT_ACTION_RECOMPILE,
         cratonvm_jit::deopt::DeoptAction::MakeNotCompilable => DEOPT_ACTION_BLACKLIST,
     }
+}
+
+/// `(class, method, descriptor)` from a compiled artifact's `method_label`,
+/// which is `<class>.<method>:<descriptor>` or `<class>.<method><descriptor>`.
+fn split_method_label(label: &str) -> Option<(String, String, String)> {
+    let open = label.find('(')?;
+    let head = label[..open].trim_end_matches(':');
+    let dot = head.rfind('.')?;
+    Some((
+        head[..dot].to_string(),
+        head[dot + 1..].to_string(),
+        label[open..].to_string(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
