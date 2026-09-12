@@ -543,7 +543,7 @@ pub struct CachedBytecodeMethod {
     pub invoc_key: std::sync::OnceLock<u64>,
     /// T2.2 — epoch memo for "this method has no published JIT body".
     ///
-    /// Holds the value of `cratonvm_jit::jit_cache_generation()` as of the last
+    /// Holds the value of the owning VM's `JitCache::generation()` as of the last
     /// time an interpreter dispatch arm probed the shared JIT cache for this
     /// method and found *nothing*. `0` means "never probed" (the live generation
     /// starts at 1 and only ever increases, so `0` can never compare equal to
@@ -555,7 +555,7 @@ pub struct CachedBytecodeMethod {
     /// published a body for this method. That lookup hashes all three strings
     /// and then re-compares all three with full string equality — the exact
     /// re-resolution the per-call-site inline cache exists to avoid. Because
-    /// *every* JIT-cache publication and invalidation bumps the global
+    /// *every* JIT-cache publication and invalidation bumps that cache's
     /// generation, comparing this snapshot against it is an equivalent test:
     /// equal ⇒ the cache content has not changed since we last looked and found
     /// nothing, so looking again cannot find anything. Steady state therefore
@@ -777,8 +777,9 @@ impl CachedBytecodeMethod {
     /// T2.2 — has this method already been probed against the shared JIT cache
     /// at generation `current_generation` and found to have no compiled body?
     ///
-    /// `current_generation` must come from `cratonvm_jit::jit_cache_generation()`
-    /// (an `Acquire` load). A `true` answer means the caller may skip the
+    /// `current_generation` must come from the owning VM's
+    /// `JitCache::generation()` (an `Acquire` load). Per cache, so another VM's
+    /// compilations do not invalidate this VM's memo. A `true` answer means the caller may skip the
     /// string-keyed `JitCache::get` entirely.
     #[inline]
     pub fn jit_probe_is_current(&self, current_generation: u64) -> bool {
@@ -2337,7 +2338,7 @@ mod tests {
     fn jit_probe_generation_memo_reports_current_only_for_the_recorded_value() {
         let cached = make_cached_method();
         // A fresh entry has never probed: 0 can never equal a live generation
-        // (`JIT_CACHE_GENERATION` starts at 1 and only increases).
+        // (a cache generation starts at 1 and only increases).
         assert!(!cached.jit_probe_is_current(1));
         assert!(!cached.jit_probe_is_current(u64::MAX));
 

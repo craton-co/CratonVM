@@ -1406,7 +1406,7 @@ pub(crate) struct LambdaJitSite {
     /// The impl method, for the JIT-cache probe and the redefinition gate.
     cached: Arc<CachedBytecodeMethod>,
     gate: RedefineGate,
-    /// The compiled impl body, re-probed only when `jit_cache_generation()`
+    /// The compiled impl body, re-probed only when `JitCache::generation()`
     /// moves. `None` at the current generation means "not compiled yet" — the
     /// warmup counter in `try_invoke_cached_lambda_impl` is what eventually
     /// changes that, which is why that counter and this fast path are one
@@ -1774,12 +1774,12 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
 /// Epoch-guarded like every other JIT-cache probe in this VM: the string-keyed
 /// `JitCache::get` — a hash, an `ArcSwap` load and a `memcmp`, together 5.6% of
 /// a lambda-shape profile when it ran per invocation — is skipped entirely
-/// while this site's snapshot of `jit_cache_generation()` is still current.
+/// while this site's snapshot of `JitCache::generation()` is still current.
 pub(crate) fn lambda_jit_site_code(
     shared: &SharedVm,
     site: &LambdaJitSite,
 ) -> Option<cratonvm_jit::RetainedCode> {
-    let generation = cratonvm_jit::jit_cache_generation();
+    let generation = shared.jit.jit_cache.generation();
     if site.code_generation.get() != generation {
         let found = shared
             .jit
@@ -2303,7 +2303,7 @@ pub(crate) fn build_lambda_impl_cached(
 /// `invoke_or_native`, which knows how to enter compiled code.
 ///
 /// The probe is epoch-guarded exactly like its three twins: while this entry's
-/// snapshot of `jit_cache_generation()` is current, nothing has been published
+/// snapshot of `JitCache::generation()` is current, nothing has been published
 /// or invalidated since the last miss, so the string-keyed `JitCache::get` is
 /// skipped. The invocation is still COUNTED in that case, or the method could
 /// never reach the threshold that makes re-probing worthwhile.
@@ -2315,7 +2315,7 @@ pub(crate) fn bytecode_callee_compiled_or_nominate(
     if crate::runtime::env_cache::disable_jit() {
         return false;
     }
-    let jit_generation = cratonvm_jit::jit_cache_generation();
+    let jit_generation = shared.jit.jit_cache.generation();
     if !cached.jit_probe_is_current(jit_generation) {
         let found = shared.jit.jit_cache.read().get(
             &cached.class_name,
@@ -2467,11 +2467,11 @@ pub(super) fn try_invoke_cached_lambda_impl(
         lambda_jit::bump(&lambda_jit::ELIGIBLE);
         // Epoch-guarded exactly like the twins: skip the string-keyed
         // `JitCache::get` while this entry's snapshot of
-        // `jit_cache_generation()` is still current, because no publication or
+        // `JitCache::generation()` is still current, because no publication or
         // invalidation has happened since the probe that missed. Read the
         // generation BEFORE probing so a racing publication can only cause a
         // redundant re-probe, never a missed one.
-        let jit_generation = cratonvm_jit::jit_cache_generation();
+        let jit_generation = shared.jit.jit_cache.generation();
         let compiled = if cached.jit_probe_is_current(jit_generation) {
             None
         } else {

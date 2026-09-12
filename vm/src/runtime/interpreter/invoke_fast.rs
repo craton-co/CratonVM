@@ -426,7 +426,7 @@ pub(super) fn note_invocation_for_tierup(
 /// checks, which is the general dispatcher's job.
 #[inline]
 pub(super) fn callee_has_compiled_body(shared: &SharedVm, cached: &CachedBytecodeMethod) -> bool {
-    let jit_generation = cratonvm_jit::jit_cache_generation();
+    let jit_generation = shared.jit.jit_cache.generation();
     if cached.jit_probe_is_current(jit_generation) {
         return false;
     }

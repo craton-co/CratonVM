@@ -52,7 +52,7 @@ pub struct JitRealm {
     /// negative set: a stale *seal* only costs throughput (the method stays
     /// interpreted), but a stale *pass* would let a redefined body — whose new
     /// bytecode may call a native-shadowed target — reach the compiler, which
-    /// is exactly what the seal exists to prevent. `bump_redefine_epoch()` is
+    /// is exactly what the seal exists to prevent. `JitCache::bump_redefine_epoch` is
     /// already called on every `redefineClass`, beside the `clear_all()` that
     /// evicts the compiled artifacts, so an entry stamped with an older epoch
     /// is simply a miss and the gate re-runs.

@@ -16298,6 +16298,13 @@ pub struct JitCache {
     /// a publication whose compilation began earlier can be checked against it
     /// (see [`Self::dependencies_are_current`]).
     invalidations: parking_lot::Mutex<InvalidationLog>,
+    /// This cache's publication generation: advanced by every `put` and
+    /// `put_osr`, and by an `invalidate_matching` or `clear_all` that removed
+    /// something. Starts at 1, so 0 stays the interpreter memos' "never probed"
+    /// value. See [`Self::generation`].
+    generation: std::sync::atomic::AtomicU64,
+    /// Class redefinitions this VM has performed. See [`Self::redefine_epoch`].
+    redefine_epoch: std::sync::atomic::AtomicU32,
 }
 
 static JIT_ENTRY_OWNERS: std::sync::OnceLock<
@@ -17473,48 +17480,6 @@ fn dbg_jit_pin_enabled() -> bool {
     })
 }
 
-/// Monotonic publication/invalidation generation for external entry caches.
-///
-/// Advanced by EVERY mutation of a [`JitCache`] — `put`, `put_osr`, any
-/// `invalidate_*`, and `clear_all` — including a first-time insertion of a key
-/// that was not previously present.
-///
-/// That last case matters: until T2.2 the two `put` paths bumped only when they
-/// *replaced* an existing entry, which was sufficient for the original consumer
-/// (`vm/src/jit/helpers.rs`'s thread-local raw-entry dispatch caches, a purely
-/// *positive* cache that a brand-new key cannot invalidate). The interpreter's
-/// invoke-cache epoch check is a *negative* cache — "this method has no compiled
-/// body" — and a first-time publication is precisely what falsifies it, so the
-/// bump has to be unconditional. Under-bumping there would leave an interpreted
-/// call site pinned to the interpreter forever after a background compile
-/// published its body.
-/// Process-wide count of JVMTI class redefinitions.
-///
-/// Bumped once per successful `redefineClass`. Inline-cache slots stamp the
-/// value they were last validated against, so a redefinition costs each slot
-/// one flush rather than a flush on every dispatch for the rest of the
-/// process. See [`JitMICSlot::redefine_epoch`].
-pub static REDEFINE_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Read the current redefinition epoch (one relaxed atomic load).
-#[inline]
-pub fn redefine_epoch() -> u32 {
-    REDEFINE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Record that a class was redefined. Invalidates every inline cache exactly
-/// once, lazily, as each slot is next dispatched through.
-///
-/// Also advances [`JIT_INSTALL_EPOCH`], so a compilation that is already in
-/// flight when this runs carries a strictly older stamp than any cache flush
-/// that follows. Arming is `JitCache::clear_all`'s job — see
-/// [`JitCache::flush_barrier`].
-#[inline]
-pub fn bump_redefine_epoch() {
-    REDEFINE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
-    bump_jit_install_epoch();
-}
-
 /// Monotonic process-wide *compilation* epoch.
 ///
 /// Read at the START of a compilation and stamped onto the resulting artifact
@@ -17728,6 +17693,25 @@ fn strict_install_epoch_enabled() -> bool {
     })
 }
 
+/// Monotonic publication/invalidation generation for external entry caches,
+/// summed over every [`JitCache`] in the process.
+///
+/// Advanced by EVERY mutation of any cache — `put`, `put_osr`, any
+/// `invalidate_*`, and `clear_all` — including a first-time insertion of a key
+/// that was not previously present. Each cache also keeps its own
+/// [`JitCache::generation`], which is what the interpreter's negative memos
+/// read; this process-wide sum is for the thread-local raw-entry dispatch memos
+/// in `vm/src/jit/helpers.rs`, which outlive any one VM.
+///
+/// That last case matters: until T2.2 the two `put` paths bumped only when they
+/// *replaced* an existing entry, which was sufficient for the original consumer
+/// (`vm/src/jit/helpers.rs`'s thread-local raw-entry dispatch caches, a purely
+/// *positive* cache that a brand-new key cannot invalidate). The interpreter's
+/// invoke-cache epoch check is a *negative* cache — "this method has no compiled
+/// body" — and a first-time publication is precisely what falsifies it, so the
+/// bump has to be unconditional. Under-bumping there would leave an interpreted
+/// call site pinned to the interpreter forever after a background compile
+/// published its body.
 pub fn jit_cache_generation() -> u64 {
     JIT_CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -17745,6 +17729,8 @@ impl JitCache {
             flush_barrier: std::sync::atomic::AtomicU64::new(0),
             inlined_class_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
             invalidations: parking_lot::Mutex::new(InvalidationLog::default()),
+            generation: std::sync::atomic::AtomicU64::new(1),
+            redefine_epoch: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -17889,6 +17875,54 @@ flushed at epoch {barrier}",
             );
         }
         !strict_install_epoch_enabled()
+    }
+
+    /// This cache's generation (one acquire load).
+    ///
+    /// The interpreter's "no compiled body" memos
+    /// (`CachedBytecodeMethod::jit_probe_generation`, lambda sites) compare
+    /// against it. They used to read the process-wide
+    /// [`jit_cache_generation`], so a compilation in one VM flushed every VM's
+    /// memos. That counter remains for the thread-local dispatch memos that
+    /// outlive any one VM.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Advance this cache's generation and the process-wide one.
+    #[inline]
+    fn bump_generation(&self) {
+        use std::sync::atomic::Ordering;
+        JIT_CACHE_GENERATION.fetch_add(1, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Class redefinitions this VM has performed (one acquire load).
+    ///
+    /// Inline-cache slots stamp the value they were last validated against
+    /// ([`JitMICSlot::redefine_epoch`]), so a redefinition costs each slot one
+    /// flush rather than a flush on every dispatch for the rest of the process.
+    /// Per cache, because the slots live in this cache's bodies: a process-wide
+    /// epoch made one VM's redefinition flush every VM's inline caches and
+    /// gate-pass memos.
+    #[inline]
+    pub fn redefine_epoch(&self) -> u32 {
+        self.redefine_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that a class was redefined in this VM. Invalidates each of this
+    /// VM's inline caches exactly once, lazily, as it is next dispatched
+    /// through.
+    ///
+    /// Also advances [`JIT_INSTALL_EPOCH`], so a compilation that is already in
+    /// flight when this runs carries a strictly older stamp than any cache flush
+    /// that follows. Arming is [`Self::clear_all`]'s job — see
+    /// [`Self::flush_barrier`].
+    pub fn bump_redefine_epoch(&self) {
+        self.redefine_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        bump_jit_install_epoch();
     }
 
     /// Log a dependency invalidation of this cache BEFORE it scans.
@@ -18145,7 +18179,7 @@ invalidation before this body's publication"
         // "no compiled body for this method" memo
         // (`CachedBytecodeMethod::jit_probe_generation`) must observe. See
         // `jit_cache_generation`.
-        JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.bump_generation();
     }
 
     /// Publish an OSR body without superseding the method-entry body.
@@ -18236,7 +18270,7 @@ invalidation before this body's publication"
         // be mid-execution when it is replaced.
         retire_withdrawn_body(superseded.map(|(_, cm)| cm));
         // T2.2 — unconditional, for the same reason as `put` above.
-        JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.bump_generation();
     }
 
     pub fn len(&self) -> usize {
@@ -18485,7 +18519,7 @@ invalidation before this body's publication"
             }
         }
         if removed != 0 {
-            JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.bump_generation();
         }
         removed
     }
@@ -18550,7 +18584,7 @@ invalidation before this body's publication"
             }
         }
         if count != 0 {
-            JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.bump_generation();
         }
         count
     }
@@ -42789,6 +42823,25 @@ mod code_cache_lifetime_tests {
             Arc::from("()V"),
             cratonvm_types::ClassId::new(1),
         )
+    }
+
+    /// One VM's publication or redefinition must not flush another VM's
+    /// negative memos or inline caches: both counters belong to the cache.
+    #[test]
+    fn generation_and_redefine_epoch_belong_to_one_cache() {
+        let a = JitCache::new();
+        let b = JitCache::new();
+        assert_eq!(a.generation(), 1, "0 must stay the memos' never-probed value");
+        let (class, method, desc, cid) = key();
+        let b_before = b.generation();
+        a.put(class.clone(), method.clone(), desc.clone(), cid, ret_body());
+        assert!(a.generation() > 1, "a publication advances its own cache");
+        assert_eq!(b.generation(), b_before, "and no other");
+
+        let (a_epoch, b_epoch) = (a.redefine_epoch(), b.redefine_epoch());
+        a.bump_redefine_epoch();
+        assert_ne!(a.redefine_epoch(), a_epoch);
+        assert_eq!(b.redefine_epoch(), b_epoch);
     }
 
     /// A compilation that inlined from `Base` and began before

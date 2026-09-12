@@ -2376,12 +2376,12 @@ pub(super) fn execute_invokevirtual_cached(
                         // T2.2 -- epoch-guarded exactly like the invokestatic twin
                         // in `execute_invokestatic_cached`: skip the string-keyed
                         // `JitCache::get` while this entry's snapshot of
-                        // `jit_cache_generation()` is still current, because no
+                        // `JitCache::generation()` is still current, because no
                         // publication or invalidation has happened since the probe
                         // that missed. Read the generation before probing so a
                         // racing publication can only cause a redundant re-probe,
                         // never a missed one.
-                        let jit_generation = cratonvm_jit::jit_cache_generation();
+                        let jit_generation = shared.jit.jit_cache.generation();
                         // The SECOND census. `tierup-decline` above stops at
                         // the `&&` chain; from here down is everything that
                         // can still refuse a site the chain ADMITTED, and
@@ -4663,7 +4663,7 @@ pub(super) fn execute_invokevirtual_fast_door(
                 );
             }
             if !has_native && (nominate_always || !promotion_barred) {
-                let jit_generation = cratonvm_jit::jit_cache_generation();
+                let jit_generation = shared.jit.jit_cache.generation();
                 let found = if promotion_barred || cached.jit_probe_is_current(jit_generation) {
                     if census && promotion_barred {
                         crate::runtime::interp_census::record_promote_refuse(

@@ -8449,7 +8449,7 @@ impl<'a> NativeContextImpl<'a> {
         // stamp against this counter on their next dispatch and flush then;
         // nothing pays a per-call cost afterwards. Must be bumped alongside
         // the cache clear so no slot can validate against a pre-clear epoch.
-        cratonvm_jit::bump_redefine_epoch();
+        self.shared.jit.jit_cache.bump_redefine_epoch();
         let evicted = self.shared.jit.jit_cache.write().clear_all();
         if evicted > 0 {
             tracing::debug!(

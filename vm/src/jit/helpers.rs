@@ -21794,11 +21794,12 @@ unsafe fn install_lambda_inline_cache(
 /// entry is withdrawn, and the next miss finds the stamp stale, flushes and
 /// re-resolves against the redefined class.
 fn withdraw_ic_publication_if_redefined(
+    vm: &SharedVm,
     epoch_at_resolution: u32,
     mic: &JitMICSlot,
     pic: Option<&JitPICSlot>,
 ) {
-    if cratonvm_jit::redefine_epoch() == epoch_at_resolution {
+    if vm.jit.jit_cache.redefine_epoch() == epoch_at_resolution {
         return;
     }
     mic.clear_compiled_entry();
@@ -22741,7 +22742,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // A match means the slot was populated after the most recent redefinition
     // and is as trustworthy as any other inline cache. Steady state is one
     // relaxed load and a compare.
-    let epoch_now = cratonvm_jit::redefine_epoch();
+    let epoch_now = vm.jit.jit_cache.redefine_epoch();
     // Read first; write only when the epoch actually moved.
     //
     // This was an unconditional `swap`, i.e. a locked read-modify-write on the
@@ -23200,6 +23201,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                     );
                 }
                 withdraw_ic_publication_if_redefined(
+                    vm,
                     epoch_now,
                     mic,
                     (pic_ptr != 0).then(|| &*(pic_ptr as *const JitPICSlot)),
@@ -23432,6 +23434,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             );
         }
         withdraw_ic_publication_if_redefined(
+            vm,
             epoch_now,
             mic,
             (pic_ptr != 0).then(|| &*(pic_ptr as *const JitPICSlot)),

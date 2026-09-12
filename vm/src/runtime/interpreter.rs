@@ -1999,7 +1999,7 @@ pub fn execute(
         // sealed for the reason it computes — it was re-running, not running
         // once per method.
         //
-        // Stamped with `redefine_epoch()` because a stale PASS is unsafe in a
+        // Stamped with this VM's `JitCache::redefine_epoch()` because a stale PASS is unsafe in a
         // way a stale seal is not: see `JitRealm::jit_gate_pass`.
         // Keyed on `ClassId`, not on the class name the negative set uses — see
         // `JitRealm::jit_gate_pass` for why the name is safe there and unsafe
@@ -2009,7 +2009,7 @@ pub fn execute(
         {
             None
         } else {
-            let epoch = cratonvm_jit::redefine_epoch();
+            let epoch = shared.jit.jit_cache.redefine_epoch();
             shared
                 .jit
                 .jit_gate_pass
@@ -2121,7 +2121,7 @@ pub fn execute(
                 cratonvm_jit::note_jit_gate_pass_fill();
                 shared.jit.jit_gate_pass.write().insert(
                     (class_id, gate_pass_key.0.clone(), gate_pass_key.1.clone()),
-                    (cratonvm_jit::redefine_epoch(), is_interface_default),
+                    (shared.jit.jit_cache.redefine_epoch(), is_interface_default),
                 );
             }
             (

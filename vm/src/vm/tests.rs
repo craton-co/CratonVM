@@ -65031,7 +65031,7 @@ fn m5_jit_skip_set_does_not_block_user_classes() {
 ///
 /// Asserted on the redemption rule rather than by driving `execute()`,
 /// because that is the rule the gate reads: an entry whose stamp is not the
-/// current `redefine_epoch()` is a miss.
+/// current `JitCache::redefine_epoch()` is a miss.
 #[test]
 fn jit_gate_pass_memo_is_invalidated_by_a_redefine() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -65041,7 +65041,7 @@ fn jit_gate_pass_memo_is_invalidated_by_a_redefine() {
     );
 
     let key: (ClassId, Arc<str>, Arc<str>) = (ClassId::new(7), Arc::from("bar"), Arc::from("()V"));
-    let epoch_at_fill = cratonvm_jit::redefine_epoch();
+    let epoch_at_fill = shared.jit.jit_cache.redefine_epoch();
     shared
         .jit
         .jit_gate_pass
@@ -65050,7 +65050,7 @@ fn jit_gate_pass_memo_is_invalidated_by_a_redefine() {
 
     // Same epoch -> the memo answers, which is the whole point.
     let redeem = |shared: &SharedVm| -> Option<bool> {
-        let epoch = cratonvm_jit::redefine_epoch();
+        let epoch = shared.jit.jit_cache.redefine_epoch();
         shared
             .jit
             .jit_gate_pass
@@ -65066,8 +65066,8 @@ fn jit_gate_pass_memo_is_invalidated_by_a_redefine() {
     );
 
     // A redefinition bumps the epoch; the stale PASS must stop answering.
-    cratonvm_jit::bump_redefine_epoch();
-    assert_ne!(cratonvm_jit::redefine_epoch(), epoch_at_fill);
+    shared.jit.jit_cache.bump_redefine_epoch();
+    assert_ne!(shared.jit.jit_cache.redefine_epoch(), epoch_at_fill);
     assert_eq!(
         redeem(&shared),
         None,
@@ -65086,7 +65086,7 @@ fn jit_gate_pass_memo_is_invalidated_by_a_redefine() {
 #[test]
 fn jit_gate_pass_memo_does_not_collide_across_same_named_classes() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let epoch = cratonvm_jit::redefine_epoch();
+    let epoch = shared.jit.jit_cache.redefine_epoch();
     let method: Arc<str> = Arc::from("equals");
     let desc: Arc<str> = Arc::from("(Ljava/lang/Object;)Z");
 
@@ -65111,7 +65111,7 @@ fn jit_gate_pass_memo_does_not_collide_across_same_named_classes() {
 #[test]
 fn jit_gate_pass_memo_round_trips_is_interface_default() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let epoch = cratonvm_jit::redefine_epoch();
+    let epoch = shared.jit.jit_cache.redefine_epoch();
     for iface in [false, true] {
         let key: (ClassId, Arc<str>, Arc<str>) = (
             ClassId::new(11),
