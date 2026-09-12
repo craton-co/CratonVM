@@ -117,7 +117,14 @@ Sized by what the numbers above support, not by what is interesting:
 1. **`fib` at 3.7x** (§1) — recursive invocation. The largest gap on any row
    that is pure compilation: no allocation, no collections, no collector
    involvement, one arithmetic expression and two calls. Whatever it is, it is
-   the JIT's.
+   the JIT's. **OPENED UP, same day**, in
+   [`c2-fib-per-call-budget-20260912.md`](c2-fib-per-call-budget-20260912.md):
+   a CratonVM call is ~36 instructions to HotSpot's ~10, about fifteen of them
+   stores, and almost none of it is arithmetic an optimizer could improve — it
+   is the per-frame contract (a 512-byte frame, a five-store reserved tail, the
+   mirror, the safepoint id, the stack guard, the sentinel, and a home word for
+   every value). Three obvious fixes are measured and discarded there, including
+   the precise-maps mirror and the equal-depth sink.
 2. **Optimizer strength / coverage in C2** (§3): ten of twenty-five candidates
    refused `inert`. Until the optimizer changes something on a typical method,
    improving the code it emits for the few it does change is bounded by 4.5%.
