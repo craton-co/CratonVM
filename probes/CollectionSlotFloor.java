@@ -19,13 +19,31 @@ import java.util.*;
  *
  * Exits non-zero if anything mismatched, so it is usable as a gate.
  *
- * KNOWN BASELINE, synthetic-JDK mode, 2026-09-11: eight checks mismatch there —
- * `TreeMap.keySet()/entrySet()` report 0, `IdentityHashMap` reports 0 for
- * everything, and `LinkedHashSet` reports 0 for size. Those are synthetic-JDK
- * gaps in three collection families that have nothing to do with the slot
- * floors: an unchanged build produces the IDENTICAL eight. Real-JDK mode is
- * clean. Compare the SET of mismatches against that baseline rather than
- * expecting a bare pass in synthetic mode.
+ * KNOWN BASELINE, synthetic-JDK mode, MEASURED 2026-09-12 on `dev` at
+ * `0ad29ab00`: SIXTEEN rows, and NONE of them is a slot floor. The count was
+ * documented as eight and had not been re-measured since; sections added after
+ * that reach further into the synthetic class library, and what they find there
+ * is missing METHODS, not lost slots. Real-JDK mode is clean.
+ *
+ * <pre>
+ *   8 MISMATCH  TreeMap.keySet/entrySet report 0; IdentityHashMap reports 0 for
+ *               everything; LinkedHashSet and CopyOnWriteArraySet report 0 for
+ *               size and after-remove   -- synthetic gaps in four families
+ *   ERROR LinkedList            NoSuchMethodError LinkedList.indexOf
+ *   ERROR ArrayDeque            NoSuchMethodError String.entrySet (iterator path)
+ *   ERROR empty sorted reads    NPE: Set.iterator() returned null
+ *   ERROR floor-exempt families NoSuchMethodError LinkedBlockingQueue$Itr.hasNext
+ *   ERROR wrapped ArrayDeque    NoSuchMethodError String.entrySet (iterator path;
+ *                               `toString` on the SAME deque answers `[x, y]`,
+ *                               so the gap is the iterator, not the state)
+ *   ERROR Properties chain names  UnsupportedOperationException from
+ *                               stringPropertyNames
+ * </pre>
+ *
+ * An unchanged build produces the IDENTICAL sixteen. Compare the SET against
+ * that baseline rather than expecting a bare pass in synthetic mode, and when a
+ * section starts throwing there, give it its own `section(..)` so it stops
+ * hiding the checks behind it rather than deleting the check.
  *
  * See docs/internal/fixed-bugs/jdk-collection-classes-are-padded-to-a-synthetic-stub-floor-FIXED-20260911.md
  */
@@ -94,6 +112,18 @@ public class CollectionSlotFloor {
         // a raw absolute slot past the real width would read back as an empty
         // or a garbled collection here, not as an error anywhere.
         section("floor-exempt families", CollectionSlotFloor::floorExemptFamilies);
+
+        // Four states the section above does not reach, on the same seven
+        // classes. Each is a reader a narrowed floor could break WITHOUT
+        // breaking anything asserted there, which is the only reason to add a
+        // check to a family already covered. One section each: the last two
+        // throw in synthetic-JDK mode for reasons that are not floors, and a
+        // shared section would let either of them hide the rest.
+        section("LinkedHashSet order", CollectionSlotFloor::linkedHashSetOrder);
+        section("empty exempt sets", CollectionSlotFloor::emptyExemptSets);
+        section("wrapped ArrayDeque", CollectionSlotFloor::wrappedArrayDeque);
+        section("Properties chain names",
+                CollectionSlotFloor::propertiesDefaultsChainNames);
 
         // EnumMap / EnumSet have their own floors.
         section("EnumMap/EnumSet", () -> {
@@ -351,6 +381,118 @@ public class CollectionSlotFloor {
      * fabricated model index as its fallback -- so it is where a wrong slot
      * would show up first.
      */
+    /// Insertion ORDER on a `LinkedHashSet`, which nothing else here reads.
+    ///
+    /// Its floor went 3 -> 1 with `FLOOR_EXEMPT_CLASSES`, and order is the one
+    /// thing a `LinkedHashSet` has that a `HashSet` does not. It is also the
+    /// quietest thing to lose: right contents, right size, wrong sequence, no
+    /// exception anywhere. `setFamily` cannot see it.
+    static void linkedHashSetOrder() {
+        LinkedHashSet<String> lhs = new LinkedHashSet<>();
+        for (int i = 0; i < 12; i++) lhs.add("e" + i);
+        StringBuilder order = new StringBuilder();
+        for (String s : lhs) order.append(s).append(',');
+        check("LinkedHashSet insertion order",
+                "e0,e1,e2,e3,e4,e5,e6,e7,e8,e9,e10,e11,", order.toString());
+        check("LinkedHashSet re-add is false", "false", String.valueOf(lhs.add("e0")));
+        lhs.remove("e5");
+        StringBuilder afterRemove = new StringBuilder();
+        for (String s : lhs) afterRemove.append(s).append(',');
+        check("LinkedHashSet order after remove",
+                "e0,e1,e2,e3,e4,e6,e7,e8,e9,e10,e11,", afterRemove.toString());
+    }
+
+    /// The never-written receiver, for the three exempt SET classes.
+    ///
+    /// `setFamily` fills before it reads, so "empty" is a state its readers are
+    /// never handed — and an empty set is exactly where a reader that assumes a
+    /// backing store exists answers with a crash or with garbage instead of
+    /// with nothing.
+    static void emptyExemptSets() {
+        HashSet<String> emptySet = new HashSet<>();
+        check("empty HashSet size", "0", String.valueOf(emptySet.size()));
+        check("empty HashSet contains", "false", String.valueOf(emptySet.contains("a")));
+        check("empty HashSet iterator", "false",
+                String.valueOf(emptySet.iterator().hasNext()));
+        check("empty HashSet toString", "[]", emptySet.toString());
+        check("empty HashSet remove", "false", String.valueOf(emptySet.remove("a")));
+        check("empty HashSet toArray", "0", String.valueOf(emptySet.toArray().length));
+
+        LinkedHashSet<String> emptyLhs = new LinkedHashSet<>();
+        check("empty LinkedHashSet size", "0", String.valueOf(emptyLhs.size()));
+        check("empty LinkedHashSet iterator", "false",
+                String.valueOf(emptyLhs.iterator().hasNext()));
+
+        java.util.concurrent.CopyOnWriteArraySet<String> emptyCows =
+                new java.util.concurrent.CopyOnWriteArraySet<>();
+        check("empty COWArraySet size", "0", String.valueOf(emptyCows.size()));
+        check("empty COWArraySet isEmpty", "true", String.valueOf(emptyCows.isEmpty()));
+        check("empty COWArraySet iterator", "false",
+                String.valueOf(emptyCows.iterator().hasNext()));
+
+        ArrayDeque<String> emptyDq = new ArrayDeque<>();
+        check("empty ArrayDeque size", "0", String.valueOf(emptyDq.size()));
+        check("empty ArrayDeque poll", "null", String.valueOf(emptyDq.poll()));
+        check("empty ArrayDeque peek", "null", String.valueOf(emptyDq.peek()));
+        check("empty ArrayDeque toString", "[]", emptyDq.toString());
+        check("empty ArrayDeque toArray", "0", String.valueOf(emptyDq.toArray().length));
+    }
+
+    /// The SMALL wrapped deque, which is a different check from the large one.
+    ///
+    /// `collection_elements` tests the receiver's WIDTH to decide it
+    /// understands an `ArrayDeque`, then reads slots 0..=2 and derives the
+    /// count. With the fourth slot gone, a width test that still demanded four
+    /// drops every real deque into the generic `f0 = array, f1 = size`
+    /// heuristic below it — which reads `head` as the count. Two `addFirst` on
+    /// a fresh deque leave `head = 15`, so that path yields fifteen nulls where
+    /// this asserts two elements. That is the 2026-08-11 `stream()` defect, and
+    /// a 60-element deque does NOT reproduce it: filling forward leaves
+    /// `head = 0`, which makes the wrong reading look right.
+    ///
+    /// SYNTHETIC-JDK: iterating this receiver throws there (see the class
+    /// comment's baseline). `toString` on the same deque answers `[x, y]`, so
+    /// the gap is in the iterator path alone; it is a synthetic-mode gap and
+    /// not a floor one, which is why it sits in its own section rather than
+    /// taking the checks around it down with it.
+    static void wrappedArrayDeque() {
+        ArrayDeque<String> wrapped = new ArrayDeque<>();
+        wrapped.addFirst("y");
+        wrapped.addFirst("x");
+        check("ArrayDeque wrapped size", "2", String.valueOf(wrapped.size()));
+        check("ArrayDeque wrapped toString", "[x, y]", wrapped.toString());
+        check("ArrayDeque wrapped toArray", "2", String.valueOf(wrapped.toArray().length));
+        StringBuilder wrappedOrder = new StringBuilder();
+        for (String s : wrapped) wrappedOrder.append(s);
+        check("ArrayDeque wrapped iteration", "xy", wrappedOrder.toString());
+    }
+
+    /// `stringPropertyNames`, which walks the `defaults` chain to build a SET.
+    ///
+    /// A different reader from `getProperty`, which walks it to answer one key,
+    /// and from `size()`, which deliberately does not walk it at all. The link
+    /// it follows is the one that used to live in a raw model slot — absolute
+    /// 3, which on a real `Properties` is `Hashtable.loadFactor`, a float.
+    ///
+    /// SYNTHETIC-JDK: throws `UnsupportedOperationException` there (see the
+    /// class comment's baseline). Its own section for the same reason as
+    /// `wrappedArrayDeque`.
+    static void propertiesDefaultsChainNames() {
+        Properties chainBase = new Properties();
+        chainBase.setProperty("shared", "from-defaults");
+        chainBase.setProperty("only-in-base", "b");
+        Properties chainTop = new Properties(chainBase);
+        chainTop.setProperty("shared", "from-derived");
+        chainTop.setProperty("only-in-derived", "d");
+        Set<String> names = chainTop.stringPropertyNames();
+        check("Properties stringPropertyNames spans the chain", "3",
+                String.valueOf(names.size()));
+        check("Properties stringPropertyNames sees the inherited key", "true",
+                String.valueOf(names.contains("only-in-base")));
+        check("Properties stringPropertyNames does not duplicate the override", "true",
+                String.valueOf(names.contains("shared")));
+    }
+
     static void floorExemptFamilies() {
         setFamily("CopyOnWriteArraySet", new java.util.concurrent.CopyOnWriteArraySet<String>());
 
