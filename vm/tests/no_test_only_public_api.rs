@@ -188,7 +188,13 @@ use std::path::{Path, PathBuf};
 /// lower this number does not spend an afternoon rediscovering that
 /// `#[cfg(test)]` breaks the tests that item exists to serve.
 ///
-const BASELINE_OFFENDERS: usize = 296;
+/// **296 -> 292 on 2026-09-12**, with the code-cache lifecycle join
+/// (`vm/src/jit/code_cache_lifecycle.rs`). Four items came off, all in that
+/// file: `record_install`, `record_retirement` and `process_lifecycle` were
+/// deleted — shims onto a model queue that no production path ever fed — and
+/// `code_cache_lifecycle_raw` gained a production caller in
+/// `code_cache_lifecycle_report`, which now reports the JIT's real accounting.
+const BASELINE_OFFENDERS: usize = 292;
 
 /// Minimum number of declarations the scan must find before its result means
 /// anything.

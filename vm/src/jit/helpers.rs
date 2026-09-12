@@ -91,7 +91,7 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
 //
 // What the default-OFF period cost, measured independently on 2026-07-27 (H2
 // `org/h2/` ban residuals): this flag gates the ONLY write of
-// `mic.cached_entry_ptr`, so with it off the inline MIC/PIC cascade the codegen
+// `mic.cached_entry_word`, so with it off the inline MIC/PIC cascade the codegen
 // emits can never open and every virtual call out of compiled code falls back
 // through `invoke_or_native` into the INTERPRETER. Compiling a method therefore
 // made its callees slower, and compiling more of a program made it slower
@@ -2535,9 +2535,9 @@ const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
 ///    `HASHMAP_PUT_DIRECT_INFO`, `HASHMAP_GET_DIRECT_INFO`,
 ///    `CONCURRENT_HASHMAP_GET_DIRECT_INFO`, `STRING_LATIN1_LOWER_DIRECT_INFO`),
 ///    which is literally the SAME address in every VM in the process;
-///  * every other info lives in `JitCache::invoke_info_arena`, a per-VM arena
-///    freed when that VM's `JitCache` drops, so a later VM's arena can hand
-///    out the same address.
+///  * every other info is owned by the `CompiledMethod` that bakes it
+///    (`_jit_invoke_infos`) and freed with that artifact, so a later
+///    compilation — in this VM or another — can be handed the same address.
 ///
 /// What these memos hold is per-VM to the word: raw compiled entry pointers
 /// into one VM's code cache, receiver `ClassId`s, `NativeMethodId` census
@@ -21837,6 +21837,31 @@ unsafe fn install_lambda_inline_cache(
     }
 }
 
+/// Withdraw what a dispatch just published into its inline caches if a class
+/// redefinition landed while it was resolving the target.
+///
+/// `jit_invoke_virtual_mic` stamps the MIC with the redefinition epoch BEFORE
+/// it resolves and publishes. A redefinition that lands between the stamp and
+/// the publication is invisible to that stamp, and the published entry is then
+/// served by the inline machine-code cascade, which never re-enters the helper
+/// to notice. Re-reading the epoch after publishing closes the window: the
+/// entry is withdrawn, and the next miss finds the stamp stale, flushes and
+/// re-resolves against the redefined class.
+fn withdraw_ic_publication_if_redefined(
+    vm: &SharedVm,
+    epoch_at_resolution: u32,
+    mic: &JitMICSlot,
+    pic: Option<&JitPICSlot>,
+) {
+    if vm.jit.jit_cache.redefine_epoch() == epoch_at_resolution {
+        return;
+    }
+    mic.clear_compiled_entry();
+    if let Some(pic) = pic {
+        pic.clear_entries();
+    }
+}
+
 /// A compiled caller's SAM call, served straight from the lambda call site's
 /// own cached target.
 ///
@@ -22771,7 +22796,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // A match means the slot was populated after the most recent redefinition
     // and is as trustworthy as any other inline cache. Steady state is one
     // relaxed load and a compare.
-    let epoch_now = cratonvm_jit::redefine_epoch();
+    let epoch_now = vm.jit.jit_cache.redefine_epoch();
     // Read first; write only when the epoch actually moved.
     //
     // This was an unconditional `swap`, i.e. a locked read-modify-write on the
@@ -22865,16 +22890,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             )
         } else {
             let pic = &*(pic_ptr as *const JitPICSlot);
+            let ways: [(u32, u64, bool); cratonvm_jit::JIT_PIC_ENTRIES] =
+                std::array::from_fn(|i| pic.way(i).unwrap_or((0, 0, false)));
             (
-                std::array::from_fn(|i| {
-                    pic.class_ids[i].load(std::sync::atomic::Ordering::Acquire)
-                }),
-                std::array::from_fn(|i| {
-                    pic.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire)
-                }),
-                std::array::from_fn(|i| {
-                    pic.needs_context[i].load(std::sync::atomic::Ordering::Acquire)
-                }),
+                std::array::from_fn(|i| ways[i].0),
+                std::array::from_fn(|i| ways[i].1),
+                std::array::from_fn(|i| ways[i].2),
             )
         };
         eprintln!(
@@ -22884,8 +22905,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             info.descriptor,
             cached_cid,
             receiver_cid,
-            mic.cached_entry_ptr
-                .load(std::sync::atomic::Ordering::Acquire),
+            mic.cached_entry().0,
             pic_ptr,
             pic_classes,
             pic_entries,
@@ -22945,19 +22965,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     if cached_cid == receiver_cid && cached_cid != 0 && receiver_is_plain_object {
         mic.record_hit();
 
-        // Try the cached compiled entry pointer (true inline cache hit)
-        let entry = mic
-            .cached_entry_ptr
-            .load(std::sync::atomic::Ordering::Acquire);
+        // Try the cached compiled entry pointer (true inline cache hit). The
+        // entry and its ABI flag are decoded from ONE load of the tagged word,
+        // exactly as generated code does.
+        let (entry, needs_ctx) = mic.cached_entry();
         if direct_virtual_compiled_callee_entry_enabled() && entry != 0 && !redefine_jit_quiesced {
             // Direct call to the compiled callee — same ABI as `jit_invoke_dispatch`
             // uses after a JIT-cache hit (receiver + params in `args_slice`, optional
-            // leading `vm_ptr` when `cached_needs_context` is true).  **Do not** pass
+            // leading `vm_ptr` when the entry word's context tag is set).  **Do not** pass
             // `(vm_ptr, info_ptr, args_ptr, num_args)` here; that was a mis-invocation
             // that corrupts the stack and surfaces as Windows AV / Linux SIGSEGV.
-            let needs_ctx = mic
-                .cached_needs_context
-                .load(std::sync::atomic::Ordering::Acquire);
             // Register-table call straight off the raw arg slots — no `Value`
             // decode on this hot path. `try_call_compiled_entry` returns
             // `None` exactly when the callee has more args than the register
@@ -23038,7 +23055,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // rebuilt it twice via `values[1..].to_vec()` + a fresh prepend.)
         let full_args = decode_values();
 
-        // Try to compile callee for next time (populate cached_entry_ptr + needs_ctx).
+        // Try to compile callee for next time (populate the MIC's tagged entry word).
         //
         // VIRTUAL DISPATCH FIX: resolve the callee from the RECEIVER's class
         // (`class_name`, derived from `receiver_class_id` above), NOT from
@@ -23198,7 +23215,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 // the only writer that also resolves and RETAINS the callee's
                 // `Arc<CompiledMethod>` in the slot's `compiled_owner`.
                 //
-                // Until 2026-07-27 this branch stored `cached_entry_ptr`
+                // Until 2026-07-27 this branch stored the entry word
                 // directly, so a slot reached through the "class cached, target
                 // unresolved" shape (what `prepopulate` seeds and what
                 // `clear_compiled_entry` leaves behind after every
@@ -23237,6 +23254,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                         crate::vm::dispatch_policy(vm).is_jdk_only(),
                     );
                 }
+                withdraw_ic_publication_if_redefined(
+                    vm,
+                    epoch_now,
+                    mic,
+                    (pic_ptr != 0).then(|| &*(pic_ptr as *const JitPICSlot)),
+                );
             }
         }
 
@@ -23464,6 +23487,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 crate::vm::dispatch_policy(vm).is_jdk_only(),
             );
         }
+        withdraw_ic_publication_if_redefined(
+            vm,
+            epoch_now,
+            mic,
+            (pic_ptr != 0).then(|| &*(pic_ptr as *const JitPICSlot)),
+        );
     }
 
     // See the matching note in the cache-hit branch — `decode_values` already
@@ -23713,19 +23742,6 @@ impl DeoptimizationController {
         // so production VMs neither bump nor consult it (byte-identical).
         if cratonvm_jit::deopt_real_enabled() {
             vm.bump_compilation_epoch(&method_key);
-        }
-
-        // For class-check or receiver-type failures, also check the
-        // invalidation manager for dependent methods.
-        if matches!(
-            reason,
-            cratonvm_jit::deopt::DeoptReason::ReceiverTypeChanged
-                | cratonvm_jit::deopt::DeoptReason::ClassCheck
-                | cratonvm_jit::deopt::DeoptReason::ClassLoading
-        ) {
-            let mut inv_mgr = vm.jit.invalidation_manager.lock();
-            // Clear stale assumptions for the deoptimized method
-            inv_mgr.clear_assumptions(&method_key);
         }
 
         // If the deopt log recommends giving up, add to the JIT skip set.

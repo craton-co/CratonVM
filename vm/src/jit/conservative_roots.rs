@@ -123,6 +123,15 @@ pub(crate) struct JitFrameChainEntry {
     /// has no `JvmThread` to ask, but no interpreter frame can have been pushed
     /// since the entry it nests inside, so the enclosing depth is exact.
     pub interp_depth: u32,
+    /// The `GLOBAL_JIT_DEPTH` stripe this entry's push incremented, filled by
+    /// [`push_entry_full`]. The pop decrements exactly that stripe, so an entry
+    /// released during thread teardown cannot land on stripe 0 and cancel a
+    /// live peer's depth. Constructors pass `StripeToken::UNSET`.
+    pub depth_stripe: cratonvm_types::striped_counter::StripeToken,
+    /// The executable-code quiescence token this entry's push took, filled by
+    /// [`push_entry_full`] and handed back to `jit_execution_leave` by the pop.
+    /// Constructors pass `JitExecutionToken::UNSET`.
+    pub exec_token: cratonvm_jit::JitExecutionToken,
 }
 
 /// Sentinel for [`JitFrameChainEntry::interp_depth`]: resolve at push time from
@@ -1018,6 +1027,8 @@ pub fn push_jit_entry_at(sp: usize) -> usize {
         entry_sp: sp,
         precise: None,
         interp_depth: INTERP_DEPTH_INHERIT,
+        depth_stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+        exec_token: cratonvm_jit::JitExecutionToken::UNSET,
     })
 }
 
@@ -1053,6 +1064,12 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
                 info.exact_cm_id = published_compile_id();
             }
         }
+        // Both process-wide counts are raised here, with their stripes kept in
+        // the entry the matching pop consumes. A few instructions earlier than
+        // the push they describe is the over-approximating direction for
+        // "is anyone in JIT?".
+        entry.depth_stripe = GLOBAL_JIT_DEPTH.inc_token();
+        entry.exec_token = cratonvm_jit::jit_execution_enter();
         v.push(entry);
         let n = v.len();
         top_rbp_set(0);
@@ -1065,7 +1082,6 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         }
         n
     });
-    GLOBAL_JIT_DEPTH.inc();
     publish_self_jit_depth(depth);
     // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
     // this is the ONLY point at which a thread becomes
@@ -1076,7 +1092,6 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         ThreadExecState::CompiledUninterruptible,
         "jit::conservative_roots::push_entry_full",
     );
-    cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
     // compaction whenever any thread is inside a JIT call. NEW-12's
     // precise root walk removes false positives from the root set,
@@ -1151,24 +1166,18 @@ pub fn pop_jit_entry() -> Option<usize> {
         (p, v.len())
     });
     if let Some(entry) = popped {
-        GLOBAL_JIT_DEPTH.dec();
+        GLOBAL_JIT_DEPTH.dec_token(entry.depth_stripe);
         publish_self_jit_depth(remaining);
         thread_state::record_transition(
             leaving_compiled_state(remaining),
             "jit::conservative_roots::pop_jit_entry",
         );
         cratonvm_gc::gc_quiescence::leave();
-        cratonvm_jit::jit_execution_leave();
-        // P1 code-cache retirement: leaving a compiled frame is one of the two
-        // moments `GLOBAL_JIT_DEPTH` can reach zero, and therefore one of the
-        // two moments an unpublished body can become reclaimable. The sweep
-        // asks the quiescence question itself (with the retirement queue lock
-        // held — see `code_cache_lifecycle`'s §1.2); all this site owes it is
-        // the wake-up. The gate is one relaxed load, and with nothing queued —
-        // the overwhelmingly common case — that is the whole cost.
-        if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
-            crate::jit::code_cache_lifecycle::sweep_if_quiescent();
-        }
+        // P1 code-cache retirement: `jit_execution_leave` is also the
+        // retirement queue's wake-up. It records this thread's return to depth
+        // 0 and drains when that can release something, so this hot path owes
+        // the queue nothing more.
+        cratonvm_jit::jit_execution_leave(entry.exec_token);
         note_jit_residue(entry.entry_sp);
         Some(entry.entry_sp)
     } else {
@@ -1205,6 +1214,13 @@ pub fn pop_jit_entry() -> Option<usize> {
 /// engaged. Returns the number of stale entries reclaimed.
 pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
     let mut remaining = 0usize;
+    // The counter tokens of every pruned entry, so each decrement lands on the
+    // stripe its push raised. `Vec::new` does not allocate until a prune
+    // actually removes something, which is the rare case.
+    let mut pruned_tokens: Vec<(
+        cratonvm_types::striped_counter::StripeToken,
+        cratonvm_jit::JitExecutionToken,
+    )> = Vec::new();
     let pruned = JIT_ENTRY_CHAIN.with(|c| {
         let mut v = c.borrow_mut();
         let before = v.len();
@@ -1212,6 +1228,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         // above the scanner SP). Entries below it have provably returned.
         for e in v.iter().filter(|e| e.entry_sp < scanner_sp) {
             note_jit_residue(e.entry_sp);
+            pruned_tokens.push((e.depth_stripe, e.exec_token));
         }
         v.retain(|e| e.entry_sp >= scanner_sp);
         let pruned = before - v.len();
@@ -1251,10 +1268,10 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
             "jit::conservative_roots::prune_returned_jit_entries",
         );
     }
-    for _ in 0..pruned {
-        GLOBAL_JIT_DEPTH.dec();
+    for (depth_stripe, exec_token) in pruned_tokens {
+        GLOBAL_JIT_DEPTH.dec_token(depth_stripe);
         cratonvm_gc::gc_quiescence::leave();
-        cratonvm_jit::jit_execution_leave();
+        cratonvm_jit::jit_execution_leave(exec_token);
     }
     if pruned > 0 {
         publish_self_jit_depth(remaining);
@@ -1280,12 +1297,12 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
             pruned,
             scanner_sp,
         );
-        // P1 code-cache retirement: the self-heal is the OTHER way
-        // `GLOBAL_JIT_DEPTH` reaches zero. Without this wake-up a leaked
-        // `JitEntryGuard` would wedge the retirement queue exactly as it used
-        // to wedge the moving collector — and because retention is the
-        // fail-safe, that would show up as unbounded code-cache growth rather
-        // than as a crash. See `code_cache_lifecycle`'s §1.3.
+        // P1 code-cache retirement: a leaked `JitEntryGuard` is exactly what
+        // wedges the retirement queue, and each leave above pumps the drain only
+        // on its thread's schedule. Ask once, explicitly, now that the wedge is
+        // gone — retention is the fail-safe, so a missed wake-up would show up
+        // as code-cache growth rather than as a crash. See
+        // `code_cache_lifecycle`'s §1.3.
         if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
             crate::jit::code_cache_lifecycle::sweep_if_quiescent();
         }
@@ -1374,6 +1391,8 @@ impl JitEntryGuard {
         let sp = current_stack_pointer();
         let entry = JitFrameChainEntry {
             entry_sp: sp,
+            depth_stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+            exec_token: cratonvm_jit::JitExecutionToken::UNSET,
             interp_depth: match interp_depth {
                 Some(d) => u32::try_from(d).unwrap_or(u32::MAX - 1),
                 None => INTERP_DEPTH_INHERIT,
@@ -5301,6 +5320,52 @@ pub fn any_thread_in_jit() -> bool {
 #[inline]
 pub fn current_thread_jit_depth() -> usize {
     JIT_ENTRY_CHAIN.with(|c| c.borrow().len())
+}
+
+/// Code reclamation: publish, at a transition into a blocked state, which
+/// compiled bodies this thread's stack can return into while it stays blocked.
+///
+/// A thread parked inside compiled code (a pool worker in
+/// `LinkedBlockingQueue.take()`) holds a JIT execution for as long as it is
+/// parked, so the process-wide quiescence count never reaches zero. Every return
+/// address into compiled code on this thread lies between the current frame and
+/// the outermost JIT entry's captured SP, so that band is what
+/// `cratonvm_jit::jit_thread_blocked_enter` scans. See
+/// `docs/jit/code-cache-lifetime.md`.
+///
+/// `#[inline(never)]` so the stack probe lives in this frame, which stays live
+/// for the whole scan. Called by every `GcBarrier` blocked-state entry; paired
+/// with [`note_blocking_transition_leave`].
+#[inline(never)]
+pub(crate) fn note_blocking_transition_enter() {
+    let lo = current_stack_pointer();
+    // A thread holding no JIT entry passes an empty band: nothing to scan, but
+    // the window still nests, so the matching leave stays balanced.
+    let hi = outermost_jit_entry_sp().unwrap_or(lo).max(lo);
+    // SAFETY: `[lo, hi)` is this thread's own stack between this live frame and
+    // the outermost live compiled entry's SP, all of it mapped for the call.
+    unsafe { cratonvm_jit::jit_thread_blocked_enter(lo, hi) };
+}
+
+/// End the blocked window [`note_blocking_transition_enter`] opened.
+#[inline]
+pub(crate) fn note_blocking_transition_leave() {
+    cratonvm_jit::jit_thread_blocked_leave();
+}
+
+/// Highest `entry_sp` on this thread's JIT entry chain — the outermost compiled
+/// entry — or `None` with no entry. `try_with`/`try_borrow` because a blocking
+/// transition can run during thread teardown and must never panic.
+fn outermost_jit_entry_sp() -> Option<usize> {
+    JIT_ENTRY_CHAIN
+        .try_with(|chain| {
+            chain
+                .try_borrow()
+                .ok()
+                .and_then(|entries| entries.iter().map(|e| e.entry_sp).max())
+        })
+        .ok()
+        .flatten()
 }
 
 /// The active compiled frames of the CURRENT thread, outermost first, as
@@ -11670,6 +11735,8 @@ mod tests {
         let entry_sp = current_stack_pointer() + 4096;
         push_entry_full(JitFrameChainEntry {
             entry_sp,
+            depth_stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+            exec_token: cratonvm_jit::JitExecutionToken::UNSET,
             // No interpreter stack in this unit test; `INTERP_DEPTH_INHERIT`
             // is what a site that cannot name its depth pushes, and with an
             // empty chain it resolves to 0.

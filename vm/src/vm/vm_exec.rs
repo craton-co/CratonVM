@@ -8449,14 +8449,13 @@ impl<'a> NativeContextImpl<'a> {
         // stamp against this counter on their next dispatch and flush then;
         // nothing pays a per-call cost afterwards. Must be bumped alongside
         // the cache clear so no slot can validate against a pre-clear epoch.
-        cratonvm_jit::bump_redefine_epoch();
+        self.shared.jit.jit_cache.bump_redefine_epoch();
         let evicted = self.shared.jit.jit_cache.write().clear_all();
         if evicted > 0 {
             tracing::debug!(
                 "JIT: fully invalidated {evicted} method(s) due to redefineClass: {name}"
             );
         }
-        let _ = self.shared.invalidate_jit_for_class(&name);
         // Every tiering verdict recorded against the old bytecode (ineligible,
         // c2_bailout, trap counts, OSR denials) says nothing about the new one.
         self.shared.jit.tiered_manager.on_class_redefined(&name);
@@ -10816,9 +10815,8 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         let mut cm = self.shared.classes.class_manager_write();
         match cm.define_class(name, bytes, ClassLoaderId::Application) {
             Ok(cid) => {
-                // Release the ClassManager write lock before calling
-                // `invalidate_jit_for_class` (which takes a read lock on
-                // the same manager).
+                // Release the ClassManager write lock before invalidating:
+                // nothing below needs it.
                 drop(cm);
                 // Invalidate JIT-compiled methods that inlined from this class (Session 31)
                 let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
@@ -10827,17 +10825,9 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                         "JIT: invalidated {evicted} method(s) due to class reload: {name}"
                     );
                 }
-                // T5.4.4 вЂ” additionally consult the InvalidationManager's
-                // LeafClass/class_dependencies entries.
-                let cha_evicted = self.shared.invalidate_jit_for_class(name);
                 // A define over an already-loaded name replaces that class's
                 // bytecode, and with it every tiering verdict about the old one.
                 self.shared.jit.tiered_manager.on_class_redefined(name);
-                if cha_evicted > 0 {
-                    tracing::debug!(
-                        "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
-                    );
-                }
                 Some(cid)
             }
             Err(e) => {
@@ -10905,16 +10895,9 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                         "JIT: invalidated {evicted} method(s) due to class reload: {name}"
                     );
                 }
-                // T5.4.4 вЂ” CHA-listener invalidation
-                let cha_evicted = self.shared.invalidate_jit_for_class(name);
                 // A define over an already-loaded name replaces that class's
                 // bytecode, and with it every tiering verdict about the old one.
                 self.shared.jit.tiered_manager.on_class_redefined(name);
-                if cha_evicted > 0 {
-                    tracing::debug!(
-                        "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
-                    );
-                }
                 Some(cid)
             }
             Err(e) => {
@@ -11043,13 +11026,9 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         if evicted > 0 {
             tracing::debug!("JIT: invalidated {evicted} method(s) due to defineClass: {name}");
         }
-        let cha_evicted = self.shared.invalidate_jit_for_class(name);
         // A define over an already-loaded name replaces that class's bytecode,
         // and with it every tiering verdict about the old one.
         self.shared.jit.tiered_manager.on_class_redefined(name);
-        if cha_evicted > 0 {
-            tracing::debug!("JIT: CHA-invalidated {cha_evicted} method(s) for: {name}");
-        }
 
         if opts.initialize {
             // Best-effort init; failures bubble back as Err.

@@ -1999,7 +1999,7 @@ pub fn execute(
         // sealed for the reason it computes — it was re-running, not running
         // once per method.
         //
-        // Stamped with `redefine_epoch()` because a stale PASS is unsafe in a
+        // Stamped with this VM's `JitCache::redefine_epoch()` because a stale PASS is unsafe in a
         // way a stale seal is not: see `JitRealm::jit_gate_pass`.
         // Keyed on `ClassId`, not on the class name the negative set uses — see
         // `JitRealm::jit_gate_pass` for why the name is safe there and unsafe
@@ -2009,7 +2009,7 @@ pub fn execute(
         {
             None
         } else {
-            let epoch = cratonvm_jit::redefine_epoch();
+            let epoch = shared.jit.jit_cache.redefine_epoch();
             shared
                 .jit
                 .jit_gate_pass
@@ -2121,7 +2121,7 @@ pub fn execute(
                 cratonvm_jit::note_jit_gate_pass_fill();
                 shared.jit.jit_gate_pass.write().insert(
                     (class_id, gate_pass_key.0.clone(), gate_pass_key.1.clone()),
-                    (cratonvm_jit::redefine_epoch(), is_interface_default),
+                    (shared.jit.jit_cache.redefine_epoch(), is_interface_default),
                 );
             }
             (
@@ -2182,8 +2182,8 @@ pub fn execute(
         // from redefining with *byte-identical* bytecode.
         //
         // It was also protecting nothing. `redefine_class` already evicts
-        // every compiled artifact — `jit_cache.write().clear_all()` plus
-        // `invalidate_jit_for_class` in `vm_exec.rs` — so no code compiled
+        // every compiled artifact — `jit_cache.write().clear_all()` in
+        // `vm_exec.rs` — so no code compiled
         // from the old body can survive the redefinition, and a later
         // compilation necessarily reads the current (agent-woven) bytecode
         // out of the class store. Blocking recompilation on top of a full

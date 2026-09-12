@@ -12414,8 +12414,8 @@ impl Compiler {
                             // Layout (verified by `test_jit_mic_slot_offsets` in
                             // jit/src/lib.rs; struct is `#[repr(C)]`):
                             //   offset  0  AtomicU32  cached_class_id
-                            //   offset  8  AtomicU64  cached_entry_ptr
-                            //   offset 16  AtomicBool cached_needs_context
+                            //   offset  8  AtomicU64  cached_entry_word
+                            //              (entry | needs-context in bit 0)
                             //
                             // HIGH-7 follow-up — Inline 4-way PIC fast-path
                             // guard. `JitPICSlot` is now `#[repr(C)]` with
@@ -12425,7 +12425,10 @@ impl Compiler {
                             //
                             //   CLASS_ID_OFFSETS      = [0, 4, 8, 12]
                             //   ENTRY_PTR_OFFSETS     = [16, 24, 32, 40]
-                            //   NEEDS_CONTEXT_OFFSETS = [48, 49, 50, 51]
+                            //
+                            // Each entry offset holds a TAGGED word: the
+                            // target address with bit 0 set when it needs
+                            // the VM context (`JIT_IC_NEEDS_CONTEXT_TAG`).
                             //
                             // The Mutex<Option<String>> array (`class_names`)
                             // is moved to the tail so its unstable layout
@@ -12442,15 +12445,17 @@ impl Compiler {
                             //   mov   eax, [rax]                       ; class_id @ ObjectHeader+0
                             //   ; --- per slot i in 0..4 ---
                             //   cmp   eax, [r10 + CLASS_ID_OFFSETS[i]]
-                            //   jne   .try_{i+1}  (or .miss for i==2)
-                            //   cmp   byte [r10 + NEEDS_CONTEXT_OFFSETS[i]], 0
-                            //   je    .noctx
-                            //   <load context ABI: vm_ptr + arg_slots[0..n]>
-                            //   jmp   .call
+                            //   jne   .try_{i+1}  (or .miss for the last)
+                            //   mov   r11, [r10 + ENTRY_PTR_OFFSETS[i]] ; ONE load
+                            //   test  r11, r11
+                            //   jz    .miss
+                            //   btr   r11, 0          ; CF = needs-context tag
+                            //   jnc   .noctx
+                            //   jmp   .call           ; context ABI already live
                             // .noctx:
                             //   <load context-free ABI: arg_slots[0..n]>
                             // .call:
-                            //   call  qword [r10 + ENTRY_PTR_OFFSETS[i]]
+                            //   call  r11
                             //   jmp   .done
                             //   ; --- end per-slot ---
                             // .miss:
@@ -12581,7 +12586,6 @@ impl Compiler {
                                 // a compile error here.
                                 const CLASS_ID_OFFS: [u8; 4] = [0, 4, 8, 12];
                                 const ENTRY_PTR_OFFS: [u8; 4] = [16, 24, 32, 40];
-                                const NEEDS_CTX_OFFS: [u8; 4] = [48, 49, 50, 51];
 
                                 // Compile-time sanity: the byte offsets we
                                 // hardcode in the encodings below must
@@ -12597,10 +12601,8 @@ impl Compiler {
                                         && crate::JitPICSlot::ENTRY_PTR_OFFSETS[1] == 24
                                         && crate::JitPICSlot::ENTRY_PTR_OFFSETS[2] == 32
                                         && crate::JitPICSlot::ENTRY_PTR_OFFSETS[3] == 40
-                                        && crate::JitPICSlot::NEEDS_CONTEXT_OFFSETS[0] == 48
-                                        && crate::JitPICSlot::NEEDS_CONTEXT_OFFSETS[1] == 49
-                                        && crate::JitPICSlot::NEEDS_CONTEXT_OFFSETS[2] == 50
-                                        && crate::JitPICSlot::NEEDS_CONTEXT_OFFSETS[3] == 51
+                                        // `BTR R11, 0` below strips exactly bit 0.
+                                        && crate::JIT_IC_NEEDS_CONTEXT_TAG == 1
                                 );
 
                                 // R10 = pic_ptr (imm64, fixed 10-byte form).
@@ -12864,28 +12866,33 @@ impl Compiler {
                                         miss_patches_rel32.push(self.buf.pos() - 4);
                                     }
 
+                                    // Capture the way's target ONCE. The word
+                                    // carries the entry AND its calling
+                                    // convention, so the ABI chosen below and
+                                    // the CALL can never come from two
+                                    // different publications of this way.
+                                    // MOV R11, qword [R10 + ENTRY_PTR_OFFS[i]]
+                                    // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
+                                    self.buf.emit(&[0x4D, 0x8B, 0x5A, ENTRY_PTR_OFFS[i]]);
                                     // A receiver profile may pre-populate only
-                                    // class_id; entry_ptr remains zero until
-                                    // the resolving helper compiles and
-                                    // publishes a concrete target.
-                                    // CMP QWORD [R10 + ENTRY_PTR_OFFS[i]], 0
-                                    self.buf.emit(&[0x49, 0x83, 0x7A, ENTRY_PTR_OFFS[i], 0x00]);
-                                    // JE rel32 → .miss
+                                    // class_id, and a retired way's word is
+                                    // zeroed: never CALL a zero target.
+                                    // TEST R11, R11 (3 bytes)
+                                    self.buf.emit(&[0x4D, 0x85, 0xDB]);
+                                    // JZ rel32 → .miss
                                     self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                                     miss_patches_rel32.push(self.buf.pos() - 4);
 
-                                    // CMP BYTE [R10 + NEEDS_CTX_OFFS[i]], 0
-                                    // 5 bytes: REX.B (0x41) + 80 /7 + modrm
-                                    //   modrm = mod(01) reg(/7=111) rm(010)
-                                    //         = 0b01_111_010 = 0x7A
-                                    //   + disp8 + imm8(0)
-                                    self.buf.emit(&[0x41, 0x80, 0x7A, NEEDS_CTX_OFFS[i], 0x00]);
+                                    // BTR R11, 0 — CF := the needs-context
+                                    // tag, R11 := the bare entry address.
+                                    // 5 bytes: REX.WB + 0F BA /6 + ModRM(11,110,R11) + imm8
+                                    self.buf.emit(&[0x49, 0x0F, 0xBA, 0xF3, 0x00]);
 
-                                    // JE rel32 → .noctx. Both ABI shapes are
+                                    // JNC rel32 → .noctx. Both ABI shapes are
                                     // valid cache hits; small interface
                                     // implementations are commonly
                                     // context-free.
-                                    self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                    self.buf.emit(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]);
                                     let noctx_patch = self.buf.pos() - 4;
 
                                     // Callee ABI args (vm_ptr + n) have
@@ -12920,40 +12927,22 @@ impl Compiler {
                                     );
                                     self.buf.try_patch_i32(ctx_call_patch, call_rel as i32).ok();
 
-                                    // SECURITY FIX (V1): do NOT keep the
-                                    // call target live in memory addressed
-                                    // through R10 across an indirect CALL.
-                                    // R10 is the shared bounds-check / SIMD
-                                    // scratch register (see SCRATCH_REGS
-                                    // exclusion and emit_bounds_check, which
-                                    // clobbers R10D). Previously this site
-                                    // emitted `CALL qword [R10 + disp]`, so
-                                    // ANY R10-clobbering instruction emitted
-                                    // in the window between `MOV R10,&slot`
-                                    // and the CALL would corrupt the call
-                                    // target → indirect call to an attacker-
-                                    // influenced address. We close the window
-                                    // to a single, fixed instruction pair:
-                                    // load the entry_ptr into R11 (a
-                                    // caller-saved scratch reg that is NOT in
-                                    // ARG_REGS / SCRATCH_REGS / LOCAL_REGS and
-                                    // is clobbered by the call anyway) and
-                                    // CALL R11. The R10→R11 load reads R10
-                                    // exactly once, immediately before the
-                                    // CALL, with nothing emittable in between,
-                                    // so no later codegen can perturb the
-                                    // target. INVARIANT: nothing may be
-                                    // emitted between this entry-ptr load and
-                                    // the paired `CALL R11` below.
+                                    // SECURITY FIX (V1): do NOT keep the call
+                                    // target live in memory addressed through
+                                    // R10 across an indirect CALL — R10 is the
+                                    // shared bounds-check / SIMD scratch
+                                    // register. The target was captured into
+                                    // R11 above (a caller-saved scratch reg
+                                    // that is NOT in ARG_REGS / SCRATCH_REGS /
+                                    // LOCAL_REGS and is clobbered by the call
+                                    // anyway) and R10 is not read again.
+                                    // Between that capture and this CALL only
+                                    // the `emit_load_local` loads of the
+                                    // no-context ABI run, and they write
+                                    // ARG_REGS alone. INVARIANT: nothing that
+                                    // writes R11 may be emitted between the
+                                    // entry-word capture and this `CALL R11`.
                                     //
-                                    // MOV R11, qword [R10 + ENTRY_PTR_OFFS[i]]
-                                    if ENTRY_PTR_OFFS[i] == 0 {
-                                        // 3 bytes: REX.WRB + 8B /r + ModRM(00,R11,R10)
-                                        self.buf.emit(&[0x4D, 0x8B, 0x1A]);
-                                    } else {
-                                        // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
-                                        self.buf.emit(&[0x4D, 0x8B, 0x5A, ENTRY_PTR_OFFS[i]]);
-                                    }
                                     // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
                                     self.buf.emit(&[0x41, 0xFF, 0xD3]);
                                     // A compiled callee's prologue publishes
@@ -13112,27 +13101,35 @@ impl Compiler {
                                 self.buf.emit(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
                                 mic_miss_patches32.push(self.buf.pos() - 4);
 
+                                // Capture the tagged target word ONCE: the
+                                // entry address with the needs-context flag in
+                                // bit 0, so the ABI and the call target come
+                                // from the same publication.
+                                // MOV R11, qword [R10 + 8]
+                                // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
+                                self.buf.emit(&[0x4D, 0x8B, 0x5A, 0x08]);
                                 // A profiled MIC can publish the receiver class
                                 // before the helper has installed a compiled
-                                // target. Never CALL a class-only seed.
-                                // CMP QWORD [R10 + 8], 0
-                                self.buf.emit(&[0x49, 0x83, 0x7A, 0x08, 0x00]);
-                                // JE rel32 → .miss
+                                // target, and a withdrawal zeroes the word.
+                                // Never CALL a zero target.
+                                // TEST R11, R11 (3 bytes)
+                                self.buf.emit(&[0x4D, 0x85, 0xDB]);
+                                // JZ rel32 → .miss
                                 self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                                 mic_miss_patches32.push(self.buf.pos() - 4);
 
-                                // CMP BYTE [R10 + 16], 0  — select cached entry ABI.
-                                // 5 bytes: REX.B (0x41) + 80 /7 + modrm(01 111 010) + disp8 + imm8
-                                self.buf.emit(&[0x41, 0x80, 0x7A, 0x10, 0x00]);
+                                // BTR R11, 0 — CF := needs-context, R11 := entry.
+                                // 5 bytes: REX.WB + 0F BA /6 + ModRM(11,110,R11) + imm8
+                                self.buf.emit(&[0x49, 0x0F, 0xBA, 0xF3, 0x00]);
 
-                                // JE rel32 → .noctx. Context-free compiled
+                                // JNC rel32 → .noctx. Context-free compiled
                                 // methods use Java arg0 in ARG_REGS[0], while
                                 // context-using methods reserve that register
                                 // for vm_ptr. The cache publishes this ABI bit;
                                 // honoring both shapes is essential because
                                 // small interface implementations almost
                                 // always compile context-free.
-                                self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                self.buf.emit(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]);
                                 let noctx_patch = self.buf.pos() - 4;
 
                                 // ---- Set up callee ABI: (vm_ptr, arg_slots[0..n]) ----
@@ -13170,25 +13167,14 @@ impl Compiler {
                                 self.buf.try_patch_i32(ctx_call_patch, call_rel as i32).ok();
 
                                 // SECURITY FIX (V1): same hardening as the
-                                // PIC arm — never CALL indirectly through a
-                                // target addressed by R10, because R10 is the
-                                // shared bounds-check / SIMD scratch register
-                                // and any R10-clobbering instruction emitted
-                                // in the window between `MOV R10,&slot` and
-                                // the CALL would redirect the call. The
-                                // ABI-marshalling loop above this point loads
-                                // into ARG_REGS (never R10), so R10 is intact
-                                // here today, but we still tighten the window
-                                // to a single fixed pair: load the cached
-                                // entry_ptr into R11 (caller-saved scratch,
-                                // not in ARG_REGS / SCRATCH_REGS / LOCAL_REGS,
-                                // clobbered by the call anyway) and CALL R11.
-                                // INVARIANT: nothing may be emitted between
-                                // this load and the paired `CALL R11`.
+                                // PIC arm — the target was captured into R11
+                                // (caller-saved scratch, not in ARG_REGS /
+                                // SCRATCH_REGS / LOCAL_REGS) before the ABI
+                                // marshalling, which loads into ARG_REGS only,
+                                // and R10 is not read again. INVARIANT: nothing
+                                // that writes R11 may be emitted between the
+                                // entry-word capture and this `CALL R11`.
                                 //
-                                // MOV R11, qword [R10 + 8]  — cached_entry_ptr.
-                                // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
-                                self.buf.emit(&[0x4D, 0x8B, 0x5A, 0x08]);
                                 // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
                                 self.buf.emit(&[0x41, 0xFF, 0xD3]);
                                 self.emit_post_call_rbp_republish();

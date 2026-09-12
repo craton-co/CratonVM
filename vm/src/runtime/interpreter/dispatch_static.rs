@@ -1617,7 +1617,7 @@ pub(super) fn execute_invokestatic_cached(
             // compile had published a body. That is exactly the re-resolution
             // this per-call-site inline cache exists to avoid.
             //
-            // It is now epoch-guarded: `jit_cache_generation()` advances on every
+            // It is now epoch-guarded: this VM's `JitCache::generation()` advances on every
             // JIT-cache publication AND every invalidation (see
             // `jit::JitCache::put`/`put_osr`/`invalidate_matching`/`clear_all` --
             // the only mutators), so while this entry's snapshot still equals the
@@ -1631,7 +1631,7 @@ pub(super) fn execute_invokestatic_cached(
                 // compares unequal next time and re-probes -- safe. Memoizing a
                 // generation NEWER than the probe would be the unsound direction,
                 // and this ordering makes it impossible.
-                let jit_generation = cratonvm_jit::jit_cache_generation();
+                let jit_generation = shared.jit.jit_cache.generation();
                 let compiled_probe = if cached.jit_probe_is_current(jit_generation) {
                     None
                 } else {

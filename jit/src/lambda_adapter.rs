@@ -7,7 +7,7 @@
 //!
 //! `jit_invoke_virtual_mic`'s emitted cascade is the reason an ordinary
 //! `invokeinterface` costs ~12 ns in this VM: it compares the receiver's class
-//! id against the slot's, loads `cached_entry_ptr`, and CALLs it with the
+//! id against the slot's, loads `cached_entry_word`, and CALLs it with the
 //! caller's own argument registers — never leaving compiled code. For a named
 //! class the Rust helper is entered ONCE per call site
 //! (`mic_calls=1` across 2 200 000 dispatches, measured with

@@ -520,3 +520,27 @@ thread-local that outlives a VM, answer three questions:
 
 And: there is exactly one VM-identity notion — `SharedVm::vm_identity` /
 `NativeContext::vm_identity()` / `VmId`. Do not add a second.
+
+---
+
+## 8. JIT code memory and its bookkeeping (2026-09-12)
+
+Not part of §2's counts. Compiled code is the one subsystem where most of the
+state is process-scoped on purpose: executable pages are an OS resource, and an
+OS thread can run compiled code belonging to more than one VM, so anything that
+decides "may this body be freed?" has to see every thread in the process.
+
+| # | State | Where | Holds | Scope | Verdict |
+|---|-------|-------|-------|-------|---------|
+| J1 | `JitCache`: shards, flush barrier, invalidation log, `generation()`, `redefine_epoch()` | `jit/src/lib.rs` (`JitRealm::jit_cache`) | compiled bodies by key, and "has this VM's cache changed?" | per-VM | per-VM. The generation the interpreter's negative memos compare against and the redefinition epoch inline caches stamp were process-global (`JIT_CACHE_GENERATION`, `REDEFINE_EPOCH`), so one VM's compile or redefinition flushed every VM's memos and inline caches. **FIXED**: both are fields of the cache. |
+| J2 | `JIT_CACHE_GENERATION` | `jit/src/lib.rs` | count of every cache's publications and invalidations | process | PROCESS. Kept for the per-thread raw-entry dispatch memos in `vm/src/jit/helpers.rs` (`flush_raw_entry_dispatch_caches`): they live in thread-locals that outlive a VM and are keyed `(vm_identity, info)`, so a process count can only over-flush them. |
+| J3 | `JIT_INSTALL_EPOCH`, `JIT_INVALIDATION_EPOCH` | `jit/src/lib.rs` | stamps taken when a compilation begins | process counter, per-cache gate | PROCESS. Monotonic counters: another VM's bump only makes a stamp older. The gates that compare against them (`flush_barrier`, the invalidation log) are per cache. |
+| J4 | executable mappings, `COMMITTED_JIT_CODE_BYTES`, the code-cache cap | `jit/src/lib.rs`, `jit/src/platform.rs` | OS pages | process | PROCESS, with one CONTENTION: the cap is shared, so one VM's code counts against another's (`jit_code_cache_at_capacity`). |
+| J5 | retirement queue (`DEFERRED_JIT_OWNERS`), `ACTIVE_JIT_EXECUTIONS`, `JIT_THREADS`, `JIT_RETIRE_GENERATION` / `JIT_GRACED_GENERATION`, reclamation counters | `jit/src/lib.rs` | owners awaiting grace; per-thread in-JIT records | process | PROCESS by necessity (a grace period must cover every thread that could be inside a body). |
+| J6 | code-range registry, region list, `JIT_ENTRY_OWNERS`, compile-id table, `JIT_NAME_RANGES`, implicit-null ranges | `jit/src/lib.rs`, `jit/src/implicit_null.rs` | metadata for signal handlers, stack walkers and pointer validation | process | PROCESS. Keyed by code address (or a compile id bound to one), which is unique while mapped; every entry is withdrawn before its buffer is unmapped, and a released compile id is reissued only after grace. |
+| J7 | `TYPECHECK_NAME_INTERN` / `TYPECHECK_TARGET_BY_SITE` | `jit/src/lib.rs` | leaked names keyed by `(name, ClassId)` | per-VM ideally | CONTENTION. A `ClassId` is per-VM (Fact 1), so `jit_typecheck_resolve` re-verifies that the recorded id names the site's class in its own VM before trusting it (the `frame.rs` pattern). Leaks one string per distinct pair. |
+
+Rule for this subsystem: bookkeeping may be process-global only if it is keyed
+by a code address that is unique while mapped, or if it is a monotonic counter
+whose gate lives per VM. Anything that answers "has *this VM* changed?" belongs
+on that VM's `JitCache`.

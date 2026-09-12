@@ -10,9 +10,6 @@
 //!   that describes how to reconstruct an interpreter frame at each deopt site.
 //! - A `DeoptimizationLog` that records deopt events and drives adaptive
 //!   recompilation decisions.
-//! - An `InvalidationManager` that tracks compilation assumptions and
-//!   determines which methods must be invalidated when the class hierarchy
-//!   changes.
 //! - A [`DeoptVerifier`] that checks emitted deopt metadata *before* the
 //!   artifact is installed, so a frame that could not be reconstructed
 //!   byte-for-byte bails the compile instead of becoming live code.
@@ -810,15 +807,14 @@ pub fn despec_clear_for_test() {
 /// trampoline can decide — **before dereferencing the box** — whether the
 /// speculation it bakes has been superseded by a later invalidation.
 ///
-/// Why a separate cell rather than a field on the box: the box describes the
-/// speculation and must be dereferenced to reconstruct the interpreter frame.
-/// Under the `CRATONVM_JIT_FREE_CODE=1` A/B mode an evicted artifact's
-/// `DeoptimizationPoint` boxes can be freed; reading the epoch *from* the box
-/// would itself be the use-after-free we are trying to avoid. This guard is
-/// retained independently of the artifact (see [`crate::CompiledMethod`]'s
-/// `Drop`), so `x64_deopt_entry` reads the live epoch and the artifact's
-/// creation epoch from here without touching the box at all when the artifact is
-/// stale. ("bake a stable live-epoch cell pointer alongside the box.")
+/// Why a separate cell rather than a field on the box: it was built for a
+/// `CRATONVM_JIT_FREE_CODE=1` A/B mode in which an evicted artifact's
+/// `DeoptimizationPoint` boxes could be freed under a running frame, so reading
+/// the epoch *from* the box would itself have been the use-after-free. That mode
+/// is gone (an executing artifact owns its boxes until it returns), and
+/// `x64_deopt_entry` no longer short-circuits on this guard. It is still leaked
+/// independently of the artifact and still stamped, so the stub ABI and the
+/// VM-side staleness check keep a stable cell to read.
 ///
 /// Stamped once by the VM at install time (`SharedVm`/`stamp_compilation_epoch`)
 /// under `deopt_real_enabled()`; on every production artifact it stays
@@ -1164,324 +1160,6 @@ impl DeoptimizationLog {
         } else {
             DeoptAction::MakeNotCompilable
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Compilation assumptions & invalidation
-// ---------------------------------------------------------------------------
-
-/// An assumption the JIT made while compiling a method.
-#[derive(Debug, Clone)]
-pub enum CompilationAssumption {
-    /// Class has no subclasses (enables devirtualization).
-    LeafClass(u32),
-    /// A concrete method is the only implementation.
-    UniqueConcreteMethod { class_id: u32, method_name: String },
-    /// A field is always non-null.
-    NonNullField { class_id: u32, field_index: usize },
-    /// A branch is never taken.
-    UncommonBranch { bci: u32 },
-    /// A type check always succeeds with a specific type.
-    StableType { bci: u32, expected_class: u32 },
-}
-
-/// Tracks assumptions and class dependencies so compiled code can be
-/// invalidated when the class hierarchy changes.
-/// T10.9.B: FxHashMap — internal method names and class_id keys.
-///
-/// PERF (jit-deopt-perf): `on_class_loaded` / `on_method_override` used to
-/// scan EVERY method's full assumption list on every class-load /
-/// method-override event — O(methods × assumptions) per event, i.e. a linear
-/// sweep over the entire assumption table on every single class load. We now
-/// maintain two reverse indices (`leaf_class_index`, `unique_method_index`)
-/// keyed by the class / (class, method) an assumption depends on, so an event
-/// visits only the assumptions that actually reference it. The indices are
-/// kept in lock-step with `assumptions` in `register_assumption` /
-/// `clear_assumptions`; invalidation correctness is preserved exactly (every
-/// dependent assumption that fired before still fires, with the same dedup).
-pub struct InvalidationManager {
-    assumptions: FxHashMap<String, Vec<CompilationAssumption>>,
-    class_dependencies: FxHashMap<u32, Vec<String>>,
-    /// Reverse index: class_id → method keys that hold a `LeafClass(class_id)`
-    /// assumption. Each method key appears at most once per class_id (matching
-    /// the old per-method `break` dedup). Mirrors the `LeafClass` entries in
-    /// `assumptions`.
-    leaf_class_index: FxHashMap<u32, Vec<String>>,
-    /// Reverse index: (class_id, method_name) → method keys that hold a
-    /// `UniqueConcreteMethod { class_id, method_name }` assumption. Each method
-    /// key appears at most once per (class_id, method_name). Mirrors the
-    /// `UniqueConcreteMethod` entries in `assumptions`.
-    unique_method_index: FxHashMap<(u32, String), Vec<String>>,
-    /// Reverse index: expected receiver class_id → method keys that hold a
-    /// `StableType { expected_class }` assumption. Mirrors the `StableType`
-    /// entries in `assumptions`, same per-key dedup as the two indices above.
-    ///
-    /// PGO-02 (`docs/feature-designs/profile-guided-inlining.md` §4): a guarded
-    /// receiver speculation IS a `StableType` assumption, and this index is
-    /// what [`Self::on_class_loaded_with_supertypes`] queries. It exists
-    /// because a speculation on class `A` must be RETIRED when a descendant of
-    /// `A` is loaded — not for correctness (an exact class-id guard rechecks
-    /// the receiver and routes a miss to normal dispatch) but because without
-    /// a retirement event the caller keeps paying a guard that now always
-    /// misses, forever, with nothing to trigger a recompile.
-    stable_type_index: FxHashMap<u32, Vec<String>>,
-}
-
-impl InvalidationManager {
-    pub fn new() -> Self {
-        Self {
-            assumptions: FxHashMap::default(),
-            class_dependencies: FxHashMap::default(),
-            leaf_class_index: FxHashMap::default(),
-            unique_method_index: FxHashMap::default(),
-            stable_type_index: FxHashMap::default(),
-        }
-    }
-
-    /// Drop all hierarchy assumptions after class unloading. Unloading is rare
-    /// and invalidates both owners and dependants, so a conservative reset is
-    /// smaller and safer than retaining strings that may name dead metadata.
-    pub fn clear_all(&mut self) {
-        self.assumptions.clear();
-        self.class_dependencies.clear();
-        self.leaf_class_index.clear();
-        self.unique_method_index.clear();
-        self.stable_type_index.clear();
-    }
-
-    /// Register an assumption made while compiling `method`.
-    ///
-    /// PERF-P5 (T10.9.C): same get_mut/insert pattern as `record_deopt`
-    /// — assumptions accumulate over many calls for the same method, so
-    /// skipping `method.to_string()` on the hit path is a real win.
-    ///
-    /// TODO(PERF-P5): take `&Arc<str>` once upstream call sites in
-    /// `vm/src/vm.rs` thread the standard `Arc<str>` method-name carrier.
-    ///
-    /// PERF (jit-deopt-perf): also feed the reverse indices used by
-    /// `on_class_loaded` / `on_method_override` so those events no longer scan
-    /// the whole assumption table. The index update mirrors exactly which
-    /// `(method, assumption)` pairs the old linear scan would have matched.
-    pub fn register_assumption(&mut self, method: &str, assumption: CompilationAssumption) {
-        // Maintain the reverse index for the assumption kinds queried by the
-        // invalidation events. We dedup the method key per index entry so a
-        // method appears at most once in the result — matching the old
-        // per-method `break` after the first match. (A method may register the
-        // same assumption more than once; the index must not list it twice.)
-        match &assumption {
-            CompilationAssumption::LeafClass(cid) => {
-                let entry = self.leaf_class_index.entry(*cid).or_default();
-                if !entry.iter().any(|m| m == method) {
-                    entry.push(method.to_string());
-                }
-            }
-            CompilationAssumption::UniqueConcreteMethod {
-                class_id,
-                method_name,
-            } => {
-                let key = (*class_id, method_name.clone());
-                let entry = self.unique_method_index.entry(key).or_default();
-                if !entry.iter().any(|m| m == method) {
-                    entry.push(method.to_string());
-                }
-            }
-            CompilationAssumption::StableType { expected_class, .. } => {
-                let entry = self.stable_type_index.entry(*expected_class).or_default();
-                if !entry.iter().any(|m| m == method) {
-                    entry.push(method.to_string());
-                }
-            }
-            // Other assumption kinds are not consulted by class-load /
-            // method-override events, so they need no reverse index.
-            _ => {}
-        }
-
-        if let Some(assumptions) = self.assumptions.get_mut(method) {
-            assumptions.push(assumption);
-            return;
-        }
-        self.assumptions
-            .insert(method.to_string(), vec![assumption]);
-    }
-
-    /// Called when a new class is loaded. Returns the set of compiled methods
-    /// whose `LeafClass` assumption on `class_id` is now invalid, plus any
-    /// methods listed in `class_dependencies`.
-    pub fn on_class_loaded(&self, class_id: u32) -> Vec<String> {
-        let mut invalidated = Vec::new();
-
-        // PERF (jit-deopt-perf): O(matches) reverse-index lookup instead of an
-        // O(methods × assumptions) sweep of the whole table. `leaf_class_index`
-        // already holds exactly the method keys whose `LeafClass(class_id)`
-        // assumption is now invalid, deduped per class_id.
-        if let Some(methods) = self.leaf_class_index.get(&class_id) {
-            invalidated.extend(methods.iter().cloned());
-        }
-
-        // Also include direct class dependencies.
-        if let Some(deps) = self.class_dependencies.get(&class_id) {
-            for m in deps {
-                if !invalidated.contains(m) {
-                    invalidated.push(m.clone());
-                }
-            }
-        }
-
-        invalidated
-    }
-
-    /// Called when a new class is loaded, given that class's full supertype
-    /// closure. Returns everything [`Self::on_class_loaded`] would, PLUS every
-    /// method holding a `StableType` assumption on the new class or on any of
-    /// its ancestors.
-    ///
-    /// The supertype argument is what closes the gap
-    /// `docs/feature-designs/profile-guided-inlining.md` §4 records. A guarded
-    /// receiver speculation on `A` is threatened by a *descendant* of `A`
-    /// appearing, not by `A` itself changing — and a class-load event knows
-    /// only the id of the class that just arrived. Asking the caller for the
-    /// closure keeps the hierarchy walk where the class metadata lives,
-    /// instead of building a second parent map in here that could disagree
-    /// with the real one.
-    ///
-    /// The result is a *retirement* set, never a correctness one: a stale
-    /// guard still rechecks the receiver's exact class id and routes a miss to
-    /// normal dispatch. What this buys is that the recheck stops being paid
-    /// forever after the speculation has been falsified.
-    pub fn on_class_loaded_with_supertypes(
-        &self,
-        class_id: u32,
-        supertypes: &[u32],
-    ) -> Vec<String> {
-        let mut invalidated = self.on_class_loaded(class_id);
-        // `class_id` itself covers a redefinition of the speculated class;
-        // every ancestor covers the case this exists for — a NEW DESCENDANT,
-        // whose receivers a guard baked before it existed can only miss.
-        for probe in std::iter::once(&class_id).chain(supertypes.iter()) {
-            let Some(methods) = self.stable_type_index.get(probe) else {
-                continue;
-            };
-            for m in methods {
-                if !invalidated.contains(m) {
-                    invalidated.push(m.clone());
-                }
-            }
-        }
-        invalidated
-    }
-
-    /// Called when a method is overridden in `class_id`. Returns methods whose
-    /// `UniqueConcreteMethod` assumption is now invalid.
-    pub fn on_method_override(&self, class_id: u32, method_name: &str) -> Vec<String> {
-        // PERF (jit-deopt-perf): O(matches) reverse-index lookup instead of an
-        // O(methods × assumptions) sweep. `unique_method_index` already holds
-        // exactly the method keys whose `UniqueConcreteMethod { class_id,
-        // method_name }` assumption is now invalid, deduped per key.
-        //
-        // We allocate one `String` to build the probe key — method-override is
-        // a rare, cold event, so this is dwarfed by the eliminated full-table
-        // scan (and by the work the caller does to actually invalidate code).
-        self.unique_method_index
-            .get(&(class_id, method_name.to_string()))
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Get all assumptions recorded for `method`.
-    pub fn assumptions_for(&self, method: &str) -> &[CompilationAssumption] {
-        self.assumptions.get(method).map_or(&[], |v| v.as_slice())
-    }
-
-    /// Clear assumptions for a method (on recompilation).
-    pub fn clear_assumptions(&mut self, method: &str) {
-        let removed = match self.assumptions.remove(method) {
-            Some(a) => a,
-            // Nothing recorded for this method — indices already consistent.
-            None => return,
-        };
-
-        // PERF (jit-deopt-perf): keep the reverse indices in lock-step. For
-        // each removed assumption, drop this method key from the matching
-        // index entry so `on_class_loaded` / `on_method_override` no longer
-        // report it (preserving exact invalidation correctness). We dedup the
-        // index-key work so a method that registered the same assumption twice
-        // is removed once. Empty buckets are pruned to keep lookups tight.
-        let mut leaf_seen: Vec<u32> = Vec::new();
-        let mut unique_seen: Vec<(u32, &str)> = Vec::new();
-        let mut stable_seen: Vec<u32> = Vec::new();
-        for a in &removed {
-            match a {
-                CompilationAssumption::LeafClass(cid) => {
-                    if leaf_seen.contains(cid) {
-                        continue;
-                    }
-                    leaf_seen.push(*cid);
-                    if let Some(entry) = self.leaf_class_index.get_mut(cid) {
-                        entry.retain(|m| m != method);
-                        if entry.is_empty() {
-                            self.leaf_class_index.remove(cid);
-                        }
-                    }
-                }
-                CompilationAssumption::UniqueConcreteMethod {
-                    class_id,
-                    method_name,
-                } => {
-                    let probe = (*class_id, method_name.as_str());
-                    if unique_seen.contains(&probe) {
-                        continue;
-                    }
-                    unique_seen.push(probe);
-                    let key = (*class_id, method_name.clone());
-                    if let Some(entry) = self.unique_method_index.get_mut(&key) {
-                        entry.retain(|m| m != method);
-                        if entry.is_empty() {
-                            self.unique_method_index.remove(&key);
-                        }
-                    }
-                }
-                CompilationAssumption::StableType { expected_class, .. } => {
-                    if stable_seen.contains(expected_class) {
-                        continue;
-                    }
-                    stable_seen.push(*expected_class);
-                    if let Some(entry) = self.stable_type_index.get_mut(expected_class) {
-                        entry.retain(|m| m != method);
-                        if entry.is_empty() {
-                            self.stable_type_index.remove(expected_class);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Register that `method` depends on `class_id`.
-    ///
-    /// PERF-P5 (T10.9.C): the inner `Vec<String>` still owns its method
-    /// names — but at least skip the empty-vec allocation by using
-    /// `get_mut` first. (We still pay one `String::from(method)` per
-    /// call because the dependency lists may legitimately contain the
-    /// same method multiple times; we are not deduping.)
-    ///
-    /// TODO(PERF-P5): switch `class_dependencies` values to
-    /// `Vec<Arc<str>>` once upstream call sites carry `Arc<str>` keys.
-    pub fn add_class_dependency(&mut self, class_id: u32, method: &str) {
-        if let Some(deps) = self.class_dependencies.get_mut(&class_id) {
-            deps.push(method.to_string());
-            return;
-        }
-        self.class_dependencies
-            .insert(class_id, vec![method.to_string()]);
-    }
-
-    /// Get the list of methods that depend on `class_id`.
-    pub fn methods_depending_on(&self, class_id: u32) -> &[String] {
-        self.class_dependencies
-            .get(&class_id)
-            .map_or(&[], |v| v.as_slice())
     }
 }
 
@@ -1946,14 +1624,6 @@ thread_local! {
     /// consume via [`take_last_deopt`] rather than being resumed directly.
     static LAST_DEOPT: std::cell::RefCell<Option<ReconstructedFrame>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// Legacy compatibility gate. Code reclamation is now ownership-safe in every
-/// configuration: an executing artifact owns its deopt metadata until return,
-/// so a superseded frame remains reconstructable and must not be forced into a
-/// side-effect-replaying whole-method fallback.
-fn jit_free_code_enabled() -> bool {
-    false
 }
 
 /// Take (and clear) the frame most recently reconstructed by a deopt.
@@ -2626,15 +2296,11 @@ pub extern "C" fn ir_deopt_entry(
 /// call. STASH ONLY — no resume yet (that is Step 4).
 ///
 /// deopt-osr Step 9 follow-up (a): a 4th arg, `epoch_guard`, carries the
-/// stable, retained [`DeoptEpochGuard`] baked alongside the box. Before
-/// dereferencing `point`, the entry consults the guard: if the artifact has been
-/// superseded (its creation epoch is older than the method's live epoch), the
-/// baked speculation is stale, so it stashes a sentinel "re-run" frame
-/// (out-of-range bci ⇒ the VM resume path rejects it and re-runs the method)
-/// **without touching `point` at all** — the before-deref check the
-/// `CRATONVM_JIT_FREE_CODE=1` mode needs (where the box may have been freed).
-/// `epoch_guard` is null on every production artifact (the VM stamps it only
-/// under `deopt_real_enabled()`), so the check is inert there.
+/// stable, retained [`DeoptEpochGuard`] baked alongside the box. It is accepted
+/// and ignored: the before-deref short-circuit it fed existed only for the
+/// deleted `CRATONVM_JIT_FREE_CODE=1` mode (see the body). `epoch_guard` is null
+/// on every production artifact anyway (the VM stamps it only under
+/// `deopt_real_enabled()`).
 ///
 /// # Safety
 /// `point` and `regs` must be non-null and valid for the trapping frame, and
@@ -2647,49 +2313,19 @@ pub extern "C" fn x64_deopt_entry(
     regs: *const SavedRegisters,
     epoch_guard: *const DeoptEpochGuard,
 ) -> i64 {
-    // Before-deref staleness short-circuit — ONLY when `CRATONVM_JIT_FREE_CODE`
-    // is set (the A/B mode that actually frees artifacts and their deopt-point
-    // boxes on eviction). In the default retain-everything mode the box is
-    // leaked for the process lifetime (see `CompiledMethod`'s Drop), and a
-    // superseded artifact's snapshot is still SELF-CONSISTENT with the machine
-    // state of the (retained, still-executing) code that trapped — the epochs
-    // version the SPECULATION, not the frame layout. Short-circuiting here for
-    // retained code stashed an identity-less `bci == u32::MAX` sentinel that
-    // forced every post-supersession trap onto the imprecise whole-method
-    // re-run — re-introducing the side-effect duplication for exactly the
-    // methods that keep getting dispatched via stale cached entries after
-    // their first de-speculation (jit-invokedynamic-groovy-regression fix).
-    if !epoch_guard.is_null() && jit_free_code_enabled() {
-        // SAFETY: a non-null `epoch_guard` is a retained `DeoptEpochGuard`
-        // (process-lifetime, see `CompiledMethod`'s Drop) — valid to read.
-        let guard = unsafe { &*epoch_guard };
-        if guard.is_superseded() {
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
-                eprintln!(
-                    "[cratonvm-deopt] x64 frame-deopt SUPERSEDED (creation_epoch={} < live) — \
-                     skipping reconstruction, routing to safe re-run",
-                    guard
-                        .creation_epoch
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
-            }
-            // Stash a sentinel so the VM treats this as deopt-and-re-run
-            // (take_last_deopt is Some), never as a real i64::MIN return. The
-            // out-of-range bci makes the resume path fail → safe whole-method
-            // re-run. No `point` deref.
-            LAST_DEOPT.with(|c| {
-                *c.borrow_mut() = Some(ReconstructedFrame {
-                    method_key: String::new(),
-                    bci: u32::MAX,
-                    locals: Vec::new(),
-                    stack: Vec::new(),
-                    monitors: Vec::new(),
-                    caller_frames: Vec::new(),
-                })
-            });
-            return i64::MIN;
-        }
-    }
+    // No staleness short-circuit, even for a superseded guard. The trapping
+    // frame is executing its artifact, and an executing artifact owns its deopt
+    // boxes until it returns (the retirement queue reclaims a body only once no
+    // thread can be inside it). So the box is valid, and a superseded
+    // artifact's snapshot is still SELF-CONSISTENT with the machine state of the
+    // code that trapped: the epochs version the SPECULATION, not the frame
+    // layout. A short-circuit here stashed an identity-less `bci == u32::MAX`
+    // sentinel that forced every post-supersession trap onto the imprecise
+    // whole-method re-run, duplicating side effects
+    // (jit-invokedynamic-groovy-regression fix). It survived only under a
+    // `CRATONVM_JIT_FREE_CODE=1` mode that freed boxes under running frames, and
+    // was deleted with that mode. `epoch_guard` stays in the stub ABI.
+    let _ = epoch_guard;
     if point.is_null() || regs.is_null() {
         return i64::MIN;
     }
@@ -2772,18 +2408,14 @@ mod x64_deopt_entry_tests {
     }
 
     /// deopt-osr Step 9 follow-up (a), REVISED by the
-    /// jit-invokedynamic-groovy-regression identity fix: in the default
-    /// retain-everything mode (`CRATONVM_JIT_FREE_CODE` unset — which unit
-    /// tests must assume, since mutating a process-global env var races
-    /// parallel tests) a SUPERSEDED guard NO LONGER short-circuits — the
-    /// artifact's code and deopt boxes are leaked for the process lifetime,
-    /// so the box is valid and its snapshot is self-consistent with the
-    /// (stale, still-executing) code that trapped. The entry must proceed to
-    /// a normal reconstruction; short-circuiting here stashed an
-    /// identity-less `bci == u32::MAX` sentinel that forced every
-    /// post-supersession trap onto the corrupting imprecise re-run. (The
-    /// before-deref short-circuit still exists under `CRATONVM_JIT_FREE_CODE`
-    /// — not unit-covered, by the env-race constraint above.)
+    /// jit-invokedynamic-groovy-regression identity fix: a SUPERSEDED guard
+    /// does not short-circuit. The trapping frame owns its artifact, so the
+    /// box is valid and its snapshot is self-consistent with the (stale,
+    /// still-executing) code that trapped. The entry must proceed to a normal
+    /// reconstruction; short-circuiting here stashed an identity-less
+    /// `bci == u32::MAX` sentinel that forced every post-supersession trap
+    /// onto the corrupting imprecise re-run. (The short-circuit survived under
+    /// a `CRATONVM_JIT_FREE_CODE=1` mode, since deleted.)
     #[test]
     fn superseded_guard_still_reconstructs_in_retain_mode() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -7357,226 +6989,6 @@ mod tests {
         };
         assert_eq!(event.timestamp_ms, 123456789);
         assert_eq!(event.speculation_id, 7);
-    }
-
-    // -- InvalidationManager -----------------------------------------------
-
-    #[test]
-    fn invalidation_register_assumption() {
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption("m", CompilationAssumption::LeafClass(1));
-        assert_eq!(mgr.assumptions_for("m").len(), 1);
-    }
-
-    #[test]
-    fn invalidation_on_class_loaded_leaf() {
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption("m1", CompilationAssumption::LeafClass(10));
-        mgr.register_assumption("m2", CompilationAssumption::LeafClass(20));
-        let inv = mgr.on_class_loaded(10);
-        assert!(inv.contains(&"m1".to_string()));
-        assert!(!inv.contains(&"m2".to_string()));
-    }
-
-    #[test]
-    fn invalidation_on_method_override() {
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption(
-            "caller",
-            CompilationAssumption::UniqueConcreteMethod {
-                class_id: 5,
-                method_name: "run".to_string(),
-            },
-        );
-        let inv = mgr.on_method_override(5, "run");
-        assert_eq!(inv, vec!["caller".to_string()]);
-    }
-
-    #[test]
-    fn invalidation_on_method_override_no_match() {
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption(
-            "caller",
-            CompilationAssumption::UniqueConcreteMethod {
-                class_id: 5,
-                method_name: "run".to_string(),
-            },
-        );
-        let inv = mgr.on_method_override(5, "stop");
-        assert!(inv.is_empty());
-    }
-
-    #[test]
-    fn invalidation_class_dependency() {
-        let mut mgr = InvalidationManager::new();
-        mgr.add_class_dependency(10, "dep_method");
-        let deps = mgr.methods_depending_on(10);
-        assert_eq!(deps, &["dep_method".to_string()]);
-    }
-
-    #[test]
-    fn invalidation_class_loaded_includes_dependencies() {
-        let mut mgr = InvalidationManager::new();
-        mgr.add_class_dependency(10, "dep_method");
-        let inv = mgr.on_class_loaded(10);
-        assert!(inv.contains(&"dep_method".to_string()));
-    }
-
-    #[test]
-    fn invalidation_clear_assumptions() {
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption("m", CompilationAssumption::LeafClass(1));
-        mgr.register_assumption("m", CompilationAssumption::UncommonBranch { bci: 5 });
-        assert_eq!(mgr.assumptions_for("m").len(), 2);
-        mgr.clear_assumptions("m");
-        assert_eq!(mgr.assumptions_for("m").len(), 0);
-    }
-
-    #[test]
-    fn invalidation_empty_dependencies() {
-        let mgr = InvalidationManager::new();
-        assert!(mgr.methods_depending_on(999).is_empty());
-    }
-
-    // -- reverse-index correctness (jit-deopt-perf) ------------------------
-
-    #[test]
-    fn invalidation_clear_removes_from_leaf_index() {
-        // After clearing, on_class_loaded must no longer report the method —
-        // this guards the reverse-index teardown in clear_assumptions.
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption("m", CompilationAssumption::LeafClass(42));
-        assert_eq!(mgr.on_class_loaded(42), vec!["m".to_string()]);
-        mgr.clear_assumptions("m");
-        assert!(mgr.on_class_loaded(42).is_empty());
-    }
-
-    /// PGO-02 §4: a guarded receiver speculation on `A` must be retired when a
-    /// DESCENDANT of `A` is loaded — including a grandchild, which the old
-    /// direct-superclass-only reach missed entirely.
-    #[test]
-    fn stable_type_speculation_is_retired_by_a_descendant_load() {
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption(
-            "app/Caller.run()V",
-            CompilationAssumption::StableType {
-                bci: 12,
-                expected_class: 100, // app/Circle
-            },
-        );
-
-        // The old query cannot see it at all: `on_class_loaded` only consults
-        // the LeafClass index, so a StableType assumption had no retirement
-        // path of any kind.
-        assert!(mgr.on_class_loaded(200).is_empty());
-
-        // Direct subclass: supertype closure is [Circle].
-        assert_eq!(
-            mgr.on_class_loaded_with_supertypes(200, &[100]),
-            vec!["app/Caller.run()V".to_string()]
-        );
-        // GRANDCHILD: closure is [SmallCircle, Circle]. This is the case §4
-        // documented as unreachable.
-        assert_eq!(
-            mgr.on_class_loaded_with_supertypes(300, &[200, 100]),
-            vec!["app/Caller.run()V".to_string()]
-        );
-        // Redefining the speculated class itself.
-        assert_eq!(
-            mgr.on_class_loaded_with_supertypes(100, &[]),
-            vec!["app/Caller.run()V".to_string()]
-        );
-        // An unrelated hierarchy must not evict — invalidation that fires on
-        // everything is invalidation nobody can afford to leave on.
-        assert!(mgr
-            .on_class_loaded_with_supertypes(400, &[401, 402])
-            .is_empty());
-    }
-
-    /// The `StableType` index tears down with the assumption, like the other
-    /// two. A retirement index that outlives its assumption evicts code for a
-    /// speculation that is no longer made.
-    #[test]
-    fn invalidation_clear_removes_from_stable_type_index() {
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption(
-            "caller",
-            CompilationAssumption::StableType {
-                bci: 3,
-                expected_class: 55,
-            },
-        );
-        // Registered twice: the index must still list the method once, and one
-        // clear must remove it.
-        mgr.register_assumption(
-            "caller",
-            CompilationAssumption::StableType {
-                bci: 9,
-                expected_class: 55,
-            },
-        );
-        assert_eq!(
-            mgr.on_class_loaded_with_supertypes(70, &[55]),
-            vec!["caller".to_string()]
-        );
-        mgr.clear_assumptions("caller");
-        assert!(mgr.on_class_loaded_with_supertypes(70, &[55]).is_empty());
-    }
-
-    #[test]
-    fn invalidation_clear_removes_from_unique_method_index() {
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption(
-            "caller",
-            CompilationAssumption::UniqueConcreteMethod {
-                class_id: 7,
-                method_name: "go".to_string(),
-            },
-        );
-        assert_eq!(mgr.on_method_override(7, "go"), vec!["caller".to_string()]);
-        mgr.clear_assumptions("caller");
-        assert!(mgr.on_method_override(7, "go").is_empty());
-    }
-
-    #[test]
-    fn invalidation_clear_only_affects_cleared_method() {
-        // Two methods share LeafClass(9); clearing one must leave the other.
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption("a", CompilationAssumption::LeafClass(9));
-        mgr.register_assumption("b", CompilationAssumption::LeafClass(9));
-        mgr.clear_assumptions("a");
-        let inv = mgr.on_class_loaded(9);
-        assert!(!inv.contains(&"a".to_string()));
-        assert!(inv.contains(&"b".to_string()));
-    }
-
-    #[test]
-    fn invalidation_duplicate_assumption_listed_once() {
-        // Registering the same LeafClass twice for one method must still yield
-        // the method exactly once (matches the old per-method `break` dedup).
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption("m", CompilationAssumption::LeafClass(3));
-        mgr.register_assumption("m", CompilationAssumption::LeafClass(3));
-        let inv = mgr.on_class_loaded(3);
-        assert_eq!(inv, vec!["m".to_string()]);
-        // And clearing once removes it fully despite the double registration.
-        mgr.clear_assumptions("m");
-        assert!(mgr.on_class_loaded(3).is_empty());
-    }
-
-    #[test]
-    fn invalidation_class_loaded_unions_leaf_and_dependencies() {
-        // A LeafClass match and a class dependency on the same class_id both
-        // appear, with no duplicate when a method is in both.
-        let mut mgr = InvalidationManager::new();
-        mgr.register_assumption("leaf_m", CompilationAssumption::LeafClass(5));
-        mgr.add_class_dependency(5, "leaf_m"); // also a dependency
-        mgr.add_class_dependency(5, "dep_only");
-        let inv = mgr.on_class_loaded(5);
-        assert!(inv.contains(&"leaf_m".to_string()));
-        assert!(inv.contains(&"dep_only".to_string()));
-        // leaf_m must not be duplicated.
-        assert_eq!(inv.iter().filter(|m| *m == "leaf_m").count(), 1);
     }
 
     // -- reconstruct_frame -------------------------------------------------

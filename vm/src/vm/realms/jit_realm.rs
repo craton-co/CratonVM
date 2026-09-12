@@ -52,7 +52,7 @@ pub struct JitRealm {
     /// negative set: a stale *seal* only costs throughput (the method stays
     /// interpreted), but a stale *pass* would let a redefined body — whose new
     /// bytecode may call a native-shadowed target — reach the compiler, which
-    /// is exactly what the seal exists to prevent. `bump_redefine_epoch()` is
+    /// is exactly what the seal exists to prevent. `JitCache::bump_redefine_epoch` is
     /// already called on every `redefineClass`, beside the `clear_all()` that
     /// evicts the compiled artifacts, so an entry stamped with an older epoch
     /// is simply a miss and the gate re-runs.
@@ -99,10 +99,6 @@ pub struct JitRealm {
     /// Shared fail-closed epoch for methods admitted after the bounded
     /// per-method epoch table reaches capacity.
     pub(crate) method_epoch_overflow: std::sync::atomic::AtomicU64,
-
-    /// Invalidation manager — tracks class-hierarchy assumptions and invalidates
-    /// dependent compiled methods when class loading breaks those assumptions.
-    pub invalidation_manager: parking_lot::Mutex<cratonvm_jit::deopt::InvalidationManager>,
 
     /// Per-class allocation-init cache for the JIT slow-path allocators
     /// (`jit_new_object` + the guarded TLAB-refill arm): primitive-field

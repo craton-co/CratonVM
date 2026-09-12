@@ -367,8 +367,9 @@ impl Compiler {
         // Record a stable boxed copy (the frame-deopt stub bakes it as arg0) and
         // the by-value point (find_deopt_point / iteration). The Box payload does
         // not move when `deopt_boxes` reallocs or when it is moved into
-        // `CompiledMethod::_deopt_point_boxes` at finalize (and is leaked on
-        // Drop), so a baked imm64 of this pointer outlives the emitted code.
+        // `CompiledMethod::_deopt_point_boxes` at finalize, which drops it only
+        // with the artifact itself, so a baked imm64 of this pointer lives as
+        // long as the emitted code.
         // Capture the heap payload's address with `addr_of!` BEFORE moving the
         // Box into the Vec — pushing the Box (a pointer) does not relocate its
         // payload, so this is the same address `&**deopt_boxes.last()` would
@@ -2111,11 +2112,11 @@ impl Compiler {
                 let base = self.deopt_regs_base;
                 // deopt-osr Step 9 follow-up (a): allocate (once) the artifact's
                 // retained epoch guard and bake it as the 4th arg. Leaked so its
-                // address is stable for the process lifetime — even under
-                // CRATONVM_JIT_FREE_CODE=1, where the artifact (and its deopt
-                // boxes) may be freed, this guard survives so `x64_deopt_entry`
-                // can read the live/creation epochs WITHOUT touching the box. The
-                // VM stamps it (creation epoch + live-epoch cell) at install.
+                // address is stable for the process lifetime. (It fed a
+                // before-deref short-circuit for a CRATONVM_JIT_FREE_CODE=1 mode
+                // that freed deopt boxes under running frames; that mode is gone
+                // and `x64_deopt_entry` now ignores the argument.) The VM stamps
+                // it (creation epoch + live-epoch cell) at install.
                 if self.deopt_epoch_guard.is_null() {
                     let g = Box::new(crate::deopt::DeoptEpochGuard::new());
                     // LEAK(intentional): retained for the process lifetime; baked

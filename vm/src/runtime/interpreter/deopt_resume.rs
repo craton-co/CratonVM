@@ -2005,9 +2005,10 @@ fn transfer_osr_exit_chain_into_live_frame(
 ///
 /// Step 9 follow-up (a): ALSO stamp the artifact's `DeoptEpochGuard` (baked into
 /// its frame-deopt stubs) with the same creation epoch and a stable pointer to
-/// the live-epoch cell, so `x64_deopt_entry` can short-circuit a superseded
-/// artifact BEFORE dereferencing the deopt box (the `CRATONVM_JIT_FREE_CODE=1`
-/// before-deref guard). No-op when no guard was emitted (`deopt_epoch_guard`
+/// the live-epoch cell. (`x64_deopt_entry` used it to short-circuit before
+/// dereferencing the deopt box under a `CRATONVM_JIT_FREE_CODE=1` mode that
+/// freed boxes under running frames; that mode is gone and the entry now
+/// ignores the guard.) No-op when no guard was emitted (`deopt_epoch_guard`
 /// null) — i.e. on every production artifact.
 #[inline]
 pub(super) fn stamp_compilation_epoch(
@@ -2031,39 +2032,6 @@ pub(super) fn stamp_compilation_epoch(
     }
 }
 
-/// deopt-osr Step 9 — resume a real-frame deopt under the epoch staleness
-/// guard, then drive de-speculation. Only reached under `CRATONVM_DEOPT_REAL`
-/// with `compiled.can_deopt_resume`, so it is inert in production.
-///
-/// 1. **Staleness guard.** The running artifact (`compiled`) carries the
-///    compilation epoch live when it was installed; the method's *live* epoch
-///    advances on every invalidation (`SharedVm::bump_compilation_epoch`). If
-///    the live epoch has moved past the artifact's, this compilation has been
-///    superseded — its baked `DeoptimizationPoint`s describe a speculation that
-///    has since been invalidated — so we do NOT resume its frame; we fall back
-///    to the safe whole-method re-run (returning `None`). This is the
-///    "assert the owning method's current epoch matches the box's creation
-///    epoch before following it" guard: a `DeoptimizationPoint` box is built
-///    during compilation (it cannot know the install-time epoch) and is
-///    reachable only through the artifact that baked it, so checking the
-///    artifact's `compilation_epoch` versions the box.
-/// 2. **Resume.** When the artifact is current, build + push the interpreter
-///    frame and resume at the trapping bci (`resume_real_ir_deopt`).
-/// 3. **De-speculation.** Record the deopt and drive the escalation policy
-///    (`DeoptimizationController::deoptimize`: log the event so the deopt rate
-///    is observable, evict so the next call recompiles, blacklist on repeated
-///    deopts), which also advances the live epoch. Run AFTER the resume
-///    decision so it only affects FUTURE invocations — the current frame,
-///    already resumed, is unaffected. The reason is recovered from the matching
-///    deopt point so OSR-exit events stay countable separately from guards.
-///
-/// Returns `Some` when the frame was resumed (caller returns it), `None` to
-/// fall through to the whole-method re-run.
-/// Legacy compatibility mirror. Ownership-safe reclamation keeps an executing
-/// artifact's reconstruction metadata alive, so stale frames remain resumable.
-pub(super) fn vm_jit_free_code_enabled() -> bool {
-    false
-}
 
 /// jit-invokedynamic-groovy-regression fix — does the stashed reconstructed
 /// frame belong to `cached`? The producer bakes the compiling method's
@@ -2205,6 +2173,31 @@ pub(super) fn despeculate_stashed_frame_method(
     );
 }
 
+/// deopt-osr Step 9 — resume a real-frame deopt under the epoch staleness
+/// guard, then drive de-speculation. Only reached under `CRATONVM_DEOPT_REAL`
+/// with `compiled.can_deopt_resume`, so it is inert in production.
+///
+/// 1. **Staleness guard.** The running artifact (`compiled`) carries the
+///    compilation epoch live when it was installed; the method's *live* epoch
+///    advances on every invalidation (`SharedVm::bump_compilation_epoch`). An
+///    artifact whose epoch is behind is superseded, but its frame is still
+///    resumed: the trapping frame owns its artifact, so the baked
+///    `DeoptimizationPoint` is valid and self-consistent with the code that
+///    trapped (the epochs version the speculation, not the frame layout).
+///    Only a redefinition of the declaring class, which invalidates the
+///    bytecode itself, falls back to the whole-method re-run (`None`).
+/// 2. **Resume.** Build + push the interpreter frame and resume at the
+///    trapping bci (`resume_real_ir_deopt`).
+/// 3. **De-speculation.** Record the deopt and drive the escalation policy
+///    (`DeoptimizationController::deoptimize`: log the event so the deopt rate
+///    is observable, evict so the next call recompiles, blacklist on repeated
+///    deopts), which also advances the live epoch. Run AFTER the resume
+///    decision so it only affects FUTURE invocations — the current frame,
+///    already resumed, is unaffected. The reason is recovered from the matching
+///    deopt point so OSR-exit events stay countable separately from guards.
+///
+/// Returns `Some` when the frame was resumed (caller returns it), `None` to
+/// fall through to the whole-method re-run.
 pub(super) fn real_frame_deopt_resume_and_despeculate(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -2245,19 +2238,18 @@ pub(super) fn real_frame_deopt_resume_and_despeculate(
         cached.class_name, cached.method_name, cached.method_descriptor
     );
     let live = shared.compilation_epoch_for(&method_key);
-    // Epoch freshness matters only in the `CRATONVM_JIT_FREE_CODE` A/B mode,
-    // where a superseded artifact's code and deopt boxes are actually freed.
-    // In the default retain-everything mode they are leaked for the process
-    // lifetime, and the snapshot is SELF-CONSISTENT with the (stale, still
-    // executing) code that trapped — the epochs version the speculation, not
-    // the frame layout — so resuming is sound once the identity check above
-    // passed (jit-invokedynamic-groovy-regression fix: skipping here forced
-    // the imprecise whole-method re-run for every trap arriving through a
-    // stale cached entry right after the first de-speculation, re-duplicating
-    // side effects). Class redefinition invalidates the bytecode itself, so
-    // it keeps the conservative skip in either mode.
+    // A superseded artifact still resumes. The trapping frame owns its
+    // artifact until it returns, so its code and deopt boxes are live, and the
+    // snapshot is SELF-CONSISTENT with the (stale, still executing) code that
+    // trapped — the epochs version the speculation, not the frame layout — so
+    // resuming is sound once the identity check above passed
+    // (jit-invokedynamic-groovy-regression fix: skipping here forced the
+    // imprecise whole-method re-run for every trap arriving through a stale
+    // cached entry right after the first de-speculation, re-duplicating side
+    // effects). Class redefinition invalidates the bytecode itself, so it keeps
+    // the conservative skip.
     let fresh = compiled.compilation_epoch >= live
-        || (!vm_jit_free_code_enabled() && !class_was_redefined(shared, cached.declaring_class_id));
+        || !class_was_redefined(shared, cached.declaring_class_id);
     let resumed = if fresh {
         resume_real_ir_deopt(shared, thread, cached, rframe)
     } else {
@@ -2869,9 +2861,7 @@ mod deopt_step3_tests {
     /// and deopt boxes are leaked, so its snapshot remains self-consistent
     /// with the code that trapped, and refusing forced the corrupting
     /// imprecise re-run for traps arriving through stale cached entries. The
-    /// conservative skip is retained only under `CRATONVM_JIT_FREE_CODE`
-    /// (which actually frees the boxes — not unit-testable here without a
-    /// racy global env mutation) and after class redefinition.
+    /// conservative skip is retained only after class redefinition.
     #[test]
     fn step9_stale_artifact_resumes_in_retain_mode() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
