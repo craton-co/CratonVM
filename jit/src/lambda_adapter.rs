@@ -501,6 +501,13 @@ pub fn lambda_adapter_entry(
     cm.method_label = format!("lambda-adapter->{impl_entry:#x}");
     let arc = Arc::new(cm);
     let entry = arc.entry_ptr() as usize;
+    // Profiler/debugger symbols (perf map, jitdump, GDB); no-op unless enabled.
+    crate::code_events::publish(entry, arc.code_len(), || {
+        crate::code_events::with_tier_suffix(
+            &arc.method_label,
+            crate::code_events::CodeTier::Stub("lambda-adapter"),
+        )
+    });
     crate::register_jit_entry_owner_for_adapter(entry, &arc);
     map.insert(key, arc);
     Some(entry)
