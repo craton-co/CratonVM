@@ -441,9 +441,23 @@ pub fn entry_from_frame(class_store: &ClassStore, frame: &Frame) -> StackTraceEn
 /// Walk a frame slice and produce a `StackTraceEntry` vector with full
 /// source-file / line-number / BCI data.
 ///
-/// Iteration order is top-of-stack → bottom (i.e. the caller chain from
-/// innermost to outermost), matching the order produced by
-/// `JvmThread.frames.iter()`.
+/// **Result order is OUTERMOST-first**: index 0 is the bottom of the stack and
+/// the last entry is the innermost (currently-executing) frame. That is
+/// `JvmThread.frames.iter()`'s own order — `frames[0]` is the bottom frame —
+/// and it is the opposite of [`frame_class_ids_with_compiled`]'s.
+///
+/// This comment used to say "top-of-stack → bottom (i.e. the caller chain from
+/// innermost to outermost)", which is wrong in both halves and is the exact
+/// trap `two frame-walk APIs order their results oppositely` records. MEASURED
+/// with `CRATONVM_DBG_STTRACE=1` on a two-frame capture
+/// (`FillTopFrame.main` calls `make()`, which allocates the throwable):
+///
+/// ```text
+///   STTRACE_DBG_CAP[0] FillTopFrame.main      <- outermost
+///   STTRACE_DBG_CAP[1] FillTopFrame.make      <- innermost, the throw site
+/// ```
+///
+/// [`trim_throwable_fill_frames`] trims from the END for that reason.
 pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<StackTraceEntry> {
     let jit = crate::jit::conservative_roots::active_compiled_frames();
     if jit.is_empty() {
@@ -454,6 +468,94 @@ pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<Sta
     }
     let (jit, osr_bci) = drop_osr_continuations(frames, jit);
     interleave_compiled_frames(class_store, frames, &jit, &osr_bci)
+}
+
+/// HotSpot's `java_lang_Throwable::fill_in_stack_trace` frame skip, applied to
+/// a trace captured for `throwable`.
+///
+/// A throwable's trace must start at the frame that CREATED it, not at the
+/// machinery that filled the trace in. HotSpot drops, from the innermost end:
+///
+///  1. leading `fillInStackTrace*` frames whose holder the throwable `is_a`,
+///     then
+///  2. leading `<init>` frames whose holder the throwable `is_a`.
+///
+/// Both phases stop at the first frame that does not match — they are prefixes,
+/// not filters, so an application method that happens to be called `<init>` or
+/// `fillInStackTrace` further down the stack is never dropped.
+///
+/// # Why this VM needs it, and why the need is not new
+///
+/// The `native_exc_init_*` bodies stand in front of `Throwable.<init>` and push
+/// no interpreter frame, so for `new IllegalStateException(...)` there is
+/// nothing to skip and the answer has always been right. But the PUBLIC
+/// `Throwable.fillInStackTrace()` is real bytecode in every mode — only the
+/// private `fillInStackTrace(int)` it calls is a native — so an explicit
+/// `t.fillInStackTrace()` captured its own `Throwable.fillInStackTrace` frame
+/// and reported it as the throw site. MEASURED on JDK 25.0.3+9, both modes:
+///
+/// ```text
+///   new RuntimeException("y"); u.fillInStackTrace(); u.getStackTrace()[0]
+///     HotSpot   FillTopFrame.main
+///     was       java.lang.Throwable.fillInStackTrace
+/// ```
+///
+/// # Phase 2 was written for a retirement and turned out to be the bigger half
+///
+/// It is what makes the throwable family's `<init>` rows RETIRABLE: once those
+/// registrations yield, the real `Throwable.<init>` and its `super(...)` chain
+/// are ordinary Java frames on top of the throw site, and
+/// `apps/probes/ThrowableFamilySweep.java` and `IoSystemSweep` ask for exactly
+/// that top frame.
+///
+/// **It was never only about the retirement.** An APPLICATION exception's own
+/// constructor is real bytecode today — the native `super(m)` inside it is
+/// where the capture happens — so `MyEx.<init>` was already sitting on top of
+/// every such trace, in both compatibility modes. MEASURED on the same image:
+///
+/// ```text
+///   class MyEx extends RuntimeException { MyEx(String m) { super(m); } }
+///   static Throwable a() { return new MyEx("a"); }   a().getStackTrace()[0]
+///     HotSpot   SubclassTop.a
+///     was       SubclassTop$MyEx.<init>
+/// ```
+///
+/// Only `java.*` throwables looked right, because their constructors ARE the
+/// natives that do the capturing and push no frame. Every framework exception
+/// hierarchy has the other shape.
+///
+/// `trace` is OUTERMOST-first (see [`capture_full_trace`]), so both phases pop
+/// from the END.
+pub fn trim_throwable_fill_frames(
+    class_store: &ClassStore,
+    throwable_class: Option<ClassId>,
+    trace: &mut Vec<StackTraceEntry>,
+) {
+    let Some(throwable_class) = throwable_class else {
+        return;
+    };
+    let Some(tclass) = class_store.get(throwable_class) else {
+        return;
+    };
+    // `throwable->is_a(holder)`. Prefer the frame's own `ClassId` — the
+    // loader-faithful answer; fall back to the loader-blind name walk only for
+    // a synthesized entry that carries no id (see `StackTraceEntry::class_id`).
+    let is_a = |e: &StackTraceEntry| match e.class_id {
+        Some(cid) => tclass.is_subclass_of(cid, class_store),
+        None => tclass.is_subclass_of_by_name(&e.class_name, class_store),
+    };
+    while trace
+        .last()
+        .is_some_and(|e| &*e.method_name == "fillInStackTrace" && is_a(e))
+    {
+        trace.pop();
+    }
+    while trace
+        .last()
+        .is_some_and(|e| &*e.method_name == "<init>" && is_a(e))
+    {
+        trace.pop();
+    }
 }
 
 /// The declaring class of every frame on this thread's Java stack, INNERMOST

@@ -46435,7 +46435,12 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 const AD_FIELD_DATA: usize = 0; // Object[] circular buffer
 const AD_FIELD_HEAD: usize = 1; // Int head index
 const AD_FIELD_TAIL: usize = 2; // Int tail index
-const AD_FIELD_SIZE: usize = 3; // Int element count
+/// One PAST the last slot an `ArrayDeque` has. Not a field any more: the count
+/// is derived from `head`/`tail` (see [`ad_state`]), nothing writes slot 3, and
+/// `synthetic_stub_fields` declares the three the real class declares. Kept as
+/// the name for "the extent this native surface needs", which is what the
+/// receiver-width bound in `collect_collection_elements` asks for.
+const AD_FIELD_SIZE: usize = 3;
 /// Elements a default-constructed deque holds before the first grow. The
 /// *array* is one slot longer — see [`ad_ensure_capacity`] for why that spare
 /// slot is not an optimisation but the JDK's own emptiness invariant.
@@ -46500,9 +46505,13 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     };
     // `size` is DERIVED from `head`/`tail`, never read back from slot 3.
     //
-    // Slot 3 is ours -- the real `java.util.ArrayDeque` declares exactly
-    // `elements`/`head`/`tail`, and `synthetic_stub_fields` pads the class to
-    // four so a count could live there. Storing the count there made every real
+    // Slot 3 used to be ours -- the real `java.util.ArrayDeque` declares
+    // exactly `elements`/`head`/`tail`, and `synthetic_stub_fields` padded the
+    // class to four so a count could live there. It no longer does: with
+    // nothing reading or writing that slot, the table was narrowed to three on
+    // 2026-09-12 and the class stopped being padded out of the compact layout
+    // (232 bytes empty -> the width three fields actually need).
+    // Storing the count there made every real
     // JDK body that mutates the buffer a corruption: `delete(i)` moves `head`
     // or `tail` and cannot know slot 3 exists. `native_ad_remove_first_occurrence`
     // carries the scar -- it exists only to keep real `delete` bytecode away
@@ -46548,8 +46557,9 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 /// The spare slot is the whole of the 2026-08-11 `stream()` fix, so it is worth
 /// stating why it is not slack. Slots 0..2 of our overlay are not ours: the real
 /// `java.util.ArrayDeque` declares exactly `elements`/`head`/`tail` in that
-/// order, and `synthetic_stub_fields` pads the class to four so our `size` can
-/// live at slot 3. Everything real JDK bytecode reads about this deque it
+/// order, which is now also exactly what `synthetic_stub_fields` declares --
+/// the fourth slot our `size` used to live at is gone, because the count is
+/// derived. Everything real JDK bytecode reads about this deque it
 /// derives from `head`/`tail` alone — `size()` is `sub(tail, head,
 /// elements.length)` — and that arithmetic has no way to distinguish full from
 /// empty. The JDK resolves the ambiguity by never letting the buffer fill:
@@ -46559,8 +46569,9 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 ///
 /// This function used to grow only when the buffer was *over*full
 /// (`min_cap <= old_cap` returned early), so a deque whose element count
-/// reached its capacity wrapped `tail` right back onto `head` — a perfectly
-/// consistent state for our natives, which read `size` from slot 3, and an
+/// reached its capacity wrapped `tail` right back onto `head` -- a perfectly
+/// consistent state for our natives, which read `size` from slot 3 at the
+/// time, and an
 /// EMPTY deque to everything else. Measured on the pre-fix binary against
 /// HotSpot 25, two elements from `new ArrayDeque<>(List.of("a","b"))`:
 ///
@@ -49019,7 +49030,14 @@ fn collect_collection_elements_pinned(
             return Ok(out);
         }
 
-        if cls_name == "java/util/ArrayDeque" && ctx.object_num_fields(coll) > AD_FIELD_SIZE {
+        // `>= AD_FIELD_SIZE`, i.e. the three slots this path actually reads
+        // (`elements`, `head`, `tail`) — not four. `ad_state` DERIVES the
+        // count from `head`/`tail`, so slot 3 is neither read nor written any
+        // more, and `synthetic_stub_fields` narrowed `java/util/ArrayDeque` to
+        // the three the real class declares so it stops being padded out of
+        // the compact layout. Asking for a fourth slot here would have made
+        // this arm unreachable on every real deque.
+        if cls_name == "java/util/ArrayDeque" && ctx.object_num_fields(coll) >= AD_FIELD_SIZE {
             let (data, head, _tail, size) = ad_state(ctx, coll);
             if let Some(buf) = data {
                 let cap = ctx.array_length(buf);
@@ -76977,13 +76995,19 @@ mod tests {
         assert_eq!(AD_FIELD_DATA, 0);
         assert_eq!(AD_FIELD_HEAD, 1);
         assert_eq!(AD_FIELD_TAIL, 2);
-        assert_eq!(AD_FIELD_SIZE, 3);
-        // Slots 0..2 are the REAL `java.util.ArrayDeque` layout
-        // (`elements`/`head`/`tail`, in that declaration order, confirmed with
-        // `javap -p java.util.ArrayDeque` on Temurin 25.0.3). Only slot 3 is
-        // ours, reached because `synthetic_stub_fields` pads the class to four.
-        // That is why real bytecode reading this receiver sees a coherent deque
-        // at all — and why `head`/`tail` have to obey the JDK's invariant.
+        // `AD_FIELD_SIZE` is no longer a field: it is ONE PAST the last slot,
+        // and the assertion says exactly that. Slots 0..2 are the REAL
+        // `java.util.ArrayDeque` layout (`elements`/`head`/`tail`, in that
+        // declaration order, confirmed with `javap -p java.util.ArrayDeque` on
+        // Temurin 25.0.3), `synthetic_stub_fields` declares those same three,
+        // and the count is derived from `head`/`tail`. That is why real
+        // bytecode reading this receiver sees a coherent deque at all — and
+        // why `head`/`tail` have to obey the JDK's invariant.
+        // The companion half -- that `synthetic_stub_fields` declares exactly
+        // these three for `java/util/ArrayDeque` and not a fourth -- is
+        // asserted in `vm/tests/tier1_tests.rs`, which can see the classloading
+        // crate; this one cannot depend on it.
+        assert_eq!(AD_FIELD_SIZE, AD_FIELD_TAIL + 1);
         assert_eq!(AD_DEFAULT_CAPACITY, 16);
         // The array is `AD_DEFAULT_CAPACITY + 1` slots, never a power of two,
         // and that is deliberate: the JDK's own `ArrayDeque()` allocates

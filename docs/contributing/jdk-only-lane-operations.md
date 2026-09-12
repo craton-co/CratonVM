@@ -304,6 +304,54 @@ invocation before the tree, and read the FIRST line of the output.
 `synthetic-jdk` — the third arm alone compiles 176 tests nothing else does.
 `--tests` subsumes `--lib` for that crate.
 
+### Three gates are SCRIPTS, and this page did not name them until 2026-09-10
+
+The cargo list above is not the whole blocking set. `ci.yml` runs three more,
+none of which a `cargo test` invocation reaches, and a lane that copies its gate
+script from this page's §5 runs none of them:
+
+```bash
+CV=target/release/cratonvm JDK="$JAVA_HOME" bash scripts/jdk-only-refusal-survivors.sh
+sh regression-suite/bridge-ratchet.sh          # linux only, see below
+sh scripts/jdk-only-census.sh
+```
+
+`jdk-only-refusal-survivors.sh` is the one a RETIREMENT wave most needs, because
+it measures the thing a retirement can silently fail to be. A refusal retires a
+triple only when nothing already owns it; when an earlier registration does, the
+earlier native survives as the winner, the retirement does not happen, and if
+the survivor's kind is `Intrinsic` the §1.4 census cannot see the row either.
+The script boots the VM under `--jdk-only`, reads the refusals out of
+`--jdk-only-report` and compares the ones that left a survivor against
+`scripts/baselines/jdk-only-refusal-survivors.tsv`. Lane T ran it after the
+fact and it answered `5 rows, matches baseline (refusals seen: 2994)` — which
+is the same claim the wave's own survivor check made, taken by a different
+instrument.
+
+**Two of the three are `if: matrix.os == 'ubuntu-latest'` in CI, and one of
+those cannot be run on Windows at all.** `bridge-ratchet.sh` keys its baseline
+on `<jdk-feature>/<os>` because `image_declaring_method` is a statement about
+one runtime image and the registrars are platform-conditional; only `25/linux`
+is committed, so on a Windows host it exits 2 — REFUSED, which is explicitly
+not a pass. Do not `--update-baseline` your way out of that: freezing a
+`25/windows` key from a mid-campaign tree makes one lane's state the platform's
+baseline. Run it under Linux, or accept that CI is the first place that leg is
+scored, and say which in the wave's record.
+
+Its ratchet is one-directional — `observed > frozen + slack` — so a wave that
+RETIRES rows (lowering the `Bridge` count) cannot fire it; what it catches is a
+wave that adds a `Bridge` whose target the image does not declare `ACC_NATIVE`.
+Its second gate, the per-registration kind map, reads
+`scripts/baselines/jdk-only-kind-map-25-<os>.tsv`, and that one a retirement
+DOES move: re-tagging a triple `SyntheticStub` changes its row, so amend the
+TSV in the same commit.
+
+One host note for Git Bash on Windows: these scripts call `python3`, which
+resolves to the Microsoft Store stub rather than a Python. The stub prints an
+install advert on stdout and the script then reports `the report parsed to
+nothing — schema change?`, which reads like a schema break in the VM's own
+output. Put a `python3` shim ahead of it on `PATH`.
+
 ---
 
 ## 6. Telling your red from theirs

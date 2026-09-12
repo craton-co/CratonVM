@@ -357,7 +357,7 @@ profiling. Added here:
   routing and the capability gate to be correct. The bound, not an opinion, is
   why it is not built.
 * **"Just count them" at the fast door.** Not re-tried:
-  `interpreted-invoke-cost-350ns-20260825.md` § Untaken levers already built
+  `interpreted-invoke-cost-350ns-RETIRED-20260911.md` § Untaken levers already built
   and reverted it (`CRATONVM_JIT=special-tierup` — counted invocations
   129 391 → 129 455, compiled census 672 → 674, wall-clock *worse*). #2 above
   is the other thing: not counting more sites, but letting the sites that are
@@ -435,6 +435,6 @@ spelling both work; the second prints a one-line notice naming the first.
 - [`juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md`](juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md).
 - [`../retired/aqs-thread-handoff-latency-RETIRED-20260805.md`](../retired/aqs-thread-handoff-latency-RETIRED-20260805.md)
   item 3 — the measurement item 2 re-opened, and did not reproduce.
-- [`../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`](../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md)
+- [`docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md`](docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md)
   — its § Untaken levers names `execute_invokevirtual_cached`'s tier-up block
   as where the exclusions live; #2 above adds the second door.

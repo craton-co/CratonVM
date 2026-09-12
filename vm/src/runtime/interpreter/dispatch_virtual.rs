@@ -2180,7 +2180,7 @@ pub(super) fn execute_invokevirtual_cached(
                     // `OrderedPlRwLock<ClassManager>::try_read` at 1.67% and
                     // `::read` at 1.38% of the interpreted-invoke arm, both
                     // attributed straight to this function. See
-                    // known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
+                    // docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md.
                     //
                     // Called in place in the `&&` chain they inherit its
                     // short-circuit, which is what the ordering of that chain
@@ -2265,7 +2265,11 @@ pub(super) fn execute_invokevirtual_cached(
                             // two want opposite next steps: the exception table
                             // is an unresumable-handler hazard, the prefix a
                             // stale-receiver-entry one (cb563d707).
-                            let barred_handler = !cached.exception_table.is_empty();
+                            // The bar is relaxable now: see
+                            // `env_cache::jit_virtual_promote_handler_callee`.
+                            let barred_handler =
+                                !crate::runtime::env_cache::jit_virtual_promote_handler_callee()
+                                    && !cached.exception_table.is_empty();
                             let barred_prefix =
                                 !crate::runtime::env_cache::jit_virtual_promote_java_util()
                                     && receiver_is_java_util();
@@ -2358,7 +2362,9 @@ pub(super) fn execute_invokevirtual_cached(
                             // `receiver_is_java_util` is evaluated only when it
                             // can still change the answer, so the promotion arm
                             // does not pay its class-manager `try_read` either.
-                            promotion_barred = !cached.exception_table.is_empty()
+                            promotion_barred = (!crate::runtime::env_cache::
+                                jit_virtual_promote_handler_callee()
+                                && !cached.exception_table.is_empty())
                                 || (!crate::runtime::env_cache::jit_virtual_promote_java_util()
                                     && receiver_is_java_util());
                             crate::runtime::env_cache::jit_virtual_nominate_always()
@@ -2499,6 +2505,14 @@ pub(super) fn execute_invokevirtual_cached(
                             );
                         }
                         if let Some(compiled) = compiled_opt {
+                            // Engagement, not a clock: which population this
+                            // direct compiled call belongs to. See
+                            // `site_stats::HANDLER_CALLEE_DIRECT`.
+                            site_stats::bump(if cached.exception_table.is_empty() {
+                                site_stats::PLAIN_CALLEE_DIRECT
+                            } else {
+                                site_stats::HANDLER_CALLEE_DIRECT
+                            });
                             let ret = cached.return_tag();
                             let heap = compiled.needs_heap();
                             // total_args = receiver + declared params; the decoded
@@ -2578,6 +2592,7 @@ pub(super) fn execute_invokevirtual_cached(
             native_id,
             native_kind,
             num_params,
+            facts,
             gate: _,
         } => {
             let num_params_usize = num_params as usize; // Widening: parameter count conversion
@@ -2705,6 +2720,44 @@ pub(super) fn execute_invokevirtual_cached(
                         return Ok(CachedCallResult::CacheMiss);
                     }
 
+                    // THE LEAF QUESTION WAS NEVER ASKED HERE. Both `Native`
+                    // arms have gone through `invoke_cached_native_callback_
+                    // leaf_aware` since the leaf funnel landed; this one --
+                    // the arm that serves every `invokevirtual` and
+                    // `invokeinterface` on a registered native, which is the
+                    // largest single population the fast doors decline --
+                    // still paid the full funnel for a body that cannot block.
+                    // The id is the one the cache already resolved, so the
+                    // question is one bounds-checked index.
+                    //
+                    // And `facts` is the call site's descriptor, which is a
+                    // constant of this inline-cache entry: re-resolving it per
+                    // call cost a resolution-cache `RwLock` read, a hash probe,
+                    // three `Arc<str>` clone/drop pairs and two scans of the
+                    // string it returned, plus two heap `Vec`s.
+                    if native_site_facts_usable(&facts, num_params_usize, true) {
+                        site_stats::bump(site_stats::NATFACTS_VIRTUAL);
+                        let mut buf = [Value::Uninitialized; MAX_CACHED_NATIVE_ARGS];
+                        let n = pop_coerced_invoke_args_virtual_facts(
+                            shared, frame_idx, thread, &facts, num_params_usize, &mut buf,
+                        )?;
+                        invoke_cached_native_callback_leaf_aware(
+                            shared,
+                            thread,
+                            frame_idx,
+                            callback,
+                            native_id,
+                            &buf[..n],
+                            RetTag::Known(facts.ret_tag),
+                        )?;
+                        return Ok(CachedCallResult::Handled);
+                    }
+                    // The kill switch has to restore the OLD path whole, and
+                    // the old path here was not leaf-aware -- so this arm asks
+                    // the full funnel exactly as it always did. A control that
+                    // keeps half the change is not a control; see this page's
+                    // own note on the first `iface-select` A/B.
+                    site_stats::bump(site_stats::NATFACTS_RESOLVE);
                     let (args, method_descriptor) = pop_coerced_invoke_args_virtual(
                         shared,
                         caller_class_id,
@@ -3125,6 +3178,7 @@ pub(super) fn execute_invokevirtual_cached(
             native_id,
             native_kind,
             num_params,
+            facts,
             gate: _,
         } => {
             // NULL-RECEIVER-CACHED-20260801: same guard as the `Bytecode` arm
@@ -3150,6 +3204,28 @@ pub(super) fn execute_invokevirtual_cached(
                     .evict(caller_class_id, cp_index, is_special);
                 return Ok(CachedCallResult::CacheMiss);
             };
+            // See the matching arm in `execute_invokestatic_cached`: the call
+            // site's descriptor is a constant of this entry, so ask `facts`
+            // rather than re-resolving the constant pool per call.
+            let num_params = num_params as usize;
+            if native_site_facts_usable(&facts, num_params, true) {
+                site_stats::bump(site_stats::NATFACTS_VIRTUAL);
+                let mut buf = [Value::Uninitialized; MAX_CACHED_NATIVE_ARGS];
+                let n = pop_coerced_invoke_args_virtual_facts(
+                    shared, frame_idx, thread, &facts, num_params, &mut buf,
+                )?;
+                invoke_cached_native_callback_leaf_aware(
+                    shared,
+                    thread,
+                    frame_idx,
+                    callback,
+                    native_id,
+                    &buf[..n],
+                    RetTag::Known(facts.ret_tag),
+                )?;
+                return Ok(CachedCallResult::Handled);
+            }
+            site_stats::bump(site_stats::NATFACTS_RESOLVE);
             let (args, method_descriptor) = pop_coerced_invoke_args_virtual(
                 shared,
                 caller_class_id,
@@ -3164,7 +3240,7 @@ pub(super) fn execute_invokevirtual_cached(
                 callback,
                 native_id,
                 &args,
-                &method_descriptor,
+                RetTag::Scan(&method_descriptor),
             )?;
             Ok(CachedCallResult::Handled)
         }
@@ -3551,6 +3627,7 @@ pub(super) fn populate_virtual_invoke_cache(
                 native_kind,
                 // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                 num_params: num_params as u16,
+                facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                 gate,
             };
             // T10.4 — promote so sibling threads skip the class_manager walk.
@@ -3666,6 +3743,7 @@ pub(super) fn populate_virtual_invoke_cache(
                                 native_kind,
                                 // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                                 num_params: num_params as u16,
+                                facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                                 gate,
                             };
                             shared
@@ -3706,6 +3784,7 @@ pub(super) fn populate_virtual_invoke_cache(
                             native_kind,
                             // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                             num_params: num_params as u16,
+                            facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                             gate,
                         };
                         shared
@@ -3757,6 +3836,7 @@ pub(super) fn populate_virtual_invoke_cache(
                 native_id,
                 native_kind,
                 num_params: num_params as u16, // Widening: parameter count conversion
+                facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                 gate,
             };
             // T10.4 — promote so sibling threads skip this walk.
@@ -3852,6 +3932,7 @@ pub(super) fn populate_virtual_invoke_cache(
                     native_kind,
                     // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                     num_params: num_params as u16,
+                    facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                     gate,
                 };
                 shared
@@ -3900,6 +3981,7 @@ pub(super) fn populate_virtual_invoke_cache(
                     native_id,
                     native_kind,
                     num_params: num_params as u16,
+                    facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                     gate,
                 };
                 shared
@@ -3944,6 +4026,7 @@ pub(super) fn populate_virtual_invoke_cache(
                     native_id,
                     native_kind,
                     num_params: num_params as u16,
+                    facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
                     gate,
                 };
                 shared
@@ -3992,6 +4075,7 @@ pub(super) fn populate_virtual_invoke_cache(
             native_kind,
             // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
             num_params: num_params as u16,
+            facts: cratonvm_jit_api::DescriptorFacts::of(&descriptor),
             gate,
         };
         shared
@@ -4526,7 +4610,9 @@ pub(super) fn execute_invokevirtual_fast_door(
         && !crate::runtime::env_cache::disable_jit()
         && crate::runtime::env_cache::jit_virtual_tierup()
     {
-        let handler_bearing = !cached.exception_table.is_empty();
+        let handler_bearing =
+            !crate::runtime::env_cache::jit_virtual_promote_handler_callee()
+                && !cached.exception_table.is_empty();
         let nominate_always = crate::runtime::env_cache::jit_virtual_nominate_always();
         // Under the defaults a handler-bearing callee is barred outright and
         // nothing below can change that, so neither the registry memo nor the
@@ -4544,7 +4630,12 @@ pub(super) fn execute_invokevirtual_fast_door(
                 .is_some();
             let java_util = match crate::classloading::class_is_java_util(receiver_class_id) {
                 Some(b) => b,
-                None => return None,
+                None => {
+                    crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+                        "the java.util bitmap has no answer for the receiver class",
+                    );
+                    return None;
+                }
             };
             // The two PROMOTION hazards, exactly as `execute_invokevirtual_cached`
             // names them. A handler-bearing callee entered by a direct compiled
@@ -4647,7 +4738,12 @@ pub(super) fn execute_invokevirtual_fast_door(
                                     Some(CachedInvokeTarget::VirtualBytecode { gate, .. }) => {
                                         gate.clone()
                                     }
-                                    _ => return None,
+                                    _ => {
+                                        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+                                            "an inline tier-up attempt is due",
+                                        );
+                                        return None;
+                                    }
                                 };
                                 if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
                                     try_jit_upgrade_with_gate(shared, &cached, gate)
@@ -4664,10 +4760,19 @@ pub(super) fn execute_invokevirtual_fast_door(
     }
 
     if let Some(compiled) = compiled_call {
+        // Same engagement split as the general dispatcher's promotion arm.
+        site_stats::bump(if cached.exception_table.is_empty() {
+            site_stats::PLAIN_CALLEE_DIRECT
+        } else {
+            site_stats::HANDLER_CALLEE_DIRECT
+        });
         // Compiled callee: the direct call wants `Value` arguments, so this
         // is the one shape that still decodes them.
         const MAX_INLINE_ARGS: usize = 16;
         if total_args > MAX_INLINE_ARGS {
+            crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+                "compiled callee with more arguments than the inline buffer",
+            );
             return None;
         }
         let param_tags = ParamTags::for_method(&cached);
@@ -4730,6 +4835,7 @@ pub(super) fn execute_invokevirtual_fast_door(
                 _ => false,
             };
             if !ok {
+                invoke_fast::note_virtual_decline("an argument slot needs coercion");
                 return None;
             }
             slots[i] = (cv, tag);

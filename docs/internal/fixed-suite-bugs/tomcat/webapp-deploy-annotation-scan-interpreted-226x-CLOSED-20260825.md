@@ -107,7 +107,7 @@
 
 > ## Criterion 3 — the real work. HANDED OFF, not abandoned.
 >
-> `docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`.
+> `docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md`.
 >
 > That page inherits everything on this one that is about the interpreted
 > invoke rather than about Tomcat: the ~350 ns figure and its two-arm
