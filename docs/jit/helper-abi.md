@@ -383,3 +383,100 @@ edit scope, so they are listed here rather than changed:
   revision of the 65-field, 520-byte table shipped today" — the constant is 12.
 * `jit-api/src/lib.rs`: two comments describing `[helpers_ptr + disp32]` loads
   (§0).
+
+## 9. Panics in helpers
+
+The workspace builds with `panic = "unwind"`. Since Rust 1.81, a panic that
+unwinds out of an `extern "C"` function aborts the process, with no
+Java-visible error and no metric. `vm/src/jit/helper_guard.rs` contains those
+panics. Its module doc is the authoritative list; this section states the
+contract.
+
+### Shape
+
+A guarded helper keeps its `extern "C"` signature, so the table, the `HelperFn*`
+aliases and invariant 33 are untouched. Its original body moves, textually
+unchanged, into a private `<name>_body` function, and the shell becomes:
+
+```rust
+pub unsafe extern "C" fn jit_monitor_exit(vm_ptr: i64, obj_ptr: i64) -> i64 {
+    let f = || jit_monitor_exit_body(vm_ptr, obj_ptr);
+    contain("jit_monitor_exit", OnPanic::Throw { vm_ptr }, i64::MIN, f)
+}
+```
+
+`contain(name, on_panic, sentinel, body)` costs a `catch_unwind` plus one
+thread-local scope depth on the normal path. It takes no lock and allocates
+nothing. The sentinel is an argument, not a trait, because helpers with the
+same return type fail differently.
+
+### On a panic
+
+1. Increment the process-wide counter `jit_helper_panic_count()`. Record the
+   helper name for `jit_helper_last_panic()` and `jit_helper_recent_panics()`
+   (the last eight).
+2. The first time a given helper panics, print one `[jit-helper-panic]` line to
+   stderr with the helper name and the payload.
+3. Apply the wrap site's policy:
+
+   | Policy | Used for | Effect |
+   |---|---|---|
+   | `Throw { vm_ptr }` | Helpers whose normal path already allocates, runs Java or parks, so the call site is already a GC safepoint | Stash `java.lang.InternalError: JIT runtime helper <name> panicked: <payload>` with `set_jit_pending_exception` (`vm_ptr == 0` uses the process VM). If that cannot be built, only the sentinel is returned. |
+   | `Deopt` | Leaf helpers whose call sites publish no oop map | Allocate nothing. Call `set_jit_deopt_pending()`, so an `i64::MIN` return reads as a sentinel. |
+   | `Record` | Void helpers whose answer to trouble is already "drop and count", and fast paths whose failure answer is "declined" | Count and report only. |
+
+4. Return the sentinel.
+
+### Sentinels
+
+Each guarded helper returns the failure answer its call site already handles
+(§5):
+
+| Sentinel | Helpers |
+|---|---|
+| `i64::MIN`, `Throw` | `invoke_dispatch`, `invoke_virtual_mic`, `service_callee_deopt`, `indy_bridge`, `lambda_int_to_double`, `varhandle_read_direct`, `varhandle_cas_direct`, the `integer_*`, `long_*`, `dbb_*`, `md_update_byte`, `preconditions_check_index`, `buffer_session`, `thread_current_thread`, `concurrent_hashmap_get`, `hashmap_get`, `hashmap_put` and `string_latin1_to_lower` direct intrinsics, `monitor_enter`, `monitor_exit`, `checkcast`, `aastore_type_check`, `getstatic`, `putstatic_*`, `self_call_stack_guard` |
+| `i64::MIN`, `Deopt` | `baload`, `iaload`, `aaload`, `arraylength`, `getfield`, `throw_aioobe`, `throw_arithmetic`, `throw_exception` |
+| `0` / null, `Throw` | `newarray`, `new_object`, `new_object_cp`, `anewarray_object`, `anewarray_object_cp`, `multianewarray_2d`, `ldc_class_cp`, `ldc_string_cp`, `ldc_string`, `instanceof` |
+| `0`, `Deopt` | `tlab_post_init` (the inline-TLAB arm's `emit_post_alloc_oom_check` routes it) |
+| `0`, `Record` | `ffm_segment_get`, `ffm_segment_set` (declined; the native path runs) |
+| `-1`, `Throw` | `local_handler_lookup` (propagate) |
+| `DEOPT_ACTION_REINTERPRET`, `Deopt` | `uncommon_trap` |
+| `()`, `Throw` | `aastore`, `varhandle_write_direct`, `safepoint_slow_path` |
+| `()`, `Deopt` | `npe_with_action` (its stub loads `i64::MIN` itself) |
+| `()`, `Record` | `bastore`, `iastore`, `putfield_int`, `putfield_long`, `putfield_float`, `putfield_double` |
+
+A void helper has no failure channel. A `Throw` stash is delivered at the
+thread's next pending-exception drain, not at the faulting instruction, and a
+`Record` panic is invisible to Java.
+
+### Unguarded helpers must stay panic-free
+
+These are not wrapped:
+
+* `set_deopt_pending`, `dispatch_threw`, `set_throw_bci`, `get_current_thread`
+* `native_stack_floor`, `frame_record`, `verify_inline_frame_record`
+* `math_fma_double`, `math_fma_float`, `jit_frem`, `jit_drem`
+* `reachability_fence_direct`, `resolve_static_base`
+* the savebase watch: `arm_savebase_watch` is `#[naked]`, and its inner half
+  belongs to the crash handler
+
+`write_barrier`, `g1_post_write_barrier`, `satb_pre_write_barrier` and
+`putfield_object` are left unguarded on purpose. A contained panic there would
+silently drop a card mark, remembered-set entry or SATB record, which is a
+latent use-after-free, so the abort is preferred.
+
+Any change to an unguarded helper must keep it free of panics. A new helper
+that cannot be shown panic-free must be guarded, and it chooses `Throw` or
+`Deopt` by whether its call site is a GC safepoint.
+
+### Crash reporting and limits
+
+* `contain` runs the body inside `cratonvm_jit::tiered::contain_compile_panic`'s
+  scope. The hook installed by `crash_handler::install_crash_handler` already
+  honours that scope, so a contained helper panic writes no
+  `hs_err_pid<pid>.log`. Hooks still run first. That hook chains to the default
+  one, and `vm-cli`'s own hook prints every panic.
+* Unwinding releases every guard, lock and `RefCell` borrow the body held.
+  State undone by an explicit call rather than by `Drop` is not restored: a
+  `set_jit_thread` scope, a thread-state transition, a half-initialised object.
+* A panic raised while already unwinding still aborts.
