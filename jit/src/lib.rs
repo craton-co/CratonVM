@@ -4560,6 +4560,35 @@ pub fn osr_refusal_is_permanent(b: &bailout::Bailout) -> bool {
     }
 }
 
+/// The memoable refusals whose answer depends on the state the compile ran
+/// under, rather than on the bytecode alone.
+///
+/// An unconditional trap, an unresumable exit, an ambiguous exit image and a
+/// contract disagreement are all read off the artifact's deopt metadata, and
+/// what metadata a compile records depends on what it saw: `CRATONVM_DEOPT_REAL`,
+/// a class that has loaded since, a speculation the profile no longer supports.
+/// Memoing them against the method for the life of the process refused OSR to a
+/// recompile that would have produced a different artifact.
+/// [`mark_osr_entry_rejected_by`] stamps these with the JIT install epoch, so
+/// the memo expires when a redefinition or a code-cache flush moves it.
+pub const OSR_COMPILE_STATE_REFUSAL_TAGS: [&str; 4] = [
+    OSR_REFUSE_UNCONDITIONAL_TRAP,
+    OSR_REFUSE_UNRESUMABLE_EXIT,
+    OSR_REFUSE_AMBIGUOUS_EXIT_IMAGE,
+    OSR_REFUSE_CONTRACT_DISAGREEMENT,
+];
+
+/// Whether a (memoable) refusal depends on compile-time state; see
+/// [`OSR_COMPILE_STATE_REFUSAL_TAGS`].
+pub fn osr_refusal_depends_on_compile_state(b: &bailout::Bailout) -> bool {
+    match &b.reason {
+        bailout::BailoutReason::UnsupportedShape(tag) => {
+            OSR_COMPILE_STATE_REFUSAL_TAGS.iter().any(|t| *t == *tag)
+        }
+        _ => false,
+    }
+}
+
 /// Where an [`OsrEntryPlan`]'s per-slot expectations came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OsrContractSource {
@@ -15631,13 +15660,21 @@ struct JitKey {
     declaring_class_id: cratonvm_types::ClassId,
 }
 
-/// Compute a u64 hash key for a JIT cache entry by XOR-folding independent
-/// FxHashes (class, method, descriptor, declaring class id). Using separate
-/// hashers per component (rather than chained writes) keeps each call
-/// branch-free and avoids the per-call Arc clones the previous keyed
-/// lookup required.
+/// Compute a u64 hash key for a JIT cache entry from (class, method,
+/// descriptor, declaring class id), written in that order into ONE hasher with
+/// a separator after each string.
 ///
-/// Hash collisions are tolerated by the cache: `JitCache::get` always
+/// This used to hash each component with its own hasher and XOR-fold the four
+/// results. The fold is symmetric, so equal components cancelled
+/// (`class Foo { void Foo() }` and `class Bar { void Bar() }` hashed to the same
+/// value, since `h("Foo") ^ h("Foo")` is zero) and swapped components collided.
+/// `JitCache` survived that by verifying the full key on every hit, but the
+/// negative memos keyed by this hash verified nothing, so a collision there
+/// refused an innocent method. `0xFF` never occurs in modified UTF-8, so the
+/// separators also make every component boundary unambiguous (`"ab" + "c"` is
+/// not `"a" + "bc"`). No per-call allocation either way.
+///
+/// Hash collisions are still tolerated by the cache: `JitCache::get` always
 /// verifies the full string key match after the hash hit (see PERF-P2
 /// fix). A collision degrades to a cache miss, which is correct but
 /// slightly suboptimal (triggers a re-compile via the slow path).
@@ -15648,15 +15685,15 @@ fn compute_jit_key_hash(
     desc: &str,
     declaring_class_id: cratonvm_types::ClassId,
 ) -> u64 {
-    let mut hc = FxHasher::default();
-    hc.write(class.as_bytes());
-    let mut hm = FxHasher::default();
-    hm.write(method.as_bytes());
-    let mut hd = FxHasher::default();
-    hd.write(desc.as_bytes());
-    let mut hi = FxHasher::default();
-    hi.write_u32(declaring_class_id.as_u32());
-    hc.finish() ^ hm.finish() ^ hd.finish() ^ hi.finish()
+    let mut h = FxHasher::default();
+    h.write(class.as_bytes());
+    h.write_u8(0xFF);
+    h.write(method.as_bytes());
+    h.write_u8(0xFF);
+    h.write(desc.as_bytes());
+    h.write_u8(0xFF);
+    h.write_u32(declaring_class_id.as_u32());
+    h.finish()
 }
 
 /// Per-VM JIT cache: maps method identity to compiled native code.
@@ -18784,44 +18821,162 @@ fn ir_verify_reject(
 // "transient" None paths (resolver-fail, allocator-fail) short-circuit
 // *before* x64::compile and therefore don't pollute the bail-list.
 //
-// Implementation: a process-wide `FxHashSet<u64>` (keyed by the same
-// XOR-folded FxHash we already use for the JIT cache, see
-// `compute_jit_key_hash`).  Membership is checked at the top of
-// `try_compile`; entries are added when the heavy backend path returns
-// None.  The set is never pruned — bail-listed methods stay bail-listed
-// for the JVM's lifetime (matches the "wave them off" intent).
+// Implementation: ONE process-wide verdict store (`JIT_VERDICTS`) for this
+// module's three negative memos -- the bail list, the refusal reason recorded
+// beside it, and the per-(method, pc) OSR entry rejects further down.
 //
-// Hash collisions between two methods are benign here: the worst case
-// is a non-bail-listed method that shares a hash with a bail-listed
-// one gets falsely skipped (and stays in the interpreter).  Probability
-// is the same ~2.7e-10 / 100k methods as the JIT cache.
+// They used to be three separate process-wide sets keyed by a bare hash and
+// never pruned. A verdict recorded against bytecode that a JVMTI redefinition
+// had since replaced, or against a class that had since been unloaded (and its
+// name reused), refused the new code for the life of the process. Now:
+//
+//   * every entry stores the full (class, method, descriptor) names and a hit
+//     verifies them, so a hash collision cannot refuse an innocent method;
+//   * every verdict is stamped with the redefine epoch it was recorded at and
+//     stops counting once a redefinition moves it;
+//   * a verdict that depends on compile-time state rather than on the bytecode
+//     alone (`osr_refusal_depends_on_compile_state`) is also stamped with the
+//     JIT install epoch, which a code-cache flush moves too;
+//   * `forget_jit_verdicts_for_class` drops a class's entries outright; the
+//     tiered manager calls it on class unload and on redefinition.
+//
+// There is no `ClassId` in the key: every caller of this API holds names only.
+// Two same-named classes in different loaders therefore share verdicts. That
+// errs in the safe direction -- one of them may be compiled later than it
+// could have been, never compiled wrongly -- and an unload or redefinition of
+// either clears both.
 
-static JIT_BAIL_LIST: std::sync::OnceLock<parking_lot::RwLock<rustc_hash::FxHashSet<u64>>> =
-    std::sync::OnceLock::new();
 static JIT_BAIL_SHORTCIRCUITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn jit_bail_list() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<u64>> {
-    JIT_BAIL_LIST.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
+/// When a compile verdict was recorded, for deciding whether it still counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerdictStamp {
+    /// [`redefine_epoch`] when the verdict was recorded.
+    redefine_epoch: u32,
+    /// [`jit_install_epoch`] when the verdict was recorded, for a verdict that
+    /// depends on compile-time state; `None` for one about the bytecode alone.
+    install_epoch: Option<u64>,
 }
 
-/// Whether the given method has been added to the JIT bail-list by a
-/// prior permanent-bail compilation attempt.  Checked at the top of
-/// `try_compile` to short-circuit re-attempts.
-pub fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> bool {
-    // This is a permanent-failure blocklist, not the dispatch cache — a
-    // name-only collision between two same-named classes from different
-    // loaders is benign here (worst case: one class's compilable method
-    // gets conservatively skipped because a same-named-and-shaped method
-    // elsewhere hit a genuine backend limitation), so a fixed sentinel
-    // `ClassId` keeps this hash's shape unchanged rather than threading a
-    // real class identity through this negative-cache-only path.
-    let h = compute_jit_key_hash(
+impl VerdictStamp {
+    fn now(depends_on_compile_state: bool) -> Self {
+        Self {
+            redefine_epoch: redefine_epoch(),
+            install_epoch: depends_on_compile_state.then(jit_install_epoch),
+        }
+    }
+
+    fn is_current_at(self, redefine: u32, install: u64) -> bool {
+        self.redefine_epoch == redefine && self.install_epoch.map_or(true, |epoch| epoch == install)
+    }
+
+    fn is_current(self) -> bool {
+        self.is_current_at(redefine_epoch(), jit_install_epoch())
+    }
+}
+
+/// Every compile verdict recorded about one method.
+struct MethodVerdicts {
+    class_name: Box<str>,
+    method_name: Box<str>,
+    descriptor: Box<str>,
+    /// Bail-listed by [`mark_jit_bail_listed`].
+    bail_listed: Option<VerdictStamp>,
+    /// The last refusal site a compile of the method recorded.
+    bail_site: Option<(VerdictStamp, (&'static str, u32, u32))>,
+    /// OSR entry pcs whose compiled body refused entry.
+    osr_rejects: Vec<(usize, VerdictStamp)>,
+}
+
+impl MethodVerdicts {
+    fn new(class_name: &str, method_name: &str, descriptor: &str) -> Self {
+        Self {
+            class_name: Box::from(class_name),
+            method_name: Box::from(method_name),
+            descriptor: Box::from(descriptor),
+            bail_listed: None,
+            bail_site: None,
+            osr_rejects: Vec::new(),
+        }
+    }
+
+    fn names(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
+        &*self.class_name == class_name
+            && &*self.method_name == method_name
+            && &*self.descriptor == descriptor
+    }
+}
+
+static JIT_VERDICTS: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<u64, MethodVerdicts>>,
+> = std::sync::OnceLock::new();
+
+fn jit_verdicts() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, MethodVerdicts>> {
+    JIT_VERDICTS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+fn verdict_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
+    compute_jit_key_hash(
         class_name,
         method_name,
         descriptor,
         cratonvm_types::ClassId::new(0),
-    );
-    jit_bail_list().read().contains(&h)
+    )
+}
+
+/// Read a method's verdicts, if any are recorded under its exact names.
+fn read_verdicts<R>(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    read: impl FnOnce(&MethodVerdicts) -> R,
+) -> Option<R> {
+    let verdicts = jit_verdicts().read();
+    let entry = verdicts.get(&verdict_key(class_name, method_name, descriptor))?;
+    entry
+        .names(class_name, method_name, descriptor)
+        .then(|| read(entry))
+}
+
+/// Update a method's verdicts, creating its entry on first use.
+fn write_verdicts(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    write: impl FnOnce(&mut MethodVerdicts),
+) {
+    let mut verdicts = jit_verdicts().write();
+    let entry = verdicts
+        .entry(verdict_key(class_name, method_name, descriptor))
+        .or_insert_with(|| MethodVerdicts::new(class_name, method_name, descriptor));
+    if !entry.names(class_name, method_name, descriptor) {
+        // A genuine 64-bit collision between two different methods: the newer
+        // one takes the slot. Losing the older verdicts costs that method one
+        // more compile attempt, which is the safe direction.
+        *entry = MethodVerdicts::new(class_name, method_name, descriptor);
+    }
+    write(entry);
+}
+
+/// Forget every compile verdict recorded about methods of `class_name` -- the
+/// bail list, refusal reasons and OSR entry rejects. Called by the tiered
+/// manager when the class is unloaded or redefined. Returns the number of
+/// methods whose verdicts were dropped.
+pub fn forget_jit_verdicts_for_class(class_name: &str) -> usize {
+    let mut verdicts = jit_verdicts().write();
+    let before = verdicts.len();
+    verdicts.retain(|_, entry| &*entry.class_name != class_name);
+    before - verdicts.len()
+}
+
+/// Whether the given method has been added to the JIT bail-list by a
+/// prior permanent-bail compilation attempt of the bytecode loaded now.
+/// Checked at the top of `try_compile` to short-circuit re-attempts.
+pub fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+    read_verdicts(class_name, method_name, descriptor, |entry| {
+        entry.bail_listed.is_some_and(VerdictStamp::is_current)
+    })
+    .unwrap_or(false)
 }
 
 /// Mark the method as permanently bail-listed.  Called when the heavy
@@ -18844,13 +18999,27 @@ pub fn ir_method_memo_hash(class_name: &str, method_name: &str, descriptor: &str
 }
 
 pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) {
-    let h = compute_jit_key_hash(
-        class_name,
-        method_name,
-        descriptor,
-        cratonvm_types::ClassId::new(0),
-    );
-    jit_bail_list().write().insert(h);
+    write_verdicts(class_name, method_name, descriptor, |entry| {
+        entry.bail_listed = Some(VerdictStamp::now(false));
+    });
+}
+
+/// The IR refusal memo's key: the method's IR memo hash re-keyed by the
+/// redefine epoch.
+///
+/// That memo (`ir_evidence::note_method_refused`) records "a previous compile
+/// carried no evidence the optimizing tier helps" and skips the IR attempt ever
+/// after. The verdict was about the bytecode compiled at the time, and after a
+/// redefinition it went on skipping the new body's IR attempt. Mixing in the
+/// epoch grants every method one fresh attempt per redefinition, a retry
+/// bounded by the number of redefinitions. The site-trap registry keeps the
+/// un-keyed [`ir_method_memo_hash`] on purpose: the runtime looks it up for
+/// frames of code that is already installed.
+fn ir_refusal_memo_key(ir_method_hash: u64, redefine_epoch: u32) -> u64 {
+    let mut h = FxHasher::default();
+    h.write_u64(ir_method_hash);
+    h.write_u32(redefine_epoch);
+    h.finish()
 }
 
 /// Bail-list a method AND record the refusal site the compile that just ran left
@@ -18952,57 +19121,48 @@ pub fn record_compile_refusal(
 }
 /// Diagnostic: number of methods currently bail-listed.
 pub fn jit_bail_list_size() -> usize {
-    jit_bail_list().read().len()
+    jit_verdicts()
+        .read()
+        .values()
+        .filter(|entry| entry.bail_listed.is_some_and(VerdictStamp::is_current))
+        .count()
 }
 
-/// Last recorded refusal site per method, keyed exactly like [`jit_bail_list`].
+/// Record the refusal site of a compile that just bailed, beside the method's
+/// other verdicts in `JIT_VERDICTS`.
 ///
 /// The thread-local [`JIT_BAIL_SITE`] answers "why did the compile that just
 /// ran bail?", which only helps somebody already watching `CRATONVM_DBG_JITC`
 /// at the moment it happened. The place a permanently-uncompilable hot method
 /// is actually *noticed* is the end-of-run
 /// `CRATONVM_DBG=jit-method-stats` table, which runs long after every compile
-/// worker has moved on — so the reason has to outlive the compile. Same
-/// key/collision argument as the bail-list above: a collision at worst
-/// mislabels one diagnostic line.
-static JIT_BAIL_REASONS: std::sync::OnceLock<
-    parking_lot::RwLock<rustc_hash::FxHashMap<u64, (&'static str, u32, u32)>>,
-> = std::sync::OnceLock::new();
-
-fn jit_bail_reasons(
-) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, (&'static str, u32, u32)>> {
-    JIT_BAIL_REASONS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
-}
-
+/// worker has moved on — so the reason has to outlive the compile. It expires
+/// with the bytecode it describes, like every other verdict.
 fn record_jit_bail_reason(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     site: (&'static str, u32, u32),
 ) {
-    let h = compute_jit_key_hash(
-        class_name,
-        method_name,
-        descriptor,
-        cratonvm_types::ClassId::new(0),
-    );
-    jit_bail_reasons().write().insert(h, site);
+    write_verdicts(class_name, method_name, descriptor, |entry| {
+        entry.bail_site = Some((VerdictStamp::now(false), site));
+    });
 }
 
 /// The refusal site last recorded for this method, rendered for a report
-/// line, or `None` if no compile of it ever bailed.
+/// line, or `None` if no compile of the currently loaded bytecode bailed.
 pub fn jit_bail_reason_for(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
 ) -> Option<String> {
-    let h = compute_jit_key_hash(
-        class_name,
-        method_name,
-        descriptor,
-        cratonvm_types::ClassId::new(0),
-    );
-    let site = *jit_bail_reasons().read().get(&h)?;
+    let site = read_verdicts(class_name, method_name, descriptor, |entry| {
+        entry
+            .bail_site
+            .filter(|(stamp, _)| stamp.is_current())
+            .map(|(_, site)| site)
+    })
+    .flatten()?;
     Some(format_jit_bail_site(Some(site)))
 }
 
@@ -19823,61 +19983,93 @@ fn format_jit_bail_site(site: Option<(&'static str, u32, u32)>) -> String {
 // memoises — RBC.2's 2,610 recompiles of `SecP521R1Curve$1.lookup` and RBC.4's
 // 35,923 re-run pipelines on `Nat.inc`.
 //
-// The rejection is a pure function of the compile, which is deterministic for a
-// given method, so it is permanent. It is keyed per (method, entry_pc) rather
+// The rejection is a function of the compile, which is deterministic for a
+// given method and compile state. It is keyed per (method, entry_pc) rather
 // than per method: a method's other back-edges are usually fine, and banning
-// all of them would cost real throughput.
-static OSR_ENTRY_REJECTS: std::sync::OnceLock<
-    parking_lot::RwLock<rustc_hash::FxHashSet<(u64, usize)>>,
-> = std::sync::OnceLock::new();
+// all of them would cost real throughput. It lives in `JIT_VERDICTS` beside the
+// method's other verdicts, so it expires with the bytecode it was measured on
+// and, for the refusals that depend on compile-time state, with that state.
 
-fn osr_entry_rejects() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<(u64, usize)>> {
-    OSR_ENTRY_REJECTS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
-}
-
-fn osr_reject_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
-    // Same sentinel-ClassId rationale as `is_jit_bail_listed`: this is a
-    // negative cache, so a cross-loader name collision only costs one method
-    // one OSR entry point.
-    compute_jit_key_hash(
-        class_name,
-        method_name,
-        descriptor,
-        cratonvm_types::ClassId::new(0),
-    )
-}
-
-/// Whether a previous OSR compile for this method produced a body that refused
-/// to OSR-enter at `entry_pc`. Checked before re-running the OSR pipeline.
+/// Whether a previous OSR compile of the currently loaded bytecode produced a
+/// body that refused to OSR-enter at `entry_pc`. Checked before re-running the
+/// OSR pipeline.
 pub fn is_osr_entry_rejected(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     entry_pc: usize,
 ) -> bool {
-    osr_entry_rejects().read().contains(&(
-        osr_reject_key(class_name, method_name, descriptor),
-        entry_pc,
-    ))
+    read_verdicts(class_name, method_name, descriptor, |entry| {
+        entry
+            .osr_rejects
+            .iter()
+            .any(|&(pc, stamp)| pc == entry_pc && stamp.is_current())
+    })
+    .unwrap_or(false)
 }
 
 /// Record that compiling this method for `entry_pc` yields a body that cannot
-/// enter there, so the pipeline is never re-run for that PC.
+/// enter there, so the pipeline is not re-run for that PC until the bytecode
+/// changes. For a refusal the compiler explained with a [`bailout::Bailout`],
+/// use [`mark_osr_entry_rejected_by`], which also lets the memo expire when the
+/// refusal depended on compile-time state.
 pub fn mark_osr_entry_rejected(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     entry_pc: usize,
 ) {
-    osr_entry_rejects().write().insert((
-        osr_reject_key(class_name, method_name, descriptor),
-        entry_pc,
-    ));
+    record_osr_entry_reject(class_name, method_name, descriptor, entry_pc, false);
 }
 
-/// Diagnostic: number of (method, entry_pc) pairs currently OSR-reject-memoed.
+/// [`mark_osr_entry_rejected`] for a refusal the compiler explained. A refusal
+/// in [`OSR_COMPILE_STATE_REFUSAL_TAGS`] is stamped with the JIT install epoch
+/// and stops counting when that moves.
+pub fn mark_osr_entry_rejected_by(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    entry_pc: usize,
+    refusal: &bailout::Bailout,
+) {
+    record_osr_entry_reject(
+        class_name,
+        method_name,
+        descriptor,
+        entry_pc,
+        osr_refusal_depends_on_compile_state(refusal),
+    );
+}
+
+fn record_osr_entry_reject(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    entry_pc: usize,
+    depends_on_compile_state: bool,
+) {
+    write_verdicts(class_name, method_name, descriptor, |entry| {
+        let stamp = VerdictStamp::now(depends_on_compile_state);
+        match entry.osr_rejects.iter_mut().find(|(pc, _)| *pc == entry_pc) {
+            Some(slot) => slot.1 = stamp,
+            None => entry.osr_rejects.push((entry_pc, stamp)),
+        }
+    });
+}
+
+/// Diagnostic: number of (method, entry_pc) pairs whose OSR reject still counts.
 pub fn osr_entry_reject_count() -> usize {
-    osr_entry_rejects().read().len()
+    jit_verdicts()
+        .read()
+        .values()
+        .map(|entry| {
+            entry
+                .osr_rejects
+                .iter()
+                .filter(|(_, stamp)| stamp.is_current())
+                .count()
+        })
+        .sum()
 }
 
 /// Compiled call sites reclassified from `invokevirtual` to a direct,
@@ -24487,7 +24679,11 @@ fn try_compile_inner(
         &cached.method_descriptor,
         cratonvm_types::ClassId::new(0),
     );
-    let ir_refused_before = ir_evidence::method_already_refused(ir_method_hash);
+    // The refusal memo is keyed per redefine epoch, so a verdict about replaced
+    // bytecode does not skip the new body's IR attempt. See
+    // `ir_refusal_memo_key`.
+    let ir_refusal_key = ir_refusal_memo_key(ir_method_hash, redefine_epoch());
+    let ir_refused_before = ir_evidence::method_already_refused(ir_refusal_key);
     if ir_refused_before {
         ir_evidence::note_memo_skip();
         if ir_stage_reporting() {
@@ -27323,7 +27519,7 @@ fn try_compile_inner(
                                     ir_evidence::describe(evidence.map_or(0, |r| r.bits)),
                                 );
                             }
-                            ir_evidence::note_method_refused(ir_method_hash);
+                            ir_evidence::note_method_refused(ir_refusal_key);
                             drop(cm);
                             None
                         }
@@ -36573,6 +36769,96 @@ mod tests {
             );
         }
         assert_eq!(mgr.queue_size(), 1);
+    }
+
+    /// The JIT key hash XOR-folded per-component hashes, so equal components
+    /// cancelled and swapped components collided. The negative memos key on it
+    /// without the cache's full-key check, so a collision there refused an
+    /// innocent method.
+    #[test]
+    fn jit_key_hash_does_not_collide_on_equal_or_swapped_components() {
+        let id = cratonvm_types::ClassId::new(0);
+        assert_ne!(
+            compute_jit_key_hash("Foo", "Foo", "()V", id),
+            compute_jit_key_hash("Bar", "Bar", "()V", id),
+            "equal class and method names must not cancel out"
+        );
+        assert_ne!(
+            compute_jit_key_hash("a/A", "b", "()V", id),
+            compute_jit_key_hash("b", "a/A", "()V", id),
+            "swapped components must not collide"
+        );
+        assert_ne!(
+            compute_jit_key_hash("ab", "c", "()V", id),
+            compute_jit_key_hash("a", "bc", "()V", id),
+            "a component boundary is part of the key"
+        );
+        assert_ne!(
+            compute_jit_key_hash("a/A", "m", "()V", id),
+            compute_jit_key_hash("a/A", "m", "()V", cratonvm_types::ClassId::new(3)),
+            "the declaring class id is part of the key"
+        );
+    }
+
+    /// Verdicts go with their class, and a verdict recorded against older
+    /// bytecode (redefine epoch) or older compile state (install epoch) stops
+    /// counting.
+    #[test]
+    fn jit_verdicts_are_cleared_with_their_class_and_expire_with_their_epoch() {
+        let class = "craton/test/VerdictClearing";
+        mark_jit_bail_listed(class, "bailed", "()V");
+        record_compile_refusal(class, "bailed", "()V", "test-refusal");
+        mark_osr_entry_rejected(class, "loop", "()V", 12);
+        assert!(is_jit_bail_listed(class, "bailed", "()V"));
+        assert!(jit_bail_reason_for(class, "bailed", "()V").is_some());
+        assert!(is_osr_entry_rejected(class, "loop", "()V", 12));
+        assert!(!is_osr_entry_rejected(class, "loop", "()V", 13), "per pc");
+        assert!(
+            !is_jit_bail_listed(class, "notBailed", "()V"),
+            "a verdict is looked up by its exact names"
+        );
+
+        assert_eq!(forget_jit_verdicts_for_class(class), 2);
+        assert!(!is_jit_bail_listed(class, "bailed", "()V"));
+        assert!(jit_bail_reason_for(class, "bailed", "()V").is_none());
+        assert!(!is_osr_entry_rejected(class, "loop", "()V", 12));
+
+        // Epoch expiry, checked on the stamp itself: bumping the real epochs
+        // would expire every other test's verdicts in this binary.
+        let about_bytecode = VerdictStamp {
+            redefine_epoch: 3,
+            install_epoch: None,
+        };
+        assert!(about_bytecode.is_current_at(3, 100));
+        assert!(
+            about_bytecode.is_current_at(3, 101),
+            "a bytecode verdict survives a code-cache flush"
+        );
+        assert!(!about_bytecode.is_current_at(4, 100), "but not a redefinition");
+        let about_compile_state = VerdictStamp {
+            redefine_epoch: 3,
+            install_epoch: Some(100),
+        };
+        assert!(about_compile_state.is_current_at(3, 100));
+        assert!(
+            !about_compile_state.is_current_at(3, 101),
+            "a compile-state verdict expires with the install epoch"
+        );
+    }
+
+    #[test]
+    fn compile_state_dependent_osr_refusals_are_memoable_and_classified() {
+        for tag in OSR_COMPILE_STATE_REFUSAL_TAGS {
+            assert!(
+                OSR_PERMANENT_REFUSAL_TAGS.contains(&tag),
+                "{tag} must be memoable in the first place"
+            );
+            assert!(osr_refusal_depends_on_compile_state(&osr_refusal(tag, "probe")));
+        }
+        assert!(!osr_refusal_depends_on_compile_state(&osr_refusal(
+            OSR_REFUSE_PC_NOT_AN_ENTRY,
+            "probe"
+        )));
     }
 
     /// The happy path, on the production artifact shape (no deopt metadata):

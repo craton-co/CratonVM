@@ -20,9 +20,9 @@
 //!       │                  │
 //!       └──► C2 (if has profile + enough invocations)
 //!                          │
-//!       ◄──────────────────┘  (on deoptimization)
+//!       ◄──────────────────┘  (on a deopt that evicts the body)
 //!       │
-//!       └──► C1 (after 3+ deopts → c2_bailout, stays C1)
+//!       └──► C1 (per-bci trap limit or per-method trap cutoff → c2_bailout, stays C1)
 //! ```
 
 use std::collections::VecDeque;
@@ -288,6 +288,12 @@ pub struct CompilationPolicy {
     /// Invocation count threshold for C2 compilation.
     pub c2_threshold: u32,
     /// Back-edge count threshold for OSR compilation.
+    ///
+    /// Parsed (`CRATONVM_TIER_OSR_THRESHOLD`) but no longer consulted by the
+    /// manager: its only reader was the counting `on_backedge` door, which had
+    /// no production caller and was deleted. Back-edge OSR is throttled per
+    /// frame by `Frame::should_try_osr` (`CRATONVM_TIER_OSR_BACKEDGE`), which
+    /// calls [`TieredCompilationManager::request_osr`] directly.
     pub osr_threshold: u32,
     /// Whether tiered compilation is enabled.
     pub tiered_enabled: bool,
@@ -2448,6 +2454,10 @@ impl TieredCompilationManager {
             .osr_denied
             .write()
             .retain(|key, _| !key.belongs_to(class_id, class_name));
+        // And the process-wide compile verdicts about the class (bail list,
+        // refusal reasons, OSR entry rejects): a class that is gone must not
+        // leave refusals behind for the next class loaded under its name.
+        crate::forget_jit_verdicts_for_class(class_name);
         for _ in 0..windows_to_close {
             self.core.close_branch_window();
         }
@@ -2492,6 +2502,10 @@ impl TieredCompilationManager {
             .osr_denied
             .write()
             .retain(|key, _| &*key.class_name != class_name);
+        // The compile verdicts were measured on the old bytecode too. They
+        // already stop counting once the redefine epoch moves; dropping them
+        // also releases the memory.
+        crate::forget_jit_verdicts_for_class(class_name);
         self.core.bump_settled_generation();
     }
 

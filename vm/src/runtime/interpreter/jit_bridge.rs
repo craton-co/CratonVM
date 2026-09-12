@@ -4041,11 +4041,14 @@ pub(super) fn try_osr(
             cratonvm_jit::metrics::record_osr_event("osr_refused_entry");
             let permanent = cratonvm_jit::osr_refusal_is_permanent(&b);
             if permanent {
-                crate::jit::mark_osr_entry_rejected(
+                // `_by`: a refusal that depends on compile-time state expires
+                // when that state is flushed, instead of standing for good.
+                crate::jit::mark_osr_entry_rejected_by(
                     &class_name,
                     &method_name,
                     &method_descriptor,
                     entry_pc,
+                    &b,
                 );
             }
             if crate::runtime::env_cache::dbg_jitc() {
