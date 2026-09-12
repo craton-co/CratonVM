@@ -341,8 +341,7 @@ trial printed the same words. Twice for the `SSLContext` gate (§5) and once
 for `URL.toURI` — the fix that was measured, not the fix that was reasoned
 about, is the one that moved a row.
 
-**Run 2 — the merged tree**, which is what lands. `dev` moved 60+ commits
-under this wave:
+**Run 2 — the merged tree.** `dev` moved 60+ commits under this wave:
 
 ```text
   --jdk-only corpus          134 passed, 0 failed
@@ -355,6 +354,22 @@ under this wave:
   gate: ... --features synthetic-jdk  one target failed  (the same one)
   A/B re-run against the merged binary   reproduces every number above
 ```
+
+**Runs 3, 4 and 5 — `dev` kept moving, so the whole set ran again each time.**
+Two pushes were rejected mid-run; the corpus grew by two vectors and `core` by
+two on the way through. The tree that actually LANDED scored:
+
+```text
+  --jdk-only corpus          136 passed, 0 failed
+  SUITE=all                  136 passed, 0 failed
+  SUITE=core                  95 passed, 0 failed
+  the five gate configurations   identical to run 2, red for red
+  A/B, final tree                80 -> 0, 14 -> 0, 58 -> 36, 18 -> 14, 20 -> 16
+```
+
+The verification and the `git push` were finally put in ONE script, because
+the reject was never a gate result — it was the two minutes between a run
+finishing and a person reading it.
 
 ### The one red, and why it is not this wave's
 
