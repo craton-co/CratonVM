@@ -22,6 +22,25 @@ The opcode `matrix` step is explicitly report-only.
 The panic-only parser fuzzers are a separate harness with a separate posture —
 see [`fuzzing-state.md`](fuzzing-state.md).
 
+**JIT execution paths are gated against the interpreter, not HotSpot.** Two
+further subcommands use `nojit` as the oracle, so they need no HotSpot run and
+no ledger rows (operator guide:
+[`docs/testing/jit-differential.md`](../testing/jit-differential.md)):
+
+* `path-gate` runs a corpus through `Mode::execution_paths()` plus `moving-gc`
+  and fails on any reproducible disagreement with `nojit` that is not listed in
+  `difftest/path-gate-known.json`. The `difftest-jit-paths` CI job runs it over
+  `difftest/seeds` with the IR verifier lanes exported, and leaves the existing
+  `gate` step byte-identical.
+* `fuzz-jit` is the bytecode tier §3.1 describes, with a differential oracle
+  instead of a panic oracle. It writes verifiable class files directly through
+  a typed assembler (`classgen.rs`), covers sixteen JIT-hostile categories
+  (`MIN_VALUE / -1`, shift masking, NaN compares, float-to-int saturation,
+  switch edge keys, wrapping loop bounds, evaluation-order-sensitive `double`
+  sums, aliased arrays, every `dup*_x*` form, `wide`), and minimizes any split
+  to a runnable `.class`. `jit-differential-nightly.yml` runs a fixed seed range
+  under default, GC-stress, eager-deopt and major-49 axes.
+
 ## 1. Problem & motivation
 
 CratonVM is validated against HotSpot almost entirely by hand. Every entry in
