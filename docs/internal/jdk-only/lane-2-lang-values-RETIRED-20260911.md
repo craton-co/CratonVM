@@ -299,9 +299,20 @@ where retiring is a defect.
   `BootLoader` natives. 0 -> 35 on both arms against HotSpot's 91, and the triple
   has LEFT `RETIRED_SHADOW_L2_TRIPLES` because nothing registers it any more.
   Record: `package-getpackages-answered-empty-FIXED-20260911.md`.
-- **`the_drift_baseline_has_no_stale_rows` is red on `origin/dev`**, from lane
-  0's `Class.getModule` `Intrinsic` re-tag. Attributed and recorded in
-  `bug-two-drift-gates-are-red-on-pristine-dev-from-a-class-parameterised-registrar-20260822.md`.
+- ~~**`the_drift_baseline_has_no_stale_rows` is red on `origin/dev`**, from lane
+  0's `Class.getModule` `Intrinsic` re-tag.~~ **GREEN as of 93ca8d5c3.** Measured
+  2026-09-12 while retiring the `BigInteger` rows: `registrar_drift` is 7 passed /
+  0 failed in all three feature arms, and that file holds exactly seven `#[test]`
+  functions, of which this is one — so the pass is this row's and not a filtered
+  run's. Nothing in this lane fixed it; it is recorded here because a handoff that
+  names a red owes the reader the fact that the red is gone.
+  `bug-two-drift-gates-are-red-on-pristine-dev-from-a-class-parameterised-registrar-20260822.md`
+  keeps the history.
+
+  Worth keeping for the method: the whole of `native-builtins`' gate set read
+  "one red, and it is dev's" for months while `cargo test --tests` stopped at
+  `lock_discipline_ratchet` and never compiled `registrar_drift` at all. This row
+  could have been green for weeks without anyone being able to tell.
 - ~~**Lane 0's L2 row** should read 390/57/279.~~ It does, as of the retirement commit — `lane-0-integration-and-gates.md` line 67. The three numbers are a POPULATION (390 shadows over 57 classes, 279 sites) and so do not move when rows retire.
 
 ## 7. Acceptance
