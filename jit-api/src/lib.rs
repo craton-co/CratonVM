@@ -1193,10 +1193,11 @@ mod getfield_arg_tests {
 ///
 /// This struct is an ABI, not a data structure. The rules are absolute:
 ///
-/// * **`#[repr(C)]` is mandatory.** The JIT reads slots as
-///   `[helpers_ptr + disp32]` with the displacement computed at compile time.
-///   `repr(Rust)` may reorder fields, which would silently re-point every
-///   baked `CALL` at a different helper.
+/// * **`#[repr(C)]` is mandatory.** Backends read a slot by field name at
+///   compile time and bake its value into a `CALL`, but `HELPER_FIELDS`, the
+///   `Offset` slots and every golden-offset check name slots by byte offset.
+///   `repr(Rust)` may reorder fields, which would silently re-point each of
+///   those at a different helper.
 /// * **Every field is `usize`** (8 bytes; x86-64 only), so the byte offset of
 ///   field *N* is exactly `N * 8`. A non-`usize` field would introduce padding
 ///   and break that identity — see the `const _` assertions below.
@@ -2853,11 +2854,11 @@ mod tests {
 
     // --- JitRuntimeHelpers golden ABI offsets ---
     //
-    // The JIT compiler bakes `JitRuntimeHelpers` field addresses into
-    // generated RWX machine code as absolute CALL targets and as
-    // `[helpers_ptr + disp32]` loads. A silent field reorder would
-    // change the disp32 immediates while the JIT still emits the old
-    // offsets — i.e. a CALL that used to dispatch `new_object` would
+    // The JIT compiler bakes `JitRuntimeHelpers` slot values into
+    // generated RWX machine code as absolute CALL targets, and
+    // `HELPER_FIELDS` plus the `Offset` slots name slots by byte offset.
+    // A silent field reorder would leave those offsets naming the old
+    // slots — i.e. a CALL that used to dispatch `new_object` would
     // now dispatch `anewarray_object`, with no compile error. This
     // failure is undetectable at runtime until the wrong helper
     // corrupts the heap.

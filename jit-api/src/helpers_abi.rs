@@ -59,11 +59,10 @@
 //! * [`JitRuntimeHelpers::validate_with`], a version-checked validator that
 //!   names the first missing required slot.
 //!
-//! **The validator is not armed.** Nothing outside this crate calls
-//! [`JitRuntimeHelpers::validate_abi`], [`JitRuntimeHelpers::validate`] or
-//! [`JitRuntimeHelpers::null_pointers`] — the runtime half of this contract
-//! exists and is tested, but never runs in a real VM. See
-//! `docs/jit/helper-abi.md`.
+//! **The validator is armed.** The VM's `build_helpers` runs
+//! [`JitRuntimeHelpers::validate_abi`] on every table it produces and panics on
+//! a missing required slot, so a gap fails at VM start instead of surfacing as
+//! a `CALL 0` from compiled code. See `helper-abi.md`.
 //!
 //! # ABI contract
 //!
@@ -106,8 +105,7 @@ use crate::JitRuntimeHelpers;
 /// `build_helpers`) and consumers (the JIT backends) that disagree on this
 /// number disagree on where the helpers live.
 ///
-/// `6` is the revision of the 65-field, 520-byte table shipped today. The
-/// full history is in [`ABI_REVISIONS`], which a const assertion ties to this
+/// The full history, current revision last, is in [`ABI_REVISIONS`], which a const assertion ties to this
 /// constant, to [`NUM_HELPER_FIELDS`] and to [`JIT_HELPERS_ABI_SIZE`] — so
 /// appending a field without bumping this number no longer compiles.
 ///

@@ -3356,12 +3356,10 @@ pub struct CompiledMethod {
     /// bci the OPTIMIZING
     /// tier's body can be entered at part-way.
     ///
-    /// Empty on every artifact today: the stubs are emitted only under
-    /// `CRATONVM_JIT_IR_OSR_ENTRY=1`, and nothing calls them yet —
-    /// `compile_osr_artifact` reaches `x64::compile_with_param_slots` directly
-    /// and knows nothing about this tier. Published early so the codegen half
-    /// can be tested on its own, which is the half where a mistake produces a
-    /// plausible wrong number rather than a crash.
+    /// Filled by `ir_lower` (default on since 2026-09-05;
+    /// `CRATONVM_JIT_IR_OSR_ENTRY=0` removes the stubs) and entered by the
+    /// interpreter's OSR door through [`Self::ir_osr_enter`] when
+    /// [`Self::ir_osr_entry_addr`] names the loop header's bci.
     ///
     /// Distinct from `osr_pc_to_native`, the SINGLE-PASS door's table: that
     /// carries a native offset per bci for a body whose locals live at fixed
@@ -4421,7 +4419,8 @@ impl CompiledMethod {
     /// `osr_trampoline` because the trampoline builds the single-pass frame
     /// from outside.
     ///
-    /// `None` on every artifact today; see [`Self::ir_osr_entries`].
+    /// `None` when the body published no entry at `bci`; see
+    /// [`Self::ir_osr_entries`].
     pub fn ir_osr_entry_addr(&self, bci: u32) -> Option<(usize, u32)> {
         self.ir_osr_entries
             .iter()
@@ -6025,19 +6024,6 @@ fn osr_dead_local_entry_allowed() -> bool {
     )
 }
 
-/// Global cache of emitted OSR trampolines, keyed by `target_addr`.
-///
-/// Each `target_addr` (= `CompiledMethod.entry + native_offset` for an OSR PC) is
-/// stable for the lifetime of the compiled method. The trampoline body depends
-/// only on the method's frame layout and the destination JIT address — all of
-/// which are constant per `target_addr`. Runtime values (`vm_ptr`, `locals_ptr`)
-/// are now passed via argument registers instead of being baked in as immediates,
-/// so a single emitted trampoline can be reused across every OSR entry at that PC.
-///
-/// Buffers are held behind `Arc<ExecutableBuffer>` so they outlive any concurrent
-/// re-entry. Entries are never evicted during a VM run; they're released when the
-/// process exits (or, if the cache is ever cleared, after no thread can hold a
-/// transient `Arc` clone).
 /// Emitted OSR trampolines, keyed by `(target_addr, dead_mask)`.
 ///
 /// NOT by `target_addr` alone: the body bakes in the per-pc dead-local skip
@@ -6045,6 +6031,11 @@ fn osr_dead_local_entry_allowed() -> bool {
 /// them emits no bytes. A cache hit for the second then reused the first pc's
 /// skip set — skipping a live local, or seeding a dead one over a coalesced
 /// live register.
+///
+/// Runtime values (`vm_ptr`, `locals_ptr`) arrive in argument registers, so one
+/// trampoline serves every entry at its key. Each buffer sits behind an `Arc`,
+/// so an entry already under way keeps it mapped, and `CompiledMethod`'s `Drop`
+/// purges every key whose target lies inside the retiring body.
 #[allow(clippy::type_complexity)]
 fn osr_trampoline_cache(
 ) -> &'static parking_lot::Mutex<FxHashMap<(usize, u64), Arc<ExecutableBuffer>>> {
@@ -19235,41 +19226,18 @@ fn ir_call_is_identity_hash(node: &ir::Node, info_ptr: usize) -> bool {
 
 // ── The monitor half of the bridge (docs/jit/lock-elimination.md §6.2) ──
 //
-// NOT WIRED, and not for want of an arm here: **`ir::Op` has no
-// `MonitorEnter`/`MonitorExit` variant at all.** `ir::MemEffect::monitor_enter`
-// / `monitor_exit` exist and classify a monitor as `MemOrder::Acquire`/`Release`
-// with `safepoint: true`, but their own doc says `monitorenter` has no IR
-// lowering, so a synchronized method bails to the single-pass backend before it
-// ever reaches this bridge. That bail — not this file — is the gate on lock
-// elision and lock coarsening running in production.
-//
-// When the variants land, add to `escape_analysis_from_ir`'s FIRST-pass
-// `match &ir_node.op` (op choice):
-//
-//     ir::Op::MonitorEnter => escape_analysis::Op::MonitorEnter,
-//     ir::Op::MonitorExit  => escape_analysis::Op::MonitorExit,
-//
-// and to its SECOND-pass `match &ir_node.op` (operand re-packing) — this half
-// is the one that is easy to get wrong:
-//
-//     ir::Op::MonitorEnter | ir::Op::MonitorExit if ir_node.inputs.len() >= 3 => {
-//         // EA layout contract: the locked reference is input 0. The IR node
-//         // carries `[ctrl, mem, obj]`, exactly like `Load`/`Store`. Forwarding
-//         // verbatim attributes the monitor to the MEMORY TOKEN.
-//         vec![map_id(ir_node.inputs[2])]
-//     }
-//
-// `apply_ea_to_ir`'s elision loop is already all-or-nothing per object, which
-// is the precondition `docs/jit/lock-elimination.md` §6.1 requires to be in
-// place *before* this block is uncommented.
+// WIRED. `ir::Op::MonitorEnter`/`MonitorExit` exist, and both passes of
+// `escape_analysis_from_ir` map them: the op choice in `ir_op_to_ea_op`, and the
+// operand re-packing that forwards `inputs[2]`, the locked reference. (The IR
+// node carries `[ctrl, mem, obj]`; forwarding it verbatim would attribute the
+// monitor to the memory token.) `apply_ea_to_ir`'s elision loop is
+// all-or-nothing per object, the precondition `lock-elimination.md` §6.1 sets.
 //
 // `Object.wait`/`notify`/`notifyAll` ⇒ `EaOp::MonitorWait`/`MonitorNotify` are
-// deliberately NOT wired ahead of the variants either. Those mappings are
-// relaxations (they stop escaping the receiver through the `Op::Call` rule),
-// and with no `MonitorEnter` in the graph they would buy nothing: their only
-// consumers are the `E3` refusal (`waits_or_notifies_on`) and the identity
-// gate, both of which need monitors to exist before they can decide anything.
-// Wire them in the same change as the variants, not before.
+// still NOT wired. Those mappings are relaxations (they stop escaping the
+// receiver through the `Op::Call` rule), so they must land together with a test
+// that a waited-on receiver is refused elision (`waits_or_notifies_on`, the `E3`
+// refusal), not before.
 //
 // `athrow` ⇒ `EaOp::Throw` — WIRED, cov-07. `ir::Op::Throw` now exists
 // (`IrBuilder::build`'s `0xbf` arm) and maps below with NO operand
@@ -20138,13 +20106,11 @@ fn apply_ea_to_ir_pinned(
     //   * its memory-token chain cannot be spliced;
     //   * some non-token input still reads its value.
     //
-    // `escape_analysis_from_ir` still produces no `escape_analysis::Op::
-    // MonitorEnter` / `MonitorExit` (`ir::Op` has no monitor variant at all —
-    // see the ready-to-uncomment block in `escape_analysis_from_ir`), so
-    // `lock_elisions` is empty for every IR-derived graph and this loop is a
-    // no-op today. It is written correctly *first*, deliberately: bridging
-    // monitor ops while a per-node filter was in place is what would turn a
-    // latent hazard into a thrown `IllegalMonitorStateException`.
+    // `escape_analysis_from_ir` bridges `ir::Op::MonitorEnter`/`MonitorExit`,
+    // so a graph whose builder emitted a monitor pair reaches this loop with
+    // real plans. The loop is all-or-nothing per object on purpose: eliding
+    // one half of a pair is what turns a latent hazard into a thrown
+    // `IllegalMonitorStateException`.
     for plan in &ea_result.lock_elisions {
         let mut group: Vec<ir::NodeId> = Vec::with_capacity(plan.monitors.len());
         let mut ok = true;
@@ -35818,9 +35784,8 @@ mod tests {
     /// pair on a returned (therefore escaping) object, and a deopt snapshot
     /// naming the second of the pair. Returns `(graph, obj, m_enter, m_exit)`.
     ///
-    /// `ir::Op` has no `MonitorEnter`/`MonitorExit` variant (see the
-    /// ready-to-uncomment block next to `ir_call_is_identity_hash`), so real
-    /// monitor nodes cannot be built. Nothing is lost: `apply_ea_to_ir`'s lock
+    /// The fixture predates `ir::Op::MonitorEnter`/`MonitorExit` and keeps
+    /// ordinary nodes as stand-ins. Nothing is lost: `apply_ea_to_ir`'s lock
     /// loop asks three questions of a monitor — is it snapshot-named, is its
     /// memory token spliceable, is its value still read — and none of the three
     /// is monitor-specific. Two ordinary `Op::Store`s answer them the same way.
