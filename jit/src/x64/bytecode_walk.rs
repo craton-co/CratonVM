@@ -4393,6 +4393,38 @@ impl Compiler {
                                     .filter(|&&po| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
+                                // Implicit null checks. A `getfield` whose
+                                // receiver could not be proved non-null emits
+                                // NO test: the dereference is allowed to fault
+                                // and `implicit_null::recover` translates the
+                                // SIGSEGV into an NPE by looking the faulting
+                                // PC up in a table. A duplicated copy of that
+                                // dereference is a DIFFERENT faulting PC, and
+                                // until this snapshot existed it was in no
+                                // table -- so a null receiver in copy 0 threw
+                                // NullPointerException and the same receiver
+                                // one iteration later killed the process.
+                                //
+                                // Not a hypothetical: `walk(N o) { for (int i =
+                                // 0; i < 5; i++) { a += o.v; o = o.next; } }`
+                                // over a three-element list is an
+                                // EXCEPTION_ACCESS_VIOLATION reading 0x0F under
+                                // the default configuration, and correct with
+                                // `CRATONVM_DISABLE_UNROLL=1`. The bodies are
+                                // byte-identical; only the table differs.
+                                //
+                                // This vector post-dates the Task #60 sweep
+                                // above, which is how it came to be the one
+                                // patch vector the duplicator did not know
+                                // about.
+                                let orig_implicit_null: Vec<(usize, usize)> = self
+                                    .implicit_null_sites
+                                    .iter()
+                                    .filter(|&&(fault_off, _)| {
+                                        fault_off >= body_start && fault_off < body_end
+                                    })
+                                    .copied()
+                                    .collect();
                                 let orig_deopt_stubs: Vec<(usize, usize, i64)> = self
                                     .deopt_stubs
                                     .iter()
@@ -4436,10 +4468,16 @@ impl Compiler {
                                     .copied()
                                     .collect();
                                 // RIP-relative displacements addressing a fixed
-                                // absolute target (the safepoint flag). Same
-                                // hazard as the helper rel32 above and the same
-                                // fix: verbatim bytes would address
-                                // `target + shift` from the copy.
+                                // absolute target: the safepoint flag, and
+                                // since 2026-09-10 the layout-replacement
+                                // epoch a getfield site guards on. Same hazard
+                                // as the helper rel32 above and the same fix:
+                                // verbatim bytes would address
+                                // `target + shift` from the copy. The two
+                                // carry DIFFERENT trailing-byte counts (the
+                                // poll's `imm8`, the guard's `imm32`), which
+                                // is why the trail is per entry and not a
+                                // constant here.
                                 let orig_rip_abs: Vec<(usize, usize)> = self
                                     .rip_abs_disp32_patches
                                     .iter()
@@ -4664,6 +4702,30 @@ impl Compiler {
                                     );
                                     self.self_call_patches
                                         .extend(orig_self_calls.iter().map(|&po| po + shift_us));
+                                    // The RECOVERY address shifts only when it
+                                    // is itself inside the duplicated span.
+                                    // Every site this emitter makes recovers at
+                                    // its own arm's guarded slow path, which is
+                                    // a few bytes further into the same body --
+                                    // but an out-of-line recovery would NOT be
+                                    // duplicated, and sending a copy's fault to
+                                    // `recovery + shift` would resume it in
+                                    // whatever happened to be there. That is
+                                    // the one failure this table can produce
+                                    // that nothing downstream catches, so the
+                                    // condition is written rather than assumed.
+                                    self.implicit_null_sites.extend(
+                                        orig_implicit_null.iter().map(|&(fault, recover)| {
+                                            let recover = if recover >= body_start
+                                                && recover < body_end
+                                            {
+                                                recover + shift_us
+                                            } else {
+                                                recover
+                                            };
+                                            (fault + shift_us, recover)
+                                        }),
+                                    );
                                     // Deopt stub patches: (patch_offset, bci,
                                     // reason). bci and reason are the same
                                     // across copies (it's the same logical
@@ -5486,9 +5548,13 @@ impl Compiler {
                                                                                               // (NPE + i64::MIN sentinel) and flushes the scratch cache
                                                                                               // up-front because its slow path CALLs out.
                         let raw_mode = inline_getfield_enabled();
-                        if !raw_mode {
-                            self.flush_scratch_registers();
-                        }
+                        // Both modes flush since 2026-09-10: the
+                        // layout-replacement guard below clobbers R11 and RCX
+                        // on its fallback form, and its bail CALLs the checked
+                        // helper — so raw mode has a call on a path where it
+                        // never had one, and a stale scratch cache across it
+                        // would hand a later read a register the callee owns.
+                        self.flush_scratch_registers();
                         let trusted_have_key = !self.method_key.is_empty();
                         let trusted_marks_exact = self.stack_oop_marks_exact;
                         let trusted_top_is_oop =
@@ -5519,6 +5585,27 @@ impl Compiler {
                             );
                         }
                         let obj_slot = self.pop_stack();
+                        // The baked `cell_off` is a compile-time claim about
+                        // this class's compact layout, and the class manager
+                        // can REPLACE that layout at run time — the
+                        // synthetic-stub→real-bytecode upgrade. Every other
+                        // emitter that bakes one has guarded it since
+                        // 2026-09-04, whose commit named five such sites; this
+                        // one and the ungated compact reference `putfield`
+                        // below were not among them, and read at the OLD
+                        // offset for a REPLACED layout with nothing to stop
+                        // them. The allocation emitters' own comment calls
+                        // that "confirmed heap corruption".
+                        //
+                        // Emitted BEFORE the receiver load because the
+                        // fallback form clobbers R11 and RCX, exactly as
+                        // `objects.rs`'s three call sites do.
+                        let mut layout_bail: Vec<usize> = if jit_sp_field_layout_guard_enabled()
+                        {
+                            self.emit_layout_epoch_guard().into_iter().collect()
+                        } else {
+                            Vec::new()
+                        };
                         self.load_slot_to_reg(RAX, obj_slot);
                         let (mut slow_patches, null_patch) = if raw_mode {
                             // Null check: TEST RAX,RAX; JZ <null> (result 0).
@@ -5658,32 +5745,58 @@ impl Compiler {
                             }
                         }
                         let done_legacy_patch = self.emit_jmp_rel32_patch();
+                        // RAW mode emits no helper tail of its own, but the
+                        // layout-replacement bail above needs one: routing it
+                        // to the null path would answer 0, and routing it to
+                        // the legacy arm would read a compact object at the
+                        // uniform slot offset. So raw mode grows the tail too,
+                        // and jumps over it on the null path.
+                        let mut done_null_patch = None;
                         if let Some(null_patch) = null_patch {
                             // RAW mode null path: RAX := 0 (historical semantics).
                             self.patch_rel32_to_here(null_patch);
                             self.emit_xor_reg_self(RAX);
-                        } else {
+                            if !layout_bail.is_empty() {
+                                done_null_patch = Some(self.emit_jmp_rel32_patch());
+                            }
+                        }
+                        if null_patch.is_none() || !layout_bail.is_empty() {
                             // GUARDED slow path: null / unaligned / out-of-heap
                             // receiver → the checked helper, whose NPE +
                             // i64::MIN-sentinel semantics match the helper-only
-                            // arm below exactly.
+                            // arm below exactly. A replaced layout lands here
+                            // too, from either mode: the helper resolves the
+                            // CURRENT layout, which is the whole point of
+                            // refusing the baked offset.
                             for p in slow_patches {
                                 self.patch_rel32_to_here(p);
                             }
-                            // The implicit null check's recovery address is
-                            // THIS point. The slow path reloads the receiver
-                            // from its frame slot rather than reusing RAX, so
-                            // a fault recovered into here needs no register
-                            // repair — only the instruction pointer moves.
-                            self.bind_implicit_null_recovery();
+                            for p in layout_bail.drain(..) {
+                                self.patch_rel32_to_here(p);
+                            }
+                            if null_patch.is_none() {
+                                // The implicit null check's recovery address is
+                                // THIS point. The slow path reloads the receiver
+                                // from its frame slot rather than reusing RAX, so
+                                // a fault recovered into here needs no register
+                                // repair — only the instruction pointer moves.
+                                //
+                                // Raw mode tested null explicitly and has no
+                                // implicit check to recover, so it must not
+                                // claim this address as one.
+                                self.bind_implicit_null_recovery();
+                            }
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, pc);
                             crate::metrics::note_getfield_arm(1);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
                         }
                         // join
+                        if let Some(p) = done_null_patch {
+                            self.patch_rel32_to_here(p);
+                        }
                         self.patch_rel32_to_here(done_compact_patch);
                         self.patch_rel32_to_here(done_legacy_patch);
                         self.push_from_rax();
@@ -5874,7 +5987,7 @@ impl Compiler {
                             self.bind_implicit_null_recovery();
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, pc);
                             crate::metrics::note_getfield_arm(2);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
@@ -5906,7 +6019,7 @@ impl Compiler {
                         let obj_slot = self.pop_stack();
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, pc);
                         crate::metrics::note_getfield_arm(3);
                         self.emit_call_absolute(self.helpers.getfield);
                         // See the inlined-callee getfield site above: the checked
@@ -6118,6 +6231,18 @@ impl Compiler {
                                 // (cell base, not +8) differ.
                                 let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: disp32
                                 let mut bail: Vec<usize> = Vec::new();
+                                // The baked `cell_off` is a compile-time claim
+                                // about a layout the class manager can REPLACE
+                                // at run time. `emit_gated_compact_ref_putfield`
+                                // — the arm that ran before this one and
+                                // declined — has guarded it since 2026-09-04;
+                                // this ungated fallback arm did not, and every
+                                // `bail` here already means "take the
+                                // compact-aware helper", so it is the same
+                                // vector and the same destination.
+                                if jit_sp_field_layout_guard_enabled() {
+                                    bail.extend(self.emit_layout_epoch_guard());
+                                }
                                 // F-08 — the G1 arm. Under G1 the guard
                                 // below rejects every receiver (empty
                                 // store-side table), so this whole inline path
@@ -6467,8 +6592,11 @@ impl Compiler {
                         // SAFETY: `invoke_info` owns every pointer it hands
                         // out for the life of this compile.
                         let info = unsafe { &*(ip as *const crate::JitInvokeInfo) };
+                        // `keeps_dispatch_helper`, not `is_kernel`: inlining is
+                        // one-way, and a registry miss can mean "could not have
+                        // known yet". See its AUDIT 2026-09-07 note.
                         info.invoke_kind == 3
-                            && crate::offload_hook::is_kernel(
+                            && crate::offload_hook::keeps_dispatch_helper(
                                 info.class_name,
                                 info.method_name,
                                 info.descriptor,
@@ -10386,6 +10514,219 @@ impl Compiler {
                         }
                         // ===== INTRINSIC REGION END: BOX_UNBOX =====
 
+                        // ===== INTRINSIC REGION BEGIN: STRINGBUILDER_ACCESS =====
+                        // java.lang.StringBuilder: length()I and append(C).
+                        //
+                        // MEASURED on this tree, and the reason this region
+                        // exists: `StringBuilder.length()` is 194 ns/op and
+                        // `append(char)` 349 ns, while `String.length()` — the
+                        // same shape, already intrinsified two regions below —
+                        // is 2 ns. `System.identityHashCode`, a trivial native
+                        // with one object argument, is 120 ns, which is what
+                        // the boundary alone costs. The builder was paying it
+                        // on every call.
+                        //
+                        // # The slow edge is a CALL, not an uncommon trap
+                        //
+                        // Every other intrinsic in this file deopts on a failed
+                        // guard, because its guards fail on genuinely uncommon
+                        // things (a null receiver, an out-of-bounds index).
+                        // `append`'s do not: a full payload is what every
+                        // growing builder reaches O(log n) times, and a UTF16
+                        // builder fails the coder guard on EVERY call. Deopting
+                        // there would re-run the whole method in the
+                        // interpreter each time, so these edges go to the same
+                        // `invoke_dispatch` the site would have used anyway —
+                        // the decline-edge shape the FFM region above
+                        // established. Nothing here has to reproduce an
+                        // exception, a growth, or a coder inflation: the native
+                        // does all three, unchanged.
+                        if !intrinsic_handled
+                            && (callee_entry
+                                == crate::JitIntrinsic::StringBuilderLength.as_entry()
+                                || callee_entry
+                                    == crate::JitIntrinsic::StringBuilderAppendChar.as_entry())
+                        {
+                            let is_append = callee_entry
+                                == crate::JitIntrinsic::StringBuilderAppendChar.as_entry();
+                            let info_ptr = self
+                                .invoke_info_idx
+                                .get(&pc)
+                                .map(|&i| self.invoke_info[i].1);
+                            // The narrow-`value` refusal lives in
+                            // `StringBuilderFieldLayout::new`, not here, so
+                            // that registration and emission cannot disagree
+                            // about it — see that constructor.
+                            let layout = self.string_layout.and_then(|l| l.builder);
+                            match (info_ptr, layout) {
+                                (Some(info), Some(b)) if !info.is_null() => {
+                                    self.flush_scratch_registers();
+                                    // Operands, deepest first: receiver, then
+                                    // (append only) the char.
+                                    let ch_slot =
+                                        if is_append { Some(self.pop_stack()) } else { None };
+                                    let recv_slot = self.pop_stack();
+
+                                    let mut decline: Vec<usize> = Vec::new();
+
+                                    // RAX = receiver; null takes the call.
+                                    self.load_slot_to_reg(RAX, recv_slot);
+                                    self.emit_test_r64_r64(RAX);
+                                    decline.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                    // The receiver guard, and it is exact:
+                                    // `StringBuilder` is final, so a header
+                                    // class-id match IS that class. This is
+                                    // what keeps `StringBuffer` — synchronized
+                                    // methods, a `toStringCache` to invalidate
+                                    // on every mutation — off a path that
+                                    // emits neither obligation.
+                                    //   CMP DWORD [RAX + 0], class_id
+                                    self.buf.emit(&[0x81, 0x78, 0x00]);
+                                    self.buf.emit(&b.class_id.to_le_bytes());
+                                    decline.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                    let done = if let Some(ch) = ch_slot {
+                                        // RCX = the char. LATIN1 only: a wider
+                                        // one inflates the payload to UTF16,
+                                        // which is the native's job.
+                                        //
+                                        // Destructured rather than `expect`ed:
+                                        // this file denies production panics
+                                        // (`hot_files_have_no_production_panics`),
+                                        // and `is_append` and `ch_slot.is_some()`
+                                        // are the same fact — the operand is
+                                        // popped under exactly that condition.
+                                        self.load_slot_to_reg(RCX, ch);
+                                        self.buf.emit(&[0x81, 0xF9]); // CMP ECX, imm32
+                                        self.buf.emit(&0xFFi32.to_le_bytes());
+                                        decline.push(self.emit_jcc_rel32_patch(0x87)); // JA
+
+                                        // One compact/legacy branch for the
+                                        // whole body rather than one per field:
+                                        // the body is ten instructions, and a
+                                        // per-field test would emit four
+                                        // branches over the same header bit.
+                                        self.emit_test_mem8_imm8(
+                                            RAX,
+                                            cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
+                                            cratonvm_types::GC_FLAG_COMPACT,
+                                        );
+                                        let legacy = self.emit_jcc_rel32_patch(0x84); // JZ
+                                        self.emit_sb_append_char_body(
+                                            b.count_compact_offset,
+                                            b.value_compact_offset,
+                                            b.coder_compact_offset,
+                                            b.coder_compact_is_byte,
+                                            &mut decline,
+                                        );
+                                        let joined = self.emit_jmp_rel32_patch();
+                                        self.patch_rel32_to_here(legacy);
+                                        self.emit_sb_append_char_body(
+                                            b.count_legacy_offset,
+                                            b.value_legacy_offset,
+                                            b.coder_legacy_offset,
+                                            false,
+                                            &mut decline,
+                                        );
+                                        self.patch_rel32_to_here(joined);
+                                        // `append` returns its receiver, which
+                                        // is still in RAX and was never moved:
+                                        // this path allocates nothing.
+                                        self.emit_jmp_rel32_patch()
+                                    } else {
+                                        // length() is `count`, sign-extended
+                                        // into the 64-bit operand slot the same
+                                        // way `String.length()` ends.
+                                        self.emit_load_string_i32_field(
+                                            RAX,
+                                            RAX,
+                                            b.count_compact_offset,
+                                            false,
+                                            b.count_legacy_offset,
+                                        );
+                                        self.emit_jmp_rel32_patch()
+                                    };
+
+                                    // ---- decline edge: the unchanged dispatch
+                                    for p in decline {
+                                        self.patch_rel32_to_here(p);
+                                    }
+                                    let nargs = if is_append { 2 } else { 1 };
+                                    let args_base = match self
+                                        .reserve_spill_slots(nargs, SpillReason::HelperArgs)
+                                    {
+                                        Some(base) => base,
+                                        None => {
+                                            self.fail(
+                                                "singlepass-codegen/sb-args-spill-exhausted",
+                                            );
+                                            return false;
+                                        }
+                                    };
+                                    // `jit_invoke_dispatch`'s buffer runs
+                                    // arg[0] at the HIGHEST offset down. Both
+                                    // operands are loaded before either is
+                                    // stored: the buffer can overlap the
+                                    // operand homes.
+                                    self.load_slot_to_reg(RAX, recv_slot);
+                                    if let Some(ch) = ch_slot {
+                                        self.load_slot_to_reg(RCX, ch);
+                                    }
+                                    // Cast: an argument count of 1 or 2.
+                                    let top = args_base + (nargs as i32 - 1) * 8;
+                                    self.emit_store_local(top, RAX);
+                                    if ch_slot.is_some() {
+                                        self.emit_store_local(top - 8, RCX);
+                                    }
+                                    self.emit_load_local(
+                                        ARG_REGS[0],
+                                        self.heap_local_offset,
+                                    );
+                                    self.emit_mov_imm64(ARG_REGS[1], info as *const _ as i64);
+                                    self.emit_lea_frame_slot(ARG_REGS[2], top);
+                                    self.emit_mov_imm32_sx(ARG_REGS[3], nargs as i32);
+                                    self.emit_pre_safepoint_spill();
+                                    self.emit_call_absolute(self.helpers.invoke_dispatch);
+                                    self.emit_oop_map_for_safepoint();
+                                    // `append` returns a reference, `length` an
+                                    // int; neither shares the `i64::MIN`
+                                    // pending-exception sentinel with a
+                                    // legitimate value, so both take the plain
+                                    // arm.
+                                    self.emit_post_invoke_exception_check(if is_append {
+                                        b'L'
+                                    } else {
+                                        b'I'
+                                    });
+
+                                    // ---- join -----------------------------
+                                    self.patch_rel32_to_here(done);
+                                    self.next_spill_offset = args_base;
+                                    self.push_from_rax();
+                                    if is_append {
+                                        // The builder it returns is the builder
+                                        // it was handed.
+                                        self.mark_top_as_oop();
+                                    }
+                                    intrinsic_handled = true;
+                                }
+                                // Falling through is NOT safe: the site carries
+                                // an intrinsic SENTINEL as its
+                                // `JitDirectCall::entry`, and the ordinary
+                                // direct-call path would CALL that sentinel.
+                                // Registration and emission must agree, so a
+                                // shape that cannot be emitted fails the
+                                // compile and drops the method to the
+                                // interpreter.
+                                _ => {
+                                    self.fail("singlepass-codegen/sb-intrinsic-unemittable");
+                                    return false;
+                                }
+                            }
+                        }
+                        // ===== INTRINSIC REGION END: STRINGBUILDER_ACCESS =====
+
                         // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
                         // java.lang.String access intrinsics (Phase 3a):
                         // length()I, isEmpty()Z, charAt(I)C, hashCode()I.
@@ -13275,16 +13616,40 @@ impl Compiler {
                     self.flush_scratch_registers();
                     let atype = code[pc + 1] as i32; // Widening: always safe
                     let count_slot = self.pop_stack();
-                    // Load heap pointer → ARG_REGS[0]
-                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                    // atype immediate → ARG_REGS[1]
-                    self.emit_mov_imm32_sx(ARG_REGS[1], atype);
-                    // count → ARG_REGS[2]
-                    self.load_slot_to_reg(ARG_REGS[2], count_slot);
                     // Round-8 wave-3: defensive callee-saved spill
                     // before any GC-triggering CALL.
+                    //
+                    // Emitted BEFORE the fast path, not between it and the
+                    // helper, because both arms merge into one oop map below
+                    // and the spill has to cover the edge that calls. The
+                    // inline arm never calls, so it pays stores it does not
+                    // need — the `new` arm's `sink_alloc_blind_spill` is the
+                    // machinery for withholding them, and wiring an array-
+                    // shaped request into it is a separate change from giving
+                    // arrays a bump at all.
                     self.emit_pre_safepoint_spill();
-                    self.emit_call_absolute(self.helpers.newarray);
+                    // The inline TLAB bump, with `helpers.newarray` as its own
+                    // slow path. Declines (and emits nothing) for a shape it
+                    // cannot serve, leaving the unconditional call below.
+                    //
+                    // `ArrayElementType`'s discriminants ARE the JVM `atype`
+                    // values (`Boolean = 4` … `Long = 11`), which is what makes
+                    // `array_element_type_from_tag` the decode here; an
+                    // unrecognised tag yields `None` and keeps the call, the
+                    // same outcome `jit_newarray`'s own `_ => return 0` arm has.
+                    // Cast: an `atype` is one bytecode operand byte.
+                    let inlined = cratonvm_types::array_element_type_from_tag(atype as u8)
+                        .map(|elem| self.emit_inline_tlab_newarray(elem, atype, count_slot))
+                        .unwrap_or(false);
+                    if !inlined {
+                        // Load heap pointer → ARG_REGS[0]
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        // atype immediate → ARG_REGS[1]
+                        self.emit_mov_imm32_sx(ARG_REGS[1], atype);
+                        // count → ARG_REGS[2]
+                        self.load_slot_to_reg(ARG_REGS[2], count_slot);
+                        self.emit_call_absolute(self.helpers.newarray);
+                    }
                     // T1.1.a — `newarray` is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
                     // Heap-exhaustion guard: a null result means OOM (the helper

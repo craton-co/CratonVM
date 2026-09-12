@@ -1610,6 +1610,49 @@ fn reset_permissive_dispatch_memo() {
     PERMISSIVE_DISPATCH_MEMO.with(|memo| memo.set((0, 0, 0)));
 }
 
+/// [`check_native_dispatch_capability`] for a caller that already knows the
+/// classification and the slot, and has no strings to spend on re-deriving
+/// either.
+///
+/// The JIT's per-call-site native cache
+/// (`jit::helpers::try_jit_site_cached_native_dispatch`) is that caller. It
+/// resolved the site once, against the RECEIVER's runtime class — which is not
+/// necessarily `JitInvokeInfo::class_name`, the constant-pool owner — and it
+/// holds the `NativeMethodId`. Re-entering through the string form would
+/// re-classify from the CP owner, and `java/io/InputStream` (unclassified) with
+/// a `java/io/FileInputStream` receiver (`FileRead`) is exactly the shape where
+/// that silently drops the gate. So the kind travels on the cache entry and the
+/// decision is made from it, never re-derived.
+///
+/// Otherwise identical to the string form, arm for arm: the permissive-mode
+/// thread memo first, then the slot's own precomputed classification, then the
+/// `classify_native` answer as the fallback for a slot that carries none.
+pub(crate) fn check_native_dispatch_capability_for_slot(
+    shared: &SharedVm,
+    kind: cratonvm_native_api::CapabilityKind,
+    native_id: Option<cratonvm_native_api::NativeMethodId>,
+) -> Result<(), MethodCallFailed> {
+    let registry = &shared.natives.native_methods;
+    let Some(caps) = registry.capabilities() else {
+        return Ok(());
+    };
+    if caps.mode() == cratonvm_native_api::CapabilityMode::Permissive
+        && permissive_dispatch_already_recorded(shared.vm_identity, caps, kind)
+    {
+        return Ok(());
+    }
+    if let Some(id) = native_id {
+        if registry.capability_of_id(id).is_some() {
+            return registry.check_dispatch_capability(id).map_err(Into::into);
+        }
+    }
+    caps.check(cratonvm_native_api::Capability::of(
+        kind,
+        cratonvm_native_api::Scope::Any,
+    ))
+    .map_err(Into::into)
+}
+
 /// The ~35-native half of [`check_native_dispatch_capability`]. Out of line so
 /// the hot path is two predicted-not-taken branches and nothing else.
 #[cold]
@@ -1931,7 +1974,8 @@ fn lookup_known_system_library_symbol(name: &str, c_name: &std::ffi::CStr) -> Op
     static LIBZSTD_HANDLE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let handle = *LIBZSTD_HANDLE.get_or_init(|| {
         for lib in [b"libzstd.so.1\0".as_slice(), b"libzstd.so\0".as_slice()] {
-            let handle = unsafe { libc::dlopen(lib.as_ptr() as *const libc::c_char, libc::RTLD_LAZY) };
+            let handle =
+                unsafe { libc::dlopen(lib.as_ptr() as *const libc::c_char, libc::RTLD_LAZY) };
             if !handle.is_null() {
                 return Some(handle as usize);
             }
@@ -2174,7 +2218,17 @@ pub fn coerce_value_for_return(value: Value, ret_type: u8) -> Value {
 /// the method descriptor's return type.
 #[inline]
 pub fn coerce_native_return(value: Option<Value>, descriptor: &str) -> Option<Value> {
-    let ret = crate::jit::return_type(descriptor);
+    coerce_native_return_typed(value, crate::jit::return_type(descriptor))
+}
+
+/// [`coerce_native_return`] for a caller that already holds the descriptor's
+/// return tag.
+///
+/// `crate::jit::return_type` is a byte-at-a-time scan for `)`, and the compiled
+/// native dispatch path runs it on every call for a descriptor it has already
+/// decoded once (see `jit::helpers::JitArgShape`). Same answer, no scan.
+#[inline]
+pub fn coerce_native_return_typed(value: Option<Value>, ret: u8) -> Option<Value> {
     if ret == b'V' {
         return value;
     }
@@ -3304,6 +3358,93 @@ struct NativeDiagState {
 /// Cheap and confined: this is the native boundary, not the interpreter's
 /// `putfield`, and the barrier short-circuits on anything that is not a moved
 /// object.
+/// Stores `NativeContext::set_field_by_name` DROPPED because the receiver's
+/// class does not declare the named field.
+static FIELD_BY_NAME_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many `set_field_by_name` calls named a field their receiver does not
+/// have. Always counted; see [`note_field_by_name_dropped`] for what a non-zero
+/// value does and does not mean.
+pub fn field_by_name_dropped_count() -> u64 {
+    FIELD_BY_NAME_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The silent arm of `set_field_by_name`, made audible under
+/// `CRATONVM_DBG_DEADREF_STORE`.
+///
+/// # Why this is where a stale receiver actually surfaces
+///
+/// `set_field_by_name` resolves the field against the class of whatever object
+/// is AT the address it is handed. A native that kept a receiver across an
+/// allocation hands it a vacated address — and a young semispace is re-served
+/// from the same base every cycle, so that address is usually occupied by some
+/// unrelated object by the time the store runs. The field name then does not
+/// resolve, and the store disappears **before** it reaches the heap: no
+/// `set_field`, so no `[deadref-store]`, no `[deadref-recv]`, no
+/// `[CELLWATCH]`, no `[PUTFIELD-WATCH]`. Nothing in the VM said anything.
+///
+/// That is exactly how `native_assertj_lightweight_comparable_assert`'s
+/// `objects` store vanished (see
+/// `docs/internal/springboot/bindabletests-assertj-objects-receiver-stale-across-clinit-20260911.md`),
+/// and it is why the heap-side screens could not have found it however many
+/// arms they grew.
+///
+/// # Why it is counted always and printed only under the flag
+///
+/// A miss is not always a defect: several natives set a field that only some
+/// subclasses declare (`strings` and `failures` on the AssertJ assertions are
+/// the local example), so an unconditional warning would be noise — MEASURED, a
+/// single `BindableTests` run drops 2 710 stores and ~2 700 of them are one
+/// benign shape, `StringBuilder.toStringCache`. The COUNT is free and makes
+/// "did this happen at all" answerable; the line with its backtrace is behind
+/// the same switch as the rest of the stale-reference family, because that is
+/// when someone is asking this question, and it is deduped by
+/// `(receiver class, field name)` so that population cannot crowd out the one
+/// row a reader opened the log for.
+#[cold]
+#[inline(never)]
+fn note_field_by_name_dropped(
+    class_id: ClassId,
+    class_name: &str,
+    field_name: &str,
+    obj: ObjectRef,
+    value: Value,
+) {
+    FIELD_BY_NAME_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !cratonvm_types::flags().gc.dbg_deadref_store {
+        return;
+    }
+    // DEDUPE BY SHAPE, not by occurrence count. A plain "first N" cap is worse
+    // than useless here and was measured to be: a BindableTests run drops 2 710
+    // stores, ~2 700 of them one benign shape (`StringBuilder.toStringCache`),
+    // so a 32-line cap spends every line on the noise and never reaches the
+    // one that matters. One line per distinct `(receiver class, field name)`
+    // turns the same population into a handful of rows, and a stale receiver is
+    // a shape nothing else in the run produces.
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u32, String)>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = match SEEN.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
+    if seen.len() >= 256 || !seen.insert((class_id.as_u32(), field_name.to_string())) {
+        return;
+    }
+    let n = seen.len() - 1;
+    drop(guard);
+    eprintln!(
+        "[field-by-name-dropped] #{n} obj=0x{:x} recv_class={class_name} \
+         recv_class_id={} field={field_name:?} value={value:?} — the receiver's class does not \
+         declare this field, so the store was DROPPED. Either the caller named a field only some \
+         subclasses have, or the receiver is a stale address now occupied by a different object.\n{:?}",
+        obj.as_ptr() as usize,
+        class_id.as_u32(),
+        std::backtrace::Backtrace::force_capture(),
+    );
+}
+
 #[inline]
 fn forward_boundary_value(heap: &crate::memory::VmHeap, value: Value) -> Value {
     match value {
@@ -3463,7 +3604,9 @@ pub(crate) fn safe_native_call_leaf(
     // Copy nothing unless the barrier has something to rewrite — see the same
     // shape, and the measurement behind it, in `safe_native_call_impl`.
     const INLINE_NATIVE_ARGS: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
-    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    // Declared, not initialised — see the same shape, and the measurement, in
+    // `safe_native_call_impl`.
+    let mut inline_forwarded: [Value; INLINE_NATIVE_ARGS];
     let mut heap_forwarded: Vec<Value>;
     let mut moved = None;
     for (index, value) in args.iter().enumerate() {
@@ -3479,6 +3622,7 @@ pub(crate) fn safe_native_call_leaf(
         None => args,
         Some(first_moved) => {
             let buf: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+                inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
                 inline_forwarded[..args.len()].copy_from_slice(args);
                 &mut inline_forwarded[..args.len()]
             } else {
@@ -3827,12 +3971,27 @@ fn safe_native_call_impl(
     // whether or not one is used, measured at 7.3 ns for the two scratch arrays
     // together in `native_funnel_profile` (`vm_exec.rs`), against a ~23 ns
     // one-argument funnel.
-    let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
+    // DECLARED, not initialised. The comment above prices the eight-`Value`
+    // fill at 7.3 ns for the pair and says it is paid "whether or not one is
+    // used" — and the ordinary case is that none is, because an argument that
+    // forwards to itself needs no scratch at all. Definite-assignment lets the
+    // fill move into the arm that actually reads it, so the common path stores
+    // nothing. Measured at 2.7-3.8 ns for the remaining array on
+    // `native_funnel_profile`'s scratch rung, against a ~26 ns funnel.
+    let mut inline_forwarded: [Value; INLINE_NATIVE_ARGS];
     let mut heap_forwarded: Vec<Value>;
     let mut moved = None;
     for (index, value) in args.iter().enumerate() {
         if let Value::Object(Some(obj)) = value {
-            let forwarded = shared.mem.heap.load_and_forward(*obj);
+            // The caller already walked these pointers when it validated them;
+            // `load_and_forward` would walk each one again. See
+            // `VmHeap::load_and_forward_validated` for the contract, and
+            // `safe_native_call_prevalidated_objects` for who establishes it.
+            let forwarded = if prevalidated_objects {
+                shared.mem.heap.load_and_forward_validated(*obj)
+            } else {
+                shared.mem.heap.load_and_forward(*obj)
+            };
             if forwarded.as_ptr() != obj.as_ptr() {
                 moved = Some(index);
                 break;
@@ -3846,6 +4005,7 @@ fn safe_native_call_impl(
         // its own forwarding target.
         Some(first_moved) => {
             let forwarded_args: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
+                inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
                 inline_forwarded[..args.len()].copy_from_slice(args);
                 &mut inline_forwarded[..args.len()]
             } else {
@@ -4291,6 +4451,51 @@ fn safe_native_call_impl(
                     );
                 }
                 *o = healed;
+                // `CRATONVM_DBG_DEADREF_STORE`: did the heal actually heal it?
+                //
+                // `load_and_forward` reads the forwarding marker at the old
+                // address, and the comment above is careful to say that marker
+                // "stays readable until the memory is actually reused". Once the
+                // allocator has re-served the span there is nothing left to
+                // read, and the heal silently returns the dead address it was
+                // given. That is not a rare corner under GC stress: it is the
+                // normal case, because a stale reference is only USED some
+                // cycles after it goes stale.
+                //
+                // So this is the boundary at which a native's stale return
+                // becomes the interpreter's problem, and it is the only place
+                // that can name the native. Everything downstream sees an
+                // ordinary operand-stack value.
+                {
+                    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *ON.get_or_init(|| cratonvm_types::flags().gc.dbg_deadref_store) {
+                        if let Some(reason) =
+                            cratonvm_gc::gen_heap::dead_young_ref_reason_global(o.as_ptr() as usize)
+                        {
+                            static N: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                let callee = native_callee_name(callback);
+                                let java_site = thread
+                                    .frames
+                                    .last()
+                                    .map(|f| {
+                                        format!(
+                                            "{}.{}{}",
+                                            f.class_name(),
+                                            f.method_name(),
+                                            f.method_descriptor()
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "[deadref-nret] {reason} native {callee} (invoked from                                      {java_site}) returned 0x{:x}, which names no live object,                                      and `load_and_forward` could not heal it — the forwarding                                      marker is gone because the span was re-served. The defect                                      is in the native: it held a reference across an allocation.",
+                                    o.as_ptr() as usize,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);
@@ -4421,17 +4626,128 @@ pub fn native_return_pushed_to_stack(_shared: &SharedVm, thread: &mut JvmThread)
 /// object graph it touches. Calling this from the safepoint publish bounds
 /// that damage to one safepoint interval. Returns the number of chain
 /// entries + write-backs applied.
-/// `CRATONVM_BLOCKED_WAKE_JIT_REMAP=1` -- remap a waking blocked thread's
-/// COMPILED state (JIT frames, register image, shadow stack), not just its
-/// interpreter frames.
+/// The JIT half of the blocked-region wake: remap this thread's active
+/// compiled frames, register images and shadow stack through the fixup chain
+/// composed while it slept.
 ///
-/// Default OFF only until it is measured; the omission it closes is a
-/// use-after-free. See the block in [`apply_pending_blocked_fixups`].
+/// **Default-ON as of 2026-09-08; `CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP=1` is the
+/// kill switch.** It shipped opt-in and wired into
+/// `apply_pending_blocked_fixups` only -- the LEAKED-region fallback -- so the
+/// path that actually runs, `check_post_block_gc_refs`, remapped interpreter
+/// frames and thread-local refs and nothing compiled. A thread that blocked in
+/// a native with compiled frames below it therefore resumed with every
+/// JIT-frame oop, register-image word and shadow-stack entry still at its
+/// pre-move address, which is a use-after-free whatever else is true.
+///
+/// That omission is the one `xt_jit_coverage_assume`'s doc names as the price
+/// of crediting blocked peers -- *"giving them a deposit means teaching the
+/// blocked-region WAKE to remap JIT frames (it currently remaps only
+/// interpreter frames)"* -- and it is what
+/// `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
+/// spent §6-§12 narrowing to "the stale reference is outside the heap, in a
+/// peer". Measured on that page's own repro at
+/// `CRATONVM_GC_YOUNG_TRIGGER_PERCENT=1 CRATONVM_XT_JIT_COVERAGE_ASSUME=1
+/// CRATONVM_GC_NO_PEER_PIN_DIVERT=1`: SIGSEGV in compiled code reading a
+/// decommitted heap span, **6/6 with this disabled and 0/10 with it enabled on
+/// one binary** (10/10 on the dev tip that predates it). Across the whole
+/// 19-class family at that engagement, 18 of 19 classes crashed before and
+/// none after.
 fn blocked_wake_jit_remap_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_BLOCKED_WAKE_JIT_REMAP").is_some()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP").is_none()
     })
+}
+
+/// The JIT half of a blocked-region wake, shared by the ordinary path
+/// (`check_post_block_gc_refs`) and the leaked-region fallback
+/// (`apply_pending_blocked_fixups`).
+///
+/// Sound on both because each runs ON the waking thread, after
+/// `leave_blocked_region_flagged` and before it can re-enter Java or compiled
+/// code: `JIT_ENTRY_CHAIN`, the cached top RBP and the shadow stack are all
+/// thread-local, so nothing here reads another thread's state, and no pause can
+/// complete concurrently (this thread now counts in `expected`). Re-remapping an
+/// already-rewritten slot is harmless -- a second lookup of a to-space address
+/// misses.
+fn apply_blocked_wake_jit_remap(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    fixup: &cratonvm_types::PointerMap,
+) {
+    if !blocked_wake_jit_remap_enabled() || fixup.is_empty() {
+        return;
+    }
+    crate::jit::conservative_roots::remap_active_jit_frames(fixup);
+    crate::jit::conservative_roots::remap_register_image_words(fixup, Some(shared));
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        thread.shadow_stack.remap(fixup);
+    }
+}
+
+/// Write back the native-stack words a peer collection scanned out of this
+/// thread while it was blocked. Returns how many were stored.
+///
+/// Called from BOTH wake paths. `check_post_block_gc_refs` is the ordinary one;
+/// `apply_pending_blocked_fixups` is the leaked-blocked-region fallback. The
+/// first cut of this repair lived only in the fallback, and the engagement
+/// census said so plainly -- `captured=49916 written=0 skipped=0`.
+pub(crate) fn apply_native_slot_fixups(thread: &mut JvmThread) -> usize {
+    let slots = {
+        let mut n = thread.gc_block_state.native_slots.lock();
+        std::mem::take(&mut *n)
+    };
+    if slots.is_empty() {
+        return 0;
+    }
+    let mut n = 0usize;
+    // THE BLOCKED-PEER NATIVE-STACK WRITE-BACK (2026-09-07).
+    //
+    // These are raw words in THIS thread's own machine stack that a peer
+    // collection scanned conservatively while we were blocked: the objects were
+    // kept alive and RELOCATED, and nothing rewrote the words, because a
+    // blocked thread skips the safepoint-resume `apply_pointer_map_to_thread`
+    // and the pin that was supposed to protect it is a no-op on a Cheney copy
+    // (`VmHeap::Generational::honours_conservative_pins()` is false).
+    //
+    // Running here is what makes the write safe from concurrency: this is the
+    // owning thread, after `leave_blocked_region_flagged` and before it can
+    // re-enter Java or compiled code.
+    //
+    // THE GUARD IS LOAD-BEARING. The scanned band spans the peer's actively
+    // running NATIVE frames, whose C locals churn while it is blocked, so a
+    // word may have been reused since the capture. Only a word that still reads
+    // `orig` is stored into; anything else is left alone. What remains is the
+    // residual every conservative scan carries -- a C value bit-identical to a
+    // young object base that moved -- and it is the same residual
+    // `remap_one_frame_register_images` accepted when it chose to WRITE the
+    // callee-saved GPR image, on the same grounds: `is_object_address` vetted
+    // the word against the arena bounds and the object-start bitmap.
+    for ns in &slots {
+        if ns.cur == ns.orig || ns.addr == 0 || ns.addr & 0x7 != 0 {
+            continue;
+        }
+        // SAFETY: `ns.addr` is a word inside this thread's own stack, recorded
+        // by the cross-thread scan while this thread was blocked, and this code
+        // runs ON that thread. The read-compare-write is not racing anything:
+        // no other thread writes this stack, and we have not resumed Java yet.
+        unsafe {
+            let p = ns.addr as *mut usize;
+            if p.read() == ns.orig {
+                p.write(ns.cur);
+                cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_WRITTEN
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                n += 1;
+            } else {
+                // The native call reused this word since the capture. Leaving
+                // it alone is the whole safety argument -- see the block
+                // comment above.
+                cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_SKIPPED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    n
 }
 
 pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmThread) -> usize {
@@ -4444,10 +4760,10 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
         let mut o = thread.gc_block_state.slot_origins.lock();
         std::mem::take(&mut *o)
     };
-    if fixup.is_empty() && origins.iter().all(|so| so.cur == so.orig) {
+    let mut applied = apply_native_slot_fixups(thread);
+    if fixup.is_empty() && origins.iter().all(|so| so.cur == so.orig) && applied == 0 {
         return 0;
     }
-    let mut applied = 0usize;
     if !fixup.is_empty() {
         applied += fixup.len();
         // THE JIT HALF, and it was missing entirely.
@@ -4488,13 +4804,10 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
         // function runs ON the waking thread, before it can re-enter compiled
         // code. Re-remapping an already-rewritten slot is harmless -- a second
         // lookup of a to-space address misses.
-        if blocked_wake_jit_remap_enabled() {
-            crate::jit::conservative_roots::remap_active_jit_frames(&fixup);
-            crate::jit::conservative_roots::remap_register_image_words(&fixup, Some(shared));
-            if crate::jit::conservative_roots::shadow_stack_enabled() {
-                thread.shadow_stack.remap(&fixup);
-            }
-        }
+        // Attribution: this thread applied a relocation map through the
+        // LEAKED-REGION FALLBACK.
+        cratonvm_gc::gc_quiescence::note_pointer_map_applied(3);
+        apply_blocked_wake_jit_remap(shared, thread, &fixup);
         for frame in &mut thread.frames {
             frame.update_local_refs(&fixup, &shared.mem.heap);
             frame.stack.update_object_refs(&fixup, &shared.mem.heap);
@@ -6100,6 +6413,108 @@ pub struct NativeContextImpl<'a> {
 }
 
 impl NativeContextImpl<'_> {
+    /// Charge a native-side allocation that did NOT come out of the calling
+    /// thread's TLAB to the two allocation counters.
+    ///
+    /// # Why this exists
+    ///
+    /// `getThreadAllocatedBytes` / `getTotalThreadAllocatedBytes` are fed from
+    /// exactly two places (see `cratonvm_gc::tlab`): the TLAB cursor, and
+    /// `note_external_allocation` for everything that bypassed the TLAB. The
+    /// interpreter's own slow paths (`alloc_object_shared`, `gc_alloc_array`)
+    /// have always called the second. The NATIVE allocation funnels did not,
+    /// on any of their non-TLAB arms -- and every collection, string, box and
+    /// reflective object in this VM is built through them.
+    ///
+    /// The hole was invisible while the counter had a larger over-count on top
+    /// of it, and it is not small. MEASURED, `Integer.valueOf(100000 + i)` a
+    /// million times: 24.0 bytes per object retained on the heap, and **0.0**
+    /// reported by BOTH counters on Generational and ZGC, against a correct
+    /// 24.0 on G1 -- not because G1 counted better, but because G1 is the one
+    /// backend with neither a native old-gen batch pool nor a disabled-by-
+    /// default TLAB refill, so its native allocations happened to land on the
+    /// one arm that was already counted. On the Hibernate HQL parse this
+    /// record is about, the difference between the two is 72 MB against 191 MB
+    /// for byte-identical bytecode.
+    ///
+    /// An under-count is the dangerous direction: it is what makes a byte
+    /// budget pass vacuously. `HqlParserMemoryUsageTest` asserts one.
+    ///
+    /// Sized from the ALLOCATED OBJECT's own header, not from the slot count
+    /// the caller asked for. The two differ: `alloc_object` clamps a native
+    /// caller's slot count up to the class's real field count, and the heap
+    /// rounds the result, so charging the request over-reported a boxed
+    /// `Integer` at 32 bytes where its header says 24. Reading the header back
+    /// is one load and cannot drift from what was actually laid down.
+    #[inline]
+    fn note_native_object_alloc(&mut self, obj: ObjectRef) {
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let slots = self.shared.mem.heap.get_header(obj).num_slots() as usize;
+        self.thread
+            .tlab
+            .note_external_allocation(HEADER_SIZE + slots.saturating_mul(SLOT_SIZE));
+    }
+
+    /// [`Self::note_native_object_alloc`] for an array. The data area is sized
+    /// by the same `array_data_size` the allocator used, so the charge is the
+    /// footprint and not the element count.
+    #[inline]
+    fn note_native_array_alloc(&mut self, array: ObjectRef) {
+        self.thread
+            .tlab
+            .note_external_allocation(self.native_array_footprint(array));
+    }
+
+    /// Footprint of an allocated array, read back from the heap: header plus
+    /// the `array_data_size` of its own length and element type. Shares the
+    /// sizing rule with the allocator rather than restating it.
+    ///
+    /// Read straight off the header rather than through `array_length` /
+    /// `element_type_of`. Those two are the defensive accessors: they run
+    /// `is_object_address` first, which on ZGC is a registry lookup, and this
+    /// runs on every native array allocation -- every collection resize in the
+    /// process. The defence buys nothing here, because the only callers pass an
+    /// array this method's own allocator returned microseconds earlier.
+    #[inline]
+    fn native_array_footprint(&self, array: ObjectRef) -> usize {
+        use cratonvm_gc::heap::HEADER_SIZE;
+        let header = self.shared.mem.heap.get_header(array);
+        if header.kind() != ObjectKind::Array {
+            // Not an array: charge nothing. Reachable only through the String
+            // helper, whose field 0 is an array on every real layout but is a
+            // duck-typed read -- and inventing a header's worth of allocation
+            // for a String that turned out not to have a backing array would be
+            // a bias in the over-reporting direction, which is the one this
+            // whole record exists to remove.
+            return 0;
+        }
+        let len = header.array_length() as usize;
+        let data = cratonvm_types::array_data_size(len, header.element_type()).unwrap_or(0);
+        HEADER_SIZE.saturating_add(data)
+    }
+
+    /// [`Self::note_native_object_alloc`] for a freshly built `java/lang/String`,
+    /// charging BOTH the String object and its backing array.
+    ///
+    /// Sized by reading the object back rather than from the source text: the
+    /// String's slot count and its backing array's element type (LATIN1 `byte[]`
+    /// against UTF16, or a legacy `char[]`) are layout decisions made inside
+    /// `alloc_java_string_object`, and re-deriving them here would be a second
+    /// copy of that logic to keep in step.
+    ///
+    /// The caller decides WHETHER to call this, because the pooled constructor
+    /// returns an existing object on an intern hit and that allocates nothing.
+    fn note_native_string_alloc(&mut self, s: ObjectRef) {
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let slots = self.shared.mem.heap.get_header(s).num_slots() as usize;
+        let mut bytes = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+        if let Value::Object(Some(backing)) = self.shared.mem.heap.get_field(s, 0) {
+            // `native_array_footprint` screens the kind off the header itself.
+            bytes = bytes.saturating_add(self.native_array_footprint(backing));
+        }
+        self.thread.tlab.note_external_allocation(bytes);
+    }
+
     /// Terminal object allocation for [`NativeContext::alloc_object`], with the
     /// heap-exhaustion unwind applied (see `crate::runtime::native_oom`).
     ///
@@ -7190,6 +7605,9 @@ impl<'a> NativeContextImpl<'a> {
             let mut f = self.thread.gc_block_state.fixup.lock();
             std::mem::take(&mut *f)
         };
+        // The native-stack half of the same wake, and the path that actually
+        // runs: see `apply_native_slot_fixups`.
+        let _native_applied = apply_native_slot_fixups(self.thread);
         crate::runtime::interpreter::remap_trace_push(
             self.shared,
             self.thread,
@@ -7219,6 +7637,25 @@ impl<'a> NativeContextImpl<'a> {
                     self.thread.frames.len()
                 );
             }
+            // THE JIT HALF OF THIS WAKE (2026-09-08), and until now it ran
+            // only in the leaked-region FALLBACK. Everything below this line
+            // rewrites interpreter frames and thread-local `ObjectRef`s; a
+            // thread that blocked in a native with COMPILED frames below it
+            // has its live oops in JIT frame slots, register images and the
+            // shadow stack instead, and nothing on this path touched them.
+            //
+            // `apply_pointer_map_to_thread` -- the STW-resume path -- has
+            // carried exactly these three calls for the thread that parked at
+            // the barrier, and its comment already describes this defect for
+            // that population: "this stranded a non-initiator's JIT-frame oops
+            // at their old addresses after a relocation -- a use-after-free".
+            // A blocked peer is the same bug one path over, and it is the
+            // population a moving young cycle relocates under whenever the
+            // cross-thread coverage handshake credits it.
+            // Attribution: this thread applied a relocation map through the
+            // ORDINARY BLOCKED-REGION WAKE.
+            cratonvm_gc::gc_quiescence::note_pointer_map_applied(2);
+            apply_blocked_wake_jit_remap(self.shared, self.thread, &fixup);
             for frame in &mut self.thread.frames {
                 frame.update_local_refs(&fixup, &self.shared.mem.heap);
                 frame
@@ -8153,7 +8590,6 @@ struct VmNativeThreadBlocker {
     thread_id: ThreadId,
 }
 
-
 /// Payload size in bytes of a primitive array, or `None` when `arr` is
 /// not one.
 ///
@@ -8770,6 +9206,13 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
     }
 
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
+        // DBG (`CRATONVM_DBG_DEADRECV`): the widest of the three sites — every
+        // "what class is this" read lands here, so a victim that reaches
+        // neither of the other two is still named. `ClassId::new(0)` on a hit
+        // is what a reclaimed header already reads as.
+        if deadrecv_check(&self.shared, self.thread, obj, "class_id_of_object") {
+            return ClassId::new(0);
+        }
         self.shared.mem.heap.class_id_of(obj)
     }
 
@@ -10623,7 +11066,24 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         if opts.initialize {
             // Best-effort init; failures bubble back as Err.
             if let Err(e) = self.initialize_class(cid) {
-                return Err(format!("initialize after define failed for {name}: {e}"));
+                // `MethodCallFailed::ExceptionThrown`'s Display is the raw
+                // heap address, so this used to read
+                //   initialize after define failed for <name>: exception
+                //   thrown: ref(0x7b5b041c3720)
+                // which names neither the exception class nor its message. The
+                // caller turns this string into a `ClassFormatError` message,
+                // so the pointer is what an operator, a probe diff and a
+                // regression vector all end up holding. `describe_throwable`
+                // is the same reader the uncaught-exception path uses.
+                let cause = match &e {
+                    cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) => {
+                        describe_throwable(&self.shared, *exc)
+                    }
+                    other => other.to_string(),
+                };
+                return Err(format!(
+                    "initialize after define failed for {name}: {cause}"
+                ));
             }
         }
         Ok(cid)
@@ -11417,6 +11877,64 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
             // -- see the GC-safety comment above this block's `if`.
             receiver = self.thread.native_pin_roots[sam_compat_pin_base];
             self.thread.native_pin_roots.truncate(sam_compat_pin_base);
+
+            // THE RESOLVED-HANDLE FAST PATH for a native->Java callback.
+            //
+            // Everything from here to `invoke_or_native` resolves the callee
+            // BY NAME, on every call: a class-manager read plus a `String`
+            // allocation for the receiver's class name, a `find_with_kind`
+            // triple hash against ~3 100 native slots, the cold
+            // descriptor-quirk rewrite on the miss, two more class-manager
+            // reads inside `invoke_or_native`, and then the whole by-name
+            // resolution again in `invoke_on_class_shared_inner`. This is
+            // ~2 500 stubs' calling convention, and
+            // `completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
+            // §3 measured removing it at ONE call site at 1.154x of a whole
+            // benchmark.
+            //
+            // A hit means this exact (VM, receiver class, method, descriptor)
+            // last reached the ordinary bytecode tail at the bottom of
+            // `invoke_on_class_shared_inner`, on this declaring class, and
+            // nothing that could change that has happened since — see
+            // `native_callee_memo`'s invalidation table. The replay is
+            // `interpreter::execute` on that class, which is exactly what the
+            // tail does and exactly what `invoke_virtual_bytecode_only` (the
+            // hand-written form of this fix) does.
+            //
+            // Three things are refused before the probe. An ARRAY receiver
+            // stores its COMPONENT class id in the header, so its id would
+            // redeem a plain receiver's entry and run the component's
+            // override (the `KC26 array.clone()` bug, restated below). A
+            // REDEFINED process has an agent's woven bytecode competing with
+            // registered natives, and that verdict is per-class state no
+            // epoch here tracks. A lambda-proxy id cannot appear: those come
+            // from the reserved `LAMBDA_PROXY_ID_BASE` range and `ClassId`s
+            // are never reused, so an id that was an ordinary class when the
+            // memo was filled is still one.
+            let memo_eligible = crate::runtime::env_cache::native_callback_memo()
+                && self.shared.mem.heap.kind_of(receiver) != cratonvm_types::ObjectKind::Array
+                && !crate::classloading::any_class_redefined();
+            if memo_eligible {
+                if let Some(declaring) = crate::runtime::native_callee_memo::lookup(
+                    self.shared,
+                    receiver_class_id,
+                    method_name,
+                    descriptor,
+                ) {
+                    let mut full_args = Vec::with_capacity(1 + args.len());
+                    full_args.push(Value::Object(Some(receiver)));
+                    full_args.extend_from_slice(args);
+                    return crate::runtime::interpreter::execute(
+                        self.shared,
+                        self.thread,
+                        declaring,
+                        method_name,
+                        descriptor,
+                        &full_args,
+                    );
+                }
+            }
+
             // Not a lambda proxy SAM call вЂ” normal virtual dispatch.
             // If the receiver IS a lambda proxy but calling a non-SAM method
             // (e.g. andThen), dispatch on the functional interface class.
@@ -11649,7 +12167,30 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                     method_name, class_name, resolved_from_receiver, receiver_class_id, global_id, needs_exact_class_dispatch
                 );
             }
-            if needs_exact_class_dispatch {
+            // Arm the memo's witness across the dispatch. It is NOT a
+            // prediction: the fill below happens only if the dispatch
+            // actually arrives at `invoke_on_class_shared_inner`'s ordinary
+            // bytecode tail, which every special arm returns before reaching.
+            // Both routes below end at that same tail with the same declaring
+            // class, so both are memoisable.
+            //
+            // `arms_poly_call_site` is the one thing the tail cannot see: a
+            // signature-polymorphic `invoke`/`invokeExact` needs
+            // `invoke_or_native` to publish the CALL-SITE descriptor before
+            // dispatching, and the fast path does not call it. Refused here
+            // rather than at the tail because this is where the class name
+            // that predicate reads is in hand.
+            let memo_save = (memo_eligible
+                && resolved_from_receiver
+                && !arms_poly_call_site(&class_name, method_name))
+            .then(|| {
+                crate::runtime::native_callee_memo::arm(
+                    receiver_class_id,
+                    method_name,
+                    descriptor,
+                )
+            });
+            let result = if needs_exact_class_dispatch {
                 invoke_on_class_shared(
                     self.shared,
                     self.thread,
@@ -11660,7 +12201,19 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                 )
             } else {
                 self.invoke_or_native(&class_name, method_name, descriptor, &full_args)
+            };
+            if let Some(save) = memo_save {
+                if let Some(declaring) = crate::runtime::native_callee_memo::disarm(save) {
+                    crate::runtime::native_callee_memo::fill(
+                        self.shared,
+                        receiver_class_id,
+                        method_name,
+                        descriptor,
+                        declaring,
+                    );
+                }
             }
+            result
         }
     }
 
@@ -11768,6 +12321,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 }))
             })?;
         crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
+        self.note_native_object_alloc(obj_ref);
         Ok(Some(Value::Object(Some(obj_ref))))
     }
 
@@ -11809,6 +12363,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                     ))
                 })?;
             crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
+            self.note_native_object_alloc(obj_ref);
 
             // Keep the new object and constructor object arguments rooted until
             // the Java `<init>` frame owns them in scanned locals.
@@ -11958,6 +12513,41 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                         "[blockgc] PIN-STALE tid={} 0x{:x}->0x{new:x} class={fwd_class} caller:\n{}",
                         self.thread.thread_id.0,
                         obj.as_ptr() as usize,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
+        // `CRATONVM_DBG_DEADREF_STORE`: the same pin-time canary for the case
+        // the two sources above are blind to.
+        //
+        // `debug_forwarded_target` and `was_vacated` both answer "this object
+        // MOVED and here is where to". Neither can see a reference to memory
+        // that holds no object at all — an address the evacuator refused, or
+        // one whose semispace was emptied — because nothing was ever forwarded
+        // from it. That is the shape `alloc_unmod_wrapper` and `build_module`
+        // both hit on BindableTests: the caller handed down an `ObjectRef` it
+        // had held across an allocation, the collection declined to relocate
+        // it, and the pin faithfully preserved a dead address.
+        //
+        // Pinning is the right place to ask, because a pin is a promise that
+        // the value is live: if it is not live HERE, no later refresh can
+        // recover it, and the caller named in the backtrace is the defect.
+        if cratonvm_types::flags().gc.dbg_deadref_store {
+            if let Some(reason) = self
+                .shared
+                .mem
+                .heap
+                .dead_young_ref_reason(obj.as_ptr() as usize)
+            {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 12 {
+                    eprintln!(
+                        "[deadref-pin] #{n} {reason} pin_native_root(0x{:x}) on tid={} — the                          value names no live object, so this pin preserves a dead address                          rather than protecting a live one. caller:
+{:?}",
+                        obj.as_ptr() as usize,
+                        self.thread.thread_id.0,
                         std::backtrace::Backtrace::force_capture(),
                     );
                 }
@@ -12386,6 +12976,29 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
+        // DBG (`CRATONVM_DBG_DEADRECV`): is this receiver an address the
+        // collector already reclaimed?
+        //
+        // ASKED BEFORE THE FIRST DEREFERENCE, and that is the whole point.
+        // Every other consumer of the reclamation rings asks AFTER something
+        // has already read the object -- a failed `checkcast` reads the class
+        // id, the sweep-zero consumer reads an all-zero header -- so none of
+        // them can answer when the read ITSELF faults, which is what happens
+        // once `CRATONVM_GEN_UNCOMMIT` has unmapped the span. Both lookups
+        // below are pure ring probes keyed on the ADDRESS and touch no heap
+        // memory, so they answer whether or not the page is still mapped.
+        //
+        // This site because it is where the Generational `--nojit` failure
+        // lands: 4 of 5 crashes on the 2026-09-06 Kafka reproducer are
+        // `native_object_hash_code` -> here, faulting on the mark word.
+        //
+        // Returns 0 rather than walking into the fault, so one run names MANY
+        // victims instead of dying at the first. That makes the flag
+        // behaviour-changing -- a 0 identity hash is otherwise impossible, see
+        // the C28 note below -- which is why it is opt-in and named DBG.
+        if deadrecv_check(&self.shared, self.thread, obj, "identity_hash_code") {
+            return 0;
+        }
         // C28: identityHashCode must NEVER return 0. JDK's
         // InvokerBytecodeGenerator uses identityHashCode as a HashMap key and
         // asserts non-zero ("hash must be nonzero").
@@ -12773,6 +13386,13 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             drop(cm);
             self.shared.mem.heap.set_field(obj, index, value);
             // write_barrier fires automatically inside set_field
+        } else {
+            let class_name = cm
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            drop(cm);
+            note_field_by_name_dropped(class_id, &class_name, field_name, obj, value);
         }
     }
 
@@ -12821,6 +13441,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .native_array_gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // Straight to the heap, never through the TLAB -- so the counters only
+        // learn about it here. See `note_native_object_alloc`.
+        self.note_native_array_alloc(array);
         array
     }
 
@@ -12859,6 +13482,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .native_array_gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.note_native_array_alloc(array);
         array
     }
 
@@ -12867,10 +13491,15 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // young→old-gen spill path reports `None` on true exhaustion instead of
         // aborting, so native callers (e.g. `ArrayList(int)`) can raise a
         // catchable OutOfMemoryError matching HotSpot.
-        self.shared
-            .mem
-            .heap
-            .try_alloc_array_full(class_id, ArrayElementType::Reference, length)
+        let array = self.shared.mem.heap.try_alloc_array_full(
+            class_id,
+            ArrayElementType::Reference,
+            length,
+        );
+        if let Some(a) = array {
+            self.note_native_array_alloc(a);
+        }
+        array
     }
 
     fn try_new_array(
@@ -12880,10 +13509,15 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     ) -> Option<ObjectRef> {
         // Fallible sibling of `new_array` (primitive arrays) — see
         // `try_new_ref_array`.
-        self.shared
-            .mem
-            .heap
-            .try_alloc_array_full(ClassId::new(0), element_type, length)
+        let array =
+            self.shared
+                .mem
+                .heap
+                .try_alloc_array_full(ClassId::new(0), element_type, length);
+        if let Some(a) = array {
+            self.note_native_array_alloc(a);
+        }
+        array
     }
 
     fn reclaim_before_alloc_retry(&mut self) -> bool {
@@ -13033,6 +13667,13 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     /// element type**, and `Int(0)` only where the element type is unknowable
     /// (non-array receiver). The type lookup is on the cold `Err` arm only.
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
+        // DBG (`CRATONVM_DBG_DEADRECV`) — the second measured face of the
+        // Generational `--nojit` reclaim: 1 crash in 3 faults in
+        // `get_array_element_unboxing` rather than in `identity_hash_code`.
+        // Asked before `load_and_forward`, which dereferences.
+        if deadrecv_check(&self.shared, self.thread, obj, "get_array_element") {
+            return Value::Object(None);
+        }
         let obj = self.shared.mem.heap.load_and_forward(obj);
         match self.shared.mem.heap.get_array_element_unboxing(obj, index) {
             Ok(value) => value,
@@ -13267,17 +13908,14 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         n
     }
 
-    fn write_primitive_array_bytes(
-        &mut self,
-        arr: ObjectRef,
-        byte_off: usize,
-        src: &[u8],
-    ) -> bool {
-        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr)
-        else {
+    fn write_primitive_array_bytes(&mut self, arr: ObjectRef, byte_off: usize, src: &[u8]) -> bool {
+        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr) else {
             return false;
         };
-        if byte_off.checked_add(src.len()).map_or(true, |end| end > capacity) {
+        if byte_off
+            .checked_add(src.len())
+            .map_or(true, |end| end > capacity)
+        {
             return false;
         }
         if src.is_empty() {
@@ -13297,14 +13935,8 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         }
     }
 
-    fn read_primitive_array_bytes(
-        &self,
-        arr: ObjectRef,
-        byte_off: usize,
-        dst: &mut [u8],
-    ) -> usize {
-        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr)
-        else {
+    fn read_primitive_array_bytes(&self, arr: ObjectRef, byte_off: usize, dst: &mut [u8]) -> usize {
+        let Some(capacity) = primitive_array_byte_capacity_of(&self.shared.mem.heap, arr) else {
             return 0;
         };
         if byte_off >= capacity {
@@ -13592,12 +14224,45 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         self.shared.mem.heap.element_type_of(obj)
     }
 
+    /// One membership walk and one forwarding barrier for all three answers.
+    ///
+    /// `object_is_array` + `heap_element_type_of` + `array_length` repeat both
+    /// per call, and `array_length`'s walk alone was measurable on the
+    /// `String/Regex` row: `is_object_address` is 5% of its builder phase, and
+    /// `sb_view` asks all three of these questions about the same payload
+    /// array on every `append`. The KINDOF-SENTINEL guard comes first for the
+    /// reason `array_length` documents — an invalid `obj` must not reach
+    /// `load_and_forward`, whose first read dereferences it unconditionally.
+    fn array_shape(&self, obj: ObjectRef) -> Option<(ArrayElementType, usize)> {
+        self.shared
+            .mem
+            .heap
+            .is_object_address(obj.as_ptr() as usize)?;
+        let obj = self.shared.mem.heap.load_and_forward_validated(obj);
+        if self.shared.mem.heap.kind_of_validated(obj) != ObjectKind::Array {
+            return None;
+        }
+        Some((
+            self.shared.mem.heap.element_type_of_validated(obj),
+            self.shared.mem.heap.array_length(obj),
+        ))
+    }
+
     fn create_string(&mut self, text: &str) -> ObjectRef {
-        super::create_java_string(self.shared, text)
+        // Pooled: an intern HIT returns an existing object and allocates
+        // nothing, and only a miss is charged. The constructor reports which
+        // happened, so the hit path does not pay a second pool lock.
+        let (s, allocated) = super::create_java_string_reporting(self.shared, text);
+        if allocated {
+            self.note_native_string_alloc(s);
+        }
+        s
     }
 
     fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
-        super::create_java_string_uninterned(self.shared, text)
+        let s = super::create_java_string_uninterned(self.shared, text);
+        self.note_native_string_alloc(s);
+        s
     }
 
     fn create_string_uninterned_gc_safe(&mut self, text: &str) -> ObjectRef {
@@ -13625,7 +14290,10 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             crate::runtime::interpreter::maybe_gc(self.shared, self.thread);
         }
-        super::create_java_string_uninterned_gc_safe_threaded(self.shared, self.thread, text)
+        let s =
+            super::create_java_string_uninterned_gc_safe_threaded(self.shared, self.thread, text);
+        self.note_native_string_alloc(s);
+        s
     }
 
     fn get_ascii_case_string_cached(
@@ -13722,7 +14390,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn create_string_from_units(&mut self, units: &[u16]) -> ObjectRef {
-        super::create_java_string_from_units(self.shared, units)
+        let s = super::create_java_string_from_units(self.shared, units);
+        self.note_native_string_alloc(s);
+        s
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
@@ -13875,7 +14545,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 let cached = self.shared.classes.anon_class_cache[num_fields]
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if cached != 0 {
-                    return self.heap_alloc_object(ClassId::new(cached), num_fields);
+                    let obj = self.heap_alloc_object(ClassId::new(cached), num_fields);
+                    self.note_native_object_alloc(obj);
+                    return obj;
                 }
             }
             let name = format!("cratonvm/synthetic/AnonymousObject${num_fields}");
@@ -14104,6 +14776,11 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 if self.thread.native_alloc_pool.is_empty() {
                     self.thread.native_alloc_pool_layout = None;
                 }
+                // Charged as each object is HANDED OUT, not when the batch of
+                // 2048 was carved: the batch is a lock-amortisation device, and
+                // charging it up front would report 2048 objects' worth of
+                // allocation to whichever caller happened to trip the refill.
+                self.note_native_object_alloc(obj);
                 return obj;
             }
             self.thread.native_alloc_pool_layout = None;
@@ -14167,10 +14844,18 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 } else {
                     Some((class_id, slots))
                 };
+                // Only the object handed out here; the rest are charged as the
+                // pool arm above pops them.
+                self.note_native_object_alloc(obj);
                 return obj;
             }
         }
-        self.heap_alloc_object(class_id, slots)
+        // The TLAB arm above is NOT charged here -- its bytes are the TLAB
+        // cursor's advance, which both counters already read. Every other arm
+        // of this method bypassed the TLAB and has to say so.
+        let obj = self.heap_alloc_object(class_id, slots);
+        self.note_native_object_alloc(obj);
+        obj
     }
 
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
@@ -14178,7 +14863,12 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn heap_allocated_bytes(&self) -> usize {
-        self.shared.mem.heap.allocated_bytes()
+        // `live_bytes_estimate`, NOT `allocated_bytes`. The two differ by the
+        // young free list, which is reusable space the arena hands straight
+        // back out — see the trait doc for what reporting the cursor instead
+        // cost. The other collectors' `live_bytes_estimate` falls through to
+        // `allocated_bytes`, so this is a no-op for them.
+        self.shared.mem.heap.live_bytes_estimate()
     }
 
     fn current_thread_allocated_bytes(&self) -> Option<u64> {
@@ -14190,9 +14880,19 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // peer's in-flight cursor may not be read while its owner runs, so the
         // under-count is bounded by one TLAB per running thread — and the value
         // stays monotonic, which the occupancy gauge this replaced was not.
+        //
+        // `consumed_bytes()` — the LIVE SPAN — not `thread_allocated_bytes()`,
+        // which is that span PLUS this thread's whole running total. That total
+        // is already inside `process_allocated_bytes()`: every retire and every
+        // `note_external_allocation` credits both. Adding it again made this
+        // counter report exactly 2x of the truth on Generational and G1 (and
+        // 3x under ZGC, whose heap-staging TLAB layer was crediting the global
+        // a second time — see `TlabAccounting`). Hibernate's
+        // `HqlParserMemoryUsageTest` reads this counter and budgets 256 MiB
+        // against it, so the doubling alone turned a passing parse into a FAIL.
         Some(
             cratonvm_gc::tlab::process_allocated_bytes()
-                .saturating_add(self.thread.tlab.thread_allocated_bytes()),
+                .saturating_add(self.thread.tlab.consumed_bytes() as u64),
         )
     }
 
@@ -16734,7 +17434,23 @@ impl<'a> NativeExceptionAccess for NativeContextImpl<'a> {
     }
 
     fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
-        let trace = self.capture_current_stack_trace();
+        let mut trace = self.capture_current_stack_trace();
+        // HotSpot's `fill_in_stack_trace` skip, applied HERE rather than at the
+        // `fillInStackTrace` native, because this is the one entry point every
+        // "record this throwable's origin" path goes through — the twelve
+        // `native_exc_init_*` bodies via `capture_throwable_trace`, and
+        // `Throwable.fillInStackTrace(int)` itself. Doing it at one of those
+        // instead would leave the other reporting the filling machinery as the
+        // throw site. See `stackwalker::trim_throwable_fill_frames`.
+        let throwable_class = self.class_id_of_object(throwable);
+        {
+            let cm = self.shared.classes.class_manager.read();
+            crate::runtime::stackwalker::trim_throwable_fill_frames(
+                &cm.class_store,
+                Some(throwable_class),
+                &mut trace,
+            );
+        }
         self.shared
             .store_throwable_stack_trace(throwable, trace.clone());
         trace
@@ -17299,8 +18015,17 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
             use crate::runtime::kernels::GemmKind;
             let kind = if half { GemmKind::F16 } else { GemmKind::F32 };
             Some(crate::runtime::offload::dispatch_gemm(
-                self.shared, kind, a_handle, b_handle, c_handle, m, n, k, trans_a,
-                trans_b, stream_handle,
+                self.shared,
+                kind,
+                a_handle,
+                b_handle,
+                c_handle,
+                m,
+                n,
+                k,
+                trans_a,
+                trans_b,
+                stream_handle,
             ))
         }
         #[cfg(not(feature = "gpu-offload"))]
@@ -19067,8 +19792,185 @@ pub(super) fn convert_element_value(
 // Env-gated and `#[cold]`: the enabled path takes a global `Mutex` and formats
 // a `String` per call, so it is a diagnosis tool, not something to leave on.
 #[cold]
+/// `CRATONVM_DBG_DEADRECV`: at `identity_hash_code`, ask whether the receiver is
+/// an address this process already freed, BEFORE the first dereference, and
+/// report it through `reclaim_guard` instead of faulting on it.
+///
+/// Two sources, because no single one covers both collectors: the reclamation
+/// RINGS for the non-moving reclamations that feed them, and the published
+/// young GEOMETRY for a moving young cycle, which feeds no ring at all. See
+/// `deadrecv_check` for why the second arm exists and what it costs.
+///
+/// Opt-in and behaviour-changing: a hit returns 0, which `identity_hash_code`
+/// otherwise never does (C28). That is deliberate, so one run names many
+/// victims rather than dying at the first.
+fn dbg_deadrecv() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEADRECV").is_some())
+}
+
+/// `CRATONVM_DBG_DEADRECV`'s shared body: is `obj` an address this process has
+/// already reclaimed, asked BEFORE anything dereferences it?
+///
+/// Every lookup is keyed on the ADDRESS and dereferences nothing, so they answer
+/// whether or not the page is still mapped — which is the whole point, because
+/// this defect's face is a fault on the read that every other consumer performs
+/// first.
+///
+/// `true` means reported; the caller returns a benign value rather than
+/// walking into the fault, so one run names MANY victims.
+pub(crate) fn deadrecv_check(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    obj: ObjectRef,
+    site: &'static str,
+) -> bool {
+    if !dbg_deadrecv() {
+        return false;
+    }
+    let addr = obj.as_ptr() as usize;
+    // RE-ALLOCATION SCREEN, and without it this probe reports mostly noise.
+    //
+    // Neither reclamation ring is pruned when the allocator hands a freed span
+    // back out: `record_young_span_freed` appends one entry per coalesced span
+    // and nothing ever removes it, so EVERY object later allocated inside that
+    // span answers `young_freed_lookup` for the rest of the process. The rings
+    // remember what was freed, not what is dead now.
+    //
+    // `is_object_address` is the opposite question and the one this guard
+    // actually wants: the arena's object-start bitmap records "a base this
+    // arena handed out and has NOT freed", so `Some` means the address was
+    // RE-SERVED and is live whatever the ring remembers. It is address-keyed
+    // and lock-free, and it screens through the commit bitmap before touching
+    // anything, so it is safe on exactly the decommitted addresses this guard
+    // exists to survive.
+    //
+    // What this trades away, stated rather than hidden: an ABA — a stale
+    // reference to an address the allocator has since re-served for a
+    // DIFFERENT object — now reads as live and is not reported. That case is
+    // indistinguishable here without a per-address allocation epoch, and the
+    // alternative was a guard whose every hit had to be re-litigated by hand.
+    // `CRATONVM_DBG_VACATED_FRAMES` (`gc_quiescence::was_vacated`) is the
+    // instrument that does track re-issue exactly; use it for the ABA face.
+    //
+    // Measured on `test_classes/gpu/GpuResidencyGc 0 1024 800` under
+    // `--XX:UseGc Generational`, which is where the unscreened form was read as
+    // evidence (`gpuresidencygc-generational-jit-reclaims-a-live-object-FIXED-20260908.md`):
+    // 8 hits every run with the JIT on and 0 with `--nojit` — a split that is
+    // fully explained by WHICH COLLECTOR RAN, since only the non-moving sweep
+    // populates the young ring at all, and not by any reference being stale.
+    // With the screen: 0 hits, 3 runs, and the probe passes.
+    //
+    // It also puts the guard's COST back where it belongs. Both lookups are
+    // linear scans of their rings — the old-gen one is 2^20 entries — on every
+    // `identity_hash_code` and `class_id_of_object`. Armed, that probe took
+    // 163-251 s against 4 s unarmed; with this screen in front of them it is 4 s
+    // armed, because a live address never reaches the scan. An instrument that
+    // dilates its workload 40-60x is not measuring the same run.
+    if shared.mem.heap.is_object_address(addr).is_some() {
+        return false;
+    }
+    if cratonvm_gc::gen_heap::old_freed_lookup_covering(addr).is_some()
+        || cratonvm_gc::gen_heap::young_freed_lookup(addr).is_some()
+    {
+        report_deadrecv(shared, thread, addr, site);
+        return true;
+    }
+    // THE MOVING-YOUNG ARM, and without it this probe is silent on the one
+    // collector it was written for.
+    //
+    // Both rings above are fed by a NON-MOVING reclamation: `old_freed_*` by
+    // the old-gen sweep and mark-compact, `young_freed_*` by
+    // `sweep_young_non_moving`'s `record_young_span_freed`. A MOVING young
+    // cycle writes to neither — it evacuates the semispace and
+    // `uncommit_evacuated_young` hands the span back to the OS — so on
+    // `--XX:UseGc Generational` with moving cycles in the history, the rings
+    // answer nothing about exactly the addresses that fault. That is the
+    // Hazelcast `ServerTests` face: the crash handler names the span
+    // (`site=unbumped-middle`, `and NOT re-committed since`) and this guard,
+    // asked about the same address one instruction earlier, said "live".
+    //
+    // The question is address-keyed and dereferences NOTHING, which is what
+    // lets it answer on a released granule: `is_object_address` screened above
+    // through the commit bitmap and the arena's object-start bitmap, and
+    // `young_geometry_span` is four relaxed loads and two range compares. A
+    // live young reference always names an object start, so "inside the young
+    // geometry and no object starts there" names no live object.
+    //
+    // Cheap enough to stay armed, which is the property the page asked for:
+    // the `CRATONVM_DBG_VACATED_FRAMES` ledger that answers the same question
+    // exactly costs a RECORD path running all process long and dilates this
+    // workload about ninefold, past the window the crash needs.
+    if let Some(span) = cratonvm_gc::gen_heap::young_geometry_span(addr) {
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            obj = format!("{addr:#x}"),
+            site = site,
+            semispace = span,
+            "receiver names a YOUNG address at which no object starts: a moving young cycle evacuated this span and nothing rewrote the reference. INACTIVE-SEMISPACE is the arena the last flip emptied; ACTIVE-SEMISPACE means the span was re-served, but not to an object base.",
+        );
+        report_deadrecv(shared, thread, addr, site);
+        return true;
+    }
+    false
+}
+
+/// The shared report for both [`deadrecv_check`] arms: the reclaim guard's
+/// verdict, then the Java stack that handed the dead receiver in.
+///
+/// The guard answers WHAT the address is and proves no live heap object holds it
+/// — which leaves "a frame local, a register, or a native side table", and says
+/// nothing about WHICH. The Java stack is the cheapest thing that narrows that:
+/// the receiver was on some frame's operand stack one bytecode ago, so the
+/// innermost frames bound where it came from.
+fn report_deadrecv(shared: &SharedVm, thread: &JvmThread, addr: usize, site: &'static str) {
+    crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
+        shared,
+        addr,
+        site,
+        "java/lang/Object",
+        0,
+    );
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        site = site,
+        java_frames = %deadrecv_java_frames(thread),
+        "…and THIS is the Java stack that handed the dead receiver in. The innermost frame is the call site; the producer is the native, or the reference copy, that put this address on its operand stack.",
+    );
+}
+
+/// Innermost Java frames, for [`report_deadrecv`].
+///
+/// Bounded at eight: this is an error path, and a full Hazelcast stack is
+/// hundreds deep with nothing in the tail the top does not already say.
+fn deadrecv_java_frames(thread: &JvmThread) -> String {
+    thread
+        .frames
+        .iter()
+        .rev()
+        .take(8)
+        .map(|f| {
+            format!(
+                "{}.{}{} pc={}",
+                f.class_name(),
+                f.method_name(),
+                f.method_descriptor(),
+                f.pc
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" <- ")
+}
+
 pub fn dbg_dispatch_tally(site: &str, class_name: &str, method_name: &str, descriptor: &str) {
     dispatch_tally::record(site, class_name, method_name, descriptor);
+}
+
+/// Print the `CRATONVM_DBG=dispatch-tally` rows at exit. Called from
+/// `interp_census::report_at_exit`; prints nothing when the tally is unarmed.
+pub fn dump_dispatch_tally_at_exit() {
+    dispatch_tally::dump_at_exit();
 }
 
 mod dispatch_tally {
@@ -19092,18 +19994,35 @@ mod dispatch_tally {
         if !enabled() {
             return;
         }
-        static TOTAL: AtomicU64 = AtomicU64::new(0);
         {
             let mut guard = counts().lock().unwrap_or_else(|p| p.into_inner());
             *guard
                 .entry(format!("{site} {class_name}.{method_name}{descriptor}"))
                 .or_insert(0) += 1;
         }
-        let n = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let n = TOTAL_SO_FAR.fetch_add(1, Ordering::Relaxed) + 1;
         if n % (1 << 20) == 0 {
             dump(n);
         }
     }
+
+    /// Print the tally at exit, from `interp_census::report_at_exit`.
+    ///
+    /// `record` only dumped every 2^20 rows, so a workload that generates
+    /// fewer than a million dispatches -- `HibfixComposeProbe2` at 40 000
+    /// chains generates ~100 000 -- armed the instrument and printed nothing.
+    /// An instrument that cannot report at the size its own page measures is
+    /// an instrument armed where nobody reads it.
+    pub(super) fn dump_at_exit() {
+        if !enabled() {
+            return;
+        }
+        dump(TOTAL_SO_FAR.load(Ordering::Relaxed));
+    }
+
+    /// Every row recorded so far, for [`dump_at_exit`]. `record`'s own
+    /// periodic dump reads the same counter.
+    pub(super) static TOTAL_SO_FAR: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn dump(total: u64) {
         let guard = counts().lock().unwrap_or_else(|p| p.into_inner());
@@ -19723,22 +20642,37 @@ pub fn invoke_or_native(
     let redefine_probe: Option<(ClassId, bool, u32)> = {
         let cm = shared.classes.class_manager.read();
         cm.get_loaded_class_id(effective_class).and_then(|cid| {
-            crate::classloading::find_method_recursive(cid, method_name, descriptor, &cm.class_store)
-                .map(|(m, declaring_id)| {
-                    (
-                        declaring_id,
-                        !m.is_native() && m.code().is_some(),
-                        cm.class_redefine_generation(declaring_id),
-                    )
-                })
+            crate::classloading::find_method_recursive(
+                cid,
+                method_name,
+                descriptor,
+                &cm.class_store,
+            )
+            .map(|(m, declaring_id)| {
+                (
+                    declaring_id,
+                    !m.is_native() && m.code().is_some(),
+                    cm.class_redefine_generation(declaring_id),
+                )
+            })
         })
+    };
+    // The ZIP arm of the immunity is receiver-aware: a Mockito inline mock of
+    // `JarFile`/`ZipFile` is not an archive this VM opened, so the native it
+    // keeps has nothing to answer from and the woven advice is the only body
+    // that can. See `zip_immunity_waived_for_receiver`.
+    let redefine_receiver = match args.first() {
+        Some(Value::Object(Some(obj))) => Some(*obj),
+        _ => None,
     };
     let native_shadow_dropped_by_redefine = crate::classloading::any_class_redefined()
         && redefine_probe.is_some_and(|(_, has_body, generation)| has_body && generation > 0)
-        && !crate::runtime::interpreter::redefine_immune_forced_native(
+        && !crate::runtime::interpreter::redefine_immune_forced_native_for_receiver(
+            shared,
             effective_class,
             method_name,
             descriptor,
+            redefine_receiver,
         );
     if crate::runtime::env_cache::dbg_native_shadow()
         && crate::classloading::any_class_redefined()
@@ -19761,10 +20695,12 @@ pub fn invoke_or_native(
         if seen.lock().insert(key) {
             eprintln!(
                 "[native-shadow] {effective_class}.{method_name}{descriptor}                  dropped={native_shadow_dropped_by_redefine} probe={redefine_probe:?}                  immune={}",
-                crate::runtime::interpreter::redefine_immune_forced_native(
+                crate::runtime::interpreter::redefine_immune_forced_native_for_receiver(
+                    shared,
                     effective_class,
                     method_name,
-                    descriptor
+                    descriptor,
+                    redefine_receiver,
                 ),
             );
         }
@@ -20285,6 +21221,14 @@ impl<'a> NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+        // The NATIVE->JAVA CALLBACK door, labelled separately in
+        // `CRATONVM_DBG=dispatch-tally`. Without the label every door's calls
+        // arrive under one `invoke_or_native` heading keyed by CALLEE, so the
+        // question `composition-native-callback-and-the-promotion-question-20260902.md`
+        // item 1 actually asks -- how much of the general resolver's traffic
+        // is a native calling back into Java -- cannot be read off it. On
+        // `HibfixComposeProbe2` the answer is 1.3 % of it.
+        dbg_dispatch_tally("native_callback", class_name, method_name, descriptor);
         invoke_or_native(
             self.shared,
             self.thread,
@@ -24900,6 +25844,16 @@ fn invoke_on_class_shared_inner(
                                 | ("java/lang/System$1", "addOpens", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
                                 | ("java/lang/System$1", "addOpensToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
                                 | ("java/lang/System$1", "addUses", "(Ljava/lang/Module;Ljava/lang/Class;)V")
+                                // Same eight, on the name this carrier has
+                                // on JDK 21 (see JLA_CARRIER_CANDIDATES).
+                                | ("java/lang/System$2", "addReads", "(Ljava/lang/Module;Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addReadsAllUnnamed", "(Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addExports", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$2", "addExports", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addExportsToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$2", "addOpens", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
+                                | ("java/lang/System$2", "addOpensToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$2", "addUses", "(Ljava/lang/Module;Ljava/lang/Class;)V")
                                 | ("jdk/jfr/internal/Type", "getKnownType", "(Ljava/lang/Class;)Ljdk/jfr/internal/Type;")
                                 | ("jdk/jfr/internal/util/Utils", "getValidType", "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;")
                                 | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")
@@ -26903,37 +27857,43 @@ fn invoke_on_class_shared_inner(
                                     | "copyMemory"
                                     | "copyMemoryInternal"
                             ))
-                        // BREAKITER: `java.text.BreakIterator.getWordInstance` /
-                        // `getLineInstance` / `getSentenceInstance` / `getCharacterInstance`
-                        // are concrete static factories whose JDK 25 bytecode walks
-                        // `LocaleProviderAdapter.forJRE().getBreakIteratorProvider()`,
-                        // then `BreakIteratorProviderImpl.getBreakInstance(...)` which
-                        // reads `LocaleResources.getBreakIteratorInfo("BreakIteratorClasses")`.
-                        // That cache lookup returns null in our partial locale-data
-                        // bootstrap (jdk.localedata's class-based resource bundles are
-                        // not surfaced through our jimage path), producing
-                        //   "Cannot load from null array"
-                        // at `BreakIteratorProviderImpl.getBreakInstance pc=21`.
-                        // Tripwire: JUnit Platform's `--help` formatter uses
-                        // `BreakIterator.getLineInstance(Locale.US)` for text wrapping
-                        // and aborts on the NPE under `CRATONVM_DISABLE_JIT=1`.
+                        // BREAKITER, REMOVED 2026-09-11 (lane 1 wave 6). The four
+                        // static factories were pinned here from 2026-07 because the
+                        // real chain died at
+                        // `BreakIteratorProviderImpl.getBreakInstance pc=21` with
+                        // "Cannot load from null array" -- `LocaleResources
+                        // .getBreakIteratorInfo("BreakIteratorClasses")` answered null.
+                        // Tripwire: JUnit Platform's `--help` formatter wraps text with
+                        // `BreakIterator.getLineInstance(Locale.US)`.
                         //
-                        // Fix: pin our native overrides (registered in
-                        // `phases_late.rs::register_p66_break_iterator`) ahead of the
-                        // JDK bytecode. The natives return a synthetic
-                        // `java/text/BreakIterator` whose instance methods
-                        // (`setText`/`first`/`next`/`previous`/`last`) are abstract on
-                        // the real class — those route via the `method.is_abstract()`
-                        // branch automatically, so only the static factories need an
-                        // allow-list entry here.
-                        || (class_name == "java/text/BreakIterator"
-                            && matches!(
-                                method_name,
-                                "getWordInstance"
-                                | "getLineInstance"
-                                | "getSentenceInstance"
-                                | "getCharacterInstance"
-                            ))
+                        // Both halves of that are now fixed and MEASURED, by
+                        // `apps/probes/L1BreakIterRealProbe`, whose `P.*` rows reach
+                        // `BreakIteratorProviderImpl` WITHOUT these factories and so
+                        // could be measured while the pin was still here:
+                        //
+                        //   wave 5  the two `LocaleResources` readers answer from the
+                        //           image (`non_cldr_packages`), so the bundle and the
+                        //           `*BreakIteratorData` blob are found and
+                        //           `new sun.text.RuleBasedBreakIterator(name, bytes)`
+                        //           validates the rule data.
+                        //   wave 6  `setText(String)` and `preceding(int)` -- the only
+                        //           two of the seventeen registrations CONCRETE on the
+                        //           abstract class, and therefore the only two a real
+                        //           subclass receiver could not escape -- step aside
+                        //           for a receiver this VM did not fabricate. Before
+                        //           that, every real BreakIterator in the VM had its
+                        //           text written into slot 0 of an object whose slot 0
+                        //           is `charCategoryTable`, and the walks answered
+                        //           `[0]`.
+                        //
+                        // With the pin gone the factories run their own bytecode and
+                        // answer `sun.text.RuleBasedBreakIterator`,
+                        // `sun.text.DictionaryBasedBreakIterator` (th) and
+                        // `GraphemeBreakIterator` like HotSpot, offset for offset on
+                        // every walk the probe takes. The synthetic natives stay
+                        // registered for synthetic-JDK mode, where there is no bytecode
+                        // to prefer, and are retired under `--jdk-only`
+                        // (`RETIRED_SHADOW_L1_BI_TRIPLES`).
                         // BUG-15: `LocaleResources.getDateTimePattern(int,int,
                         // Calendar)` returns null in our partial locale-data
                         // bootstrap (jdk.localedata class-based bundles not
@@ -26956,6 +27916,26 @@ fn invoke_on_class_shared_inner(
                                 // unsurfaced jdk.localedata bundle and otherwise
                                 // returns null → appendPattern(null) NPE.
                                 || method_name == "getJavaTimeDateTimePattern"))
+                        // BREAKITER, the real data (2026-09-11): the two
+                        // readers `BreakIteratorProviderImpl.getBreakInstance`
+                        // needs, answered from the image's own
+                        // `BreakIteratorInfo` bundle class and
+                        // `*BreakIteratorData` binary rather than null.
+                        //
+                        // This arm is what the pin above was waiting on, and
+                        // as of wave 6 that pin is GONE: the real chain builds
+                        // a `sun.text.RuleBasedBreakIterator` and walks it
+                        // like HotSpot, and `java/text/BreakIterator`'s 17
+                        // registrations are retired rather than pinned. These
+                        // two entries are therefore load-bearing for the whole
+                        // family now, not a step towards it -- remove them and
+                        // `getBreakInstance` is back to "Cannot load from null
+                        // array" with nothing pinned behind it.
+                        || (class_name == "sun/util/locale/provider/LocaleResources"
+                            && matches!(
+                                method_name,
+                                "getBreakIteratorInfo" | "getBreakIteratorResources"
+                            ))
                         // java.time text names: `CalendarDataUtility.retrieve
                         // JavaTimeFieldValueName(s)` back `DateTimeTextProvider`'s
                         // `EEE`/`MMM`/`a`/`G` lookups. Same locale-data gap as
@@ -27391,17 +28371,24 @@ fn invoke_on_class_shared_inner(
                     let name_override_suppressed_by_redefine = name_override
                         && crate::classloading::any_class_redefined()
                         && cm.class_redefine_generation(declaring_id) > 0
-                        && !crate::runtime::interpreter::redefine_immune_forced_native(
+                        && !crate::runtime::interpreter::redefine_immune_forced_native_for_receiver(
+                            shared,
                             class_name,
                             method_name,
                             descriptor,
+                            match args.first() {
+                                Some(Value::Object(Some(obj))) => Some(*obj),
+                                _ => None,
+                            },
                         );
                     if name_override_suppressed_by_redefine {
                         CHECK_OVERRIDE_REDEFINE_SUPPRESSED
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     let check_override = method.is_abstract()
-                        || (!jdk_only_strict && name_override && !name_override_suppressed_by_redefine);
+                        || (!jdk_only_strict
+                            && name_override
+                            && !name_override_suppressed_by_redefine);
                     // A name disjunct wanted this native and strict policy said
                     // no. Record it where every other §1.4 observation goes, so
                     // `--jdk-only-report` names the triple instead of leaving a
@@ -28415,6 +29402,15 @@ fn invoke_on_class_shared_inner(
                 // bug-h2-classid0-stale-address-family-FIXED.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
                     let addr = recv.as_ptr() as usize;
+                    // The RE-SERVED face. The free-list verdict below answers
+                    // for a receiver still sitting in reclaimed memory; once
+                    // the allocator has handed the address out again it reads
+                    // as a perfectly valid object of an unrelated class and
+                    // every probe there stays silent. That is precisely this
+                    // dispatch miss's shape -- `Hashtable.openStream()` for a
+                    // `URL` receiver. The history ledger discriminates it, and
+                    // the backtrace names the VM code still holding it.
+                    cratonvm_gc::gc_quiescence::check_stale_use(addr, "invoke dispatch");
                     if crate::memory::reclaim_guard::report_reclaimed_receiver(
                         shared,
                         addr,
@@ -28465,6 +29461,38 @@ fn invoke_on_class_shared_inner(
                             f.method_name(),
                             f.pc
                         );
+                    }
+                    // The frame chain names WHERE the bad receiver was used; it
+                    // does not say which slot still holds it, or whether the
+                    // same address sits in a caller's local as well. Both are
+                    // the difference between "the producer handed back a stale
+                    // value" and "one slot went stale in place", and both are
+                    // gone the moment this terminal returns. Dump the object
+                    // slots of the innermost three frames with the class each
+                    // address actually resolves to.
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(3) {
+                        let mut show = |what: &str, idx: usize, o: ObjectRef| {
+                            let a = o.as_ptr() as usize;
+                            let cid = shared.mem.heap.class_id_of(o);
+                            let cn = shared
+                                .classes
+                                .class_manager
+                                .read()
+                                .get_class(cid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_else(|| format!("cid#{}", cid.as_u32()));
+                            eprintln!("    CCE-BT-SLOT[{i}] {what}[{idx}] 0x{a:x} {cn}");
+                        };
+                        for li in 0..f.locals_len() {
+                            if let Value::Object(Some(o)) = f.get_local(li as u16) {
+                                show("local", li, o);
+                            }
+                        }
+                        for si in 0..f.stack.len() {
+                            if let Value::Object(Some(o)) = f.stack.peek_at(si) {
+                                show("stack", si, o);
+                            }
+                        }
                     }
                     if let Some(Value::Object(Some(r))) = args.first() {
                         let addr = r.as_ptr() as usize;
@@ -29343,6 +30371,26 @@ fn invoke_on_class_shared_inner(
         if let Some(callback) = override_cb {
             safe_native_call(shared, thread, callback, args)
         } else {
+            // THE ORDINARY TAIL, and the one site the native->Java callback
+            // memo is allowed to learn from.
+            //
+            // Reaching here means every override, proxy, retarget and
+            // policy arm above declined — so a memo filled from this point
+            // cannot be smuggling past one of them, including arms added
+            // after this line was written. See
+            // `crate::runtime::native_callee_memo`'s "Why a witness, and not
+            // a classifier".
+            //
+            // `!is_native && !is_synchronized` is the tail's own pair of
+            // facts about the callee, and the second is load-bearing: a
+            // synchronized callee's monitor is held by the `_sync_guard`
+            // below, which the memo's fast path does not build.
+            crate::runtime::native_callee_memo::note_plain_bytecode_tail(
+                declaring_class_id,
+                method_name,
+                descriptor,
+                !is_native && !is_synchronized,
+            );
             // Execute bytecode via interpreter
             crate::runtime::interpreter::execute(
                 shared,
@@ -32781,6 +33829,87 @@ mod tests {
         reset_permissive_dispatch_memo();
         assert!(gate(&shared, SENSITIVE).is_ok());
         assert_eq!(caps.audit_report().total_checks(), 2);
+    }
+
+    /// The JIT site cache's gate, arm for arm against the string form.
+    ///
+    /// It exists because the site cache stopped refusing capability-classified
+    /// triples on 2026-09-11 — see `resolve_native_site`'s note and
+    /// `performance/composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`
+    /// #1. A fast path that serves `Unsafe` is only allowed to exist if its
+    /// gate answers what the funnel's would, so this asserts exactly that in
+    /// all three modes, with no `NativeMethodId` in hand (the fallback arm) and
+    /// with the classification carried rather than re-derived.
+    #[test]
+    fn the_slot_keyed_gate_answers_what_the_string_gate_answers() {
+        use cratonvm_native_api::CapabilityKind;
+
+        // Permissive: allowed, and recorded exactly once per kind per thread.
+        let (shared, caps) = vm_in_mode(CapabilityMode::Permissive);
+        assert!(
+            check_native_dispatch_capability_for_slot(
+                &shared,
+                CapabilityKind::ProcessSpawn,
+                None
+            )
+            .is_ok()
+        );
+        assert_eq!(caps.audit_report().total_checks(), 1);
+        for _ in 0..8 {
+            assert!(check_native_dispatch_capability_for_slot(
+                &shared,
+                CapabilityKind::ProcessSpawn,
+                None
+            )
+            .is_ok());
+        }
+        assert_eq!(
+            caps.audit_report().total_checks(),
+            1,
+            "the permissive memo must suppress the audit write for the slot              form exactly as it does for the string form"
+        );
+        drop(shared);
+
+        // Audit: allowed, and every use tallied as ungranted.
+        let (shared, caps) = vm_in_mode(CapabilityMode::Audit);
+        assert!(
+            check_native_dispatch_capability_for_slot(&shared, CapabilityKind::RawMemory, None)
+                .is_ok()
+        );
+        assert_eq!(caps.audit_report().total_ungranted(), 1);
+        drop(shared);
+
+        // Enforce: refused, every time, with the same SecurityException the
+        // funnel raises — this is the arm that makes the fast path safe.
+        let (shared, _caps) = vm_in_mode(CapabilityMode::Enforce);
+        let denied =
+            check_native_dispatch_capability_for_slot(&shared, CapabilityKind::RawMemory, None)
+                .expect_err("RawMemory is not granted");
+        let text = denied.to_string();
+        assert!(text.contains("SecurityException"), "{text}");
+        assert!(text.contains("raw-memory"), "{text}");
+        for _ in 0..8 {
+            assert!(check_native_dispatch_capability_for_slot(
+                &shared,
+                CapabilityKind::RawMemory,
+                None
+            )
+            .is_err());
+        }
+        drop(shared);
+
+        // And with no policy installed at all the gate is a no-op, which is
+        // what keeps an embedder that never called `set_capabilities` paying
+        // nothing.
+        let shared = SharedVm::new(VmConfig::default());
+        if shared.natives.native_methods.capabilities().is_none() {
+            assert!(check_native_dispatch_capability_for_slot(
+                &shared,
+                CapabilityKind::RawMemory,
+                None
+            )
+            .is_ok());
+        }
     }
 
     /// `Audit` is the mode a deployment runs its suite in before flipping:

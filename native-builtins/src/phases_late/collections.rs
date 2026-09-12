@@ -80,21 +80,37 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/util/Set;",
         |ctx, args| {
             let elem = args[0];
-            // Pin across the set/array allocs below — a moving young GC there
-            // would relocate them (native stale-local family).
+            // Built through the REAL `HashSet.<init>` and `add`, not by writing
+            // raw slots. The three slots this used to write (bucket array,
+            // size, capacity) are the MAP layout, on a class whose one real
+            // field is `map` (`Ljava/util/HashMap;`) -- so a reader resolving
+            // `map` by name, which is what `hs_map_slot` and any surviving JDK
+            // bytecode both do, found an `Object[]` where a map belongs. It is
+            // the same shape `publish_map_table` records fixing on the map
+            // side, and it also wrote the element straight into bucket 0 with
+            // no hashing, so the set was only findable by an implementation
+            // that agreed to look there.
+            //
+            // It also pinned the class's synthetic slot floor at 3 against one
+            // real field, which pads `java/util/HashSet` (and `LinkedHashSet`,
+            // which declares none of its own) out of the compact layout.
+            //
+            // Pin across every allocating call -- `<init>` allocates the
+            // backing map and `add` allocates a node; a moving young GC in
+            // either relocates both the set and the element.
             let elem_pin = pinned_object_value(ctx, elem);
-            let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
+            let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
             let set_pin = ctx.pin_native_root(set);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let _ = ctx.invoke(
+                "java/util/HashSet",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(set))],
+            );
             let set = ctx.read_native_pin(set_pin, set);
             let elem = read_pinned_object_value(ctx, elem_pin, elem);
-            ctx.set_field(set, 0, Value::Object(Some(arr)));
-            ctx.set_field(set, 1, Value::Int(0));
-            ctx.set_field(set, 2, Value::Int(16));
-            // Just store element — we'll use the standard HashSet native_set_add internally
-            // But we can't call it directly here. Just allocate and put manually:
-            ctx.set_array_element(arr, 0, elem);
-            ctx.set_field(set, 1, Value::Int(1));
+            let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[elem]);
+            let set = ctx.read_native_pin(set_pin, set);
             ctx.unpin_native_roots(elem_pin.map(|(h, _)| h).unwrap_or(set_pin));
             Ok(Some(Value::Object(Some(set))))
         },
@@ -809,10 +825,27 @@ pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
     });
     r.register(whm, "keySet", "()Ljava/util/Set;", |ctx, _args| {
         // Return empty HashSet stub
-        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+        // Built through the REAL `HashSet.<init>`, not by writing raw slots.
+        // The three slots this used to write (bucket array, size, capacity)
+        // are the MAP layout, on a class whose one real field is `map`
+        // (`Ljava/util/HashMap;`) -- so a reader resolving `map` by name, which
+        // is what `hs_map_slot` and any surviving JDK bytecode both do, found
+        // an `Object[]` where a map belongs. It is the same shape
+        // `publish_map_table` records fixing on the map side.
+        //
+        // It also pinned the class's synthetic slot floor at 3 against one
+        // real field, which pads `java/util/HashSet` (and `LinkedHashSet`,
+        // which declares none of its own) out of the compact layout entirely.
+        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+        let set_pin = ctx.pin_native_root(set);
+        let _ = ctx.invoke(
+            "java/util/HashSet",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(set))],
+        );
+        let set = ctx.read_native_pin(set_pin, set);
+        ctx.unpin_native_roots(set_pin);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(whm, "values", "()Ljava/util/Collection;", |ctx, _args| {
@@ -1240,7 +1273,14 @@ pub(crate) fn native_p64_ll_reversed(
         _ => 0,
     };
     let mut elements = Vec::with_capacity(size);
+    // GC-safety: `get(I)` is a virtual dispatch into real bytecode on every
+    // turn, so `this` is stale from the second turn on, and each element
+    // already collected into `elements` is stale from the turn after it was
+    // read. Pin the receiver for the walk and pin each element as it arrives.
+    let this_pin = ctx.pin_native_root(this);
+    let mut elem_pins: Vec<usize> = Vec::with_capacity(size);
     for i in (0..size).rev() {
+        let this = ctx.read_native_pin(this_pin, this);
         let elem = ctx
             .invoke_virtual(
                 this,
@@ -1249,16 +1289,33 @@ pub(crate) fn native_p64_ll_reversed(
                 &[Value::Int(i as i32)],
             )?
             .unwrap_or(Value::Object(None));
+        elem_pins.push(match elem {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        });
         elements.push(elem);
     }
     // Build new ArrayList with reversed elements
     let new_al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+    let new_al_pin = ctx.pin_native_root(new_al);
     let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elements.len());
+    let new_al = ctx.read_native_pin(new_al_pin, new_al);
     for (i, elem) in elements.iter().enumerate() {
-        ctx.set_array_element(new_arr, i, *elem);
+        // Read each element back through its own pin: the two allocations
+        // above sit between the read that collected it and this store.
+        let elem = match (*elem, elem_pins[i]) {
+            (Value::Object(Some(o)), pin) if pin != usize::MAX => {
+                Value::Object(Some(ctx.read_native_pin(pin, o)))
+            }
+            (other, _) => other,
+        };
+        ctx.set_array_element(new_arr, i, elem);
     }
     ctx.set_field(new_al, 0, Value::Object(Some(new_arr)));
     ctx.set_field(new_al, 1, Value::Int(elements.len() as i32));
+    // `this_pin` is the frame base, so this releases the element pins and
+    // `new_al_pin` with it -- after the last store, not before.
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(new_al))))
 }
 
@@ -1448,22 +1505,44 @@ fn p64_seq_map_edge_entry(
         _ => return Ok(Some(Value::Object(None))),
     };
     let mut found = Value::Object(None);
+    // GC-safety: `hasNext`/`next` are real bytecode and this loop dispatches
+    // both on `it` every turn. The iterator is a bare Rust local; pin it and
+    // re-read at the top of the body. `found` needs the same treatment for the
+    // `want_last` walk: it holds the entry from turn k across every dispatch
+    // in turns k+1.., and it is what the function returns.
+    let it_pin = ctx.pin_native_root(it);
+    let mut found_pin = usize::MAX;
     loop {
+        let it = ctx.read_native_pin(it_pin, it);
         match ctx.invoke_virtual(it, "hasNext", "()Z", &[])? {
             Some(Value::Int(1)) => {}
             _ => break,
         }
+        let it = ctx.read_native_pin(it_pin, it);
         let next = ctx
             .invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])?
             .unwrap_or(Value::Object(None));
         if matches!(next, Value::Object(None)) {
             break;
         }
+        if found_pin != usize::MAX {
+            ctx.unpin_native_roots(found_pin);
+            found_pin = usize::MAX;
+        }
+        if let Value::Object(Some(o)) = next {
+            found_pin = ctx.pin_native_root(o);
+        }
         found = next;
         if !want_last {
             break;
         }
     }
+    if let (Value::Object(Some(o)), pin) = (found, found_pin) {
+        if pin != usize::MAX {
+            found = Value::Object(Some(ctx.read_native_pin(pin, o)));
+        }
+    }
+    ctx.unpin_native_roots(it_pin);
     Ok(Some(found))
 }
 
@@ -1510,15 +1589,52 @@ pub(crate) fn native_p64_lhm_reversed(
     ctx.set_field(new_lhm, 2, Value::Int(init_cap));
     ctx.set_field(new_lhm, 3, Value::Object(None)); // head
     ctx.set_field(new_lhm, 4, Value::Object(None)); // tail
-                                                    // Insert each entry via invoke_virtual
+
+    // Insert each entry via invoke_virtual.
+    //
+    // GC-safety: `put` is a virtual dispatch into real bytecode, so the map
+    // being filled AND every key/value gathered from the old chain are stale
+    // from the second turn on. Pin the map for the loop and each pair for the
+    // one call that consumes it.
+    let new_lhm_pin = ctx.pin_native_root(new_lhm);
     for (key, val) in &entries {
+        let key_pin = match key {
+            Value::Object(Some(o)) => ctx.pin_native_root(*o),
+            _ => usize::MAX,
+        };
+        let val_pin = match val {
+            Value::Object(Some(o)) => ctx.pin_native_root(*o),
+            _ => usize::MAX,
+        };
+        // The LOWER of the two is the frame base to truncate at; a null key
+        // with a reference value would otherwise leave `val_pin` held for the
+        // whole walk.
+        let pair_base = if key_pin != usize::MAX { key_pin } else { val_pin };
+        let new_lhm = ctx.read_native_pin(new_lhm_pin, new_lhm);
+        let key = match (*key, key_pin) {
+            (Value::Object(Some(o)), p) if p != usize::MAX => {
+                Value::Object(Some(ctx.read_native_pin(p, o)))
+            }
+            (other, _) => other,
+        };
+        let val = match (*val, val_pin) {
+            (Value::Object(Some(o)), p) if p != usize::MAX => {
+                Value::Object(Some(ctx.read_native_pin(p, o)))
+            }
+            (other, _) => other,
+        };
         let _ = ctx.invoke_virtual(
             new_lhm,
             "put",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[Value::Object(Some(new_lhm)), *key, *val],
+            &[Value::Object(Some(new_lhm)), key, val],
         );
+        if pair_base != usize::MAX {
+            ctx.unpin_native_roots(pair_base);
+        }
     }
+    let new_lhm = ctx.read_native_pin(new_lhm_pin, new_lhm);
+    ctx.unpin_native_roots(new_lhm_pin);
     Ok(Some(Value::Object(Some(new_lhm))))
 }
 

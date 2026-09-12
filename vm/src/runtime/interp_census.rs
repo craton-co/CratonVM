@@ -56,6 +56,49 @@ pub fn tierup_decline_enabled() -> bool {
     gate(&TIERUP_DECLINE_ON, "CRATONVM_DBG_TIERUP_DECLINE")
 }
 
+static CALLBACK_MEMO_ON: AtomicU8 = AtomicU8::new(0);
+
+/// `CRATONVM_DBG_CALLBACK_MEMO=1` — the native->Java callback memo's
+/// engagement census (`crate::runtime::native_callee_memo`).
+///
+/// Read it the way `direct-binds` is read: a `hits` count alone cannot tell a
+/// working memo from a workload with no native->Java callbacks in it, so
+/// `probes` is printed beside it as the denominator and `fills`/`evictions`
+/// beside THAT, because a memo whose fills track its probes is a memo that is
+/// thrashing rather than one that is working.
+#[inline(always)]
+pub fn callback_memo_enabled() -> bool {
+    gate(&CALLBACK_MEMO_ON, "CRATONVM_DBG_CALLBACK_MEMO")
+}
+
+static PROMOTE_REFUSE_ON: AtomicU8 = AtomicU8::new(0);
+
+/// `CRATONVM_DBG_PROMOTE_REFUSE=1` — the SECOND tier-up census, and the one
+/// `tierup-decline` structurally cannot produce.
+///
+/// `tierup-decline` names the first condition of the `&&` chain in
+/// `execute_invokevirtual_cached` that refused a site. A site that chain
+/// ADMITS can still be interpreted, and on the composition workload that is
+/// exactly what happens: with
+/// `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS=1 CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL=1`
+/// the `tierup-decline` census reports `CompletableFuture.getNow` admitted and
+/// `CRATONVM_DBG_INTERP_FRAMES=1` still reports 40 000 interpreted frames for
+/// it in 40 000 chains — so the refusal is downstream of the chain and nothing
+/// named it. See
+/// `composition-native-callback-and-the-promotion-question-20260902.md` item 2:
+/// "what is missing is the reason the `jit_cache` probe or
+/// `execute_jit_call_decoded` then refuses, which is a second census and the
+/// next thing to build."
+///
+/// One row per dispatch, keyed by the reason the site did not END UP in
+/// compiled code. `entered_compiled` is the success row and is recorded too: a
+/// refusal census with no success row cannot be told from an instrument that
+/// is not wired up.
+#[inline(always)]
+pub fn promote_refuse_enabled() -> bool {
+    gate(&PROMOTE_REFUSE_ON, "CRATONVM_DBG_PROMOTE_REFUSE")
+}
+
 static DIRECT_BINDS_ON: AtomicU8 = AtomicU8::new(0);
 
 /// `CRATONVM_DBG_DIRECT_BINDS=1` — the thin-direct-call engagement census.
@@ -131,6 +174,29 @@ pub fn record_tierup_decline(reason: &str, class: &str, method: &str, descriptor
     }
 }
 
+fn promote_refuse_census() -> &'static Census {
+    static C: OnceLock<Census> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record why a site the tier-up `&&` chain ADMITTED did or did not end up
+/// executing compiled code. Caller has already tested
+/// [`promote_refuse_enabled`].
+#[cold]
+pub fn record_promote_refuse(reason: &str, class: &str, method: &str, descriptor: &str) {
+    let key = format!("{reason} {class}.{method}{descriptor}");
+    if let Ok(mut m) = promote_refuse_census().lock() {
+        *m.entry(key).or_insert(0) += 1;
+    }
+}
+
+/// The `execute_jit_call_decoded` half, recorded from `jit_bridge` where the
+/// cached entry is in hand but the census module is not otherwise reached.
+#[cold]
+pub fn record_decoded_call_refusal(reason: &str, class: &str, method: &str, descriptor: &str) {
+    record_promote_refuse(reason, class, method, descriptor);
+}
+
 fn dump(label: &str, c: &Census, top: usize) {
     let Ok(m) = c.lock() else { return };
     if m.is_empty() {
@@ -147,9 +213,51 @@ fn dump(label: &str, c: &Census, top: usize) {
 
 /// Print both censuses. Called from `vm-cli`'s exit report block; a census
 /// that was never armed prints nothing.
+/// A trapped compiled frame the sinks could not rebuild re-ran its method FROM
+/// ENTRY — side effects included. Say so, always.
+///
+/// # Why this one is not behind a debug flag
+///
+/// Everything else in this file is a diagnostic: you turn it on because you are
+/// already looking. This is not that. It is a silent WRONG ANSWER — a store, a
+/// call or a monitor action that happened twice because a deopt could not be
+/// resumed and the sink re-entered the method at bci 0
+/// (`jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md`). The
+/// 2026-09-07 fix resumes wherever the frame CAN be rebuilt, which is the
+/// common case; what is left is this, and leaving it behind
+/// `CRATONVM_DBG_JITC` would keep the residual exactly as invisible as the
+/// defect was.
+///
+/// One line, only when the count is non-zero, naming the reasons. A clean run
+/// prints nothing.
+fn report_unrebuildable_frames() {
+    let bails = crate::runtime::interpreter::deopt_frame_bail_counts();
+    let total: u64 = bails.iter().map(|(_, n)| *n).sum();
+    if total == 0 {
+        return;
+    }
+    let detail = bails
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(why, n)| format!("{why}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "[cratonvm] WARNING: {total} trapped compiled frame(s) could not be rebuilt and their \
+         methods RE-RAN FROM ENTRY, repeating any side effect committed before the trap: \
+         {detail}. See internal/fixed-bugs/\
+         jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md."
+    );
+}
+
 pub fn report_at_exit() {
+    report_unrebuildable_frames();
     dump("interp-frames", interp_census(), 60);
     dump("tierup-decline", decline_census(), 60);
+    dump("promote-refuse", promote_refuse_census(), 60);
+    // `CRATONVM_DBG=dispatch-tally`, which could only report every 2^20 rows
+    // and therefore printed nothing at the size its own page measures.
+    crate::vm::dump_dispatch_tally_at_exit();
     // C1→C2 supersede engagement. `unchanged`/`first-publish` are the two
     // outcomes that cannot invalidate anything, and `ic_evictions` is what the
     // epoch bump actually costs — the number of `Jit` invoke-cache entries it
@@ -193,10 +301,67 @@ pub fn report_at_exit() {
             .map(|(cause, n)| format!("{cause}={n}"))
             .collect::<Vec<_>>()
             .join(" ");
-        eprintln!("[c2-supersede] ir site traps planted: {trap_line}");
+        // REFUSED, beside PLANTED, for the same reason PLANTED is printed as
+        // all three rows including zeros: a planted count on its own cannot
+        // tell "this workload has no such site" from "every such site was
+        // declined", and those want opposite next steps.
+        //
+        // It is also the price tag of `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD`.
+        // Every refusal is one optimizing body handed back to the single-pass
+        // tier, and the guard's own doc claims that cost is "countable rather
+        // than argued about" — which was not true while nothing read the
+        // counter. `ir_trap_refusal_census` landed with no reader in
+        // 7ade4a87c; this is that reader.
+        let refused_line = cratonvm_jit::ir::ir_trap_refusal_census()
+            .iter()
+            .map(|(cause, n)| format!("{cause}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // TAKEN, beside PLANTED. The planting doc promised this half and did
+        // not have it: "a cause whose taken count is not ~0 has had its
+        // coldness argument refuted". A non-zero number means a trap sat on a
+        // LIVE path, which is the falsifiable form of that claim.
+        eprintln!(
+            "[c2-supersede] ir site traps planted: {trap_line} | REFUSED as unresumable: \
+             {refused_line} | TAKEN at runtime: {}",
+            cratonvm_jit::ir::site_traps_taken(),
+        );
+        let repeats = cratonvm_jit::ir::site_trap_repeats();
+        if repeats > 0 {
+            eprintln!(
+                "[c2-supersede] ir site traps re-fired after the decision: {repeats} (a caller frame still holds a baked CALL to the trapping body)"
+            );
+        }
+        // Trapped frames the sinks could NOT rebuild, confirmed at zero.
+        //
+        // The non-zero case is reported unconditionally by
+        // `report_unrebuildable_frames` above and is NOT repeated here; this
+        // line exists so a diagnostic run can tell "the residual is empty"
+        // apart from "the census is not wired up", which are the same silence.
+        if crate::runtime::interpreter::deopt_frame_bail_total() == 0 {
+            eprintln!(
+                "[c2-supersede] trapped frames that could not be rebuilt: 0 (every trap this \
+                 run resumed precisely)"
+            );
+        }
         let (lowered, refused) = cratonvm_jit::ir::scalar_intrinsic_census();
         eprintln!(
             "[c2-supersede] call-site intrinsics: lowered_as_arithmetic={lowered} refused_method={refused}"
+        );
+        // The guarded slot-0 accessors (`Op::Unbox`): the unboxing pair and the
+        // four `Atomic*` families. Counted on their own line rather than folded
+        // into `lowered_as_arithmetic`, because they are not arithmetic -- they
+        // are guarded memory ops, and three of them WRITE. They came off the
+        // `refused_method` work list, so the two numbers have to be readable
+        // against each other.
+        //
+        // `note_unbox_lowered` existed from the day the op landed and nothing
+        // printed it, which is the "instrument armed where nobody reads it"
+        // shape this census exists to avoid: a zero here now means the emitter
+        // found no sites, and that is a different statement from silence.
+        eprintln!(
+            "[c2-supersede] unbox accessors: lowered_inline={}",
+            cratonvm_jit::ir::unbox_lowered()
         );
         // The branch-profile window. `still_open` at exit should be ~0: a
         // nomination that opens the window and never closes it pins branch
@@ -225,6 +390,16 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] refusals by optimizer activity: simplified={ref_simpl} inert={ref_inert}"
         );
+        // The third refusal reason, and the one that means the opposite of the
+        // other two: these bodies DID carry evidence the list accepts and were
+        // refused anyway, because the transform they carried made them slower.
+        // A non-zero count is the priced gate catching what the transform list
+        // alone published -- see `ir_evidence`'s header for the 897 ms against
+        // 338 ms that motivated pricing it.
+        let (cost_ref, cost_ns) = cratonvm_jit::ir_evidence::cost_regression_census();
+        eprintln!(
+            "[c2-supersede] refused as a cost regression: bodies={cost_ref} est_ns_per_execution_declined={cost_ns}"
+        );
         // Array guard elision. Elided AND emitted on both rows, always: an
         // elision count alone cannot tell a working pass from a workload that
         // compiles no array accesses in this tier.
@@ -239,14 +414,213 @@ pub fn report_at_exit() {
             "[c2-supersede] ir bounds elisions by range proof: {} (rest are dominating-redundancy)",
             cratonvm_jit::ir_check_elim::range_census(),
         );
+        // WHY the rest were not provable. "Extend the range pass" is four
+        // separate decisions with very different costs, and this says which
+        // one is actually holding the checks.
+        let refusals = cratonvm_jit::ir_check_elim::refusal_census();
+        if !refusals.is_empty() {
+            let body: Vec<String> = refusals
+                .iter()
+                .map(|(name, n)| format!("{name}={n}"))
+                .collect();
+            eprintln!(
+                "[c2-supersede] ir bounds range refusals: {}",
+                body.join(" ")
+            );
+        }
         eprintln!(
             "[c2-supersede] ir aastore sites lowered: {}",
             cratonvm_jit::ir_lower::ir_aastore_census(),
+        );
+        // Block-exit shape. Read as a RATIO: `elided` alone cannot separate a
+        // layout that is working from a method whose blocks were already in
+        // source order, and until the elision existed every edge ended in an
+        // explicit `JMP` — so frequency-driven block layout could not pay,
+        // whatever it reordered.
+        let (ft_elided, ft_jmps) = cratonvm_jit::ir_lower::ir_fallthrough_census();
+        eprintln!(
+            "[c2-supersede] ir block exits: fell_through={ft_elided} jmp_emitted={ft_jmps}"
+        );
+        // Safepoint polls, by shape. The inline shape branches over its own
+        // slow path on the FAST path, so a hot loop pays a taken jump and
+        // carries ~230 bytes it never enters; `CRATONVM_JIT_IR_POLL_OUTLINE`
+        // moves the block after the body and inverts the test.
+        let (poll_out, poll_inline) = cratonvm_jit::ir_lower::ir_poll_census();
+        eprintln!(
+            "[c2-supersede] ir safepoint polls: outlined={poll_out} inline={poll_inline}"
+        );
+        // Reads eliminated as redundant with one already performed in the
+        // same block (`CRATONVM_JIT_IR_LOAD_CSE`). A zero with the flag on means
+        // no method in this workload read one cell twice out of one heap state
+        // — a fact about the workload, not a broken pass.
+        let load_cse = cratonvm_jit::ir_optimize::ir_load_cse_census();
+        eprintln!("[c2-supersede] ir redundant reads removed: {load_cse}");
+        // Inline field-read sites, split by whether the site before it in the
+        // same block had already run the layout-epoch guard and the per-object
+        // compactness test. `later` is the population a CSE of those two could
+        // serve; `elided` beside it is what the receiver null-check CSE
+        // ALREADY serves, which is the comparison that says whether the
+        // remaining guards are worth the work.
+        // Why a workload has few inline field sites has two very different
+        // answers — the code reads few fields, or the inline path refused most
+        // of them — and only this distinguishes them.
+        let declines = cratonvm_jit::metrics::ir_getfield_declines();
+        if !declines.is_empty() {
+            let joined: Vec<String> =
+                declines.iter().map(|(n, v)| format!("{n}={v}")).collect();
+            eprintln!(
+                "[c2-supersede] ir getfield inline declines: {}",
+                joined.join(" ")
+            );
+        }
+        let (first_site, later_site) = cratonvm_jit::ir_lower::ir_field_site_census();
+        let (seeded, elided, emitted) = cratonvm_jit::metrics::ir_receiver_null_check_counts();
+        eprintln!(
+            "[c2-supersede] ir inline field sites: first-in-block={first_site} later-in-block={later_site}; receiver null checks: seeded={seeded} elided={elided} emitted={emitted}"
+        );
+        // Speculation. A zero with `CRATONVM_JIT_IR_SPECULATE=1` means no
+        // branch in this workload was one-sided over the sample — a fact about
+        // the program, not about the pass — and that is precisely what a bare
+        // "nothing happened" cannot tell you.
+        eprintln!(
+            "[c2-supersede] ir cold branch arms pruned: {}",
+            cratonvm_jit::ir::branch_prune_census(),
+        );
+        // Multi-return splicing. `bodies=0` is the DEFAULT reading — the
+        // feature is off. With `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1` a zero
+        // means no admitted callee had a second reachable `return`, which is a
+        // fact about the workload rather than about the feature.
+        let (mr_bodies, mr_edges) = cratonvm_jit::ir::multi_return_splice_census();
+        eprintln!(
+            "[c2-supersede] ir multi-return spliced bodies: bodies={mr_bodies} return_edges={mr_edges}"
+        );
+        // Reference residency. `admitted=0` under
+        // `CRATONVM_JIT_IR_REF_RESIDENCY=1` means no reference in this workload
+        // was worth a register; `admitted>0 dropped=0` would mean the
+        // invalidation is not wired, which is the one reading that must never
+        // be silent — it is a stale-oop bug, not a missed optimization.
+        let (ref_admitted, ref_dropped) = cratonvm_jit::ir_lower::ir_ref_residency_census();
+        eprintln!(
+            "[c2-supersede] ir reference residency: admitted={ref_admitted} copies_dropped={ref_dropped}"
+        );
+        // Calls this tier lowered to `jit_invoke_dispatch` -- a name
+        // resolution per execution. `in_splice` is the row to act on: a splice
+        // exists to delete a frame, and a resolution costs far more than the
+        // frame it removed, so a non-zero here means the optimizing body is
+        // very likely SLOWER than the single-pass one for that method. It read
+        // non-zero for every spliced statically-bound call until 2026-09-09;
+        // see `c2-splice-getstatic-and-the-calls-it-left-behind-20260909.md`.
+        let (bd_own, bd_splice) = cratonvm_jit::ir_lower::ir_blind_dispatch_census();
+        eprintln!(
+            "[c2-supersede] ir blind dispatches: own_code={bd_own} in_splice={bd_splice}"
         );
         let (held, spent, retired) = cratonvm_jit::deferred_new_retry_census();
         eprintln!(
             "[c2-supersede] deferred-new retries: held={held} spent={spent} retired={retired} re_offered={}",
             crate::runtime::interpreter::jit_bridge::deferred_new_reoffered(),
+        );
+    }
+    // The DEFERRED carry -- a consumer taking BOTH of its single-use operands
+    // in registers rather than one.
+    //
+    // OUTSIDE the supersede block on purpose. Everything above it is gated on
+    // a C1 body having been superseded, and most workloads that compile
+    // hundreds of methods never supersede one: the first run of this census
+    // over the probe set reported `planned=0` from 54 processes that had
+    // compiled thousands of methods between them, which is an instrument
+    // armed where nobody reads it rather than a fact about the code.
+    //
+    // Read against its denominator. `taken` alone says how often the shape
+    // was TAKEN and nothing about how often it was there, and
+    // `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`
+    // closed on exactly that distinction. `candidates` is every consumer
+    // already taking its first
+    // operand in RAX -- the shape the second slot exists for.
+    // `declined_mid_writes_rcx` is the share of those refused because the arm
+    // in between can write RCX, and `foldable` is the part of THAT which
+    // `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` converts.
+    if crate::runtime::env_cache::dbg_jitc() {
+        let (dc, dt, dm, df) = cratonvm_jit::ir_lower::ir_carry_deferred_census();
+        eprintln!(
+            "[c2-supersede] ir deferred carries: candidates={dc} taken={dt} \
+             declined_mid_writes_rcx={dm} (foldable={df})"
+        );
+        // And the pass UPSTREAM of that one. The deferred carry's largest
+        // decline is `operand_position` -- the triple it needs was never
+        // formed -- and this is the census of the pass whose job is forming
+        // it. Read the two lines together: the numbers above are what the
+        // emitter could take, the numbers below are why the scheduler did or
+        // did not offer it.
+        // Loop unrolling. OUTSIDE the supersede gate, and read as a
+        // DISTRIBUTION rather than a total: `unrolled=0` is the expected
+        // reading and says nothing on its own, while `runtime_bound` sizes the
+        // PARTIAL unroller's population and `safepoint_named` sizes what the
+        // full one refuses on a default run.
+        //
+        // `runtime_bound` is a SHAPE count and deliberately not a term of the
+        // closing identity; `runtime_bound_refused` is its terminal counterpart,
+        // and the two are EQUAL until the partial unroller is armed. Read
+        // `partially_unrolled` against the gap between them: it is how many of
+        // the loops the partial unroller took responsibility for it actually
+        // transformed, and the rest went to one of the shared refusals on this
+        // same line.
+        let uc = cratonvm_jit::ir_optimize::ir_unroll_census();
+        eprintln!(
+            "[c2-supersede] ir unroll: merges={} (loops = merges - not_single_backedge) unrolled={} \
+             (of which per_copy_frames={}) partially_unrolled={} | declined: \
+             runtime_bound={} (of which refused_outright={} trap_free={} pure_body={}) \
+             safepoint_named={} \
+             frame_uncopyable={} side_effect={} not_counted={} control_shape={} \
+             body_unclonable={} trip_over_cap={} escapes_or_pinned={} \
+             not_single_backedge={}",
+            uc.headers,
+            uc.unrolled,
+            uc.per_copy_frames,
+            uc.partially_unrolled,
+            uc.runtime_bound,
+            uc.runtime_bound_refused,
+            uc.runtime_bound_trap_free,
+            uc.runtime_bound_pure_body,
+            uc.safepoint_named,
+            uc.frame_uncopyable,
+            uc.side_effect,
+            uc.not_counted,
+            uc.control_shape,
+            uc.body_unclonable,
+            uc.trip_over_cap,
+            uc.escapes_or_pinned,
+            uc.not_single_backedge,
+        );
+        // Fused branches whose fall-through edge the LAYOUT chose. OUTSIDE the
+        // supersede gate for the reason the deferred-carry line above is: a
+        // workload that compiles thousands of methods and supersedes none
+        // would report zero from an instrument that was never armed, which is
+        // an artefact of the gate rather than a fact about the code.
+        eprintln!(
+            "[c2-supersede] ir branch polarity from layout: {}",
+            cratonvm_jit::ir_lower::ir_branch_polarity_from_layout(),
+        );
+        let pc = cratonvm_jit::ir_schedule::ir_pair_census();
+        eprintln!(
+            "[c2-supersede] ir operand pairing: candidates={} paired={} | declined: \
+             multi_use={} producer_arm={} other_block={} after_consumer={} \
+             already_adjacent={} deopt_between={} no_node={}",
+            pc.candidates,
+            pc.paired,
+            pc.multi_use,
+            pc.producer_arm,
+            pc.other_block,
+            pc.after_consumer,
+            pc.already_adjacent,
+            pc.deopt_between,
+            pc.no_node,
+        );
+    }
+    if callback_memo_enabled() {
+        let [probes, hits, fills, evictions] = crate::runtime::native_callee_memo::census();
+        let misses = probes.saturating_sub(hits);
+        eprintln!(
+            "[callback-memo] probes={probes} hits={hits} misses={misses} fills={fills} evictions={evictions}"
         );
     }
     if direct_binds_enabled() {

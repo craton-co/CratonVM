@@ -453,6 +453,58 @@ fn populate_calendar_data_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
     ctx.unpin_native_roots(map_pin);
 }
 
+/// Copy the JDK image's OWN `CalendarData` rows into the synthetic bundle,
+/// returning whether anything was read.
+///
+/// `firstDayOfWeek` / `minimalDaysInFirstWeek` are NOT per-locale integers in
+/// CLDR. They are one region-keyed TABLE shared by every locale --
+/// `"1: AG AS BD ... US ...;2: 001 AD ... DE ...;6: MV;7: AE AF ..."` -- which
+/// `CLDRCalendarDataProviderImpl` parses and then selects from by the locale's
+/// COUNTRY. `populate_calendar_data_en` writes a bare `"1"` in its place, and a
+/// bare `"1"` is not a region table: the real provider finds no region in it,
+/// answers 0, and `CalendarDataUtility`'s "not in 1..7" guard substitutes its
+/// own default of 1. Every locale then reports Sunday / 1 minimal day, and
+/// `en-US` looks healthy only because 1/1 happens to be the right answer for
+/// the US -- which is what made the defect survive its own control.
+///
+/// This reads the real bundle class out of the image by the same mechanism
+/// `cldr_collation_rule` uses for `CollationData`, so the region table arrives
+/// intact rather than being re-derived from a curated table in this file (which
+/// would be one more copy of CLDR to keep in step with the image). Returning
+/// false leaves the caller on that curated fallback, which is still the right
+/// answer for an image that has no `sun/util/resources/cldr/CalendarData.class`
+/// at all.
+fn populate_calendar_data_from_cldr(
+    ctx: &mut dyn NativeContext,
+    map_pin: usize,
+    map: ObjectRef,
+    lang: &str,
+    country: &str,
+) -> bool {
+    let Some(table) = load_cldr_table(ctx, "sun.util.resources.cldr.CalendarData", lang, country)
+    else {
+        return false;
+    };
+    // GC: `put_str`/`put_arr` re-read `map` through `map_pin` on every call, so
+    // the raw `map` handed in here may already be a pre-move address -- the
+    // same contract the `CollationData` arm below relies on.
+    let mut wrote = false;
+    for (key, value) in table.iter() {
+        match value {
+            CldrValue::Str(s) => {
+                crate::phases_late::text_intl::put_str(ctx, map_pin, map, key, s);
+                wrote = true;
+            }
+            CldrValue::Arr(items) => {
+                let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+                crate::phases_late::text_intl::put_arr(ctx, map_pin, map, key, &refs);
+                wrote = true;
+            }
+        }
+    }
+    wrote
+}
+
 fn populate_currency_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // cceres5: every put below allocates; one entry pin, read per call.
     let map_pin = ctx.pin_native_root(map);
@@ -547,6 +599,37 @@ fn cldr_packages(base_name: &str) -> Option<(&'static str, &'static str)> {
         Some(("sun/util/resources/cldr", "sun/util/resources/cldr/ext"))
     } else {
         None
+    }
+}
+
+/// The bundle families that genuinely live OUTSIDE the `cldr` packages.
+///
+/// [`cldr_packages`] maps EVERY `sun.text.resources.*` base name onto the CLDR
+/// package pair on purpose, and its own doc comment says why: this VM's
+/// adapter selection asks for the legacy JRE name where HotSpot's CLDR default
+/// asks for the `cldr` one, and HotSpot's answer is the oracle. That is right
+/// for the families CLDR re-generated.
+///
+/// A few were never re-generated, because their data is not CLDR's, and for
+/// those the blanket mapping makes every candidate miss and the family read as
+/// absent. Verified against a JDK 25.0.3 image with `jimage list`, not assumed:
+///
+/// ```text
+///   java.base       sun/text/resources/BreakIteratorInfo.class
+///                   sun/text/resources/{Word,Line,Sentence}BreakIteratorData
+///   jdk.localedata  sun/text/resources/ext/BreakIteratorInfo_th.class
+///                   sun/text/resources/ext/{Word,Line}BreakIteratorData_th
+/// ```
+///
+/// and no `sun/text/resources/cldr/BreakIteratorInfo` of either. `CollationData`
+/// is the same shape and is the reason [`cldr_collation_rule`] had to hand-roll
+/// its own probe rather than call [`load_cldr_table`]; it is left alone here so
+/// that working reader keeps its cache and its most-specific-first order, which
+/// differ from this one's merge.
+fn non_cldr_packages(simple: &str) -> Option<(&'static str, &'static str)> {
+    match simple {
+        "BreakIteratorInfo" => Some(("sun/text/resources", "sun/text/resources/ext")),
+        _ => None,
     }
 }
 
@@ -664,11 +747,16 @@ fn load_cldr_table(
     lang: &str,
     country: &str,
 ) -> Option<CldrTable> {
-    let (root_pkg, ext_pkg) = cldr_packages(base_name)?;
     let simple = base_name.rsplit('.').next().unwrap_or_default();
     if simple.is_empty() {
         return None;
     }
+    // The non-CLDR families first: for them `cldr_packages`' blanket mapping
+    // names two packages the image does not have.
+    let (root_pkg, ext_pkg) = match non_cldr_packages(simple) {
+        Some(pair) => pair,
+        None => cldr_packages(base_name)?,
+    };
     let cache_key = format!("{simple}|{lang}|{country}");
     if let Ok(cache) = cldr_cache().lock() {
         if let Some(hit) = cache.get(&cache_key) {
@@ -700,12 +788,26 @@ fn load_cldr_table(
     let table: Option<CldrTable> = if loaded_any {
         Some(std::sync::Arc::new(merged))
     } else {
-        // Warn only for the families CLDR is expected to answer. The other
-        // `sun.*.resources.*` base names (`BreakIteratorInfo`, `CollationData`,
-        // …) legitimately have no `cldr` package at all, and a warning on those
-        // would be crying wolf — which is how a real fallback notice gets
-        // filtered out of a log.
-        if matches!(simple, "FormatData" | "CurrencyNames" | "LocaleNames") {
+        // Warn only for the families that are expected to answer. The other
+        // `sun.*.resources.*` base names (`CollationData`, …) legitimately have
+        // no `cldr` package at all, and a warning on those would be crying
+        // wolf — which is how a real fallback notice gets filtered out of a
+        // log.
+        //
+        // `BreakIteratorInfo` USED to be the first example in that sentence and
+        // is now in the list below instead, because `non_cldr_packages` routes
+        // it to the packages the image actually has. The sentence was right
+        // about the old behaviour and would now suppress the warning for the
+        // one family whose miss means the probe is broken.
+        // `BreakIteratorInfo` is in the list because its ROOT bundle is in
+        // `java.base`: unlike the `cldr` families, a jlinked image that dropped
+        // `jdk.localedata` still has it, so a total miss is not the ordinary
+        // degradation this warning exists to announce — it means the probe is
+        // wrong.
+        if matches!(
+            simple,
+            "FormatData" | "CurrencyNames" | "LocaleNames" | "BreakIteratorInfo"
+        ) {
             tracing::warn!(
                 family = simple,
                 language = lang,
@@ -925,6 +1027,21 @@ fn cldr_collation_rule_uncached(
 
 /// The FormatData table for a locale. One name for the base string so the six
 /// call sites cannot drift apart on it.
+/// The merged `BreakIteratorInfo` bundle for a locale.
+///
+/// Root + `_<lang>` + `_<lang>_<country>`, least specific first, so `_th`'s
+/// `WordData = WordBreakIteratorData_th` overrides the root's while the root's
+/// `BreakIteratorClasses` still resolves for a locale that has no override.
+/// That merge is [`load_cldr_table`]'s, and it is the right one here for the
+/// same reason it is right for `FormatData`: the JDK's own parent chain.
+fn break_iterator_info(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    country: &str,
+) -> Option<CldrTable> {
+    load_cldr_table(ctx, "sun.text.resources.BreakIteratorInfo", lang, country)
+}
+
 fn cldr_format_data(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> Option<CldrTable> {
     load_cldr_table(ctx, "sun.text.resources.cldr.FormatData", lang, country)
 }
@@ -1280,8 +1397,13 @@ fn build_bundle(
         } else if bundle_name.starts_with("sun.util.resources.CalendarData")
             || bundle_name.starts_with("sun.util.resources.cldr.CalendarData")
         {
-            let mut map_now = ctx.read_native_pin(map_pin, map);
-            populate_calendar_data_en(ctx, &mut map_now);
+            // The image's own CalendarData FIRST. Its week rules are a
+            // region-keyed table that the curated fallback cannot express --
+            // see `populate_calendar_data_from_cldr`.
+            if !populate_calendar_data_from_cldr(ctx, map_pin, map, lang, country) {
+                let mut map_now = ctx.read_native_pin(map_pin, map);
+                populate_calendar_data_en(ctx, &mut map_now);
+            }
         } else if bundle_name.starts_with("sun.util.resources.CurrencyNames")
             || bundle_name.starts_with("sun.util.resources.cldr.CurrencyNames")
         {
@@ -1481,8 +1603,90 @@ fn is_synthesized_locale_base(name: &str) -> bool {
 /// accessors return a plain `ResourceBundle` (no `checkcast`), and
 /// `DateFormatSymbols`/`DecimalFormatSymbols` consume them through the curated
 /// English/US map populated by `build_bundle`.
-fn needs_concrete_bundle_class(name: &str) -> bool {
-    name.ends_with(".TimeZoneNames")
+fn needs_concrete_bundle_class(name: &str, caller_is_app: bool) -> bool {
+    name.ends_with(".TimeZoneNames") || (name.ends_with(".LocaleNames") && !caller_is_app)
+}
+
+/// `.LocaleNames` was added 2026-09-11 (wave 6) and the paragraph above said
+/// why it was not there: "nothing in the failing test exercises their cast".
+/// Something does now.
+///
+/// `apps/probes/L1LocaleProviderWorkload` asks for
+/// `Locale.getDisplayVariant` and `getDisplayScript`, and both land in
+/// `LocaleData.getLocaleNames`, whose `checkcast` to
+/// `sun/util/resources/OpenListResourceBundle` a curated
+/// `java/util/ResourceBundle` cannot satisfy:
+///
+/// ```text
+///   N.displayVariant  Valencian -> THREW java.lang.ClassCastException
+///       class java.util.ResourceBundle cannot be cast to class
+///       sun.util.resources.OpenListResourceBundle
+/// ```
+///
+/// The other half of that paragraph -- "the real CLDR display names live in
+/// `sun.util.resources.cldr.ext.*`, which the simple locale-candidate chain
+/// does not reach" -- was true of the chain and is what
+/// [`concrete_bundle_chain`] fixes. `jimage list` on the JDK 25.0.3 image:
+///
+/// ```text
+///   sun/util/resources/LocaleNames.class            (legacy root)
+///   sun/util/resources/cldr/LocaleNames.class
+///   sun/util/resources/cldr/LocaleNames_en.class
+///   sun/util/resources/cldr/ext/LocaleNames_ca.class
+/// ```
+///
+/// `CurrencyNames` has the same shape and is deliberately NOT added: it
+/// measured `+38` armed on the same probe, so its curated path is doing work
+/// the class bundles would have to replace, and that is its own measurement.
+///
+/// # `LocaleNames` is routed for JDK-INTERNAL callers only, and that is
+/// MEASURED
+///
+/// The first cut routed it for every caller and cost one probe:
+///
+/// ```text
+///   CurrencyNameProbe row 18   HotSpot: THREW MissingResourceException
+///                                       "Can't find bundle for base name
+///                                        sun.util.resources.LocaleNames"
+///                              this VM: sun.util.resources.cldr.LocaleNames_en
+/// ```
+///
+/// Application code calling `ResourceBundle.getBundle` on that base name by
+/// hand gets a `MissingResourceException` on HotSpot, and answering it is a
+/// wrong answer even though the bundle is real and the cast would have
+/// worked. The `checkcast` that needs the real class lives in
+/// `LocaleData.getLocaleNames`, which is not application code -- so
+/// `caller_is_app` is exactly the discriminator, and it is already computed
+/// here for `is_jdk_internal_bundle`'s sake.
+///
+/// `TimeZoneNames` is NOT gated the same way: it was routed unconditionally
+/// in 2026-08 for Tomcat's `TestExpiresFilter` and nothing has measured the
+/// app-caller side of it. Narrowing someone else's fix on an argument rather
+/// than a measurement is how a working path breaks.
+fn concrete_bundle_chain(
+    bundle_name: &str,
+    chain: &[(String, String, String)],
+) -> Vec<(String, String, String)> {
+    let Some((root_pkg, ext_pkg)) = cldr_packages(bundle_name) else {
+        return chain.to_vec();
+    };
+    let root_pkg = root_pkg.replace('/', ".");
+    let ext_pkg = ext_pkg.replace('/', ".");
+    let mut out: Vec<(String, String, String)> = chain.to_vec();
+    // LEAST specific first, and appended AFTER the plain candidates on
+    // purpose: `try_class_bundle` links each existing candidate as the child
+    // of the previous one and returns the last, so the CLDR bundle ends up
+    // the most specific and the legacy root becomes its parent rather than
+    // its replacement.
+    for (cand, lang, country) in chain {
+        let Some(simple) = cand.rsplit('.').next() else {
+            continue;
+        };
+        for pkg in [root_pkg.as_str(), ext_pkg.as_str()] {
+            out.push((format!("{pkg}.{simple}"), lang.clone(), country.clone()));
+        }
+    }
+    out
 }
 
 /// Real-JDK "java.class" bundle format: the bundle is a compiled
@@ -2017,7 +2221,14 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // javac/launcher messages — and some apps ship resources — as compiled
     // bundle classes, e.g. `com.sun.tools.javac.resources.compiler`). Skip the
     // hand-synthesized locale-data families, which stay on their curated path.
-    if !is_synthesized_locale_base(&bundle_name) || needs_concrete_bundle_class(&bundle_name) {
+    if !is_synthesized_locale_base(&bundle_name)
+        || needs_concrete_bundle_class(&bundle_name, caller_is_app)
+    {
+        let chain = if needs_concrete_bundle_class(&bundle_name, caller_is_app) {
+            concrete_bundle_chain(&bundle_name, &chain)
+        } else {
+            chain.clone()
+        };
         if let Some(real) = try_class_bundle(ctx, &chain) {
             ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
             return Ok(Some(Value::Object(Some(real))));
@@ -2726,6 +2937,58 @@ fn locale_calendar_name(
         .map(|(name, _)| name.to_string())
 }
 
+
+/// `java.text.Normalizer`'s two null contracts, measured rather than guessed.
+///
+/// Both public entry points take `(CharSequence src, Normalizer.Form form)`
+/// and neither declares a check; the NPEs come out of the first dereference
+/// each one performs, so the ORDER is observable and `src` wins:
+///
+/// ```text
+///   HotSpot 25.0.4+7, java.text.Normalizer
+///     normalize(null, NFC)    NPE: Cannot invoke "java.lang.CharSequence.toString()" because "src" is null
+///     normalize("a", null)    NPE: Cannot invoke "java.text.Normalizer$Form.ordinal()" because "form" is null
+///     normalize(null, null)   NPE: ... "src" is null          <- src first
+///     isNormalized(null, NFC) NPE: ... "src" is null
+///     isNormalized("a", null) NPE: ... "form" is null
+/// ```
+///
+/// Measured 2026-09-10 with `apps/probes/L1TailSweep.java`; this VM answered
+/// `null`, `"a"`, `null`, `true`, `true` for those five. `java/text/` is a
+/// HELD family for L1 — arming it moves `L1TailSweep` eleven rows AWAY from
+/// HotSpot — so the remedy §1.4 would prefer (yield to the bytecode) is not
+/// available here and the native has to carry the contract itself.
+///
+/// Registered TWICE (`locale_resources.rs` for the real-JDK boot,
+/// `phases_late/text_intl.rs` for synthetic mode), so both call this: a
+/// duplicate pair that sits half-fixed is the shape `owns_slot` exists to
+/// catch, and only one of the two wins any given boot.
+pub(crate) fn normalizer_reject_nulls(
+    src: Option<&Value>,
+    form: Option<&Value>,
+) -> Result<(), MethodCallFailed> {
+    let null = |v: Option<&Value>| !matches!(v, Some(Value::Object(Some(_))));
+    if null(src) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.lang.CharSequence.toString()\" because \"src\" is null"
+                    .to_string(),
+            ),
+        }
+        .into());
+    }
+    if null(form) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.text.Normalizer$Form.ordinal()\" because \"form\" is null"
+                    .to_string(),
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 pub fn register(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -2969,6 +3232,75 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // through to a key CLDR does not define. The en constants stay as
             // the fallback for an image with no `jdk.localedata`.
             let (lang, country) = receiver_locale(ctx, args.first());
+            // An EMPTY language is always wrong here and was previously
+            // SILENT in the worst possible way: `cldr_format_data(ctx, "", "")`
+            // resolves to the ROOT bundle, which loads fine and carries a full
+            // 13-element `NumberElements` -- so the lookup SUCCEEDS, no
+            // fallback arm is taken, no warning fires, and every locale is
+            // formatted with root (English) number symbols. Neither the W7-80
+            // "no bundle" warning nor the "no NumberElements" one below can see
+            // it, because nothing is missing; the wrong LOCALE was asked for.
+            //
+            // This is the tell to check first when a locale asked for BY NAME
+            // still formats as English.
+            if lang.is_empty() {
+                // Two different faults produce an empty language here and they
+                // need different fixes, so name which one it was rather than
+                // guessing. The field SHAPE is identical on JDK 21 and 25
+                // (`private final java.util.Locale locale;`, same position,
+                // measured with javap), so a missing field means the receiver
+                // is not the real `LocaleResources` -- not that the JDK differs.
+                let field = match args.first() {
+                    Some(Value::Object(Some(this))) => {
+                        match ctx.get_field_by_name(*this, "locale") {
+                            Value::Object(Some(loc)) => {
+                                // The Locale is there. Ask it directly and
+                                // report the RAW shape of the answer, because
+                                // the three cases need different fixes and all
+                                // three read as an empty string upstream:
+                                //   * a real "" -- the Locale genuinely has no
+                                //     language;
+                                //   * Ok(None) -- the call returned VOID, which
+                                //     is what a REFUSED native hands back to a
+                                //     native caller, and is the tell that this
+                                //     dispatch route did not reach bytecode;
+                                //   * Err -- it threw.
+                                // Bytecode callers of Locale.getLanguage() are
+                                // known-correct in every mode (measured), so a
+                                // gap here is a DISPATCH-ROUTE difference, not a
+                                // broken accessor.
+                                match ctx.invoke_virtual(
+                                    loc,
+                                    "getLanguage",
+                                    "()Ljava/lang/String;",
+                                    &[],
+                                ) {
+                                    Ok(Some(Value::Object(Some(sref)))) => {
+                                        match ctx.read_string(sref) {
+                                            Some(v) if v.is_empty() => {
+                                                "getLanguage-returned-empty-string"
+                                            }
+                                            Some(_) => "getLanguage-OK-but-lang-empty-upstream",
+                                            None => "getLanguage-unreadable-string",
+                                        }
+                                    }
+                                    Ok(Some(Value::Object(None))) => "getLanguage-returned-null",
+                                    Ok(Some(_)) => "getLanguage-returned-non-reference",
+                                    Ok(None) => "getLanguage-returned-VOID-refused-native",
+                                    Err(_) => "getLanguage-threw",
+                                }
+                            }
+                            Value::Object(None) => "locale-field-null",
+                            _ => "locale-field-not-a-reference",
+                        }
+                    }
+                    _ => "no-receiver",
+                };
+                tracing::warn!(
+                    locale_field = field,
+                    "W7-80: LocaleResources receiver yielded no language, so number                      symbols resolve against the ROOT bundle and EVERY locale formats                      as English. Nothing is missing from the JDK image and this bridge                      is not the culprit -- the wrong LocaleResources was handed to it.                      `getLanguage-returned-empty-string` (the measured JDK 21                      --jdk-only case) means the receiver IS a real LocaleResources but                      for the ROOT locale: something upstream answered a non-root                      request with root resources, so look at adapter/resource                      SELECTION, not at this bridge or at the CLDR bundles.                      `getLanguage-returned-VOID-refused-native` would instead mean the                      call never reached bytecode."
+                );
+            }
             let cldr = cldr_format_data(ctx, &lang, &country)
                 .and_then(|t| cldr_number_strings(&t, "NumberElements"));
             let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 3);
@@ -2983,13 +3315,36 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                     let refs: Vec<&str> = v.iter().map(String::as_str).collect();
                     make_string_array(ctx, &refs)
                 }
-                _ => make_string_array(
-                    ctx,
-                    &[
-                        ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN", ".",
-                        ",",
-                    ],
-                ),
+                _ => {
+                    // Substituting en here is a SILENT wrong answer: the caller
+                    // gets a fully-formed 13-element array and formats every
+                    // locale as English with no error at all. That is how the
+                    // strict-mode `textformat` divergence stayed unexplained --
+                    // the W7-80 warning in `load_cldr_table` never fires for
+                    // it, because a locale that resolves to the ROOT bundle
+                    // LOADS fine and only its CONTENT is English.
+                    //
+                    // Say it here, where the substitution actually happens, and
+                    // name the locale that was asked for: an EMPTY language is
+                    // the tell that the receiver's `locale` field could not be
+                    // read at all, rather than that the image lacks the data.
+                    tracing::warn!(
+                        language = %lang,
+                        country = %country,
+                        "W7-80: no CLDR NumberElements for this locale; substituting \
+                         CratonVM's en number symbols, so every locale will format as \
+                         English. An EMPTY language here means the LocaleResources \
+                         receiver's locale could not be read, NOT that the JDK image \
+                         lacks the data."
+                    );
+                    make_string_array(
+                        ctx,
+                        &[
+                            ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN",
+                            ".", ",",
+                        ],
+                    )
+                }
             };
             let outer_now = ctx.read_native_pin(outer_pin, outer);
             ctx.set_array_element(outer_now, 0, Value::Object(Some(elems)));
@@ -3595,6 +3950,129 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         |ctx, args| Ok(Some(locale_datetime_pattern(ctx, args))),
     );
 
+    // ---------------------------------------------------------------------
+    // BREAKITER, the real data. `java.text.BreakIterator`'s three bundle-fed
+    // factories walk
+    //
+    //   BreakIteratorProviderImpl.getBreakInstance(locale, idx, dataKey, dictKey)
+    //     LocaleResources.getBreakIteratorInfo("BreakIteratorClasses")  -> String[]
+    //     LocaleResources.getBreakIteratorInfo(dataKey)                 -> String
+    //     LocaleResources.getBreakIteratorResources(dataKey)            -> byte[]
+    //     new sun.text.RuleBasedBreakIterator(name, bytes)
+    //
+    // (`getCharacterInstance` is not here: JDK 25 answers it with an inline
+    // `GraphemeBreakIterator` and asks no bundle at all. Read from the image's
+    // own bytecode, not assumed — the other three pass indices 0/1/2 and the
+    // root bundle's `BreakIteratorClasses` has exactly three entries.)
+    //
+    // Both readers returned null, so `classNames[type]` threw
+    // `NullPointerException: Cannot load from null array` and this VM had to
+    // pin a synthetic iterator over the whole family (the BREAKITER allow-list
+    // in `vm/src/vm/vm_exec.rs`). The comments there and in
+    // `reflect_annotations.rs` blame "jdk.localedata's class-based resource
+    // bundles are not surfaced through our jimage path" — which W7-80 showed
+    // was STALE for the CLDR families and is stale here too. The classes and
+    // the binary data are both in the image this VM already boots from; the
+    // reason the lookup missed is that `cldr_packages` sent it to a `cldr`
+    // package that does not exist for this family. See `non_cldr_packages`.
+    //
+    // Answering these two from the image is what lets `java/text/BreakIterator`'s
+    // 17 registrations be retired rather than pinned — lane 1 §10 item 5.
+    registry.register(
+        "sun/util/locale/provider/LocaleResources",
+        "getBreakIteratorInfo",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let Some(Value::Object(Some(k))) = args.get(1).copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(key) = ctx.read_string(k) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let (lang, country) = receiver_locale(ctx, args.first());
+            let Some(table) = break_iterator_info(ctx, &lang, &country) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            match table.get(&key) {
+                Some(CldrValue::Arr(v)) => {
+                    let refs: Vec<&str> = v.iter().map(String::as_str).collect();
+                    let arr = make_string_array(ctx, &refs);
+                    Ok(Some(Value::Object(Some(arr))))
+                }
+                Some(CldrValue::Str(sv)) => {
+                    let sv = sv.clone();
+                    let o = ctx.create_string(&sv);
+                    Ok(Some(Value::Object(Some(o))))
+                }
+                // ABSENT KEY. HotSpot's body ends in `ResourceBundle.getObject`,
+                // which throws `MissingResourceException` rather than answering
+                // null. Answering null is a deliberate, narrower divergence: it
+                // is what this method did for EVERY key before this native, and
+                // the three keys `getBreakInstance` asks for are all present in
+                // the root bundle, so no caller reaches this arm. Throwing here
+                // would turn a silent wrong answer into a new abort on a path
+                // that has never been exercised.
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
+    );
+
+    registry.register(
+        "sun/util/locale/provider/LocaleResources",
+        "getBreakIteratorResources",
+        "(Ljava/lang/String;)[B",
+        |ctx, args| {
+            let Some(Value::Object(Some(k))) = args.get(1).copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(key) = ctx.read_string(k) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let (lang, country) = receiver_locale(ctx, args.first());
+            // The data file's NAME is a value in the same bundle, exactly as
+            // `BreakIteratorResourceBundle.handleGetObject` reads it:
+            // `getPackageName().replace('.','/') + "/" + info.getString(key)`.
+            // So `WordData` -> `WordBreakIteratorData` in the root bundle and
+            // `WordBreakIteratorData_th` in `_th`'s, and the package is the
+            // bundle's own — which is why both are probed below rather than
+            // the root one only.
+            let Some(table) = break_iterator_info(ctx, &lang, &country) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(CldrValue::Str(file)) = table.get(&key).cloned() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let mut bytes = None;
+            for pkg in ["sun/text/resources/ext", "sun/text/resources"] {
+                if let Some(b) = ctx.find_resource(&format!("{pkg}/{file}")) {
+                    bytes = Some(b);
+                    break;
+                }
+            }
+            let Some(bytes) = bytes else {
+                tracing::warn!(
+                    key = %key,
+                    file = %file,
+                    "BREAKITER: the bundle names a data file the image does not                      carry; the real RuleBasedBreakIterator cannot be built."
+                );
+                return Ok(Some(Value::Object(None)));
+            };
+            // No pin/re-read pair: `new_array` is the only allocation and
+            // `write_byte_array_from` is a bulk write into it, so nothing can
+            // move between them.
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+            if !ctx.write_byte_array_from(arr, 0, &bytes) {
+                // A refused bulk write leaves a zero-filled array, which the
+                // real `RuleBasedBreakIterator` would parse as a corrupt table
+                // rather than reject. Null is the answer this method already
+                // gave for everything, and it keeps the failure at the caller
+                // that can see it.
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+
     // sun.util.locale.provider.CalendarDataUtility.retrieveJavaTimeFieldValueNames(
     //     String id, int field, int style, Locale locale) -> Map<String,Integer>
     // The java.time text-name entry point (see the module note above). Build a
@@ -3710,6 +4188,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/CharSequence;Ljava/text/Normalizer$Form;)Ljava/lang/String;",
         |ctx, args| {
             use unicode_normalization::UnicodeNormalization;
+            normalizer_reject_nulls(args.first(), args.get(1))?;
             let input = match args.first() {
                 Some(Value::Object(Some(s))) => normalizer_read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Object(None))),
@@ -3754,6 +4233,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             use unicode_normalization::{
                 is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick, IsNormalized,
             };
+            normalizer_reject_nulls(args.first(), args.get(1))?;
             let input = match args.first() {
                 Some(Value::Object(Some(s))) => normalizer_read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Int(1))),
@@ -3907,5 +4387,97 @@ fn calendar_id_is_gregorian(ctx: &mut dyn NativeContext, arg: Option<&Value>) ->
             id.eq_ignore_ascii_case("gregory") || id.eq_ignore_ascii_case("iso8601")
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod w6_concrete_bundle_chain_tests {
+    use super::*;
+
+    /// The CLDR candidates are APPENDED, least-specific first, and the plain
+    /// ones are kept.
+    ///
+    /// Both halves matter. Keeping the plain chain means `TimeZoneNames`,
+    /// whose legacy root is the one `try_class_bundle` has always found,
+    /// still finds it. Appending means the CLDR bundle is instantiated LAST
+    /// and therefore returned, with the legacy root as its parent rather than
+    /// its replacement.
+    #[test]
+    fn the_cldr_packages_are_appended_after_the_plain_candidates() {
+        let chain = vec![
+            (
+                "sun.util.resources.LocaleNames".to_string(),
+                String::new(),
+                String::new(),
+            ),
+            (
+                "sun.util.resources.LocaleNames_en".to_string(),
+                "en".to_string(),
+                String::new(),
+            ),
+        ];
+        let out = concrete_bundle_chain("sun.util.resources.LocaleNames", &chain);
+        let names: Vec<&str> = out.iter().map(|(c, _, _)| c.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "sun.util.resources.LocaleNames",
+                "sun.util.resources.LocaleNames_en",
+                "sun.util.resources.cldr.LocaleNames",
+                "sun.util.resources.cldr.ext.LocaleNames",
+                "sun.util.resources.cldr.LocaleNames_en",
+                "sun.util.resources.cldr.ext.LocaleNames_en",
+            ]
+        );
+        // The locale each candidate stands for travels with it: `rb_get_bundle`
+        // reads that pair back to stamp the bundle's `locale` field, and a
+        // candidate that lost its language would stamp the root.
+        assert_eq!(out[4].1, "en");
+    }
+
+    /// A base name with no CLDR package pair is handed back untouched rather
+    /// than given invented candidates.
+    #[test]
+    fn a_non_locale_base_name_keeps_its_own_chain() {
+        let chain = vec![(
+            "com.example.Messages".to_string(),
+            String::new(),
+            String::new(),
+        )];
+        let out = concrete_bundle_chain("com.example.Messages", &chain);
+        assert_eq!(out, chain);
+    }
+
+    /// The two families this routing is for, and the one it is deliberately
+    /// not for.
+    #[test]
+    fn currency_names_is_not_routed_to_the_class_bundles() {
+        assert!(needs_concrete_bundle_class(
+            "sun.util.resources.TimeZoneNames",
+            false
+        ));
+        assert!(needs_concrete_bundle_class(
+            "sun.util.resources.LocaleNames",
+            false
+        ));
+        // An APPLICATION caller asking for `LocaleNames` by hand gets
+        // HotSpot's `MissingResourceException`, not our real bundle --
+        // measured on `CurrencyNameProbe` rows 18 and 20.
+        assert!(!needs_concrete_bundle_class(
+            "sun.util.resources.LocaleNames",
+            true
+        ));
+        // `TimeZoneNames` is unconditional, as it has been since 2026-08.
+        assert!(needs_concrete_bundle_class(
+            "sun.util.resources.TimeZoneNames",
+            true
+        ));
+        // +38 armed on `L1LocaleProviderWorkload`: its curated path is doing
+        // work the class bundles would have to replace, and that is its own
+        // measurement rather than this one's corollary.
+        assert!(!needs_concrete_bundle_class(
+            "sun.util.resources.CurrencyNames",
+            false
+        ));
     }
 }

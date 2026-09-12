@@ -843,7 +843,17 @@ fn dlbf_register_bean_definition(
 fn empty_hashmap(ctx: &mut dyn NativeContext) -> MethodCallResult {
     let map = match ctx.new_object("java/util/HashMap").ok().flatten() {
         Some(Value::Object(Some(o))) => o,
-        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8)?,
+        // Width asked for: the table's own count for this class. This
+        // allocation writes NO slot -- it is a fallback that hands the
+        // object straight to the real `<init>` (or to a field) -- so any
+        // width the class can actually be is correct, and
+        // `alloc_concurrent_synthetic` takes `max(n, real)` anyway. It
+        // used to ask for a generous round number, which the T9C gate
+        // reads as a SHAPE the natives index and scores the table short
+        // against. The only way to satisfy that reading is to widen the
+        // table, and a widened floor pads the real class past its
+        // declared width -- which costs it the compact layout entirely.
+        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?,
     };
     // GC-safety: the `<init>` invocation below can itself allocate; pin
     // `map` and re-read the forwarded reference before returning it.
@@ -1086,7 +1096,14 @@ fn cache_get_mapped(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => {
             // Return empty set
-            let s = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 8)?;
+            // See the `empty_hashmap` note: a fallback that writes no slot.
+            // ONE, which is what the real class declares -- the allocator
+            // takes `max(n, real)`, so a fabricated stub still gets its three.
+            // A literal three here would be this file declaring the fabricated
+            // shape on a receiver that is real in real-JDK mode, which is what
+            // `t9d_floor_exempt_classes_have_no_oversized_factories` refuses
+            // for a class in `FLOOR_EXEMPT_CLASSES`.
+            let s = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
             return Ok(Some(Value::Object(Some(s))));
         }
     };
@@ -1099,7 +1116,11 @@ fn cache_get_mapped(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // data was null OR we just installed an empty one — return empty Set.
     let s = match ctx.new_object("java/util/HashSet").ok().flatten() {
         Some(Value::Object(Some(o))) => o,
-        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 8)?,
+        // ONE for the same reason as the arm above: the width the real class
+        // declares, clamped up to the fabricated stub's by the allocator. The
+        // object goes straight into `HashSet.<init>` below and this arm writes
+        // no slot of it.
+        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?,
     };
     // GC-safety: the `<init>` invocation below can itself allocate; pin
     // `s` and re-read the forwarded reference before returning it.
@@ -2417,7 +2438,14 @@ fn walk_imports_recursive(
         single => vec![single],
     };
 
+    // GC-safety: `register_root_bean_definition` allocates a
+    // `RootBeanDefinition` and dispatches `registerBeanDefinition`, and the
+    // recursive call below does the same at every depth. `registry` is a bare
+    // Rust parameter carried into all of them, so from the second `@Import`
+    // target on it is a pre-GC address.
+    let registry_pin = ctx.pin_native_root(registry);
     for entry in entries {
+        let registry = ctx.read_native_pin(registry_pin, registry);
         let desc = match entry {
             cratonvm_native_api::AnnotationElementValue::Class(d) => d,
             _ => continue,
@@ -2449,8 +2477,10 @@ fn walk_imports_recursive(
             *registered += 1;
         }
         // Recurse into the import's own @Import tree.
+        let registry = ctx.read_native_pin(registry_pin, registry);
         walk_imports_recursive(ctx, &imp_class, registry, seen, registered, depth + 1)?;
     }
+    ctx.unpin_native_roots(registry_pin);
     Ok(())
 }
 

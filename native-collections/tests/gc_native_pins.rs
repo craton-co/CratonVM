@@ -237,9 +237,7 @@ fn array_deque_iterator_roots_snapshot_graph_across_allocations() {
     // with any particular index.
     let arr = (0..ctx.object_num_fields(wrapper))
         .find_map(|i| match ctx.get_field(wrapper, i) {
-            Value::Object(Some(o))
-                if ctx.heap_kind_of(o) == cratonvm_types::ObjectKind::Array =>
-            {
+            Value::Object(Some(o)) if ctx.heap_kind_of(o) == cratonvm_types::ObjectKind::Array => {
                 Some(o)
             }
             _ => None,

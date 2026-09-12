@@ -55,7 +55,7 @@
 //! these accessors touch is an instance of exactly [`CLASS`], which only
 //! `native_fc_open` and the `newFileChannel` legacy fallback produce.
 
-use crate::appended_slots::base_for_class;
+use crate::appended_slots::{base_for_class, base_for_class_id};
 use crate::registry::{NativeClassAccess, NativeContext, NativeHeapAccess};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -82,12 +82,19 @@ pub fn alloc_slots(ctx: &mut dyn NativeContext) -> usize {
 }
 
 /// The private base for `this`, or `None` when `this` is not one of ours.
-fn private_base(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<usize> {
-    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
-    if class_name.as_deref() != Some(CLASS) {
+///
+/// Asks [`base_for_class_id`] with the receiver's own id rather than handing
+/// `CLASS` back to [`base_for_class`]. The screen above has already proved the
+/// two name the same class, and the id-taking form does not reach
+/// `ensure_class_initialized` — so `fd_value`, `position_value` and their
+/// setters are no longer `<clinit>` doors, which is what they were on every
+/// call. Same base, same guard, no Java re-entry.
+fn private_base(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let class_id = ctx.class_id_of_object(this);
+    if ctx.class_name_of_id(class_id).as_deref() != Some(CLASS) {
         return None;
     }
-    let base = base_for_class(ctx, CLASS);
+    let base = base_for_class_id(ctx, class_id);
     // A stub or an unresolvable class gives base 0; either way the slot has to
     // exist on the object before we touch it. `alloc_object` clamps UP to the
     // declared width, so a receiver we allocated always satisfies this; a

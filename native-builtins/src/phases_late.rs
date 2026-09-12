@@ -3558,15 +3558,23 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             if urls.is_empty() && ctx.find_resource(resource_name).is_some() {
                 urls.push(format!("classpath:{name}"));
             }
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
+            // A URL and its string per entry: the array outlives both, and the
+            // URL outlives the string stored into it.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let arr_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
+            let arr_h = scope.root(arr_obj);
             for (i, u) in urls.iter().enumerate() {
-                let url_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 6)?;
-                let full = ctx.create_string(u);
-                ctx.set_field(url_obj, 0, Value::Object(Some(full)));
-                ctx.set_field(url_obj, 5, Value::Object(Some(full)));
-                ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
+                let url_obj = try_alloc_concurrent_synthetic(&mut *scope, "java/net/URL", 6)?;
+                let url_h = scope.root(url_obj);
+                let full = scope.create_string(u);
+                let url_obj = scope.get(&url_h);
+                scope.set_field(url_obj, 0, Value::Object(Some(full)));
+                scope.set_field(url_obj, 5, Value::Object(Some(full)));
+                let arr = scope.get(&arr_h);
+                scope.set_array_element(arr, i, Value::Object(Some(url_obj)));
             }
-            let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
+            let arr = scope.get(&arr_h);
+            let enm = crate::classloader::make_snapshot_enumeration(&mut *scope, arr)?;
             Ok(Some(Value::Object(Some(enm))))
         },
     );
@@ -8035,16 +8043,25 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 q = next_q;
             }
             words.reverse();
-            let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, words.len());
+            // The receiver is an argument address, and the magnitude array is
+            // allocated after it is read: root it and store through the
+            // post-allocation address.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let mag_arr = scope.new_array(cratonvm_types::ArrayElementType::Int, words.len());
             for (i, w) in words.iter().enumerate() {
-                ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
+                scope.set_array_element(mag_arr, i, Value::Int(*w as i32));
             }
-            ctx.set_field(this, sig_i, Value::Int(actual_signum));
-            ctx.set_field(this, mag_i, Value::Object(Some(mag_arr)));
+            let this = scope.get(&this_h);
+            scope.set_field(this, sig_i, Value::Int(actual_signum));
+            scope.set_field(this, mag_i, Value::Object(Some(mag_arr)));
         } else {
-            let s = ctx.create_string(&decimal);
-            ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(s)));
-            ctx.set_field(this, BI_FIELD_SIGNUM, Value::Int(actual_signum));
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let s = scope.create_string(&decimal);
+            let this = scope.get(&this_h);
+            scope.set_field(this, BI_FIELD_VALUE, Value::Object(Some(s)));
+            scope.set_field(this, BI_FIELD_SIGNUM, Value::Int(actual_signum));
         }
         Ok(None)
     });

@@ -107,6 +107,11 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                     ctx.set_field_by_name(ze, "csize", Value::Long(csize));
                     ctx.set_field_by_name(ze, "method", Value::Int(method));
                     ctx.set_field_by_name(ze, "crc", Value::Long(crc));
+                    // See `p59_attach_entry_attributes`: HotSpot's
+                    // `JarFileEntry.getAttributes()` reads the manifest
+                    // section for this name, and this VM answered null for
+                    // every entry of every jar until it did too.
+                    let ze = p59_attach_entry_attributes(ctx, ze, &path, &entry_name)?;
                     return Ok(Some(Value::Object(Some(ze))));
                 }
             }
@@ -1942,6 +1947,253 @@ pub(crate) fn jar_entry_bytes_cached(
     Some(bytes)
 }
 
+/// The manifest's PER-ENTRY sections, parsed once per (path, mtime).
+///
+/// `Manifest.getEntries()` is already answered from a full parse elsewhere;
+/// this cache exists because `JarEntry.attr` has to be decided at every entry
+/// materialization, and re-parsing `META-INF/MANIFEST.MF` per `getEntry` call
+/// would put a parse on the path that `jar_contents_cached`'s doc comment
+/// spent a whole paragraph taking a decompress off. The bytes themselves come
+/// from `jar_entry_bytes_cached`, so a jar with no manifest costs one miss.
+///
+/// An absent or unparseable manifest caches the EMPTY map rather than
+/// returning `None` on every call: the answer "this jar has no sections" is as
+/// cacheable as any other, and a negative that is not cached is a re-read per
+/// entry on exactly the jars that have nothing to read.
+pub(crate) fn jar_manifest_sections_cached(
+    path: &str,
+) -> Option<std::sync::Arc<std::collections::HashMap<String, Vec<(String, String)>>>> {
+    use std::sync::{Arc, OnceLock};
+    type Sections = std::collections::HashMap<String, Vec<(String, String)>>;
+    // LEVEL (lock-discipline ratchet): `Scratch` is L0, the bottom of the
+    // hierarchy -- a thread holding it may acquire NOTHING else, not even
+    // another `Scratch`. This cache meets that the same way `mtime_memo` above
+    // does, and the argument is the same one in the same order:
+    //
+    // * Its two critical sections are a `get(&str).cloned()` and an
+    //   `insert(String, Arc<_>)` on a plain `HashMap` of owned values. Neither
+    //   takes another lock.
+    // * `jar_manifest_sections_cached` takes no `NativeContext`, so it *cannot*
+    //   re-enter the VM while holding this -- which is the cycle this crate's
+    //   locks actually risk, since a native callback calling back into Java
+    //   takes the heap and the L10 class-manager lock.
+    // * The two calls it makes that DO take locks are both outside its critical
+    //   sections, and deliberately: `jar_path_mtime` (which takes the `Scratch`
+    //   mtime memo) runs before the first `lock()`, and `jar_entry_bytes_cached`
+    //   (which takes the two raw jar caches) runs between them. Two `Scratch`
+    //   locks nested would violate this level as surely as a higher one would,
+    //   so keep the mtime lookup where it is: it exists only to build the key.
+    static CACHE: OnceLock<OrderedPlMutex<std::collections::HashMap<String, Arc<Sections>>>> =
+        OnceLock::new();
+    if path.is_empty() {
+        return None;
+    }
+    let mtime = jar_path_mtime(path);
+    let key = format!("{path}\u{0}{mtime}");
+    let cache = CACHE
+        .get_or_init(|| OrderedPlMutex::new(std::collections::HashMap::new(), LockLevel::Scratch));
+    // Bound to a `let` rather than read in the `if let` scrutinee: a scrutinee's
+    // temporary lives to the end of the whole `if let`, so the guard's release
+    // point would depend on a rule about temporaries rather than on anything
+    // visible here. The claim the level makes is worth making structurally.
+    let hit = cache.lock().get(&key).cloned();
+    if let Some(s) = hit {
+        return Some(s);
+    }
+    let sections: Sections = jar_entry_bytes_cached(path, "META-INF/MANIFEST.MF")
+        .and_then(|bytes| p59_parse_manifest_bytes(&bytes).ok())
+        .map(|parsed| parsed.entries.into_iter().collect())
+        .unwrap_or_default();
+    let sections = Arc::new(sections);
+    cache.lock().insert(key, sections.clone());
+    Some(sections)
+}
+
+/// Give a freshly minted `JarEntry` the `attr` a real one would have, and hand
+/// back the (possibly relocated) entry.
+///
+/// WHAT WAS WRONG. `java.util.jar.JarEntry.getAttributes()` is, in its
+/// entirety, `return attr;` — verified with `javap -c` against the JDK 25
+/// image this VM boots, not assumed. The JDK never leaves that field for the
+/// caller to fill: `JarFile.getEntry` hands back a `JarFile$JarFileEntry`,
+/// whose `getAttributes()` reads `jarfile.getManifest().getAttributes(name)`.
+/// This VM mints a plain `JarEntry` and never wrote `attr`, so
+/// `getAttributes()` answered null for every entry of every jar — including
+/// the ones whose manifest has a section for exactly that entry. Measured by
+/// `apps/probes/L1JarTextSweep`'s `E.attributesFromJar` row, which reads
+/// `null` where HotSpot reads the section's `Section-Key`.
+///
+/// It is the JarFile family's defect and not `JarEntry`'s: `JarEntry` declares
+/// no native here at all, so nothing wave 4 could have retired repairs it.
+///
+/// WHAT THIS IS NOT. It is not the `JarFile` state model that section 10 item
+/// 5 prices — the entry is still a synthetic `JarEntry` rather than a
+/// `JarFileEntry` bound to a live `ZipFile`. It fills one field that the real
+/// `getAttributes()` bytecode then reads on its own, which is why the repair
+/// needs no native on `JarEntry` and no new carrier class.
+///
+/// A jar whose manifest has no section for this entry leaves `attr` null,
+/// which is what HotSpot answers there too. On the 4-slot synthetic layout the
+/// named write finds no field and is a no-op, leaving the previous behaviour
+/// exactly as it was.
+pub(crate) fn p59_attach_entry_attributes(
+    ctx: &mut dyn NativeContext,
+    je: ObjectRef,
+    path: &str,
+    entry_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let sections = match jar_manifest_sections_cached(path) {
+        Some(s) => s,
+        None => return Ok(je),
+    };
+    let pairs = match sections.get(entry_name) {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => return Ok(je),
+    };
+    // GC-SAFETY: everything below runs Java code — `Attributes.<init>` and one
+    // `putValue` per pair — and both `je` and the fresh `Attributes` are bare
+    // Rust locals the collector cannot see. Root both, re-read both, and
+    // release only after the last allocating call.
+    let je_pin = ctx.pin_native_root(je);
+    let attrs = p59_manifest_new_attributes(ctx)?;
+    let attrs_pin = ctx.pin_native_root(attrs);
+    p59_attrs_populate_real(ctx, attrs_pin, attrs, &pairs)?;
+    let attrs = ctx.read_native_pin(attrs_pin, attrs);
+    let je = ctx.read_native_pin(je_pin, je);
+    // Releases both pins: `unpin_native_roots` truncates to the index given,
+    // and `je_pin` is the earlier of the two. Nothing below allocates.
+    ctx.unpin_native_roots(je_pin);
+    ctx.set_field_by_name(je, "attr", Value::Object(Some(attrs)));
+    Ok(je)
+}
+
+#[cfg(test)]
+mod w6_entry_attribute_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_jar(dir_tag: &str, manifest: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cratonvm_w6_attrs_{dir_tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let jar = dir.join("probe.jar");
+        let file = std::fs::File::create(&jar).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        if let Some(m) = manifest {
+            zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
+            zip.write_all(m.as_bytes()).unwrap();
+        }
+        zip.start_file("p/one.txt", options).unwrap();
+        zip.write_all(b"one").unwrap();
+        zip.finish().unwrap();
+        jar
+    }
+
+    /// The section a real `JarFileEntry.getAttributes()` would answer with.
+    #[test]
+    fn a_per_entry_section_is_found_by_the_entrys_own_name() {
+        let jar = write_jar(
+            "section",
+            Some(
+                "Manifest-Version: 1.0\r\nMain-Class: p.Main\r\n\r\n\
+                 Name: p/one.txt\r\nSection-Key: Section-Value\r\n\r\n",
+            ),
+        );
+        let sections = jar_manifest_sections_cached(jar.to_str().unwrap()).unwrap();
+        let one = sections
+            .get("p/one.txt")
+            .expect("the manifest declares a section for this entry");
+        assert!(
+            one.iter()
+                .any(|(k, v)| k == "Section-Key" && v == "Section-Value"),
+            "section pairs were {one:?}"
+        );
+        // The MAIN attributes are not part of an entry's `attr`:
+        // `Manifest.getAttributes(name)` is `entries.get(name)` and nothing
+        // more, so a probe reading `Main-Class` off an entry reads null on
+        // HotSpot too.
+        assert!(
+            !one.iter().any(|(k, _)| k == "Main-Class"),
+            "main attributes leaked into the entry section: {one:?}"
+        );
+        assert!(
+            sections.get("p/two.txt").is_none(),
+            "an entry with no section must not acquire one"
+        );
+    }
+
+    /// A jar with no manifest answers the EMPTY map rather than `None`, which
+    /// is what makes the negative cacheable.
+    #[test]
+    fn a_jar_with_no_manifest_caches_an_empty_section_map() {
+        let jar = write_jar("nomanifest", None);
+        let sections = jar_manifest_sections_cached(jar.to_str().unwrap())
+            .expect("a jar with no manifest still answers");
+        assert!(sections.is_empty(), "sections were {sections:?}");
+        // Twice, because the second call is the one that would re-read the
+        // archive if the negative were not cached.
+        let again = jar_manifest_sections_cached(jar.to_str().unwrap()).unwrap();
+        assert!(again.is_empty());
+    }
+
+    /// An empty path is the closed-`JarFile` shape (`close()` clears slot 0),
+    /// and must not be treated as a jar.
+    #[test]
+    fn an_empty_path_is_not_a_jar() {
+        assert!(jar_manifest_sections_cached("").is_none());
+    }
+
+    /// The sections cache's `LockLevel::Scratch` claim is actually EVALUATED,
+    /// and the miss path does not hold its guard across the read it needs.
+    ///
+    /// Modelled on `memo_lock_is_order_checked_and_not_re_entered_on_a_miss`
+    /// further down this file, because it is the same claim about the same
+    /// kind of lock and the sibling has already been bitten once by the shape
+    /// this asserts the absence of.
+    ///
+    /// * `enforcement_active()` is unconditionally true in DEBUG builds, which
+    ///   is what makes the three tests above live checks of the ordering claim
+    ///   rather than runs with the checker asleep. Asserting it here means a
+    ///   future change that makes debug enforcement conditional turns this
+    ///   module from silently vacuous into loudly red. `cfg`-gated because in
+    ///   RELEASE enforcement is off unless `CRATONVM_LOCK_ORDER_CHECK` is set
+    ///   and `cargo test --release` runs this test too.
+    /// * A MISS locks, drops, reads the manifest through
+    ///   `jar_entry_bytes_cached` — which takes two more locks — and then locks
+    ///   again to publish. `jar_path_mtime` takes the `Scratch` mtime memo
+    ///   before any of that. `Scratch` is the floor, so a thread holding it may
+    ///   take nothing else *including another `Scratch`*, and `parking_lot` is
+    ///   not reentrant: a guard left alive in an `if let` scrutinee is a HANG
+    ///   rather than a failure. Miss, hit, revalidate, hit — the whole cycle,
+    ///   under the checker.
+    #[test]
+    fn sections_lock_is_order_checked_and_not_held_across_the_read() {
+        #[cfg(debug_assertions)]
+        assert!(
+            cratonvm_types::lock_order::enforcement_active(),
+            "debug builds must enforce lock order, or this module's ordering \
+             claim is never checked by anything"
+        );
+
+        let jar = write_jar(
+            "lockorder",
+            Some("Manifest-Version: 1.0\r\n\r\nName: p/one.txt\r\nK: V\r\n\r\n"),
+        );
+        let path = jar.to_str().unwrap().to_string();
+        let miss = jar_manifest_sections_cached(&path).expect("miss");
+        let hit = jar_manifest_sections_cached(&path).expect("hit");
+        assert_eq!(miss.len(), hit.len());
+        assert!(miss.contains_key("p/one.txt"), "sections were {miss:?}");
+        // Re-probe the mtime (the memo lock again, still outside ours) and
+        // come back through the cache.
+        jar_cache_revalidate(&path);
+        let after = jar_manifest_sections_cached(&path).expect("post-revalidate");
+        assert_eq!(miss.len(), after.len());
+    }
+}
+
 /// Read the central directory of `path` and return a Vec of allocated
 /// synthetic `java/util/jar/JarEntry` ObjectRefs. Returns an empty Vec on
 /// any I/O / zip-parse error so callers see an empty Stream rather than
@@ -2009,6 +2261,11 @@ pub(crate) fn p59_jar_collect_entries(
         ctx.set_field_by_name(je, "crc", Value::Long(crc));
         ctx.set_field_by_name(je, "comment", Value::Object(comment_s));
         p59_set_jar_entry_times(ctx, je, times);
+        // Same reason as in `p59_jar_lookup_entry`: an entry that arrived
+        // through `entries()`/`stream()` answers `getAttributes()` from the
+        // manifest on HotSpot too, and a jar with no sections pays one cached
+        // map lookup per entry for it.
+        let je = p59_attach_entry_attributes(ctx, je, path, name)?;
         out.push(Value::Object(Some(je)));
     }
     // Re-read every entry to its current (post-GC) address before returning.
@@ -2181,6 +2438,9 @@ pub(crate) fn p59_jar_lookup_entry(
     ctx.set_field_by_name(je, "crc", Value::Long(crc));
     ctx.set_field_by_name(je, "comment", Value::Object(comment_s));
     p59_set_jar_entry_times(ctx, je, times);
+    // `JarFile.getEntry`/`getJarEntry` hand back a `JarFileEntry` on HotSpot,
+    // whose `getAttributes()` reads the manifest section for this name.
+    let je = p59_attach_entry_attributes(ctx, je, path, &name)?;
     Ok(Value::Object(Some(je)))
 }
 

@@ -252,6 +252,26 @@ pub struct ValueStack {
     /// fact and no per-slot runtime tag is needed at all. Until the interpreter
     /// consumes those maps, this array stays.
     ///
+    /// # And do not reach for the packed-mask shortcut instead
+    ///
+    /// Collapsing `kinds` / `Frame::local_kinds` from `Vec<u8>` to a packed
+    /// 2-bit mask is the obvious cheaper move — three values, and the second
+    /// `Vec` costs a bounds check, a cache line and a pooled buffer per frame.
+    /// It is not a point fix, and it carries one specific hazard:
+    ///
+    /// * 43 call sites read the two arrays, plus the GC root scan, freeze/thaw,
+    ///   deopt, `snapshot_raw` / `from_snapshot`, and the transmute listed
+    ///   above. `Frame::local_kinds` deliberately **is** the pool tuple's
+    ///   `Vec<u8>` half, so removing it reshapes the frame pool.
+    /// * `max_stack` and `max_locals` are `u16`. An inline `u64`/`u128` mask
+    ///   therefore needs a spill path for the tail — and **a fixed-width
+    ///   structure that silently stops describing slots past its width is
+    ///   precisely the defect this tree has already shipped once**, when
+    ///   precise oop maps stopped at 64 locals and said nothing about it.
+    ///
+    /// Whoever takes this should build the type-map consumer first; it deletes
+    /// the array rather than shrinking it, and it has no width to overrun.
+    ///
     /// The per-frame *allocation* cost this array used to imply is separately
     /// addressed: every `Frame` constructor now sources both halves from a
     /// buffer pool (`Frame::new_pooled*` from the thread pool, `Frame::new` /
@@ -449,6 +469,15 @@ impl ValueStack {
 
     #[inline(always)]
     fn check_vacated_compact(cv: &CompactValue) {
+        // See `check_dead_push` — this is the compact half, and it is the path
+        // `dup`, a local reload and the cached field/return producers take, so
+        // leaving it out would blind the probe to exactly the values that reach
+        // an invoke without ever touching a `Value`.
+        if cv.is_object() {
+            if let Some(ptr) = cv.as_object_ptr() {
+                Self::check_dead_push(ptr as usize, "push_compact");
+            }
+        }
         if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
             return;
         }
@@ -463,7 +492,47 @@ impl ValueStack {
     }
 
     #[inline(always)]
+    /// `CRATONVM_DBG_DEADREF_STORE`: a reference PUSHED onto the operand stack
+    /// that names no live object.
+    ///
+    /// The arm `check_vacated_push` below cannot see this. That one reads the
+    /// vacated ledger, which forgets an address the moment the allocator
+    /// re-issues it, and a stale reference on this workload is pushed after
+    /// re-issue — so it reported zero on every run while the operand stack was
+    /// demonstrably carrying a dead value into an invoke.
+    ///
+    /// An operand-stack slot is already a GC root, so a hit here is one of two
+    /// things and the backtrace says which: something produced a dead value (a
+    /// native return, a field read), or the frame-root remap missed the slot
+    /// this value was copied from. Both are defects; they have different fixes.
+    #[cold]
+    fn report_dead_push(addr: usize, reason: &'static str, site: &'static str) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 8 {
+            return;
+        }
+        eprintln!(
+            "[deadref-push] {reason} {site}: 0x{addr:x} pushed onto the operand stack names no              live object. caller:
+{:?}",
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
+
+    #[inline]
+    fn check_dead_push(addr: usize, site: &'static str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| cratonvm_types::flags().gc.dbg_deadref_store) {
+            return;
+        }
+        if let Some(reason) = cratonvm_gc::gen_heap::dead_young_ref_reason_global(addr) {
+            Self::report_dead_push(addr, reason, site);
+        }
+    }
+
     fn check_vacated_push(value: &Value) {
+        if let Value::Object(Some(o)) = value {
+            Self::check_dead_push(o.as_ptr() as usize, "push");
+        }
         if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
             return;
         }

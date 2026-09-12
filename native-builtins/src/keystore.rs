@@ -94,6 +94,21 @@ pub enum EntryKind {
         key_der: Vec<u8>,
         /// Cert chain in DER form, leaf first.
         chain: Vec<Vec<u8>>,
+        /// The envelope this entry's OWN password opens, in the protection
+        /// format its store type writes, for an entry set through
+        /// `setKeyEntry` / `setEntry` with a password.
+        ///
+        /// KS-5: with nowhere to keep it, an entry password did nothing at
+        /// all. `engineStore` had nothing to encrypt with but the STORE
+        /// password, and `engineGetKey` had nothing to check a password
+        /// against -- which is both halves of the only job an entry password
+        /// has.
+        ///
+        /// `None` for an entry read off disk. There the envelope, if the load
+        /// password did not open it, IS `key_der` -- see `load_pkcs12_ex`'s
+        /// placeholder arm -- and `keystore_unlock_private_keys` re-attempts
+        /// it with whatever password `getKey` was given.
+        protected: Option<Vec<u8>>,
     },
     TrustedCert {
         /// X.509 cert DER.
@@ -222,7 +237,13 @@ pub fn keystore_set_cert_entry(id: i32, alias: &str, cert_der: Vec<u8>) -> bool 
 /// to `keystore_set_pending_km_identity` -- so `KeyManagerFactory.init`
 /// found no identity to stage for the TLS layer. Returns true if the store
 /// existed.
-pub fn keystore_set_key_entry(id: i32, alias: &str, key_der: Vec<u8>, chain: Vec<Vec<u8>>) -> bool {
+pub fn keystore_set_key_entry(
+    id: i32,
+    alias: &str,
+    key_der: Vec<u8>,
+    chain: Vec<Vec<u8>>,
+    protected: Option<Vec<u8>>,
+) -> bool {
     let mut g = registry().write();
     if let Some(store) = g.stores.get_mut(&id) {
         store.entries.insert(
@@ -230,7 +251,11 @@ pub fn keystore_set_key_entry(id: i32, alias: &str, key_der: Vec<u8>, chain: Vec
             KeyStoreEntry {
                 alias: alias.to_string(),
                 creation_time_ms: 0,
-                kind: EntryKind::PrivateKey { key_der, chain },
+                kind: EntryKind::PrivateKey {
+                    key_der,
+                    chain,
+                    protected,
+                },
             },
         );
         true
@@ -290,7 +315,7 @@ pub fn keystore_delete_entry(id: i32, alias: &str) {
 pub fn keystore_get_private_key(id: i32, alias: &str) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
     let store = registry().read().stores.get(&id).cloned()?;
     let entry = store.entries.get(alias)?;
-    if let EntryKind::PrivateKey { key_der, chain } = &entry.kind {
+    if let EntryKind::PrivateKey { key_der, chain, .. } = &entry.kind {
         Some((key_der.clone(), chain.clone()))
     } else {
         None
@@ -1341,7 +1366,11 @@ pub(crate) fn load_pkcs12_ex(
             KeyStoreEntry {
                 alias,
                 creation_time_ms: 0,
-                kind: EntryKind::PrivateKey { key_der, chain },
+                kind: EntryKind::PrivateKey {
+                    key_der,
+                    chain,
+                    protected: None,
+                },
             },
         );
     }
@@ -1489,7 +1518,11 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
                     KeyStoreEntry {
                         alias,
                         creation_time_ms,
-                        kind: EntryKind::PrivateKey { key_der, chain },
+                        kind: EntryKind::PrivateKey {
+                            key_der,
+                            chain,
+                            protected: None,
+                        },
                     },
                 );
             }
@@ -1686,22 +1719,40 @@ pub(crate) fn write_pkcs12(store: &LoadedKeyStore, password: &[u8]) -> Result<Ve
                     ],
                 });
             }
-            EntryKind::PrivateKey { key_der, chain } => {
+            EntryKind::PrivateKey {
+                key_der,
+                chain,
+                protected: entry_envelope,
+            } => {
                 next_key_id += 1;
                 let key_id = next_key_id.to_be_bytes().to_vec();
+                // KS-5: an entry set through the API carries the envelope its
+                // OWN password opens. Emit that, rather than re-encrypting the
+                // plaintext under the STORE password: before this the entry
+                // password protected nothing on disk, and a file this VM wrote
+                // could not be opened with it by keytool or any other JCA
+                // reader -- MEASURED against HotSpot 25.0.3+9 on all three
+                // store types.
+                //
                 // A key that never decrypted is still inside its ORIGINAL
                 // envelope (see `load_jks`/`load_pkcs12`'s
                 // `unwrap_or(encrypted)` arms). Re-wrapping it would
                 // double-encrypt; pass it straight through when it already
                 // parses as an EncryptedPrivateKeyInfo.
-                let epki = if let Ok(existing) =
+                let epki = if let Some(existing) = entry_envelope
+                    .as_deref()
+                    .and_then(|e| yasna::parse_ber(e, p12::EncryptedPrivateKeyInfo::parse).ok())
+                {
+                    existing
+                } else if let Ok(existing) =
                     yasna::parse_ber(key_der, p12::EncryptedPrivateKeyInfo::parse)
                 {
                     existing
                 } else {
                     pbes2_encrypt(key_der, password).ok_or_else(|| {
                         format!(
-                            "write_pkcs12({alias:?}): OS entropy unavailable, refusing to \\n                             protect a private key with a predictable salt"
+                            "write_pkcs12({alias:?}): OS entropy unavailable, refusing to \
+                             protect a private key with a predictable salt"
                         )
                     })?
                 };
@@ -1732,7 +1783,9 @@ pub(crate) fn write_pkcs12(store: &LoadedKeyStore, password: &[u8]) -> Result<Ve
             } => {
                 let Some(alg_oid) = secret_key_alg_oid(algorithm) else {
                     return Err(format!(
-                        "write_pkcs12({alias:?}): no PKCS#12 OID is known for secret-key \\n                         algorithm {algorithm:?}, and writing it under a wrong OID would \\n                         read back as a different algorithm"
+                        "write_pkcs12({alias:?}): no PKCS#12 OID is known for secret-key \
+                         algorithm {algorithm:?}, and writing it under a wrong OID would \
+                         read back as a different algorithm"
                     ));
                 };
                 // The PKCS#8-shaped plaintext SunPKCS12 encrypts:
@@ -1748,7 +1801,8 @@ pub(crate) fn write_pkcs12(store: &LoadedKeyStore, password: &[u8]) -> Result<Ve
                 });
                 let epki = pbes2_encrypt(&plain, password).ok_or_else(|| {
                     format!(
-                        "write_pkcs12({alias:?}): OS entropy unavailable, refusing to protect \\n                         a secret key with a predictable salt"
+                        "write_pkcs12({alias:?}): OS entropy unavailable, refusing to protect \
+                         a secret key with a predictable salt"
                     )
                 })?;
                 let epki_der = yasna::construct_der(|w| epki.write(w));
@@ -1793,7 +1847,8 @@ pub(crate) fn write_pkcs12(store: &LoadedKeyStore, password: &[u8]) -> Result<Ve
     let mut mac_salt = [0u8; 20];
     if !crate::securerandom::os_random_bytes(&mut mac_salt) {
         return Err(
-            "write_pkcs12: OS entropy unavailable, refusing to emit a PKCS#12 MAC with a \\n             predictable salt"
+            "write_pkcs12: OS entropy unavailable, refusing to emit a PKCS#12 MAC with a \
+             predictable salt"
                 .to_string(),
         );
     }
@@ -1891,7 +1946,11 @@ pub(crate) fn write_jks_with_magic(
                 body.extend_from_slice(&(cert_der.len() as u32).to_be_bytes());
                 body.extend_from_slice(cert_der);
             }
-            EntryKind::PrivateKey { key_der, chain } => {
+            EntryKind::PrivateKey {
+                key_der,
+                chain,
+                protected: entry_envelope,
+            } => {
                 // Re-apply Sun's KeyProtector envelope. `load_jks` stores the
                 // DECRYPTED PKCS#8 (see its tag-1 arm), so writing `key_der`
                 // straight out — the previous behaviour — put an UNPROTECTED
@@ -1905,7 +1964,13 @@ pub(crate) fn write_jks_with_magic(
                 //     all would lose the entry; that path keeps the old
                 //     behaviour and warns loudly rather than emitting a
                 //     predictable-salt envelope.
-                let protected: Vec<u8> = if is_jks_encrypted_private_key(key_der) {
+                let protected: Vec<u8> = if let Some(env) = entry_envelope
+                    .as_deref()
+                    .filter(|e| is_jks_encrypted_private_key(e))
+                {
+                    // KS-5: the envelope this entry's OWN password opens.
+                    env.to_vec()
+                } else if is_jks_encrypted_private_key(key_der) {
                     key_der.clone()
                 } else {
                     match jks_protect_key(key_der, password) {
@@ -2170,6 +2235,78 @@ fn jks_protect_key(plain_pkcs8: &[u8], password_bytes: &[u8]) -> Option<Vec<u8>>
 }
 
 /// Whether a JKS key entry is still wrapped in Sun's KeyProtector envelope.
+/// Is this key material still inside an encryption envelope?
+///
+/// Two envelopes reach `engineGetKey` on this VM, and neither is a private key:
+///
+///  * the JKS key protector, which [`is_jks_encrypted_private_key`] recognises
+///    by its OID and which `load_jks` stores verbatim until a `getKey`
+///    password opens it;
+///  * a PKCS#12 `EncryptedPrivateKeyInfo`, which `load_pkcs12` keeps as a
+///    placeholder `key_der` when the STORE password did not open the shrouded
+///    bag (its `unwrap_or_else` arm says so) -- deliberately, so alias and
+///    chain pairing still work for an entry whose key is separately protected.
+///
+/// The discrimination is exact rather than heuristic. A plaintext PKCS#8
+/// `PrivateKeyInfo` opens with an INTEGER version where an
+/// `EncryptedPrivateKeyInfo` opens with an `AlgorithmIdentifier` SEQUENCE, so
+/// a real key cannot parse as an envelope.
+pub(crate) fn is_encrypted_private_key(der: &[u8]) -> bool {
+    if is_jks_encrypted_private_key(der) {
+        return true;
+    }
+    yasna::parse_ber(der, p12::EncryptedPrivateKeyInfo::parse).is_ok()
+}
+
+/// Does this SPI's store type protect keys with a PKCS#12 envelope?
+///
+/// JKS and JCEKS both answer `false`: this VM writes a JCEKS store as JKS
+/// records under `JCEKS_MAGIC` (see [`write_jks_with_magic`]) rather than with
+/// SunJCE's PBE, so the envelope a JCEKS entry must carry is the JKS one.
+/// Decided by receiver class for the reason [`spi_supports_secret_keys`] gives:
+/// `NativeCallback` is a bare `fn` pointer and cannot capture its FQN.
+fn spi_wants_pkcs12_envelope(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    class_name_of(ctx, this).starts_with("sun/security/pkcs12/")
+}
+
+/// Wrap `plain` under `password` in the envelope `pkcs12` selects.
+///
+/// KS-5: the envelope has to match the format the store will be WRITTEN in, so
+/// `engineStore` can pass it through verbatim instead of re-encrypting with a
+/// password the entry never chose.
+fn protect_key_for_store(pkcs12: bool, plain: &[u8], password: &[u8]) -> Option<Vec<u8>> {
+    if pkcs12 {
+        let epki = pbes2_encrypt(plain, password)?;
+        Some(yasna::construct_der(|w| epki.write(w)))
+    } else {
+        jks_protect_key(plain, password)
+    }
+}
+
+/// Open EITHER envelope with `password`, or answer `None`.
+///
+/// KS-6: `load_pkcs12_ex` keeps a shrouded bag the STORE password did not open
+/// as a placeholder `key_der`, and nothing downstream re-attempted it with the
+/// ENTRY password `getKey` receives -- so a HotSpot-written PKCS#12 whose two
+/// passwords differ handed the envelope back as a `PrivateKey` for every
+/// password INCLUDING the correct one. JKS escaped that only because
+/// `keystore_unlock_private_keys` already re-attempted its own scheme; this
+/// makes that funnel scheme-blind, which is what its own doc already claimed.
+///
+/// The decrypt chain is deliberately the same one `load_pkcs12_ex` uses on the
+/// way in, in the same order, so a bag that opens at load time and a bag that
+/// opens at `getKey` time cannot disagree about what "opens" means.
+pub(crate) fn recover_key_any_scheme(envelope: &[u8], password: &[u8]) -> Option<Vec<u8>> {
+    if let Some(plain) = jks_recover_key(envelope, password) {
+        return Some(plain);
+    }
+    let epk = yasna::parse_ber(envelope, p12::EncryptedPrivateKeyInfo::parse).ok()?;
+    let bmp = pkcs12_bmp_string(&String::from_utf8_lossy(password));
+    epk.decrypt(&bmp)
+        .or_else(|| decrypt_secret_pbes2(&epk, password))
+        .or_else(|| decrypt_secret_pbes2(&epk, &bmp))
+}
+
 pub(crate) fn is_jks_encrypted_private_key(der: &[u8]) -> bool {
     const JKS_KEY_PROTECTOR_OID: &[u8] = b"\x06\x0a\x2b\x06\x01\x04\x01\x2a\x02\x11\x01\x01";
     der.windows(JKS_KEY_PROTECTOR_OID.len())
@@ -2742,7 +2879,11 @@ fn read_stream_to_end(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<u8>
     let mut out: Vec<u8> = Vec::with_capacity(4096);
     let chunk_size = 4096usize;
     let chunk = ctx.new_array(ArrayElementType::Byte, chunk_size);
+    let chunk_pin = ctx.pin_native_root(chunk);
+    let stream_pin = ctx.pin_native_root(stream);
     loop {
+        let chunk = ctx.read_native_pin(chunk_pin, chunk);
+        let stream = ctx.read_native_pin(stream_pin, stream);
         let res = ctx.invoke(
             "java/io/InputStream",
             "read",
@@ -2844,7 +2985,7 @@ pub(crate) fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let mut trust_anchor_ders: Vec<Vec<u8>> = Vec::new();
     for entry in store.entries.values() {
         match &entry.kind {
-            EntryKind::PrivateKey { key_der, chain } => {
+            EntryKind::PrivateKey { key_der, chain, .. } => {
                 if !is_jks_encrypted_private_key(key_der) {
                     crate::t27_tls::install_identity_from_der(key_der, chain);
                     if first_key_identity.is_none() {
@@ -2912,7 +3053,68 @@ pub(crate) fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         return Ok(Some(Value::Object(None)));
     };
 
-    if let EntryKind::PrivateKey { key_der, .. } = &entry.kind {
+    if let EntryKind::PrivateKey {
+        key_der,
+        protected: entry_envelope,
+        ..
+    } = &entry.kind
+    {
+        // KS-5, the IN-MEMORY half. An entry set through the API keeps its
+        // plaintext in `key_der`, so the envelope check below -- which asks
+        // whether `key_der` is still ciphertext -- cannot see a wrong password
+        // here and never could: there is no ciphertext to look at. Ask the
+        // envelope the ENTRY password built instead, which is the only thing
+        // in this entry that knows what that password was.
+        //
+        // HotSpot refuses the same call for the same reason: SunPKCS12 keeps
+        // the key encrypted in memory and decrypts inside `engineGetKey`.
+        if let Some(env) = entry_envelope.as_deref() {
+            if recover_key_any_scheme(env, &password).is_none() {
+                let msg = if is_jks_encrypted_private_key(env) {
+                    "Cannot recover key"
+                } else {
+                    "Get Key failed: Given final block not properly padded. Such issues can arise if a bad key is used during decryption."
+                };
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/UnrecoverableKeyException",
+                    msg,
+                ));
+            }
+        }
+        // KS-1: the password did not open this entry, so there is no key to
+        // return. Before this check the still-encrypted envelope was wrapped in
+        // the `PrivateKey` mirror below and handed to the application, which
+        // cannot tell: the mirror answers `getAlgorithm()` and `getFormat()`
+        // from fields, so ciphertext reads as `RSA/PKCS#8` and only
+        // `getEncoded()` -> `KeyFactory` shows it is not a key.
+        //
+        // MEASURED 2026-09-10 against HotSpot 25.0.3+9
+        // (`apps/probes/KSInteropWriteRead.java`, and the matrix in
+        // `docs/known-issues/jdk-only/keystore-getkey-accepts-any-
+        //  password-and-the-key-does-not-round-trip-20260910.md`): on a
+        // HotSpot-written JKS this VM already DISCRIMINATES correctly: the
+        // entry password yields a usable key and the other two yield the
+        // envelope, so the whole of the defect on that path was returning it
+        // instead of throwing. `keystore_unlock_private_keys` above is the verification;
+        // this is the verdict.
+        //
+        // The message is chosen by the ENVELOPE, not the store type, because
+        // the envelope is what this VM actually holds: HotSpot's JKS
+        // `KeyProtector` says "Cannot recover key", and SunPKCS12 reports the
+        // JCE padding failure behind a "Get Key failed: " prefix.
+        if is_encrypted_private_key(key_der) {
+            let msg = if is_jks_encrypted_private_key(key_der) {
+                "Cannot recover key"
+            } else {
+                "Get Key failed: Given final block not properly padded. Such issues can arise if a bad key is used during decryption."
+            };
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/UnrecoverableKeyException",
+                msg,
+            ));
+        }
         // Allocate the synthetic PrivateKey mirror. Field layout matches the
         // existing convention (algo_idx=0, key_size_bits=1, key_len_bytes=2,
         // key_id=3) so the TLS path keeps working. We additionally stash the
@@ -3489,7 +3691,26 @@ pub(crate) fn engine_set_key_entry(
         }
         crate::t27_tls::install_identity_from_der(&key_der, &chain);
     }
-    keystore_set_key_entry(id, &alias, key_der, chain);
+    // KS-5: `engineSetKeyEntry(String, Key, char[], Certificate[])` -- args[3]
+    // is the ENTRY password, and this native READ it nowhere. Wrap the key now,
+    // in the format this store type writes, so `engineStore` has something to
+    // emit that the entry password opens and `engineGetKey` has something to
+    // check a password against.
+    //
+    // `key_der` itself stays plaintext: the TLS identity path
+    // (`keystore_get_private_key`) reads it directly and must keep working for
+    // an in-memory store that is never written out.
+    let pkcs12 = spi_wants_pkcs12_envelope(ctx, this);
+    let entry_password = args
+        .get(3)
+        .map(|v| read_password(ctx, v))
+        .unwrap_or_default();
+    let protected = if entry_password.is_empty() {
+        None
+    } else {
+        protect_key_for_store(pkcs12, &key_der, &entry_password)
+    };
+    keystore_set_key_entry(id, &alias, key_der, chain, protected);
     Ok(None)
 }
 
@@ -3622,7 +3843,9 @@ fn engine_set_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     }
 
-    let id = keystore_ensure_store_id(ctx, this);
+    // `this` IS the SPI here -- this is an `engine*` callback -- so the id is
+    // read off the object the fifteen sibling callbacks read theirs off.
+    let id = ensure_store_id_on(ctx, this);
     let entry_class = class_name_of(ctx, entry);
     match entry_class.as_str() {
         "java/security/KeyStore$TrustedCertificateEntry" => {
@@ -3654,7 +3877,8 @@ fn engine_set_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                     ctx,
                     "java/security/KeyStoreException",
                     &format!(
-                        "setEntry({alias:?}): no DER encoding available for this certificate \n                         — nothing was stored"
+                        "setEntry({alias:?}): no DER encoding available for this certificate \
+                         — nothing was stored"
                     ),
                 ));
             }
@@ -3696,7 +3920,8 @@ fn engine_set_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                     ctx,
                     "java/security/KeyStoreException",
                     &format!(
-                        "setEntry({alias:?}): the private key has no PKCS#8 encoding this VM \n                         can store (getEncoded() returned nothing) — nothing was stored"
+                        "setEntry({alias:?}): the private key has no PKCS#8 encoding this VM \
+                         can store (getEncoded() returned nothing) — nothing was stored"
                     ),
                 ));
             }
@@ -3723,7 +3948,21 @@ fn engine_set_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             if !chain.is_empty() {
                 crate::t27_tls::install_identity_from_der(&key_der, &chain);
             }
-            keystore_set_key_entry(id, &alias, key_der, chain);
+            // KS-5, the `setEntry` door onto the same store. `password` here is
+            // the `PasswordProtection`'s char[], already unwrapped above.
+            let pkcs12 = spi_wants_pkcs12_envelope(ctx, this);
+            let protected = match password.as_ref() {
+                Some(v) => {
+                    let pw = read_password(ctx, v);
+                    if pw.is_empty() {
+                        None
+                    } else {
+                        protect_key_for_store(pkcs12, &key_der, &pw)
+                    }
+                }
+                None => None,
+            };
+            keystore_set_key_entry(id, &alias, key_der, chain, protected);
             Ok(None)
         }
         "java/security/KeyStore$SecretKeyEntry" => {
@@ -3762,7 +4001,8 @@ fn engine_set_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                     ctx,
                     "java/security/KeyStoreException",
                     &format!(
-                        "setEntry({alias:?}): the secret key has no RAW encoding this VM can \n                         store (getEncoded() returned nothing) — nothing was stored"
+                        "setEntry({alias:?}): the secret key has no RAW encoding this VM can \
+                         store (getEncoded() returned nothing) — nothing was stored"
                     ),
                 ));
             }
@@ -3882,7 +4122,8 @@ fn engine_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             ctx,
             "java/security/KeyStoreException",
             &format!(
-                "getEntry({alias:?}): this private-key entry has no certificate chain, so no \n                 PrivateKeyEntry can be built for it"
+                "getEntry({alias:?}): this private-key entry has no certificate chain, so no \
+                 PrivateKeyEntry can be built for it"
             ),
         ));
     }
@@ -4120,6 +4361,20 @@ pub(crate) fn certificate_der(ctx: &mut dyn NativeContext, cert: ObjectRef) -> V
 /// later read resolves the same store.
 pub(crate) fn keystore_ensure_store_id(ctx: &mut dyn NativeContext, ks_obj: ObjectRef) -> i32 {
     let target = unwrap_keystore_spi(ctx, ks_obj);
+    ensure_store_id_on(ctx, target)
+}
+
+/// [`keystore_ensure_store_id`] without the unwrap, for a caller that already
+/// holds the SPI.
+///
+/// Every other `engine*` callback in this file reads its id with a plain
+/// `get_store_id(ctx, this)`; `engine_set_entry` was the one that went through
+/// the unwrapping form, and on a `KeyStoreDelegator` receiver that is how it
+/// came to write its entries somewhere no reader looks. Asking for the id of
+/// the object you were handed is the invariant the other fifteen callbacks
+/// hold, so it is spelled out here rather than left to the unwrap being
+/// harmless.
+fn ensure_store_id_on(ctx: &mut dyn NativeContext, target: ObjectRef) -> i32 {
     let existing = get_store_id(ctx, target);
     if existing != 0 {
         return existing;
@@ -4364,9 +4619,33 @@ fn unwrap_keystore_spi(ctx: &mut dyn NativeContext, keystore_obj: ObjectRef) -> 
         return spi;
     }
     // Fallback: real KeyStore's field order is type(0)/provider(1)/keyStoreSpi(2).
+    //
+    // THE INDEX IS BLIND, SO WHAT IT PRODUCES IS CHECKED BEFORE IT IS BELIEVED.
+    // This helper is also reached with a receiver that is ALREADY an SPI --
+    // `keystore_ensure_store_id` is called from `engine_set_entry`, whose
+    // `this` is the provider's own `KeyStoreSpi`. `KeyStore.getInstance("PKCS12")`
+    // resolves to `sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12`, a
+    // `sun/security/util/KeyStoreDelegator` whose slot 2 is `primaryKeyStore`:
+    // a `java.lang.Class` MIRROR, not a keystore. The name lookup above misses
+    // (a delegator has no `keyStoreSpi` field), the index fired, and every
+    // `setEntry` was stored against the store id of a process-global class
+    // mirror -- which no reader ever asks. `setEntry` returned normally,
+    // `size()`/`aliases()`/`getKey()` answered as if nothing had been stored,
+    // and `store()` serialised an empty keystore. Measured on JDK 25, both
+    // modes, `apps/probes/JdkOnlyPlatformProbe.java`'s `security` section.
+    //
+    // So the candidate must actually BE a `KeyStoreSpi`. When that class
+    // cannot be resolved at all the historical blind behaviour is kept rather
+    // than silently changed on an image that has no such class.
     if ctx.object_num_fields(keystore_obj) > 2 {
         if let Value::Object(Some(spi)) = ctx.get_field(keystore_obj, 2) {
-            return spi;
+            let Some(spi_cid) = ctx.class_id_by_name("java/security/KeyStoreSpi") else {
+                return spi;
+            };
+            let actual = ctx.class_id_of_object(spi);
+            if actual == spi_cid || ctx.is_subclass(actual, spi_cid) {
+                return spi;
+            }
         }
     }
     keystore_obj
@@ -4443,8 +4722,10 @@ fn keystore_unlock_private_keys(id: i32, password: &[u8]) {
     };
     let mut installed_identity = false;
     for entry in store.entries.values_mut() {
-        if let EntryKind::PrivateKey { key_der, chain } = &mut entry.kind {
-            if let Some(plain) = jks_recover_key(key_der, password) {
+        if let EntryKind::PrivateKey { key_der, chain, .. } = &mut entry.kind {
+            // Both schemes, since KS-6: a PKCS#12 bag the store password did
+            // not open is still sitting here as its own envelope.
+            if let Some(plain) = recover_key_any_scheme(key_der, password) {
                 *key_der = plain;
                 if !installed_identity {
                     if crate::nbflags().dbg_tls_hs {
@@ -4472,7 +4753,7 @@ fn keystore_get_first_private_key(id: i32) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
             .entries
             .iter()
             .map(|(alias, e)| match &e.kind {
-                EntryKind::PrivateKey { key_der, chain } => format!(
+                EntryKind::PrivateKey { key_der, chain, .. } => format!(
                     "{alias}=PrivateKey(key_len={},chain_cert_lens={:?})",
                     key_der.len(),
                     chain.iter().map(|c| c.len()).collect::<Vec<_>>()
@@ -4489,7 +4770,7 @@ fn keystore_get_first_private_key(id: i32) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         );
     }
     for (alias, entry) in store.entries.iter() {
-        if let EntryKind::PrivateKey { key_der, chain } = &entry.kind {
+        if let EntryKind::PrivateKey { key_der, chain, .. } = &entry.kind {
             if crate::nbflags().dbg_tls_hs {
                 eprintln!(
                     "[dbg-tls-hs] keystore_get_first_private_key store_id={} PICKED alias={:?}",
@@ -4700,6 +4981,88 @@ mod tests {
 
     // -- BER -> DER length normalisation -----------------------------------
 
+    /// The discrimination `engine_get_key` refuses on: a real key must never
+    /// read as an envelope, or a correct password starts throwing.
+    ///
+    /// It is exact rather than heuristic, and this states why: a PKCS#8
+    /// `PrivateKeyInfo` opens with an INTEGER version where an
+    /// `EncryptedPrivateKeyInfo` opens with an `AlgorithmIdentifier` SEQUENCE,
+    /// so the two cannot be confused by a parser that reads the first element.
+    /// KS-6: the recovery funnel has to open BOTH protection schemes, because
+    /// `getKey` is handed one password and the entry could have arrived in
+    /// either envelope. Written to fail on the pre-KS-6 funnel, which knew only
+    /// the JKS one: the PKCS#12 assertions below are exactly the rows a
+    /// HotSpot-written store produces.
+    #[test]
+    fn both_protection_schemes_open_with_the_right_password_and_neither_with_the_wrong_one() {
+        let plain: &[u8] = &[
+            0x30, 0x18, 0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+            0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, 0x04, 0x04, 0xde, 0xad, 0xbe, 0xef,
+        ];
+
+        let jks = jks_protect_key(plain, b"entrypw").expect("OS entropy for the JKS envelope");
+        assert_eq!(
+            recover_key_any_scheme(&jks, b"entrypw").as_deref(),
+            Some(plain),
+            "the JKS envelope must still open through the widened funnel"
+        );
+        assert_eq!(
+            recover_key_any_scheme(&jks, b"storepw"),
+            None,
+            "a wrong password must not open the JKS envelope"
+        );
+
+        let epki = pbes2_encrypt(plain, b"entrypw").expect("OS entropy for the PBES2 envelope");
+        let p12 = yasna::construct_der(|w| epki.write(w));
+        assert_eq!(
+            recover_key_any_scheme(&p12, b"entrypw").as_deref(),
+            Some(plain),
+            "KS-6: a PKCS#12 envelope must open too -- the funnel knew only JKS \
+             before, which is why a separately-protected shrouded bag came back \
+             out of getKey as ciphertext wearing a PrivateKey mirror"
+        );
+        assert_eq!(
+            recover_key_any_scheme(&p12, b"storepw"),
+            None,
+            "a wrong password must not open the PKCS#12 envelope"
+        );
+
+        // And the two envelopes are not interchangeable: each is recognisable,
+        // so `engine_get_key` can pick the message HotSpot would have printed.
+        assert!(is_jks_encrypted_private_key(&jks));
+        assert!(!is_jks_encrypted_private_key(&p12));
+        assert!(is_encrypted_private_key(&p12));
+    }
+
+    #[test]
+    fn an_envelope_is_told_from_a_key_exactly() {
+        // SEQUENCE { INTEGER 0, SEQUENCE { OID rsaEncryption, NULL },
+        //            OCTET STRING 4 } -- a well-formed, if tiny, PKCS#8.
+        let plain: &[u8] = &[
+            0x30, 0x18, 0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+            0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, 0x04, 0x04, 0xde, 0xad, 0xbe, 0xef,
+        ];
+        assert!(
+            !is_encrypted_private_key(plain),
+            "a plaintext PKCS#8 key must not read as an envelope -- if it does,              every getKey with the CORRECT password throws"
+        );
+
+        let wrapped = jks_protect_key(plain, b"changeit")
+            .expect("OS entropy is available in the test environment");
+        assert!(
+            is_encrypted_private_key(&wrapped),
+            "the JKS key protector's own output must read as an envelope"
+        );
+        assert!(is_jks_encrypted_private_key(&wrapped));
+
+        // And it round-trips, so the envelope this recognises is one the
+        // right password still opens.
+        assert_eq!(
+            jks_recover_key(&wrapped, b"changeit").as_deref(),
+            Some(plain)
+        );
+        assert_eq!(jks_recover_key(&wrapped, b"wrong"), None);
+    }
     #[test]
     fn der_input_is_returned_unchanged() {
         // SEQUENCE { INTEGER 5 }, already definite-length.
@@ -4782,7 +5145,7 @@ mod tests {
             _ => panic!("expected TrustedCert"),
         }
         match &store.entries["leaf-key"].kind {
-            EntryKind::PrivateKey { key_der, chain } => {
+            EntryKind::PrivateKey { key_der, chain, .. } => {
                 assert_eq!(key_der, b"\x30\x07PKCS8KEY");
                 assert_eq!(chain.len(), 1);
                 assert_eq!(chain[0], b"\x30\x06DUMMY2");
@@ -5113,6 +5476,7 @@ mod tests {
                 kind: EntryKind::PrivateKey {
                     key_der: b"\x30\x08PRIVKEY1".to_vec(),
                     chain: vec![leaf.clone()],
+                    protected: None,
                 },
             },
         );
@@ -5127,7 +5491,7 @@ mod tests {
         assert_eq!(back.entries.len(), 3, "aliases: {:?}", back.entries.keys());
 
         match &back.entries.get("pk").expect("pk").kind {
-            EntryKind::PrivateKey { key_der, chain } => {
+            EntryKind::PrivateKey { key_der, chain, .. } => {
                 assert_eq!(key_der.as_slice(), b"\x30\x08PRIVKEY1");
                 assert_eq!(chain, &vec![leaf]);
             }
@@ -5223,6 +5587,145 @@ mod tests {
             back.entries.keys().collect::<Vec<_>>(),
             vec!["zzz-first", "aaa-second"],
             "insertion order, not alphabetical, and no secret key"
+        );
+    }
+}
+
+/// `unwrap_keystore_spi`'s slot-2 fallback, both directions.
+///
+/// # The defect these hold shut
+///
+/// `KeyStore.setEntry("secret", new SecretKeyEntry(...), new PasswordProtection(pw))`
+/// returned normally and stored NOTHING. Measured on JDK 25 in both
+/// `--real-jdk` and `--jdk-only`:
+///
+/// ```text
+///                          HotSpot   CratonVM
+/// size() after setEntry       1         0
+/// containsAlias("secret")   true     false
+/// getKey("secret", pw)     <key>      null
+/// store(...) byte count      421       122      (an EMPTY keystore)
+/// setKeyEntry(...)   -- the pre-1.5 route to the same thing -- worked
+/// ```
+///
+/// `engine_set_entry` was the one `engine*` callback that read its store id
+/// through `keystore_ensure_store_id`, which UNWRAPS. Its receiver is already
+/// the SPI, and for `KeyStore.getInstance("PKCS12")` that SPI is
+/// `sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12`, a
+/// `sun/security/util/KeyStoreDelegator`. A delegator has no `keyStoreSpi`
+/// field, so the name lookup missed and the blind slot-2 fallback fired --
+/// and slot 2 of `KeyStoreDelegator` is `primaryKeyStore`, a `java.lang.Class`
+/// MIRROR. Every `setEntry` was therefore filed under the store id of a
+/// process-global class mirror, which no reader ever asks for.
+///
+/// # Why a mock and not a source scan
+///
+/// A source witness would pin today's spelling of the guard; these call the
+/// function. The second test is the one that keeps the first honest: a guard
+/// that rejected everything would make the delegator case pass while silently
+/// breaking every real `java.security.KeyStore` wrapper, which is the caller
+/// the fallback exists for.
+#[cfg(test)]
+mod unwrap_keystore_spi_tests {
+    use super::*;
+    use cratonvm_native_api::test_mock::MockNativeContext;
+    // The mock implements these through the trait, so the trait has to be in
+    // scope for `alloc_object` / `set_field` / `class_id_by_name` to resolve.
+    use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess};
+
+    /// Slot 2 of the receiver is a `java.lang.Class`, exactly as it is on a
+    /// `KeyStoreDelegator`. The unwrap must refuse it and answer the receiver.
+    #[test]
+    fn a_slot_two_that_is_not_a_keystore_spi_is_not_followed() {
+        let mut ctx = MockNativeContext::new();
+        let spi_cid = ctx.declare_class("java/security/KeyStoreSpi", &[]);
+        let delegator_cid = ctx.declare_class(
+            "sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12",
+            &[
+                ("primaryType", "Ljava/lang/String;"),
+                ("secondaryType", "Ljava/lang/String;"),
+                ("primaryKeyStore", "Ljava/lang/Class;"),
+            ],
+        );
+        let class_mirror_cid = ctx.declare_class("java/lang/Class", &[]);
+        assert_ne!(
+            spi_cid, class_mirror_cid,
+            "the mock handed the same ClassId to two names, so this test could not tell \
+             a Class mirror from a KeyStoreSpi and would pass on the broken tree"
+        );
+
+        let mirror = ctx.alloc_object(class_mirror_cid, 0);
+        let delegator = ctx.alloc_object(delegator_cid, 8);
+        ctx.set_field(delegator, 2, Value::Object(Some(mirror)));
+
+        let got = unwrap_keystore_spi(&mut ctx, delegator);
+        assert_eq!(
+            got, delegator,
+            "unwrap_keystore_spi followed slot 2 to a java.lang.Class. That is how \
+             KeyStore.setEntry came to store its entries against the store id of a \
+             process-global class mirror: setEntry returned normally, threw nothing, and \
+             size()/aliases()/getKey() all answered as if it had never been called."
+        );
+    }
+
+    /// The same fallback, with a slot 2 that IS a `KeyStoreSpi`. It must still
+    /// be followed — otherwise the narrowing above has broken the real
+    /// `java.security.KeyStore` wrapper it was never aimed at.
+    #[test]
+    fn a_slot_two_that_is_a_keystore_spi_is_still_followed() {
+        let mut ctx = MockNativeContext::new();
+        let spi_cid = ctx.declare_class("java/security/KeyStoreSpi", &[]);
+        let wrapper_cid = ctx.declare_class(
+            "java/security/KeyStore",
+            &[
+                ("type", "Ljava/lang/String;"),
+                ("provider", "Ljava/security/Provider;"),
+                ("keyStoreSpi", "Ljava/security/KeyStoreSpi;"),
+            ],
+        );
+
+        let spi = ctx.alloc_object(spi_cid, 1);
+        let wrapper = ctx.alloc_object(wrapper_cid, 4);
+        // By INDEX only: the by-name tier is what a real wrapper answers, and
+        // this test is about the tier underneath it.
+        ctx.set_field(wrapper, 2, Value::Object(Some(spi)));
+
+        let got = unwrap_keystore_spi(&mut ctx, wrapper);
+        assert_eq!(
+            got, spi,
+            "the slot-2 fallback stopped following a genuine KeyStoreSpi. That tier is the \
+             only one that resolves a synthetic KeyStore mirror, so breaking it drops every \
+             staged keystore identity -- the KeyManagerFactory/TrustManagerFactory defect \
+             `keystore_id_from_object` documents."
+        );
+    }
+
+    /// When `java/security/KeyStoreSpi` cannot be resolved at all, the check
+    /// cannot adjudicate and the historical blind behaviour is kept.
+    ///
+    /// Written down as a test because it is a decision, not an accident: an
+    /// image with no such class (a `--synthetic-jdk` mirror) must not have its
+    /// unwrap silently changed by a guard that has nothing to compare against.
+    #[test]
+    fn an_unresolvable_keystore_spi_class_keeps_the_old_behaviour() {
+        let mut ctx = MockNativeContext::new();
+        // Deliberately NOT declaring `java/security/KeyStoreSpi`.
+        let carrier_cid = ctx.declare_class("cratonvm/internal/ks/Carrier", &[]);
+        let inner_cid = ctx.declare_class("cratonvm/internal/ks/Inner", &[]);
+        let inner = ctx.alloc_object(inner_cid, 1);
+        let carrier = ctx.alloc_object(carrier_cid, 6);
+        ctx.set_field(carrier, 2, Value::Object(Some(inner)));
+
+        assert!(
+            ctx.class_id_by_name("java/security/KeyStoreSpi").is_none(),
+            "this test's premise is that the class is unresolvable; the mock resolved it, \
+             so the branch under test was never reached"
+        );
+        assert_eq!(
+            unwrap_keystore_spi(&mut ctx, carrier),
+            inner,
+            "with no KeyStoreSpi to compare against, the fallback must behave as it always \
+             did rather than start refusing on an image that cannot answer the question"
         );
     }
 }

@@ -43,7 +43,7 @@
 //!
 //! So the compiled store does not evict. It records which *bucket* was
 //! written into a 64-byte side table, and the eviction happens in
-//! `runtime::offload::input_cache::drain_compiled_writes` — from Rust, on
+//! `runtime::offload::input_cache::drain_locked` — from Rust, on
 //! the marshalling path, before any cached buffer can be read. The window
 //! between the store and the drain is invisible: nothing consults the
 //! cache inside it.

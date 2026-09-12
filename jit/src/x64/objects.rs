@@ -15,6 +15,32 @@
 
 use super::*;
 
+/// `newarray` sites that took the inline TLAB bump, and those that kept the
+/// helper. See `Compiler::note_inline_array_site` for why both are recorded.
+static INLINE_ARRAY_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STUB_ONLY_ARRAY_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Why the inline `newarray` bump last declined, and how often each reason fired.
+static INLINE_ARRAY_DECLINES: std::sync::Mutex<Option<Vec<(&'static str, u64)>>> =
+    std::sync::Mutex::new(None);
+
+/// `(inline bump, stub only)` counts of compiled `newarray` sites.
+pub fn inline_array_site_counts() -> (u64, u64) {
+    (
+        INLINE_ARRAY_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        STUB_ONLY_ARRAY_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `(reason, count)` for every inline `newarray` decline this process has seen.
+pub fn inline_array_declines() -> Vec<(&'static str, u64)> {
+    INLINE_ARRAY_DECLINES
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default()
+}
+
+
 /// Reference-store sites that received the GATED inline barrier sequence.
 ///
 /// A count needs a denominator to be readable: zero here means either that no
@@ -376,6 +402,88 @@ impl Compiler {
         self.patch_rel32_to_here(legacy);
         self.emit_movsxd_r64_mem_disp32(dst, base, legacy_offset);
         self.patch_rel32_to_here(done);
+    }
+
+    /// One layout's arm of the inline `StringBuilder.append(char)` body.
+    ///
+    /// Emitted twice — once per instance layout — because a per-field
+    /// compact/legacy test would put four branches over the same header bit
+    /// around ten instructions. On entry RAX is the receiver (already
+    /// null-checked and class-id-guarded) and ECX is the character (already
+    /// screened to 0..=0xFF). RDX, R8 and R9 are scratch. RAX is unchanged on
+    /// exit, which is what `append` returns.
+    ///
+    /// Every edge that cannot serve the append pushes a patch into `decline`,
+    /// and the caller routes them all to the ordinary native dispatch — see
+    /// the STRINGBUILDER_ACCESS region for why these are calls and not
+    /// uncommon traps.
+    ///
+    /// # What the guards buy
+    ///
+    /// `coder == LATIN1` and `count < value.length` are exactly the conditions
+    /// under which `sb_append_units` takes its own in-place arm: it checks
+    /// `v.count + units.len() <= v.capacity` and that every unit is
+    /// representable, then writes the bytes and stores the new count. Anything
+    /// else — a UTF16 payload, a full payload, a character above LATIN1 —
+    /// makes it grow or inflate the array, which is the native's job and stays
+    /// the native's job here.
+    ///
+    /// # Why no GC barrier
+    ///
+    /// The two stores are a BYTE into a `byte[]` and an `int` field. Neither
+    /// writes a reference, so neither can create a cross-generational edge for
+    /// a card mark to record or overwrite one for SATB to retain. The payload
+    /// array is reached through the receiver and is not published or moved
+    /// here; this path allocates nothing and so cannot reach a collection.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn emit_sb_append_char_body(
+        &mut self,
+        count_offset: i32,
+        value_offset: i32,
+        coder_offset: i32,
+        coder_is_byte: bool,
+        decline: &mut Vec<usize>,
+    ) {
+        // R9D = coder. LATIN1 (0) or take the call.
+        if coder_is_byte {
+            // MOVZX R9D, BYTE [RAX + coder_offset]
+            self.buf.emit(&[0x44, 0x0F, 0xB6, 0x88]);
+        } else {
+            // MOV R9D, [RAX + coder_offset]
+            self.buf.emit(&[0x44, 0x8B, 0x88]);
+        }
+        self.buf.emit(&coder_offset.to_le_bytes());
+        self.buf.emit(&[0x45, 0x85, 0xC9]); // TEST R9D, R9D
+        decline.push(self.emit_jcc_rel32_patch(0x85)); // JNZ
+
+        // RDX = value (the byte[] payload). Null takes the call — a builder
+        // whose payload the native has not installed yet.
+        self.buf.emit(&[0x48, 0x8B, 0x90]); // MOV RDX, [RAX + value_offset]
+        self.buf.emit(&value_offset.to_le_bytes());
+        self.emit_test_r64_r64(RDX);
+        decline.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+        // R8D = count, R9D = value.length. LATIN1 is one byte per character,
+        // so the array's element count IS the capacity in characters.
+        self.buf.emit(&[0x44, 0x8B, 0x80]); // MOV R8D, [RAX + count_offset]
+        self.buf.emit(&count_offset.to_le_bytes());
+        // Truncation: a fixed header offset that fits a disp8.
+        self.buf
+            .emit(&[0x44, 0x8B, 0x4A, cratonvm_types::ARRAY_LENGTH_OFFSET as u8]); // MOV R9D,[RDX+len]
+        self.buf.emit(&[0x45, 0x39, 0xC8]); // CMP R8D, R9D
+        decline.push(self.emit_jcc_rel32_patch(0x8D)); // JGE — full, or a
+                                                       // corrupt count; the
+                                                       // native decides.
+
+        // value[count] = (byte) ch
+        //   MOV [RDX + R8*1 + ARRAY_DATA_OFFSET], CL
+        self.buf.emit(&[0x42, 0x88, 0x4C, 0x02]);
+        // Truncation: a fixed header offset that fits a disp8.
+        self.buf.emit(&[cratonvm_types::ARRAY_DATA_OFFSET as u8]);
+        // count += 1
+        self.buf.emit(&[0x41, 0xFF, 0xC0]); // INC R8D
+        self.buf.emit(&[0x44, 0x89, 0x80]); // MOV [RAX + count_offset], R8D
+        self.buf.emit(&count_offset.to_le_bytes());
     }
 
     /// Emit a compiled `getstatic` as a direct load, with no helper `CALL`.
@@ -1479,14 +1587,33 @@ impl Compiler {
         // branch silently dropped it. Two dwords per `new` is the same price
         // that comment already judged negligible.
         self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32 + 4, 0);
+        // The HIGH dword is not zero: it carries `GC_FLAG_HEADER`, the bit that
+        // makes a published header distinguishable from zeroed arena space. A
+        // JIT-inline `new Object()` is `ClassId(0)`, `shape = 0` and (before
+        // this) `mark = 0` — sixteen zero bytes, which the young non-moving
+        // sweep cannot parse and therefore never reclaims. See
+        // `cratonvm_types::GC_FLAG_HEADER`.
+        //
+        // Folded into the existing store rather than added as a fifth
+        // instruction: `GC_FLAGS_BYTE_OFFSET` is `MARK_WORD_OFFSET + 7`, i.e.
+        // byte 3 of THIS dword, so the flag is just the immediate shifted by
+        // 24. `header_offset_contract_gc_flags_live_in_the_mark_words_top_byte`
+        // pins that relationship.
+        const HEADER_FLAG_IN_HIGH_DWORD: i32 = (cratonvm_types::GC_FLAG_HEADER as i32) << 24;
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+            HEADER_FLAG_IN_HIGH_DWORD,
+        );
 
-        // AFTER the mark-word zeroing, which would otherwise erase it.
+        // AFTER the mark-word zeroing, which would otherwise erase it. The
+        // whole-byte store carries `GC_FLAG_HEADER` too, for the same reason —
+        // it overwrites the byte the flag was just written into.
         if compact_flag_pending {
             self.emit_mov_byte_mem_disp32_imm8(
                 R11,
                 cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
-                cratonvm_types::GC_FLAG_COMPACT,
+                cratonvm_types::GC_FLAG_COMPACT | cratonvm_types::GC_FLAG_HEADER,
             );
         }
 
@@ -1504,10 +1631,11 @@ impl Compiler {
             // written inline above, the header is complete enough for
             // both the GC walker and the runtime; no helper call needed.
             //
-            // Class, kind/flags, and shape are explicitly published above.
-            // Body defaults, forwarding_ptr=null, and
-            // mark_word=MARK_NEUTRAL come from the refill zeroing invariant
-            // unless the conservative opt-out repeats those stores inline.
+            // Class, kind/flags, shape and the whole mark word are explicitly
+            // published above — the mark word unconditionally, and with
+            // `GC_FLAG_HEADER` set, so the span is parseable as an object by
+            // the collector's linear walk. Only the body defaults come from
+            // the refill zeroing invariant.
             //
             // RAX = obj_ptr — both arms converge with RAX holding the
             // freshly-allocated object pointer.
@@ -1549,6 +1677,321 @@ impl Compiler {
 
         // ----- done -----
         self.patch_rel32_to_here(done_patch);
+    }
+
+    /// The largest array this path will bump inline, as an element COUNT.
+    ///
+    /// `tlab_alloc_array_guarded_refill` refuses anything whose total size
+    /// reaches `cratonvm_gc::tlab::tlab_max_alloc()` and routes it to the
+    /// ordinary path, which owns the young-vs-old-gen (humongous) routing
+    /// decision. This path must not quietly take that decision away from it,
+    /// so the same ceiling applies here — converted to a count at compile time,
+    /// because a count is one unsigned `CMP` against the length register while
+    /// a size is three more instructions after the shift.
+    ///
+    /// `the_inline_array_cap_tracks_the_allocator_s_own` pins the constant to
+    /// the allocator's, which this crate can only see from a test
+    /// (`cratonvm-gc` is a dev-dependency).
+    pub(super) const INLINE_ARRAY_TLAB_MAX_ALLOC: usize = 32 * 1024;
+
+    /// Whether a `newarray` site took the inline bump, and why one did not.
+    ///
+    /// BOTH, always, and for the reason `ir_alloc_site_counts` gives next door:
+    /// a checksum from a workload whose arrays all took the helper proves
+    /// nothing about the bump, so a zero on the left has to be
+    /// distinguishable from "emitted and refused". The decline reasons are a
+    /// work list — `no thread slot` and `zgc registration` mean different next
+    /// steps, and a bare count cannot be acted on.
+    fn note_inline_array_site(&self, why: Option<&'static str>) {
+        match why {
+            None => {
+                INLINE_ARRAY_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Some(why) => {
+                STUB_ONLY_ARRAY_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut g) = INLINE_ARRAY_DECLINES.lock() {
+                    let v = g.get_or_insert_with(Vec::new);
+                    match v.iter_mut().find(|(k, _)| *k == why) {
+                        Some((_, n)) => *n += 1,
+                        None => v.push((why, 1)),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inline TLAB bump allocation for a PRIMITIVE `newarray`, with the
+    /// existing `helpers.newarray` call as its slow path.
+    ///
+    /// Returns `false` without emitting anything when the shape is not
+    /// admitted, in which case the caller emits its helper call alone —
+    /// exactly the previous behaviour.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Self::emit_inline_tlab_new`] has given `new` a bump-and-publish
+    /// sequence since 2024; `newarray` never had one. `jit_newarray`'s own body
+    /// says so — "unlike the `new` site there is no inline TLAB bump in codegen
+    /// for arrays, so this helper is not a slow path — it is the ONLY path a
+    /// JIT-compiled `newarray` has" — and it is a long helper: a JIT-boundary
+    /// note, an SATB drain, two concurrent-mark pokes, the atype decode, the
+    /// size arithmetic, a thread-local fetch with a guard, and only then the
+    /// bump this emits in eight instructions. Measured on this tree at 150 ns
+    /// for `new byte[8]` against HotSpot's 10 ns, with `-Xmx` varied 4 GB →
+    /// 16 GB to rule the collector out.
+    ///
+    /// Every `String` CratonVM creates is a `byte[]` plus a `String`, so this
+    /// is most of what `Matcher.group()` costs.
+    ///
+    /// # PRIMITIVE only, deliberately
+    ///
+    /// `anewarray` keeps the helper. A reference element's size is
+    /// `narrow_oop::ref_element_size()` — a value this emitter would have to
+    /// bake and guard, exactly as the compact-layout snapshot above is baked
+    /// and guarded. That is a second change the size of this one, and it buys a
+    /// shape the String path does not allocate.
+    ///
+    /// # What is shared with `new`, and why
+    ///
+    /// The ordering argument is the same one, and it is the whole safety case:
+    /// **every header word lands before the cursor commits**. The commit store
+    /// is the single linearization point and x86-64 TSO does not reorder it
+    /// ahead of older stores, so no walker can observe a committed object whose
+    /// header is still whatever the TLAB slot held. See
+    /// [`Self::emit_inline_tlab_new`] for the BinTrees-18 heap corruption that
+    /// argument was paid for.
+    ///
+    /// The header is not hand-encoded: the mark word comes from
+    /// `ObjectHeader::new`, the same constructor `TlabShape::init_header` calls,
+    /// so the bytes this stamps and the bytes the allocator stamps agree by
+    /// construction rather than by inspection.
+    pub(super) fn emit_inline_tlab_newarray(
+        &mut self,
+        element_type: cratonvm_types::ArrayElementType,
+        atype: i32,
+        count_slot: StackSlot,
+    ) -> bool {
+        use cratonvm_types::{ClassId, ObjectHeader, ObjectKind};
+
+        // Name the refusal rather than returning a bare `false`. This arm is
+        // default-ON and carries the same documented heap-corruption risk its
+        // object-shaped sibling does, and the sibling's own history is that a
+        // silent `false` is how a path comes to be held responsible for a
+        // number it never produced: a census across all five collectors found
+        // `emit_inline_tlab_new_ir` emitting ZERO sites in every one of them,
+        // while its doc comment was being cited as the reason another feature
+        // stayed shut.
+        let declined = if !inline_tlab_newarray_enabled() {
+            // This arm's OWN opt-out, separate from the `new` one below it, so
+            // the array bump can be priced and bisected without also taking
+            // away the object bump that has been shipping since 2024. Both
+            // arms of an A/B are then one binary, which is the only kind of
+            // control this project trusts on a host whose absolute timings
+            // drift — see `docs/benchmarking/methodology.md`.
+            Some("CRATONVM_NO_JIT_INLINE_TLAB_NEWARRAY")
+        } else if !inline_tlab_new_enabled() {
+            // The `new` opt-out covers this arm too: one lever for "route every
+            // compiled allocation through its always-correct helper" is worth
+            // more than two that have to be remembered together.
+            Some("CRATONVM_NO_JIT_INLINE_TLAB_NEW")
+        } else if !inline_tlab_zero_elision_enabled() {
+            // Zero elision OFF means "re-emit the defensive per-object clears".
+            // `new` can: its body size is a compile-time constant and the clears
+            // are a straight-line run of stores. An array's body length is a
+            // RUNTIME value, so the same request is a loop — and the point of
+            // the lever is to bisect against a path that behaves like the
+            // helper. Handing arrays back to the helper IS that behaviour.
+            Some("zero elision off")
+        } else if cratonvm_types::jit_tlab_registration_required() {
+            // A collector whose sweep is driven by an allocation-base registry
+            // rather than by walking the chunk (ZGC) has to be told about every
+            // object, and an inline bump has nothing to tell it with — the `new`
+            // arm keeps `jit_post_tlab_init` for exactly this, and there is no
+            // array-shaped twin of that helper to keep. An unannounced object is
+            // not an object to `is_object_address`, and its first use as a
+            // receiver decodes as `null`.
+            Some("tlab registration required")
+        } else if !self.needs_heap {
+            // `vm_ptr` in the heap slot is what the slow path needs.
+            Some("no heap slot")
+        } else if self.helpers.newarray == 0 {
+            Some("helpers.newarray is null")
+        } else if self.helpers.get_current_thread == 0 && self.jit_thread_slot_off == 0 {
+            // …and a thread is what the fast path needs.
+            Some("no thread source")
+        } else if element_type == cratonvm_types::ArrayElementType::Reference {
+            // A reference array's element size is `ref_element_size()`, which
+            // this arm does not bake — see the doc comment.
+            Some("reference element")
+        } else {
+            None
+        };
+        if let Some(why) = declined {
+            self.note_inline_array_site(Some(why));
+            return false;
+        }
+
+        let elem_size = cratonvm_types::element_byte_size(element_type);
+        let log2_elem = match elem_size {
+            1 => 0u8,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            // Unreachable for the primitive family, and a refusal rather than an
+            // assert: a new element width should cost coverage, not a panic.
+            _ => {
+                self.note_inline_array_site(Some("element width"));
+                return false;
+            }
+        };
+        // `array_data_size_checked` rounds the data area up to 8, so the count
+        // cap is derived from the size cap — the rounding cannot then push a
+        // just-admitted array past it.
+        let max_len =
+            (Self::INLINE_ARRAY_TLAB_MAX_ALLOC - cratonvm_types::ARRAY_DATA_OFFSET) / elem_size;
+        let Ok(max_len) = i32::try_from(max_len) else {
+            self.note_inline_array_site(Some("cap does not fit imm32"));
+            return false;
+        };
+        // Every header displacement below is encoded as a disp8.
+        if cratonvm_types::MARK_WORD_OFFSET + 4 > 127
+            || cratonvm_types::ARRAY_LENGTH_OFFSET > 127
+            || cratonvm_types::ARRAY_DATA_OFFSET > 127
+        {
+            self.note_inline_array_site(Some("header offset past disp8"));
+            return false;
+        }
+
+        // Cast: value to i32 (encoding immediate/displacement)
+        let cursor_off = self.helpers.tlab_cursor_offset_in_thread as i32;
+        // Cast: value to i32 (encoding immediate/displacement)
+        let end_off = self.helpers.tlab_end_offset_in_thread as i32;
+
+        let mut slow: Vec<usize> = Vec::new();
+
+        // Step 1 — the cached `JvmThread*`, exactly as the `new` arm fetches it.
+        if self.jit_thread_slot_off != 0 {
+            self.emit_load_local(RAX, self.jit_thread_slot_off);
+            self.emit_test_r64_r64(RAX);
+            let have_cached_thread = self.emit_jcc_rel32_patch(0x85); // JNE have_thread
+            self.emit_fetch_current_thread_into_rax();
+            self.emit_store_local(self.jit_thread_slot_off, RAX);
+            self.patch_rel32_to_here(have_cached_thread);
+        } else {
+            self.emit_fetch_current_thread_into_rax();
+        }
+        self.emit_test_r64_r64(RAX);
+        slow.push(self.emit_jcc_rel32_patch(0x84)); // JE slow_path
+
+        // Step 2 — the length, and the ONE check that screens both a negative
+        // length and an oversized one.
+        //
+        // RCX holds whatever the operand slot holds, which `jit_newarray`'s own
+        // body documents may be a NaN-boxed `CompactValue` rather than a bare
+        // integer — it narrows with `length as i32 as i64` for that reason.
+        // Reading ECX is that same narrowing, so the two paths agree on what the
+        // length is.
+        //
+        // The compare is UNSIGNED (`JA`), which is what makes it one
+        // instruction: a negative length reads as >= 0x8000_0000, so it is above
+        // the cap and diverts to the helper — which raises
+        // `NegativeArraySizeException` through the pending-exception channel,
+        // the behaviour this arm must not change.
+        self.load_slot_to_reg(RCX, count_slot);
+        self.buf.emit_byte(0x81); // CMP ECX, imm32
+        self.buf.emit_byte(0xF9);
+        self.buf.emit(&max_len.to_le_bytes());
+        slow.push(self.emit_jcc_rel32_patch(0x87)); // JA slow_path
+
+        // Step 3 — cursor, aligned up to 8. An interleaved allocation can leave
+        // it unaligned and the walker assumes 8-aligned headers.
+        self.emit_mov_r64_r64(R10, RAX);
+        self.emit_mov_r64_mem_disp32(R11, R10, cursor_off);
+        self.emit_add_r64_imm8(R11, 7);
+        self.emit_and_r64_imm8(R11, -8);
+
+        // Step 4 — the data size, then the bump. This is
+        // `array_data_size_checked` in four instructions: `length * elem_size`,
+        // rounded up to 8. `length` is capped above and `elem_size` is at most
+        // 8, so the shift cannot reach the pointer range and the `checked_mul`
+        // its Rust twin needs has nothing left to catch.
+        self.buf.emit(&[0x89, 0xCA]); // MOV EDX, ECX  (zero-extends into RDX)
+        if log2_elem != 0 {
+            self.buf.emit(&[0x48, 0xC1, 0xE2, log2_elem]); // SHL RDX, log2_elem
+        }
+        self.emit_add_r64_imm8(RDX, 7);
+        self.emit_and_r64_imm8(RDX, -8);
+        // LEA RAX, [R11 + RDX + ARRAY_DATA_OFFSET] — the end of the object,
+        // which is also the new cursor.
+        self.buf.emit(&[0x49, 0x8D, 0x44, 0x13]);
+        // Cast: bounded by the disp8 screen above.
+        self.buf.emit_byte(cratonvm_types::ARRAY_DATA_OFFSET as u8);
+        // CMP RAX, [R10 + end_off]; JA slow_path (TLAB exhausted).
+        self.emit_cmp_r64_mem_disp32(RAX, R10, end_off);
+        slow.push(self.emit_jcc_rel32_patch(0x87)); // JA slow_path
+
+        // Step 5 — the whole header, before the commit below.
+        //
+        // `class_id` is `ClassId::new(0)` because that is what `jit_newarray`
+        // passes `tlab_alloc_array_guarded_refill` for a primitive array: the
+        // element type lives in the mark word, not in a class.
+        self.emit_mov_dword_mem_disp32_imm32(R11, 0, 0);
+        // `shape` IS the length for an array kind — `ObjectHeader::new` picks
+        // `array_length` over `num_slots` on `ObjectKind::Array`.
+        // MOV DWORD [R11 + ARRAY_LENGTH_OFFSET], ECX
+        self.buf.emit(&[0x41, 0x89, 0x4B]);
+        // Cast: bounded by the disp8 screen above.
+        self.buf.emit_byte(cratonvm_types::ARRAY_LENGTH_OFFSET as u8);
+        // The mark word, taken from the constructor the allocator itself calls
+        // rather than re-derived here: `kind`, `element_type`, `gc_age` and
+        // `gc_flags` live in bits 48..63, and `GC_FLAG_HEADER` must be among
+        // them or the span is not parseable as an object by the collector's
+        // linear walk (a wholly zero header is reclaimed arena space).
+        let mark = ObjectHeader::new(ClassId::new(0), ObjectKind::Array, element_type, 0, 0)
+            .mark_word
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Cast: the two halves of a u64, written as two imm32 stores.
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::MARK_WORD_OFFSET as i32,
+            mark as u32 as i32,
+        );
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+            (mark >> 32) as u32 as i32,
+        );
+
+        // The BODY is not cleared here, and Java requires it to read as zero. It
+        // does: every production `VmHeap::refill_tlab` backend returns a fully
+        // zeroed chunk, including cells reused by a non-moving sweep. That is
+        // the same invariant `emit_inline_tlab_new` relies on for its field
+        // slots under `inline_tlab_zero_elision_enabled` — and this arm has
+        // already declined when that lever is off.
+
+        // Step 6 — commit the bump LAST. x86-64 TSO preserves the
+        // header-before-cursor store order; do not add an SFENCE.
+        self.emit_mov_mem_disp32_r64(R10, RAX, cursor_off);
+        // Both arms converge with RAX = the array pointer.
+        self.emit_mov_r64_r64(RAX, R11);
+        let done_patch = self.emit_jmp_rel32_patch();
+
+        // ----- slow_path -----
+        for patch in slow {
+            self.patch_rel32_to_here(patch);
+        }
+        // `jit_newarray(vm, atype, length)`. The caller has already emitted the
+        // pre-safepoint spill, and emits the oop map and the OOM check after the
+        // merge, so this edge needs only the arguments.
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.emit_mov_imm32_sx(ARG_REGS[1], atype);
+        self.load_slot_to_reg(ARG_REGS[2], count_slot);
+        self.emit_call_absolute(self.helpers.newarray);
+
+        // ----- done -----
+        self.patch_rel32_to_here(done_patch);
+        self.note_inline_array_site(None);
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -1680,23 +2123,48 @@ impl Compiler {
     ///
     /// So they guard on the process-wide replacement epoch instead — coarser,
     /// and affordable because only a REPLACEMENT bumps it, never a new class
-    /// registration. Four instructions; a mismatch permanently routes the site
+    /// registration. Two instructions; a mismatch permanently routes the site
     /// to the always-correct helper.
     ///
+    /// The compare is `CMP DWORD [rip+disp32], imm32` — see
+    /// [`Self::emit_cmp_mem32_abs_imm32`] — which is why "two" and not the
+    /// "four" this comment said until 2026-09-10.
+    ///
+    /// Whether that form is REACHABLE is not this emitter's decision. The
+    /// counter has to be within ±2GB of the buffer, which took moving it off
+    /// `.data` (Windows: ~140TB away as a `static`) and then, on System V,
+    /// moving the CODE — `jit::platform`'s `near_globals`, where
+    /// `mmap(NULL, …)` had been putting buffers ~130TB from the heap the
+    /// counter lives in. Where neither holds, the range check below declines
+    /// and the long form is emitted. See `LAYOUT_REPLACE_EPOCH` in
+    /// `cratonvm_types::field_layout`, and
+    /// `docs/internal/performance/c2-the-layout-epoch-guard-was-unreachable-by-rip-20260910.md`.
+    ///
+    /// Reach is best-effort, so the materialize-the-address form stays as the
+    /// fallback — and `CRATONVM_JIT_SP_EPOCH_GUARD_RIP=0` selects it
+    /// deliberately rather than waiting for an address space that produces it.
+    ///
     /// Returns `None` when the caller should emit no guard at all, which today
-    /// never happens — the epoch address is a `'static` and always available —
-    /// but keeps the shape honest if that ever changes.
+    /// never happens — the epoch address is always available — but keeps the
+    /// shape honest if that ever changes.
     pub(super) fn emit_layout_epoch_guard(&mut self) -> Option<usize> {
         let (addr, expected) = cratonvm_types::layout_replace_epoch_guard();
         if addr.is_null() {
             return None;
         }
-        self.emit_mov_imm64_full(R11, addr as i64);
-        self.emit_mov_r32_mem_disp32(RCX, R11, 0);
-        // CMP ECX, imm32.
-        self.buf.emit_byte(0x81);
-        self.buf.emit_byte(0xF9);
-        self.buf.emit(&(expected as i32).to_le_bytes());
+        if !jit_sp_epoch_guard_rip_enabled()
+            || !self.emit_cmp_mem32_abs_imm32(addr as usize, expected)
+        {
+            // Out of ±2GB RIP reach, or the encoding switch is off:
+            // materialize the address and read through it. This is the shape
+            // the guard had before 2026-09-10, kept verbatim as the fallback.
+            self.emit_mov_imm64_full(R11, addr as i64);
+            self.emit_mov_r32_mem_disp32(RCX, R11, 0);
+            // CMP ECX, imm32.
+            self.buf.emit_byte(0x81);
+            self.buf.emit_byte(0xF9);
+            self.buf.emit(&(expected as i32).to_le_bytes());
+        }
         Some(self.emit_jcc_rel32_patch(0x85)) // JNE -> helper
     }
 

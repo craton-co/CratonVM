@@ -266,13 +266,25 @@ finite.
 **What landed.** `regalloc::xmm_roles::IR_GP_LINEAR_SCAN` = RBX, R12–R15 — a
 general-purpose file beside the XMM one, on the same write-through contract.
 
-Every part of the register choice is forced. They are callee-saved on **both**
-ABIs, which this wiring needs because it has no reload machinery: a value's
-register must survive a call by the calling convention rather than by analysis,
-and that rules out even the otherwise-obvious System V candidates RSI/RDI. They
-are untouched by this emitter's own tiers. The prologue saves them and every
-exit restores them (`IR_GP_PROLOGUE_SAVED`), on the same footing as the XMM save
-area and just as dynamically — a method that promotes nothing emits no save.
+Every part of the register choice is forced. They must be **callee-saved on the
+target ABI**, which this wiring needs because it has no reload machinery: a
+value's register must survive a call by the calling convention rather than by
+analysis, and that rules out every caller-saved register. They are untouched by
+this emitter's own tiers. The prologue saves them and every exit restores them
+(`IR_GP_PROLOGUE_SAVED`), on the same footing as the XMM save area and just as
+dynamically — a method that promotes nothing emits no save.
+
+> **Corrected 2026-09-10.** This paragraph used to read "callee-saved on
+> **both** ABIs […] and that rules out even the otherwise-obvious System V
+> candidates RSI/RDI" — a System V fact stated as an ABI-independent one.
+> **Win64 makes RSI and RDI callee-saved**, and the single-pass backend has
+> been colouring locals into them all along (`x64::LOCAL_REGS` is `[u8; 7]` on
+> Windows and `[u8; 5]` elsewhere). The IR file now widens to seven there
+> behind `CRATONVM_JIT_IR_GP_WIDE`, which is **default OFF because it was
+> measured slower**, not because it is unsoaked:
+> `docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`.
+> The reason it is slower is the next paragraph but one — write-through means a
+> wider file buys publishes, not fewer stores.
 
 **The safepoint obligation is discharged by type, not by structure.** A GC root
 walk reads a frame it did not stop, through RBP, and `OopMapEntry` names frame
@@ -972,7 +984,8 @@ downgrade that gate was shut for.
 2. **Every compiled call still republishes RBP and pushes/reloads the shadow
    stack.** Those buy precise roots, not nothing, and removing them is a GC
    trade rather than a codegen one.
-3. **Nothing compares a C2 body against the C1 body it replaces.** The
+3. **Nothing compares a C2 body against the C1 body it replaces.**
+   *(Partly closed 2026-09-10 — see the note at the end of this item.)* The
    policy question is unchanged and deliberately still open — the obvious
    static metrics both misjudge the good cases, since a bigger body is usually
    inlining or unrolling and more call sites can be a callee's own calls after
@@ -981,6 +994,30 @@ downgrade that gate was shut for.
    also does is remove the causes that made a C2 body worse — the tier now has
    an inline TLAB bump, gated inline reference stores, and a register file.
    **What that instrument then said is below.**
+   **2026-09-10, what is now closed of item 3.** The acceptance gate no longer
+   judges only by *what the tier did*. `ir_evidence::CompileRecord` carries the
+   per-execution cost a compile introduced beside its transform bitset, and
+   `is_worth_publishing` refuses a body whose priced cost went UP however much
+   it transformed. Evidence is now necessary, not sufficient.
+
+   The prices are the two this crate already reasons in — a blind
+   `jit_invoke_dispatch` resolves by name at ~175 ns against a direct `CALL`'s
+   ~4 — and the trade they settle is splicing: a spliced frame saves a call, a
+   call the splice strands without a bindable target costs a resolution on every
+   execution. What is NOT modelled is site execution frequency, so a resolution
+   on a cold branch is charged like one in a loop; that errs toward refusing,
+   which is the safe direction, and it is the first thing to fix if the gate is
+   ever measured refusing better bodies.
+
+   This is still not a general C1-vs-C2 comparison. It prices one specific trade
+   because that trade has measured constants; the rest of item 3 stands.
+   `[c2-supersede] refused as a cost regression: bodies=N est_ns_per_execution_declined=M`
+   is the reading. It came out of a case where a transform's presence was the
+   evidence that published a 3x regression — `Objects.checkIndex` spliced into
+   `ArrayList.get` set `Inlined`, the stranded call was native-shadowed, and the
+   published body ran its probe in 897 ms against the single-pass 338. See
+   `internal/performance/c2-splice-checkcast-and-instanceof-20260909.md`.
+
 4. **`Node` is still 48 bytes against HotSpot's 24.** Unchanged, structural,
    and a GC item: see
    `known-issues/perf/perf-bintrees-9x-gap-characterised.md`.
@@ -1315,7 +1352,12 @@ Generational; `cratonvm-jit` 2225 passed.
 | Deferred-`new` retry held until the class resolves | **ON** | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` |
 | Reverse-postorder block layout (def before use) | **ON** | `CRATONVM_JIT_IR_RPO_LAYOUT=0` |
 | IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
+| IR-tier fused compare reads its operands in place (register, frame slot or folded immediate) | **ON** | `CRATONVM_JIT_IR_CMP_IN_PLACE=0` |
+| IR-tier `x + k` / `x - k` as one `LEA` | **ON** | `CRATONVM_JIT_IR_ADD_LEA=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
+| IR-tier redundant-read elimination (same cell, same heap, same block) | off — large on the probe written for it (0.627x on `FieldLoop.sumWide` with the memory-edge hoist off) and fires on **nothing** in CratonBench; `c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md` §8 | `CRATONVM_JIT_IR_LOAD_CSE=1` |
+| LICM may hoist a read of a maybe-null base out of a loop whose constant trip count proves the body runs | off — 0.793x on `probes/CountedHoist.java`, unmeasured elsewhere; §9 of the same page | `CRATONVM_JIT_IR_LICM_HOIST_COUNTED=1` |
+| Redundant-read elimination steps over a store that provably cannot alias the cell read | off — measured delta **zero** on every workload in this tree; §11.4 of the same page | `CRATONVM_JIT_IR_LOAD_CSE_ALIAS=1` |
 | IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |
 | IR-tier inline TLAB bump for `Op::New` | off — the sequence has a defect `RJitMapTierDiff` reproduces 4/10; see `ir_inline_tlab_enabled` | `CRATONVM_JIT_IR_INLINE_TLAB=1` |
 | Thread pointer fetched from a TLS mirror (both tiers) | **ON** where the probe succeeds | `CRATONVM_JIT_TLS_THREAD_FETCH=0` |
@@ -1357,6 +1399,14 @@ So **"every loop" is no longer true — one shape of five is.** The field-read
 loop reproduces cleanly: both control pairs agree (3.5% and 1.4%) while the
 groups differ by 65%, and the medians are separated by far more than either
 spread.
+
+**Re-measured 2026-09-10: still there, at 1.594x.** The table above is a
+2026-09-03 snapshot and seven register flags went default-ON after it, so the
+number was retaken rather than carried forward — `probes/FieldLoop.java` `sum`,
+`tools/tier-ab/tier-ab.sh`, 503 ms baseline against 812 ms optimizing over a
+2.6% floor. The register work that landed in between did not close it, and
+widening the GP file does not either. See
+`docs/internal/performance/c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md`.
 
 Two things it is **not**. The optimizing tier emits *less* code for that method
 (1,030 bytes against 1,579), so it is not bloat; and `getfield helper calls`
@@ -1613,6 +1663,18 @@ the same slot two instructions apart —
 — with the accumulator itself crossing the back edge through the frame, so
 every iteration waits on the previous one's store.
 
+**That pair has since been removed for one shape, and the removal is where this
+tier's remaining frame traffic was finally counted.** A second carry slot lets a
+consumer take BOTH of its single-use operands in registers instead of one, which
+deletes exactly the store-and-reload above; widening the rule that says which
+arm a carried value may cross — from an OP-level allowlist to the NODE-level
+question the arm actually asks — took the probe set from 1 such carry to 11 and
+is worth 1.009x against a 0.1% floor on a kernel that has the shape. The census
+that made possible is the part to read before reaching for this paragraph again:
+**82% of the candidate sites fail on operand POSITION**, not on anything the
+emitter decides. Full write-up in
+`c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md`.
+
 The exact stall could not be named: this host is a VM without PMU passthrough
 (`perf stat` reports `<not supported>` for cycles and instructions), so
 store-forwarding latency is the likely mechanism rather than the measured one.
@@ -1703,6 +1765,30 @@ inversion**, and it is why the switch is kept rather than the change reverted:
 it is the smallest known perturbation that moves this loop by 20%, which makes
 it the cheapest handle on whatever the real cause is.
 
+**2026-09-11 — RETIRED: the anomaly no longer reproduces.** Re-measured on the
+current tree with `tools/tier-ab/flag-ab.sh` (7 rounds, interleaved, same-config
+control, checksum `1200150000` on every run), `CRATONVM_JIT_IR_THIS_NONNULL` on
+`probes/FieldLoop.java` `sum` is **0.981x — UNMEASURABLE inside a 4.6% floor**.
+It is not 20% slower; it is not measurably anything. Whatever arrangement
+produced the 1.78/1.93-against-1.49/1.61 medians is gone, most likely with the
+phi-copy change in
+`docs/internal/performance/c2-the-phi-copy-staging-register-20260911.md` §5.
+
+So this paragraph's standing recommendation — keep the switch because it is the
+cheapest handle on the residual inversion — no longer holds: there is no longer
+an effect for it to be a handle on. Keep the switch on its own merits (it is
+correct and it elides real checks), not as a lead.
+
+The layout theory it invited was tested and did not survive either.
+`docs/internal/performance/c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md`
+counts this loop at **412 bytes spanned, ~122 executed**, the rest cold code
+emitted inline; `CRATONVM_JIT_IR_POLL_OUTLINE` removes the largest of those
+blocks (229 bytes) and one taken branch per iteration, and it measures
+**0.999x — UNMEASURABLE**. A well-predicted branch over cold bytes costs
+approximately nothing, because fetch follows the predicted target rather than
+the linear address. What actually moved this loop was removing WORK: see the
+same document's §3.
+
 One structural asymmetry is worth naming as a candidate: the receiver
 null-check elision described above — the `this` seed and
 `CRATONVM_JIT_RECEIVER_NULL_ELIM` — is **single-pass only**. Both arms it
@@ -1728,6 +1814,18 @@ actually gave a register to, how many could lose their home word:
 [ir-ls] resident=3 (fp=0 gp=3)
 [ir-ls] home: droppable=0 blocked_deopt=1 blocked_phi=2 safepoints=16
 ```
+
+> **The census in that code block no longer exists, 2026-09-10.** It kept
+> asking the question it was written for — "promoted, named by no safepoint at
+> all, and not a phi" — while `ir-reg-authoritative`, `ir-drop-home` and
+> `ir-drop-phi-home` widened the rule the emission uses to "named by no
+> REACHABLE frame state". By 2026-09-10 it printed `droppable=0` on a compile
+> of `FieldLoop.sum` that dropped **three** homes and skipped five stores. It
+> is replaced by `[ir-ls] homes: dropped_values=` (the outcome) and
+> `[ir-ls] homes kept: switch/deopt/type/op` (the per-cause remainder), the
+> second computed from `home_dropped` itself under an accounting identity so
+> it cannot fall behind again. Read the block below as the 2026-09-04 record
+> it is.
 
 **Zero of three**, on the loop this whole section is about. The design's safety
 argument — that `pinned` covers every deopt-named value, so a promoted value is
@@ -1798,7 +1896,8 @@ tested, so deopt metadata CAN name a register — but the IR tier's
 `emit_deopt_stub` passes only `rbp` to `ir_deopt_entry` and reserves no
 `SavedRegisters` region, so nothing would fill one. Dropping the home of a
 deopt-named value needs that region reserved and the callee-saved file spilled
-into it first. `blocked_deopt` is the counter that says what that would buy.
+into it first. `blocked_deopt` is the counter that says what that would buy
+(retired 2026-09-10; `[ir-ls] homes kept: deopt=` is its successor).
 
 #### The register image was built, and the home is gone for the values it covers
 
@@ -2349,7 +2448,8 @@ safepoint[16] bci=23 locals=[3, 12, -, 13, 14] stack=[23]
 `graph.safepoints` records the **full operand stack at every bci**, so an
 intermediate is named by a frame state from its definition until its consumer
 pops it. That is the same wall the residency file hit — its `blocked_deopt`
-census — reached from a different direction.
+census, today `[ir-ls] homes kept: deopt=` — reached from a different
+direction.
 
 And it is worth reading beside what the door reports for this very method:
 `sentinel_free=true`, which is `deopt_stub_patches.is_empty() &&
@@ -2551,6 +2651,143 @@ constant.
 | + everything else | 44 | 10 | 3 | 7 |
 | **+ everything** | **40** | **10** | **3** | **7** |
 
+#### The loop control itself, 2026-09-11
+
+The fold above reaches every `x op k` in a method, and the residue it left
+behind was the three instructions at the bottom of every counted loop. Two
+changes finish it. Both are default-ON with a kill switch, both strictly remove
+instructions **and** bytes wherever they fire, and neither resolves on this
+build host's clock — which is said here rather than dressed up.
+
+**A fused compare reads its operands where they already are.** A compare whose
+only consumer is the `If` defines no value, writes no home and publishes no
+register; the only thing that outlives it is the flags, and those are the same
+whichever registers or addresses the comparison names. So it names them:
+
+```text
+mov rax,rbx / mov rcx,r12        / cmp eax,ecx    becomes   cmp ebx,r12d
+mov rax,rbx / mov rcx,[rbp-60h]  / cmp eax,ecx    becomes   cmp ebx,[rbp-60h]
+mov rax,rbx / mov ecx,64h        / cmp eax,ecx    becomes   cmp ebx,64h
+mov rax,[rbp-60h] / mov ecx,64h  / cmp eax,ecx    becomes   cmp [rbp-60h],64h
+```
+
+Four forms, `pick_cmp_form` in that order of preference. The two immediate forms
+are the common ones — `i < 100` is the shape of most Java loops — and the two
+frame forms are not fallbacks: `peak_live` routinely exceeds the five-register
+GP file, and a loop bound is exactly the long-lived value that loses its
+register.
+
+Three guards, each of which fails closed rather than wrong. `carry_names`
+declines either operand a carry is holding, because a carried value has to be
+read through `gp_load_value` or the carry strands. The frame forms go through
+`slot_of_checked`, so a dropped home declines the form rather than latching a
+bailout on a path with a perfectly good fallback. And the immediate forms gate
+on `alu_imm32`, which is the same gate the arithmetic folds use: it declines a
+constant too wide for `i32` (every immediate form here sign-extends, so such a
+constant has no immediate encoding at all) and it is off under a MIR mode, where
+a tiled node is emitted by the selector and a fold here would leave the
+byte-equality lane comparing two different programs.
+
+The 32-bit frame forms read four bytes where the `MOV` they replace read eight.
+That is the same comparison: the slot holds the `int` in its low word, and the
+`CMP EAX, ECX` being replaced only ever looked at those four bytes either.
+
+**`x + k` and `x - k` become one `LEA`.** `LEA` is the only three-operand
+integer instruction on this machine, so it is the only way to read a source and
+write a different destination without routing through the accumulator:
+
+```text
+mov rax,rbx / add eax,1 / mov r14,rax     becomes   lea r14d,[rbx+1]
+mov rax,rbx / add eax,1                   becomes   lea eax,[rbx+1]
+```
+
+Two forms, and **the weaker one is the common case**, which is the thing to know
+about this change. Whether the first is reachable turns on whether the result
+got a register of its own, and a loop-carried increment does not: measured on
+`CmpImm.wide`, `def_publishes=0` against `phi copies: reg_publishes=10` — the
+loop-carried values are published by the phi copies on the back edge, so `i + 1`
+writes a home word and is given no register. A first version that required one
+engaged **nowhere** on that probe. `PollReach.hotLoop` is where the direct form
+does fire (`add_lea=1+0`), and it is worth two instructions there rather than
+one.
+
+Unlike the compare this DEFINES a value, so the direct form owes everything a
+definition owes, and `every_droppable_op_writes_its_home_once_through_store_rax`
+had to grow an exception for it — the one home write in a claimed arm that does
+not go through `store_rax`. The exception is named in that test and proved in
+`the_lea_add_form_publishes_what_it_does_not_store`, which reads the direct
+form's source and requires that it publish the register and say so BEFORE it
+decides whether to skip the home store. The accumulator form needs none of that:
+it leaves RAX holding exactly what `mov rax,x; add eax,k` would have, and
+`store_rax` finishes unchanged.
+
+`x - k` is `x + (-k)` through the same encoder, except at `Integer.MIN_VALUE`,
+whose negation is not an `int`. One constant in the language, and it declines
+rather than wrapping into a silent `+ MIN`.
+
+**Measured — instructions and bytes yes, time no.** Release binary, the two
+flags as the A/B, first optimizing-tier compile of each method:
+
+| probe | both off | cmp only | lea only | **both on** | forms that fired |
+|---|---:|---:|---:|---:|---|
+| `CmpImm.wide` | 186 / 923 | 184 / 919 | 185 / 918 | **183 / 914** | `cmp_imm=1+0 add_lea=0+1` |
+| `CmpImm.down` | 186 / 919 | 184 / 912 | 185 / 914 | **183 / 907** | `cmp_imm=1+0 add_lea=0+1` |
+| `LoopCtl.spin` | 189 / 933 | 187 / 927 | 188 / 928 | **186 / 922** | `cmp_in_place=0+1 add_lea=0+1` |
+| `PollReach.hotLoop` | 200 / 1190 | 198 / 1185 | 198 / 1183 | **196 / 1178** | `cmp_in_place=1+0 add_lea=1+0` |
+| `PollReach.wideLoop` | 268 / 1637 | 266 / 1631 | 267 / 1632 | **265 / 1626** | `cmp_in_place=0+1 add_lea=0+1` |
+
+instructions / bytes. The four arms are additive to the instruction, which is
+what says the two levers are disjoint. Bytes fall in every arm — the point worth
+contrasting with the operand-pairing pass, which bought its one instruction for
+three extra bytes and was rejected.
+
+All four compare forms engage somewhere: the register-immediate form on
+`CmpImm.wide`, the frame-immediate form on `CmpImmProbe` (`cmp_imm=0+2` on one
+compile) and on `CmpImm.tight` (`1+1`), the register-register form on
+`PollReach.hotLoop`, the register-frame form on `LoopCtl.spin`.
+
+**The timing is a null on this host and no speedup is claimed.** Three arms
+interleaved ABCCBA, A and C the SAME build, so the A-C spread is the floor:
+
+| probe | rounds | floor (A vs C) | effect (B→A) |
+|---|---:|---:|---:|
+| `CmpImm.wide` | 12 | 1.43% median / 1.18% min | −2.62% median / +3.05% min |
+| `LoopCtl.spin` | 12 | 5.69% median / 1.55% min | +3.19% median / +3.49% min |
+| `CmpImm.wide` | 20 | **14.63%** median / 0.07% min | +9.35% median / **−5.28%** min |
+| `LoopCtl.spin` | 20 | 3.11% median / 2.74% min | +22.22% median / +0.40% min |
+
+Host load ran 40-111 on 8 cores across those runs, and it shows: two identical
+builds come out 14.63% apart, the measured "effect" ranges from −5.28% to
++22.22%, and the median and the minimum disagree about its SIGN. **That is a
+null, not a small win**, and adding rounds made it worse rather than better
+because the load rose faster than the averaging helped. A quieter box is what
+this needs; the instruction and byte counts above need nothing, being exact.
+
+**One mechanism worth writing down, because it is the only argument AGAINST the
+`LEA`.** `mov rax,rbx` is eliminated at rename on every current x86-64, so the
+instruction the accumulator form removes was very likely already free. On Intel
+`LEA` also issues on fewer ports than `ADD` (1 and 5, against 0/1/5/6), so in a
+port-1/5-bound loop it could in principle cost a cycle it does not spend. **Not
+on this host** — an AMD EPYC 9V45 (Zen 5), where the simple base-plus-
+displacement form runs on all four ALUs — but the flag is not host-specific
+and the next machine may be. So: the `LEA` removes an instruction and five bytes
+but probably not a uop. It ships ON for the decode and I-cache saving, which is
+not in doubt, and `CRATONVM_JIT_IR_ADD_LEA=0` is the way back. The compare has
+no such counter-argument — `mov ecx,imm` is a real uop that no renamer
+removes.
+
+**Verified.** 2366 `cratonvm-jit` unit tests and 2645 `cratonvm-vm` unit tests in
+debug, so `debug_assert` is live; 145 `ir_vs_singlepass` differential tests. The
+regression suite **92/92 with the new defaults and 92/92 with both kill
+switches** — both directions, because a switch nobody exercises is not a switch.
+`probes/CmpImmProbe.java` agrees with HotSpot to the checksum under the
+defaults, under each kill switch, under both, under `CRATONVM_JIT_IR_ALU_IMM=0`,
+under `CRATONVM_JIT_IR_LINEAR_SCAN=0` and under `--nojit`; it covers the
+`imm8`/`imm32` boundary in both signs, negative bounds, a `long` constant outside
+`i32` that no immediate can express, `Integer.MIN_VALUE` as a bound and as an
+addend, a first operand forced out of its register, and a reference against
+`null`.
+
 `alu immediates folded: 5`, and `ck=5100017428506113` in every arm.
 
 **And this is where the arc ends.** User CPU, five interleaved arms, nine
@@ -2738,8 +2975,9 @@ been losing its inline cache at the tier-up boundary.
 The stores this section kept naming as the residual were home writes for values
 pinned by frame states. `graph.safepoints` records the **full operand stack at
 every bci**, so an intermediate is deopt-named from its definition until its
-consumer pops it — which is what `plan_register_residency`'s `blocked_deopt` and
-the carry's `still_deopt_named` refuse on. Meanwhile the OSR door reports
+consumer pops it — which is what the home census's `deopt` cause (then
+`plan_register_residency`'s `blocked_deopt`) and the carry's
+`still_deopt_named` refuse on. Meanwhile the OSR door reports
 `sentinel_free=true` for the same method: it emits **no deopt stub and no
 call-exception stub**, so nothing inside it can transfer to the interpreter.
 Thirty-three frame states, not one reachable, all of them pinning intermediates
@@ -3023,6 +3261,7 @@ Seven changes, each with a kill switch and an engagement census.
 | 3a | scalar intrinsics lowered as arithmetic | **ON** | `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` |
 | 3b | uncommon trap at an `invokedynamic` site | **ON** | `CRATONVM_JIT_IR_SITE_TRAP=0` |
 | 3b' | ...at an unresolved `checkcast`/`instanceof`/`new` | **OFF** — the coldness argument was refuted; see below | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` |
+| 3b" | ...only where the trap could be RESUMED | **ON** (added 2026-09-07) | `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` |
 | 3c | `aastore` through `jit_aastore` | **ON** | `CRATONVM_JIT_IR_AASTORE=0` |
 | 4a | frequency block layout + list scheduling | **ON** | `CRATONVM_JIT_IR_HOT_LAYOUT=0`, `CRATONVM_JIT_IR_LIST_SCHED=0` |
 | 4b | branch profile window around a C2 nomination | **ON** | `CRATONVM_TIER_PGO_C2_WINDOW=0` |
@@ -3043,6 +3282,54 @@ names a class that **has never been loaded**, and a class that has never been
 loaded cannot have been touched by any path that has executed. That is a proof.
 `invokedynamic` has no such proof, and is on the list because the single-pass
 backend has made exactly this trade by default since it stopped bailing on indy.
+
+**A trap the interpreter cannot get back from is not a slow path (2026-09-07).**
+That last sentence — matching the single-pass backend's indy trade — copied the
+trade without its precondition, and the precondition is the whole thing. The
+single-pass `0xba` arm checks the snapshot it just built and bails the entire
+compile (`mark_codegen_unencodable("unresumable-indy-trap")`) when the trap
+could not be resumed. This tier needs that check MORE, not less: `x64::driver`
+sets `can_deopt_resume = !deopt_points.is_empty() && !has_elided_monitor`, while
+`ir_lower` sets it only on the scalar-replacement path, so on a production
+artifact an optimizing-tier deopt has exactly one fallback — the interpreter's
+whole-method replay from entry — and that replay is refused, fatally, once the
+bytecode before the trap has committed something a re-run would duplicate.
+
+`IrBuilder::trap_replay_is_safe` now asks the CONSUMER's own predicate
+(`replay_from_entry_is_observably_equivalent`) before planting, and a refusal
+returns `false`, which the callers already turn into `ir_build_bail` — so the
+method falls back to the single-pass backend rather than going uncompiled.
+`ir_trap_refusal_census()` counts refusals by cause beside `ir_trap_census()`'s
+plants.
+
+Note that `invokedynamic` is `0xba` and `opcode_commits_side_effect` commits the
+whole `0xb6..=0xba` invoke range, so a body containing an indy can never satisfy
+the whole-body clause: every indy trap is decided by the prefix before it.
+
+It costs nothing measurable. An indy trap is UNCONDITIONAL, so an optimizing
+body whose live path reaches one pays a deopt on every call and is strictly
+worse than the single-pass body it superseded; declining it hands the method
+back to a tier that runs it. Measured ABBA-interleaved over 24 Spring classes
+(673 test methods) on one binary: guard ON 294.9 s / 286.6 s, guard OFF
+316.4 s / 336.9 s — no overlap, and the fastest slot is the last one, so host
+drift cannot explain the ordering.
+
+What it is worth, measured on the same day's dev tip and AFTER both deopt-sink
+resume fixes had landed: on the 56-class Spring Framework cluster, switching it
+off costs **20 classes and 296 test methods** (53 OK / 1 FAIL / 2 TIMEOUT
+becomes 34 OK / 21 FAIL / 1 TIMEOUT). Confirmed ABBA-interleaved over six of
+them, byte-identical between repeats of each arm. The sink fixes make an
+unresumable trap *recoverable*; not planting it is what stops these classes
+failing.
+
+Before any of the three fixes, every in-process javac compile under Spring's
+`TestCompiler` died with `InternalError: precise deoptimization unavailable
+... refusing side-effecting replay` (javac catches it, prints its own banner to
+stderr and returns `false` with an empty `DiagnosticListener`, which reads as a
+compile that failed with no diagnostics), and every H2 CRASH class in the
+2026-09-07 3-arm run died the same way. See the retired
+`testcompiler-injit-mode-silent-compile-failure-19-class-aot-cluster` and
+`precise-deoptimization-unavailable-cross-suite-crash` write-ups.
 
 **The intrinsics split by what the intrinsic replaces, not by convenience.**
 Letting an unlowerable intrinsic site take an ordinary `Op::Call` is a
@@ -3486,3 +3773,1433 @@ share, and expected: H2's hot code is collections and MVStore rather than raw
 array loops, which is the same reason the seven-item pass measured flat there.
 
 Regression suite 91/91 on ZGC.
+
+### The remaining 57 refusals are recoverable for free, and recovering them costs 3%
+
+`CRATONVM_JIT_IR_OVER_INTRINSIC=1` already exists and already works. With it on,
+the planner stops refusing a method for containing an intrinsic call site it has
+no node for, and falls back to an ordinary `Op::Call` there:
+
+| H2 | default | `OVER_INTRINSIC=1` |
+|---|---:|---:|
+| `refused_method` | 57 | **0** |
+| bodies accepted | 569 | 614 |
+| bodies lowered | 113 | 123 |
+| fell through to single-pass | 19 | 12 |
+| `lowered_as_arithmetic` | 20 | 29 |
+| `DOD RESULT` | OK | OK |
+| regression suite | 91/91 | **91/91** |
+
+So the whole remaining work list clears, with no correctness cost. That is the
+easy half, and it is the wrong half.
+
+The refusal carries an argument rather than a measurement:
+
+> Every family that reaches here has an emitted intrinsic that replaces a LOOP
+> … or a memory form this tier has no node for … For those the intrinsic really
+> is worth more than the rest of the method's optimization, so the method-level
+> refusal stays.
+
+Earlier in this file an argument of exactly that shape — the acceptance gate's
+evidence list — was measured and turned out to be wrong by 3.4%. This one was
+measured too, and **it is right.**
+
+Three interleaved runs, order reversed on alternate rounds, the default
+configuration run TWICE as its own noise floor, paired counts:
+
+| run | host load | control (cpu / wall) | `over` beats `default` (cpu / wall) |
+|---|---|---|---|
+| 1 | 18% | 11/21, 12/21 — coin, means within 0.6% | **8/21, 8/21** |
+| 2 | high | 17/21, 16/21 — **means 6% apart** | *discarded* |
+| 3 | 31% | 9/21, 7/21 — means within 1.4% | **3/21, 2/21** |
+
+Run 2 is discarded rather than reported: the control disagreed with ITSELF by
+6% on the means, larger than the effect under test, and the absolute times
+jumped from ~2.1 s to ~2.8 s mid-run. Its treatment comparison happened to read
+as a coin, which is exactly why the rule is to discard on the control and not
+on whether the answer is convenient.
+
+Over the two valid runs `over` wins **11 of 42 on CPU and 10 of 42 on wall** —
+about 3% slower on the means, and agreeing in DIRECTION in both instruments and
+both runs.
+
+*(Re-scored 2026-09-07 against the stricter standard the hibernate reversal
+forced on this file. Per run: run 1 is 8 of 21 on both instruments, z = -1.09 —
+**a coin on its own**; run 3 is 3 of 21 and 2 of 21, z = -3.27 and -3.71. Pooled,
+z = -3.09 and -3.39. So "consistent in both runs" overstated run 1: what is
+consistent is the DIRECTION, four times out of four, and the pooled count is
+what carries the significance. That is still a much stronger position than the
+withdrawn hibernate result, whose two samples pointed OPPOSITE ways (+2.47 and
+-2.49) — direction agreement across independent runs is exactly the check that
+one failed and this one passes.*
+
+*What remains untested is the same thing that broke hibernate: both runs used
+the SAME 21 classes, so this establishes REPEATABILITY, not that the effect
+generalises to other H2 classes. The claim is load-bearing — it is why
+`OVER_INTRINSIC` stays off and why the accessor work is scoped as "lower these
+families" rather than "stop refusing them" — so the disjoint-class check is
+worth running before anyone leans on it harder than that.)*
+
+*And that check cannot currently be run, which is the more useful finding: **the
+instrument that produced these numbers is not in the repo.** `tools/suite-pair-ab`
+is fork-per-class JUnit only ("netty, hibernate-reactive" by its own header) and
+knows nothing about H2; the three-interleaved-run harness described above was
+ad-hoc and did not survive its session. So the measurement backing a default-OFF
+flag and a filed work item is, today, unreproducible by anyone including its
+author. Committing an H2 equivalent of `pair-ab` — same ABBA-per-unit shape, same
+same-config noise floor, same split-half check — is the prerequisite for
+re-testing any H2 throughput claim in this file, not just this one.*
+
+**So the intrinsic at those sites really is worth more than optimizing the
+method around it.** Trading an inline unboxing load or an `Atomic*` accessor for
+a generic `jit_invoke_dispatch` costs more than the surrounding body gains, and
+the ~57-method refusal is paying for itself.
+
+The flag stays OFF, and its default is now measured instead of argued.
+
+#### What this makes the work list mean
+
+`refused_method` is a list of families to LOWER, not a list of refusals to lift.
+The bit-scan families above are the pattern that works: recognised in
+`try_ir_scalar_intrinsic`, lowered as real IR nodes, no call at all — both the
+intrinsic's speed and the method's optimization. Calling them instead gets the
+reach and loses the point.
+
+Ranked by how much of the current H2 refusal each family holds:
+
+| family | methods held | shape |
+|---|---:|---|
+| `System.arraycopy` | 10 | memory; a real loop-replacing intrinsic |
+| `Long.longValue` | 8 | a field load behind two header layouts |
+| `AtomicLong.get` | 7 | a volatile load (plain `MOV` on x86-64 TSO) |
+| `String.valueOf(Object)` | 5 | allocation + dispatch |
+| `String.trim` | 4 | string internals |
+| `String.isNotContinuation`, `String.<init>([BB)V` | 4 | string internals |
+| `String.isLatin1` | 3 | string internals |
+| `Integer.intValue` | 3 | as `longValue` |
+| `AtomicInteger` inc/dec, `AtomicLong.getAndAdd` | 3 | `LOCK XADD` |
+| `Math.abs(F)` / `Math.abs(D)` | 2 | `ANDPS`/`ANDPD` with a sign mask |
+| `Long.bitCount` | 1 | needs POPCNT, deliberately excluded |
+| 7 more, one method each | 7 | `String` ctor/`indexOf`/`join`/`valueOf(J)`/`startsWith`, `Arrays.equals`, `AtomicLong.<init>` |
+
+The two `Math.abs` FP forms are the cheapest real entry (a sign-mask AND, no
+memory, no guard); the unboxing and `Atomic*` accessors are the largest single
+block but need a header-shape decision — `box_unbox_intrinsic_shape` resolves a
+`value_compact_offset` AND a `value_legacy_offset`, so an IR node for them has
+to pick between two layouts or guard on one.
+
+### netty and IR inlining: the pass rate is clean, and the throughput number could not be taken
+
+`CRATONVM_JIT_IR_INLINE` ships default ON as of this branch, and every number
+justifying that came from H2. The debt this section pays is the one named above:
+"netty and hibernate are where the IR-inlining soak measured 8% and 15–26%, and
+those are the arms that would price item 1 on its own terms."
+
+200 netty test classes on the Azure host, fork-per-class, 4 shards, 180 s
+per-class cap. ONE binary, one lever, three arms — `on`, `off`, and `on` AGAIN,
+because that box is shared and two arms cannot separate an inlining effect from
+the machine getting busier between them.
+
+| arm | `IR_INLINE` | wall | `sum_class_ms` | PASS | FAIL | ABORTED | HANG | `[ir] spliced` |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| on (1st) | 1 | 977 s | 2,279,174 | 111 | 57 | 18 | 2 | 2802 |
+| off | 0 | 1061 s | 2,374,963 | 110 | 57 | 18 | 3 | **0** |
+| on (2nd) | 1 | 1083 s | 2,693,458 | 111 | 57 | 18 | 2 | 2836 |
+
+#### The engagement census, first
+
+`spliced` is 2802 and 2836 on the two `on` arms and **0** on the `off` arm.
+That is what makes the rest of the table readable at all: the lever demonstrably
+moves the thing it names, on this workload, in this binary. A soak without that
+row is not a soak, and netty is exactly the workload where IR inlining has
+something to chew on — 6600 inline-plan sites against H2's handful.
+
+#### The pass rate: no regression
+
+Across 200 classes the `on` and `off` arms differ in **exactly one class**:
+
+```
+only in the INLINE=1 arm:  io.netty.buffer.AdaptiveByteBufAllocatorGrowthTest ok=400 failed=0
+only in the INLINE=0 arm:  (none)
+```
+
+Every other class reports identical `ok=` and `failed=`. `FAIL=57`,
+`ABORTED=18` and `NOTESTS=12` are byte-identical in all three arms, and the two
+`on` arms agree exactly (111/57/18/2/12). The one class that differs completed
+400 tests with inlining and hit the flat 180 s cap without it — which is a
+HANG-vs-PASS at a timeout on a host under load 10–20, not a demonstration that
+inlining rescued it.
+
+**So the default-ON flip does not regress netty.** That is the claim worth
+making and it is the one the run supports.
+
+#### The throughput number: NOT measured, and not reported as if it were
+
+The naive reading of the table is that `on` beats `off` by 7.9% on wall and 4.0%
+on `sum_class_ms`, comfortably in line with the 8% this section owed. That
+reading is wrong, and the third arm is what says so:
+
+* wall: the two IDENTICAL arms are 977 s and 1083 s — **10.8% apart**, against a
+  7.9% on-vs-off difference.
+* `sum_class_ms`: 2,279,174 and 2,693,458 — **18% apart**, against 4.0%.
+
+**The control disagrees with itself by more than the effect**, in both
+instruments, so no throughput conclusion is available. Host load ran between
+2 and 21 over the three arms (another session was building with `-j 6`
+throughout), and the arms are necessarily sequential because the harness is
+fork-per-class rather than interleaved.
+
+This is the third time in this document that rule has fired — the acceptance
+gate's discarded run, the over-intrinsic run 2, and now this one. It keeps
+firing because the tempting number and the invalid control arrive together: had
+the third arm been skipped, this section would have reported "8% confirmed on
+netty" and been believed.
+
+What it would take to price it properly: a quiet host, or an interleaved harness
+that alternates the lever per CLASS rather than per run so drift cancels
+pairwise. The per-class `@@RESULT ms=` values make the second one cheap to
+build, and that is the right next step for anyone who wants the number rather
+than the pass rate.
+
+hibernate-reactive was not run. The netty arm alone took ~50 minutes of host
+time in a three-arm shape, and a second suite would have added nothing the
+control did not already invalidate.
+
+### The per-class alternating harness, and what it says about the host
+
+The section above ended with what it would take to price IR inlining properly:
+"a harness that alternates the lever per CLASS rather than per run so drift
+cancels pairwise". That is `tools/suite-pair-ab/pair-ab.sh`.
+
+It is generic over the lever (`--lever CRATONVM_X --on 1 --off 0`) and over the
+suite, because nothing in it is netty-specific beyond the runner directory it is
+pointed at.
+
+#### The design, and why each piece is load-bearing
+
+**ABBA, not AB.** Each class is measured as four runs, `A B B A` (and `B A A B`
+on odd classes, so the block asymmetry cancels across the list). ABBA cancels
+LINEAR drift exactly: the mean timestamp of the two A runs equals the mean
+timestamp of the two B runs, so a host steadily getting busier contributes
+equally to both arms. Plain alternation does not have that property.
+
+**The within-arm noise floor.** `|A1-A2|` and `|B1-B2|` are two runs of the SAME
+configuration, so they measure the host and not the lever. This is the piece the
+per-run shape could not have at any repetition count, and it is what lets the
+harness say **UNMEASURABLE** instead of reporting a number. A harness that
+cannot decline will eventually assert something false.
+
+The two floors are deliberately asymmetric and the pessimistic one is used: in
+ABBA the B runs are adjacent (positions 2, 3) while the A runs are separated by
+them (1, 4), so `|B1-B2|` understates the noise and `|A1-A2|` overstates it. The
+reported floor is `max(A, B)`, because the failure being defended against is
+claiming an effect that is really drift.
+
+**The same-work gate.** A pair counts only when all four runs report identical
+`found/ok/failed/skipped/aborted`. Two runs that executed different numbers of
+tests have incomparable `ms=`, and without this gate a flaky class contributes a
+work difference disguised as a timing difference. Classes with `ok=0`, any
+failure, or any abort are dropped for the same reason — on the 24-class
+validation slice that dropped 13 of 24, which is the gate working, not a defect.
+
+**Strictly sequential.** No shards. Sharded forks compete with each other, so
+the two members of a pair would see different contention — the exact thing the
+design exists to remove.
+
+#### What it measured, which is the host
+
+24 netty classes, `CRATONVM_JIT_IR_INLINE` on vs off, host load 11-13 with
+another session building throughout:
+
+```
+A faster than B in 7 of 11 classes  (fair coin under no effect)
+median per-class delta : +1.0%
+median within-arm noise: 11.6%   (SAME config, two runs)
+  of the 2 classes whose own delta beats their own noise: A faster in 1
+VERDICT: UNMEASURABLE.
+```
+
+Read naively that is "inlining wins 7 of 11 and is 1.0% faster". The harness
+refuses it, and it is right to: **two runs of the identical configuration differ
+by 11.6%**, eleven times the effect. Only two of eleven classes had a delta
+larger than their own noise, and those two split 1-1.
+
+That number is the useful output. It quantifies, for the first time, why the
+three-arm per-run A/B could not work on this host — not "the arms were 17
+minutes apart" as a hypothesis, but **11.6% same-config variance measured
+back-to-back on the same class**. Any per-run design was doomed by a wide
+margin, and so is this one at this load.
+
+Two individual classes are worth recording because the per-run shape could never
+surface them: `AdaptiveLittleEndianHeapByteBufTest` came in at -3.9% against a
+1.6% floor (inlining SLOWER) while `AdaptiveBigEndianHeapByteBufTest` read
++12.9% against 11.6%. Whatever the aggregate turns out to be, IR inlining is not
+uniformly good or bad across classes, and a single suite-wide number would hide
+that.
+
+#### How to get the number
+
+Run it on a quiet host. The floor is a property of the machine, not the harness:
+on the 12-class smoke run earlier the same day, individual classes reported 1%
+and 3% floors, so a quiet box should resolve effects in the low single digits.
+`--min-ms` drops classes too short for the JIT to matter, and `--count` /
+`--start` shard the list across sessions.
+
+The verdict line is the contract: if it says UNMEASURABLE, the run has produced
+a noise measurement and no throughput claim, and the honest report is the floor.
+
+#### The floor is the machine, and the 8% is not there
+
+The claim above — that the 11.6% floor is a property of the host rather than of
+the harness — is testable, so it was tested: the SAME classes, the same lever,
+run again when the box had quietened from load 11-13 to load ~4.
+
+| class | floor at load 11-13 | floor at load ~4 |
+|---|---:|---:|
+| `BootstrapTest` | 2.5% | **0.9%** |
+| `ServerBootstrapTest` | 26.9% | **1.9%** |
+| `AbstractReferenceCountedByteBufTest` | 93.0% | **2.7%** |
+| `AdaptiveBigEndianDirectByteBufTest` | 3.7% | **2.1%** |
+| `AdaptiveBigEndianHeapByteBufTest` | 11.6% | **0.9%** |
+
+The floor is the machine. On the quiet run the harness resolves to about 2%,
+and it does that on the very classes that read 27% and 93% an hour earlier.
+
+```
+A faster than B in 2 of 6 classes
+median per-class delta : -0.6%
+median within-arm noise: 2.0%   (SAME config, two runs)
+  no class had a delta larger than its own within-arm noise
+VERDICT: UNMEASURABLE
+```
+
+**And that is the substantive finding, not a shrug.** At a 2.0% floor the
+effect of IR inlining on these six netty classes is smaller than 2%, and the
+median points very slightly the OTHER way (-0.6%, inlining marginally slower).
+The original 8% is not merely unconfirmed here — it is excluded at this
+resolution on this slice. Six classes is a small slice and the honest scope is
+"these six", but the instrument was good enough to have seen 8% and did not.
+
+#### The one class that differed in the suite A/B was a timeout, confirmed
+
+The per-run three-arm comparison found exactly one class differing between
+inline-on and inline-off: `AdaptiveByteBufAllocatorGrowthTest` passed with
+inlining and HUNG without it, at the flat 180 s cap. That was read cautiously at
+the time as "a slow class near the cap, not a rescue".
+
+Run sequentially with no shard contention it takes **91.4 s with inlining and
+90.7 s without** — a 0.7% difference against a 3.0% floor. It is a ~91 s class
+that crosses a 180 s cap when four shards compete, and the lever had nothing to
+do with it. The caution was right, and this is what it looks like to close that
+kind of loose end instead of leaving it as a hedge.
+
+## The seven follow-ups, 2026-09-07
+
+### 1. Pricing what shipped default-ON without a price
+
+Range BCE and the scalar-intrinsic families both went in on correctness and
+engagement — 91/91 on three collectors, six of ten checks removed on a probe,
+twenty-odd sites lowered — and neither was ever measured for throughput. That
+is the same omission this file criticised the acceptance gate for, so it was
+closed. H2, one binary, one lever, three arms with the default run TWICE as its
+own floor, host at 4% CPU:
+
+| lever | paired count (cpu / wall) | control (cpu / wall) | verdict |
+|---|---|---|---|
+| `CRATONVM_JIT_IR_BCE_RANGE=0` | 11/21, 11/21 | 13/21, 11/21 | **coin** |
+| `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` | 9/21, 10/21 | 12/21, 12/21 | **coin** |
+
+Both are throughput-neutral on H2. For the scalar-intrinsic arm the control's
+own means sat 3.6% apart, which is as large as the treatment gap, so only the
+paired counts are readable there — the means are not.
+
+Neither result is a disappointment and neither is a reason to remove anything:
+they are reach and correctness work, which is the same verdict the original
+seven-item pass earned. What changed is that it is now measured rather than
+assumed in the favourable direction.
+
+### 2. IR inlining on netty, with the per-class harness
+
+Two runs of `tools/suite-pair-ab/pair-ab.sh`, 46 usable classes between them:
+
+| run | classes | A faster | median delta | noise floor | verdict |
+|---|---:|---:|---|---|---|
+| quiet host | 6 | 2 | -0.6% | **2.0%** | UNMEASURABLE |
+| busier host | 40 | 17 | -0.7% | 8.8% | UNMEASURABLE |
+
+**19 of 46 overall** — a coin, leaning very slightly against inlining, with both
+runs agreeing on the sign and the magnitude (-0.6% / -0.7%). The 8% that
+motivated this whole line of work is not there. The quiet run resolves to 2%,
+so an 8% effect would have been unmissable.
+
+Five classes had a delta beating their own noise; A was faster in three of
+them. Even the individually-significant subset is a coin.
+
+### 3. Why the other bounds checks are not provable — and why NOT to extend the pass
+
+The range pass proves 9-11 checks of ~130 on H2. The obvious next move is to
+relax its two restrictions (unit stride, guard-dominates-back-edge). The
+refusal census says that would be wasted work:
+
+```
+[c2-supersede] ir bounds range refusals:
+    no-length-test=110  other-array=16  index-not-non-negative=4
+```
+
+`guard-not-dominating=0`. `iv-shape-rejected=0`. **Not one bounds check on H2
+fails because of the stride rule or the back-edge rule.** 110 of 130 fail
+because the index is never compared against ANY array length anywhere in the
+graph — they are isolated accesses, not loop-guarded ones, and no relaxation of
+a loop-shape rule reaches them.
+
+Removing those needs a different technique altogether (whole-method length-fact
+propagation, or speculative predication with a deopt), not an extension of
+this pass. Sixteen more are indexed by one array and length-tested against
+another, which needs an equal-length or aliasing fact this tier does not have.
+
+That is the entire value of the census: without it the next session extends the
+stride rule, measures no change, and has to work out why. `pair-ab` and this
+are the same lesson in two places — build the instrument that can say "no".
+
+### 4. `Math.abs(float)` / `Math.abs(double)` as scalar intrinsics
+
+The first FP members of `ScalarOp`, and the cheapest entry left on the
+work list. One AND against a sign mask — no branch, no memory, no CPU feature.
+
+The sign-mask form is not merely faster than `x < 0 ? -x : x`, it is *more
+correct*: the comparison form returns **-0.0** for `abs(-0.0)`, because
+`-0.0 < 0` is false. `probes/ScalarFpAbsProbe.java` pins that (via `1/x`, since
+`-0.0 == +0.0` compares true), plus NaN, both infinities, both `MIN_VALUE`
+subnormals and a full-mantissa value, and agrees with HotSpot on all of them.
+
+These do NOT go through `gp_load_value`/`store_rax` like every other member, so
+the lowering arm gained an `is_fp()` guard that returns before the
+general-purpose load. Two things made that safe to bolt onto the existing op
+rather than needing a new one: `fp_load_value`/`fp_store_value` already exist,
+and `value_home_droppable` refuses any type that is not `Int`/`Long`, so the
+`op_home_is_one_store_rax` claim over `Op::ScalarIntrinsic` is filtered by type
+before it can be consulted for an FP node.
+
+`every_declared_family_is_recognised` now drives off an EXHAUSTIVE match
+instead of a hand-kept tuple list. The old form could not catch the one failure
+it existed for — a family present in the enum and the lowering but missing from
+the recognizer, which reads from outside exactly like a workload with no such
+call site. Adding a variant is now a compile error until its signature is
+declared.
+
+H2 `refused_method` 57 -> 45.
+
+### 5. The unresolved-class trap does NOT self-heal — and the correction above was wrong
+
+This file said, earlier today, that the original assessment of this trap had
+named the wrong blocker:
+
+> `Op::Guard` does bake an action into its `DeoptimizationPoint`, but nothing
+> reads it. […] `UncommonTrap` takes the count-based policy: `Reinterpret` on
+> the first deopt, then `RecompileAndReinterpret`. So the self-healing the
+> switch was said to be waiting for is already there, one deopt later than
+> ideal.
+
+**That correction was itself wrong, and the text it corrected was right.**
+`probes/UnresolvedTrapProbe.java` fires the trap and the answer is not
+ambiguous.
+
+The probe's shape is the awkward part and worth keeping: for a trap to be
+planted the class must be unloaded when the method compiles, but a method only
+gets hot by running, and running the cast would load the class. So the cast
+sits behind a parameter that is false during warm-up — 200,000 calls with
+`doCast=false` compile the method with `Shape` still unloaded, then 200,000
+calls with `doCast=true` put the trap on a live path.
+
+```
+[c2-supersede] ir site traps planted: unresolved-typecheck=1
+200000  reason=UnreachedCode bci=5 action=MakeNotCompilable
+        eager re-queue (RecompileAndReinterpret): 0
+```
+
+**Every single call deopts.** 200,000 of 200,000, at the checkcast bci, with
+`MakeNotCompilable` and not one recompile. The answers stay correct — the
+interpreter finishes the bytecode — which is exactly why this could never have
+been settled by a correctness probe, and why the earlier reasoning went astray:
+the failure mode is throughput, permanently, and it is invisible unless you
+count deopts.
+
+Two things the run also settles:
+
+The reason is `UnreachedCode`, not the `UncommonTrap` that `Op::Guard`'s
+lowering bakes into its `DeoptimizationPoint`. So the guard's `reason` field is
+as dead as its `action` field — the runtime sees a fixed code — and
+`UnreachedCode` maps to `MakeNotCompilable` on the FIRST occurrence, with no
+count-based escalation at all. That is the mechanism, and it is worse than
+either the original text or its correction supposed.
+
+It is not the acceptance gate hiding the IR body either. With
+`CRATONVM_C2_ACCEPT=always` (`accepted=4 refused_no_evidence=0`) the result is
+byte-identical: 200,000 deopts, same reason, same action.
+
+`CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` stays **OFF**, now for a measured
+reason. And a flag worth raising rather than burying: the `invokedynamic` trap
+is DEFAULT ON and is planted by the same `plant_uncommon_trap`, so it has the
+same property. No harm is observed — H2 plants 21 of them and fires none, and
+an indy bootstrap this tier will never lower has no "later" to wait for — but
+"none of them has ever gone live on a workload we run" is the only thing
+standing between that default and this behaviour.
+
+The lesson worth keeping is about the correction, not the trap: a unit test
+with no deopt runtime could not distinguish "traps once and heals" from "traps
+forever", and I used that inability as licence to prefer the reading I had
+derived from reading a policy function. Reading a policy function is not
+running one.
+
+### 6. hibernate-reactive
+
+60 classes, one binary, one lever.
+
+| arm | `IR_INLINE` | PASS | NOTESTS | `[ir] spliced` |
+|---|---|---:|---:|---:|
+| on | 1 | 59 | 1 | **12,677** |
+| off | 0 | 59 | 1 | **0** |
+
+Pass rates identical, and the engagement census is emphatic: hibernate gives IR
+inlining more than four times the work netty does (12,677 splices against
+2,802). If any workload here were going to show the effect, it is this one.
+
+`sum_class_ms` reads 1,061,583 on and 1,179,251 off — a 10% win, the largest
+apparent number in this whole investigation. **It is not reported as a result**,
+because it is a per-run sequential comparison, which the section above proved
+cannot produce a timing number on this host. It is exactly the shape that read
+"8% on netty" and turned out to be drift.
+
+So the harness was pointed at hibernate instead, and it found something.
+
+### The one real throughput result: inlining is a small, consistent win on hibernate
+
+37 usable classes, ABBA per class:
+
+```
+A faster than B in 26 of 37 classes
+median per-class delta : +0.3%
+median within-arm noise: 6.9%   (SAME config, two runs)
+  of the 3 classes whose own delta beats their own noise: A faster in 3
+sign test on the paired count: z = +2.47  (consistent, p < 0.05)
+VERDICT: SMALL BUT CONSISTENT.
+```
+
+26 of 37 is not something a fair coin does. Each individual class is
+noise-dominated — 0.3% against a 6.9% floor — but the DIRECTION survives
+averaging over 37 of them, and the three classes that individually clear their
+own noise all point the same way.
+
+**This is the first positive throughput result for IR inlining on real code in
+this document**, and it is nothing like 8%: it is a fraction of a percent,
+detectable only because the sign test aggregates many classes. Set against
+netty's 19 of 46 (z = -1.18, a coin), the picture is that IR inlining is
+somewhere between neutral and slightly positive on real applications, and the
+original 8% does not reproduce anywhere.
+
+#### The harness had to be corrected to see it
+
+The first version compared the median effect against the median noise floor and
+called hibernate UNMEASURABLE. That rule is right for a single class and wrong
+for a suite: a small effect that is CONSISTENT across many classes is exactly
+what a per-class design can detect and a per-run design cannot, and folding the
+paired count out of the verdict threw away the only thing this harness was
+built to find. `pair-ab.sh` now reports the sign test as a z-score and has a
+third verdict, SMALL BUT CONSISTENT, for effect-below-floor with a paired count
+a coin does not produce. netty still reads UNMEASURABLE under the new rule
+(z = +0.90); hibernate reads z = +2.47.
+
+### 7. The two flakes
+
+**G1's GC-stress family is a harness TIMEOUT, not a stochastic defect.** Four
+clean full-suite G1 runs on an uncontended host: **92/92, four times.** The
+earlier "91, 91, 90" that put this on the residual list was taken while other
+work shared the box.
+
+A fifth run, taken deliberately while twelve `cargo test` invocations ran
+alongside, reproduced the failure and labelled it:
+
+```
+RExceptions   FAIL rc=124: HARNESS FAULT — TIMED OUT; the harness killed the
+                   VM, it did not fail [try TIMEOUT=600]
+RMapGcStress  FAIL rc=124: HARNESS FAULT — TIMED OUT ...
+HARNESS ERROR [G4] RJdkFormatLocale: the HotSpot oracle run FAILED (rc=1)
+```
+
+The HotSpot ORACLE failed in that run too, which no CratonVM defect can cause.
+So the vector to record is not "RMapGcStress is flaky on G1" but "the suite's
+flat per-class timeout is too tight for a contended host", and the fix is
+`TIMEOUT=600` or an uncontended run, not a `known-flaky.txt` row. That also
+explains why the vector passed 4/4 when run alone and failed only inside a full
+suite: the suite is what supplies the load.
+
+**`test_jit_cache_clear_all_evicts_entries` is NOT MEASURED, and the reason is
+worth writing down.** The `cratonvm-vm` lib-test target does not build in this
+checkout: release ends in `rustc` exit 101, and debug fails with
+`os error 112 — not enough disk space`. The machine had **0 bytes free of
+930 GB**, and the debug tree from that one attempt was itself 9.3 GB. Nothing
+was measured because nothing could be run.
+
+What the G1 result does supply is a much better prior. The original observation
+was "1 failure in 11 PARALLEL runs, 0 single-threaded" — the same contention
+signature that turned out to explain the G1 family entirely. That is a
+hypothesis with new support, not a result, and it is recorded as one.
+
+### The invokedynamic trap fires on real code, and firing cost the method every tier
+
+The section above flagged this and did not measure it: the `invokedynamic`
+trap is DEFAULT ON, is planted by the same `plant_uncommon_trap` as the
+unresolved-class trap, and therefore has the same never-heals property —
+"no harm is observed" being the only thing standing between that default and
+the behaviour.
+
+Harm is observed. H2, default configuration:
+
+```
+ir site traps planted: invokedynamic=21 ... | TAKEN at runtime: 1
+org/h2/mvstore/MVStore.getMapId:(Ljava/lang/String;)I
+    reason=UnreachedCode bci=5 action=MakeNotCompilable
+```
+
+One of the twenty-one went live, and `MakeNotCompilable` is consulted by
+`compile_gate` itself (`is_jit_bail_listed`), so `getMapId` lost its body on
+**every** tier — including the single-pass backend, which lowers
+`invokedynamic` perfectly well and had been compiling that method before site
+traps existed. Planting a trap to gain the rest of the method's optimization
+cost the method all of its compilation, permanently, the first time the trapped
+path ran.
+
+#### Where it came from
+
+`try_resume_trapped_callee` hard-codes the reason it reports, ignoring the
+`DeoptimizationPoint` the artifact carries — which is why `Op::Guard`'s baked
+`UncommonTrap` never reaches the policy. Its comment says so, and anticipates
+this exact case:
+
+> Reason: `UnreachedCode` — the one-shot "give up immediately" policy […] so
+> the trapping method is made not-compilable on the FIRST resolution […]
+> (A guard-bail stash reaching this arm is over-blacklisted by this —
+> acceptable: it reverts to the interpreter, which is always correct.)
+
+Correct for the single-pass indy trap, where no tier can do better. Wrong for an
+IR site trap, where only the OPTIMIZING tier had the problem. "Reverts to the
+interpreter, which is always correct" is true about answers and silent about
+throughput, and this is the second time in this document that a
+correctness-only argument hid a permanent slowdown.
+
+#### The fix
+
+A site trap now says what it means: ban the optimizing tier for this method —
+the memo `try_compile_inner` already consults — and pick a reason that
+RECOMPILES rather than blacklists. The recompile then goes single-pass and does
+not trap. `SpeculationFailed` is that reason: `RecompileAndReinterpret` until
+the per-method deopt count crosses `max_deopts_per_method`, which keeps a
+backstop if the assumption is ever wrong.
+
+Telling the two apart needs the runtime to know the artifact carries a site
+trap, so `plant_uncommon_trap` now records the method (`build(mut self, ..)`
+consumes the builder, so the count comes back through a per-build thread-local,
+the same idiom `reset_string_access_sites` uses).
+
+H2, same workload, after:
+
+```
+ir site traps planted: invokedynamic=21 ... | TAKEN at runtime: 1
+org/h2/mvstore/MVStore.getMapId  reason=SpeculationFailed
+                                 action=RecompileAndReinterpret
+eager re-queue (RecompileAndReinterpret) org/h2/mvstore/MVStore.getMapId
+```
+
+One deopt, one recompile, IR banned for that method, single-pass body restored.
+`DOD RESULT OK`, regression suite 92/92.
+
+#### TAKEN, at last
+
+`plant_uncommon_trap`'s own doc has promised this since it was written —
+"[`ir_trap_census`] counts what was PLANTED by cause; the runtime side counts
+what is TAKEN. A cause whose taken count is not ~0 has had its coldness
+argument refuted" — and the runtime side did not exist. It does now, and it is
+the number that refuted the argument: `TAKEN at runtime: 1` on H2 by default,
+and 200,000 on `UnresolvedTrapProbe`.
+
+#### What is NOT fixed
+
+The fix restores the method's compilation; it does not stop a HOT trapped path
+from deopting. `UnresolvedTrapProbe`, whose trapped path runs 200,000 times,
+still reads 200,000 deopts — 20 of them `RecompileAndReinterpret` and the rest
+`MakeNotCompilable` once the per-method count crosses its threshold. The IR ban
+takes effect (`memo_skips=5`) and the re-queues happen (20), but the trapping
+artifact is not displaced from under the running caller, so calls keep entering
+it.
+
+So: a trap on a COLD-ish path (the real H2 case, one fire) is now cheap and
+self-correcting. A trap on a HOT path is still a permanent deopt loop, and the
+remaining blocker is artifact displacement, not the deopt policy. That is the
+next piece of work, and it is why
+`CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` — whose sites are demonstrably hot —
+stays OFF.
+
+#### Artifact displacement: what it is, and what could actually be done
+
+The residual above was "the trapping artifact is not displaced from under the
+running caller". Tracing it named the mechanism exactly.
+
+`main` bakes a raw direct `CALL` to the callee's entry
+(`CRATONVM_DBG_JIT_FIELD_SITES` prints one `[jit-emit-direct]` per baked call,
+here at pc=23 and pc=92). Eviction machinery all fires on the first trap:
+`jit_cache.remove` runs `invalidate_matching`, whose transitive reverse closure
+evicts *the direct caller too*, and the epoch is bumped. It demonstrably works
+— the tracer shows `main` recompiled and baking a SECOND callee entry.
+
+And it changes nothing here, because the caller is a single **in-flight
+invocation** running a loop: 200,000 calls happen inside one `main` frame, whose
+already-executing code holds the old address. Cache eviction governs future
+ENTRIES to a method, not a frame midway through one. Displacing that needs the
+caller's frame deoptimized, or the callee's entry patched to a re-dispatch stub
+— and `MakeNotEntrant` is an enum variant in this tree with no entry-patching
+behind it, so there is no cheap displacement to reach for. Writing one is real
+runtime surgery (atomic patching of live code under W^X, against threads that
+may be at the entry) and is not something to bolt on beside a trap fix.
+
+What IS in reach is refusing to compound the damage. The deopt bookkeeping
+exists to DECIDE a policy; once IR is banned for the method and the recompile
+has happened, every later trap re-runs a decision already taken — and that is
+not free, because `SpeculationFailed` escalates on the per-method deopt COUNT.
+A trapped site in a long-running caller therefore drove the method to
+`MakeNotCompilable` purely by being reached often: the exact outcome the fix
+exists to prevent, arrived at by a different road.
+
+So the decision is taken once, and the rest resume in the interpreter.
+
+| `UnresolvedTrapProbe` | before the trap fix | after it | after this |
+|---|---:|---:|---:|
+| deopt EVENTS | 200,000 | 200,000 | **1** |
+| `MakeNotCompilable` | 200,000 | 199,980 | **0** |
+| site traps TAKEN | (uncounted) | 200,000 | 200,000 |
+| re-fired after the decision | — | — | 199,999 |
+
+The trap still fires 199,999 times — that is the in-flight caller and nothing
+short of displacement removes it — but it now costs an interpreter resume
+apiece instead of deopt bookkeeping plus permanent blacklisting, and the method
+is fully compiled again the moment that frame returns. The residual is
+COUNTED rather than hidden: `ir site traps re-fired after the decision` is a
+direct measure of how much a real workload would gain from entry patching, and
+on H2 it is **0**.
+
+H2 unchanged: 21 planted, 1 taken, 0 re-fired, 0 blacklisted, suite 92/92.
+
+### A census number is only comparable to one taken BACK TO BACK
+
+Several deltas in this file were quoted from runs taken minutes or hours apart —
+`refused_method 57 -> 45` for the `Math.abs` work most recently. That is not a
+valid delta, and this section is the measurement that says so.
+
+Twenty-four runs of the same workload on the same binary, no lever changed:
+
+| batch | `accepted` | `refused_method` | `lowered_as_arithmetic` | `bounds_emitted` |
+|---|---|---|---|---|
+| A (7 runs) | 527-585 | 43-54 | 19-24 | 129-164 |
+| B (5 runs) | 526-582 | 44-54 | 19-24 | 130-166 |
+| C (12 runs) | 560-578 | — | — | — |
+
+Across all 24, `accepted` spans **526 to 585 — 11%**. Within a contiguous batch
+it is roughly ±1%. The between-batch spread is an order of magnitude larger
+than the within-batch spread.
+
+An intermediate reading of the first twelve runs looked cleanly BIMODAL — nine
+at ~529 and two at ~584, well separated and internally tight — and that reading
+was wrong. The third batch sat at 570-578, between the two supposed modes, which
+no two-mode model produces. Twelve samples were enough to fit a story and not
+enough to test it.
+
+What survives is simpler and more useful: **the census drifts with ambient
+machine state**, and the drift dwarfs most of the effects being reported. The
+cause is not chased here — background compilation is a race between the
+compiler threads and the workload's own progress, and which methods cross their
+thresholds depends on how the machine feels — but the consequence is concrete:
+
+> A census delta is only meaningful between runs taken **back to back**, in one
+> batch, on one binary, with one lever changed. Exactly the discipline the
+> timing work already uses; it applies to deterministic-looking counters too,
+> because they are not deterministic.
+
+#### The claims this corrects
+
+`refused_method 57 -> 45` for `Math.abs(F)/(D)`: the 57 and the 45 came from
+different sittings and the gap is inside the 43-54 range a single configuration
+produces. The DIRECTION is not in doubt — the two families are recognised and
+lowered, `every_declared_family_is_recognised` proves the recognizer sees them,
+and `Math.abs` disappears from the per-family refusal breakdown — but the
+MAGNITUDE was never measured. The honest statement is "two families moved from
+refused to lowered", with no number attached.
+
+The same caution applies to every single-run census figure quoted above. The
+ones taken as an A/B pair in one sitting — the range-BCE arms, the
+over-intrinsic arms, the trap on/off arms — are unaffected, because both halves
+were taken back to back. That is the whole distinction.
+
+### `test_jit_cache_clear_all_evicts_entries`: 111 runs, 0 failures
+
+Recorded on the residual list as "1 failure in 11 parallel runs, 0
+single-threaded — measured, not proven pre-existing". It was unmeasurable for
+most of a day because the test target would not build: release ended in `rustc`
+exit 101 and debug in `os error 112, not enough disk space`, on a machine with
+**0 bytes free of 930 GB**. Once space came back it built immediately, which
+says the exit-101 was the disk too.
+
+Then a false start worth recording, because it produced a clean-looking zero:
+the first attempt ran the `cratonvm-vm` lib-test binary and got 0 failures in
+30 — from a binary that does not contain the test. `--list | grep -c` said
+`present: 0`. The test lives in `jit/src/lib.rs`, not the vm crate. A pass count
+from a binary that never ran the test is the vacuous green this file keeps
+re-learning, and the only thing that caught it was asking the binary whether it
+had the test rather than assuming the filter matched something.
+
+With the right binary, four shapes:
+
+| shape | runs | failures |
+|---|---:|---:|
+| the test alone, `--test-threads=1` | 30 | 0 |
+| the `jit_cache` module, 8 threads | 20 | 0 |
+| the FULL binary (2,283 tests), default parallelism | 25 | 0 |
+| **six CONCURRENT full binaries**, deliberate max contention | 36 | **0** |
+
+**111 runs, no failures.** At 0/111 the 95% upper bound on the rate is about
+2.7%, which excludes the 9% that "1 in 11" implies. The last shape matters most:
+the original sighting was inside a `cargo test` run, which starts many test
+binaries at once, so six concurrent copies of the heaviest one is a harder
+version of the same condition.
+
+Two readings survive and the second is better supported. Either the single
+observed failure was far rarer than one in eleven, or — consistent with the G1
+family in this same session, where failures under load turned out to be
+`rc=124 HARNESS FAULT — TIMED OUT` and the HotSpot ORACLE failed too — it was
+whole-machine contention during a `cargo test` that was also compiling. The
+recorded rate is not supported either way, and the residual should say so rather
+than carry a number nothing reproduces.
+
+### The hibernate inlining result REVERSES on a disjoint sample — there is no positive throughput result
+
+This file said, earlier today:
+
+> **This is the first positive throughput result for IR inlining on real code
+> in this document** […] 26 of 37 is not something a fair coin does.
+
+It was tested on the rest of the suite and it does not hold. Same binary (one
+`mtime`, both runs on it), same harness, same lever, disjoint classes:
+
+| sample | classes | A (inline ON) faster | median delta | median noise | z |
+|---|---:|---:|---:|---:|---:|
+| hibernate, classes 0-39 | 37 | 26 (70%) | +0.3% | 6.9% | **+2.47** |
+| hibernate, classes 40-119 | 78 | 28 (36%) | **-0.4%** | **2.7%** | **-2.49** |
+| **hibernate pooled** | **115** | **54 (47%)** | — | — | **-0.65** |
+| netty | 46 | 19 (41%) | — | — | -1.18 |
+| **every inline pair taken** | **161** | **73 (45%)** | — | — | **-1.18** |
+
+Two disjoint halves of ONE suite, each "consistent, p < 0.05", pointing in
+OPPOSITE directions, with z-scores that are near mirror images. Pooled, the
+whole thing is a coin — and so is every inlining pair ever taken here, 73 of
+161.
+
+The second sample is the better one on every axis that matters: twice the
+classes, and a median within-arm noise of 2.7% against the first's 6.9%. If
+either were to be believed it would be the one saying inlining is SLOWER. The
+honest reading is that neither is: **IR inlining has no measurable throughput
+effect on hibernate**, and the earlier claim is withdrawn.
+
+#### What went wrong, and what the harness now has to say
+
+The design was right about the thing it was built for — a per-class ABBA pairing
+does remove the drift that made a per-run comparison useless, and the noise
+floor it reports is real. The error was in the inference laid on top: a sign
+test over classes assumes the per-class deltas differ only by the lever plus
+symmetric noise. They do not. Classes carry their own systematic
+differences — how much of the run is JIT-visible at all, how much is MySQL
+round-trips — and slicing a null effect into two class subsets can hand you a
+significant count in either direction. Which is exactly what it did.
+
+So a paired count is evidence about THE CLASSES IT WAS TAKEN OVER, and a
+significant z is a reason to take a SECOND, disjoint sample — not a result.
+This is the same lesson as the census drift recorded above, one level up: there
+the trap was comparing runs across time, here it is generalising from a sample
+to the suite.
+
+`pair-ab.sh` prints the count, the z and the noise floor and it printed them
+correctly both times. The verdict line is what over-reached, and it now says so:
+SMALL BUT CONSISTENT requires a confirming disjoint sample before it means
+anything.
+
+### A one-lever A/B found the TRIGGER and I called it the defect
+
+The question was whether `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` could default ON
+now that firing no longer blacklists a method. H2 said yes emphatically — 48
+traps planted, **none taken**, `accepted` 579 -> 592, `lowered` 116 -> 127, no
+blacklists. Thirty hibernate-reactive classes said the opposite, and the control
+arm is where the interesting number was:
+
+| arm (binary WITHOUT the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| unresolved-class trap ON | 64 | 33 | 120 | 102 |
+| the shipped default (indy trap ON) | 182 | 7 | 4 | **36** |
+| all site traps OFF | **241** | **0** | 0 | **0** |
+
+The third arm only got run because the second — the *control* — had 36 hard
+errors sitting in it. One lever, 241/0/0 against 182/7/36, and the conclusion
+looked inescapable: the default-ON `invokedynamic` trap was costing 59 passing
+tests and 36 `InternalError`s in the stock configuration. The callees named in
+those errors were exactly the ones tabulated on the `TransferToInterpreter`
+known-issue page filed that morning. So site traps were switched to default OFF.
+
+**That was wrong, and the check that caught it was re-reading dev before
+pushing.** Another session had spent the same afternoon on the same family from
+the other end and found the actual defect: one deopt SINK aborted on a trapped
+frame that its sibling sink resumed (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default
+ON). Re-measured on a binary carrying their fix:
+
+| arm (binary WITH the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| site traps ON | 239 | 0 | 7 | **0** |
+| site traps OFF | 241 | 0 | 0 | **0** |
+
+Zero errors either way. The trap was never the defect — it was the thing that
+*produced the deopts* the broken sink then mishandled. Traps fire (`TAKEN=7`)
+and nothing breaks. The default-OFF flip is reverted.
+
+And the arm that started all this reverses too. The unresolved-class trap, the
+one that read `ok=64 failed=33` and looked destructive, on the fixed binary:
+
+| arm (binary WITH the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` | **241** | **0** | **112** | **0** |
+| the shipped default | 241 | 0 | 9 | 0 |
+
+One hundred and twelve traps fired, no failures, no errors, the same pass count
+as the default. Every number this file has ever recorded against that switch —
+"200,000 deopts", "traps forever", "craters hibernate" — was measuring a broken
+deopt sink through it.
+
+So the CORRECTNESS objection to `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` is gone.
+It stays OFF anyway, because the case for turning it ON was always throughput
+(+13 accepted bodies and +11 lowered on H2) and that has never been measured —
+and the inlining reversal recorded above is a fresh demonstration of how hard
+that measurement is to get right here. What has changed is the reason: it is no
+longer "this is harmful", it is "this is unmeasured".
+
+#### The methodological point, which is the part worth keeping
+
+A single-lever A/B is airtight about one thing and silent about another. Turning
+site traps off removed the errors, and that PROVED the trap is on the causal path
+to the failure. It said nothing about whether the trap or something downstream of
+it was the defect — and a kill switch answers identically in both cases. Every
+feature that produces deopts would have "fixed" this bug by being switched off.
+
+The tell was available and I read past it: the failing arm's errors named
+`can_deopt_resume=false`, a property of the METHOD and the SINK, not of the trap.
+A lever that removes a symptom by removing its input is a bisection step, not a
+diagnosis.
+
+Two further notes. `TAKEN` undercounts on the pre-fix binary by construction:
+the counter sits in the resume path past the point where the resume succeeded,
+so a trap whose resume was REFUSED never reached it — `TAKEN=4` beside 36 errors
+was 4 traps that resumed and 36 that could not, and that discrepancy was itself
+a signal the trap was not the whole story. And H2 remains unable to see any of
+this: it plants traps and fires none, so its census reads as pure gain either
+way. A lever whose entire risk is what happens when a trap FIRES has to be
+measured where traps fire.
+
+#### What this does retire
+
+The case for artifact displacement — entry patching, a real `MakeNotEntrant`.
+Its premise was that a trap on a HOT path needs the trapping artifact displaced
+to be survivable. With the sink fixed, traps fire on hibernate and nothing
+breaks, and the residual re-fire counter reads 0 on both real workloads. Nothing
+here is asking for live-code patching, which in this tree means atomic surgery
+under W^X with no safepoint hook and no existing patch site to copy. It is not
+being built, and this is the measurement that says why.
+
+#### The split-half check, so the next run catches this itself
+
+The reversal above took a day and a second deliberate sample to find. It should
+not have: the evidence was inside the FIRST run, in the classes it had already
+measured. `pair-ab.sh` now scores its own two halves and prints them:
+
+```text
+sign test on the paired count: z = +2.85  (consistent, p < 0.05)
+split-half   : first 20 classes z = +4.02 | last 20 classes z = -0.45
+  ** THE HALVES DISAGREE IN SIGN. ...
+VERDICT: UNMEASURABLE (SPLIT-HALF DISAGREEMENT). A wins 29 of 40
+         overall, but the two halves of this run point OPPOSITE ways.
+```
+
+The discriminating case is the pair the self-test is built on: two runs with the
+IDENTICAL pooled count — 29 of 40, z = +2.85 — where one has halves at
++1.79/+1.79 and the other +4.02/-0.45. The first is reported as SMALL BUT
+CONSISTENT; the second is refused. A check that could not separate those two
+would be doing nothing, which is why the self-test asserts the pooled counts
+match before asserting the verdicts differ.
+
+`tools/suite-pair-ab/selftest.sh` runs the real awk out of `pair-ab.sh` rather
+than a copy, so the two cannot drift, and it was verified to FAIL when the
+detector is disabled.
+
+**The first version of that check was confounded, and it was my own.** Rows are
+written in RUN order, so first-half-vs-last-half is also EARLY-vs-LATE across a
+run that can span an hour: a disagreement could equally be the classes or the
+host drifting underneath. It now computes an ODD/EVEN split as well, which
+interleaves the same classes in time and is therefore blind to drift:
+
+| first/last | odd/even | reading |
+|---|---|---|
+| agree | agree | stable direction |
+| **disagree** | agree | **drift during the run**, not a class effect |
+| — | **disagree** | **genuinely class-dependent** — does not generalise |
+
+A near-zero z has no sign to disagree with, so a disagreement counts only when
+both sides clear \|z\| >= 1; without that gate the drift fixture reads +0.00
+against -0.45 and gets reported as class-dependence, which is how the bug was
+found. And the "identical pooled count" pair now separates three ways rather
+than two: `agree` reports a direction, `hidden` (one half carries it, the other
+is flat) keeps the direction but is annotated as resting on half the sample, and
+only a real sign reversal is refused. Its own first draft had the bug this file keeps meeting:
+the "same pooled count" assertion compared two EMPTY strings and reported `ok`
+when the summary had not run at all.
+
+### And the trap does not buy anything measurable either
+
+With the correctness objection retracted, the only thing keeping
+`CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` off was that its benefit had never been
+measured. Measured now — 57 hibernate-reactive classes, ABBA per class, on a
+binary with the deopt-sink fix:
+
+```text
+A faster than B in 34 of 57 classes            z = +1.46  (a coin)
+split-half   : first 28 z = +1.13 | last 29 z = +0.56
+median per-class delta : +1.4%
+median within-arm noise: 10.7%   (SAME config, two runs)
+VERDICT: UNMEASURABLE
+```
+
+No effect. The two halves at least AGREE in direction this time — both weakly
+positive, so this is not the reversal pattern the split-half check exists to
+catch — but the pooled count is a coin and the effect is a seventh of the noise
+floor.
+
+That floor is the caveat and it is a large one: **10.7%, against 2.7% on the
+quiet-host hibernate run earlier the same day**. Load was 3.5-6.5 on 8 cores
+throughout. This is a weak measurement, and it is reported as one. The
+sub-result that "of the 10 classes whose own delta beats their own noise, A is
+faster in 9" is NOT quoted as evidence: it is a selection conditioned on the
+noise estimate, over ten classes, and this document has already been burned once
+today by a significant-looking count over a small sample.
+
+So the switch stays OFF with both halves of its case now measured rather than
+assumed:
+
+- **not harmful** — 112 traps fired across 30 classes, `ok=241 failed=0`,
+  zero `refusing side-effecting replay` (the old "it craters hibernate" was a
+  broken deopt sink seen through this switch);
+- **not beneficial** — no measurable throughput effect, on a noisy run.
+
+What would settle it: the same 57-class A/B on a host at load < 2.5, which is
+what produced the 2.7% floor. Anything less and the answer is the noise floor,
+not the lever.
+
+#### `tools/h2-ab` — so an H2 claim can be re-checked at all
+
+The audit above found that no H2 throughput number in this file is
+reproducible: the harness that produced them was never committed, and the
+corpus's `test-classes/` directory is empty on this box, so even the 21-class
+shape cannot be rebuilt. `tools/h2-ab/h2-ab.sh` is the replacement, and its
+limits are stated in its own header rather than discovered later.
+
+It carries over the two rules that made the original trustworthy — ABBA per
+round (BAAB on odd rounds, so order bias cancels across rounds too), and a
+CONTROL arm measured twice every round whose spread is the noise floor, with an
+effect inside the floor refused. It adds a third: with no control pair at all it
+reports NO CONTROL rather than comparing against nothing.
+
+**What it cannot do, and the header says so.** One timed unit means no per-class
+sign test and no split-half check — the two things that caught a false result
+the same day. It answers only "is this bigger than the host's own same-config
+spread", the weakest of the three questions, and its positive verdict tells the
+reader to confirm on a second workload. `suite-pair-ab` remains the better
+instrument wherever the workload is fork-per-class.
+
+`--analyze <samples.tsv>` runs the statistics on recorded samples with no VM, so
+`selftest.sh` can check the maths directly. It was mutation-tested, and the
+mutation testing paid immediately: an assertion that checked only the VERDICT
+passed when `worst` was changed to "whichever round awk visited last", because
+awk walks an associative array in unspecified order and both readings happened
+to give UNMEASURABLE. The fixture now puts the worst round FIRST and asserts the
+reported floor VALUE (30.0%), which fails at 0.3% under that mutation.
+
+First real run, corroborating the Azure result on different hardware: the
+unresolved-class trap reads an effect of **-0.2% against a 7.5% floor** —
+UNMEASURABLE, agreeing with hibernate's z = +1.46.
+
+### The unboxing accessors, lowered — the first MEMORY family the IR tier has
+
+`Long.longValue()J` and `Integer.intValue()I` were the two largest single
+entries on the call-site-intrinsic refusal list (8 and 2-3 sites on H2). They
+are now lowered by the optimizing tier instead of refusing the method, and they
+are the first family it lowers that touches the HEAP rather than registers.
+
+```
+[ir] unbox-intrinsics UnboxIntrinsicProbe.sumLong([Ljava/lang/Long;)J:
+     1 site(s) lowered as a guarded field load
+```
+
+Both families are gone from the H2 refusal breakdown — `java/lang/Long.longValue`
+and `java/lang/Integer.intValue` no longer appear at all, against 8 and 2-3
+before — and 11 sites lower per run. `refused_method` reads 43-45, which is
+inside the 43-54 band one configuration produces, so **no delta is claimed
+there**: the disappearance of the two families from the per-family list is the
+engagement evidence, not the total.
+
+#### Why this one was left until last
+
+The arithmetic families are pure register work. These read a field, and the byte
+offset of that field is not a compile-time constant: a compact instance keeps
+the payload at a registered body offset, a legacy one inside its 16-byte `Value`
+cell, and BOTH shapes exist in one heap because different allocators build
+different cells. So the lowering is not a load — it is a null check, an exact
+receiver class guard, a per-object test of the header's compact bit, and then
+one of two loads.
+
+The node carries only the guard class id. Offsets are re-derived at lowering
+from `ir::unbox_offsets`, which is the same `AtomicLongFieldLayout` /
+`AtomicIntFieldLayout` the single-pass backend asks — because two backends
+disagreeing about where a field lives is not a wrong answer, it is a wild read.
+A test pins that agreement.
+
+#### What the codebase made me declare
+
+Adding one `ir::Op` variant failed to compile in FIVE places, every one of them
+a deliberate forcing function, and each wanted a different decision:
+
+| where | what it forced |
+|---|---|
+| `ir_verify::expected_arity` | the node's input shape (`[ctrl, mem, obj]`) |
+| `declared_lowering` | that it produces a value, not an effect |
+| `op_representatives` | a concrete instance for the coverage tests to drive |
+| `op_defines_result_slot` | that it allocates a result slot |
+| `regalloc::ir_op_defines_value` | the same, for the LIVENESS model — without it every method containing the node silently loses register residency |
+
+And a sixth asked for a judgement rather than a fact: the arm ends in exactly
+one `store_rax`, so `every_eligible_op_is_claimed_or_explicitly_rejected`
+demanded it be claimed for the home-drop optimization or explicitly rejected
+with a reason. It is **rejected**: unlike every claimed op its arm is not
+straight-line — two deopts and a layout branch precede that store — and
+reasoning about what each deopt edge sees is exactly what that list exists to
+stop being done casually. Claimable later with a measurement; not worth a wrong
+answer to save one store.
+
+#### Verification
+
+`probes/UnboxIntrinsicProbe.java` mixes boxes from BOTH allocation paths on
+purpose — values inside the `Integer`/`Long` cache come from a preallocated
+table, values outside it are freshly allocated — so a compact/legacy branch that
+was wrong for either shape returns garbage for one group. Every answer is
+checked against a value computed without the accessor, so it cannot pass by
+agreeing with itself, and a null receiver must still raise NPE rather than read
+offset 0 of nothing.
+
+It agrees with HotSpot exactly (`SUMS -4 -3`) under
+`CRATONVM_COMPACT_REF_FIELDS=1` **and** `=0`, which exercises both offset
+derivations. The kill switch was checked in the direction that matters: with
+`CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` the two families reappear in the refusal
+log (86 lines); on, zero. Suite 92/92, 2,285 jit tests green.
+
+**Not claimed: any throughput number.** `h2-ab` says an effect this size is
+inside this host's noise floor, and today's two withdrawn results are the reason
+that is left as a measurement someone takes on a quiet host rather than a figure
+asserted here.
+
+---
+
+## 2026-09-11 — a phi copy staged in RAX, and a census that redirected the work
+
+Two things landed, and the second is the reason the first was findable.
+
+### The census: operand POSITION is 3.8%, not 82%
+
+`c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md` closed by
+naming `ir_schedule::pair_single_use_operands` as the next lever, on the
+strength of the deferred carry declining **82%** of its candidate windows for
+`operand_position`, and asking for a census of that pass because *"which of
+those four dominates is not yet counted"*.
+
+Built (`ir_schedule::PairCensus` — one counter per `continue`, under a
+`debug_assert`ed accounting identity so a new reason cannot read low) and run
+over 188 probes, **34,289 windows**:
+
+| cause | share |
+|---|---:|
+| producer is multi-use | **78.3%** |
+| producer's arm not certified by `op_home_is_one_store_rax` | **16.2%** |
+| the four POSITION buckets, together | **3.8%** |
+| paired | 1.7% |
+
+The two figures have different denominators and both are right — the carry's
+82% is over windows where a consumer already takes its first operand in RAX,
+the pass's is over every `(consumer, operand)` pair — but only the second says
+what the PASS could act on. **94.5% of the operands it sees were never
+eligible**, and no scheduling change reaches them. The carry page now carries
+the correction beside its prediction.
+
+Where it points instead: `producer_arm`, and inside it `Op::Load`. A
+`getfield`'s three lowering paths are mutually exclusive and each ends in one
+`store_rax` with RAX holding the result, but the mechanical test counts
+`self.store_rax(slot);` textually and sees three, so the op is excluded from a
+certification it appears to satisfy. Unowned, and the per-op breakdown that
+would size it is one more counter.
+
+### The change: `CRATONVM_JIT_IR_PHI_COPY_DIRECT`, default ON
+
+Every phi edge copy staged through RAX and then published into the phi's own
+register. On a loop back edge that is `mov rax,r15` / `mov r12,rax` for a
+resident source and `mov rax,[slot]` / `mov rbx,rax` for one still in its
+word — **one instruction per loop-carried value per iteration**, to move a
+value that is already in a register or already in the word.
+
+`emit_copy_op` now reads straight into the phi's register when it has one, so
+the publish disappears. It is the same program: the write to that register
+moves earlier inside ONE `CopyOp`, crossing only that copy's own store, so
+`resolve_parallel_copy`'s cross-op invariant is untouched.
+
+`FieldLoop.sum`'s back edge goes from four instructions to two, its loop body
+from 26 to 24, and its body from 1071 to 1059 bytes. Measured
+(`tools/tier-ab/cpu-ab.ps1`, four invocations, all outside their own floors and
+agreeing on the sign, the last re-taken after merging `dev`):
+**−4.8% / −7.0% / −7.3% / −10.5%**, i.e. about **1.08x** on
+that shape, and the tiering inversion there goes **1.208x → 1.11x** on this
+host. `FieldLoop.sumWide`, which folds twice as many copies, is
+**UNMEASURABLE** — four times the arithmetic per iteration, so the same two
+instructions are a quarter of the share.
+
+**A restriction worth copying, not just recording.** The first version also
+staged when the phi's home store survived, and wrote that home from the staged
+register. Replacing that store with `panic!()` left the **entire**
+`cratonvm-jit` suite green — 2356 unit tests and 145 differential tests — so
+the branch was shipping unexercised; and forcing it to run still could not
+catch storing the WRONG register, because nothing reads a resident phi's home
+word back. The change was narrowed to the home-dropped case (where the store
+does not exist at all) rather than the test weakened, and
+`a_phi_copy_that_keeps_its_home_is_byte_identical` pins the exclusion by
+demanding byte equality. One instruction given up on a path nothing reaches,
+in exchange for every remaining path being one the suite can fail.
+
+### And a third witness that the register file is not the constraint
+
+`c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md` argued from
+census counters that widening the GP file does not pay. The disassembly now
+shows what the two extra Win64 registers actually buy: with
+`CRATONVM_JIT_IR_GP_WIDE=1` the induction variable's home store AND its reload
+on the back edge disappear entirely — `lea r15d,[rbx+1]`, no frame traffic —
+which is exactly the store-to-load-forwarding pair this document traced the
+tier's residual 1.36x to. It still measures **+0.4% against a 0.8% floor**.
+
+So that chain is not this loop's critical path, whatever its latency is in
+isolation, and the next person reaching for "the loop-carried value round-trips
+through the frame" has a measurement to answer first.
+
+Full write-up, including the per-iteration instruction budget that says where
+the remaining gap is — **20 instructions against 26**, with the two survivors
+being that this tier does not unroll (so it pays the safepoint poll and the back
+edge every iteration rather than every fourth) and that its receiver null check
+is explicit where the single-pass tier's is implicit — in
+[`internal/performance/c2-the-phi-copy-staging-register-20260911.md`](internal/performance/c2-the-phi-copy-staging-register-20260911.md).
+
+### The same budget's next line: the loop branched the wrong way
+
+`FieldLoop.sum` takes **four** branches per iteration at this tier against the
+single-pass tier's one, and one of the four was free:
+
+```asm
+25d: cmp ebx,r14d
+260: jl  +5        ; to the loop body -- TAKEN every iteration
+266: jmp exit      ;   ...skipping this
+26b: <loop body>
+```
+
+The fused-branch arm picks its fall-through edge from `branch_hints`, which is
+empty without `CRATONVM_TIER_PGO`. The fallback that left behind — *the `true`
+edge is the near one* — is inverted for every javac counted loop, and for a
+reason this document already records in the range-BCE closeout: **javac puts the
+loop body on the FALSE edge**, because `for (i = 0; i < n; i++)` compiles to
+`if_icmpge exit`. So the near edge was the loop EXIT, the exit was not the next
+block, and `ir_fallthrough_enabled`'s `JMP rel32` elision — default-ON since
+2026-09-09 and built for exactly this — could never reach it.
+
+`CRATONVM_JIT_IR_BRANCH_LAYOUT_POLARITY` (default ON) takes the fall-through
+edge from the block LAYOUT when there is no hint: `layout_hot_paths` is
+default-ON, needs no profile, and `block_idx + 1` is its decision. The sequence
+becomes one not-taken `jge exit`: **−5 bytes, −1 instruction, −1 taken branch
+per iteration**, and 41 branches take it on `CratonBenchC2`.
+
+**It measures nothing** — UNMEASURABLE on `FieldLoop` (+0.6% against a 0.6%
+floor) and on `CratonBenchC2` (−2.5% against a 4.8% floor), checksums identical
+throughout. It ships ON because it is weakly better in both instructions and
+taken branches and strictly better whenever the near edge would otherwise need a
+`JMP`, not because anything here shows it pays.
+
+**It does not override a profile hint, and a test caught it trying.**
+`step4_ir_lower_consumes_branch_bias_hint` went red on the first version. The
+interaction it exposed is a real gap: `ScheduleOptions::branch_counts` is
+documented as taking the same per-bci bias the lowerer takes, and
+`production_schedule_options()` leaves it **empty** — so a profile informs the
+polarity of one `Jcc` and never informs which block is placed next. Populating
+it is small, and nobody has.
+
+**And a harness finding worth more than the number.** The first run reported
++1.3% against a **0.0%** floor — the tightest this apparatus has printed, and
+meaningless: Windows accounts CPU in ~15.625 ms ticks, the samples were 0.586 s,
+so one tick was 2.7% of a sample and both medians had merely landed on the same
+one. `cpu-ab.ps1` now prints the tick as a percentage of the median and refuses
+a verdict inside it. That is the second way a clean floor misleads — the first
+being drift between invocations (§5.2 of the GP-register page) — and both make a
+tight floor read as permission to stop.
+
+### CORRECTION: "the optimizing tier does not unroll" — true, and not for the reason implied
+
+This document has said since 2026-09-03 that the optimizing tier does not
+unroll, priced it at about 1.12x on a counted loop, and listed it as the
+largest remaining item in that tier's per-iteration budget. All three stand.
+What does not stand is the conclusion anyone would draw from them — that an
+unroller needs writing.
+
+**`ir_optimize::unroll` exists, is default-ON, and recognises a javac counted
+loop exactly.** Driven against a real bytecode-built `for (i = 0; i < 5; i++)
+a += i;` it reports `trip=5 init=0 stride=1` and then declines, silently, on the
+`body_named_by_safepoint` refusal — whose escape hatch is gated on
+`CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES`, **default OFF**. With that flag set,
+the same loop unrolls. The flag's own sibling
+(`CRATONVM_JIT_IR_REG_AUTHORITATIVE`) rests on the identical prediction, was
+soaked and flipped ON on 2026-09-09, and says so in its doc comment; the flag it
+names was never revisited.
+
+**And that would not reach the loops that matter.** `ir_optimize::UnrollCensus`
+— one counter per `continue`, under a closing identity — says every counted loop
+in both benchmark suites has a RUNTIME bound, which full unrolling can never
+serve:
+
+| | CratonBenchC2 | CratonBench |
+|---|---:|---:|
+| loops found (merges − not_single_backedge) | 13 | 6 |
+| of which runtime-bounded | **6** | **4** |
+| `safepoint_named` | 0 | 0 |
+| unrolled | **0** | **0** |
+
+So the thing to build is a PARTIAL unroller, in the single-pass tier's own shape
+(keep the test in every copy, amortise only the poll and the back edge — no
+trip-count arithmetic, so none of the overflow hazard the range-BCE closeout
+records). It was designed and deliberately **not built**, because both of the
+gates under which it could be written without touching deopt metadata measure
+**zero**:
+
+| gate | asks | CratonBenchC2 | CratonBench | `FieldLoop` |
+|---|---|---:|---:|---:|
+| whole method trap-free | `graph_cannot_deopt` | 0 of 6 | 0 of 4 | 0 of 1 |
+| **cloned nodes all pure** | the real obligation | **0 of 6** | **0 of 4** | **0 of 1** |
+
+The second is zero for the same reason these loops are worth unrolling:
+`FieldLoop.sum`'s body IS a field read, and `Op::Load` is not pure.
+
+**What unrolling actually needs is one thing, and it is the same for both
+unrollers: a deopt point addressable per COPY rather than per bci.**
+`DeoptimizationPoint` already carries `(native_offset, bci, frame_state)` and
+two points may share a bci — the representation is fine. Two things collapse
+them: `bci_native` keeps the EARLIEST offset per bci, so only copy 0 is
+anchored, and `find_deopt_point` is an exact-offset binary search returning
+`None` for the rest; and `graph.safepoints` has one snapshot per bci naming the
+original nodes, so a later copy has no frame describing its own values. That is
+a bounded change to three named places, and it is the prerequisite for every
+version of this feature.
+
+Full write-up, including the census, the refusal taxonomy and the partial-unroll
+design that was not built, in
+[`internal/performance/c2-unrolling-is-a-deopt-metadata-problem-20260911.md`](internal/performance/c2-unrolling-is-a-deopt-metadata-problem-20260911.md).
+
+### FOLLOW-UP: the per-copy deopt frame, built (`CRATONVM_JIT_IR_PER_COPY_FRAMES`, default OFF)
+
+The "bounded change to three named places" above is done, and it is off by
+default because it is deopt metadata: the failure mode is a right-looking wrong
+answer, not a crash.
+
+* **`Node::frame_snapshot: Option<u32>`** — the per-copy identity, on the node.
+  `None` on everything the builder makes, so the by-bci scan is unchanged for
+  every compile that does not unroll. `Graph::set_node_frame_snapshot` refuses a
+  snapshot whose bci is not the node's own.
+* **`ir_optimize::install_copy_frames`** — one substituted snapshot per
+  iteration; iteration 0 rewrites its own in place so `bci_native`'s anchor and
+  the frame at it keep describing the same code.
+* **`Lowerer::snapshot_native` / `resolve_frame_state_for_site`** — the anchor
+  and the frame taken from the copy rather than from the bci.
+
+Two places the design note did not name turned out to matter. **GVN's identity**
+now includes `frame_snapshot`: two copies of a body compute the same value at
+different program points, and merging them hands one copy's code the other's
+frame. And **`ir_verify`'s duplicate-bci rule**, which existed because of this
+exact collapse, is now *"a duplicated bci is a violation unless every snapshot at
+it is claimed by a node"* — an unclaimed duplicate is still the bug, and is what
+a half-finished copy looks like.
+
+**One thing the end-to-end run taught that is not about unrolling.** The probe
+that exercises a deopt out of copy 3 still crashed on a default run, and the
+reason was `ir_evidence::accept`: it priced the unrolled C2 body as not worth
+publishing and handed the method back to the single-pass tier. The C2 body was
+never running. `CRATONVM_C2_ACCEPT=always` installs it, and then all three
+shapes match HotSpot exactly (20 000 `NullPointerException`s out of a cloned
+body, each resuming in the copy that trapped). Worth remembering generally: with
+an acceptance gate between a transform and its execution, "the checksum matched"
+can be a statement about code that never ran.
+
+**It wins nothing measurable yet, and that is expected.** The census above says
+every counted loop in both suites has a runtime bound, so `per_copy_frames`
+(a new sub-count of `unrolled`) is zero there. What it buys is that the sentence
+the previous page ended on is no longer owed: the partial unroller can now be
+written against a frame mechanism instead of around one.
+
+One cost is worth knowing before it is discovered: **safepoint slots are DCE
+roots**, so per-copy frames keep every iteration's intermediates alive to
+describe them. On the `for (i = 0; i < 5; i++) a += i;` fixture the loop folds to
+`Const(10)` and five `Const` nodes survive anyway, materialised purely for the
+frames. The narrower fix (root only snapshots that can be consulted) is a DCE
+change, not this one.
+
+Full write-up in
+[`internal/performance/c2-per-copy-deopt-frames-20260911.md`](internal/performance/c2-per-copy-deopt-frames-20260911.md).
+
+### FOLLOW-UP: the partial unroller was written (`CRATONVM_JIT_IR_PARTIAL_UNROLL`, default OFF)
+
+**2026-09-11, same day.** It keeps the loop test in every copy — so no
+trip-count arithmetic and no speculation — and sends each copy's failing test
+**back to the header** rather than to a new exit merge, which is what keeps the
+transform closed under the loop and leaves every post-loop use and safepoint
+slot untouched.
+
+It is **correct and it is not faster**: 9 alternating pairs on
+`bench/C2PartialUnrollProbe.java` read 356 ms rolled against 362 ms unrolled at
+factor 4 — a ratio of 0.98 against a ±8% spread — with checksums matching
+Temurin 25 on trip counts both divisible and not divisible by the factor. The
+per-iteration instruction count *does* fall, 20 to 16.25. It buys nothing
+because the rolled loop keeps `a` and `i` in `rbx`/`r15` with **no memory
+operand in its loop at all** and the unrolled one spills every carried value:
+`sink_pure_nodes` moves a node only when the loop depth strictly DECREASES, and
+every copy of an unrolled body sits at the header's own depth, so all four are
+computed above the first test and eight intermediates contend for a
+five-register file.
+
+The sentence at 1437 and item 1 at 1484 both need a caveat now. The optimizing
+tier *can* unroll; unrolling is not by itself what the baseline's 4x buys. The
+baseline also colours its locals into callee-saved registers, and that is the
+half this tier is still missing.
+
+Two wrong-code defects were found on the way, both in shared code, both live
+before this transform and reachable by anything that clones a control node: an
+`If`'s successors were ordered by **node id** rather than by projection index,
+and an OSR entry resolved a bci **two blocks claimed**. Both are fixed and
+pinned by tests.
+
+Full write-up, including why the obvious schedule-late fix is not landed, in
+[`internal/performance/c2-the-partial-unroller-20260911.md`](internal/performance/c2-the-partial-unroller-20260911.md).

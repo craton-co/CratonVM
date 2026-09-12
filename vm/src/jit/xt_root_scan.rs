@@ -217,15 +217,50 @@ where
     Some(slots)
 }
 
-/// `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE=1` -- resolve a frozen peer's words
-/// with `resolve_interior_for_pin` rather than `is_heap_addr`.
+/// `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE=0` -- resolve a frozen peer's words
+/// with `is_heap_addr` rather than `resolve_interior_for_pin`.
 ///
 /// The difference is the two cases `is_heap_addr` drops and a frozen peer's
 /// registers hold: a MISALIGNED interior pointer and a ONE-PAST-THE-END cursor.
 /// Both leave an object unpinned, and relocation then moves it out from under
 /// the register that names it.
+///
+/// # DEFAULT ON since 2026-09-08, because the discharge made it load-bearing
+///
+/// It shipped opt-in on 2026-09-04 and, as
+/// `fixed-suite-bugs/bug-testlargeblob-segv-decommit-under-live-memcpy-20260904`
+/// records while eliminating it as that page's cause, *"it is
+/// `runtime_var_os(..).is_some()`, i.e. opt-in and default OFF, so it was never
+/// active in any run"*. That left an asymmetry nobody had to notice while the
+/// pin was merely additive: `helper_window_discharge_enabled` is default ON and
+/// **discharges the refusal on the strength of the pin**, so from that day the
+/// pin stopped being a hint and became the thing standing between relocation
+/// and a peer's registers.
+///
+/// A discharged cycle asks `helper_windows_all_pinned_this_cycle`, and that
+/// answers yes for a window whose every candidate came back from a predicate
+/// documented to drop exactly the two shapes a compiled loop puts in a register.
+/// `is_heap_addr` rejects a misaligned address -- a cursor into a `char[]` or
+/// `byte[]` -- and its extent test is `addr < end`, so a cursor one past the
+/// last element resolves to no base. Either leaves the array unpinned while the
+/// cycle relocates, which is a use-after-free rather than lost compaction.
+///
+/// So the two flags have to agree, and the direction to agree in is the one
+/// `ZgcRealHeap::resolve_interior_for_pin` already argues for itself: the
+/// result withholds a page from relocation, so a false positive costs one page
+/// of compaction and a false negative costs a use-after-free.
+///
+/// `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE=0` is the kill switch and restores the
+/// `is_heap_addr` probe. It is the A/B for pricing the wider pin, not a
+/// configuration anyone should run with the discharge on.
 pub fn helper_window_pin_resolve_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE").is_some()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
 }
 
 pub fn helper_window_discharge_enabled() -> bool {
@@ -426,6 +461,17 @@ fn dbg() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
 }
 
+/// Opt-in verification that the roster `take_over_pass` is handed really does
+/// cover every thread that can be in compiled code. Deliberately NOT part of
+/// `dbg()`: the audit re-walks the whole system thread table, which is the
+/// exact cost the roster exists to remove, and folding it into the ordinary
+/// scan-debug flag would make the scan un-observable without also restoring
+/// that cost. See `imp::audit_roster_covers_jit_peers`.
+#[inline]
+fn roster_audit_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_ROOT_SCAN_AUDIT").is_some()
+}
+
 /// Handles of peer threads that were suspended in JIT code and must be
 /// resumed once the collection completes. Resuming is mandatory for liveness
 /// (a leaked suspend wedges the peer forever), so this is `#[must_use]`.
@@ -611,7 +657,10 @@ mod imp {
                 // relocated, so the collector's own object test accepts it,
                 // and the alternative is millions of words per peer. Register
                 // 0xff marks the stack side.
-                cratonvm_gc::gc_quiescence::record_peer_reg(os_tid, 0xff, w);
+                // 0xfe = TAKE-OVER stack (peer held frozen for the whole
+                // collection); 0xff = helper window (suspended and resumed
+                // inside root gathering, before anything relocates).
+                cratonvm_gc::gc_quiescence::record_peer_reg(os_tid, 0xfe, w);
                 roots.push(o);
                 found += 1;
             }
@@ -623,30 +672,76 @@ mod imp {
     /// One enumeration pass: suspend each not-yet-taken peer thread, and for
     /// those whose `Rip` is in JIT code, scan + keep them frozen. Returns the
     /// number of peers newly taken over this pass.
-    pub fn take_over_pass<F>(taken: &mut TakenOver, is_obj: &F, roots: &mut Vec<ObjectRef>) -> usize
+    ///
+    /// `live_tids` is the roster of OS thread ids this pass may freeze — the
+    /// registered Java threads, re-read by the caller on every barrier round
+    /// so a thread that registers mid-collection is picked up on the next one.
+    ///
+    /// ## Why a caller-supplied roster and not `CreateToolhelp32Snapshot`
+    ///
+    /// (2026-09-10.) That call enumerates every thread on the MACHINE, not in
+    /// this process, and the `Thread32Next` walk that follows filters the
+    /// whole system table down to the handful of entries that belong here.
+    /// Measured on the reference box: 6,952 system threads to find 44 of ours,
+    /// 9.9ms for the snapshot and 83ms for snapshot+walk — per pass. This pass
+    /// runs once per barrier round, so a `VthreadGcStress` run spent 14.5s
+    /// across 174 passes walking the machine's thread table to freeze nothing
+    /// at all (0 peers taken over in every pass of every run measured). That
+    /// cost is why `CRATONVM_XT_JIT_ROOT_SCAN=0` finished the same workload in
+    /// 5s against 13-37s with the scan on; it was never the SuspendThread /
+    /// GetThreadContext / ResumeThread triples, which come to ~0.1s for all
+    /// 6,960 of them.
+    ///
+    /// The Linux implementation never had this problem — it reads
+    /// `/proc/self/task`, which is already process-local. The roster restores
+    /// the two platforms to asking the same question rather than making
+    /// Windows ask a machine-wide one.
+    ///
+    /// ## Coverage obligation
+    ///
+    /// The roster MUST contain every thread that can have `Rip` inside a
+    /// registered JIT code range. A peer this pass does not freeze is a peer
+    /// whose registers and spill slots go unscanned — a missed conservative
+    /// root, and a use-after-free of an object only that peer still names.
+    ///
+    /// It does contain them: compiled code is entered only through
+    /// `JitEntryGuard::enter_with_compiled` / `enter_with_compiled_at`, whose
+    /// production call sites all sit on Java execution paths
+    /// (`runtime::interpreter`, `runtime::interpreter::jit_bridge`,
+    /// `jit::helpers`), and every thread executing Java is in the registry
+    /// with its OS tid published. (`memory::roots` uses the plain
+    /// `JitEntryGuard::enter`, which records a chain entry for the root walk
+    /// and transfers control to nothing, so it never puts `Rip` in JIT code.)
+    ///
+    /// Because being wrong here is silent and fatal, the argument is also
+    /// checked at runtime rather than only asserted: setting
+    /// `CRATONVM_XT_ROOT_SCAN_AUDIT=1` enables
+    /// [`audit_roster_covers_jit_peers`], which re-walks the full system
+    /// snapshot and reports any in-process thread absent from the roster,
+    /// loudly if its `Rip` is in JIT code.
+    pub fn take_over_pass<F>(
+        taken: &mut TakenOver,
+        is_obj: &F,
+        roots: &mut Vec<ObjectRef>,
+        live_tids: &[u32],
+    ) -> usize
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let self_tid = unsafe { GetCurrentThreadId() };
-        let pid = unsafe { GetCurrentProcessId() };
         // BUG-03 deadlock avoidance: snapshot the JIT code ranges BEFORE
         // suspending any peer. Classifying a frozen peer's Rip via the
         // lock-taking `lookup_jit_code_range` would deadlock if that peer was
         // suspended while holding the code-range lock (mid-registration). The
         // local snapshot lets us classify with a lock-free range check.
         let ranges = crate::jit::jit_code_ranges_snapshot();
-        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snap == -1 || snap == 0 {
-            return 0;
-        }
         let mut newly = 0usize;
         let mut dbg_suspended = 0usize;
-        let mut e: ThreadEntry32 = unsafe { core::mem::zeroed() };
-        e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
-        let mut ok = unsafe { Thread32First(snap, &mut e) };
-        while ok != 0 {
-            let tid = e.th32_thread_id;
-            if e.th32_owner_process_id == pid && tid != self_tid && !taken.contains(tid) {
+        for &tid in live_tids {
+            // tid 0 is "unpublished": a thread that registered but has not yet
+            // reached `set_os_tid_current`. It has not run Java either, so it
+            // cannot be in compiled code, and OpenThread(0) would fail anyway.
+            if tid != 0 && tid != self_tid && !taken.contains(tid) {
                 dbg_suspended += 1;
                 if let Some((kept, found)) = unsafe { try_take(tid, &ranges, is_obj, roots) } {
                     if kept != 0 {
@@ -680,10 +775,10 @@ mod imp {
                     }
                 }
             }
-            e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
-            ok = unsafe { Thread32Next(snap, &mut e) };
         }
-        unsafe { CloseHandle(snap) };
+        if roster_audit_enabled() {
+            audit_roster_covers_jit_peers(self_tid, live_tids, &ranges);
+        }
         if dbg() {
             eprintln!(
                 "[xt-jit-roots] pass: examined {dbg_suspended} peer(s), {newly} newly taken over (Rip in JIT); {} code ranges; any_thread_in_jit={} jit_gate={}",
@@ -693,6 +788,107 @@ mod imp {
             );
         }
         newly
+    }
+
+
+    /// Number of times the audit found an in-process thread that was absent
+    /// from the roster `take_over_pass` was given AND had its `Rip` inside a
+    /// registered JIT code range — i.e. a peer the pass would have failed to
+    /// freeze and scan. Any non-zero value is a coverage hole in the roster
+    /// and a live use-after-free risk; see `take_over_pass`'s
+    /// "Coverage obligation".
+    pub static XT_ROSTER_MISSED_JIT_PEERS: AtomicU64 = AtomicU64::new(0);
+
+    /// Number of in-process threads seen by the system snapshot but absent
+    /// from the roster while NOT in JIT code. Expected to be non-zero and
+    /// harmless: the Rust-side threads (JIT compiler, GC workers, watchdogs)
+    /// never execute compiled Java. Tracked so the audit can distinguish
+    /// "the roster is narrower, as designed" from "the roster is wrong".
+    pub static XT_ROSTER_SKIPPED_NON_JAVA: AtomicU64 = AtomicU64::new(0);
+
+    /// Check, the expensive way, that the roster handed to `take_over_pass`
+    /// really did cover every thread that could be in compiled code.
+    ///
+    /// This deliberately does the thing `take_over_pass` no longer does — walk
+    /// the whole system thread table — and then suspends each in-process
+    /// thread the roster omitted just long enough to read its `Rip`. It is
+    /// gated on its own `CRATONVM_XT_ROOT_SCAN_AUDIT` rather than on `dbg()`
+    /// because that walk is precisely the 83ms-per-pass cost the roster exists
+    /// to avoid: leaving it on the ordinary scan-debug flag would put the cost
+    /// back the moment anyone tried to observe the scan, which is how the
+    /// coupling described in `stw_takeover_should_scan` stayed invisible. It is
+    /// not a fast path and must never be called on one.
+    ///
+    /// The point is that the roster's coverage argument is a claim about every
+    /// site that can transfer into compiled code, and such claims rot silently
+    /// as call sites are added. This turns the claim into something a soak run
+    /// can falsify.
+    fn audit_roster_covers_jit_peers(self_tid: u32, live_tids: &[u32], ranges: &[(usize, usize)]) {
+        let pid = unsafe { GetCurrentProcessId() };
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snap == -1 || snap == 0 {
+            return;
+        }
+        let mut e: ThreadEntry32 = unsafe { core::mem::zeroed() };
+        e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
+        let mut ok = unsafe { Thread32First(snap, &mut e) };
+        while ok != 0 {
+            let tid = e.th32_thread_id;
+            if e.th32_owner_process_id == pid
+                && tid != self_tid
+                && tid != 0
+                && !live_tids.contains(&tid)
+            {
+                match unsafe { rip_of(tid) } {
+                    Some(rip) if ranges.iter().any(|&(b, end)| rip >= b && rip < end) => {
+                        XT_ROSTER_MISSED_JIT_PEERS.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "[xt-jit-roots] ROSTER HOLE: tid={tid} is in JIT code (rip={rip:#x}) \
+                             but was absent from the roster, so take_over_pass would NOT have \
+                             frozen or scanned it. Its registers and spill slots are unscanned \
+                             conservative roots. See take_over_pass's coverage obligation."
+                        );
+                    }
+                    _ => {
+                        XT_ROSTER_SKIPPED_NON_JAVA.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
+            ok = unsafe { Thread32Next(snap, &mut e) };
+        }
+        unsafe { CloseHandle(snap) };
+    }
+
+    /// Suspend `tid` just long enough to read its `Rip`, then resume it.
+    /// Audit-only: unlike `try_take` this never keeps the peer frozen and
+    /// never scans it, so it cannot contribute roots.
+    unsafe fn rip_of(tid: u32) -> Option<usize> {
+        let h = OpenThread(
+            THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+            0,
+            tid,
+        );
+        if h == 0 {
+            return None;
+        }
+        if SuspendThread(h) == u32::MAX {
+            CloseHandle(h);
+            return None;
+        }
+        #[repr(C, align(16))]
+        struct Ctx([u8; CTX_SIZE]);
+        let mut ctx = Ctx([0u8; CTX_SIZE]);
+        *(ctx.0.as_mut_ptr().add(OFF_FLAGS) as *mut u32) = CONTEXT_CONTROL_INTEGER;
+        let got = GetThreadContext(h, ctx.0.as_mut_ptr());
+        let rip = if got == 0 {
+            None
+        } else {
+            Some(*(ctx.0.as_ptr().add(OFF_RIP) as *const u64) as usize)
+        };
+        ResumeThread(h);
+        CloseHandle(h);
+        rip
     }
 
     /// Suspend `tid`, read its context. If its `Rip` is in a JIT code range,
@@ -801,11 +997,6 @@ mod imp {
             return (0, 0);
         }
         let self_tid = unsafe { GetCurrentThreadId() };
-        let pid = unsafe { GetCurrentProcessId() };
-        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snap == -1 || snap == 0 {
-            return (0, 0);
-        }
         // Reusable copy buffer for each peer's used stack. Pre-sized so the
         // common case never allocates while a peer is frozen; grown (with the
         // peer running) when a band is larger.
@@ -817,11 +1008,16 @@ mod imp {
         // Per-cycle, so reset before the pass rather than accumulated.
         super::XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(0, Ordering::Release);
         let mut found_total = 0usize;
-        let mut e: ThreadEntry32 = unsafe { core::mem::zeroed() };
-        e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
-        let mut ok = unsafe { Thread32First(snap, &mut e) };
-        while ok != 0 {
-            let tid = e.th32_thread_id;
+        // Iterate the blocked roster directly rather than walking the system
+        // thread table (2026-09-10). The filter below was always
+        // `blocked_os_tids.contains(&tid)`, so `CreateToolhelp32Snapshot` +
+        // `Thread32Next` were enumerating every thread on the MACHINE — 6,952
+        // of them on the reference box — purely to intersect with a list this
+        // function is handed as an argument. That walk cost ~83ms a pass and
+        // this pass runs once per collection: 5.4s across the 65 passes of one
+        // `VthreadGcStress` run. Iterating the roster is exactly equivalent
+        // (a blocked tid is in-process by construction) and does no I/O.
+        for &tid in blocked_os_tids {
             // xt-hardening follow-up (2026-07-03): this pass exists ONLY to
             // close the BLOCKED-thread coverage gap (deposit_root_snapshot
             // never scans the JIT band) — a cooperatively-arrived mutator
@@ -833,11 +1029,7 @@ mod imp {
             // just adds corruption surface). Skip any peer not in the
             // blocked-tid snapshot — this also skips the suspend/resume
             // round-trip entirely for the (large majority) non-blocked case.
-            if e.th32_owner_process_id == pid
-                && tid != self_tid
-                && !taken.contains(tid)
-                && blocked_os_tids.contains(&tid)
-            {
+            if tid != 0 && tid != self_tid && !taken.contains(tid) {
                 if let Some((ctx, band_len)) = unsafe { snapshot_peer(tid, &mut band) } {
                     candidates.clear();
                     // Integer registers: a callee-saved register can still
@@ -871,13 +1063,32 @@ mod imp {
                     });
                     // Pairing capture, helper-window stack side. Same gate and
                     // same 0xff marker as the take-over path.
-                    if cratonvm_gc::gc_quiescence::peer_reg_pairing_enabled() {
+                    {
+                        // The band is a COPY of `[rsp, committed_region_end)`,
+                        // so the peer's real address for word `i` is
+                        // `rsp + i*8` -- which is what the blocked-wake fixup
+                        // has to store into. `snapshot_peer` copies from `rsp`,
+                        // so the base is the context's Rsp.
+                        // SAFETY: `ctx` is a fully-initialized CONTEXT copy.
+                        let peer_rsp = unsafe {
+                            (ctx.as_ptr().add(OFF_RSP) as *const u64).read_unaligned()
+                        } as usize;
+                        let pairing = cratonvm_gc::gc_quiescence::peer_reg_pairing_enabled();
                         for i in 0..band_len / 8 {
                             let w = unsafe {
                                 (band.as_ptr().add(i * 8) as *const usize).read_unaligned()
                             };
                             if is_obj(w).is_some() {
-                                cratonvm_gc::gc_quiescence::record_peer_reg(tid, 0xff, w);
+                                if pairing {
+                                    cratonvm_gc::gc_quiescence::record_peer_reg(tid, 0xff, w);
+                                }
+                                if peer_rsp != 0 {
+                                    cratonvm_gc::gc_quiescence::record_peer_stack_slot(
+                                        tid,
+                                        peer_rsp + i * 8,
+                                        w,
+                                    );
+                                }
                             }
                         }
                     }
@@ -940,10 +1151,7 @@ mod imp {
                     }
                 }
             }
-            e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
-            ok = unsafe { Thread32Next(snap, &mut e) };
         }
-        unsafe { CloseHandle(snap) };
         XT_HELPER_WINDOWS_SCANNED.fetch_add(windows as u64, Ordering::Relaxed);
         XT_HELPER_WINDOW_ROOTS.fetch_add(found_total as u64, Ordering::Relaxed);
         super::XT_HELPER_WINDOWS_PINNED.fetch_add(pinned_windows as u64, Ordering::Relaxed);
@@ -1369,6 +1577,43 @@ mod imp {
         }
     }
 
+    /// Snapshot of every readable mapping, from `/proc/self/maps`.
+    ///
+    /// # This snapshot must be taken PER PARKED PEER, never hoisted
+    ///
+    /// It is used to bound a conservative stack walk, and the walk
+    /// DEREFERENCES what it bounds. A snapshot only describes the address
+    /// space at the instant it was read, and this process remaps constantly:
+    /// every platform thread that starts or exits maps or unmaps an 8 MiB
+    /// stack, and a virtual-thread workload churns them by the thousand.
+    ///
+    /// The danger is not that the parked peer's own stack disappears — a
+    /// parked peer cannot exit, so its mapping is stable for exactly as long
+    /// as the walk needs it. It is that a STALE entry can still CONTAIN the
+    /// peer's `rsp` while describing a mapping that no longer exists: an
+    /// exited thread's 8 MiB stack is unmapped, a new thread's smaller stack
+    /// is later placed inside that freed span, and the old entry answers the
+    /// lookup with an `hi` far above the new stack's real top.
+    /// `readable_region_end_from_regions` then returns an `end` past the end
+    /// of the peer's stack and the walk steps off it.
+    ///
+    /// Measured 2026-09-08 on Linux, `VthreadProbe` (10000 virtual threads),
+    /// with `helper_window_pass` hoisting one snapshot for the whole pass:
+    ///
+    /// ```text
+    /// [xt-hw] tid=582 rsp=0x7126e17f29b8 end=0x7126e1ff29b8   <- rsp + 8 MiB
+    /// SIGSEGV               addr=0x7126e17fb000               <- ~34 KiB up
+    /// ```
+    ///
+    /// `end` had fallen back to the `MAX_STACK_SCAN` cap, so the matched entry
+    /// claimed at least 8 MiB above `rsp`, while the peer's real stack ended
+    /// 34 KiB up — a page-aligned fault on the first unmapped page above it,
+    /// killing the VM mid-collection. Both `vthread_probe_10000_all_increment`
+    /// and `vthread_gc_stress_completes` died this way.
+    ///
+    /// Taking it after the peer parks removes the window: the entry containing
+    /// a parked peer's `rsp` is that peer's own live stack, and a parked peer
+    /// holds it mapped.
     fn readable_regions() -> Vec<(usize, usize)> {
         let mut regions = Vec::new();
         let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
@@ -1394,6 +1639,102 @@ mod imp {
         }
         regions
     }
+
+    /// Whether `process_vm_readv` can read THIS process's own memory here.
+    ///
+    /// Probed once, against a known-good address, because a kernel or a seccomp
+    /// profile that refuses the syscall must not silently turn every stack scan
+    /// into zero roots — that is a missing-root bug, which is far worse than
+    /// the crash this reader exists to prevent. When it is unavailable the
+    /// walk falls back to the direct load it has always used.
+    fn safe_self_read_available() -> bool {
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| {
+            // Kill switch, so the reader and the historical direct load are
+            // A/B-able inside ONE binary. Setting it restores the pre-fix
+            // behaviour exactly — including the SIGSEGV.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_XT_NO_SAFE_PEER_READ")
+                .is_some()
+            {
+                return false;
+            }
+            let probe: u64 = 0x5ab0_1234_5678_9abc;
+            let mut out: u64 = 0;
+            let n = unsafe {
+                let local = libc::iovec {
+                    iov_base: (&mut out as *mut u64).cast::<libc::c_void>(),
+                    iov_len: 8,
+                };
+                let remote = libc::iovec {
+                    iov_base: (&probe as *const u64 as *mut u64).cast::<libc::c_void>(),
+                    iov_len: 8,
+                };
+                libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0)
+            };
+            n == 8 && out == probe
+        })
+    }
+
+    /// Copy up to `out.len()` bytes from OUR OWN address space at `addr`,
+    /// returning how many bytes were actually copied.
+    ///
+    /// # Why a syscall and not a load
+    ///
+    /// The conservative stack walk dereferences addresses it derived from a
+    /// `/proc/self/maps` snapshot, and NO snapshot of this process is
+    /// trustworthy for the duration of a walk. glibc caches an exited thread's
+    /// stack with its pages still readable — so the kernel reports it merged
+    /// with the neighbouring mapping — and then, when a new thread reuses that
+    /// cached stack, `mprotect`s a PROT_NONE guard page into the middle of the
+    /// span. A region that was readable when it was read back can therefore
+    /// grow an unreadable hole INSIDE it a moment later, with no unmapping
+    /// involved and nothing the reader could have re-checked. Under a
+    /// virtual-thread workload that churns thousands of threads, this happens
+    /// constantly.
+    ///
+    /// `process_vm_readv` makes the kernel do the access check: an unreadable
+    /// page ends the copy with a SHORT READ instead of delivering SIGSEGV. It
+    /// is the same primitive a debugger uses, applied to our own pid, where it
+    /// needs no privilege. Verified against a deliberately `mprotect`ed
+    /// PROT_NONE page: it returns exactly the bytes before the hole.
+    ///
+    /// A short read is not an error and is not a coverage hole: it means the
+    /// peer's readable stack ends there. Everything above is some other
+    /// thread's memory, which this peer cannot reach and which the walk had no
+    /// business reading in the first place — the fault was only the visible
+    /// half of that mistake.
+    fn read_self_memory(addr: usize, out: &mut [u8]) -> usize {
+        if !safe_self_read_available() {
+            // Historical behaviour, kept for a kernel that refuses the syscall.
+            unsafe {
+                std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
+            }
+            return out.len();
+        }
+        let n = unsafe {
+            let local = libc::iovec {
+                iov_base: out.as_mut_ptr().cast::<libc::c_void>(),
+                iov_len: out.len(),
+            };
+            let remote = libc::iovec {
+                iov_base: addr as *mut libc::c_void,
+                iov_len: out.len(),
+            };
+            libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0)
+        };
+        if n <= 0 {
+            0
+        } else {
+            (n as usize).min(out.len())
+        }
+    }
+
+    /// Number of 8-byte words copied per `read_self_memory` call.
+    ///
+    /// One syscall per 8 KiB. The scanned span is `stack_top - rsp`, i.e. the
+    /// peer's USED depth, which is tens of KiB in the common case — a handful
+    /// of syscalls per peer, against a walk that already touches every word.
+    const SCAN_CHUNK_WORDS: usize = 1024;
 
     fn readable_region_end_from_regions(addr: usize, regions: &[(usize, usize)]) -> Option<usize> {
         for &(lo, hi) in regions {
@@ -1422,9 +1763,13 @@ mod imp {
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let mut found = 0usize;
-        for reg in &slot.regs {
+        let pair_tid = slot.tid.load(Ordering::Acquire);
+        for (ri, reg) in slot.regs.iter().enumerate() {
             let v = reg.load(Ordering::Acquire);
             if let Some(o) = is_obj(v) {
+                // LINUX arm of `CRATONVM_DBG_PEER_REG_PAIRING` (§11 built the
+                // Windows one). Cast: REG_COUNT is 17.
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, ri as u8, v);
                 roots.push(o);
                 found += 1;
             }
@@ -1437,14 +1782,39 @@ mod imp {
         let Some(end) = readable_region_end_from_regions(rsp, regions) else {
             return found;
         };
+        // Read through the kernel rather than dereferencing directly: the
+        // bound above comes from a `/proc/self/maps` snapshot, and a snapshot
+        // of this process is stale the instant it is taken. See
+        // `read_self_memory`.
         let mut p = rsp;
+        let mut chunk = [0u64; SCAN_CHUNK_WORDS];
         while p + 8 <= end {
-            let w = unsafe { (p as *const usize).read_unaligned() };
-            if let Some(o) = is_obj(w) {
-                roots.push(o);
-                found += 1;
+            let want = (end - p).min(SCAN_CHUNK_WORDS * 8) & !7;
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(chunk.as_mut_ptr().cast::<u8>(), want) };
+            let got = read_self_memory(p, bytes) & !7;
+            if got == 0 {
+                // The peer's readable stack ends here.
+                break;
             }
-            p += 8;
+            for (i, &w) in chunk[..got / 8].iter().enumerate() {
+                let w = w as usize;
+                if let Some(o) = is_obj(w) {
+                    let at = p + i * 8;
+                    cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, 0xff, w);
+                    // THE REPAIR: this word lives at `at` in the peer's own
+                    // stack and nothing else will ever rewrite it. Hand the
+                    // address to the blocked-wake fixup.
+                    cratonvm_gc::gc_quiescence::record_peer_stack_slot(pair_tid, at, w);
+                    roots.push(o);
+                    found += 1;
+                }
+            }
+            p += got;
+            if got < want {
+                // Short read: an unreadable page, i.e. the top of the stack.
+                break;
+            }
         }
         found
     }
@@ -1479,12 +1849,15 @@ mod imp {
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let mut has_jit = false;
-        for reg in &slot.regs {
+        let pair_tid_hw = slot.tid.load(Ordering::Acquire);
+        for (ri_hw, reg) in slot.regs.iter().enumerate() {
             let v = reg.load(Ordering::Acquire);
             if !has_jit && ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
                 has_jit = true;
             }
             if let Some(o) = is_obj(v) {
+                // Cast: REG_COUNT is 17.
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, ri_hw as u8, v);
                 candidates.push(o);
             }
         }
@@ -1496,17 +1869,39 @@ mod imp {
         let Some(end) = readable_region_end_from_regions(rsp, regions) else {
             return (has_jit, false);
         };
+        // Same kernel-mediated read as `scan_slot_with_regions`, and for the
+        // same reason: this pass is the one that SIGSEGV'd the VM on
+        // `VthreadProbe`. See `read_self_memory`.
         let mut p = rsp;
+        let mut chunk = [0u64; SCAN_CHUNK_WORDS];
         while p + 8 <= end {
-            let w = unsafe { (p as *const usize).read_unaligned() };
-            if !has_jit && ranges.iter().any(|&(lo, hi)| w >= lo && w < hi) {
-                has_jit = true;
+            let want = (end - p).min(SCAN_CHUNK_WORDS * 8) & !7;
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(chunk.as_mut_ptr().cast::<u8>(), want) };
+            let got = read_self_memory(p, bytes) & !7;
+            if got == 0 {
+                break;
             }
-            if let Some(o) = is_obj(w) {
-                candidates.push(o);
+            for (i, &w) in chunk[..got / 8].iter().enumerate() {
+                let w = w as usize;
+                if !has_jit && ranges.iter().any(|&(lo, hi)| w >= lo && w < hi) {
+                    has_jit = true;
+                }
+                if let Some(o) = is_obj(w) {
+                    let at = p + i * 8;
+                    cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, 0xff, w);
+                    cratonvm_gc::gc_quiescence::record_peer_stack_slot(pair_tid_hw, at, w);
+                    candidates.push(o);
+                }
             }
-            p += 8;
+            p += got;
+            if got < want {
+                break;
+            }
         }
+        // COMPLETE: every readable word from `rsp` up has been read. Stopping
+        // at an unreadable page is not a partial scan — that page is the end of
+        // this peer's stack, and what lies above belongs to another thread.
         (has_jit, true)
     }
 
@@ -1515,7 +1910,18 @@ mod imp {
     /// a private signal to peer threads. The handler only parks peers interrupted
     /// inside registered JIT code; interpreter/native peers return immediately
     /// and remain cooperative barrier participants.
-    pub fn take_over_pass<F>(taken: &mut TakenOver, is_obj: &F, roots: &mut Vec<ObjectRef>) -> usize
+    /// `_live_tids` is accepted for signature parity with the Windows
+    /// implementation and deliberately ignored: `list_thread_tids` reads
+    /// `/proc/self/task`, which is already process-local and therefore already
+    /// cheap, and it enumerates the true superset (every thread of this
+    /// process, not just the registered Java ones). See the Windows
+    /// `take_over_pass` for why that platform needs the roster instead.
+    pub fn take_over_pass<F>(
+        taken: &mut TakenOver,
+        is_obj: &F,
+        roots: &mut Vec<ObjectRef>,
+        _live_tids: &[u32],
+    ) -> usize
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
@@ -1651,6 +2057,11 @@ mod imp {
         }
         install_handler();
         publish_ranges(&ranges);
+        // Hoisted deliberately: `/proc/self/maps` is enormous in a process
+        // holding thousands of thread stacks, and re-reading it per peer cost
+        // this pass 119-268 s against a 120 s cap (measured 2026-09-08). It is
+        // only ever an UPPER BOUND now — `read_self_memory` stops the walk at
+        // the first unreadable page whatever this says.
         let regions = readable_regions();
         let had_taken = taken.count() > 0;
         ACTIVE.store(true, Ordering::Release);
@@ -1860,7 +2271,12 @@ pub use imp::{helper_window_pass, resume, take_over_pass};
 // ---------------------------------------------------------------------------
 
 #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
-pub fn take_over_pass<F>(_taken: &mut TakenOver, _is_obj: &F, _roots: &mut Vec<ObjectRef>) -> usize
+pub fn take_over_pass<F>(
+    _taken: &mut TakenOver,
+    _is_obj: &F,
+    _roots: &mut Vec<ObjectRef>,
+    _live_tids: &[u32],
+) -> usize
 where
     F: Fn(usize) -> Option<ObjectRef>,
 {

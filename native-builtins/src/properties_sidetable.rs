@@ -48,7 +48,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::BuildHasherDefault;
 use std::sync::OnceLock;
 
-use cratonvm_native_api::registry::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::registry::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
@@ -1115,6 +1115,425 @@ pub fn replace_sidetable(ctx: &dyn NativeContext, obj: ObjectRef, entries: &[(St
     table().lock().insert(k, m);
 }
 
+/// Replace the receiver's REAL `java.util.Properties.map` backing with
+/// `entries`, creating it if the object has none.
+///
+/// # The one null field this exists for
+///
+/// JDK 9 moved `Properties`' storage into a `ConcurrentHashMap` field named
+/// `map`, and JDK 25's own bodies read it directly — `getProperty` at
+/// `Properties.java:1145`, `clone` at `:1526`, `store0` at `:920`. The object
+/// `System.getProperties()` hands back is VM-built, and its `map` has been
+/// **permanently null** by construction: every native in this module exists to
+/// make that object behave like a `Map` without it. The registration comment on
+/// `java/lang/System.getProperties` (`native-builtins/src/lib.rs`) names itself
+/// the root of that cluster and names this as the cluster's first move —
+/// *"make THIS return a real `Properties` — real `<init>`, real `map` — not to
+/// move a tag."*
+///
+/// # Why it is worth doing, MEASURED 2026-09-09
+///
+/// It is the single precondition standing under a large §1.4 retirement, and
+/// that is not an inference — it is what two probes' stack traces say. Armed
+/// with `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/concurrent/ConcurrentHashMap,
+/// java/util/Properties` (JDK 25.0.3, `--jdk-only`), the pair that neither
+/// class can pass alone:
+///
+/// ```text
+///                          CHM alone              CHM + Properties
+///   MapViewsShadowSweep    53 diffs, DIED 261/302   0 diffs, 302/302
+///   ChmShadowSweep         0 over 28 671 yields     0 over 28 654 yields
+/// ```
+///
+/// `MapViewsShadowSweep` is the probe that rejected the `ConcurrentHashMap`
+/// retirement on 2026-08-30, and it goes clean the moment CHM's *user* is
+/// retired with it — the coupling was never CHM's own state. What is left is
+/// two crashes, and both name this field:
+///
+/// ```text
+///   NullPointerException: Cannot invoke
+///     "java.util.concurrent.ConcurrentHashMap.get(Object)" because "this.map" is null
+///       at java/util/Properties.getProperty(Properties.java:1145)
+///       at jdk/internal/util/StaticProperty.<clinit>
+///
+///   NullPointerException: Cannot invoke "java.util.Map.size()" because "m" is null
+///       at java/util/Properties.clone(Properties.java:1526)
+///       at java/util/concurrent/ConcurrentHashMap.<init>(ConcurrentHashMap.java:863)
+/// ```
+///
+/// It is also the standing precondition the `retired_shadow` G60-1 section
+/// records for retiring `Properties.getProperty`'s two overloads, in those
+/// words: *"the native which builds the system `Properties` initialise the real
+/// `map` field."*
+///
+/// # Wholesale replace, not an additive merge
+///
+/// Same contract as [`replace_sidetable`], and for the same reason: this runs
+/// on EVERY `System.getProperties()` call against a cached singleton, so an
+/// additive store would leave a property cleared by `System.clearProperty`
+/// between calls visible to any body that reads the real map. `clear()` first.
+///
+/// # The return value is the fact a caller cannot otherwise get
+///
+/// Entries actually written, and `0` whenever the fill did not complete. The
+/// difference between "populated" and "silently empty" is invisible from the
+/// receiver — both are a non-null `map` — and it is the difference between the
+/// real bytecode working and it answering `null` for `java.home`.
+///
+/// # GC
+///
+/// Every `put` re-enters Java and is therefore a GC point, so the receiver and
+/// the map are pinned and re-read across the loop rather than carried. This is
+/// the loop-carried stale receiver the 2026-09 sweep pinned 52 of; a raw
+/// `ObjectRef` held across `invoke_virtual` names a from-space address, and a
+/// write through one is a wrong answer nothing reports.
+pub fn replace_real_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    entries: &[(String, String)],
+) -> usize {
+    let this_pin = ctx.pin_native_root(this);
+    let mut this_cur = ctx.read_native_pin(this_pin, this);
+
+    let existing = match ctx.get_field_by_name(this_cur, "map") {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    };
+    let chm = match existing {
+        Some(m) => m,
+        None => {
+            // `new_object_initialized` rather than `new_object` + a separate
+            // `invoke`: the two-step form leaves the fresh object unrooted
+            // across the constructor call.
+            let created =
+                ctx.new_object_initialized("java/util/concurrent/ConcurrentHashMap", "()V", &[]);
+            let m = match created {
+                Ok(Some(Value::Object(Some(m)))) => m,
+                other => {
+                    if props_stderr_diag() {
+                        eprintln!("[PROPS-REAL-MAP] could not construct the backing map: {other:?}");
+                    }
+                    ctx.unpin_native_roots(this_pin);
+                    return 0;
+                }
+            };
+            this_cur = ctx.read_native_pin(this_pin, this_cur);
+            ctx.set_field_by_name(this_cur, "map", Value::Object(Some(m)));
+            m
+        }
+    };
+
+    let chm_pin = ctx.pin_native_root(chm);
+    let mut chm_cur = ctx.read_native_pin(chm_pin, chm);
+    let mut trouble: Option<String> = None;
+
+    // Only a map we did NOT just create can hold anything to drop. The
+    // distinction is not tidiness: an unconditional `clear()` whose failure
+    // returned early left the receiver holding a NON-NULL EMPTY map, and that
+    // is strictly worse than the null it replaced. Real `Properties.getProperty`
+    // stops throwing and starts answering `null`, `StaticProperty.<clinit>`
+    // turns that into `InternalError: null property: java.home`, and every
+    // `size()`/`keySet()` reads 0 on a live system-properties object. MEASURED
+    // that way on the first cut of this function: `SysPropsRealMapProbe` armed
+    // answered `false` on six of ten rows where unarmed answered `true`.
+    if existing.is_some() {
+        if let Err(e) = ctx.invoke_virtual(chm_cur, "clear", "()V", &[]) {
+            trouble = Some(format!("clear: {e:?}"));
+        }
+        chm_cur = ctx.read_native_pin(chm_pin, chm_cur);
+    }
+
+    let mut written = 0usize;
+    for (key, value) in entries {
+        if key.len() > MAX_KV_LEN || value.len() > MAX_KV_LEN {
+            continue;
+        }
+        let k_obj = ctx.create_string(key);
+        let k_pin = ctx.pin_native_root(k_obj);
+        let v_obj = ctx.create_string(value);
+        let k_cur = ctx.read_native_pin(k_pin, k_obj);
+        chm_cur = ctx.read_native_pin(chm_pin, chm_cur);
+        let put = ctx.invoke_virtual(
+            chm_cur,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(k_cur)), Value::Object(Some(v_obj))],
+        );
+        match put {
+            Ok(_) => written += 1,
+            Err(e) => {
+                if trouble.is_none() {
+                    trouble = Some(format!("put {key:?}: {e:?}"));
+                }
+            }
+        }
+        ctx.unpin_native_roots(k_pin);
+        chm_cur = ctx.read_native_pin(chm_pin, chm_cur);
+    }
+
+    // The invariant: the real `map` holds the snapshot, or it is ABSENT. A
+    // half-filled or empty map is the one state nothing can detect — every
+    // reader answers plausibly and wrongly — so an incomplete fill puts the
+    // receiver back the way it was found and lets the null be loud again.
+    // Safe to do unconditionally here because the only receiver this runs on is
+    // the VM's own `System.getProperties()` singleton, whose real map has no
+    // writer but this function.
+    let complete = trouble.is_none() && written > 0;
+    if !complete {
+        this_cur = ctx.read_native_pin(this_pin, this_cur);
+        ctx.set_field_by_name(this_cur, "map", Value::Object(None));
+        written = 0;
+    }
+    if props_stderr_diag() && !complete {
+        eprintln!(
+            "[PROPS-REAL-MAP] INCOMPLETE: wrote {written} of {} entries, pre-existing map = {},              first trouble = {}",
+            entries.len(),
+            existing.is_some(),
+            trouble.as_deref().unwrap_or("none (empty snapshot?)")
+        );
+    }
+
+    ctx.unpin_native_roots(this_pin);
+    written
+}
+
+// ---------------------------------------------------------------------------
+// The other direction: real `map` -> the VM's system-property store
+// ---------------------------------------------------------------------------
+//
+// [`replace_real_map`] makes the receiver's real `map` readable by real
+// `Properties` bytecode. It does NOT make a WRITE through that bytecode
+// visible anywhere else, and once the `Properties` natives are retired
+// (`RETIRED_SHADOW_PHASE3_TRIPLES`) that write is the only one there is:
+// `System.getProperties().setProperty(k, v)` runs JDK bytecode straight into
+// the `map`, and the VM's own store -- which `System.getProperty` answers from
+// -- never hears about it.
+//
+// MEASURED: `probes/SystemRuntimeObjectSweep` rows 39 and 40 are what caught
+// it, and they are the ONLY two rows across 115 probes that the Phase 3
+// retirement moved.
+//
+//   a write through getProperties is visible to getProperty  four -> null
+//   setProperties round trip                    yes/null/true -> null/null/true
+//
+// The second is the same defect one level up: `System.setProperties(p)` read
+// its argument's entries out of the SIDE TABLE, and a `Properties` built by
+// real `<init>` has no side table -- its entries are in the real map.
+//
+// The functions below are the write half of the same bridge, and they are
+// deliberately shaped like their side-table twins
+// (`store_property_in_sidetable` / `remove_property_from_sidetable` /
+// `snapshot_sidetable`) so a future edit that adds a fourth mirror to
+// `System.setProperty` has an obvious place to put it.
+
+/// The receiver's real `map` field, or `None` if it has not been filled.
+///
+/// `None` is a real answer and not an error: [`replace_real_map`]'s stated
+/// invariant is that the field holds the whole snapshot or is ABSENT, so every
+/// caller here treats absence as "the side table is still the store" and does
+/// nothing. That is also what keeps these functions inert under `--real-jdk`,
+/// where the field is never filled at all.
+fn real_map_of(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "map") {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// Ask the receiver's own bytecode for a property.
+///
+/// `Properties.getProperty` rather than `map.get`, because the JDK method is
+/// the definition: it walks the `defaults` chain and answers `null` for a
+/// non-`String` value, and re-implementing either here would be a second
+/// opinion that drifts from the first.
+///
+/// Callers must treat `None` as "ask the VM store next", never as "absent".
+/// The real map can legitimately lag the store -- a property the VM set after
+/// the last `System.getProperties()` call is only in the store -- so this is a
+/// first opinion, not an authority.
+pub fn lookup_in_real_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: &str,
+) -> Option<String> {
+    real_map_of(ctx, this)?;
+    let this_pin = ctx.pin_native_root(this);
+    let k = ctx.create_string(key);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let got = ctx.invoke_virtual(
+        this_cur,
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        &[Value::Object(Some(k))],
+    );
+    ctx.unpin_native_roots(this_pin);
+    match got {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// Mirror one `System.setProperty` into the real map.
+///
+/// The twin of [`store_property_in_sidetable`], and it exists for the reason
+/// that one does: a caller holding the singleton (Spring's `systemProperties`
+/// bean is the recorded case) never calls `System.getProperties()` again, so
+/// the refill on that path never re-fires and the held reference goes stale.
+pub fn store_property_in_real_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: &str,
+    value: &str,
+) {
+    if key.len() > MAX_KV_LEN || value.len() > MAX_KV_LEN {
+        return;
+    }
+    if real_map_of(ctx, this).is_none() {
+        return;
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let k = ctx.create_string(key);
+    let k_pin = ctx.pin_native_root(k);
+    let v = ctx.create_string(value);
+    let k_cur = ctx.read_native_pin(k_pin, k);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let r = ctx.invoke_virtual(
+        this_cur,
+        "setProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+        &[Value::Object(Some(k_cur)), Value::Object(Some(v))],
+    );
+    ctx.unpin_native_roots(k_pin);
+    ctx.unpin_native_roots(this_pin);
+    if props_stderr_diag() {
+        if let Err(e) = r {
+            eprintln!("[PROPS-REAL-MAP] setProperty {key:?} into the real map: {e:?}");
+        }
+    }
+}
+
+/// Mirror one `System.clearProperty` into the real map.
+pub fn remove_property_from_real_map(ctx: &mut dyn NativeContext, this: ObjectRef, key: &str) {
+    if real_map_of(ctx, this).is_none() {
+        return;
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let k = ctx.create_string(key);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let r = ctx.invoke_virtual(
+        this_cur,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(Some(k))],
+    );
+    ctx.unpin_native_roots(this_pin);
+    if props_stderr_diag() {
+        if let Err(e) = r {
+            eprintln!("[PROPS-REAL-MAP] remove {key:?} from the real map: {e:?}");
+        }
+    }
+}
+
+/// Every entry in the receiver's real `map`, as `System.setProperties` needs
+/// it.
+///
+/// `keySet().toArray()` and then one `getProperty` per key. Not
+/// `stringPropertyNames()`, whose `Set` would have to be walked through an
+/// `Iterator` from native code for no gain, and not a direct read of the
+/// `ConcurrentHashMap` internals, which is the thing this whole change exists
+/// to stop doing.
+///
+/// Non-`String` keys are skipped rather than stringified: `Properties`
+/// tolerates them through its `Hashtable` inheritance, `stringPropertyNames`
+/// drops them, and the VM's property store is `String`-keyed -- so dropping is
+/// both the JDK's answer and the only representable one.
+///
+/// # GC
+///
+/// The array and the receiver are pinned and re-read across the loop, because
+/// every `getProperty` re-enters Java and is a collection point. See
+/// [`replace_real_map`]'s note on the same hazard.
+pub fn snapshot_real_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(String, String)> {
+    if real_map_of(ctx, this).is_none() {
+        return Vec::new();
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let mut this_cur = ctx.read_native_pin(this_pin, this);
+    let keys = match ctx.invoke_virtual(this_cur, "keySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(set)))) => {
+            let set_pin = ctx.pin_native_root(set);
+            let set_cur = ctx.read_native_pin(set_pin, set);
+            let arr = ctx.invoke_virtual(set_cur, "toArray", "()[Ljava/lang/Object;", &[]);
+            ctx.unpin_native_roots(set_pin);
+            match arr {
+                Ok(Some(Value::Object(Some(a)))) => Some(a),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(keys) = keys else {
+        ctx.unpin_native_roots(this_pin);
+        return Vec::new();
+    };
+    let keys_pin = ctx.pin_native_root(keys);
+    let mut keys_cur = ctx.read_native_pin(keys_pin, keys);
+    let n = ctx.array_length(keys_cur);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        keys_cur = ctx.read_native_pin(keys_pin, keys_cur);
+        let Value::Object(Some(k_obj)) = ctx.get_array_element(keys_cur, i) else {
+            continue;
+        };
+        let Some(key) = ctx.read_string(k_obj) else {
+            continue;
+        };
+        this_cur = ctx.read_native_pin(this_pin, this_cur);
+        if let Some(value) = lookup_in_real_map(ctx, this_cur, &key) {
+            out.push((key, value));
+        }
+    }
+    ctx.unpin_native_roots(keys_pin);
+    ctx.unpin_native_roots(this_pin);
+    out
+}
+
+/// Fold anything written straight into the real map back into the VM's store.
+///
+/// The one write path with no mirror: real `Properties` bytecode, reached
+/// through a reference the caller already holds. `System.setProperty` and
+/// `System.clearProperty` write both stores themselves; this is for
+/// `System.getProperties().setProperty(..)`, which writes only the map.
+///
+/// Called at the TOP of the `--jdk-only` `System.getProperties` body, before
+/// the snapshot [`replace_real_map`] refills from -- the order is the point.
+/// Refilling first would `clear()` the map and drop exactly the writes this
+/// exists to harvest.
+///
+/// # What it cannot do
+///
+/// A `remove` performed directly on the receiver is invisible here: this is a
+/// union, not a reconciliation, and there is no record of what the map used to
+/// hold. `System.clearProperty` is mirrored, so the reachable gap is a direct
+/// `props.remove(k)` on the system singleton, whose key then survives in the VM
+/// store until something overwrites it. Recorded rather than papered over:
+/// closing it needs a generation counter on the map, which is a larger change
+/// than the defect justifies.
+pub fn harvest_real_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+    let mut harvested = 0usize;
+    for (key, value) in snapshot_real_map(ctx, this) {
+        if ctx.get_system_property(&key).as_deref() == Some(value.as_str()) {
+            continue;
+        }
+        let _ = ctx.set_system_property(&key, &value);
+        harvested += 1;
+    }
+    if harvested > 0 && props_stderr_diag() {
+        eprintln!("[PROPS-REAL-MAP] harvested {harvested} entries written through the receiver");
+    }
+    harvested
+}
+
 /// Public snapshot of side-table entries for a given object, used by
 /// surefire `setAsSystemProperties` etc. to iterate entries without
 /// going through the inner Map field.
@@ -1436,9 +1855,19 @@ fn mirror_loaded_entries_to_properties_backend(
                 Ok(Some(Value::Object(Some(o)))) => Some(o),
                 _ => None,
             }) else {
+                // GC-safety: `create_property_string` allocates twice per turn
+                // and `Hashtable.put` is real bytecode, so `this` is a pre-GC
+                // address from the second entry on, and `k_obj` is stale by the
+                // time `v_obj`'s allocation returns. This is the same file and
+                // the same shape as the four receivers gdb caught on
+                // 2026-09-06.
+                let this_pin = ctx.pin_native_root(this);
                 for (k, v) in parsed {
                     let k_obj = create_property_string(ctx, k);
+                    let k_pin = ctx.pin_native_root(k_obj);
                     let v_obj = create_property_string(ctx, v);
+                    let k_obj = ctx.read_native_pin(k_pin, k_obj);
+                    let this = ctx.read_native_pin(this_pin, this);
                     let _ = ctx.invoke_special(
                         "java/util/Hashtable",
                         "put",
@@ -1449,7 +1878,9 @@ fn mirror_loaded_entries_to_properties_backend(
                             Value::Object(Some(v_obj)),
                         ],
                     );
+                    ctx.unpin_native_roots(k_pin);
                 }
+                ctx.unpin_native_roots(this_pin);
                 return;
             };
             let _ = ctx.invoke(
@@ -1463,16 +1894,24 @@ fn mirror_loaded_entries_to_properties_backend(
         }
     };
 
+    // GC-safety: as above -- two allocations and a virtual `put` per turn, with
+    // the backing map carried in from outside the loop.
+    let chm_pin = ctx.pin_native_root(chm);
     for (k, v) in parsed {
         let k_obj = create_property_string(ctx, k);
+        let k_pin = ctx.pin_native_root(k_obj);
         let v_obj = create_property_string(ctx, v);
+        let k_obj = ctx.read_native_pin(k_pin, k_obj);
+        let chm = ctx.read_native_pin(chm_pin, chm);
         let _ = ctx.invoke_virtual(
             chm,
             "put",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(k_obj)), Value::Object(Some(v_obj))],
         );
+        ctx.unpin_native_roots(k_pin);
     }
+    ctx.unpin_native_roots(chm_pin);
 }
 
 /// Store entries parsed by a native `load` into the receiver.
@@ -2152,15 +2591,40 @@ fn native_properties_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if let (Some(ks), Some(vs)) = (ks_opt.as_ref(), vs_opt.as_ref()) {
         if !ks.is_empty() {
             // String→String: store in side-table AND CHM (existing path).
-            let prev = get_kv_units(ctx, this, ks);
-            put_kv_units(ctx, this, ks, vs);
-            mirror_loaded_entries_to_properties_backend(ctx, this, &[(ks.clone(), vs.clone())]);
-            if is_system_props(ctx, this) {
-                let _ = ctx.set_system_property(&ks.to_lossy(), &vs.to_lossy());
+            //
+            // THE RECEIVER IS ROOTED ACROSS THIS BLOCK, and it held nothing
+            // before — this function had no pin at all. Two of the four calls
+            // below allocate: `put_kv_units` inflates a monitor to read the
+            // receiver's identity hash, and
+            // `mirror_loaded_entries_to_properties_backend` runs real `put`
+            // bytecode. So the receiver can be moved or freed between them,
+            // and everything after `put_kv_units` — the mirror, the
+            // system-props test — was reading a pre-GC address. The side-table
+            // key is DERIVED from that identity (`key_for`), so the two
+            // outcomes are a dereference of a dead header and an entry
+            // scattered across two keys, whichever the collector gets to
+            // first. `get_kv_units`, `read_java_text` and `is_system_props`
+            // take `&dyn NativeContext` and are not GC points; the refreshes
+            // are placed for the two that are.
+            let mut scope = NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let unrooted = props_unrooted_receivers();
+            let at = if unrooted { this } else { scope.get(&this_h) };
+            let prev = get_kv_units(&*scope, at, ks);
+            put_kv_units(&mut *scope, at, ks, vs);
+            let at = if unrooted { this } else { scope.get(&this_h) };
+            mirror_loaded_entries_to_properties_backend(
+                &mut *scope,
+                at,
+                &[(ks.clone(), vs.clone())],
+            );
+            let at = if unrooted { this } else { scope.get(&this_h) };
+            if is_system_props(&*scope, at) {
+                let _ = scope.set_system_property(&ks.to_lossy(), &vs.to_lossy());
             }
             return Ok(Some(match prev {
                 Some(p) => {
-                    let s = create_property_string(ctx, &p);
+                    let s = create_property_string(&mut *scope, &p);
                     Value::Object(Some(s))
                 }
                 None => Value::Object(None),
@@ -2359,10 +2823,36 @@ fn native_properties_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let key = read_java_text(ctx, key_obj).unwrap_or_default();
-    if key.is_empty() {
-        return Ok(Some(Value::Object(None)));
-    }
+    // A KEY WITH NO STRING FORM AT ALL is the only one this function may skip
+    // the side-table for, and it must still reach the CHM.
+    //
+    // This used to be `read_java_text(..).unwrap_or_default()` followed by
+    // `if key.is_empty() { return null }`, which returned BEFORE
+    // `remove_from_properties_backend` for two quite different keys and was
+    // wrong for both. `native_properties_put` routes a non-String key to the
+    // real `map` CHM (`put_non_string_into_chm`), so the entry stayed there
+    // while the caller was told there had been nothing to remove — and
+    // `size()`/`keySet()`/`containsKey()` all read the CHM, so it went on
+    // being counted. That is a silent failure of exactly the shape this file's
+    // header describes, and the one `probes/PropertiesBacking.java` caught:
+    //
+    // ```text
+    //   p.put(Integer.valueOf(3), "byIntKey");
+    //   p.remove(Integer.valueOf(3))  ->  null   (HotSpot: "byIntKey")
+    //   p.size()                      ->  3      (HotSpot: 2)
+    // ```
+    //
+    // The EMPTY String is the second key that took that return, and it needs
+    // the opposite treatment, because the two writers disagree about where it
+    // goes: `native_properties_put` sends it to the CHM (its side-table arm is
+    // guarded by `!ks.is_empty()`), while `native_properties_set_property`
+    // calls `put_kv_units` unconditionally and puts it in BOTH. It is an
+    // ordinary key to every reader here — `native_properties_contains_key`
+    // looks it up in the side-table like any other — so it takes the ordinary
+    // path below, which clears both stores.
+    let Some(key) = read_java_text(ctx, key_obj) else {
+        return Ok(Some(remove_from_properties_backend(ctx, this, key_obj)));
+    };
     let removed = remove_kv_units(ctx, this, &key);
     // The system-properties view must propagate removal to the global store,
     // mirroring how `setProperty`/`put` propagate writes — otherwise
@@ -3277,8 +3767,8 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             other => other,
         };
     }
-    let this_cur = ctx.read_native_pin(this_pin, this);
-    let set = cratonvm_native_collections::make_static_key_set(ctx, this_cur, &keys)?;
+    let mut this_cur = ctx.read_native_pin(this_pin, this);
+    let set = cratonvm_native_collections::make_static_key_set(ctx, &mut this_cur, &keys)?;
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(set))))
 }
@@ -3529,26 +4019,35 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// Collect this Properties object's own String keys (side-table + CHM-exclusive
 /// non-String-valued entries), de-duplicating into `seen`/`out`. Mirrors the
 /// key set `native_properties_keys` exposes for a single object.
+/// `this` is `&mut` for the reason [`ordered_snapshot_kv`] states on its own
+/// parameter: this function re-enters Java twice and the receiver can be moved
+/// or freed under it, so the refresh has to reach the CALLER's variable. It
+/// used to take `ObjectRef` by value and shadow it (`let mut this = this;`),
+/// which satisfied that `&mut` with a COPY and threw the refreshed address away
+/// at the return — while its one caller went on to read `defaults` out of the
+/// pre-GC address. That was a SIGSEGV in `gen_heap::get_field`.
 fn collect_own_property_names(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    this: &mut ObjectRef,
     seen: &mut std::collections::HashSet<JavaText>,
     out: &mut Vec<JavaText>,
 ) {
-    let mut this = this;
-    for (k, _v) in ordered_snapshot_kv(ctx, &mut this) {
+    for (k, _v) in ordered_snapshot_kv(ctx, this) {
         if seen.insert(k.clone()) {
             out.push(k);
         }
     }
-    let side = side_key_set(ctx, this);
-    for (_key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {
+    let side = side_key_set(ctx, *this);
+    for (_key_obj, _value, kstr) in chm_extra_entries(ctx, *this, &side) {
         if let Some(s) = kstr {
             if seen.insert(s.clone()) {
                 out.push(s);
             }
         }
     }
+    // `chm_extra_entries` is the second GC point and nothing here uses the
+    // receiver after it, so `*this` is left as `ordered_snapshot_kv` refreshed
+    // it. The caller does not rely on that: it re-reads its own handle.
 }
 
 /// Native `Properties.propertyNames()Ljava/util/Enumeration;` — unlike
@@ -3562,6 +4061,22 @@ fn collect_own_property_names(
 /// lost `defaults`-supplied entries). Walk the receiver then recurse through
 /// `defaults`, de-duplicating by name. `getProperty` already honours the same
 /// chain via `props_defaults`.
+/// `CRATONVM_PROPS_UNROOTED_RECEIVERS`: carry a pre-GC receiver across a GC
+/// point again, the way four sites in this file did until 2026-09-06 —
+/// `propertyNames`' `defaults` walk, both batched-store loops in `putAll`, and
+/// `put`'s mirror/system-props tail.
+///
+/// A BISECTION LEVER, not a tuning knob: what it restores is a
+/// use-after-collect, so that the before and after of its fix are two runs of
+/// ONE binary. Measured on the Kafka reproducer this page names, `--nojit`
+/// under the Generational collector.
+fn props_unrooted_receivers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_PROPS_UNROOTED_RECEIVERS").is_some()
+    })
+}
+
 fn native_properties_property_names(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3579,12 +4094,36 @@ fn native_properties_property_names(
     let mut out: Vec<JavaText> = Vec::new();
     // Walk the receiver and its defaults chain. A depth cap guards against a
     // pathological self-referential `defaults` field (the JDK chain is acyclic).
+    // EVERY CHAIN NODE IS ROOTED, AND RE-READ BEFORE EVERY USE.
+    //
+    // Both calls in this loop body re-enter Java: `props_first_non_string_key`
+    // and `collect_own_property_names` each reach `chm_extra_entries`, which
+    // invokes `entrySet`/`iterator`/`next`. So each is a GC point, and a bare
+    // `ObjectRef` loop variable carried across one is a pre-GC address. Under
+    // the Generational collector that is fatal in BOTH directions, and both
+    // were measured: the Cheney cycle can MOVE the node, and the non-moving
+    // young sweep can FREE it outright — a `defaults` link is often the only
+    // reference to the node this walk is standing on, and the walk's own
+    // variable is not a root. The `defaults` read at the bottom of the loop
+    // then dereferenced a vacated or dead header: SIGSEGV in
+    // `gen_heap::get_field` at `header.kind()`, reached from
+    // `Properties.propertyNames()`.
+    //
+    // The handle is the authority, re-read at each use rather than carried.
+    // That is what makes this correct independently of what a callee does with
+    // its own parameter — `collect_own_property_names` looked like it handled
+    // this and did not, because it took the receiver BY VALUE and refreshed
+    // only its copy (see the `&mut` contract `ordered_snapshot_kv` documents).
     let mut cur = Some(this);
     let mut depth = 0;
+    let mut scope = NativeHandleScope::new(ctx);
     while let Some(p) = cur {
         if depth > 64 {
             break;
         }
+        let node = scope.root(p);
+        // The lever: `p` is the pre-GC address the old code carried.
+        let unrooted = props_unrooted_receivers();
         // `Properties.enumerate` is `h.put((String) e.getKey(), e.getValue())`,
         // and that cast is the contract, not a formality: a `Properties`
         // holding a non-String key is already outside the class's invariant,
@@ -3596,14 +4135,19 @@ fn native_properties_property_names(
         // NOT the same rule as `stringPropertyNames`, which filters BY DESIGN
         // (`enumerateStringProperties` skips a non-String key AND a non-String
         // value) and which this file already gets right.
-        if let Some(cname) = props_first_non_string_key(ctx, p) {
-            return Err(props_key_cast_failure(ctx, &cname));
+        let at_node = if unrooted { p } else { scope.get(&node) };
+        if let Some(cname) = props_first_non_string_key(&mut *scope, at_node) {
+            let failure = props_key_cast_failure(&mut *scope, &cname);
+            return Err(failure);
         }
-        collect_own_property_names(ctx, p, &mut seen, &mut out);
-        cur = props_defaults(ctx, p);
+        let mut at_node = if unrooted { p } else { scope.get(&node) };
+        collect_own_property_names(&mut *scope, &mut at_node, &mut seen, &mut out);
+        let at_node = if unrooted { p } else { scope.get(&node) };
+        cur = props_defaults(&*scope, at_node);
         depth += 1;
     }
-    Ok(Some(Value::Object(Some(build_enumeration(ctx, out)?))))
+    let names = build_enumeration(&mut *scope, out)?;
+    Ok(Some(Value::Object(Some(names))))
 }
 
 /// Native `Properties.elements()Ljava/util/Enumeration;` — companion to
@@ -4100,21 +4644,20 @@ fn collect_via_virtual_entryset(
 /// (e.g. `SortedProperties`' sorted view) are honored.
 fn collect_store_entries(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    this: &mut ObjectRef,
 ) -> Vec<(JavaText, JavaText)> {
-    let mut this = this;
-    let cid = ctx.class_id_of_object(this);
+    let cid = ctx.class_id_of_object(*this);
     let is_exact = ctx
         .class_name_of_id(cid)
         .is_none_or(|n| n == "java/util/Properties");
     if is_exact {
-        return ordered_snapshot_kv(ctx, &mut this);
+        return ordered_snapshot_kv(ctx, this);
     }
-    let entries = collect_via_virtual_entryset(ctx, this);
+    let entries = collect_via_virtual_entryset(ctx, *this);
     // Fallback: if the virtual walk produced nothing (unexpected dispatch
     // failure) but the side-table has data, don't silently drop it.
     if entries.is_empty() {
-        return ordered_snapshot_kv(ctx, &mut this);
+        return ordered_snapshot_kv(ctx, this);
     }
     entries
 }
@@ -4171,8 +4714,8 @@ fn build_store_text(
     // forwarded (post-GC) reference.
     let this_pin = ctx.pin_native_root(this);
     let date = current_date_string(ctx);
-    let this_cur = ctx.read_native_pin(this_pin, this);
-    let entries = collect_store_entries(ctx, this_cur);
+    let mut this_cur = ctx.read_native_pin(this_pin, this);
+    let entries = collect_store_entries(ctx, &mut this_cur);
     ctx.unpin_native_roots(this_pin);
     render_store_text(comments, date.as_deref(), &entries, escape_unicode, &eol)
 }
@@ -5154,7 +5697,20 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     this = ctx.read_native_pin(this_pin, this);
     if !snapshot.is_empty() || !other_chm_extra.is_empty() {
         for (k, v) in &snapshot {
+            // REFRESH INSIDE THE LOOP, not merely around it. `put_kv_units`
+            // reaches `key_for` -> `identity_hash_code` ->
+            // `identity_hash_via_monitor`, which INFLATES A MONITOR and so
+            // allocates: every iteration is a GC point. This function refreshes
+            // `this` after each of its other calls and did not refresh here, so
+            // from the second iteration on it handed `put_kv_units` a pre-GC
+            // address and the identity-hash read dereferenced a freed header.
+            if !props_unrooted_receivers() {
+                this = ctx.read_native_pin(this_pin, this);
+            }
             put_kv_units(ctx, this, k, v);
+        }
+        if !props_unrooted_receivers() {
+            this = ctx.read_native_pin(this_pin, this);
         }
         // Mirror into `this`'s real `map` CHM backing too, so the destination
         // stays consistent for generic Map walkers (cf. native_properties_put).
@@ -5292,8 +5848,18 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
         ctx.unpin_native_roots(entry_pin);
     }
+    // Refresh inside the loop, for the reason the sibling loop above states:
+    // `put_kv_units` inflates a monitor to read the identity hash, so every
+    // iteration is a GC point and the receiver is pinned precisely so it can be
+    // re-read here.
     for (k, v) in &str_collected {
+        if !props_unrooted_receivers() {
+            this = ctx.read_native_pin(this_pin, this);
+        }
         put_kv_units(ctx, this, k, v);
+    }
+    if !props_unrooted_receivers() {
+        this = ctx.read_native_pin(this_pin, this);
     }
     mirror_loaded_entries_to_properties_backend(ctx, this, &str_collected);
     ctx.unpin_native_roots(this_pin);

@@ -1211,7 +1211,150 @@ fn host_input_is_numeric_literal(input: &str) -> bool {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(input);
     let unscoped = bare.split('%').next().unwrap_or(bare);
-    !unscoped.is_empty() && unscoped.parse::<IpAddr>().is_ok()
+    if unscoped.is_empty() {
+        return false;
+    }
+    // `Ipv4Addr::from_str` is STRICTER than the JDK: it takes four decimal
+    // octets and nothing else, so `1.2.3`, `1.2`, `16909060` and `01.2.3.4`
+    // all failed here and were remembered as host NAMES — HotSpot prints
+    // `/1.2.0.3` for `getByName("1.2.3")` and this VM printed `1.2.3/1.2.0.3`.
+    jdk_numeric_format_v4(unscoped).is_some() || unscoped.parse::<IpAddr>().is_ok()
+}
+
+/// `sun.net.util.IPAddressUtil.textToNumericFormatV4`, which is the JDK's own
+/// answer to "is this text an IPv4 literal".
+///
+/// It is neither `Ipv4Addr::from_str` (too strict: no 1-, 2- or 3-part forms)
+/// nor `inet_aton` (too lax: hex and octal). The rules, all four of them:
+///
+/// * at most 15 characters, and only decimal digits and `.`;
+/// * one to four parts, none empty;
+/// * every part but the last is an octet (`< 256`);
+/// * the last part fills the REMAINING bytes, so `1.2.3` is `1.2.0.3` and
+///   `16909060` is `1.2.3.4`.
+///
+/// A leading zero is not octal here — `01.2.3.4` is `1.2.3.4` — because the
+/// digits are accumulated base 10. That is measured, not assumed: HotSpot
+/// 25.0.4+7 answers `/1.2.3.4` for it.
+pub(crate) fn jdk_numeric_format_v4(src: &str) -> Option<Ipv4Addr> {
+    if src.is_empty() || src.len() > 15 {
+        return None;
+    }
+    let mut res = [0u8; 4];
+    let mut tmp: u64 = 0;
+    let mut cur = 0usize;
+    let mut new_octet = true;
+    for c in src.chars() {
+        if c == '.' {
+            if new_octet || tmp > 0xff || cur == 3 {
+                return None;
+            }
+            res[cur] = (tmp & 0xff) as u8;
+            cur += 1;
+            tmp = 0;
+            new_octet = true;
+        } else {
+            let digit = c.to_digit(10)?;
+            tmp = tmp * 10 + u64::from(digit);
+            new_octet = false;
+        }
+    }
+    if new_octet || tmp >= (1u64 << ((4 - cur) * 8)) {
+        return None;
+    }
+    match cur {
+        0 => res = (tmp as u32).to_be_bytes(),
+        1 => {
+            let b = (tmp as u32).to_be_bytes();
+            res[1] = b[1];
+            res[2] = b[2];
+            res[3] = b[3];
+        }
+        2 => {
+            let b = (tmp as u32).to_be_bytes();
+            res[2] = b[2];
+            res[3] = b[3];
+        }
+        _ => res[3] = (tmp & 0xff) as u8,
+    }
+    Some(Ipv4Addr::from(res))
+}
+
+/// True for the text `inet_aton(3)` accepts and the JDK deliberately does not:
+/// hexadecimal (`0x7f.0.0.1`) and octal (`0177.0.0.1`) parts.
+///
+/// This matters because the fallback for "not a literal" is a NAME lookup, and
+/// `getaddrinfo` runs `inet_aton` first — so without this check the C library
+/// resolves `0x7f.0.0.1` to 127.0.0.1 and the VM answers where HotSpot raises.
+/// The JDK raises `UnknownHostException` carrying the BARE host text (no
+/// resolver suffix), which is how this case is told apart from a DNS miss.
+pub(crate) fn bsd_parsable_v4(src: &str) -> bool {
+    if src.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = src.split('.').collect();
+    if parts.len() > 4 {
+        return false;
+    }
+    let mut saw_alternate_radix = false;
+    for part in &parts {
+        let (digits, radix) =
+            if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+                saw_alternate_radix = true;
+                (hex, 16)
+            } else if part.len() > 1 && part.starts_with('0') {
+                saw_alternate_radix = true;
+                (&part[1..], 8)
+            } else {
+                (*part, 10)
+            };
+        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+            return false;
+        }
+    }
+    saw_alternate_radix
+}
+
+/// The JDK's `UnknownHostException` text for a failed NAME lookup is
+/// `"<host>: <resolver message>"`. Rust's `io::Error` for the same call reads
+/// `"failed to lookup address information: Name or service not known"`, so the
+/// VM printed a message with an extra clause in the middle of it. The resolver
+/// text is the part after the last `": "`.
+pub(crate) fn resolver_message(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match text.rfind(": ") {
+        Some(i) => text[i + 2..].to_string(),
+        None => text,
+    }
+}
+
+/// `getByName`'s literal screen, shared by every resolving entry point.
+///
+/// Returns `Ok(Some(ip))` for a literal, `Ok(None)` when the text is a name to
+/// look up, and `Err` when the JDK rejects it as a malformed literal WITHOUT
+/// consulting the resolver — the two cases being a BSD-only IPv4 form and
+/// anything carrying a colon that is not a valid IPv6 literal.
+pub(crate) fn literal_screen(host: &str) -> Result<Option<IpAddr>, MethodCallFailed> {
+    if let Some(v4) = jdk_numeric_format_v4(host) {
+        return Ok(Some(IpAddr::V4(v4)));
+    }
+    let bracketed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(v6) = bracketed.parse::<Ipv6Addr>() {
+        return Ok(Some(IpAddr::V6(v6)));
+    }
+    if bsd_parsable_v4(host) {
+        return Err(uhex(host.to_string()));
+    }
+    // A colon cannot appear in a host NAME, so the JDK never falls through to
+    // the resolver for one: `1::2::3` and `1:2:3:4:5:6:7` are malformed
+    // literals, not names that happen not to resolve.
+    if host.contains(':') && host_input_scope(host).is_none() {
+        return Err(uhex(format!("{host}: invalid IPv6 address literal")));
+    }
+    Ok(None)
 }
 
 /// The `%scope` of a textual address literal, if it carries one.
@@ -2508,7 +2651,7 @@ fn native_inet_get_by_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // this VM NullPointerException, in BOTH modes. `obj_arg` raises the NPE for
     // every one of its ~3900 call sites, so the check has to be here.
     let Some(Value::Object(Some(arr))) = args.first() else {
-        return Err(uhex("addr is of illegal length: null".to_string()));
+        return Err(uhex("addr is of illegal length".to_string()));
     };
     let arr = *arr;
     let len = ctx.array_length(arr);
@@ -2525,7 +2668,11 @@ fn native_inet_get_by_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         // (`InetAddress.getByAddress` declares `throws UnknownHostException` and
         // uses it for the bad-length case). Real callers catch it by that type;
         // an IAE escapes their catch and propagates as an unrelated failure.
-        return Err(uhex(format!("addr is of illegal length: {len}")));
+        // MEASURED on HotSpot 25.0.4+7 (`L6InetSweep`): the message carries NO
+        // length. `InetAddress.getByAddress` throws a constant string, and the
+        // six rows that reach it here differed on the `: {len}` this VM added.
+        let _ = len;
+        return Err(uhex("addr is of illegal length".to_string()));
     };
     // Normalize to HotSpot's numeric text before storing anything, or a caller
     // that reads the address (such as Jetty's connector setup) observes Rust's
@@ -2631,11 +2778,12 @@ fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallF
     if host.is_empty() || host == "localhost" {
         return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
-    if let Ok(v4) = host.parse::<Ipv4Addr>() {
-        return Ok(IpAddr::V4(v4));
-    }
-    if let Ok(v6) = host.parse::<Ipv6Addr>() {
-        return Ok(IpAddr::V6(v6));
+    // The JDK's literal rules, ahead of the resolver: `getaddrinfo` runs
+    // `inet_aton` on numeric-looking text and accepts forms the JDK dropped,
+    // so a screen that runs AFTER it cannot see what it swallowed.
+    match literal_screen(host)? {
+        Some(ip) => return Ok(ip),
+        None => {}
     }
     // A SCOPED IPv6 literal — `fe80::1%14`, `fe80::1%eth0`,
     // `fe80::1%{04C70698-…}` on Windows, where our interface names are the
@@ -2664,7 +2812,7 @@ fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallF
     }
     let lookup = format!("{host}:0");
     let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str())
-        .map_err(|e| uhex(format!("{host}: {e}")))?;
+        .map_err(|e| uhex(format!("{host}: {}", resolver_message(&e))))?;
     match iter.next() {
         Some(sa) => Ok(sa.ip()),
         None => Err(uhex(format!("{host}"))),
@@ -3111,6 +3259,77 @@ pub(crate) fn uri_hash_code(ctx: &dyn NativeContext, uri: ObjectRef) -> i32 {
     h
 }
 
+/// `java.net.URI.compareTo(null)`.
+///
+/// The JDK has no null check here — `compareTo`'s first statement is
+/// `compareIgnoringCase(this.scheme, that.scheme)`, so the argument is
+/// dereferenced and the helpful NPE names the field it was reading. Measured
+/// on HotSpot 25.0.4+7:
+///
+/// ```text
+/// java.lang.NullPointerException: Cannot read field "scheme" because "that" is null
+/// ```
+///
+/// This registration cannot get there by dereferencing (it never touches a
+/// field), so the message is a constant — but an `IllegalArgumentException`,
+/// which is what stood here, is a different type on the wire and a
+/// `catch (NullPointerException)` walks straight past it.
+fn uri_compare_to_null() -> cratonvm_types::error::MethodCallFailed {
+    npe("Cannot read field \"scheme\" because \"that\" is null")
+}
+
+/// The `IllegalArgumentException` `java.net.URI.create(String)` throws for a
+/// parse failure: the `URISyntaxException`'s own `getMessage()` as the
+/// message, and that exception as the CAUSE.
+///
+/// MEASURED on HotSpot 25.0.4+7:
+///
+/// ```text
+///   URI.create("http://h/%zz")
+///     java.lang.IllegalArgumentException: Malformed escape pair at index 9: http://h/%zz
+///     cause java.net.URISyntaxException: Malformed escape pair at index 9: http://h/%zz
+/// ```
+///
+/// The JDK gets both for free — `catch (URISyntaxException x) { throw new
+/// IllegalArgumentException(x.getMessage(), x); }` — and this reproduces that
+/// literally rather than re-deriving the text, so the two doors cannot drift.
+fn uri_create_iae(
+    ctx: &mut dyn NativeContext,
+    input: &str,
+    fail: &crate::UriParseFail,
+) -> cratonvm_types::error::MethodCallFailed {
+    // The text the JDK's own `getMessage()` would produce, kept as the
+    // fallback for the (allocation-failure only) paths below.
+    let trimmed = crate::uri_exception_input(input);
+    let text = match fail.index {
+        Some(i) => format!("{} at index {i}: {trimmed}", fail.reason),
+        None => format!("{}: {trimmed}", fail.reason),
+    };
+    let Some(MethodCallFailed::ExceptionThrown(cause)) =
+        crate::uri_syntax_exception_pub(ctx, input, fail)
+    else {
+        return iae(text);
+    };
+    // `getMessage()` runs bytecode and the constructor below allocates, so the
+    // cause has to survive both.
+    let pin = ctx.pin_native_root(cause);
+    let cause = ctx.read_native_pin(pin, cause);
+    let msg = match ctx.invoke_virtual(cause, "getMessage", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => ctx.create_string(&text),
+    };
+    let cause = ctx.read_native_pin(pin, cause);
+    let built = ctx.new_object_initialized(
+        "java/lang/IllegalArgumentException",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        &[Value::Object(Some(msg)), Value::Object(Some(cause))],
+    );
+    ctx.unpin_native_roots(pin);
+    match built {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => iae(text),
+    }
+}
 fn cmp_order(o: std::cmp::Ordering) -> i32 {
     match o {
         std::cmp::Ordering::Less => -1,
@@ -3230,22 +3449,74 @@ fn opt_str_eq_ignore_case(a: &Option<String>, b: &Option<String>) -> bool {
     }
 }
 
+/// `java.lang.String.hashCode()` over UTF-16 code units.
+///
+/// Not `str::bytes()`: `java.net.URI` hashes CHARS, and for any component
+/// carrying a non-ASCII character (`http://h/\u{e9}`) a byte fold and a
+/// code-unit fold give different numbers.
+fn java_string_hash(s: &str) -> i32 {
+    s.encode_utf16()
+        .fold(0i32, |acc, u| acc.wrapping_mul(31).wrapping_add(u as i32))
+}
+
+/// `java.net.URI.normalizedHash(int, String)` — the arm taken for a component
+/// that contains a `%`, so that two URIs differing only in the CASE of an
+/// escape triplet (`%c3%a9` vs `%C3%A9`) hash alike, as `URI.equals` requires.
+fn uri_normalized_hash(h: i32, s: &str) -> i32 {
+    let u: Vec<u16> = s.encode_utf16().collect();
+    let mut inner: i32 = 0;
+    let mut i = 0usize;
+    while i < u.len() {
+        let c = u[i];
+        inner = inner.wrapping_mul(31).wrapping_add(c as i32);
+        if c == u16::from(b'%') {
+            // The next TWO units, upper-cased, exactly as the JDK does — and
+            // unguarded there too, because `%` only survives the parser as the
+            // first unit of a well-formed triplet.
+            for k in (i + 1)..(i + 3) {
+                let d = u.get(k).copied().unwrap_or(0);
+                let up = if (b'a' as u16..=b'z' as u16).contains(&d) {
+                    d - 32
+                } else {
+                    d
+                };
+                inner = inner.wrapping_mul(31).wrapping_add(up as i32);
+            }
+            i += 2;
+        }
+        i += 1;
+    }
+    h.wrapping_mul(127).wrapping_add(inner)
+}
+
+/// `java.net.URI.hash(int, String)` — the case-SENSITIVE component step.
+///
+/// This is `h * 127 + s.hashCode()`, a fresh string hash mixed into the
+/// accumulator, NOT a continuation of one 31-based fold across the whole URI.
+/// The difference is not cosmetic: it was worth **31 of `L6UriSweep`'s 40
+/// differing rows**, every `hashCode` row the probe asks.
 fn hash_str(h: i32, s: Option<&str>) -> i32 {
     match s {
-        Some(s) => s
-            .bytes()
-            .fold(h, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32)),
         None => h,
+        Some(s) if !s.contains('%') => h.wrapping_mul(127).wrapping_add(java_string_hash(s)),
+        Some(s) => uri_normalized_hash(h, s),
     }
 }
 
+/// `java.net.URI.hashIgnoringCase(int, String)` — used for `scheme` and
+/// `host`, the two components `URI.equals` compares case-insensitively. Unlike
+/// [`hash_str`] this one really does continue the accumulator's 31-fold.
 fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
     match s {
-        Some(s) => s.bytes().fold(h, |acc, b| {
-            acc.wrapping_mul(31)
-                .wrapping_add(b.to_ascii_lowercase() as i32)
-        }),
         None => h,
+        Some(s) => s.encode_utf16().fold(h, |acc, u| {
+            let low = if (b'A' as u16..=b'Z' as u16).contains(&u) {
+                u + 32
+            } else {
+                u
+            };
+            acc.wrapping_mul(31).wrapping_add(low as i32)
+        }),
     }
 }
 
@@ -4931,7 +5202,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let other = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Err(iae("URI.compareTo null")),
+            _ => return Err(uri_compare_to_null()),
         };
         Ok(Some(Value::Int(uri_compare(ctx, this, other))))
     });
@@ -4941,7 +5212,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let other = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Err(iae("URI.compareTo null")),
+            _ => return Err(uri_compare_to_null()),
         };
         Ok(Some(Value::Int(uri_compare(ctx, this, other))))
     });
@@ -5183,53 +5454,17 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let s = ctx.read_string(s_obj).unwrap_or_default();
-            // URI.create(String) translates URI(String) parse failures to
-            // IllegalArgumentException, but valid results must keep make_uri's
-            // field layout for the URI accessors used by Keycloak.
-            if let Some((pos, reason)) = crate::uri_scheme_name_fail_index(&s) {
-                return Err(iae(format!("{reason} at index {pos}: {s}")));
-            }
-            let strict_uri_chars = crate::nbflags().uri_strict_chars;
-            let illegal = if strict_uri_chars {
-                crate::uri_first_illegal_index(&s)
-            } else {
-                s.char_indices()
-                    .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
-                    .map(|(i, _)| i)
-            };
-            if let Some(pos) = illegal {
-                return Err(iae(format!("Illegal character in URI at index {pos}: {s}")));
-            }
-            // `URI.create` is `new URI(str)` with the checked exception
-            // translated, so it owes the same refusals in the same order.
-            if let Some(pos) = crate::uri_expected_authority_fail_index(&s) {
-                return Err(iae(format!("Expected authority at index {pos}: {s}")));
-            }
-            // The bracketed-authority check the CONSTRUCTOR already runs. Both
-            // doors owe the same refusals — `URI.create` is documented as
-            // `new URI(str)` with the checked exception translated — and this
-            // one was only on the constructor, so `http://[::1/a` was refused
-            // by `new URI` and accepted here.
-            // The SAME closing-bracket rule the constructor runs, reached
-            // through the function it was extracted into rather than a second
-            // copy of it.
-            if let Some(pos) = crate::uri_closing_bracket_fail_index(&s) {
-                return Err(iae(format!(
-                    "Expected closing bracket for IPv6 address at index {pos}: {s}"
-                )));
-            }
-            if crate::nbflags().uri_strict_chars {
-                if let Some(fail) = crate::uri_ipv6_authority_fail(&s) {
-                    return Err(iae(match fail.index {
-                        Some(pos) => format!("{} at index {pos}: {s}", fail.reason),
-                        None => format!("{}: {s}", fail.reason),
-                    }));
-                }
-            }
-            if let Some(pos) = crate::uri_empty_ssp_fail_index(&s) {
-                return Err(iae(format!(
-                    "Expected scheme-specific part at index {pos}: {s}"
-                )));
+            // `URI.create(String)` is `new URI(str)` with the checked
+            // exception TRANSLATED, not replaced. Two things came out of that
+            // word, and this door had neither: the same refusals in the same
+            // order (it carried its own four-of-seven transcription with a
+            // catch-all `Illegal character in URI at index 9` where the
+            // constructor names the component), and the `URISyntaxException`
+            // itself as the `IllegalArgumentException`'s CAUSE — which is the
+            // only place the reason and index survive for a caller that
+            // catches the unchecked wrapper.
+            if let Some(fail) = crate::uri_parse_fail(&s) {
+                return Err(uri_create_iae(ctx, &s, &fail));
             }
             Ok(Some(Value::Object(Some(make_uri(ctx, &s)?))))
         },
@@ -7625,14 +7860,24 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
                 format!("{host}:0")
             };
             let mut addrs: Vec<String> = Vec::new();
-            match std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()) {
-                Ok(iter) => {
-                    for sa in iter {
-                        addrs.push(sa.ip().to_string());
-                    }
+            // Same literal screen as `getByName`; without it this entry point
+            // answers for `0x7f.0.0.1` and reports a resolver failure in the
+            // wrong words for `1::2::3`.
+            if !(host.is_empty() || host == "localhost") {
+                if let Some(ip) = literal_screen(&host)? {
+                    addrs.push(ip.to_string());
                 }
-                Err(e) => {
-                    return Err(uhex(format!("{host}: {e}")));
+            }
+            if addrs.is_empty() {
+                match std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()) {
+                    Ok(iter) => {
+                        for sa in iter {
+                            addrs.push(sa.ip().to_string());
+                        }
+                    }
+                    Err(e) => {
+                        return Err(uhex(format!("{host}: {}", resolver_message(&e))));
+                    }
                 }
             }
             // Test servers bind their loopback listener on IPv4. Prefer that
@@ -8985,7 +9230,12 @@ fn field5_is_full_url(s: &str) -> bool {
     }
     match s.split_once(':') {
         Some((scheme, rest)) => {
-            !scheme.is_empty() && !rest.is_empty() && !rest.bytes().all(|b| b.is_ascii_digit())
+            // `rest.parse::<i64>()`, not "every byte is a digit": `h:-1` is a
+            // PORT too — HotSpot answers `getPort() == -1` and keeps `h:-1` as
+            // the authority — and the digits-only test read it as a scheme, so
+            // `new URL("http://h:-1/p").toExternalForm()` handed back the bare
+            // authority `h:-1` in place of the whole URL.
+            !scheme.is_empty() && !rest.is_empty() && rest.parse::<i64>().is_err()
         }
         None => false,
     }
@@ -10086,6 +10336,24 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         };
         let url_str = ctx.read_string(url_str_obj).unwrap_or_default();
 
+        // `URL.toURI()` is `new URI(toString())`, so it owes that
+        // constructor's refusals — and this door PUBLISHED the text into a
+        // URI carrier without ever parsing it, so `new URL("http://h/a b")
+        // .toURI()` handed back a URI whose own constructor rejects its text
+        // (`Illegal character in path at index 10`). Three `L6UrlSweep` rows,
+        // and the same door Spring reaches when it catches
+        // `URISyntaxException` to fall back to a string path.
+        //
+        // Only the CHECK is shared with the constructor; the publish below
+        // stays, because the `jar:`/`nested:` fallback it exists for is
+        // load-bearing for Spring and Tomcat (see the retirement record's
+        // item 3).
+        if let Some(fail) = crate::uri_parse_fail(&url_str) {
+            if let Some(exc) = crate::uri_syntax_exception_pub(ctx, &url_str, &fail) {
+                return Err(exc);
+            }
+        }
+
         // Always build a synthetic URI. Returning a real-JDK URI here leaves
         // our `URI.getSchemeSpecificPart()` override without access to the raw
         // string (layout differs), which can degrade to empty SSP and break
@@ -10167,15 +10435,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         // Read the protocol field (slot 0 in our synthetic URL layout).
         let protocol = read_field_string_or(ctx, this, 0, "");
-        let port = match protocol.as_str() {
-            "http" => 80,
-            "https" => 443,
-            "ftp" => 21,
-            "gopher" => 70,
-            // file/jar/jrt/classpath/nested/etc. → -1 per JDK URLStreamHandler
-            _ => -1i32,
-        };
-        Ok(Some(Value::Int(port)))
+        // file/jar/jrt/classpath/nested/etc. → -1 per JDK URLStreamHandler.
+        // One table, shared with `URL.equals`/`sameFile`/`hashCode`, which
+        // substitute the same default for an absent port.
+        Ok(Some(Value::Int(crate::url_default_port(&protocol))))
     });
 
     r.register(url, "openStream", "()Ljava/io/InputStream;", |ctx, args| {
@@ -10643,6 +10906,29 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/net/URLConnection;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // PIN THE RECEIVER, and re-read it after every allocation below.
+            //
+            // `this` is a raw `ObjectRef` -- a bare address. Everything this
+            // native does afterwards can allocate (`create_string`,
+            // `new_object`, `try_alloc_concurrent_synthetic`) or run bytecode
+            // (`invoke_virtual`, `invoke_special`), and a moving young
+            // collection at any of those points relocates the URL and leaves
+            // `this` naming the address it moved away from.
+            //
+            // The write that matters is `set_field_by_name(conn, "url", this)`
+            // on the carrier below: it stores that dead address into a LIVE
+            // object's field, where no frame remap will ever reach it, and the
+            // allocator then re-serves the address to something else.
+            //
+            // Observed exactly that way on `BindableTests` under
+            // `CRATONVM_DBG_GC_STRESS=262144`:
+            // `ServiceLoader$LazyClassPathLookupIterator.parse` dispatching
+            // `openStream()` on a `java.util.Hashtable`, while the frame's own
+            // `local[1]` still held the correct, relocated `java.net.URL`. The
+            // stale address was in the `JarURLConnection.url` field written
+            // here. See
+            // `docs/internal/springboot/bindabletests-moving-young-leaves-a-frame-slot-unremapped-20260908.md`.
+            let p_this = ctx.pin_native_root(this);
             // Application-provided `URLStreamHandler` (e.g. ShrinkWrap
             // `archive:`): the real `URL.openConnection()` is
             // `handler.openConnection(this)`. Delegate so the app's own
@@ -10660,6 +10946,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             //   `jar:file:…!/…` URL returned by ClassLoader.getResource() —
             // returning an HttpURLConnection there throws ClassCastException,
             // which is swallowed and forces a wrong `../.` home fallback.
+            let this = ctx.read_native_pin(p_this, this);
             let ext = {
                 let s5 = read_field_string_or(ctx, this, 5, "");
                 // `s5.contains(':')` alone false-positives on a real-JDK
@@ -10675,9 +10962,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 let s = if field5_is_full_url(&s5) {
                     s5
                 } else {
+                    let this = ctx.read_native_pin(p_this, this);
                     match ctx.invoke_virtual(this, "toExternalForm", "()Ljava/lang/String;", &[]) {
                         Ok(Some(Value::Object(Some(o)))) => ctx.read_string(o).unwrap_or_default(),
                         _ => {
+                            let this = ctx.read_native_pin(p_this, this);
                             let s0 = read_field_string_or(ctx, this, 0, "");
                             if s0.contains(':') {
                                 s0
@@ -10730,7 +11019,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     Some(Value::Object(Some(o))) => o,
                     _ => return Err(ioex("URL.openConnection: allocate File")),
                 };
+                let p_file = ctx.pin_native_root(file);
                 let path_string = ctx.create_string(&path);
+                let file = ctx.read_native_pin(p_file, file);
                 ctx.invoke_special(
                     "java/io/File",
                     "<init>",
@@ -10741,6 +11032,8 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     Some(Value::Object(Some(o))) => o,
                     _ => return Err(ioex("URL.openConnection: allocate FileURLConnection")),
                 };
+                let this = ctx.read_native_pin(p_this, this);
+                let file = ctx.read_native_pin(p_file, file);
                 ctx.invoke_special(
                     "sun/net/www/protocol/file/FileURLConnection",
                     "<init>",
@@ -10751,6 +11044,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                         Value::Object(Some(file)),
                     ],
                 )?;
+                ctx.unpin_native_roots(p_this);
                 return Ok(Some(Value::Object(Some(conn))));
             }
             // `jrt:` (JEP 220 runtime image) URLs get their own carrier, exactly
@@ -10764,9 +11058,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // bytes (core.io.ModuleResourceTests.existingClassFileResource).
             if ext.starts_with("jrt:") {
                 let conn = try_alloc_concurrent_synthetic(ctx, JRT_URL_CONNECTION, 16)?;
+                let this = ctx.read_native_pin(p_this, this);
                 ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
                 ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
                 ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
+                ctx.unpin_native_roots(p_this);
                 return Ok(Some(Value::Object(Some(conn))));
             }
             // For `jar:` URLs, retain the JarURLConnection carrier so callers
@@ -10806,6 +11102,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "java/net/HttpURLConnection"
             };
             let conn = try_alloc_concurrent_synthetic(ctx, carrier, 16)?;
+            let p_conn = ctx.pin_native_root(conn);
             // BY NAME, NOT BY SLOT — and this is not a style preference.
             //
             // Both carriers selected above are REAL JDK classes with the
@@ -10842,10 +11139,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // itself ("never write synthetic slots (they alias real fields on
             // a real-JDK object)") and keeps its state in an identity-keyed
             // side table.
+            let this = ctx.read_native_pin(p_this, this);
             ctx.set_field_by_name(conn, "url", Value::Object(Some(this)));
             // Default request method "GET" so `huc_perform` doesn't trip
             // on a missing method when the http(s) path is exercised.
             let m = ctx.create_string("GET");
+            let conn = ctx.read_native_pin(p_conn, conn);
             ctx.set_field_by_name(conn, "method", Value::Object(Some(m)));
             ctx.set_field_by_name(conn, "doInput", Value::Int(1));
             ctx.set_field_by_name(conn, "connected", Value::Int(0));
@@ -10858,6 +11157,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // that inherited one-`getfield` body — and a fresh connection that
             // answers `false` is reporting a value the caller never chose.
             ctx.set_field_by_name(conn, "useCaches", Value::Int(1));
+            // Same species, same fix: `HttpURLConnection`'s field initialiser is
+            // `instanceFollowRedirects = followRedirects`, i.e. true, and the
+            // constructor that would run it never runs on this ALLOCATED
+            // carrier. `L6HttpLogicSweep` row 154 read `false` from a
+            // connection nobody had configured.
+            ctx.set_field_by_name(conn, "instanceFollowRedirects", Value::Int(1));
+            // A carrier this call just minted inherits nothing. See
+            // `http_url_connection::real_forget`: its side tables are keyed by
+            // identity hash and this address may have belonged to a connection
+            // that died with a streaming mode, a method and headers set.
+            crate::http_url_connection::real_forget(ctx, conn);
+            ctx.unpin_native_roots(p_this);
             Ok(Some(Value::Object(Some(conn))))
         },
     );
@@ -10896,18 +11207,24 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 return Err(ioex("JarURLConnection.getJarFileURL: malformed URL"));
             }
             let spec = ctx.create_string(&jar_part);
+            // Same rule as `URL.openConnection` above: `new_object` allocates,
+            // so `spec` has to be re-read from a pin before it is handed to
+            // the constructor, or the URL is built from a dead address.
+            let p_spec = ctx.pin_native_root(spec);
             // Construct via the regular `new URL(String)` path so the
             // returned object is a fully-initialised java.net.URL.
             let new_url = match ctx.new_object("java/net/URL")? {
                 Some(Value::Object(Some(o))) => o,
                 _ => return Err(ioex("JarURLConnection.getJarFileURL: alloc URL")),
             };
+            let spec = ctx.read_native_pin(p_spec, spec);
             ctx.invoke_special(
                 "java/net/URL",
                 "<init>",
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(new_url)), Value::Object(Some(spec))],
             )?;
+            ctx.unpin_native_roots(p_spec);
             Ok(Some(Value::Object(Some(new_url))))
         },
     );
@@ -13657,14 +13974,11 @@ fn re5_start_async_send(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> Option<cratonvm_types::ObjectRef> {
-    let future = match ctx.new_object_initialized(
-        "java/util/concurrent/CompletableFuture",
-        "()V",
-        &[],
-    ) {
-        Ok(Some(Value::Object(Some(f)))) => f,
-        _ => return None,
-    };
+    let future =
+        match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[]) {
+            Ok(Some(Value::Object(Some(f)))) => f,
+            _ => return None,
+        };
     let future_root = ctx.add_global_root(future);
     let task = match try_alloc_concurrent_synthetic(ctx, RE5_SEND_TASK, RE5_TASK_FIELDS) {
         Ok(t) => t,
@@ -13672,9 +13986,21 @@ fn re5_start_async_send(
     };
     let future = ctx.resolve_global_root(future_root).unwrap_or(future);
     ctx.set_field(task, RE5_TASK_FUTURE, Value::Object(Some(future)));
-    ctx.set_field(task, RE5_TASK_CLIENT, args.first().copied().unwrap_or(Value::Object(None)));
-    ctx.set_field(task, RE5_TASK_REQUEST, args.get(1).copied().unwrap_or(Value::Object(None)));
-    ctx.set_field(task, RE5_TASK_HANDLER, args.get(2).copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(
+        task,
+        RE5_TASK_CLIENT,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
+    ctx.set_field(
+        task,
+        RE5_TASK_REQUEST,
+        args.get(1).copied().unwrap_or(Value::Object(None)),
+    );
+    ctx.set_field(
+        task,
+        RE5_TASK_HANDLER,
+        args.get(2).copied().unwrap_or(Value::Object(None)),
+    );
 
     let task_root = ctx.add_global_root(task);
     let thread = match ctx.new_object_initialized(
@@ -14772,9 +15098,16 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
                 pairs.push((name, value));
                 i += 2;
             }
+            // GC-safety: `re5_builder_append_header` allocates the header
+            // string it appends, so `this` is a pre-GC address from the second
+            // header on.
+            let this_pin = ctx.pin_native_root(this);
             for (name, value) in pairs {
+                let this = ctx.read_native_pin(this_pin, this);
                 re5_builder_append_header(ctx, this, &format!("{name}: {value}"));
             }
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -15436,6 +15769,15 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 eprintln!("[dbg-tls-auth] re6 SSLContext.getInstance");
             }
             let proto_val = args.first().copied().unwrap_or(Value::Object(None));
+            // MEASURED on HotSpot 25.0.4+7: `SSLContext.getInstance(null)` is
+            // `NullPointerException: null protocol name`, from
+            // `Objects.requireNonNull(protocol, "null protocol name")` at the
+            // top of the method. `value_or_string`'s default turned it into a
+            // working "TLS" context, so a caller who computed a null protocol
+            // got TLS and no signal.
+            if matches!(proto_val, Value::Object(None)) {
+                return Err(npe("null protocol name"));
+            }
             let proto = value_or_string(ctx, proto_val, "TLS");
             // W3-7 (RJdkSecurity.tls:291). TWO defects on this line.
             //
@@ -15466,6 +15808,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let name = ctx.create_string(&proto);
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(0));
+            crate::jca::ssl_context_spi::mark_context_uninitialized(ctx, obj);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -15519,6 +15862,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let name = ctx.create_string("Default");
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(1));
+            crate::jca::ssl_context_spi::mark_context_initialized(ctx, obj);
             crate::t27_tls::set_runtime_default_ssl_context(obj);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -15537,7 +15881,10 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 crate::t27_tls::set_runtime_default_ssl_context(ctx_obj);
                 Ok(None)
             }
-            _ => Err(npe("context")),
+            // `SSLContext.setDefault(null)` is `Objects.requireNonNull(context)`
+            // — the one-argument overload, so the NPE carries NO message.
+            // MEASURED: HotSpot `msg=null`, this VM `msg=context`.
+            _ => Err(npe_no_message()),
         },
     );
     r.register(
@@ -15566,6 +15913,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 );
             }
             ctx.set_field(this, 1, Value::Int(1));
+            crate::jca::ssl_context_spi::mark_context_initialized(ctx, this);
             // Stash the actual KeyManager objects too (may include a test
             // wrapper like Tomcat's `TrackingKeyManager`). rustls's own
             // client-cert path otherwise only ever presents one fixed
@@ -15704,6 +16052,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 return r;
             }
             let this = obj_arg(args, 0)?;
+            crate::jca::ssl_context_spi::require_context_initialized(ctx, this)?;
             if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
                     "[dbg-tls-auth] re6 SSLContext.getSocketFactory key={}",
@@ -15733,6 +16082,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 return r;
             }
             let this = obj_arg(args, 0)?;
+            crate::jca::ssl_context_spi::require_context_initialized(ctx, this)?;
             let f = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 1)?;
             ctx.set_field(f, 0, Value::Object(Some(this)));
             Ok(Some(Value::Object(Some(f))))
@@ -15899,6 +16249,15 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             ) {
                 return r;
             }
+            // `SSLContextImpl.engineCreateSSLEngine` is guarded by
+            // `checkInitialized` exactly like the two factory getters.
+            //
+            // THIS registration is the live one, not the pair in
+            // `phases_late::ssl_security` — a `for desc in [..]` loop hides
+            // them from the grep that finds every other `"createSSLEngine"`,
+            // which is how a trial binary with the gate on the other two
+            // still answered `L6TlsParamSweep` row 65 with an engine.
+            crate::jca::ssl_context_spi::require_context_initialized(ctx, obj_arg(args, 0)?)?;
             let eng0 = try_alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4)?;
             // Everything below this point allocates (a ReentrantLock, and the
             // peer-host String further down), so `eng` must be pinned and
@@ -19563,7 +19922,11 @@ fn register_re9_nio_selector(r: &mut NativeMethodRegistry) {
         } else {
             let deadline = std::time::Instant::now() + Duration::from_millis(raw as u64);
             let mut total = 0i32;
+            // GC-safety: `selectNow` is real bytecode, dispatched on `this`
+            // every turn of a loop that spins until a deadline.
+            let this_pin = ctx.pin_native_root(this);
             while std::time::Instant::now() < deadline {
+                let this = ctx.read_native_pin(this_pin, this);
                 if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(this, "selectNow", "()I", &[]) {
                     if n > 0 {
                         total = n;

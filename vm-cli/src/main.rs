@@ -139,6 +139,30 @@ fn maybe_dump_shutdown_reports() {
     // function is where W7-90 put its answer.
     if gc_stats_requested() {
         eprintln!("{}", cratonvm_vm::collector_decision_report());
+        // Step 14a5's engagement (`roots::a5_frame_pass`): how many cycles took
+        // the non-moving sweep on the A5 unregistered-JIT-frame term alone —
+        // where step 1's conservative frame probe, keyed on `is_active()`, was
+        // off — and how many roots the repair added there. `cycles=0` says the
+        // repair decided nothing in this run, which a passing test cannot
+        // otherwise be distinguished from "the repair works". Printed HERE for
+        // the same reason as the decision report above: `maybe_dump_shutdown_
+        // reports` is on the normal-return arm, and the workloads this number
+        // is wanted for end in `System.exit`.
+        let (a5_cycles, a5_roots) = cratonvm_vm::memory::roots::a5_frame_pass::census();
+        eprintln!("[GC] a5_frame_pass: cycles={a5_cycles} roots={a5_roots}");
+        // The above-chain conservative band, same reasoning. It is OPT-IN, so
+        // `enabled=false passes=0` is the ordinary reading and says the band
+        // was never walked; `enabled=true passes=0` would mean the lever is on
+        // but no collection had a live JIT chain, which is a different fact and
+        // the one a clean result must not be read against. `bytes` is what the
+        // lever costs in stack reads when it is on.
+        let (ac_passes, ac_roots, ac_bytes) =
+            cratonvm_vm::jit::conservative_roots::above_chain::census();
+        eprintln!(
+            "[GC] above_chain_scan: passes={ac_passes} roots={ac_roots} bytes={ac_bytes} \
+             enabled={}",
+            cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_SCAN").is_some(),
+        );
         // The collector-state half of the same census -- see
         // `VM_FOR_SHUTDOWN`. Only reachable while the VM is alive, which is
         // the `System.exit` arm; on the normal-return arm `run()` has already
@@ -343,6 +367,31 @@ fn maybe_dump_shutdown_reports() {
             eprintln!("[cratonvm] generational young uncommit: {bytes} bytes returned to the OS");
         }
     }
+    // FIELD-BY-NAME STORES THAT WENT NOWHERE. `NativeContext::set_field_by_name`
+    // resolves the field against the class of whatever object is AT the address
+    // it is handed, and DROPS the store when it does not resolve. That is a
+    // legitimate outcome for a native setting a field only some subclasses
+    // declare — and it is also what a stale receiver looks like, because a
+    // vacated young address is usually re-served to an unrelated object before
+    // the store runs. The drop happens before the heap is touched, so no
+    // `[deadref-*]` arm, no `[CELLWATCH]` and no `[PUTFIELD-WATCH]` can see it;
+    // this counter is the only place it is visible at all.
+    //
+    // A non-zero number is not a defect by itself. It is the denominator for
+    // `CRATONVM_DBG_DEADREF_STORE=1`, which turns each one into a
+    // `[field-by-name-dropped]` line with the receiver's class and a backtrace.
+    {
+        let dropped = cratonvm_vm::vm::field_by_name_dropped_count();
+        if dropped != 0 {
+            eprintln!(
+                "[cratonvm] set_field_by_name stores dropped: {dropped} — the receiver's class did \
+                 not declare the named field. Expected for natives that set a field only some \
+                 subclasses have; ALSO the shape a stale receiver takes, because the drop happens \
+                 before the heap is touched and no stale-reference probe can see it. \
+                 CRATONVM_DBG_DEADREF_STORE=1 names each one."
+            );
+        }
+    }
     // STATIC ROOT SLOTS -- the engagement number for the slot-carrying
     // root path (`CRATONVM_GC_STATIC_ROOT_SLOTS`). Both halves, for the
     // usual reason: `slots=0` alone cannot distinguish the kill switch
@@ -450,6 +499,42 @@ workers_last={workers} total={ms}ms",
                 "[cratonvm] g1 is_object_address: calls={calls} \
 accepted={accepted} total={ms}ms",
                 ms = ns / 1_000_000,
+            );
+        }
+    }
+
+    // The per-SITE half of the same question, and the reason it once took a
+    // sampled-backtrace build to answer: the per-thread walk tallies have counted
+    // every JIT-helper membership walk since it was added, and
+    // `membership_walks_by_site()` -- its only reader -- had NO CALLER at all.
+    // A write-only counter is a diagnosis nobody can read; the census's own doc
+    // says `perf` cannot attribute this population on an optimized build (DWARF
+    // returns self-recursive frames, LBR is unavailable on the virtualised PMU),
+    // which is exactly why the counters exist. They are ungated and already
+    // paid for, so the only thing missing was this line.
+    //
+    // It rides the same gate as the total above -- a non-zero census -- rather
+    // than printing unconditionally: whoever asks for the TOTAL is the one who
+    // wants the split, and re-reading the env var here would be a second
+    // spelling of the same switch that could drift from it. The JIT-helper
+    // sites are a MINORITY of that total -- the
+    // sampled population on `org.h2.test.store.TestMVStoreTool`'s create phase
+    // was 57% `VmHeap::load_and_forward` (the software read barrier, one walk
+    // per reference field/array access) and 17% `G1Collector::autobox_payload`
+    // -- so a small number here is the useful answer, not a broken instrument.
+    {
+        let sites = cratonvm_vm::jit::helpers::membership_walks_by_site();
+        if !sites.is_empty() && cratonvm_vm::g1_object_address_census().0 != 0 {
+            let total: u64 = sites.iter().map(|(_, v)| *v).sum();
+            let body = sites
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "[cratonvm] jit-helper membership walks: total={total} {body} -- the \
+JIT-helper SUBSET of the is_object_address line above; the remainder is the read \
+barrier and the array/field accessors, which carry no site counter."
             );
         }
     }
@@ -5995,6 +6080,18 @@ fn run() -> Result<()> {
             "[cratonvm]   of which VarHandle instance-field reads served directly: {}",
             cratonvm_vm::jit::helpers::varhandle_field_read_hit_count()
         );
+        // Compiled `newarray` sites that bump the TLAB inline instead of
+        // calling `jit_newarray`. BOTH halves, always: a workload whose arrays
+        // all took the helper says nothing about the bump, so a zero on the
+        // left has to be distinguishable from "emitted and refused". The
+        // decline reasons are the work list.
+        let (array_bump, array_stub) = cratonvm_jit::x64::inline_array_site_counts();
+        eprintln!(
+            "[cratonvm] compiled newarray sites: inline_tlab_bump={array_bump} stub_only={array_stub}"
+        );
+        for (why, n) in cratonvm_jit::x64::inline_array_declines() {
+            eprintln!("[cratonvm]   inline newarray declined {n}x: {why}");
+        }
         // The same read, reached WITHOUT the funnel — a thin direct call baked
         // into compiled code by `VARHANDLE_READ_DIRECT_FNS`. The pair is the
         // engagement evidence for that bind: `served` counts calls that never
@@ -6227,6 +6324,56 @@ fn run() -> Result<()> {
                  resignals={resig} classified_after_retry={saved} enabled={}",
                 cratonvm_vm::jit::xt_root_scan::enabled(),
             );
+            // Engagement census for the blocked-peer NATIVE-STACK remap
+            // (2026-09-07). `captured` is the denominator: a blocked peer's
+            // stack words that a cross-thread scan resolved to heap objects.
+            // `written` is the repair firing on wake; `skipped` is the guard
+            // declining a word the native call reused since the capture.
+            // written=0 means the repair never engaged on this run.
+            let (bs_c, bs_a, bs_w, bs_s, bs_d, bs_x, bs_u, bs_on) =
+                cratonvm_vm::blocked_peer_stack_remap_census();
+            // `discarded` is a correct discard (the cycle that captured never
+            // relocated); `dropped` is the capture buffer at its cap, which is
+            // a repair OUTAGE; `unrouted` is a capture on a RELOCATING cycle
+            // that no blocked thread claimed, i.e. a word nothing will rewrite.
+            eprintln!(
+                "[GC] blocked_peer_stack_remap: captured={bs_c} adopted={bs_a} written={bs_w} skipped={bs_s} \
+discarded={bs_d} dropped={bs_x} unrouted={bs_u} enabled={bs_on}"
+            );
+            // Extent census for the two storage classes
+            // `moving-young-corruption-rootcause.md` nominates and that no
+            // stale-word census has ever been able to rank: a frame that gave
+            // scalar replacement or LICM hoisting no slots has no such region,
+            // so a zero word-count against one of those names is a statement
+            // about the optimisation rather than about the region.
+            // `[jit-vacated-frame]` census (`CRATONVM_DBG_VACATED_FRAMES`).
+            // `verifiable` is the number that matters: a slot the coverage
+            // machinery claims to describe, still naming an address the last
+            // collection vacated.
+            {
+                let (jv_n, jv_v, jv_per) =
+                    cratonvm_vm::jit::conservative_roots::jit_vacated_frame_census();
+                if jv_n > 0 {
+                    let mut per = String::new();
+                    for (i, name) in
+                        cratonvm_vm::jit::conservative_roots::JIT_VACATED_REGION_NAMES
+                            .iter()
+                            .enumerate()
+                    {
+                        if jv_per[i] > 0 {
+                            per.push_str(&format!(" {name}={}", jv_per[i]));
+                        }
+                    }
+                    eprintln!(
+                        "[GC] jit_vacated_frames: total={jv_n} verifiable={jv_v} by_region:{per}"
+                    );
+                }
+            }
+            let (fl_n, fl_sc, fl_rh, fl_ar) = cratonvm_jit::region_extent_census();
+            eprintln!(
+                "[GC] jit_frame_region_extents: frames={fl_n} with_scalar_span={fl_sc} \
+with_ref_hoist_span={fl_rh} with_arith_span={fl_ar}"
+            );
             // Engagement census for the blocked-peer SHADOW-STACK scan. A
             // clean run with `sh_windows=0` means the scan never ran, and any
             // conclusion drawn from it is vacuous.
@@ -6242,6 +6389,17 @@ fn run() -> Result<()> {
             // at a pre-move address, i.e. references no oop map named. FRAMES
             // is the denominator -- stale=0 with frames=0 means the audit never
             // ran, not that the frames were clean.
+            // Root-remap audit (`CRATONVM_DBG_ROOT_REMAP_AUDIT=1`): scanned
+            // roots left naming an address the same collection vacated. The
+            // audit only speaks when it finds something, so the three
+            // denominators are what make its zero a reading — `moved=0` in
+            // particular means every audited cycle was non-moving and the run
+            // says nothing at all.
+            let (rra_c, rra_r, rra_m, rra_u) = cratonvm_vm::memory::gc::root_remap_audit_stats();
+            eprintln!(
+                "[GC] root_remap_audit: cycles={rra_c} roots_rescanned={rra_r} \
+                 moved_entries={rra_m} UNREMAPPED={rra_u}"
+            );
             let sfw_f = cratonvm_vm::jit::conservative_roots::stale_frame_audit::FRAMES
                 .load(O::Relaxed);
             let sfw_s =

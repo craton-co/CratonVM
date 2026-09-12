@@ -225,6 +225,60 @@ pub struct Tlab {
     /// that forgets restarts the thread's counter at zero (monotonicity is
     /// asserted by `thread_allocated_bytes_survives_refill`).
     thread_alloc_carry: u64,
+    /// How much of [`Self::thread_alloc_carry`] has already been published to
+    /// [`PROCESS_ALLOCATED_BYTES`]. A high-water mark, not a counter: every
+    /// publication sends `thread_alloc_carry - process_published` and then
+    /// moves the mark up.
+    ///
+    /// Stated this way rather than as "add the bytes I just added" so the two
+    /// counters cannot drift apart at all: a publication site that is
+    /// forgotten is caught up by the next one, and a site that runs twice
+    /// sends zero the second time. The process-wide counter has had both
+    /// defects -- see [`TlabAccounting`] and the reader note on
+    /// `PROCESS_ALLOCATED_BYTES`.
+    ///
+    /// Carried across refills by [`Self::adopt_allocation_total`], which
+    /// requires the outgoing buffer to have been retired and therefore to have
+    /// published everything it held.
+    process_published: u64,
+    /// Whether this buffer's consumption is the PROGRAM's allocation, and so
+    /// belongs in [`PROCESS_ALLOCATED_BYTES`]. See [`TlabAccounting`].
+    accounting: TlabAccounting,
+}
+
+/// Whose allocation a [`Tlab`]'s consumed span represents.
+///
+/// A `Tlab` is used at two different layers of this tree, and only one of them
+/// is measuring Java work:
+///
+/// * a **Java thread's** own bump buffer (`JvmThread::tlab`), whose consumed
+///   span is exactly the bytes the program asked for; and
+/// * a **heap-internal staging buffer** that the heap carves objects (or
+///   thread TLABs) out of — ZGC's `ZArenaTlab` and `ZTlab` both wrap a `Tlab`
+///   by value for its bump path, tail filler and idempotent retire.
+///
+/// The same byte passes through both layers. Crediting the process-wide total
+/// from both counts every allocation twice, which is precisely how
+/// `getTotalThreadAllocatedBytes` came to report 3.00x of retained heap under
+/// ZGC (the heap-staging layer) against 2.00x under Generational and G1 (no
+/// such layer — their remaining 1.00x was the reader adding the calling
+/// thread's whole running total on top of a global that already contained it;
+/// see `ThreadMXBean::total_allocated_bytes` in `vm/src/vm/vm_exec.rs`).
+///
+/// The default is [`TlabAccounting::JavaThread`] so a forgotten annotation
+/// over-counts loudly rather than under-counting silently — an allocation
+/// counter that reads low is the failure mode that passes a budget assertion
+/// vacuously, which is the one this module has already been bitten by twice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TlabAccounting {
+    /// A Java thread's own buffer. Credits [`PROCESS_ALLOCATED_BYTES`].
+    #[default]
+    JavaThread,
+    /// A heap-internal staging buffer whose span a Java thread's TLAB (or the
+    /// VM's `note_external_allocation`) counts again. Does NOT credit
+    /// [`PROCESS_ALLOCATED_BYTES`]; its own `thread_alloc_carry` still moves,
+    /// because that field is read per-buffer by the ZGC TLAB statistics.
+    HeapStaging,
 }
 
 /// Process-wide cumulative allocation, in the sense
@@ -241,22 +295,21 @@ pub struct Tlab {
 ///
 /// Fed from the two places a thread's own total is fed (`retire` rolling in the
 /// consumed span, and `note_external_allocation`), so it is the sum of every
-/// thread's retired total. Readers add the calling thread's live TLAB span on
-/// top; other threads' in-flight spans are not visible cross-thread by design
+/// thread's retired total. Readers add the calling thread's **live TLAB span**
+/// on top — the span, not the thread's running total, which is already in here;
+/// other threads' in-flight spans are not visible cross-thread by design
 /// (see `Tlab::thread_allocated_bytes`), which bounds the under-count by one
 /// TLAB per running thread and keeps the value monotonic.
+///
+/// Only buffers marked [`TlabAccounting::JavaThread`] feed it. A heap-internal
+/// staging buffer's span is re-counted one layer up, so crediting it here
+/// double-counts every byte — see [`TlabAccounting`].
 static PROCESS_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative bytes retired into the process-wide total. See
 /// [`PROCESS_ALLOCATED_BYTES`].
 pub fn process_allocated_bytes() -> u64 {
     PROCESS_ALLOCATED_BYTES.load(Ordering::Relaxed)
-}
-
-fn credit_process_total(bytes: u64) {
-    if bytes != 0 {
-        PROCESS_ALLOCATED_BYTES.fetch_add(bytes, Ordering::Relaxed);
-    }
 }
 
 impl Tlab {
@@ -347,6 +400,22 @@ impl Tlab {
             end: std::ptr::null_mut(),
             pressure: TlabPressureTracker::new(),
             thread_alloc_carry: 0,
+            process_published: 0,
+            accounting: TlabAccounting::JavaThread,
+        }
+    }
+
+    /// An empty buffer that will never credit the process-wide allocation
+    /// total. For the heap-internal staging layers — see [`TlabAccounting`].
+    ///
+    /// An empty TLAB consumes nothing, so this matters only because the
+    /// wrappers hold one of these between refills and a reader could otherwise
+    /// see the mode flip; the mode is restored at every refill by
+    /// [`Self::new_heap_staging`].
+    pub fn empty_heap_staging() -> Self {
+        Self {
+            accounting: TlabAccounting::HeapStaging,
+            ..Self::empty()
         }
     }
 
@@ -390,7 +459,67 @@ impl Tlab {
             // before it. The refill site carries the running total across
             // with `adopt_allocation_total`.
             thread_alloc_carry: 0,
+            process_published: 0,
+            accounting: TlabAccounting::JavaThread,
         }
+    }
+
+    /// [`Self::new`], for a **heap-internal staging buffer** — one that a Java
+    /// thread's TLAB, or the VM's `note_external_allocation`, will count the
+    /// same bytes out of. Its retires do not credit the process-wide
+    /// allocation total. See [`TlabAccounting`].
+    ///
+    /// This is a separate constructor rather than a setter on purpose: the
+    /// wrappers replace their whole `inner: Tlab` at every refill
+    /// (`self.inner = Tlab::new(..)`), so a "remember to also call
+    /// `mark_heap_staging()`" contract would silently lapse at exactly the
+    /// point the mode matters — the same hazard
+    /// [`Self::adopt_allocation_total`] documents for the carried total.
+    ///
+    /// # Safety
+    /// Identical to [`Self::new`].
+    pub unsafe fn new_heap_staging(ptr: *mut u8, size: usize) -> Self {
+        Self {
+            accounting: TlabAccounting::HeapStaging,
+            ..Self::new(ptr, size)
+        }
+    }
+
+    /// Whose allocation this buffer's consumed span represents.
+    pub fn accounting(&self) -> TlabAccounting {
+        self.accounting
+    }
+
+    /// Send everything this buffer has SETTLED but not yet published into the
+    /// process-wide total, and move the high-water mark up.
+    ///
+    /// A no-op for a heap-internal staging buffer, whose span is counted again
+    /// one layer up -- see [`TlabAccounting`].
+    ///
+    /// "Settled" is [`Self::thread_alloc_carry`], NOT
+    /// [`Self::thread_allocated_bytes`]: the LIVE TLAB span is deliberately
+    /// left out, because the reader of the process-wide counter adds the
+    /// calling thread's live span itself (it is the one in-flight span it may
+    /// read). Publishing it here as well is a double-count.
+    fn publish_to_process_total(&mut self) {
+        if self.accounting != TlabAccounting::JavaThread {
+            return;
+        }
+        let delta = self
+            .thread_alloc_carry
+            .saturating_sub(self.process_published);
+        if delta != 0 {
+            self.process_published = self.thread_alloc_carry;
+            PROCESS_ALLOCATED_BYTES.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes this buffer has published to the process-wide total.
+    ///
+    /// Exposed because the accounting tests cannot assert against the global
+    /// itself: every other test in the binary credits it concurrently.
+    pub fn process_published_bytes(&self) -> u64 {
+        self.process_published
     }
 
     /// Carry a thread's running allocation total onto a freshly-built TLAB.
@@ -402,6 +531,14 @@ impl Tlab {
     /// life of the thread).
     pub fn adopt_allocation_total(&mut self, prior_total: u64) {
         self.thread_alloc_carry = prior_total;
+        // The outgoing buffer was RETIRED before it was replaced (the Bug-D
+        // tail-filler fix in `gc_and_alloc.rs` requires that for heap-walk
+        // reasons of its own), so it published its whole carry and
+        // `prior_total` is already inside `PROCESS_ALLOCATED_BYTES`. Adopting
+        // the high-water mark alongside the total is what stops the successor
+        // from publishing the same bytes a second time: leaving it at 0 would
+        // re-send the thread's ENTIRE history at every refill.
+        self.process_published = prior_total;
     }
 
     /// Record bytes allocated by this thread that never passed through the
@@ -414,7 +551,7 @@ impl Tlab {
     #[inline]
     pub fn note_external_allocation(&mut self, bytes: usize) {
         self.thread_alloc_carry = self.thread_alloc_carry.saturating_add(bytes as u64);
-        credit_process_total(bytes as u64);
+        self.publish_to_process_total();
     }
 
     /// Total bytes this thread has allocated since it started, in the sense
@@ -471,6 +608,44 @@ impl Tlab {
             return None;
         }
         let ptr = aligned as *mut u8;
+        if watch_covers(ptr as usize, new_cursor) {
+            watch_note(format_args!(
+                "TLAB BUMP handed it out: ptr=0x{:x} size={size} tlab=[0x{:x},0x{:x}) cursor was 0x{cursor:x}",
+                ptr as usize,
+                self.start as usize,
+                self.end as usize,
+            ));
+        }
+        // TRIPWIRE (`CRATONVM_DBG_DEADREF_STORE`): is this TLAB bumping over
+        // memory that is not free?
+        //
+        // A chunk is zeroed when it is carved and the cursor only moves
+        // forward, so every byte this bump is about to hand out is zero — in a
+        // correct run. A non-zero word here is the one shape the two tripwires
+        // in `install_tail_filler` and `refill_tlab` cannot see, because both
+        // of those look at the moment the span is HANDED OUT and this looks at
+        // the moment it is USED: a TLAB that keeps bumping after its chunk has
+        // been retired and filled, or re-served to someone else, passes both of
+        // them and fails this one. `0xF111E700` as the value names the filler
+        // directly.
+        if cratonvm_types::flags().gc.dbg_deadref_store {
+            // SAFETY: `[ptr, ptr+footprint)` is inside `[cursor, end)`, memory
+            // this TLAB owns and that is mapped.
+            let w = unsafe { std::ptr::read_unaligned(ptr as *const u32) };
+            if w != 0 {
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 8 {
+                    eprintln!(
+                        "[tlab-audit] BUMP-OVER-OCCUPIED #{n}: TLAB alloc at 0x{:x}                          (size={size} align={align}) is handing out memory whose first word is                          0x{w:x}, not zero. start=0x{:x} cursor=0x{:x} end=0x{:x}. The chunk                          this TLAB is bumping through is not free.",
+                        ptr as usize,
+                        self.start as usize,
+                        cursor,
+                        self.end as usize,
+                    );
+                }
+            }
+        }
         init(ptr);
         // Commit last: a cross-thread root scan may publish the remaining
         // `[cursor, end)` tail while this thread is suspended in JIT code.
@@ -571,29 +746,19 @@ impl Tlab {
             }
         }
         // Roll the consumed span into the thread's running total BEFORE the
-        // pointers are nulled — `consumed_bytes()` is `cursor - start` and
+        // pointers are nulled: `consumed_bytes()` is `cursor - start` and
         // reads 0 the instant either is null. Idempotent for the same reason:
         // a second `retire()` adds 0 (the pre-filler read above is 0 too).
-        self.thread_alloc_carry = self.thread_alloc_carry.saturating_add(consumed);
-        credit_process_total(consumed);
-        self.start = std::ptr::null_mut();
-        self.cursor = std::ptr::null_mut();
-        self.end = std::ptr::null_mut();
-        // Arms the "sized before retired" tripwire in `next_refill_size`.
-        self.pressure.retired_since_refill = true;
-        // Post-condition, asserted rather than assumed: the whole cross-thread
-        // STW protocol reads "a parked or blocked peer has already retired its
-        // TLAB, therefore `reserved_tail()` is `None`, therefore it contributes
-        // no skip region" (`ThreadRegistry::tlab_addr`'s safety note). If a
-        // future edit made `retire` leave any of the three pointers live, the
-        // collector would publish a skip region for a TLAB whose backing arena
-        // is about to be reset.
-        debug_assert!(
-            self.is_retired() && self.reserved_tail().is_none(),
-            "Tlab::retire must leave the TLAB owning nothing and publishing no \
-             reserved tail — the STW census assumes exactly that of every parked \
-             and blocked peer",
-        );
+        //
+        // The post-condition `finish_retire` asserts is not a formality: the
+        // whole cross-thread STW protocol reads "a parked or blocked peer has
+        // already retired its TLAB, therefore `reserved_tail()` is `None`,
+        // therefore it contributes no skip region"
+        // (`ThreadRegistry::tlab_addr`'s safety note). If a future edit made
+        // `retire` leave any of the three pointers live, the collector would
+        // publish a skip region for a TLAB whose backing arena is about to be
+        // reset.
+        self.finish_retire(consumed);
     }
 
     /// Retire, handing the reserved tail to the CALLER instead of to a sink or
@@ -604,17 +769,55 @@ impl Tlab {
     /// Same accounting as [`Self::retire`]: the consumed span is credited to
     /// the thread and process totals, the three pointers are nulled, and the
     /// "sized before retired" tripwire is armed.
+    /// [`Self::retire_taking_tail`], with the walkable tail filler installed
+    /// over `[cursor, end)` first — for a caller that needs BOTH (ZGC's
+    /// `tlab_retire_locked` returns the tail to its own arena free list and
+    /// still wants the span parsable while it sits there).
+    ///
+    /// It exists so that caller does not have to write
+    /// `install_tail_filler(); retire_taking_tail();` by hand, which is the
+    /// exact ordering [`Self::retire`]'s own body warns about:
+    /// `install_tail_filler` sets `cursor = end` by design, so a
+    /// `consumed_bytes()` read after it charges the whole chunk including the
+    /// unused tail. That defect was fixed inside `retire` and then
+    /// reintroduced at the ZGC call site by open-coding the two steps.
+    ///
+    /// The returned tail is the PRE-filler `[cursor, end)`, which is the span
+    /// the caller must hand back to its allocator.
+    ///
+    /// # Safety
+    /// Same as [`Self::install_tail_filler`]: the backing memory must still be
+    /// valid and uniquely owned by the caller.
+    pub unsafe fn retire_with_filler_taking_tail(
+        &mut self,
+        class_id: cratonvm_types::ClassId,
+    ) -> Option<(usize, usize)> {
+        // BEFORE the filler — see the method doc and `Tlab::retire`.
+        let consumed = self.consumed_bytes() as u64;
+        let tail = self.reserved_tail();
+        self.install_tail_filler(class_id);
+        self.finish_retire(consumed);
+        tail
+    }
+
     pub fn retire_taking_tail(&mut self) -> Option<(usize, usize)> {
         let consumed = self.consumed_bytes() as u64;
         let tail = self.reserved_tail();
+        self.finish_retire(consumed);
+        tail
+    }
+
+    /// The shared tail of every retire: credit `consumed` (read by the caller
+    /// BEFORE any tail filler ran), null the three pointers, arm the
+    /// "sized before retired" tripwire.
+    fn finish_retire(&mut self, consumed: u64) {
         self.thread_alloc_carry = self.thread_alloc_carry.saturating_add(consumed);
-        credit_process_total(consumed);
+        self.publish_to_process_total();
         self.start = std::ptr::null_mut();
         self.cursor = std::ptr::null_mut();
         self.end = std::ptr::null_mut();
         self.pressure.retired_since_refill = true;
         debug_assert!(self.is_retired() && self.reserved_tail().is_none());
-        tail
     }
 
     /// Round-5 #9 / round-7 #9 — Install a synthetic `int[]` filler object
@@ -692,6 +895,68 @@ impl Tlab {
 
         let tail = end_addr - aligned;
         use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
+        // TRIPWIRE: is there already an object AT the cursor?
+        //
+        // A TLAB's memory is zeroed when the chunk is carved (`refill_tlab`),
+        // and the cursor only ever moves forward over what this thread
+        // allocated. So the bytes at `cursor` are zero unless the cursor is
+        // WRONG — pointing at or before an object that was already handed out.
+        // Filling from there buries live objects under one synthetic `int[]`:
+        // the next collection's object-start walk strides over them, their
+        // addresses stop being object starts, and every reference to them is
+        // refused by the evacuator and left dangling.
+        //
+        // That is exactly how `0x200868400d8` — a live lambda capture 261 336
+        // bytes inside a 261 792-byte filler — reached `invokevirtual` as an
+        // all-zero header on BindableTests (2026-09-09). O(1), always on: one
+        // load of a word this function is about to overwrite anyway, and the
+        // silence of a correct run costs a predicted-not-taken branch.
+        //
+        // SAFETY: `aligned` is inside `[cursor, end)`, which this TLAB owns and
+        // which is mapped until the arena is reset.
+        if watch_covers(aligned, end_addr) {
+            watch_note(format_args!(
+                "TAIL FILLER buried it: filler=[0x{aligned:x},0x{end_addr:x}) tlab=[0x{:x},0x{end_addr:x}) consumed={}",
+                self.start as usize,
+                aligned.saturating_sub(self.start as usize),
+            ));
+        }
+        let mut occupant = unsafe { std::ptr::read_unaligned(aligned as *const u32) };
+        // Same widening as the refill tripwire, and for the same reason: the
+        // O(1) word above catches a cursor that sits exactly ON an object, but
+        // not a filler span that swallows objects further along. The tail of a
+        // TLAB is untouched memory, so any non-zero word inside it is live data
+        // this filler is about to hide from every object-start walk.
+        if occupant == 0 && cratonvm_types::flags().gc.dbg_deadref_store {
+            // SAFETY: `[aligned, end_addr)` is this TLAB's own tail, mapped and
+            // 8-aligned at both ends.
+            let words = (end_addr - aligned) / 8;
+            for i in 0..words {
+                let w = unsafe { std::ptr::read_unaligned((aligned as *const u64).add(i)) };
+                if w != 0 {
+                    occupant = w as u32;
+                    break;
+                }
+            }
+        }
+        if occupant != 0 {
+            FILLER_OVER_OBJECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 || n.is_power_of_two() {
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    cursor = format!("{aligned:#x}"),
+                    start = format!("{:#x}", self.start as usize),
+                    end = format!("{end_addr:#x}"),
+                    consumed = aligned.saturating_sub(self.start as usize),
+                    tail,
+                    occupant_class_id = occupant,
+                    occurrence = n + 1,
+                    "[tlab-audit] install_tail_filler is about to stamp a filler over an                      ALREADY-ALLOCATED object: the word at the TLAB cursor is a live class id,                      not the zero this chunk was carved with. Everything from here to the TLAB                      end is about to become one synthetic int[], so the next object-start walk                      will stride over it and the evacuator will refuse every reference into it.",
+                );
+            }
+        }
         if tail < HEADER_SIZE {
             // Bug-D fix (2026-06-12): a sub-`HEADER_SIZE` tail cannot hold a
             // walkable `int[]` filler, and ZEROING it (the old behaviour) is
@@ -888,6 +1153,65 @@ pub fn max_tlab_size() -> usize {
 /// "synthetic VM" class-id range (the same kind of reserved sentinel as
 /// `AUTOBOX_CLASS_ID`, now `u32::MAX`) so it cannot collide with a
 /// classloader-issued id.
+/// `CRATONVM_DBG_WATCH_ADDR=<hex>`: one young-heap address to narrate.
+///
+/// The refusal census can say an address is not an object start on the cycle it
+/// fails, and nothing in the tree could say how it got that way — every
+/// candidate mechanism (a double-issued chunk, a filler over live data, a
+/// bump past a retired cursor) had to be tested by its own tripwire, and all of
+/// them can be silent while the address is still wrong.
+///
+/// The addresses this workload fails on repeat exactly across runs, because a
+/// semispace is reset and re-served from the same base every cycle. That makes
+/// one absolute address a usable handle: arm it, and the allocator, the
+/// retire path and the object-start walk each say what they did to it, in
+/// order, with the collection number.
+fn watch_addr() -> usize {
+    static A: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *A.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_WATCH_ADDR")
+            .ok()
+            .and_then(|v| {
+                usize::from_str_radix(v.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
+                    .ok()
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// Does `[lo, hi)` cover the watched address? `false` when unarmed.
+pub fn watch_covers(lo: usize, hi: usize) -> bool {
+    let w = watch_addr();
+    w != 0 && w >= lo && w < hi
+}
+
+/// The watched address, or 0.
+pub fn watched() -> usize {
+    watch_addr()
+}
+
+/// The collection count, published by the generational heap each cycle so the
+/// TLAB paths — which hold no heap handle — can date their own reports.
+pub static WATCH_COLLECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Emit one line of the watched address's life story.
+pub fn watch_note(what: std::fmt::Arguments<'_>) {
+    eprintln!(
+        "[watch 0x{:x}] collection={} {what}",
+        watch_addr(),
+        WATCH_COLLECTION.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
+
+/// Times [`Tlab::install_tail_filler`] found a live object at the cursor it was/// Times [`Tlab::install_tail_filler`] found a live object at the cursor it was
+/// about to fill from. See the tripwire there; a non-zero count is a
+/// use-after-free in waiting, not a diagnostic curiosity.
+pub static FILLER_OVER_OBJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Times a TLAB refill handed out a chunk that already held an object. See the
+/// tripwire in `GenerationalHeap::refill_tlab`.
+pub static REFILL_OVER_OBJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub const TLAB_FILLER_CLASS_ID: cratonvm_types::ClassId = cratonvm_types::ClassId::new(0xF111_E700);
 
 /// Bug-D fix (2026-06-12) — synthetic class id stamped into a
@@ -1074,7 +1398,13 @@ impl TlabPressureTracker {
         let next = if grow && !shrink {
             current.saturating_mul(2).min(MAX_TLAB_SIZE)
         } else if shrink && !grow {
-            (current / 2).max(MIN_TLAB_SIZE)
+            // `current` is only guaranteed to be a multiple of 8 (it can be
+            // seeded from a truncated, arena-nearly-full grant — see
+            // `refill_tlab`), not a multiple of 16+, so halving it can drop
+            // below the 8-byte alignment `Tlab::new` requires of the final
+            // refill size. Re-mask after the divide so every value this
+            // heuristic ever produces stays 8-aligned.
+            ((current / 2) & !7).max(MIN_TLAB_SIZE)
         } else {
             current
         };
@@ -1265,6 +1595,33 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let next = t.next_refill_size();
         assert_eq!(next, 32 * 1024);
+    }
+
+    /// Regression: `next_refill_size`'s shrink branch used to compute
+    /// `current / 2` without re-masking to 8-byte alignment. `current`
+    /// (`last_refill_size`) can be seeded from a truncated `refill_tlab`
+    /// grant (see `gen_heap.rs` / `g1.rs` — the arena/region need only
+    /// guarantee multiples of 8, not 16+), so a value like 16392
+    /// (multiple of 8, not of 16) halves to 8196 — still inside
+    /// `[MIN_TLAB_SIZE, MAX_TLAB_SIZE]` so the final clamp doesn't catch
+    /// it, but not 8-aligned. That poisoned "requested size" would flow
+    /// straight into `Tlab::new`, tripping its `end`-pointer alignment
+    /// contract. Every value this heuristic can ever produce must stay
+    /// 8-aligned regardless of what `last_refill_size` was seeded with.
+    #[test]
+    fn pressure_tracker_shrink_stays_8_aligned_even_from_odd_seed() {
+        let mut t = TlabPressureTracker::new();
+        // 16392 = 16384 + 8: a multiple of 8, deliberately not of 16.
+        t.begin_refill(16392);
+        t.record_allocation(64);
+        t.record_allocation(64);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let next = t.next_refill_size();
+        assert_eq!(
+            next % 8,
+            0,
+            "next_refill_size must stay 8-aligned, got {next}"
+        );
     }
 
     #[test]
@@ -1902,6 +2259,158 @@ mod tests {
         next.begin_refill(usable2);
         next.alloc(64, 8).unwrap();
         let _ = next.next_refill_size();
+    }
+
+    /// A heap-internal staging TLAB must not credit the process-wide
+    /// allocation total: the bytes it hands out are counted a second time by
+    /// the Java thread's own TLAB (or by `note_external_allocation`) one layer
+    /// up, and crediting both is exactly why `getTotalThreadAllocatedBytes`
+    /// A heap-internal staging TLAB must not publish to the process-wide
+    /// allocation total: the bytes it hands out are counted a second time by
+    /// the Java thread's own TLAB (or by `note_external_allocation`) one layer
+    /// up. Publishing from both is why `getTotalThreadAllocatedBytes` read
+    /// 3.00x of retained heap under ZGC against 2.00x under Gen/G1.
+    #[test]
+    fn heap_staging_tlab_does_not_publish_to_the_process_total() {
+        let (_owner, base, usable) = aligned_buffer(64 * 1024);
+        let mut staging = unsafe { Tlab::new_heap_staging(base, usable) };
+        assert_eq!(staging.accounting(), TlabAccounting::HeapStaging);
+        staging.alloc(4096, 8).unwrap();
+        staging.note_external_allocation(1024);
+        staging.retire();
+        assert_eq!(
+            staging.process_published_bytes(),
+            0,
+            "a heap-internal staging buffer published to the process-wide              total; its span is re-counted one layer up, so this double-counts"
+        );
+        // Its own per-buffer total still moves: the ZGC TLAB statistics read it.
+        assert_eq!(staging.thread_allocated_bytes(), 4096 + 1024);
+    }
+
+    /// The Java-thread arm of the same contract, and the size of the
+    /// publication: exactly the settled bytes, once.
+    #[test]
+    fn java_thread_tlab_publishes_settled_bytes_exactly_once() {
+        let (_owner, base, usable) = aligned_buffer(64 * 1024);
+        let mut tlab = unsafe { Tlab::new(base, usable) };
+        assert_eq!(tlab.accounting(), TlabAccounting::JavaThread);
+        tlab.alloc(4096, 8).unwrap();
+        tlab.note_external_allocation(1024);
+        assert_eq!(
+            tlab.process_published_bytes(),
+            1024,
+            "the external note settles immediately; the LIVE TLAB span must              wait for retire, because the reader adds it as the live-span term"
+        );
+        tlab.retire();
+        assert_eq!(tlab.process_published_bytes(), 4096 + 1024);
+        // Idempotent: a second retire settles nothing, so it publishes nothing.
+        tlab.retire();
+        assert_eq!(tlab.process_published_bytes(), 4096 + 1024);
+    }
+
+    /// A refill must not re-publish the thread's history. `Tlab::new` starts a
+    /// fresh buffer, so without carrying the high-water mark across, the
+    /// successor's first retire would send the WHOLE running total again --
+    /// once per refill, which on a parse that refills thousands of times is
+    /// not a 2x error but an unbounded one.
+    #[test]
+    fn refill_carries_the_published_mark_so_history_is_not_republished() {
+        let (_owner, base, usable) = aligned_buffer(64 * 1024);
+        let mut tlab = unsafe { Tlab::new(base, usable) };
+        tlab.alloc(4096, 8).unwrap();
+        let carried = {
+            tlab.retire();
+            tlab.thread_allocated_bytes()
+        };
+        assert_eq!(carried, 4096);
+
+        let (_owner2, base2, usable2) = aligned_buffer(64 * 1024);
+        let mut next = unsafe { Tlab::new(base2, usable2) };
+        next.adopt_allocation_total(carried);
+        assert_eq!(
+            next.process_published_bytes(),
+            carried,
+            "the successor must adopt the mark, not just the total"
+        );
+        next.alloc(2048, 8).unwrap();
+        next.retire();
+        assert_eq!(next.thread_allocated_bytes(), 4096 + 2048);
+        assert_eq!(
+            next.process_published_bytes() - carried,
+            2048,
+            "the successor published only its OWN bytes"
+        );
+    }
+
+    /// `getTotalThreadAllocatedBytes` is read as
+    /// `process_allocated_bytes() + <live span>`. The live span, NOT
+    /// `thread_allocated_bytes()` -- that is the span PLUS the thread's running
+    /// total, which the global already holds. Adding it twice is what made the
+    /// counter report exactly 2.00x on Generational and G1.
+    ///
+    /// This states the arithmetic the reader in
+    /// `vm/src/vm/vm_exec.rs::total_allocated_bytes` implements, against a
+    /// local stand-in for the global (the real one is credited concurrently by
+    /// every other test in this binary).
+    #[test]
+    fn process_total_plus_live_span_tracks_actual_allocation() {
+        // Stand-in for PROCESS_ALLOCATED_BYTES, fed the same way: by each
+        // buffer's published mark.
+        let (_owner, base, usable) = aligned_buffer(64 * 1024);
+        let mut tlab = unsafe { Tlab::new(base, usable) };
+        tlab.alloc(4096, 8).unwrap();
+
+        let global = tlab.process_published_bytes();
+        assert_eq!(global + tlab.consumed_bytes() as u64, 4096);
+        assert_eq!(
+            global + tlab.thread_allocated_bytes(),
+            4096,
+            "before the first retire the two agree: nothing is settled yet"
+        );
+
+        tlab.retire();
+        let carried = tlab.thread_allocated_bytes();
+        let (_owner2, base2, usable2) = aligned_buffer(64 * 1024);
+        let mut tlab = unsafe { Tlab::new(base2, usable2) };
+        tlab.adopt_allocation_total(carried);
+        tlab.alloc(2048, 8).unwrap();
+
+        let global = tlab.process_published_bytes();
+        assert_eq!(
+            global + tlab.consumed_bytes() as u64,
+            4096 + 2048,
+            "the process total plus the LIVE SPAN is the bytes allocated"
+        );
+        assert_eq!(
+            global + tlab.thread_allocated_bytes(),
+            (4096 + 2048) + 4096,
+            "regression witness: the thread's running total is already inside              the global, so adding it back over-reports by that total"
+        );
+    }
+
+    /// The ZGC arena path used to open-code
+    /// `install_tail_filler(); retire_taking_tail();`. The filler sets
+    /// `cursor = end`, so the retire that followed read the WHOLE chunk as
+    /// consumed and charged the unused tail as allocated -- the same defect
+    /// `Tlab::retire` documents having fixed, reintroduced by splitting the
+    /// two steps. `retire_with_filler_taking_tail` reads the span first.
+    #[test]
+    fn retire_with_filler_taking_tail_charges_only_the_consumed_span() {
+        let (_owner, base, usable) = aligned_buffer(64 * 1024);
+        let mut tlab = unsafe { Tlab::new_heap_staging(base, usable) };
+        tlab.alloc(4096, 8).unwrap();
+        let tail = unsafe { tlab.retire_with_filler_taking_tail(TLAB_FILLER_CLASS_ID) };
+        assert_eq!(
+            tail,
+            Some((base as usize + 4096, base as usize + usable)),
+            "the tail handed back must be the PRE-filler [cursor, end)"
+        );
+        assert_eq!(
+            tlab.thread_allocated_bytes(),
+            4096,
+            "charged the unused tail -- the filler ran before the span was read"
+        );
+        assert!(tlab.is_retired() && tlab.reserved_tail().is_none());
     }
 
     #[test]

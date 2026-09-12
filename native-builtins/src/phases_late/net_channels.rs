@@ -617,20 +617,26 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                 }
             }
         }
-        // Pin across the set/array allocs below — a moving young GC there
-        // would relocate the collected keys (native stale-local family).
+        // Pin across the set/array allocs inside the builder — a moving young
+        // GC there would relocate the collected keys (native stale-local
+        // family). `build_real_hash_set` re-pins them itself; these pins cover
+        // the gap between collecting them above and handing them over.
         let ready_pins: Vec<usize> = ready.iter().map(|k| ctx.pin_native_root(*k)).collect();
-        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
-        let set_pin = ctx.pin_native_root(set);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, ready.len());
-        let set = ctx.read_native_pin(set_pin, set);
-        for (i, k) in ready.iter().enumerate() {
-            let k = ctx.read_native_pin(ready_pins[i], *k);
-            ctx.set_array_element(arr, i, Value::Object(Some(k)));
+        let ready: Vec<ObjectRef> = ready
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ctx.read_native_pin(ready_pins[i], *k))
+            .collect();
+        // Through `HashSet.<init>` and `add`, not by writing absolute slots 0
+        // and 1. Those two are the MAP layout on a class whose one real field
+        // is `map`, so `selectedKeys().size()` / `iterator()` / `remove()` --
+        // the three methods a selector loop actually calls, and which this VM
+        // does NOT register for `HashSet` past `add` -- all read through a
+        // `map` holding an `Object[]` and answered for an empty set.
+        let set = crate::build_real_hash_set(ctx, &ready)?;
+        if let Some(base) = ready_pins.first().copied() {
+            ctx.unpin_native_roots(base);
         }
-        ctx.set_field(set, 0, Value::Object(Some(arr)));
-        ctx.set_field(set, 1, Value::Int(ready.len() as i32));
-        ctx.unpin_native_roots(ready_pins.first().copied().unwrap_or(set_pin));
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(sel, "keys", "()Ljava/util/Set;", |ctx, args| {
@@ -639,18 +645,17 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         // Pin across the set/array allocs below — a moving young GC there
         // would relocate `this` (native stale-local family).
         let this_pin = ctx.pin_native_root(this);
-        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
-        let set_pin = ctx.pin_native_root(set);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, kc);
-        let this = ctx.read_native_pin(this_pin, this);
-        let set = ctx.read_native_pin(set_pin, set);
+        let mut keys: Vec<ObjectRef> = Vec::with_capacity(kc);
         if let Value::Object(Some(ka)) = ctx.get_field(this, 1) {
             for i in 0..kc {
-                ctx.set_array_element(arr, i, ctx.get_array_element(ka, i));
+                if let Value::Object(Some(k)) = ctx.get_array_element(ka, i) {
+                    keys.push(k);
+                }
             }
         }
-        ctx.set_field(set, 0, Value::Object(Some(arr)));
-        ctx.set_field(set, 1, Value::Int(kc as i32));
+        // Same conversion, same reason, as `selectedKeys` above: the real
+        // `HashSet.<init>` and `add`, never absolute slots 0 and 1.
+        let set = crate::build_real_hash_set(ctx, &keys)?;
         ctx.unpin_native_roots(this_pin);
         Ok(Some(Value::Object(Some(set))))
     });

@@ -22,7 +22,36 @@
 public class StackTraceAfterOsr {
     static int[][] table = new int[8][];
 
-    static int leaf(int i)  { return table[i & 7][0]; }   // the throw site
+    /**
+     * The index expression of the throw site, and the one thing in this probe
+     * that is there for the COMPILER rather than for the trace.
+     *
+     * `MARK.length()` is 0, so it changes nothing a reader of the trace can
+     * see. What it changes is whether `leaf` can be SPLICED into its callers:
+     * the inline resolver refuses a callee that calls something it can neither
+     * splice nor direct-bind, and `java/lang/String.length()I` is such a call
+     * ("inline-resolve REFUSED ... is neither spliced nor direct-bound").
+     *
+     * That refusal is what gives the third row its shape. With it, `probe`'s
+     * compiled body splices `outer` and `mid` and CALLS `leaf`, so the hot
+     * throw stands in an artifact with inlined callees and
+     * `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` has two frames to take away —
+     * which is the only thing that makes that switch's arm in
+     * vm/tests/stack_trace_across_tiers.rs measure anything.
+     *
+     * Without it — the shape this probe had until 2026-09-11 — `leaf` is
+     * spliced too, all the way up. `probe`'s compiled body then contains the
+     * throw itself, traps on it (`UnreachedCode` at the splice, then
+     * `MakeNotCompilable`) and is reinterpreted the first time it is entered;
+     * so are `outer` and `mid`. Every frame below the OSR'd `main` is an
+     * interpreter frame at the third throw, the trace is still correct and
+     * still matches the interpreter, and the switch has nothing to revert.
+     * That is a silent loss of the anti-vacuity half of this probe, and it is
+     * how it was lost once already.
+     */
+    static final String MARK = "";
+
+    static int leaf(int i)  { return table[i & 7][MARK.length()]; }   // the throw site
     static int mid(int i)   { return leaf(i) + 1; }
     static int outer(int i) { return mid(i) + 1; }
 

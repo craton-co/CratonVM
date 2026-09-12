@@ -4693,45 +4693,7 @@ impl ClassManager {
         ];
 
         // Tier 3: Exception hierarchy — needed for catch handlers in real bytecode
-        let exception_classes = [
-            "java/lang/NullPointerException",
-            "java/lang/ArithmeticException",
-            "java/lang/ArrayIndexOutOfBoundsException",
-            "java/lang/IndexOutOfBoundsException",
-            "java/lang/StringIndexOutOfBoundsException",
-            "java/lang/ClassCastException",
-            "java/lang/IllegalArgumentException",
-            "java/lang/IllegalStateException",
-            "java/lang/UnsupportedOperationException",
-            "java/lang/ClassNotFoundException",
-            "java/lang/NoSuchMethodException",
-            "java/lang/NoSuchFieldException",
-            "java/lang/NoSuchMethodError",
-            "java/lang/NoSuchFieldError",
-            "java/lang/AbstractMethodError",
-            "java/lang/IncompatibleClassChangeError",
-            "java/lang/IllegalAccessError",
-            "java/lang/InstantiationError",
-            "java/lang/StackOverflowError",
-            "java/lang/OutOfMemoryError",
-            "java/lang/ExceptionInInitializerError",
-            "java/lang/LinkageError",
-            "java/lang/VerifyError",
-            "java/lang/SecurityException",
-            "java/lang/NegativeArraySizeException",
-            "java/lang/ArrayStoreException",
-            "java/lang/IllegalMonitorStateException",
-            "java/lang/InterruptedException",
-            "java/lang/CloneNotSupportedException",
-            "java/lang/NumberFormatException",
-            "java/io/IOException",
-            "java/io/FileNotFoundException",
-            "java/io/UnsupportedEncodingException",
-            "java/io/EOFException",
-            "java/util/NoSuchElementException",
-            "java/util/ConcurrentModificationException",
-            "java/lang/reflect/InvocationTargetException",
-        ];
+        let exception_classes = BOOTSTRAP_EXCEPTION_CLASSES;
 
         // Tier 4: Collections, concurrency, and functional interfaces
         let collections_classes = [
@@ -5460,8 +5422,34 @@ impl ClassManager {
                 // Not declared here. Ask the hierarchy, in the order both JVMS
                 // §5.4.3.3 and CratonVM's dispatch use: superclass chain, then
                 // superinterfaces.
-                let inherited =
-                    self.resolve_in_image_hierarchy(&mut parsed, class, name, descriptor);
+                //
+                // EXCEPT for the two initialization methods, which are not
+                // inherited and must not be resolved up the hierarchy. JVMS
+                // §6.5 `invokespecial`: "if the resolved method is an instance
+                // initialization method, and the class in which it is declared
+                // is not the class symbolically referenced by the instruction,
+                // a `NoSuchMethodError` is thrown" — so a `<init>` found on a
+                // SUPERTYPE is not a target this registration could ever yield
+                // to. `<clinit>` is never resolved by name at all.
+                //
+                // This is not a nicety: `inherited_has_code` is what puts a row
+                // in the `--jdk-only` campaign's bucket B, i.e. in the
+                // population a retirement wave may refuse. MEASURED on JDK 25,
+                // 2026-09-10: **31 registrations** carried an inherited `<init>`
+                // verdict, 23 of them live `Bridge` rows in the goal
+                // population, and 17 of those inherited `java/lang/Object`'s
+                // no-arg constructor — which initialises nothing. Retiring one
+                // would have refused a native that populates a VM-minted
+                // receiver's fields and yielded to a body that writes none of
+                // them: a silent field-init loss on
+                // `java/lang/management/*MXBean`, `HttpURLConnection`,
+                // `SSLEngineImpl` and `MBeanServer`. They are bucket F —
+                // "class present, method absent" — and always were.
+                let inherited = if name == "<init>" || name == "<clinit>" {
+                    None
+                } else {
+                    self.resolve_in_image_hierarchy(&mut parsed, class, name, descriptor)
+                };
                 match inherited {
                     Some((declarer, acc_native, has_code)) => ImageMethodVerdict {
                         image_has_class: true,
@@ -5674,6 +5662,72 @@ impl ClassManager {
         loader_id: ClassLoaderId,
     ) -> Result<ClassId, VmError> {
         self.define_class_with_options(name, bytes, loader_id, DefineClassOptions::default())
+    }
+
+    /// The synthetic slot FLOOR, applied to a class being defined from real
+    /// class-file bytes.
+    ///
+    /// Both places that define such a class — [`Self::define_class_with_options`]
+    /// and the stub-upgrade path — call this rather than open-coding the
+    /// `max`, so the floor and the exemptions below it cannot drift apart. A
+    /// FABRICATED stub never reaches here: `synthesize_stub_class` takes its
+    /// fields straight from `synthetic_stub_fields` and consults no floor, so
+    /// nothing this function does can change synthetic-JDK mode.
+    ///
+    /// The floor is the parent's already-floored total plus the class's own
+    /// fabricated instance fields, and it pads a real class up to the width
+    /// native code was written against. `java.net.InetSocketAddress` is the
+    /// case it exists for: one declared instance field (`holder`), and a
+    /// native `<init>` that writes raw synthetic indices on the REAL class.
+    ///
+    /// For [`FLOOR_EXEMPT_CLASSES`] it is skipped. Their fabricated table is a
+    /// layout for the STUB and a fiction for the real class, and applying it
+    /// pads the class out of the compact layout entirely — a padded slot has
+    /// no descriptor, so `ClassStore::build_compact_layout` refuses the class
+    /// outright and every one of its slots falls back to the legacy uniform
+    /// 16-byte tagged cell. `java.util.Properties` paid 544 bytes empty for
+    /// ten fields that pack into ~190 that way; `HashSet` paid 128 for one
+    /// reference.
+    fn apply_synthetic_floor(
+        &self,
+        name: &str,
+        superclass_id: Option<ClassId>,
+        num_total_fields: usize,
+    ) -> usize {
+        if floor_is_synthetic_only(name) {
+            // Report a JDK whose shape has moved out from under the screen
+            // that cleared this class. The exemption was measured against a
+            // specific real layout; a changed one moves every absolute index
+            // the natives were checked at, and the failure mode is the silent
+            // one (`set_field` DROPS an out-of-range write).
+            if let Some((expected, actual)) =
+                floor_exempt_real_extent_disagreement(name, num_total_fields)
+            {
+                static REPORTED: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                    eprintln!(
+                        "[layout] {name}: floor-exempt class declares {actual} instance \
+                         fields, not the {expected} its exemption in \
+                         FLOOR_EXEMPT_CLASSES was screened against. Re-run the screen \
+                         before trusting this class's raw-slot natives."
+                    );
+                }
+            }
+            return num_total_fields;
+        }
+        let stub_instance_count = synthetic_stub_fields(name)
+            .iter()
+            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+            .count();
+        let stub_parent_fields = match superclass_id {
+            Some(super_id) => self
+                .class_store
+                .get(super_id)
+                .map_or(0, |c| c.num_total_fields),
+            None => 0,
+        };
+        num_total_fields.max(stub_parent_fields + stub_instance_count)
     }
 
     /// NEW-8: extended define_class entry point used by
@@ -6293,20 +6347,13 @@ impl ClassManager {
         // slots would never be allocated (so reads see uninitialised slots and
         // misreport as e.g. `port is not an int`). Pad with the larger of the
         // declared count and the synthetic stub layout.
-        let stub_fields = synthetic_stub_fields(name);
-        let stub_instance_count = stub_fields
-            .iter()
-            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
-            .count();
-        let stub_parent_fields = match superclass_id {
-            Some(super_id) => self
-                .class_store
-                .get(super_id)
-                .map_or(0, |c| c.num_total_fields),
-            None => 0,
-        };
-        let stub_total = stub_parent_fields + stub_instance_count;
-        let num_total_fields = num_total_fields.max(stub_total);
+        //
+        // Except for the classes [`FLOOR_EXEMPT_CLASSES`] names, where the
+        // floor describes the FABRICATED layout and nothing else: no native
+        // writes a raw absolute slot past what the real class declares, so the
+        // padding buys nothing and costs the whole object. See
+        // `apply_synthetic_floor`.
+        let num_total_fields = self.apply_synthetic_floor(name, superclass_id, num_total_fields);
         if field_trace_enabled()
             && (name.contains("DefaultHttpMessageConverters")
                 || name.contains("AnsiOutputApplicationListener")
@@ -10583,23 +10630,12 @@ impl ClassManager {
             compute_field_layout(&class_file.fields, superclass_id, &self.class_store);
 
         // Wave 3-B (RE.4): pad to the synthetic stub field count when defined
-        // (mirrors `define_class_with_options`). Required for classes that are
-        // upgraded from a synthetic stub but whose real bytecode field count
-        // is smaller than the synthetic-mode layout used by native helpers.
-        let stub_fields_for_pad = synthetic_stub_fields(name);
-        let stub_instance_count_for_pad = stub_fields_for_pad
-            .iter()
-            .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
-            .count();
-        let stub_parent_fields_for_pad = match superclass_id {
-            Some(super_id) => self
-                .class_store
-                .get(super_id)
-                .map_or(0, |c| c.num_total_fields),
-            None => 0,
-        };
-        let stub_total_for_pad = stub_parent_fields_for_pad + stub_instance_count_for_pad;
-        let num_total_fields = num_total_fields.max(stub_total_for_pad);
+        // (mirrors `define_class_with_options`, through the same helper so the
+        // two cannot disagree about the floor or about who is exempt from it).
+        // Required for classes that are upgraded from a synthetic stub but
+        // whose real bytecode field count is smaller than the synthetic-mode
+        // layout used by native helpers.
+        let num_total_fields = self.apply_synthetic_floor(name, superclass_id, num_total_fields);
 
         // Extract source file. Inlined here (rather than
         // `class_file.source_file()`) so we pattern-match through
@@ -11170,6 +11206,89 @@ fn jdk_name_is_subclass(child: &str, parent: &str) -> bool {
     false
 }
 
+/// The throwable classes `bootstrap_core_classes` pre-loads (its "Tier 3").
+///
+/// Hoisted out of that function so a test can iterate it. Every name here is
+/// one this VM can hand to running bytecode, so every name here must have a
+/// `jdk_superclass` arm that reaches `java/lang/Throwable` -- see
+/// `throwable_like_inherits_its_chain`, which asserts exactly that over this
+/// list. A name added below with no arm gets a blanket `java/lang/Object`
+/// parent, which costs it the three-slot throwable model AND its compact
+/// layout, and nothing else would have said so.
+const BOOTSTRAP_EXCEPTION_CLASSES: &[&str] = &[
+    "java/lang/NullPointerException",
+    "java/lang/ArithmeticException",
+    "java/lang/ArrayIndexOutOfBoundsException",
+    "java/lang/IndexOutOfBoundsException",
+    "java/lang/StringIndexOutOfBoundsException",
+    "java/lang/ClassCastException",
+    "java/lang/IllegalArgumentException",
+    "java/lang/IllegalStateException",
+    "java/lang/UnsupportedOperationException",
+    "java/lang/ClassNotFoundException",
+    "java/lang/NoSuchMethodException",
+    "java/lang/NoSuchFieldException",
+    "java/lang/NoSuchMethodError",
+    "java/lang/NoSuchFieldError",
+    "java/lang/AbstractMethodError",
+    "java/lang/IncompatibleClassChangeError",
+    "java/lang/IllegalAccessError",
+    "java/lang/InstantiationError",
+    "java/lang/StackOverflowError",
+    "java/lang/OutOfMemoryError",
+    "java/lang/ExceptionInInitializerError",
+    "java/lang/LinkageError",
+    "java/lang/VerifyError",
+    "java/lang/SecurityException",
+    "java/lang/NegativeArraySizeException",
+    "java/lang/ArrayStoreException",
+    "java/lang/IllegalMonitorStateException",
+    "java/lang/InterruptedException",
+    "java/lang/CloneNotSupportedException",
+    "java/lang/NumberFormatException",
+    "java/io/IOException",
+    "java/io/FileNotFoundException",
+    "java/io/UnsupportedEncodingException",
+    "java/io/EOFException",
+    "java/util/NoSuchElementException",
+    "java/util/ConcurrentModificationException",
+    "java/lang/reflect/InvocationTargetException",
+];
+
+/// Does `name`'s fabricated superclass chain reach `java/lang/Throwable`?
+///
+/// `synthetic_stub_fields` asks this to decide whether a throwable-shaped stub
+/// should declare the three-slot model itself or INHERIT it. A name
+/// `jdk_superclass` knows gets a real fabricated parent chain — the stub mint
+/// path loads `jdk_superclass(name)` and sizes the class to
+/// `parent.num_total_fields + own` — so re-declaring the three at every level
+/// double-counts, and an exception hierarchy is deep enough for that to matter.
+/// A name it does not know gets a blanket `java/lang/Object` parent and must
+/// declare them.
+///
+/// `java/lang/Throwable` itself answers FALSE: nothing above it carries the
+/// model, and its own arm is what declares it.
+///
+/// The walk is bounded rather than trusting `jdk_superclass` to terminate. It
+/// does terminate today — every arm either names a strictly higher class or
+/// falls through to `java/lang/Object` — but this function's whole job is to
+/// decide a field count, and a cycle introduced later should cost a wrong
+/// count, not a hang inside class definition.
+fn jdk_chain_reaches_throwable(name: &str) -> bool {
+    let mut cur = name;
+    for _ in 0..64 {
+        let parent = jdk_superclass(cur);
+        if parent == "java/lang/Throwable" {
+            return true;
+        }
+        if parent == cur || parent == "java/lang/Object" {
+            return false;
+        }
+        cur = parent;
+    }
+    false
+}
+
 fn jdk_superclass(name: &str) -> &'static str {
     match name {
         // Throwable hierarchy
@@ -11185,6 +11304,25 @@ fn jdk_superclass(name: &str) -> &'static str {
 
         // Exception hierarchy
         "java/lang/Exception" => "java/lang/Throwable",
+        // Two checked exceptions that extend `Exception` DIRECTLY on HotSpot
+        // and had no arm here AT ALL. That was invisible while every throwable
+        // re-declared the three-slot model; once the model moved to
+        // inherit-not-redeclare it is what `CRATONVM_DBG_LAYOUT=1` reports:
+        //
+        // ```text
+        //   java/lang/InterruptedException        num_total_fields=9 declared=6 PADDED by 3
+        //   java/lang/CloneNotSupportedException  num_total_fields=9 declared=6 PADDED by 3
+        // ```
+        //
+        // A missing arm means a blanket `java/lang/Object` parent, so
+        // `jdk_chain_reaches_throwable` answers no, so each re-declares the
+        // three and is floored to nine against a real six -- and one padded
+        // slot costs the whole class its compact layout. `Thread.sleep` and
+        // `Object.clone` are on ordinary paths, so those two pads were paid by
+        // ordinary programs.
+        "java/lang/InterruptedException" | "java/lang/CloneNotSupportedException" => {
+            "java/lang/Exception"
+        }
         "java/io/IOException" => "java/lang/Exception",
         "java/io/FileNotFoundException" => "java/io/IOException",
         // Serialization's own IOException subtree. Needed as soon as anything
@@ -11193,6 +11331,28 @@ fn jdk_superclass(name: &str) -> &'static str {
         // `NotSerializableException` extends `java.lang.Object`, so
         // `catch (IOException)` — and even `catch (Exception)` — does not
         // match it, and the throw escapes the handler that was written for it.
+        // The same argument as the serialization subtree, for the `IOException`
+        // subclasses `native-builtins`' `THROWABLE_FAMILY_CLASSES` registers
+        // constructors on. Without an edge a fabricated `EOFException` extends
+        // `java.lang.Object`, and MEASURED on `--synthetic-jdk` 2026-09-12:
+        //
+        // ```text
+        //   new EOFException("m") instanceof IOException   HotSpot true
+        //                                                  CratonVM false
+        // ```
+        //
+        // -- so `catch (IOException)` around a stream read does not match the
+        // end-of-file it was written for, and the throw escapes. `readObject`
+        // loops are written exactly that way.
+        "java/io/EOFException"
+        | "java/io/UnsupportedEncodingException"
+        | "java/io/InterruptedIOException" => "java/io/IOException",
+        // `java.net`'s two, which are `IOException`s on HotSpot and are reached
+        // the same way (`URL` / `Socket` code catches `IOException`).
+        "java/net/MalformedURLException" | "java/net/UnknownHostException" => "java/io/IOException",
+        // NOT an `IOException`: `UncheckedIOException` is the wrapper that
+        // exists precisely so it does not have to be caught as one.
+        "java/io/UncheckedIOException" => "java/lang/RuntimeException",
         "java/io/ObjectStreamException" => "java/io/IOException",
         "java/io/NotSerializableException"
         | "java/io/InvalidClassException"
@@ -11263,9 +11423,45 @@ fn jdk_superclass(name: &str) -> &'static str {
         | "java/lang/AbstractMethodError"
         | "java/lang/ExceptionInInitializerError"
         | "java/lang/BootstrapMethodError" => "java/lang/LinkageError",
+        // `InstantiationError` is an `IncompatibleClassChangeError`, not a
+        // direct `LinkageError` -- it is the error a `new` of an abstract class
+        // raises, which is precisely an incompatible class change. It had no
+        // arm at all and was `PADDED by 3` for the same reason as the two
+        // checked exceptions above; the extra level is free, because the
+        // three slots are inherited either way and only the chain differs.
+        "java/lang/InstantiationError" => "java/lang/IncompatibleClassChangeError",
 
         // java.lang.reflect (JDK hierarchy for reflective wrappers)
-        "java/lang/reflect/ReflectiveOperationException" => "java/lang/Exception",
+        //
+        // `ReflectiveOperationException` lives in `java.lang`, NOT
+        // `java.lang.reflect` -- only `InvocationTargetException` below is in
+        // the subpackage. The `reflect/` spelling was the only one here, so
+        // the real `java/lang/ReflectiveOperationException` had no edge at
+        // all: it took the throwable arm's three own fields and was floored to
+        // nine against a real six (`CRATONVM_DBG_LAYOUT=1`: `PADDED by 3`).
+        // `InvocationTargetException`'s arm points at the misspelled name, so
+        // its fabricated chain stopped at `java/lang/Object` rather than
+        // reaching `Throwable`.
+        //
+        // Its siblings were never affected by this: `ClassNotFoundException`,
+        // `NoSuchMethodException` and `NoSuchFieldException` are edged to
+        // `RuntimeException` above, so their chains always reached
+        // `Throwable`, and `InterruptedException`, `CloneNotSupportedException`
+        // and `InstantiationError` had no arm of their own -- each is fixed
+        // where it belongs, not here.
+        //
+        // The misspelling is kept beside the real name: a name nothing
+        // resolves costs nothing, `InvocationTargetException` below still
+        // spells it that way, and removing it is a separate question from
+        // fixing the real one.
+        "java/lang/ReflectiveOperationException"
+        | "java/lang/reflect/ReflectiveOperationException" => "java/lang/Exception",
+        // `InstantiationException` -- the CHECKED one, raised by
+        // `Class.newInstance` -- is a `ReflectiveOperationException` on
+        // HotSpot. `native-builtins` registers constructors for it (the
+        // message-only ctor family), so this VM can hand one out, and without
+        // an arm it had the same no-chain pad as the three above.
+        "java/lang/InstantiationException" => "java/lang/ReflectiveOperationException",
         "java/lang/reflect/InvocationTargetException" => {
             "java/lang/reflect/ReflectiveOperationException"
         }
@@ -11482,9 +11678,19 @@ fn jdk_superclass(name: &str) -> &'static str {
         // ONLY edges where the parent contributes zero (or matching)
         // synthetic fields are listed here so we don't perturb existing
         // field-slot layouts that natives depend on. In particular,
-        // `LinkedHashMap`, `Properties`, and `Stack` keep their direct
-        // `Object` parent because their `synthetic_stub_fields` already
-        // count fields the candidate parent would also declare.
+        // `Properties` and `Stack` keep their direct `Object` parent because
+        // their `synthetic_stub_fields` already count fields the candidate
+        // parent would also declare.
+        //
+        // `LinkedHashMap` used to be in that list, and is no longer, because
+        // the condition it names stopped holding: its arm declared five OWN
+        // fields, three of which were `HashMap`'s, so naming `HashMap` as its
+        // parent would have counted those three twice. Its arm now declares
+        // the two it actually owns (`head`, `tail`), so the edge is honest and
+        // the chain reaches the same five slots -- `LHM_FIELD_HEAD = 3` and
+        // `LHM_FIELD_TAIL = 4` land exactly where they always did, after
+        // `HashMap`'s three. Naming the edge is what lets
+        // `synthetic_stub_total_field_count` see those five.
         //
         // Abstract bases (no synthetic fields):
         "java/util/AbstractCollection" => "java/lang/Object",
@@ -11547,6 +11753,7 @@ fn jdk_superclass(name: &str) -> &'static str {
 
         // Concrete Map hierarchy:
         "java/util/HashMap" => "java/util/AbstractMap",
+        "java/util/LinkedHashMap" => "java/util/HashMap",
         "java/util/TreeMap" => "java/util/AbstractMap",
         "java/util/IdentityHashMap" => "java/util/AbstractMap",
         "java/util/WeakHashMap" => "java/util/AbstractMap",
@@ -12746,6 +12953,152 @@ pub fn synthetic_stub_instance_field_count(name: &str) -> usize {
         .count()
 }
 
+/// The synthetic slot extent of `name`: its own fabricated instance fields
+/// PLUS every ancestor's, down the `jdk_superclass` chain.
+///
+/// This is the number a bytecode `new` of the stub actually sizes to, and so
+/// the number an absolute slot index has to fit inside.
+/// [`synthetic_stub_instance_field_count`] is the class's OWN contribution and
+/// is the wrong thing to compare an absolute index against: `LinkedHashMap`
+/// keeps `LHM_FIELD_HEAD = 3` and `LHM_FIELD_TAIL = 4`, which are its own two
+/// fields sitting after `HashMap`'s three — an extent of 5 from an own-count
+/// of 2. Comparing 2 against 5 reads as a three-slot shortfall that does not
+/// exist, and the way to make that comparison pass is to over-declare the
+/// table, which is how `LinkedHashMap` came to claim five own fields for two.
+///
+/// The chain is `jdk_superclass`, whose default arm is `java/lang/Object`, so
+/// the walk always terminates; a class with no arm contributes zero.
+#[must_use]
+pub fn synthetic_stub_total_field_count(name: &str) -> usize {
+    let mut total = 0usize;
+    let mut cur = name;
+    loop {
+        total += synthetic_stub_instance_field_count(cur);
+        if cur == "java/lang/Object" {
+            break;
+        }
+        let parent = jdk_superclass(cur);
+        if parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+    total
+}
+
+/// The classes whose synthetic slot floor describes the SYNTHETIC layout ONLY,
+/// with the real instance-field extent each one has when it is defined from
+/// real class-file bytes.
+///
+/// # Why a floor can be mode-specific at all
+///
+/// [`synthetic_stub_fields`] is one number consulted in two places that mean
+/// two different things:
+///
+/// * **Fabricating a stub** (`synthesize_stub_class`) — the table IS the
+///   layout. The natives that serve the class index it from 0 and nothing else
+///   declares those slots, so the count is a definition, not a floor.
+/// * **Defining a class from real bytes** (`define_class_with_options`, and the
+///   stub-upgrade path) — the table is a FLOOR, padding the real layout up to
+///   the width native code was written against. `java.net.InetSocketAddress`
+///   is the case that needs it: it declares one instance field (`holder`) and
+///   its native `<init>` writes raw synthetic indices on the REAL class, which
+///   an unpadded object has no room for. An out-of-range `set_field` is
+///   DROPPED, not raised, so removing that floor fails in silence.
+///
+/// For the classes below the second reading is false: in real-JDK mode nothing
+/// writes a raw absolute slot past what the class itself declares, because the
+/// natives that serve them resolve by NAME (`hs_map_slot`,
+/// `props_defaults_slot`, `receiver_table_slot`) or are shadowed out by the
+/// class's own bytecode. Applying the floor to them costs the whole object:
+/// `ClassStore::build_compact_layout` refuses a compact layout to any class
+/// with a padded slot — a padded slot has no descriptor, so its oop-map entry
+/// would be a guess — and the class falls back to the legacy uniform 16-byte
+/// tagged cell for EVERY slot. Padding by one costs 2x-4.5x.
+///
+/// # The number beside each name
+///
+/// It is the instance fields the REAL chain declares, measured on JDK 25
+/// Temurin `25.0.3+9` with `CRATONVM_DBG_LAYOUT=1`
+/// (`declared_instance_fields=`). It is not used to size anything — the real
+/// class file does that — it is what
+/// [`floor_exempt_real_extent_disagreement`] compares the loaded class against
+/// so a JDK whose shape has moved is reported rather than silently exempted,
+/// and what the `t9d_floor_exempt_classes_have_no_oversized_factories` gate
+/// (`vm/tests/tier1_tests.rs`) compares every literal
+/// `alloc_concurrent_synthetic(ctx, "name", n)` site against.
+///
+/// # Adding a class here
+///
+/// The screen is mechanical: a class may be exempt **iff** no native writes a
+/// raw absolute slot at or past its real extent on a receiver of that class in
+/// real-JDK mode. Both halves of that population are greppable — literal
+/// factories (which the gate reads) and raw `ctx.set_field(obj, N, ..)` on a
+/// receiver the caller did not allocate. Converting the writer to
+/// `set_field_by_name`, or to the class's own `<init>`, is what clears a class;
+/// lowering the number without doing that is the silent failure above.
+///
+/// `java/util/ArrayDeque` is deliberately NOT here: its fourth slot became
+/// dead when `ad_state` started deriving the count from `head`/`tail`, so its
+/// table was simply narrowed to the three the real class declares and the
+/// class needs no exemption in either mode.
+pub const FLOOR_EXEMPT_CLASSES: &[(&str, usize)] = &[
+    // One real field, `map` (`Ljava/util/HashMap;`). `hs_map_slot` answers
+    // absolute 0 for it in BOTH modes, which is the only index the
+    // `native_hs_*` surface uses. The synthetic table keeps three because
+    // `wildfly_security::count_carrying_hash_set` writes a count at slot 1 —
+    // under an explicit `is_class_synthetic_stub` gate, so that shape is
+    // reachable only where it is the layout.
+    ("java/util/HashSet", 1),
+    // Declares no instance fields of its own; it is `HashSet`'s one field,
+    // inherited, and it was padded for exactly the same reason.
+    ("java/util/LinkedHashSet", 1),
+    // One real field, `al` (`Ljava/util/concurrent/CopyOnWriteArrayList;`).
+    // `hs_map_slot` names it explicitly beside `HashSet` and answers absolute
+    // 0; the synthetic table's second slot mirrors `CopyOnWriteArrayList`'s
+    // `(data, size)` and is written only on the fabricated stub.
+    ("java/util/concurrent/CopyOnWriteArraySet", 1),
+    // Two real fields, `head` and `tail` (both `Node`). The four-slot table is
+    // `native_lbq_*`'s `(head, tail, size, capacity)`, which serves the
+    // fabricated stub; a real one runs its own lock-free bytecode, and a fresh
+    // instance has `head == tail == new Node<>()` built by it.
+    ("java/util/concurrent/ConcurrentLinkedQueue", 2),
+    ("java/util/concurrent/ConcurrentLinkedDeque", 2),
+    // Ten across the chain: `Hashtable`'s eight plus `Properties`' two. The
+    // sixteen-slot table is the fabricated model, and every native that serves
+    // a real `Properties` resolves its slot on the RECEIVER —
+    // `props_defaults_slot` by name with the model slot as a fallback,
+    // `publish_map_table` through `receiver_table_slot`. The one factory that
+    // asks for sixteen (`system_properties_object`) writes NO slot at all: the
+    // singleton's entries live in `properties_sidetable`'s side table.
+    ("java/util/Properties", 10),
+];
+
+/// Whether `name`'s synthetic slot floor must NOT be applied to a class being
+/// defined from real class-file bytes. See [`FLOOR_EXEMPT_CLASSES`].
+#[must_use]
+pub fn floor_is_synthetic_only(name: &str) -> bool {
+    FLOOR_EXEMPT_CLASSES.iter().any(|(c, _)| *c == name)
+}
+
+/// `Some((expected, actual))` when `name` is floor-exempt and the real class
+/// just defined does not have the instance-field extent
+/// [`FLOOR_EXEMPT_CLASSES`] recorded for it.
+///
+/// An exemption is only sound while the real layout is the one it was screened
+/// against. A JDK that grows or drops a field on one of these classes moves
+/// every absolute index the natives were checked at, and the failure mode is
+/// the silent one — a dropped `set_field`. This turns that into a line on
+/// stderr naming the class and both counts.
+#[must_use]
+fn floor_exempt_real_extent_disagreement(name: &str, declared: usize) -> Option<(usize, usize)> {
+    FLOOR_EXEMPT_CLASSES
+        .iter()
+        .find(|(c, _)| *c == name)
+        .map(|(_, expected)| (*expected, declared))
+        .filter(|(expected, actual)| expected != actual)
+}
+
 /// CratonVM's fabricated slot **model** for `name` — the same table that sizes
 /// a bytecode `new` of the stub and that pads a real class up to the count
 /// native code was written against.
@@ -12974,34 +13327,24 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
-        // Throwable and common exception types: 2 fields (message, cause)
-        "java/lang/Throwable"
-        | "java/lang/Exception"
-        | "java/lang/RuntimeException"
-        | "java/lang/Error"
-        | "java/lang/NullPointerException"
-        | "java/lang/ArithmeticException"
-        | "java/lang/ArrayIndexOutOfBoundsException"
-        | "java/lang/IndexOutOfBoundsException"
-        | "java/lang/ClassCastException"
-        | "java/lang/IllegalArgumentException"
-        | "java/lang/IllegalStateException"
-        | "java/lang/UnsupportedOperationException"
-        | "java/lang/ClassNotFoundException"
-        | "java/lang/NoSuchMethodException"
-        | "java/lang/StackOverflowError"
-        | "java/lang/OutOfMemoryError"
-        | "java/lang/VerifyError"
-        | "java/util/NoSuchElementException"
-        // W7-33's synthetic-mode residual: without a field arm the fabricated
-        // carrier gets no slots, and the two `Throwable` slots every other
-        // exception here relies on (message, cause) are what a `getMessage()` on
-        // a caught `EmptyStackException` reads.
-        | "java/util/EmptyStackException"
-        | "java/util/InputMismatchException"
-        | "java/io/IOException"
-        | "java/io/FileNotFoundException"
-        | "java/lang/NumberFormatException" => instance_fields(2),
+        // `java.lang.Throwable` — THREE fields, and only `Throwable` itself.
+        //
+        // The three are `synthetic_throwable_slot`'s own map, which is the one
+        // definition of a synthetic throwable's layout:
+        // `detailMessage` = 0, `cause` = 1, `suppressedExceptions` = 2. This
+        // arm declared TWO, so slot 2 fell outside a bare synthetic
+        // `Throwable` and `write_throwable_field`'s
+        // `slot < object_num_fields(this)` guard dropped every
+        // `addSuppressed` on one.
+        //
+        // Every SUBCLASS is deliberately absent, and that is the fix for the
+        // compounding described on `throwable_like_inherits_its_chain`: the
+        // count here is a class's OWN fields, appended after its parent's, and
+        // an exception hierarchy is deep. Declaring three at each level made
+        // `java/io/FileNotFoundException` claim twelve slots for a three-slot
+        // model, and in real-JDK mode stacked them on top of a real
+        // `Throwable`'s six.
+        "java/lang/Throwable" => instance_fields(3),
         "java/lang/Boolean" => {
             let mut fields = vec![
                 ClassFileField {
@@ -13187,17 +13530,42 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => {
             vec![named_field("genericComponentType", "Ljava/lang/reflect/Type;")]
         }
-        // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields (data, size)
+        // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields
+        // (data, size) -- `AL_FIELD_DATA`, `AL_FIELD_SIZE`, `AL_NUM_FIELDS = 2`
+        // in `native-collections`. This said 2 and reserved 4 until 2026-09-11;
+        // see the HashMap arm below for why that mattered and what the extra
+        // slots cost.
         "java/util/ArrayList"
         | "java/util/Vector"
         | "java/util/Stack"
-        | "java/util/concurrent/CopyOnWriteArrayList" => instance_fields(4),
+        | "java/util/concurrent/CopyOnWriteArrayList" => instance_fields(2),
         // HashMap/HashSet/ConcurrentHashMap = 3 fields (buckets, size, capacity)
+        // -- `MAP_FIELD_BUCKETS/SIZE/CAPACITY`, `HS_FIELD_MAP`,
+        // `CHM_FIELD_SEGMENTS` and its mask, all in `native-collections`. No
+        // native indexes a slot above 2 on any of these receivers.
+        //
+        // This said 3 and reserved 16 until 2026-09-11. The floor is applied in
+        // REAL-JDK mode too, as `max(declared, floor)`, and
+        // `build_compact_layout` fills the padding with 8-byte reference slots
+        // -- so an empty `java.util.HashMap` occupied 36 slots and 304 bytes
+        // against HotSpot's 48, with `table` already null and nothing allocated
+        // on the side to explain it. A `HashSet` cost 576. Bringing the two
+        // drifted floors down to what the natives actually index took HashMap to
+        // 64 bytes and ArrayList from 96 to 32, and 7% off the Hibernate HQL
+        // parse that found it.
+        //
+        // VALIDATED, because lowering a floor fails SILENTLY (an out-of-range
+        // `set_field` is dropped, not raised): 300 Hibernate ORM classes
+        // byte-for-byte identical, `regression-suite` 92/92, and
+        // `probes/CollectionSlotFloor.java` -- written for this -- passing in
+        // real-JDK mode and producing an IDENTICAL failure set to the unchanged
+        // build in synthetic-JDK mode, where the stub really is the layout.
+        // Raising a floor here is free; lowering one needs that evidence again.
         "java/util/HashMap"
         | "java/util/HashSet"
         | "java/util/EnumMap"
         | "java/util/Hashtable"
-        | "java/util/concurrent/ConcurrentHashMap" => instance_fields(16),
+        | "java/util/concurrent/ConcurrentHashMap" => instance_fields(3),
         // `ConcurrentHashMap$KeySetView` — the JDK's own two fields, named, so
         // `resolve_field_index_by_class_id` finds the same slots in synthetic
         // mode that it finds against the real class (`CollectionView.map` and
@@ -13243,12 +13611,66 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         ],
         // LinkedList = 3 fields (head, tail, size)
         "java/util/LinkedList" => instance_fields(3),
-        // LinkedHashMap = 5 fields
-        "java/util/LinkedHashMap" => instance_fields(5),
-        // TreeMap/TreeSet = 3 fields (data, size, comparator)
-        "java/util/TreeMap" | "java/util/TreeSet" => instance_fields(3),
-        // ArrayDeque = 4 fields (data, head, tail, size)
-        "java/util/ArrayDeque" => instance_fields(4),
+        // LinkedHashMap's OWN two: `head` and `tail`.
+        //
+        // The count here is a class's own fields, appended AFTER the parent's
+        // -- `stub_total` is `stub_parent_fields + stub_instance_count`. The
+        // synthetic indices `native-collections` writes are absolute:
+        // `LHM_FIELD_BUCKETS/SIZE/CAPACITY = 0/1/2` are HashMap's three, and
+        // LinkedHashMap adds `LHM_FIELD_HEAD = 3` and `LHM_FIELD_TAIL = 4`.
+        // That is an absolute EXTENT of 5, which is what the old comment
+        // ("= 5 fields") said -- but it was coded as 5 OWN fields on top of
+        // HashMap's 3, for an extent of 8. Three slots past anything indexed,
+        // in both modes.
+        //
+        // Comment and code disagreeing in the same direction is the signature
+        // this page already found twice (`HashMap` "= 3" coded as 16,
+        // `ArrayList` "= 2" coded as 4); this is the third and last of them.
+        //
+        // In real-JDK mode the arithmetic is what makes it expensive rather
+        // than merely untidy: the parent term is the REAL `HashMap`'s eight
+        // fields, so the floor came to 13 against a real `LinkedHashMap`'s
+        // twelve. Padded by ONE slot -- and a padded class is refused the
+        // compact layout entirely, so all thirteen became 16-byte tagged
+        // cells: 224 B measured, against HotSpot's 65.1 for the same twelve
+        // fields. At 2 the floor is 10, the real class is not padded, and the
+        // synthetic indices 3 and 4 are exactly where they always were.
+        "java/util/LinkedHashMap" => instance_fields(2),
+        // TreeMap = 3 fields (data, size, comparator).
+        //
+        // A real `java/util/TreeMap` declares nine, so this floor never pads
+        // it; it sizes the STUB, which in synthetic-jdk mode is the layout.
+        "java/util/TreeMap" => instance_fields(3),
+        // `TreeSet` was in that arm, and a real one declares exactly ONE
+        // instance field (`m`), so the three padded it -- over the
+        // `build_compact_layout` cliff, into 16-byte tagged cells.
+        //
+        // It is not padded for slots anyone indexes. `TS_FIELD_DATA/SIZE/
+        // COMPARATOR` name an address-keyed SIDE TABLE, not object storage:
+        // `ts_get_slot` / `ts_set_slot` say so ("The object's own fields are
+        // never touched") and contain no `set_field` at all. One slot is kept
+        // rather than zero so the `HS_FIELD_MAP = 0` shape -- `m`, the backing
+        // map, at absolute 0 -- still has somewhere to live in synthetic mode.
+        "java/util/TreeSet" => instance_fields(1),
+        // ArrayDeque = 3 fields (elements, head, tail) — EXACTLY what the real
+        // `java.util.ArrayDeque` declares, in the same order, so the class is
+        // never padded and keeps its compact layout.
+        //
+        // It was four. The fourth was `size`, and `ad_state` stopped reading it
+        // on 2026-08-30: the count is DERIVED from `head`/`tail` the way the
+        // JDK's own `size()` derives it (`sub(tail, head, elements.length)`),
+        // because any real body that moves either index — `delete`,
+        // `DeqIterator.remove`, and every mutator this VM does not register —
+        // cannot know a fourth slot exists and desynced it. Nothing has
+        // written slot 3 since; the only reader left was a `>` bound in
+        // `collect_collection_elements`, which now asks for the three that
+        // exist.
+        //
+        // Narrowing it here is what takes the class off the padded list: a
+        // floor of four against a real three cost `ArrayDeque` the compact
+        // layout for ALL of its slots (`build_compact_layout` refuses any
+        // padded class) and 232 bytes empty against HotSpot's 112.
+        "java/util/ArrayDeque" => instance_fields(3),
         // EnumSet = 2 fields (elements backing, enum type)
         "java/util/EnumSet" => instance_fields(2),
         // PriorityQueue = 3 fields (data, size, comparator)
@@ -16350,7 +16772,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // future back-pointer to a JLA-interior cache. This entry keeps the
         // synthetic fallback layout stable when the real JDK class file
         // can't be loaded.
-        "java/lang/System$1" => instance_fields(1),
+        "java/lang/System$1" | "java/lang/System$2" => instance_fields(1),
 
         // T19.H2: synthetic `ModuleLayer` fallback when the real JDK class
         // can't be resolved during boot (pre-init). Slot 0 = boot flag.
@@ -16477,7 +16899,43 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             || name.ends_with("Exception")
             || name.ends_with("Error") =>
         {
-            instance_fields(3)
+            // ZERO when the chain actually reaches `java/lang/Throwable`, so
+            // the three slots are INHERITED rather than re-declared at every
+            // level.
+            //
+            // The comment above is why this arm exists and it is still true —
+            // "a synthetic stub's superclass is a blanket `java/lang/Object`
+            // unless special-cased" — but the special case is exactly what
+            // `jdk_superclass` IS, and for a name it knows, the fabricated
+            // parent chain is built from it (`synthesize_stub_class` loads
+            // `jdk_superclass(name)` and sums `parent.num_total_fields +
+            // own`). So for those names re-declaring three is not insurance,
+            // it is DOUBLE COUNTING, and it compounds with depth:
+            //
+            // ```text
+            //                              before   after   model
+            //   java/lang/Throwable             2       3       3
+            //   java/lang/Exception             4       3       3
+            //   java/io/IOException             6       3       3
+            //   java/io/FileNotFoundException   8       3       3
+            // ```
+            //
+            // In real-JDK mode the same sum is applied as a FLOOR on top of the
+            // real class, whose `Throwable` already declares six — so
+            // `IOException` was floored to 10 against a real 6 and
+            // `FileNotFoundException` to 12, and `build_compact_layout` refuses
+            // any padded class, which put every exception object this VM
+            // allocates on the legacy 16-byte-per-slot layout.
+            //
+            // An application exception (`…/DbException`) has no
+            // `jdk_superclass` edge, so its chain does NOT reach `Throwable`,
+            // so it still gets the three this arm was written for — which is
+            // the case the `ParseException` measurement above pins.
+            if jdk_chain_reaches_throwable(name) {
+                Vec::new()
+            } else {
+                instance_fields(3)
+            }
         }
 
         _ => vec![],
@@ -18520,6 +18978,135 @@ fn field_trace_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every JDK throwable this VM can fabricate inherits the three-slot model
+    /// instead of re-declaring it, and the ones that must still declare it do.
+    ///
+    /// `synthetic_stub_fields`' throwable arm hands out ZERO own fields when
+    /// `jdk_chain_reaches_throwable` says the fabricated parent chain carries
+    /// them. That is only safe while the chain really does reach
+    /// `java/lang/Throwable`: a name whose `jdk_superclass` arm is missing gets
+    /// a blanket `java/lang/Object` parent, so zero own fields would mean a
+    /// stub with NO slots, and every `write_throwable_field` on it is dropped
+    /// by its own `slot < object_num_fields` guard — `getMessage()` on a
+    /// freshly-constructed one answers null. That is the `ParseException`
+    /// measurement quoted in the arm.
+    ///
+    /// So the two halves are asserted together: the count, and the reason the
+    /// count is allowed to be zero.
+    #[test]
+    fn throwable_like_inherits_its_chain() {
+        // Named here rather than derived, so that DELETING a `jdk_superclass`
+        // arm fails this test instead of silently moving a class into the
+        // three-own-fields branch.
+        const CHAINED: &[&str] = &[
+            "java/lang/Exception",
+            "java/lang/RuntimeException",
+            "java/lang/Error",
+            "java/lang/LinkageError",
+            "java/lang/NullPointerException",
+            "java/lang/ArithmeticException",
+            "java/lang/ArrayIndexOutOfBoundsException",
+            "java/lang/IndexOutOfBoundsException",
+            "java/lang/ClassCastException",
+            "java/lang/IllegalArgumentException",
+            "java/lang/IllegalStateException",
+            "java/lang/UnsupportedOperationException",
+            "java/lang/ClassNotFoundException",
+            "java/lang/NoSuchMethodException",
+            "java/lang/ReflectiveOperationException",
+            "java/lang/NoSuchFieldException",
+            "java/lang/InterruptedException",
+            "java/lang/CloneNotSupportedException",
+            "java/lang/InstantiationError",
+            "java/lang/InstantiationException",
+            "java/lang/StackOverflowError",
+            "java/lang/OutOfMemoryError",
+            "java/lang/VerifyError",
+            "java/util/NoSuchElementException",
+            "java/util/EmptyStackException",
+            "java/util/InputMismatchException",
+            "java/util/ConcurrentModificationException",
+            "java/io/IOException",
+            "java/io/FileNotFoundException",
+            "java/io/EOFException",
+            "java/io/UnsupportedEncodingException",
+            "java/io/InterruptedIOException",
+            "java/io/UncheckedIOException",
+            "java/io/NotSerializableException",
+            "java/net/MalformedURLException",
+            "java/net/UnknownHostException",
+            "java/lang/NumberFormatException",
+        ];
+        for name in CHAINED {
+            assert!(
+                jdk_chain_reaches_throwable(name),
+                "{name}: `jdk_superclass` no longer reaches java/lang/Throwable, so \
+                 `synthetic_stub_fields` would give it a blanket Object parent AND \
+                 zero own fields — a stub with no slots, whose every throwable \
+                 field write is silently dropped. Restore the arm, or take the \
+                 name out of this list and let it declare its own three."
+            );
+            assert!(
+                synthetic_stub_fields(name)
+                    .iter()
+                    .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+                    .count()
+                    == 0,
+                "{name}: declares its own throwable slots on top of an inherited \
+                 chain. That double-counts, and in real-JDK mode the sum is a \
+                 FLOOR over the real class: one padded slot costs the whole \
+                 object its compact layout."
+            );
+            // The extent the natives actually index, whatever the depth.
+            assert_eq!(
+                synthetic_stub_total_field_count(name),
+                3,
+                "{name}: the synthetic throwable model is \
+                 detailMessage/cause/suppressedExceptions — three absolute \
+                 slots, at every depth. See `synthetic_throwable_slot`."
+            );
+        }
+
+        // And EXHAUSTIVELY, over the list `bootstrap_core_classes` actually
+        // pre-loads. The hand-written names above are the regression cases --
+        // they say which arms were added for which measurement, and deleting
+        // one of those arms names the class it broke. This loop is the part
+        // that catches a name ADDED to the bootstrap list with no arm at all,
+        // which is how `InterruptedException`, `CloneNotSupportedException`,
+        // `InstantiationError` and `InstantiationException` each sat at
+        // `PADDED by 3` with nothing to report it.
+        //
+        // Only the chain is asserted here, not the own-field count:
+        // `InvocationTargetException` deliberately declares its own seven (it
+        // carries `target` and has natives that index it by absolute slot), so
+        // it is a legitimate exception to the zero-own-fields rule while still
+        // having to reach `Throwable` like everything else.
+        for name in BOOTSTRAP_EXCEPTION_CLASSES {
+            assert!(
+                jdk_chain_reaches_throwable(name),
+                "{name}: is pre-loaded by `bootstrap_core_classes` but its \
+                 `jdk_superclass` chain does not reach java/lang/Throwable, so \
+                 it gets a blanket `java/lang/Object` parent -- no inherited \
+                 throwable slots, no `catch (Exception)` match, and a floor \
+                 that pads it out of its compact layout. Add a `jdk_superclass` \
+                 arm for it."
+            );
+        }
+
+        // `Throwable` itself declares them; nothing above it carries the model.
+        assert!(!jdk_chain_reaches_throwable("java/lang/Throwable"));
+        assert_eq!(synthetic_stub_total_field_count("java/lang/Throwable"), 3);
+
+        // An application exception `jdk_superclass` has never heard of keeps
+        // the three this arm was written for.
+        assert!(!jdk_chain_reaches_throwable("com/example/app/WidgetException"));
+        assert_eq!(
+            synthetic_stub_total_field_count("com/example/app/WidgetException"),
+            3
+        );
+    }
+
     use crate::class::ClassStore;
     use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
     use cratonvm_reader::class_file_version::ClassFileVersion;

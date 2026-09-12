@@ -7,7 +7,7 @@ use crate::util_concurrent_ext::{
     atomic_array_cas, atomic_array_index, atomic_array_new_length, atomic_array_raw_index,
     atomic_array_rmw,
 };
-use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandle, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -364,21 +364,59 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
     r.set_category(__prev_cat);
 }
 
+/// A `Value` argument held across a call that can allocate.
+///
+/// A reference argument is an address copied out of the caller's frame: the
+/// frame roots the object, but this copy is not updated when the collector
+/// moves it, so it must be rooted in the scope and read back at the point of
+/// use. A primitive needs none of that and is carried verbatim.
+enum ArgSlot {
+    Ref(NativeHandle),
+    Plain(Value),
+}
+
+fn element_handle(scope: &mut NativeHandleScope<'_>, value: Option<Value>) -> ArgSlot {
+    match value {
+        Some(Value::Object(Some(o))) => ArgSlot::Ref(scope.root(o)),
+        Some(v) => ArgSlot::Plain(v),
+        None => ArgSlot::Plain(Value::Object(None)),
+    }
+}
+
+fn element_value(scope: &NativeHandleScope<'_>, slot: &ArgSlot) -> Value {
+    match slot {
+        ArgSlot::Ref(h) => Value::Object(Some(scope.get(h))),
+        ArgSlot::Plain(v) => *v,
+    }
+}
+
 fn native_collections_singleton_list(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let elem = args.first().copied().unwrap_or(Value::Object(None));
-    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonList") {
-        let list = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
-        ctx.set_field_by_name(list, "element", elem);
+    // The argument is an address copied off the caller's operand stack: the
+    // stack itself is a root, but this copy is not, so it is stale the moment
+    // `<clinit>` or the allocation below collects. Root it before anything
+    // runs, and read it back where it is stored.
+    let mut scope = NativeHandleScope::new(ctx);
+    let elem_h = element_handle(&mut scope, args.first().copied());
+    if let Ok(cid) = scope.ensure_class_initialized("java/util/Collections$SingletonList") {
+        let fields = scope.class_num_total_fields(cid);
+        let list = scope.alloc_object(cid, fields);
+        let elem = element_value(&scope, &elem_h);
+        scope.set_field_by_name(list, "element", elem);
         return Ok(Some(Value::Object(Some(list))));
     }
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-    ctx.set_array_element(arr, 0, elem);
-    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
-    ctx.set_field(list, 0, Value::Object(Some(arr)));
-    ctx.set_field(list, 1, Value::Int(1));
+    // The array is built first and the list allocated after it, so the array's
+    // address has to be read back on the far side of that allocation.
+    let arr_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+    let arr_h = scope.root(arr_obj);
+    let elem = element_value(&scope, &elem_h);
+    scope.set_array_element(arr_obj, 0, elem);
+    let list = try_alloc_concurrent_synthetic(&mut *scope, "java/util/ArrayList", 2)?;
+    let arr = scope.get(&arr_h);
+    scope.set_field(list, 0, Value::Object(Some(arr)));
+    scope.set_field(list, 1, Value::Int(1));
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -386,20 +424,33 @@ fn native_collections_singleton_set(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let elem = args.first().copied().unwrap_or(Value::Object(None));
-    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonSet") {
-        let set = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
-        ctx.set_field_by_name(set, "element", elem);
+    let mut scope = NativeHandleScope::new(ctx);
+    let elem_h = element_handle(&mut scope, args.first().copied());
+    if let Ok(cid) = scope.ensure_class_initialized("java/util/Collections$SingletonSet") {
+        let fields = scope.class_num_total_fields(cid);
+        let set = scope.alloc_object(cid, fields);
+        let elem = element_value(&scope, &elem_h);
+        scope.set_field_by_name(set, "element", elem);
         return Ok(Some(Value::Object(Some(set))));
     }
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
-    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
-    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
+    // `set` outlives the map's allocation, `native_map_init` (which allocates a
+    // bucket array) and `native_map_put_pub` (which can run Java for
+    // `hashCode`), so neither it nor the map can be held as a bare address.
+    let set_obj = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashSet", 1)?;
+    let set_h = scope.root(set_obj);
+    let map_obj = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashMap", 3)?;
+    let map_h = scope.root(map_obj);
+    let map_now = scope.get(&map_h);
+    cratonvm_native_collections::native_map_init(&mut *scope, &[Value::Object(Some(map_now))])?;
+    let map_now = scope.get(&map_h);
+    let elem = element_value(&scope, &elem_h);
     cratonvm_native_collections::native_map_put_pub(
-        ctx,
-        &[Value::Object(Some(map)), elem, Value::Object(None)],
+        &mut *scope,
+        &[Value::Object(Some(map_now)), elem, Value::Object(None)],
     )?;
-    ctx.set_field(set, 0, Value::Object(Some(map)));
+    let set = scope.get(&set_h);
+    let map = scope.get(&map_h);
+    scope.set_field(set, 0, Value::Object(Some(map)));
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -407,32 +458,44 @@ fn native_collections_singleton_map(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let key = args.first().copied().unwrap_or(Value::Object(None));
-    let val = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonMap") {
-        let map = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
-        ctx.set_field_by_name(map, "k", key);
-        ctx.set_field_by_name(map, "v", val);
+    let mut scope = NativeHandleScope::new(ctx);
+    let key_h = element_handle(&mut scope, args.first().copied());
+    let val_h = element_handle(&mut scope, args.get(1).copied());
+    if let Ok(cid) = scope.ensure_class_initialized("java/util/Collections$SingletonMap") {
+        let fields = scope.class_num_total_fields(cid);
+        let map = scope.alloc_object(cid, fields);
+        let key = element_value(&scope, &key_h);
+        let val = element_value(&scope, &val_h);
+        scope.set_field_by_name(map, "k", key);
+        scope.set_field_by_name(map, "v", val);
         return Ok(Some(Value::Object(Some(map))));
     }
-    // Create HashMap with 1 entry
-    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
+    // Create HashMap with 1 entry. The map, the bucket array and the node are
+    // three allocations that each move the two before it.
+    let map_obj = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashMap", 3)?;
+    let map_h = scope.root(map_obj);
     let cap = 16;
-    let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
-    ctx.set_field(map, 0, Value::Object(Some(buckets)));
-    ctx.set_field(map, 1, Value::Int(0));
-    ctx.set_field(map, 2, Value::Int(cap as i32));
+    let buckets_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, cap);
+    let buckets_h = scope.root(buckets_obj);
+    let map = scope.get(&map_h);
+    scope.set_field(map, 0, Value::Object(Some(buckets_obj)));
+    scope.set_field(map, 1, Value::Int(0));
+    scope.set_field(map, 2, Value::Int(cap as i32));
     // Put the single entry using native_map_put logic
     // Simplified: just store it
-    let node = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap$Node", 4)?;
-    ctx.set_field(node, 0, key);
-    ctx.set_field(node, 1, val);
+    let node = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashMap$Node", 4)?;
+    let key = element_value(&scope, &key_h);
+    let val = element_value(&scope, &val_h);
+    scope.set_field(node, 0, key);
+    scope.set_field(node, 1, val);
     let hash = 0i32; // simplified
-    ctx.set_field(node, 2, Value::Int(hash));
-    ctx.set_field(node, 3, Value::Object(None));
+    scope.set_field(node, 2, Value::Int(hash));
+    scope.set_field(node, 3, Value::Object(None));
     let idx = 0;
-    ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
-    ctx.set_field(map, 1, Value::Int(1));
+    let buckets = scope.get(&buckets_h);
+    let map = scope.get(&map_h);
+    scope.set_array_element(buckets, idx, Value::Object(Some(node)));
+    scope.set_field(map, 1, Value::Int(1));
     Ok(Some(Value::Object(Some(map))))
 }
 
@@ -3100,9 +3163,13 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     let props = "java/util/Properties";
     r.register(props, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let data = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 32);
-        ctx.set_field(this, 0, Value::Object(Some(data)));
-        ctx.set_field(this, 1, Value::Int(0));
+        // The receiver's address was taken before this allocation.
+        let mut scope = NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let data = scope.new_array(cratonvm_types::ArrayElementType::Reference, 32);
+        let this = scope.get(&this_h);
+        scope.set_field(this, 0, Value::Object(Some(data)));
+        scope.set_field(this, 1, Value::Int(0));
         Ok(None)
     });
     r.register(
@@ -3200,27 +3267,42 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             // and `size` was still bumped, corrupting the table. Grow the backing
             // array (double capacity, copy, reset field 0) BEFORE the store once it
             // would not fit, mirroring ucl_add_url's growth in classloader.rs.
+            //
+            // The growth allocates, which moves the receiver, the old backing
+            // array and both arguments — all of which are stored below. From
+            // here on every address goes through the scope.
+            let mut scope = NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let old_data_h = scope.root(data);
+            let key_h = element_handle(&mut scope, args.get(1).copied());
+            let val_h = element_handle(&mut scope, args.get(2).copied());
             let data = {
-                let arr_len = ctx.array_length(data);
+                let data = scope.get(&old_data_h);
+                let arr_len = scope.array_length(data);
                 if size * 2 + 1 >= arr_len {
                     // Double capacity (guard the degenerate len==0 case) and copy
                     // every existing slot into the fresh, larger array.
                     let new_cap = (arr_len * 2).max((size + 1) * 2);
                     let new_arr =
-                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                        scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                    let data = scope.get(&old_data_h);
                     for i in 0..arr_len {
-                        let elem = ctx.get_array_element(data, i);
-                        ctx.set_array_element(new_arr, i, elem);
+                        let elem = scope.get_array_element(data, i);
+                        scope.set_array_element(new_arr, i, elem);
                     }
-                    ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+                    let this = scope.get(&this_h);
+                    scope.set_field(this, 0, Value::Object(Some(new_arr)));
                     new_arr
                 } else {
                     data
                 }
             };
-            ctx.set_array_element(data, size * 2, key);
-            ctx.set_array_element(data, size * 2 + 1, val);
-            ctx.set_field(this, 1, Value::Int((size + 1) as i32));
+            let key = element_value(&scope, &key_h);
+            let val = element_value(&scope, &val_h);
+            let this = scope.get(&this_h);
+            scope.set_array_element(data, size * 2, key);
+            scope.set_array_element(data, size * 2 + 1, val);
+            scope.set_field(this, 1, Value::Int((size + 1) as i32));
             // [PERF] Fold the just-appended key into the lookup cache so a
             // load-then-many-reads pattern stays O(1) per op (the `lookup_index`
             // above already (re)built the cache for the pre-append size, so this
@@ -3229,7 +3311,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             // validity token without invalidating the indices (contents copied
             // 1:1). On any inconsistency it drops the entry and the next lookup
             // rebuilds — behavior stays correct either way.
-            props_index_cache::note_append(ctx, this, data, size);
+            props_index_cache::note_append(&mut *scope, this, data, size);
             Ok(Some(Value::Object(None)))
         },
     );
@@ -3319,7 +3401,14 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             };
             // Each entry is a 3-field object (key=0, value=1, next=2)
             let arr_len = ctx.array_length(entries);
+            // GC-safety: `accept` is an arbitrary user lambda -- it allocates --
+            // and both the consumer and the bucket array are carried across
+            // every turn.
+            let action_pin = ctx.pin_native_root(action);
+            let entries_pin = ctx.pin_native_root(entries);
             for i in 0..arr_len {
+                let action = ctx.read_native_pin(action_pin, action);
+                let entries = ctx.read_native_pin(entries_pin, entries);
                 if let Value::Object(Some(entry)) = ctx.get_array_element(entries, i) {
                     let key = ctx.get_field(entry, 0);
                     let val = ctx.get_field(entry, 1);
@@ -5393,7 +5482,9 @@ fn try_jdk_enum_set_of_elements(ctx: &mut dyn NativeContext, elems: &[Value]) ->
         Ok(Some(Value::Object(Some(s)))) => s,
         _ => return None,
     };
+    let set_pin = ctx.pin_native_root(set);
     for elem in elems {
+        let set = ctx.read_native_pin(set_pin, set);
         if let Value::Object(Some(_)) = *elem {
             if ctx
                 .invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[*elem])
@@ -5982,7 +6073,9 @@ fn native_es_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         enum_set_elements(ctx, coll)
     };
     let mut modified = false;
+    let this_pin = ctx.pin_native_root(this);
     for elem in elems {
+        let this = ctx.read_native_pin(this_pin, this);
         if matches!(elem, Value::Object(Some(_))) {
             native_es_add(ctx, &[Value::Object(Some(this)), elem])?;
             modified = true;
@@ -7990,7 +8083,25 @@ fn exchanger_do_exchange(
     let deadline = timeout_ms
         .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64));
 
+    // GC: this loop BLOCKS in `monitor_wait`, and a blocked thread is exactly
+    // where a PEER thread's collection runs. Both the receiver and the value
+    // being exchanged are Rust locals that no collection rewrites, and the
+    // loop dereferences both on the next turn. That makes this the widest
+    // window in the tranche — every other site needs a collection to land in a
+    // short call, this one waits for one. Pin both and re-read at the top of
+    // each turn. See `internal/audits/wide-tranche-triage-20260907.md`.
+    let this_pin = ctx.pin_native_root(this);
+    let my_val_pin = match my_val {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
+        let my_val = match my_val_pin {
+            Some((pin, obj)) => Value::Object(Some(ctx.read_native_pin(pin, obj))),
+            None => my_val,
+        };
         ctx.monitor_enter(this);
         let state = ctx.get_field(this, EXCH_FIELD_STATE).as_int().unwrap_or(0);
 
@@ -8010,6 +8121,11 @@ fn exchanger_do_exchange(
             // A previous exchange is still completing (the first thread has
             // not yet collected its reply) — wait for the reset, then retry.
             let wait_result = ctx.monitor_wait(this, Some(5));
+            // The wait PARKS, so the exit that pairs with it has to use the
+            // post-wait address: `MonitorTable::exit` dereferences the header,
+            // and a pre-wait address is a fault (reclaimed) or a permanently
+            // leaked monitor (merely moved).
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_exit(this);
             wait_result?;
             continue;
@@ -8021,7 +8137,14 @@ fn exchanger_do_exchange(
         ctx.monitor_exit(this);
 
         // Wait until a partner completes the exchange (state == 2).
+        //
+        // The re-read at the top of the OUTER loop does not reach here: this
+        // inner loop is where the thread actually parks, and it can spin for
+        // the whole timeout without the outer body running again. Re-read
+        // `this` on every inner turn too -- `monitor_wait` at the foot of the
+        // body is the widest collection window in this function.
         loop {
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_enter(this);
             let cur_state = ctx.get_field(this, EXCH_FIELD_STATE).as_int().unwrap_or(0);
             if cur_state == 2 {
@@ -8048,6 +8171,8 @@ fn exchanger_do_exchange(
                 }
             }
             let wait_result = ctx.monitor_wait(this, Some(5));
+            // Post-wait address, as in the state==2 branch above.
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_exit(this);
             wait_result?;
         }
@@ -8283,15 +8408,37 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
             // Not all parties arrived yet — record arrival and wait for phase to advance
             ph_set(ctx, this, PH_H_ARRIVALS, new_arrivals);
             let target_phase = phase + 1;
+            // `monitor_wait` PARKS, which is exactly where a peer thread's
+            // collection runs — and `this` is the holder array every `ph_get`
+            // and the `monitor_exit` below dereference. Pin it and re-read
+            // through the pin AFTER each wait; without that the loop kept
+            // reading (and released the monitor at) the pre-wait address.
+            //
+            // MERGE NOTE (2026-09-08): `origin/dev` fixed this site in the same
+            // hour with the re-read at the TOP of the loop instead. That closes
+            // the loop-carried half — turn N+1 no longer reads turn N's address
+            // — but not the within-turn half: the `monitor_exit` on the error
+            // path and the `ph_get` that follows the wait both still ran on the
+            // PRE-wait value, which is the address `MonitorTable::exit`
+            // dereferences. Resolved to this side because the park window ends
+            // at the wait, not at the top of the loop, and because
+            // `stale-receiver-audit.py`'s RULE 2 reports the other shape as a
+            // site.
+            let this_pin = ctx.pin_native_root(this);
+            let mut cur = this;
             // Bounded monitor-waits until the phase advances
             loop {
-                if let Err(e) = ctx.monitor_wait(this, Some(10)) {
-                    ctx.monitor_exit(this);
+                let wr = ctx.monitor_wait(cur, Some(10));
+                cur = ctx.read_native_pin(this_pin, cur);
+                if let Err(e) = wr {
+                    ctx.monitor_exit(cur);
+                    ctx.unpin_native_roots(this_pin);
                     return Err(e);
                 }
-                let current_phase = ph_get(ctx, this, PH_H_PHASE);
+                let current_phase = ph_get(ctx, cur, PH_H_PHASE);
                 if current_phase >= target_phase || current_phase < 0 {
-                    ctx.monitor_exit(this);
+                    ctx.monitor_exit(cur);
+                    ctx.unpin_native_roots(this_pin);
                     return Ok(Some(Value::Int(current_phase)));
                 }
             }
@@ -10379,6 +10526,61 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             },
         );
     }
+
+    // ForkJoinPool.execute(ForkJoinTask) — the SAME side-table policy as
+    // `submit`/`externalSubmit` directly above, and it was missing.
+    //
+    // 2026-09-11, lane 5 residual §9.1. `execute` had no registration ANYWHERE
+    // and was not on `keep_real_forkjoinpool_bridge`'s allow-list, so
+    // `pool.execute(task)` ran the concrete JDK bytecode: the task went into a
+    // real `WorkQueue` and a real worker thread ran its body through the JDK's
+    // own `doExec()`, which never touches this side table. The caller's
+    // following `join()`/`get()` is a Bridge that reads the side table, saw
+    // `done == false`, and RAN THE BODY AGAIN — two threads, one task,
+    // overlapping. `apps/probes/L5FjDouble.java` scores it per shape and says
+    // which of the three double-execution shapes it is.
+    //
+    // The retired lane page read the symptom as the JDK's own WorkQueue being
+    // claimed twice and held 70 `ForkJoinPool`/`ForkJoinTask` rows behind it.
+    // It is not the JDK's: it is one half of this pool's surface on the
+    // side-table model and the other half on the real one, with no agreement
+    // about what "done" means.
+    //
+    // Why inline rather than teaching `join()` to wait for the real worker:
+    // that is the policy `submit` already states three lines up — letting the
+    // concrete submit bytecode enqueue into the real pool exposes
+    // WorkQueue/status machinery CratonVM only partially models, and Fork6Hard
+    // observes stale task/result objects there under GC stress. `execute` is
+    // the same call with the return value dropped, so it gets the same answer;
+    // a lane that moves `submit` off this model moves `execute` with it.
+    r.register(
+        "java/util/concurrent/ForkJoinPool",
+        "execute",
+        "(Ljava/util/concurrent/ForkJoinTask;)V",
+        |ctx, args| {
+            fjp_reject_submission(ctx, args, 1)?;
+            let task = match args.get(1).copied() {
+                Some(Value::Object(Some(r))) => r,
+                // `execute(null)` throws NullPointerException on a real pool,
+                // and `fjp_reject_submission` above is what raises it — by the
+                // time control is here the argument is a non-null task or the
+                // call has already failed. Returning void for anything else
+                // keeps this arm total without inventing a second policy.
+                _ => return Ok(None),
+            };
+            let (done, _) = fjp_state_get(task);
+            if !done {
+                let frame = fjp_pool_frame_enter(ctx, args);
+                let out = fjp_compute_for_submit(ctx, task);
+                fjp_pool_frame_leave(ctx, frame);
+                out?;
+            }
+            // void: `execute` hands nothing back, and a failure surfaces at the
+            // matching `join()`/`get()` exactly as `fjp_compute_for_submit`'s
+            // own doc comment describes for `submit`.
+            Ok(None)
+        },
+    );
 
     // ForkJoinPool.submit(Callable) / submit(Runnable) / submit(Runnable, T) —
     // same Bridge policy as submit(ForkJoinTask) above: these overloads were
@@ -13889,7 +14091,14 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
             Ok(Some(Value::Object(Some(obj))))
         },
     );
-    r.register(sf, "createSocket", "()Ljava/net/Socket;", |ctx, _args| {
+    r.register(sf, "createSocket", "()Ljava/net/Socket;", |ctx, args| {
+        crate::tls_deny::deny_plaintext_fallback(
+            ctx,
+            args,
+            crate::tls_deny::TlsFactoryKind::Socket,
+            "createSocket",
+            "()Ljava/net/Socket;",
+        )?;
         Ok(Some(Value::Object(Some(phase52_alloc_socket(ctx)?))))
     });
     r.register(
@@ -13897,6 +14106,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createSocket",
         "(Ljava/lang/String;I)Ljava/net/Socket;",
         |ctx, args| {
+            crate::tls_deny::deny_plaintext_fallback(
+                ctx,
+                args,
+                crate::tls_deny::TlsFactoryKind::Socket,
+                "createSocket",
+                "(Ljava/lang/String;I)Ljava/net/Socket;",
+            )?;
             let host = args.get(1).copied().unwrap_or(Value::Object(None));
             let port = args.get(2).copied().unwrap_or(Value::Int(0));
             phase52_socket_connect(ctx, host, port)
@@ -13907,6 +14123,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createSocket",
         "(Ljava/net/InetAddress;I)Ljava/net/Socket;",
         |ctx, args| {
+            crate::tls_deny::deny_plaintext_fallback(
+                ctx,
+                args,
+                crate::tls_deny::TlsFactoryKind::Socket,
+                "createSocket",
+                "(Ljava/net/InetAddress;I)Ljava/net/Socket;",
+            )?;
             let host = match args.get(1).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(addr)) => ctx
                     .invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
@@ -13924,6 +14147,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createSocket",
         "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;",
         |ctx, args| {
+            crate::tls_deny::deny_plaintext_fallback(
+                ctx,
+                args,
+                crate::tls_deny::TlsFactoryKind::Socket,
+                "createSocket",
+                "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+            )?;
             let host = args.get(1).copied().unwrap_or(Value::Object(None));
             let port = args.get(2).copied().unwrap_or(Value::Int(0));
             phase52_socket_connect(ctx, host, port)
@@ -13934,6 +14164,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createSocket",
         "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
         |ctx, args| {
+            crate::tls_deny::deny_plaintext_fallback(
+                ctx,
+                args,
+                crate::tls_deny::TlsFactoryKind::Socket,
+                "createSocket",
+                "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+            )?;
             let host = match args.get(1).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(addr)) => ctx
                     .invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
@@ -14030,13 +14267,29 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         ssf,
         "createServerSocket",
         "()Ljava/net/ServerSocket;",
-        |ctx, _args| ctx.new_object_initialized("java/net/ServerSocket", "()V", &[]),
+        |ctx, args| {
+            crate::tls_deny::deny_plaintext_fallback(
+                ctx,
+                args,
+                crate::tls_deny::TlsFactoryKind::ServerSocket,
+                "createServerSocket",
+                "()Ljava/net/ServerSocket;",
+            )?;
+            ctx.new_object_initialized("java/net/ServerSocket", "()V", &[])
+        },
     );
     r.register(
         ssf,
         "createServerSocket",
         "(I)Ljava/net/ServerSocket;",
         |ctx, args| {
+            crate::tls_deny::deny_plaintext_fallback(
+                ctx,
+                args,
+                crate::tls_deny::TlsFactoryKind::ServerSocket,
+                "createServerSocket",
+                "(I)Ljava/net/ServerSocket;",
+            )?;
             let port = args.get(1).cloned().unwrap_or(Value::Int(0));
             ctx.new_object_initialized("java/net/ServerSocket", "(I)V", &[port])
         },
@@ -14046,6 +14299,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createServerSocket",
         "(II)Ljava/net/ServerSocket;",
         |ctx, args| {
+            crate::tls_deny::deny_plaintext_fallback(
+                ctx,
+                args,
+                crate::tls_deny::TlsFactoryKind::ServerSocket,
+                "createServerSocket",
+                "(II)Ljava/net/ServerSocket;",
+            )?;
             let port = args.get(1).cloned().unwrap_or(Value::Int(0));
             let backlog = args.get(2).cloned().unwrap_or(Value::Int(50));
             ctx.new_object_initialized("java/net/ServerSocket", "(II)V", &[port, backlog])
@@ -14056,6 +14316,13 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "createServerSocket",
         "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;",
         |ctx, args| {
+            crate::tls_deny::deny_plaintext_fallback(
+                ctx,
+                args,
+                crate::tls_deny::TlsFactoryKind::ServerSocket,
+                "createServerSocket",
+                "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;",
+            )?;
             let port = args.get(1).cloned().unwrap_or(Value::Int(0));
             let backlog = args.get(2).cloned().unwrap_or(Value::Int(50));
             let addr = args.get(3).cloned().unwrap_or(Value::Object(None));
@@ -21948,15 +22215,31 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__ctor_cat);
-    r.register(
-        lr,
-        "getLevel",
-        "()Ljava/util/logging/Level;",
-        |ctx, args| lr_get(ctx, args, "level", 0),
-    );
-    r.register(lr, "getMessage", "()Ljava/lang/String;", |ctx, args| {
-        lr_get(ctx, args, "message", 1)
-    });
+    // `getLevel` and `getMessage` are NOT registered here -- deleted
+    // 2026-09-12 with `getSequenceNumber` below and the two `Handler` rows
+    // further down. All five triples are entries in `RETIRED_SHADOW_TRIPLES`,
+    // and all five retirements were INERT: the ambient category of this
+    // function is `Intrinsic`, `Intrinsic` is allowed under `--jdk-only`, and
+    // `--jdk-only` refuses only the honest stubs on the same triples. A refusal
+    // is not a removal, so the refused stub left THESE bodies in the slot and
+    // the real JDK bytecode the retirement exists to reach never ran.
+    //
+    // The note above `Handler.setLevel` had this written down -- "the
+    // `java/util/logging/` shadow retirement does not reach it either" -- and
+    // W7-25 and W7-56 had each lifted other rows out of this block into
+    // `Bridge` for the same reason. What was missing was an instrument, not a
+    // diagnosis: `stub_ratchet.rs`'s `no_retired_triple_survives_the_strict_boot`
+    // is one line of set arithmetic over the strict boot's own registry.
+    //
+    // DELETED rather than re-tagged `Bridge` the way W7-25 and W7-56 did,
+    // for two measured reasons. First, these five are already dead in
+    // compatible mode in all three feature arms -- a later registration
+    // (`lib.rs`, `reflect_annotations.rs`, `logmanager.rs`, `nio_native.rs`)
+    // owns every one of the slots -- so deleting changes nothing a compatible
+    // run does. Second, the kind-map gate fires on a CHANGED kind and
+    // explicitly tolerates a removed row (`scripts/jdk-only-kind-map.py`:
+    // "removed rows pass and are reported"), so a re-tag would owe an
+    // ~11,900-line baseline re-freeze that a deletion does not.
     r.register(lr, "setMessage", "(Ljava/lang/String;)V", |ctx, args| {
         lr_set(ctx, args, "message", 1)
     });
@@ -22097,9 +22380,8 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)V",
         |ctx, args| lr_set(ctx, args, "resourceBundleName", 8),
     );
-    r.register(lr, "getSequenceNumber", "()J", |ctx, args| {
-        lr_get(ctx, args, "sequenceNumber", 9)
-    });
+    // `getSequenceNumber` is NOT registered here -- see the note on `getLevel`
+    // and `getMessage` above. `setSequenceNumber` below is NOT retired and stays.
     r.register(lr, "setSequenceNumber", "(J)V", |ctx, args| {
         lr_set(ctx, args, "sequenceNumber", 9)
     });
@@ -22158,44 +22440,30 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // state. That explains the difference; it does not license deriving any
     // other row from it. G21-1, G15-1 §2, HANDOFF-20260814 §5.
     //
-    // In `Compatible` this registration does not own the slot --
-    // `reflect_annotations.rs:370` overwrites it and already carries this
-    // contract (MEASURED: `owns_slot=false inv=0` here, `owns_slot=true inv=11`
-    // there). `--jdk-only` never runs `register_synthetic_overrides`, so THIS
-    // body is the only one, and it owns the slot (MEASURED: `kind=intrinsic
-    // owns_slot=true overwrote=null inv=12`). The `java/util/logging/` shadow
-    // retirement does not reach it either: `retired_shadow.rs:445` lists the
-    // triple, but that retag fires only on an effective category of `Bridge`
-    // and this function's ambient category is `Intrinsic`.
-    r.register(
-        handler,
-        "setLevel",
-        "(Ljava/util/logging/Level;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if matches!(args.get(1), None | Some(Value::Object(None))) {
-                return Err(RuntimeError::NullPointerException { message: None }.into());
-            }
-            if handler_real_layout(ctx, this) {
-                ctx.set_field_by_name(this, "logLevel", args[1]);
-            } else {
-                ctx.set_field(this, 0, args[1]);
-            }
-            Ok(Some(Value::Object(None)))
-        },
-    );
-    r.register(
-        handler,
-        "getLevel",
-        "()Ljava/util/logging/Level;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if handler_real_layout(ctx, this) {
-                return Ok(Some(ctx.get_field_by_name(this, "logLevel")));
-            }
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
+    // THE `setLevel` AND `getLevel` NATIVES ARE GONE from this file as of
+    // 2026-09-12, deleted with the three `LogRecord` rows above. The contract
+    // above survives its registration because it is about the CONTRACT, which
+    // the real bytecode now has to satisfy and which the next person tempted to
+    // add a null check to a JUL setter needs to read. It is still under test:
+    // `jul_handler_set_level_*` in this file's `t2_tests` now score
+    // `reflect_annotations::register_annotation_overrides`, the registration
+    // that owns the slot in compatible mode and carries the same measurement.
+    //
+    // What the old note here said, and why it was the bug rather than the
+    // rationale: "In `Compatible` this registration does not own the slot --
+    // `reflect_annotations.rs` overwrites it (MEASURED: `owns_slot=false inv=0`
+    // here, `owns_slot=true inv=11` there). `--jdk-only` never runs
+    // `register_synthetic_overrides`, so THIS body is the only one, and it owns
+    // the slot (MEASURED: `kind=intrinsic owns_slot=true overwrote=null
+    // inv=12`). The `java/util/logging/` shadow retirement does not reach it
+    // either: `retired_shadow.rs` lists the triple, but that retag fires only on
+    // an effective category of `Bridge` and this function's ambient category is
+    // `Intrinsic`."
+    //
+    // Every clause of that is true and together they describe an INERT
+    // retirement: the row is tabled, the census reports no surviving stub, and
+    // the native still dispatches. Dead in compatible mode, sole owner in
+    // strict mode -- the exact inverse of what the table asks for.
     // W2: `Handler.close()`/`flush()` are ABSTRACT in the real JDK. An abstract
     // method takes the `check_override` branch, which marks the site native
     // regardless and caches by RECEIVER class, so these two no-ops did not just
@@ -25271,7 +25539,9 @@ fn spl_prim_for_each_remaining(
         _ => 0,
     };
     let len = ctx.array_length(data);
+    let consumer_pin = ctx.pin_native_root(consumer);
     for i in cursor..len {
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
         let raw = ctx.get_array_element(data, i);
         let val = spl_prim_element_value(raw, prim);
         ctx.invoke_virtual(consumer, "accept", accept_desc, &[val])?;
@@ -26541,6 +26811,41 @@ mod t2_tests {
         r
     }
 
+    /// The registry that owns `Handler.setLevel` / `getLevel` in COMPATIBLE mode.
+    ///
+    /// This file registered both until 2026-09-12 and its registrations were
+    /// dead: `reflect_annotations::register_annotation_overrides` runs later and
+    /// overwrote them in every feature arm. They were deleted because, being
+    /// `Intrinsic`, they SURVIVED the `java/util/logging/` retirement's refusal
+    /// under `--jdk-only` and kept the real bytecode from running.
+    ///
+    /// The contract did not move with them, so neither do the two tests below:
+    /// they now score the body that actually dispatches, which carries the same
+    /// 2026-08-13 HotSpot measurement in its own comment.
+    fn jul_owner_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        crate::reflect_annotations::register_annotation_overrides(&mut r);
+        r
+    }
+
+    /// The owning body reads and writes `logLevel` BY NAME, where the deleted one
+    /// chose by layout and fell back to slot 0. So the mock has to declare the
+    /// field, or `set_field_by_name` silently no-ops and the assertion below
+    /// would be reading a slot nothing ever wrote.
+    fn jul_declare_log_level(ctx: &MockNativeContext, class_id: ClassId) {
+        ctx.set_declared_fields(
+            class_id,
+            vec![cratonvm_native_api::FieldMetadata {
+                name: "logLevel".to_string(),
+                descriptor: "Ljava/util/logging/Level;".to_string(),
+                access_flags: 0,
+                slot_index: 0,
+                declaring_class_id: class_id,
+                is_static: false,
+            }],
+        );
+    }
+
     fn jul_find(
         r: &NativeMethodRegistry,
         class: &str,
@@ -26586,7 +26891,7 @@ mod t2_tests {
     /// already there.
     #[test]
     fn jul_handler_set_level_null_is_refused_before_the_store() {
-        let r = jul_registry();
+        let r = jul_owner_registry();
         let set_level = jul_find(
             &r,
             "java/util/logging/Handler",
@@ -26602,6 +26907,7 @@ mod t2_tests {
 
         let mut ctx = mock_ctx();
         let handler = ctx.alloc_object(ClassId::new(0), 1);
+        jul_declare_log_level(&ctx, ClassId::new(0));
         let level = ctx.alloc_object(ClassId::new(1), 0);
         set_level(
             &mut ctx,
@@ -26630,7 +26936,7 @@ mod t2_tests {
     /// The happy path still stores, so the guard cannot be a blanket refusal.
     #[test]
     fn jul_handler_set_level_still_stores_a_real_level() {
-        let r = jul_registry();
+        let r = jul_owner_registry();
         let set_level = jul_find(
             &r,
             "java/util/logging/Handler",
@@ -26646,6 +26952,7 @@ mod t2_tests {
 
         let mut ctx = mock_ctx();
         let handler = ctx.alloc_object(ClassId::new(0), 1);
+        jul_declare_log_level(&ctx, ClassId::new(0));
         let warning = ctx.alloc_object(ClassId::new(1), 0);
         let all = ctx.alloc_object(ClassId::new(1), 0);
 

@@ -8,7 +8,7 @@
 #
 # Optional feature-gated benches (off by default so this suite keeps passing
 # before the underlying CratonVM features land — see
-# docs/known-issues/gpu-offload-followups-20260711.md):
+# gpu-offload-followups-20260711.md):
 #   BENCH_LDC=1  — also run GpuLdcBench (bench-gpu/GpuLdcBench.java), the same
 #                  96-MAD chain as GpuWarm.heavy but with multiplier/addend
 #                  constants outside sipush range (forces `ldc`). Exercises
@@ -68,7 +68,7 @@ done
 # ── GpuLdcBench (optional, BENCH_LDC=1) ─────────────────────────────────────────
 # ldc-constants bench: same 96-MAD shape as GpuWarm.heavy, but constants
 # outside sipush range make it analyzer-ineligible until ldc/ldc_w support
-# lands (docs/known-issues/gpu-offload-followups-20260711.md item 6), so
+# lands (gpu-offload-followups-20260711.md item 6), so
 # gated off by default — --gpu just re-measures the CPU fallback until then.
 # No TornadoVM twin for this one (CPU-only columns).
 if [ "$BENCH_LDC" = "1" ]; then

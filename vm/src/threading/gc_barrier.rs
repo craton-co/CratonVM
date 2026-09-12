@@ -17,12 +17,8 @@ use parking_lot::{Condvar, Mutex};
 use crate::threading::jvm_thread::ThreadId;
 use crate::threading::thread_state::{self, ThreadExecState};
 
-/// Coordinates stop-the-world pauses for garbage collection.
-///
-/// The barrier uses a cheap `AtomicBool` flag (`stw_requested`) that threads
-/// poll at safepoints. When set, threads deposit their roots and wait for
-/// the GC initiator to finish collection.
-/// A cache-line-isolated `AtomicBool`.
+/// The `stw_requested` byte, in a cache line of its own, in a page of its own,
+/// taken from the same OS allocator the JIT code cache comes from.
 ///
 /// `stw_requested` is the single hottest load in the VM: every interpreter
 /// thread reads it **once per bytecode** at the top of the dispatch loop, and
@@ -63,27 +59,103 @@ use crate::threading::thread_state::{self, ThreadExecState};
 /// ~200 ns cross-socket miss is still only ~1%. **This is a small effect, and
 /// the honest claim is a bound, not a win.**
 ///
-/// It is kept because it costs 63 bytes once per process and cannot regress
-/// anything, and because the tree already owns the idiom for exactly this
-/// reason (`gc/src/zgc/census.rs` and `gc/src/collector.rs` both carry
+/// It is kept because it costs one cache line once per process and cannot
+/// regress anything, and because the tree already owns the idiom for exactly
+/// this reason (`gc/src/zgc/census.rs` and `gc/src/collector.rs` both carry
 /// `#[repr(align(64))]` so unrelated counters cannot share a line). Anyone
 /// with a many-core box can put a number on it with the probe; that is the
 /// only way this one gets measured rather than bounded.
 ///
 /// 64 rather than 128: the two in-tree precedents use 64 and 128 respectively,
-/// and the destructive-interference size on x86-64 is 64. A single `bool` in
-/// its own line costs 63 bytes once per process.
-#[repr(align(64))]
-pub struct CacheLineFlag(AtomicBool);
+/// and the destructive-interference size on x86-64 is 64.
+///
+/// # Why it is not just `#[repr(align(64))] AtomicBool`
+///
+/// Isolation was the whole story until 2026-09-10, and `#[repr(align(64))]` on
+/// an inline field buys it. What an inline field cannot buy is an ADDRESS, and
+/// this byte is one of the few in the VM whose address is compiled INTO
+/// machine code.
+///
+/// `jit/src/x64/safepoint.rs::emit_safepoint_poll` wants
+/// `TEST BYTE [rip+disp32], 0xFF` — the entire poll in **one 7-byte
+/// instruction and no register** — on the back edge of every compiled loop and
+/// at every method entry. `disp32` reaches ±2 GB, so it needs the flag within
+/// 2 GB of the code polling it. When it is not, the emitter falls back to
+/// `MOV R11, imm64 ; TEST BYTE [R11], 0xFF`: 15 bytes and a clobbered
+/// register, at every one of those sites.
+///
+/// A `GcBarrier` field is reachable only through `Arc<SharedVm>`, i.e. from
+/// the Rust global allocator, which in a shipping build is mimalloc
+/// (`vm-cli/src/main.rs`). Mimalloc reserves its arenas nowhere near where an
+/// anonymous `mmap` / `VirtualAlloc(NULL, ...)` — the primitive
+/// `cratonvm_jit::platform` hands the code cache — lands. Measured on Linux
+/// x86-64 with `CRATONVM_DBG_JIT_DISASM=*`: code buffer at `0x7DE4D7F9E000`,
+/// flag at `0x2000CD6E2C0`, **123.9 TB apart**, so every compiled poll in the
+/// process took the long form. Nothing failed and no test noticed, because the
+/// fallback is CORRECT — it reads the same byte and branches the same way, it
+/// is just longer.
+///
+/// So the byte moves out of the struct and into a cell from
+/// [`cratonvm_jit::platform::alloc_code_adjacent_cell`], which allocates from
+/// the code cache's own primitive precisely so the two land in the same region
+/// of the address space. The field becomes a `&'static AtomicBool` into that
+/// never-unmapped cell; every reader and writer goes through the same four
+/// methods and is unaffected.
+///
+/// Placement stays a HINT — the OS picks the address and may pick badly, and
+/// `emit_safepoint_poll` keeps its fallback for exactly that. Verify on a real
+/// run with `CRATONVM_DBG_JIT_DISASM=*` and read any loop body:
+/// `test byte [rel ...]` means in reach, `mov r11, <imm64>` means it is not.
+///
+/// # Under `CRATONVM_JIT_CODE_NEAR_GLOBALS`, the `Box::leak` arm is correct
+///
+/// That strategy solves the same problem from the other end — it hints `mmap`
+/// so each code buffer lands near `layout_replace_epoch_guard()`, and it works
+/// on this flag only because the flag is a few hundred megabytes from that
+/// anchor in the same mimalloc band. A cell would take the flag OUT of that
+/// band and leave the poll ~130 TB behind the code the anchor just pulled in.
+///
+/// So `alloc_code_adjacent_cell` declines while that flag is set, and the
+/// `Box::leak` arm below is then the RIGHT answer rather than a fallback: the
+/// heap is where the flag belongs when something else owns placement. The two
+/// strategies do not compose and are not meant to; what composes is that
+/// exactly one of them is ever engaged.
+///
+/// The 64-byte cell is never freed, so a process that constructs `GcBarrier`
+/// N times keeps 64N bytes forever. That is a real leak and it is bounded by
+/// how many VMs a process creates; see `alloc_code_adjacent_cell`'s lifetime
+/// note.
+pub struct CacheLineFlag(&'static AtomicBool);
 
 impl CacheLineFlag {
-    const fn new(v: bool) -> Self {
-        Self(AtomicBool::new(v))
+    /// Take a cell for this flag.
+    ///
+    /// Not `const` any more (it allocates), which is why `GcBarrier::new` is
+    /// the only construction site — there is no `static CacheLineFlag`.
+    ///
+    /// The `Box::leak` arm is the correctness floor: if the OS refuses the
+    /// mapping the flag still exists, still works, and merely gives up the
+    /// short encoding — the state every build was in before 2026-09-10.
+    fn new(v: bool) -> Self {
+        let cell: &'static AtomicBool = match cratonvm_jit::platform::alloc_code_adjacent_cell() {
+            // SAFETY: `alloc_code_adjacent_cell` hands back a freshly
+            // carved, zero-filled, 64-byte-aligned cell that no other
+            // reference names and that is never unmapped or recycled, so
+            // the `'static` and the exclusivity of this initializing write
+            // both hold. `AtomicBool` is one byte with alignment 1.
+            Some(p) => unsafe {
+                let p = p.cast::<AtomicBool>();
+                p.write(AtomicBool::new(v));
+                &*p
+            },
+            None => Box::leak(Box::new(AtomicBool::new(v))),
+        };
+        Self(cell)
     }
     /// The flag itself, for the ordinary atomic API.
     #[inline(always)]
     pub fn flag(&self) -> &AtomicBool {
-        &self.0
+        self.0
     }
     #[inline(always)]
     pub fn load(&self, order: Ordering) -> bool {
@@ -99,12 +171,20 @@ impl CacheLineFlag {
     }
 }
 
+/// Coordinates stop-the-world pauses for garbage collection.
+///
+/// The barrier uses a cheap `AtomicBool` flag (`stw_requested`) that threads
+/// poll at safepoints. When set, threads deposit their roots and wait for
+/// the GC initiator to finish collection.
 pub struct GcBarrier {
     /// Cheap flag polled at every safepoint. Only requires an atomic load.
     ///
-    /// On its own cache line — see [`CacheLineFlag`] for why. It stays the
-    /// FIRST field so `stw_requested_flag_addr`, which compiled code bakes in,
-    /// keeps pointing at the same byte of the same allocation.
+    /// Not stored here: [`CacheLineFlag`] is a reference into a cell that
+    /// lives outside this struct entirely, on its own cache line, in its own
+    /// mapping — see its doc for both reasons (false sharing, and putting the
+    /// byte within `disp32` reach of the code that polls it). Its position
+    /// among these fields therefore no longer means anything; it used to have
+    /// to be FIRST.
     pub stw_requested: CacheLineFlag,
     /// GC generation counter — incremented after each collection.
     /// Threads compare their local generation to detect missed GCs.
@@ -185,6 +265,47 @@ struct GcBarrierInner {
     excluded_blocked: HashSet<u64>,
 }
 
+/// Monotonic count of stop-the-world pauses STARTED, process-wide.
+///
+/// A pause parks every mutator, so any counter that only a running mutator
+/// advances is frozen for its duration. A sampler that reads such a counter
+/// twice and concludes "stalled" is therefore measuring the pause, not the
+/// thing it meant to measure -- see
+/// `virtual_threads::spawn_starvation_watchdog`, whose carrier-pool growth
+/// this exists to keep honest.
+///
+/// Process-global rather than a `GcBarrier` field because the reader is the
+/// virtual-thread starvation watchdog, which is started by
+/// `VirtualThreadManager::start_carriers` and has no handle to the barrier --
+/// and must not be given one, since the unit tests construct a bare manager
+/// with no VM around it.
+pub static STW_PAUSE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a stop-the-world pause is in progress RIGHT NOW. See
+/// [`STW_PAUSE_EPOCH`], which is the one to read across an interval.
+pub static STW_PAUSE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// `(epoch, in_progress)` -- the pair a sampler needs to decide whether the
+/// interval it just measured contained a pause.
+/// Bump [`STW_PAUSE_EPOCH`] and mark a pause in progress. Called from every
+/// accepted `request_stw*`, paired with [`note_pause_end`] in `complete_gc`.
+fn note_pause_begin() {
+    STW_PAUSE_IN_PROGRESS.store(true, Ordering::Release);
+    STW_PAUSE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Clear the in-progress flag set by [`note_pause_begin`].
+fn note_pause_end() {
+    STW_PAUSE_IN_PROGRESS.store(false, Ordering::Release);
+}
+
+pub fn stw_pause_state() -> (u64, bool) {
+    (
+        STW_PAUSE_EPOCH.load(Ordering::Acquire),
+        STW_PAUSE_IN_PROGRESS.load(Ordering::Acquire),
+    )
+}
+
 impl GcBarrier {
     /// Cooperative JIT safepoint polling (`CRATONVM_JIT_SAFEPOINT_POLLS`) —
     /// stable address of the raw byte backing [`Self::stw_requested`], for
@@ -201,17 +322,23 @@ impl GcBarrier {
     /// `stw_requested` poll (`vm/src/runtime/interpreter.rs`) already
     /// accepts.
     ///
-    /// **Stability contract:** the returned pointer is valid for as long as
-    /// this `GcBarrier` is alive. `GcBarrier` is a plain (non-`Box`/non-
-    /// `Arc`-wrapped) field of `SharedVm`, and `SharedVm` itself is always
-    /// held behind `Arc<SharedVm>` for the life of the VM (see
-    /// `vm/src/vm/vm_init.rs::Vm::new`, which heap-allocates it once via
-    /// `Arc::new` and never moves or reallocates it thereafter) — so a
-    /// caller that keeps the same `Arc<SharedVm>` alive (or reaches it via
-    /// the process-global `crate::native::jni::process_vm()` singleton) may
-    /// treat this address as valid for the VM's entire lifetime and bake it
-    /// as an immediate into generated code. The pointer must NOT outlive
-    /// the `Arc<SharedVm>` it was obtained from.
+    /// **Stability contract:** the returned address is valid for the rest of
+    /// the process. It does not point into this `GcBarrier`, nor into the
+    /// `Arc<SharedVm>` that owns it: [`CacheLineFlag`] holds a `&'static`
+    /// into a cell that is never unmapped and never recycled, so a caller may
+    /// bake it as an immediate into generated code without tracking the VM's
+    /// lifetime at all.
+    ///
+    /// That is a widening of the old contract ("valid as long as this
+    /// `GcBarrier` is alive; must not outlive the `Arc<SharedVm>` it came
+    /// from"), which held only because `SharedVm` is `Arc`-allocated once by
+    /// `vm/src/vm/vm_init.rs::Vm::new` and never moved thereafter. Under that
+    /// contract a compiled poll surviving VM teardown read freed heap; it now
+    /// reads a mapped byte that simply stops changing.
+    ///
+    /// It is not a licence to SHARE the address across VMs — each `GcBarrier`
+    /// takes its own cell, and polling another VM's flag would be wrong for
+    /// the ordinary reason, not an unsafe one.
     pub fn stw_requested_flag_addr(&self) -> *const u8 {
         self.stw_requested.flag() as *const AtomicBool as *const u8
     }
@@ -379,6 +506,7 @@ impl GcBarrier {
         // that one and an over-count is the ledger's only unsound state.
         cratonvm_gc::gc_quiescence::reset_peer_proven_jit_depth();
         self.stw_requested.store(true, Ordering::Release);
+        note_pause_begin();
         true
     }
 
@@ -715,6 +843,7 @@ impl GcBarrier {
         inner.map_generation = self.gc_generation.load(Ordering::Acquire) + 1;
         self.gc_generation.fetch_add(1, Ordering::Release);
         self.stw_requested.store(false, Ordering::Release);
+        note_pause_end();
         self.gc_complete.notify_all();
     }
 
@@ -999,11 +1128,109 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// A pause must be VISIBLE to a sampler that is not the initiator and holds
+    /// no barrier handle.
+    ///
+    /// This is the contract `virtual_threads::spawn_starvation_watchdog` rests
+    /// on. That watchdog grows the carrier pool when `dispatch_count` has not
+    /// moved since its last sample — and a stop-the-world pause parks every
+    /// carrier, so `dispatch_count` CANNOT move across one. Without a way to
+    /// tell "stopped" from "starved" it grew the pool once per pause, and each
+    /// added carrier is one more OS thread for the next pause to stop (and, on
+    /// Windows, one more for `xt_root_scan::take_over_pass` to suspend and
+    /// resume): slower pause -> more stalled samples -> more carriers. Measured
+    /// on `VthreadGcStress`, the pool ran from its base 32 to 233 and
+    /// `dispatch_count` froze permanently.
+    ///
+    /// # What is and is not assertable here
+    ///
+    /// [`STW_PAUSE_EPOCH`] and [`STW_PAUSE_IN_PROGRESS`] describe THE VM, of
+    /// which production has exactly one — but this test binary builds many
+    /// `GcBarrier`s and runs their tests in parallel, so a sibling pause can
+    /// advance the epoch or clear the flag between any two lines below. Only
+    /// MONOTONICITY survives that, and monotonicity is what the watchdog needs:
+    /// it compares the epoch against its own previous sample and asks whether
+    /// it changed, never what it changed by. The per-instance `stw_requested`
+    /// is asserted alongside it because that one IS deterministic here.
+    #[test]
+    fn a_pause_is_visible_to_a_sampler_with_no_barrier_handle() {
+        let barrier = GcBarrier::new();
+        let (epoch_before, _) = stw_pause_state();
+
+        assert!(
+            barrier.request_stw(ThreadId(1), 1),
+            "the first request on a fresh barrier must be accepted",
+        );
+        let (epoch_during, _) = stw_pause_state();
+        assert!(
+            epoch_during > epoch_before,
+            "requesting a pause must advance the global epoch, or a sampler holding no handle to this barrier cannot tell a stopped VM from a starved one (epoch {epoch_before} -> {epoch_during})",
+        );
+        assert!(
+            barrier.stw_requested.load(Ordering::Acquire),
+            "the per-instance flag must be set while the pause is outstanding",
+        );
+
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
+        assert!(
+            !barrier.stw_requested.load(Ordering::Acquire),
+            "completing the collection must clear the per-instance flag",
+        );
+        let (epoch_after, _) = stw_pause_state();
+        assert!(
+            epoch_after >= epoch_during,
+            "the epoch counts pauses STARTED and must never go backwards",
+        );
+    }
+
     #[test]
     fn barrier_no_stw_by_default() {
         let barrier = GcBarrier::new();
         assert!(!barrier.stw_requested.load(Ordering::Relaxed));
         assert_eq!(barrier.gc_generation.load(Ordering::Relaxed), 0);
+    }
+
+    /// Cooperative JIT safepoint polling — the flag must sit within `disp32`
+    /// reach of the JIT code cache, so `emit_safepoint_poll` can use its
+    /// one-instruction `TEST BYTE [rip+disp32], 0xFF` form.
+    ///
+    /// The sibling of `platform::tests::a_cell_is_within_disp32_of_a_code_buffer`,
+    /// which asserts the same thing about a bare cell. This one asserts it
+    /// about the byte that is actually polled, reached the way the JIT reaches
+    /// it (`stw_requested_flag_addr`), so it also fails if `CacheLineFlag` ever
+    /// goes back to being an inline field of this `Arc`-allocated struct — the
+    /// state that made every compiled poll in the process 15 bytes and a
+    /// clobbered R11 instead of 7 bytes and none.
+    ///
+    /// x86-64 only; `disp32` reach is what makes the distance matter.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn stw_requested_flag_is_within_disp32_of_the_code_cache() {
+        use cratonvm_jit::platform::{alloc_executable, free_executable};
+
+        if cratonvm_jit::platform::alloc_code_adjacent_cell().is_none() {
+            // Either the OS refused the mapping or `CRATONVM_JIT_CODE_NEAR_GLOBALS`
+            // owns placement and the cell allocator declines by design — in
+            // which case the flag is SUPPOSED to stay on the VM heap, beside
+            // the anchor that strategy pulls the code towards, and its distance
+            // from an unhinted buffer means nothing.
+            return;
+        }
+        let barrier = GcBarrier::new();
+        let flag = barrier.stw_requested_flag_addr() as usize;
+        let code = alloc_executable(4096).expect("alloc_executable failed");
+        // Widening: usize -> i128, so the subtraction cannot wrap.
+        let delta = (flag as i128) - (code as usize as i128);
+        let in_reach = delta >= i32::MIN as i128 && delta <= i32::MAX as i128;
+        free_executable(code, 4096);
+        assert!(
+            in_reach,
+            "stw_requested flag {flag:#x} is {:.1} GB from a code buffer at \
+             {:#x}; every compiled safepoint poll falls back to \
+             MOV R11, imm64 ; TEST BYTE [R11], 0xFF",
+            (delta.unsigned_abs() as f64) / (1024.0 * 1024.0 * 1024.0),
+            code as usize,
+        );
     }
 
     /// Cooperative JIT safepoint polling — the raw byte address must alias

@@ -5,6 +5,7 @@
 
 use cratonvm_native_api::{NativeKind, NativeMethodRegistry};
 use cratonvm_native_builtins::register_essential_natives;
+use cratonvm_types::compat::CompatibilityMode;
 
 fn production_registry() -> NativeMethodRegistry {
     let mut registry = NativeMethodRegistry::new();
@@ -787,4 +788,174 @@ fn p61_does_not_displace_phase57_path_natives() {
              instead of keeping a copy in sync."
         );
     }
+}
+
+/// The `--jdk-only` `System.getProperties` arm fills the REAL `map` field, and
+/// `native-api`'s Phase 3 retirement table is why this is a test.
+///
+/// `RETIRED_SHADOW_PHASE3_TRIPLES` retires `java/util/Properties.getProperty`
+/// and 32 of its siblings. JDK 9 moved `Properties`' storage into a
+/// `ConcurrentHashMap` field named `map`, so every one of those real bodies
+/// reads that field, and the object `System.getProperties()` returns is built
+/// by this VM. Between G60-1 and 2026-09-09 the field was PERMANENTLY NULL and
+/// `retired_shadow.rs` held both `getProperty` overloads back for exactly that
+/// reason, in these words: *retire them in the same change that makes that
+/// receiver real, or not at all.*
+///
+/// `native-api` cannot check the other half of that bargain — `native-builtins`
+/// depends on it and not the reverse — so a comment there is all it has, and a
+/// comment is not a compile-time link. This is the link. Delete the
+/// `replace_real_map` call and this fails, rather than
+/// `StaticProperty.<clinit>` failing with `InternalError: null property:
+/// java.home` in a `--jdk-only` run nothing in `cargo test` reaches.
+///
+/// Two halves, because either alone is a false green:
+///
+///  1. the two compatibility modes bind DIFFERENT bodies for the triple — a
+///     runtime check, so a branch collapsed to one arm cannot pass it;
+///  2. the `--jdk-only` body calls `replace_real_map` — a source check, because
+///     nothing else here can execute a native without a live `NativeContext`.
+#[test]
+fn the_jdk_only_get_properties_arm_fills_the_real_map() {
+    const TRIPLE: (&str, &str, &str) = (
+        "java/lang/System",
+        "getProperties",
+        "()Ljava/util/Properties;",
+    );
+    const BODY: &str = "native_system_get_properties_jdk_only";
+    const FILL: &str = "replace_real_map";
+
+    let (class, method, descriptor) = TRIPLE;
+
+    let production = production_registry();
+    let mut jdk_only = NativeMethodRegistry::new();
+    jdk_only.set_compatibility_mode(CompatibilityMode::JdkOnly);
+    register_essential_natives(&mut jdk_only);
+    assert!(
+        jdk_only.compatibility_mode().is_jdk_only(),
+        "the mode did not stick, so the branch under test was never taken"
+    );
+
+    let prod_body = production
+        .find(class, method, descriptor)
+        .expect("production mode must register System.getProperties");
+    let jdk_body = jdk_only
+        .find(class, method, descriptor)
+        .expect("--jdk-only must register System.getProperties");
+    assert!(
+        !std::ptr::fn_addr_eq(prod_body, jdk_body),
+        "both modes bound the same body for {class}.{method}{descriptor}; the \
+         registration-time branch has collapsed, so --jdk-only is running the \
+         --real-jdk body and the real Properties.map is null again"
+    );
+
+    // The source half. Located by the function's own name rather than by a
+    // literal call expression: `cargo fmt` rewraps an argument list and a test
+    // that reads the call TEXT goes red for a formatting change.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let text = std::fs::read_to_string(&src).expect("lib.rs must be readable");
+    let body = strip_test_modules(&text);
+    let at = body
+        .find(&format!("fn {BODY}("))
+        .unwrap_or_else(|| panic!("{BODY} is gone from lib.rs; it is what fills Properties.map"));
+    let end = body[at..]
+        .find("\n}\n")
+        .map(|rel| at + rel)
+        .unwrap_or(body.len());
+    assert!(
+        body[at..end].contains(FILL),
+        "{BODY} no longer calls {FILL}. The 185 triples in \
+         RETIRED_SHADOW_PHASE3_TRIPLES read the real Properties.map, and \
+         nothing else fills it."
+    );
+}
+/// The `--jdk-only` `initPhase1` arm publishes `java.lang.System.props`.
+///
+/// Sibling of `the_jdk_only_get_properties_arm_fills_the_real_map`, one level
+/// up the same cluster. `System.getProperty` IS `props.getProperty(key)` in the
+/// real JDK, so a null static field is the first thing any real `System`
+/// bytecode hits -- MEASURED as the first line of the first corpus vector under
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW=all`. The native `initPhase1` that replaced
+/// the real one has always documented setting that field as step 1 of what it
+/// models, and did not.
+///
+/// Both halves again, because either alone is a false green: the two modes must
+/// bind DIFFERENT bodies (a collapsed branch cannot pass a runtime check), and
+/// the `--jdk-only` body must reach the publisher (nothing here can execute a
+/// native without a live `NativeContext`).
+///
+/// `--real-jdk` binding the UNCHANGED body is part of the contract, not an
+/// omission: the singleton only acquires a real `map` on the `--jdk-only` path,
+/// so publishing it in compatible mode would hand real bytecode a `Properties`
+/// it still cannot read.
+#[test]
+fn the_jdk_only_init_phase1_arm_publishes_the_system_props_field() {
+    const TRIPLE: (&str, &str, &str) = ("java/lang/System", "initPhase1", "()V");
+    const BODY: &str = "native_system_init_phase1_jdk_only";
+    const PUBLISH: &str = "publish_real_system_props";
+
+    let (class, method, descriptor) = TRIPLE;
+
+    let production = production_registry();
+    let mut jdk_only = NativeMethodRegistry::new();
+    jdk_only.set_compatibility_mode(CompatibilityMode::JdkOnly);
+    register_essential_natives(&mut jdk_only);
+
+    let prod_body = production
+        .find(class, method, descriptor)
+        .expect("production mode must register System.initPhase1");
+    let jdk_body = jdk_only
+        .find(class, method, descriptor)
+        .expect("--jdk-only must register System.initPhase1");
+    assert!(
+        !std::ptr::fn_addr_eq(prod_body, jdk_body),
+        "both modes bound the same body for {class}.{method}{descriptor}; the          registration-time branch has collapsed and System.props is null again"
+    );
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let text = std::fs::read_to_string(&src).expect("lib.rs must be readable");
+    let body = strip_test_modules(&text);
+    let at = body
+        .find(&format!("fn {BODY}("))
+        .unwrap_or_else(|| panic!("{BODY} is gone from lib.rs"));
+    let end = body[at..]
+        .find("
+}
+")
+        .map(|rel| at + rel)
+        .unwrap_or(body.len());
+    assert!(
+        body[at..end].contains(PUBLISH),
+        "{BODY} no longer calls {PUBLISH}, so java.lang.System.props goes back          to null and real System.getProperty bytecode NPEs on its first call."
+    );
+
+    // The same arm publishes the OTHER static the real `initPhase1` sets, and
+    // it is checked here rather than in a test of its own because they share
+    // one body: a future edit that keeps the branch and drops one call would
+    // pass every other assertion in this file.
+    //
+    // `SharedSecrets.javaLangAccess` is the larger of the two by blast radius.
+    // Real JDK code captures it into statics of its own during class
+    // initialisation (`sun.nio.cs.UTF_8.JLA`,
+    // `jdk.internal.constant.ConstantUtils.JLA`), so a null propagates and then
+    // persists -- MEASURED as the single largest family of first failures under
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=all`, nine of sixteen sampled vectors.
+    const PUBLISH_JLA: &str = "publish_shared_secrets";
+    assert!(
+        body[at..end].contains(PUBLISH_JLA),
+        "{BODY} no longer calls {PUBLISH_JLA}. SharedSecrets.getJavaLangAccess()          is a shadow like any other; declined, the real accessor returns the          static, and nothing else sets it."
+    );
+
+    // `jdk.internal.misc.VM.savedProps`, the third field of the same family and
+    // the only one that THROWS rather than answering null:
+    // `VM.getSavedProperty` is `if (savedProps == null) throw new
+    // IllegalStateException("Not yet initialized")`. So its absence is an
+    // ExceptionInInitializerError out of whichever `<clinit>` asks first --
+    // `jdk/internal/loader/ClassLoaders` in the measured case -- and it was 11
+    // of the 108 failures remaining under `CRATONVM_ENFORCE_NATIVE_SHADOW=all`.
+    const PUBLISH_SAVED: &str = "publish_vm_saved_props";
+    assert!(
+        body[at..end].contains(PUBLISH_SAVED),
+        "{BODY} no longer calls {PUBLISH_SAVED}, so VM.getSavedProperty throws          IllegalStateException(\"Not yet initialized\") for the first class          whose <clinit> reads a saved property."
+    );
 }

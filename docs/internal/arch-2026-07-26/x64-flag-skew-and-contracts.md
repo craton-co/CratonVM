@@ -419,14 +419,14 @@ fails, this table is stale.
 | Pattern | Count | Encoding | Line numbers |
 | --- | ---: | --- | --- |
 | `HEADER_SIZE as u8` via `buf.emit_byte(..)` | 17 | ModRM **disp8** | 14608, 14632, 17106, 17117, 17129, 17138, 17156, 17175, 17201, 17223, 17234, 17248, 17260, 17272, 17283, 20078, 20112 |
-| `HEADER_SIZE as u8` inside a literal instruction byte array | 18 | **disp8** / imm8 | 14282 (matrix-dot B value), 23746, 23755, 23981, 24104, 24107, 24232, 25130, 25142, 25199, 25211, 25366, 25369, 26068, 26086, `emit_bulk_zero_byte_fill_preheader`, `emit_bulk_set_byte_stride_preheader`, `emit_byte_sieve_preheader` |
+| `HEADER_SIZE as u8` inside a literal instruction byte array | 18 | **disp8** / imm8 | 14282 (matrix-dot B value), 23746, 23755, 23981, 24104, 24107, 24232, 25130, 25142, 25199, 25211, 25366, 25369, 26068, 26086, `emit_bulk_zero_byte_fill_preheader`, `emit_bulk_set_byte_stride_preheader`, `emit_byte_sieve_preheader`, **`x64/objects.rs::emit_inline_tlab_newarray`** (its disp8 screen and its `shape` store), **`x64/objects.rs::emit_sb_append_char_body`** (the `byte[]` capacity load) |
 | `(HEADER_SIZE as i32).to_le_bytes()` | 10 | **disp32** / imm32 | 13063, 13144, 13199, 13285, 13580, 13588, 13596, 13674, 13680, 13689 |
 | `HEADER_SIZE as i32` (bare) | 1 | disp32 | 25881 |
 | `HEADER_SIZE as i32` in a computed matrix-dot displacement | 2 | **disp8** after range-bounded arithmetic | 14233 (B row), 14235 (A element) |
 | `HEADER_SIZE` in compile-time arithmetic | 18 | not emitted directly | 64 (import), 14880, 14959, 15070, 15164, 15166, 22109, 22110, 22313, 22552, 22641, 27247, 28426, 29437, 29461, 29476, 29491, 29507, 29529 |
-| `ARRAY_LENGTH_OFFSET as u8` | 22 | **disp8** | 14265, 14359, 14389, 14394 (matrix-dot guards), 17289, 17452, 18886, 18976, 23706, 23716, 23968, 24064, 24068, 24234, 25094, 25175, 25220, 25351, 25354, 26042, `emit_bulk_zero_byte_fill_preheader`, `emit_bulk_set_byte_stride_preheader`, `emit_byte_sieve_preheader` |
+| `ARRAY_LENGTH_OFFSET as u8` | 25 | **disp8** | 14265, 14359, 14389, 14394 (matrix-dot guards), 17289, 17452, 18886, 18976, 23706, 23716, 23968, 24064, 24068, 24234, 25094, 25175, 25220, 25351, 25354, 26042, `emit_bulk_zero_byte_fill_preheader`, `emit_bulk_set_byte_stride_preheader`, `emit_byte_sieve_preheader`, **`x64/objects.rs::emit_inline_tlab_newarray`** (its disp8 screen and its `shape` store), **`x64/objects.rs::emit_sb_append_char_body`** (the `byte[]` capacity load) |
 | `ARRAY_LENGTH_OFFSET as i32` | 5 | disp32 | 25497, 25503, 25607, 25723, 25728 |
-| `ARRAY_LENGTH_OFFSET` through `disp::disp8_const` | 2 | **disp8**, build-checked | `x64/arrays.rs::emit_bounds_check`, `x64/deopt_stubs.rs::emit_bounds_check_stubs` |
+| `ARRAY_LENGTH_OFFSET` through `disp::disp8_const` | 3 | **disp8**, build-checked | `x64/arrays.rs::emit_bounds_check`, `x64/deopt_stubs.rs::emit_bounds_check_stubs`, `x64/deopt_stubs.rs` reason-11 precise-AIOOBE stub |
 | `NUM_SLOTS_OFFSET as i32` | 4 | disp32 | 14915, 15239 (inline TLAB `shape`), 22614, 22689 |
 | `GC_FLAGS_OFFSET as i32` | 11 | disp32 | 14671, 14690, 14890, 14900, 14965, 14972, 22144, 22351, 22591, 22600, 22669 |
 | `FORWARDING_PTR_OFFSET as i32` (and `+ 4`) | 2 | disp32 | 15269, 15274 |
@@ -435,8 +435,24 @@ fails, this table is stale.
 | `IDENTITY_HASH_CODE_OFFSET as i32` | 1 | disp32 | 15234 (was bare `8`) |
 | `NUM_SLOTS_OFFSET` in Rust pointer arithmetic | 1 | n/a | 29422 |
 
+**2026-09-11 — the inline `newarray` bump and the StringBuilder intrinsics.**
+Five new **disp8** sites in `x64/objects.rs`, and they are safe against a
+header change for one reason worth stating plainly: they are all behind ONE
+screen. `emit_inline_tlab_newarray` refuses to emit — keeping the
+`jit_newarray` helper, which is always correct — when `MARK_WORD_OFFSET + 4`,
+`ARRAY_LENGTH_OFFSET` or `ARRAY_DATA_OFFSET` exceeds 127. A header that GREW
+past a disp8 therefore costs those sites their inline path instead of silently
+addressing backwards, which is the failure mode this whole section exists to
+prevent; a header that shrank only makes the displacements smaller.
+`emit_sb_append_char_body`'s two (`ARRAY_LENGTH_OFFSET` for the capacity load,
+`ARRAY_DATA_OFFSET` for the `MOV [RDX+R8+disp8], CL` element store) address a
+`byte[]` the same constants describe.
+
+`ARRAY_DATA_OFFSET as u8` has never had a row here even though the inventory
+test counts it (13 before this change, 15 after). That is a gap in this table,
+not in the tripwire — the test is the authority and it now records 15.
 Totals: **35** `HEADER_SIZE` disp8 sites, **13** `HEADER_SIZE` disp32 sites, **18**
-compile-time-arithmetic uses, **29** `ARRAY_LENGTH_OFFSET` sites, **23** other named
+compile-time-arithmetic uses, **30** `ARRAY_LENGTH_OFFSET` sites, **23** other named
 header-offset sites. **118 sites** in this file.
 
 2026-09-02: the raw-narrowing row fell 23 -> 22 and the checked row appeared. The array

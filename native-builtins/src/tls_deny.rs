@@ -42,6 +42,17 @@
 //! call raises instead of returning a cleartext object. There is deliberately
 //! **no arm that returns a value**.
 //!
+//! **This module was never wired in, and that is why it had a defect to find.**
+//! Until 2026-09-12 `deny_plaintext_fallback` had no caller outside its own
+//! test module: the nine plaintext base registrations in `phases_early` did
+//! not call it, so the sentence below described an intention rather than a
+//! mechanism. The overload it was written to catch —
+//! `SSLServerSocketFactory.createServerSocket()`, the one shape nothing in
+//! the corpus used — went on returning a plaintext `java.net.ServerSocket`
+//! for as long as the module existed. It now has a real bridge (see
+//! [`BRIDGED_SSL_SERVER_SOCKET_FACTORY_OVERLOADS`]) AND the nine call sites,
+//! so the net catches the NEXT one.
+//!
 //! The consequence is that a TLS overload works only if it was *explicitly*
 //! bridged. Adding a new overload to the base class without also bridging it
 //! (or recording it as knowingly-unsupported) now fails loudly at the first
@@ -134,9 +145,26 @@ pub(crate) const BRIDGED_SSL_SOCKET_FACTORY_OVERLOADS: &[&str] = &[
 ];
 
 /// `SSLServerSocketFactory.createServerSocket` descriptors that have a real
-/// TLS bridge (`t27_tls::register_sslserversocket`). Every one of these binds
-/// a real TLS listener.
+/// TLS bridge (`t27_tls::register_sslserversocket`).
+///
+/// The first three bind a real TLS listener. The no-arg one does not, and it
+/// was in [`UNBRIDGED_SSL_SERVER_SOCKET_FACTORY_OVERLOADS`] until 2026-09-12
+/// for that reason — but "no listener" and "no SSLServerSocket" are different
+/// things, and the JDK's own
+/// `SSLServerSocketFactoryImpl.createServerSocket()` is
+/// `new SSLServerSocketImpl(context)`: an UNBOUND socket whose parameters can
+/// be set and read before anything binds. That is what the bridge returns
+/// now, so the two rows of `L6TlsParamSweep` that died on
+/// `class java.net.ServerSocket cannot be cast to class
+/// javax.net.ssl.SSLServerSocket` pass, and the caller who did NOT cast stops
+/// getting a plaintext listener from a factory whose name says TLS.
+///
+/// `ServerSocket.bind(SocketAddress)` on that socket is refused with a named
+/// `SocketException` rather than brought up: `create_ssl_server_socket`
+/// resolves its TLS identity from the FACTORY it was called on and a socket
+/// keeps no rooted reference to one.
 pub(crate) const BRIDGED_SSL_SERVER_SOCKET_FACTORY_OVERLOADS: &[&str] = &[
+    "()Ljava/net/ServerSocket;",
     "(I)Ljava/net/ServerSocket;",
     "(II)Ljava/net/ServerSocket;",
     "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;",
@@ -145,19 +173,13 @@ pub(crate) const BRIDGED_SSL_SERVER_SOCKET_FACTORY_OVERLOADS: &[&str] = &[
 /// `SSLServerSocketFactory.createServerSocket` descriptors this VM knowingly
 /// does **not** implement, and therefore refuses.
 ///
-/// `createServerSocket()` returns an *unbound* server socket, bound later by
-/// `ServerSocket.bind(SocketAddress)`. `t27_tls::create_ssl_server_socket`
-/// binds a `TcpListener` and builds the rustls config in one step, so there
-/// is no unbound TLS listener object to hand back. Until there is, the call
-/// raises.
-///
-/// Before this module existed it returned a plaintext `java.net.ServerSocket`
-/// via the base-class registration — the exact degradation this file closes,
-/// and the one overload of the four that was never noticed in the field
+/// **Empty since 2026-09-12**, when the no-arg overload got its bridge. The
+/// constant stays because the guard it feeds is the mechanism that keeps a
+/// future overload from silently degrading to the plaintext base-class
+/// registration — which is what the no-arg one did, unnoticed in the field,
 /// because nothing in the test corpus used the connect-later shape on the
 /// server side.
-pub(crate) const UNBRIDGED_SSL_SERVER_SOCKET_FACTORY_OVERLOADS: &[&str] =
-    &["()Ljava/net/ServerSocket;"];
+pub(crate) const UNBRIDGED_SSL_SERVER_SOCKET_FACTORY_OVERLOADS: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
 // Refusal

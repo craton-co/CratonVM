@@ -1501,11 +1501,16 @@ fn t16_afc_open_legacy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
 
     let ch = alloc_t16(ctx, "java/nio/channels/AsynchronousFileChannel", 3);
+    // GC: `create_string` below allocates, and `ch` is stored through and then
+    // returned afterwards.
+    let ch_pin = ctx.pin_native_root(ch);
     let path_val = if path_str.is_empty() {
         Value::Object(None)
     } else {
         Value::Object(Some(ctx.create_string(&path_str)))
     };
+    let ch = ctx.read_native_pin(ch_pin, ch);
+    ctx.unpin_native_roots(ch_pin);
     ctx.set_field(ch, 0, path_val);
     ctx.set_field(ch, 1, Value::Int(1)); // open = true
     ctx.set_field(ch, 2, Value::Int(0));

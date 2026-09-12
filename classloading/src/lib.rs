@@ -84,6 +84,12 @@ pub use class_manager::ImageMethodVerdict;
 // because that is where the descriptor knowledge lives.
 pub use class_manager::array_descriptor_element_class;
 pub use class_manager::synthetic_stub_instance_field_count;
+pub use class_manager::synthetic_stub_total_field_count;
+// The floor-exemption screen: which classes must NOT be padded to their
+// fabricated slot count when defined from real class-file bytes, and the real
+// instance-field extent each was screened against. Read by the
+// `t9d_floor_exempt_classes_have_no_oversized_factories` gate.
+pub use class_manager::{floor_is_synthetic_only, FLOOR_EXEMPT_CLASSES};
 // The fabricated slot MODEL itself, not just its size. `shadow_layout` diffs it
 // against the real layout; a build-time gate over the `*_FIELD_*` constants —
 // the follow-up `jdk-only-object-layout-audit.md` §"A gate worth adding"

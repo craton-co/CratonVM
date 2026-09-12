@@ -1168,13 +1168,20 @@ pub(crate) fn alloc_java_service_name(
     ctx: &mut dyn NativeContext,
     name: &Arc<ServiceName>,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceName", 2)?;
+    // Two strings and a whole recursive parent chain are allocated while this
+    // object is being filled, so the receiver is rooted and re-read at every
+    // store rather than carried as the address the allocator returned.
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let obj_raw =
+        try_alloc_concurrent_synthetic(&mut *scope, "org/jboss/msc/service/ServiceName", 2)?;
+    let obj_h = scope.root(obj_raw);
     let canonical_text = name.canonical();
-    let canonical = ctx.create_string(canonical_text);
+    let canonical = scope.create_string(canonical_text);
     // canonicalName is updated via an AtomicReferenceFieldUpdater in the
     // JDK ctor; using `set_field_by_name` is safe: it writes the same
     // slot the updater would CAS into.
-    ctx.set_field_by_name(obj, "canonicalName", Value::Object(Some(canonical)));
+    let obj = scope.get(&obj_h);
+    scope.set_field_by_name(obj, "canonicalName", Value::Object(Some(canonical)));
 
     // Real ServiceName bytecode reads the leaf `name`, `parent`, and cached
     // `hashCode` fields directly. Populate all three so native-created names
@@ -1185,14 +1192,16 @@ pub(crate) fn alloc_java_service_name(
         .last()
         .map(|s| s.as_ref())
         .unwrap_or(canonical_text);
-    let leaf_str = ctx.create_string(leaf);
-    ctx.set_field_by_name(obj, "name", Value::Object(Some(leaf_str)));
+    let leaf_str = scope.create_string(leaf);
+    let obj = scope.get(&obj_h);
+    scope.set_field_by_name(obj, "name", Value::Object(Some(leaf_str)));
     let parent = name
         .parent()
-        .map(|p| alloc_java_service_name(ctx, &p))
+        .map(|p| alloc_java_service_name(&mut *scope, &p))
         .transpose()?;
-    ctx.set_field_by_name(obj, "parent", Value::Object(parent));
-    ctx.set_field_by_name(obj, "hashCode", Value::Int(service_name_hash(name)));
+    let obj = scope.get(&obj_h);
+    scope.set_field_by_name(obj, "parent", Value::Object(parent));
+    scope.set_field_by_name(obj, "hashCode", Value::Int(service_name_hash(name)));
     Ok(obj)
 }
 
@@ -1782,7 +1791,11 @@ fn fire_lifecycle_event(
             return;
         }
     };
+    let event_obj_pin = ctx.pin_native_root(event_obj);
+    let mirror_pin = ctx.pin_native_root(mirror);
     for l in listeners {
+        let event_obj = ctx.read_native_pin(event_obj_pin, event_obj);
+        let mirror = ctx.read_native_pin(mirror_pin, mirror);
         if msc_dbg() {
             eprintln!("[msc] fire {event} id={id} listener={:?}", l.as_ptr());
         }

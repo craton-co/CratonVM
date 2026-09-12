@@ -468,18 +468,53 @@ jobs:
       # regardless of the baseline — there is no known-acceptable hang.
       #
       # `ubuntu-latest` only, exactly like the bridge ratchet and for the same
-      # reason: `25-linux` is the only committed key, and on the windows leg the
-      # gate would (correctly) refuse with exit 2 rather than look green.
+      # LINUX AND WINDOWS. It was `ubuntu-latest` only, because `25-linux` was
+      # the only committed key and the windows leg would (correctly) refuse with
+      # exit 2 rather than look green. `scripts/baselines/jdk-only-strict-corpus-25-windows.txt`
+      # now exists, measured on a real Windows host against HotSpot 25, so the
+      # leg adjudicates instead of refusing. Two mode-independent defects had to
+      # be fixed before it could: `KeyStore.setEntry(SecretKeyEntry)` stored
+      # nothing at all, and the Windows attach provider's `tempPath()` had no
+      # bridge, so `VirtualMachine.list()` threw `UnsatisfiedLinkError`. Neither
+      # was visible to any Linux leg, which is the whole argument for this one.
+      #
+      # macOS stays out: there is no `25-macos` key, and minting one needs a run
+      # on that platform, not a copied file.
+      #
+      # IF THE WINDOWS LEG GOES RED ON THE JNI FIXTURE, READ THIS FIRST. The
+      # script builds `apps/probes/jdkonly_jni_probe.c` with `cc -shared -fPIC`,
+      # and falls back to MSVC (located through the versionless `vswhere.exe`
+      # path, then `vcvars64.bat`) when no `cc` is on PATH. If BOTH fail, the
+      # jni section reports `lib=absent` in all three arms, the arms agree
+      # vacuously, and the script REFUSES (exit 2) rather than calling that a
+      # pass. Fix the fixture; declaring it with `ALLOW_DEGRADED_FIXTURES` turns
+      # the one gate that covers the JNI boundary under `--jdk-only` back off.
+      #
+      # HOW MANY PROBES THIS RUNS IS NOT IN THIS FILE, AND THAT IS DELIBERATE.
+      # The script's built-in list is three. It then appends every line of
+      # `scripts/baselines/jdk-only-strict-corpus-<feature>-<os>.probes` for
+      # THIS leg's key, if that file exists -- so both the Windows and the
+      # Linux legs run 67 today, from one unchanged command. They were 67 and 3
+      # until 2026-09-09, when the 64 promoted on Windows were measured on Linux
+      # too: 64 of 64 clean over two runs, 25435 rows -- the SAME row total the
+      # Windows promotion measured, on a different platform and a different JDK
+      # build. The list has to be
+      # keyed that way because the ratchet is a set difference against a
+      # baseline with the same key: scheduling a probe on a leg whose baseline
+      # was frozen without it makes each of its divergent sections a NEW row
+      # and fails the leg. Promote a probe by measuring it on a key and adding
+      # it to that key's file; do not add legs to this step to compensate.
       #
       # Prerequisites are already met by earlier steps: `Set up JDK 25` exports
-      # JAVA_HOME, and `Build` leaves target/debug/cratonvm. The script needs a
-      # C compiler and `jar` for its two fixtures; both are present on the
-      # runner, and it degrades to `lib=absent` / `agent=absent` in EVERY arm if
-      # they are not, so the arms still agree and the gate stays honest.
+      # JAVA_HOME, and `Build` leaves target/debug/cratonvm. `jar` comes from
+      # that JDK.
       - name: Strict corpus ratchet (three arms vs a HotSpot control)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os != 'macos-latest'
         shell: bash
-        run: CV=target/debug/cratonvm TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
+        run: |
+          CV=target/debug/cratonvm
+          [ -x "$CV" ] || CV=target/debug/cratonvm.exe
+          CV="$CV" TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
 
       # A `--jdk-only` refusal is only a RETIREMENT when nothing already owns
       # the triple. `register` is last-write-wins and its JdkOnly arm returns
@@ -1201,16 +1236,41 @@ jobs:
   #
   # ADVISORY (`continue-on-error: true`) ON PURPOSE. Two independent reasons:
   #
-  #  1. Wave 1 is measurement, not deletion (design §10). 157 synthetic-stub
-  #     natives are still registered on the default path, and the strict
-  #     class-loading refusals mean a `--jdk-only` run is *expected* to fail on
-  #     real workloads right now. The census is how that failure is measured.
+  #  1. Wave 1 is measurement, not deletion (design §10). Synthetic-stub natives
+  #     are still registered on the default path, and the strict class-loading
+  #     refusals mean a `--jdk-only` run is *expected* to fail on real workloads
+  #     right now. The census is how that failure is measured.
+  #     MEASURED 2026-09-10, because the figure that stood here (157) was prose
+  #     and prose does not get re-frozen: `registry-real.json` carries **1701
+  #     synthetic-stub rows over 1584 distinct triples**. Under `--jdk-only` the
+  #     final registry holds ZERO of them, so design §11's criterion 2 is met at
+  #     registration -- but 7 of those triples are still answered by an OLDER
+  #     registration rather than by bytecode, and refused is not retired. Take
+  #     any remaining-work figure from a dump:
+  #     `docs/known-issues/jdk-only/the-six-acceptance-criteria-measured-20260910.md`.
   #  2. The design's own acceptance criterion (§11) makes the zero-stub census
   #     blocking only once "the strict corpus shows no new HotSpot divergence" —
   #     i.e. once difftest/seeds-jdk-only is deterministic across both OS legs.
-  #     Promote this job by deleting `continue-on-error` at that point, together
-  #     with un-ignoring `strict_mode_refuses_nothing` in
-  #     `native-builtins/tests/stub_ratchet.rs`.
+  #
+  #     CORRECTED 2026-09-10. **That condition is now satisfied and it is NOT
+  #     sufficient**; the earlier wording ("promote this job by deleting
+  #     `continue-on-error` at that point, together with un-ignoring
+  #     `strict_mode_refuses_nothing`") read as an instruction to promote today,
+  #     and following it would enable a blocking gate whose own strong assertion
+  #     is still disabled. `21-linux` and `25-linux` reached ZERO divergent rows
+  #     on 2026-09-10 (`50b9c2482`), and the ratchet was proven to still fire
+  #     against the emptied files.
+  #
+  #     `native-builtins/tests/stub_ratchet.rs` governs, and it does not list
+  #     corpus determinism at all. `strict_mode_refuses_nothing` may be
+  #     un-ignored only after ALL THREE of: (a) the `SyntheticStub`
+  #     registrations are reclassified into real `Bridge`/`Intrinsic` or deleted
+  #     so real bytecode runs -- explicitly a separate wave with
+  #     subsystem-per-PR discipline, contract §8; (b) `BASELINE_SYNTHETIC_STUBS`
+  #     is driven to 0 in the SAME change, since the ratchet is slack-free and a
+  #     stale baseline would silently re-admit that many new stubs; (c) the test
+  #     is un-ignored so the zero is held. Promote this job as part of (c), not
+  #     before it.
   #
   # For the avoidance of doubt about the neighbouring jobs: the "Synthetic-stub
   # ratchet" step in `build-and-test` is BLOCKING today — it runs in a job that
@@ -1600,9 +1660,83 @@ jobs:
       # It refuses (exit 2) rather than passing when there is no baseline for
       # this matrix leg's `<feature>-<os>`. That is deliberate: a baseline from
       # another key cannot adjudicate this one, and "no baseline" must never
-      # read as "nothing diverged". Only `25-linux` is committed today, so the
-      # other three legs refuse and say so — same posture, and the same reason,
-      # as the bridge ratchet being `ubuntu-latest` only.
+      # read as "nothing diverged". `25-linux` and `25-windows` are committed,
+      # so those two legs adjudicate. `21-windows` was minted 2026-09-08 against
+      # a real Temurin 21.0.12.1+1, so the Windows 21 leg adjudicates too. It
+      # carries 16 sections where the 25 keys carry 2, because the first run
+      # ever made against a 21 image found FOUR defects -- the JavaLangAccess
+      # carrier is pinned by name to `java.lang.System$1`, which on JDK 21 is a
+      # PrivilegedAction and not the JLA at all. Those rows are frozen so the
+      # gate can say "no worse"; they are NOT accepted behaviour, and the
+      # baseline's own note names the page that diagnoses them.
+      #
+      # `21-linux` was minted 2026-09-09 against Temurin 21.0.12+8, so ALL FOUR
+      # legs now adjudicate and none refuses. It was minted at 16 sections --
+      # the same count as `21-windows`, though NOT the same set: Linux does not
+      # diverge on `textformat` (that row is locale data and this is a different
+      # host), and it carries a vthreads row Windows does not.
+      #
+      # It was RE-FROZEN at 10 sections later the same day, when the JDK 21
+      # serialization defect was fixed and its six `JdkOnlyBreadthProbe` rows
+      # stopped diverging (that probe is now byte-identical to HotSpot in both
+      # modes). GONE rows pass, so leaving them would not have gone red -- it
+      # would just have left six rows of slack in the ratchet, which is exactly
+      # the state a re-freeze exists to remove.
+      #
+      # `21-windows` STILL CARRIES THOSE SIX ROWS, and that asymmetry is
+      # deliberate rather than an oversight: the fix is platform-independent, so
+      # they will read as GONE there too and the leg passes, but re-minting a
+      # key requires running the gate against a real JDK 21 image on that OS and
+      # the Windows host no longer has one. The Windows 21 leg is therefore six
+      # rows looser than the Linux one until someone with a Windows JDK 21
+      # re-freezes it. Anyone who does: expect exactly those six rows to drop.
+      #
+      # LATER THE SAME DAY a SEVENTH `21-windows` row joined them:
+      # `JdkOnlyBreadthProbe/strict/textformat`. The JDK 21 strict locale defect
+      # behind it was fixed on 2026-09-09 -- the provider lookup answered null
+      # for every SPI, so adapter selection fell through to the fallback
+      # adapter, whose `LocaleResources` is root-only on JDK 21. Expect that row
+      # to read GONE too and to drop on the same re-mint, making it seven.
+      #
+      # That row is also why this fix has NO corpus arm that can verify it.
+      # `21-linux` never froze a `textformat` row: the defect is invisible
+      # wherever the machine default locale is already `en-US`, which the Linux
+      # host's is -- and `21-windows`, the leg that does carry it, is the one
+      # that cannot be re-minted. The verification of record is therefore
+      # `probes/LocaleSelect.java`, which asks for `de-DE` BY NAME rather than
+      # relying on the default locale, and which reads identical to HotSpot 21
+      # in all four mode/image cells.
+      #
+      # It was not accepted from one mint. The vthreads section is an
+      # intermittent race, so a baseline minted from a run that saw the smaller
+      # set reads the larger set as NEW and the leg goes red at random -- which
+      # is what the first two mints here did. The accepted baseline is the
+      # MAXIMAL observed set (every later run is then a subset, and GONE always
+      # passes); it was required to pass ten consecutive gate runs, and the
+      # paired ratchet was then re-run against it to prove it can still fail.
+      #
+      # IF THE 21-LINUX LEG GOES RED ON A vthreads ROW, THIS IS WHY, and it is
+      # not a regression. The maximal set was observed on an 8-core host; a
+      # runner with a different core count can lose the race a way that was
+      # never seen here and produce a vthreads section identity the baseline
+      # does not carry. The fix is to re-freeze with a note saying which row
+      # appeared and on what runner -- NOT to widen it by hand, and NOT to
+      # drop the probe. Any other NEW row is a real regression.
+      #
+      # IF THE 21-LINUX LEG GOES RED ON A vthreads ROW, THIS IS WHY, and it is
+      # not a regression. The maximal set was observed on an 8-core host; a
+      # runner with a different core count can lose the race a way that was
+      # never seen here and produce a vthreads section identity the baseline
+      # does not carry. The fix is to re-freeze with a note saying which row
+      # appeared and on what runner -- NOT to widen it by hand, and NOT to
+      # drop the probe. Any other NEW row is a real regression.
+      #
+      # That risk was then measured rather than left as a worry. The race was
+      # amplified along the axis its window sits on -- LOAD -- by re-running the
+      # leg while the 8-core host sat at a load average of 30 to 40, i.e. four to
+      # five times oversubscribed, which is the closest available proxy for a
+      # small CI runner. 6 of 6 PASS, no new vthreads row. With the 10 runs at
+      # load ~3.5 that is 16 consecutive passes across a tenfold load range.
       #
       # The script self-tests its own ratchet hermetically before touching a VM
       # — it asserts that an injected new section IS flagged and a baselined one

@@ -19,7 +19,7 @@
 // Exercises the reduction-dispatch feature: as of 2026-07-11 the analyzer/
 // lowering half is done (PTX with an atomic-add epilogue), but transparent
 // --gpu dispatch still falls through to the CPU for any non-void kernel (see
-// docs/known-issues/gpu-offload-followups-20260711.md, item 1 -- try_dispatch's
+// gpu-offload-followups-20260711.md, item 1 -- try_dispatch's
 // "VOID return only" gate). Until the dispatch-side result-readback lands,
 // dot_ms under --gpu is expected to equal the CPU timing; once it lands, GPU
 // offload should kick in and dot_ms should drop sharply, same as the void

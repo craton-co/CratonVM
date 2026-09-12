@@ -3139,6 +3139,13 @@ pub(crate) fn native_runtime_total_memory(
 /// separately and without a lock, so a concurrent allocation can make used
 /// exceed the committed figure read a moment earlier. HotSpot never reports a
 /// negative free heap; report 0 rather than a wrapped `Long`.
+///
+/// `used` is heap OCCUPANCY and must stay occupancy. It answered with the
+/// generational young arena's raw bump cursor until 2026-09-08, and that cursor
+/// never retreats under the in-place non-moving sweep — so `freeMemory()`
+/// reported a heap that filled once and never emptied, however much the
+/// collector reclaimed. See `NativeContext::heap_allocated_bytes`, whose doc
+/// carries the H2 measurement.
 pub(crate) fn native_runtime_free_memory(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -4409,7 +4416,14 @@ pub(crate) fn native_system_getenv_all(
     let n_next = ctx.resolve_field_index("java/util/HashMap$Node", "next");
 
     let cap = 16usize;
-    let buckets = ctx.new_ref_array(ClassId::new(0), cap);
+    // Everything from here to the end of the function allocates repeatedly —
+    // two strings and a node per environment variable — while holding the
+    // bucket array, the map and each freshly built node. Those are all young
+    // objects, so their addresses are only valid until the next allocation:
+    // hold them in the scope and re-read at every store.
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let buckets_obj = scope.new_ref_array(ClassId::new(0), cap);
+    let buckets_h = scope.root(buckets_obj);
 
     // JDK HashMap.hash: (h = key.hashCode()) ^ (h >>> 16). For Strings,
     // hashCode = sum of 31*h + ch. Then bucket index is (n-1) & hash for
@@ -4458,13 +4472,16 @@ pub(crate) fn native_system_getenv_all(
             .max()
             .unwrap_or(0)
             + 1;
-        let map = ctx.alloc_object(hashmap_class_id, map_n_fields);
-        ctx.set_field(map, f_table, Value::Object(Some(buckets)));
-        ctx.set_field(map, f_size, Value::Int(0));
+        let map_obj = scope.alloc_object(hashmap_class_id, map_n_fields);
+        let map_h = scope.root(map_obj);
+        let map = scope.get(&map_h);
+        let buckets = scope.get(&buckets_h);
+        scope.set_field(map, f_table, Value::Object(Some(buckets)));
+        scope.set_field(map, f_size, Value::Int(0));
         // threshold = (int)(capacity * 0.75) for the default load factor.
-        ctx.set_field(map, f_threshold, Value::Int((cap as i32 * 3) / 4));
-        ctx.set_field(map, f_loadfactor, Value::Float(0.75));
-        ctx.set_field(map, f_entryset, Value::Object(None));
+        scope.set_field(map, f_threshold, Value::Int((cap as i32 * 3) / 4));
+        scope.set_field(map, f_loadfactor, Value::Float(0.75));
+        scope.set_field(map, f_entryset, Value::Object(None));
 
         // Fallible since 2026-08-10 (JDK-only wave 2, step 3). This arm is the
         // REAL-layout path — every field index above came from the real
@@ -4472,30 +4489,38 @@ pub(crate) fn native_system_getenv_all(
         // loaded here and the ask resolves to the real class rather than
         // fabricating. The refusal only fires on an image where it is not.
         let node_class_id = crate::util_concurrent_ext::refused_class(
-            ctx,
+            &mut *scope,
             "java/util/HashMap$Node",
             node_n_fields,
         )?;
 
         for (key, value) in std::env::vars() {
-            let key_obj = ctx.create_string(&key);
-            let val_obj = ctx.create_string(&value);
+            let key_str = scope.create_string(&key);
+            let key_h = scope.root(key_str);
+            let val_str = scope.create_string(&value);
+            let val_h = scope.root(val_str);
             let hash = jdk_string_hash(&key);
             // (n-1) & hash, since cap=16 is power of two.
             let idx = ((cap as u32 - 1) & hash as u32) as usize;
-            let node = ctx.alloc_object(node_class_id, node_n_fields);
-            ctx.set_field(node, n_hash, Value::Int(hash));
-            ctx.set_field(node, n_key, Value::Object(Some(key_obj)));
-            ctx.set_field(node, n_value, Value::Object(Some(val_obj)));
-            let existing = ctx.get_array_element(buckets, idx);
-            ctx.set_field(node, n_next, existing);
-            ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
+            let node = scope.alloc_object(node_class_id, node_n_fields);
+            // Nothing below allocates, so one read of each address is enough —
+            // but it has to come AFTER the last allocation, not before it.
+            let key_obj = scope.get(&key_h);
+            let val_obj = scope.get(&val_h);
+            let buckets = scope.get(&buckets_h);
+            let map = scope.get(&map_h);
+            scope.set_field(node, n_hash, Value::Int(hash));
+            scope.set_field(node, n_key, Value::Object(Some(key_obj)));
+            scope.set_field(node, n_value, Value::Object(Some(val_obj)));
+            let existing = scope.get_array_element(buckets, idx);
+            scope.set_field(node, n_next, existing);
+            scope.set_array_element(buckets, idx, Value::Object(Some(node)));
 
-            let old_size = match ctx.get_field(map, f_size) {
+            let old_size = match scope.get_field(map, f_size) {
                 Value::Int(s) => s,
                 _ => 0,
             };
-            ctx.set_field(map, f_size, Value::Int(old_size + 1));
+            scope.set_field(map, f_size, Value::Int(old_size + 1));
         }
 
         // Cache the OpenJDK-shaped process-wide singleton (double-checked
@@ -4506,8 +4531,9 @@ pub(crate) fn native_system_getenv_all(
         // field index above came off the real class and running
         // `java.util.Collections` bytecode here is safe. See
         // `wrap_system_env_map`'s boot-ordering note.
-        let env = wrap_system_env_map(ctx, map, true);
-        let env = set_system_env_singleton(ctx.vm_identity(), env);
+        let map = scope.get(&map_h);
+        let env = wrap_system_env_map(&mut *scope, map, true);
+        let env = set_system_env_singleton(scope.vm_identity(), env);
         return Ok(Some(Value::Object(Some(env))));
     }
 
@@ -4523,33 +4549,42 @@ pub(crate) fn native_system_getenv_all(
     // raises `NoClassDefFoundError` naming the class instead of handing back a
     // map whose layout `java.base`'s own `HashMap` bytecode cannot read.
     let fallback_map_class_id =
-        crate::util_concurrent_ext::refused_class(ctx, "java/util/HashMap", 3)?;
+        crate::util_concurrent_ext::refused_class(&mut *scope, "java/util/HashMap", 3)?;
     let fallback_node_class_id =
-        crate::util_concurrent_ext::refused_class(ctx, "java/util/HashMap$Node", 4)?;
-    let map = ctx.alloc_object(fallback_map_class_id, 3); // MAP_NUM_FIELDS = 3
-    ctx.set_field(map, 0, Value::Object(Some(buckets))); // MAP_FIELD_BUCKETS
-    ctx.set_field(map, 1, Value::Int(0)); // MAP_FIELD_SIZE
-    ctx.set_field(map, 2, Value::Int(cap as i32)); // MAP_FIELD_CAPACITY
+        crate::util_concurrent_ext::refused_class(&mut *scope, "java/util/HashMap$Node", 4)?;
+    let map_obj = scope.alloc_object(fallback_map_class_id, 3); // MAP_NUM_FIELDS = 3
+    let map_h = scope.root(map_obj);
+    let map = scope.get(&map_h);
+    let buckets = scope.get(&buckets_h);
+    scope.set_field(map, 0, Value::Object(Some(buckets))); // MAP_FIELD_BUCKETS
+    scope.set_field(map, 1, Value::Int(0)); // MAP_FIELD_SIZE
+    scope.set_field(map, 2, Value::Int(cap as i32)); // MAP_FIELD_CAPACITY
 
     for (key, value) in std::env::vars() {
-        let key_obj = ctx.create_string(&key);
-        let val_obj = ctx.create_string(&value);
+        let key_str = scope.create_string(&key);
+        let key_h = scope.root(key_str);
+        let val_str = scope.create_string(&value);
+        let val_h = scope.root(val_str);
         let hash = jdk_string_hash(&key);
         let idx = ((cap as u32 - 1) & hash as u32) as usize;
-        let node = ctx.alloc_object(fallback_node_class_id, 4); // hash, key, value, next
-        ctx.set_field(node, 0, Value::Int(hash));
-        ctx.set_field(node, 1, Value::Object(Some(key_obj)));
-        ctx.set_field(node, 2, Value::Object(Some(val_obj)));
+        let node = scope.alloc_object(fallback_node_class_id, 4); // hash, key, value, next
+        let key_obj = scope.get(&key_h);
+        let val_obj = scope.get(&val_h);
+        let buckets = scope.get(&buckets_h);
+        let map = scope.get(&map_h);
+        scope.set_field(node, 0, Value::Int(hash));
+        scope.set_field(node, 1, Value::Object(Some(key_obj)));
+        scope.set_field(node, 2, Value::Object(Some(val_obj)));
 
-        let existing = ctx.get_array_element(buckets, idx);
-        ctx.set_field(node, 3, existing); // next = existing bucket head
-        ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
+        let existing = scope.get_array_element(buckets, idx);
+        scope.set_field(node, 3, existing); // next = existing bucket head
+        scope.set_array_element(buckets, idx, Value::Object(Some(node)));
 
-        let old_size = match ctx.get_field(map, 1) {
+        let old_size = match scope.get_field(map, 1) {
             Value::Int(s) => s,
             _ => 0,
         };
-        ctx.set_field(map, 1, Value::Int(old_size + 1));
+        scope.set_field(map, 1, Value::Int(old_size + 1));
     }
 
     // `false`: this arm was reached BECAUSE the real `java/util/HashMap` layout
@@ -4557,7 +4592,8 @@ pub(crate) fn native_system_getenv_all(
     // `java.util.Collections.unmodifiableMap` — and a real wrapper delegating to
     // a 3-field synthetic map would be worse than the stand-in whose shims read
     // slot 0. Uncached, as before, so a later call retries the real path.
-    let env = wrap_system_env_map(ctx, map, false);
+    let map = scope.get(&map_h);
+    let env = wrap_system_env_map(&mut *scope, map, false);
     Ok(Some(Value::Object(Some(env))))
 }
 
@@ -4594,20 +4630,27 @@ pub(crate) fn build_stack_trace_element_array(
     ctx: &mut dyn NativeContext,
     trace: &[cratonvm_native_api::StackTraceEntry],
 ) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), trace.len());
+    // One element, three strings and possibly a mirror are allocated per frame,
+    // so neither the array nor the element can be carried as a raw address
+    // across the body of the loop.
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let arr_obj = scope.new_ref_array(cratonvm_types::ClassId::new(0), trace.len());
+    let arr_h = scope.root(arr_obj);
     // The captured trace is outermost-first (frame[0] = bottom of stack);
     // getStackTrace()/getAllStackTraces() want index 0 = the innermost (current)
     // call, so materialize reversed вЂ” matching HotSpot ordering.
     for (i, e) in trace.iter().rev().enumerate() {
-        let ste = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4)?;
-        let cls_dotted = match ctx.class_id_by_name(&e.class_name) {
+        let ste =
+            crate::try_alloc_concurrent_synthetic(&mut *scope, "java/lang/StackTraceElement", 4)?;
+        let ste_h = scope.root(ste);
+        let cls_dotted = match scope.class_id_by_name(&e.class_name) {
             Some(cid) => {
-                crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, &e.class_name)
+                crate::lang_class::dotted_class_name(scope.vm_identity(), cid, &e.class_name)
             }
             None => std::sync::Arc::from(e.class_name.replace('/', ".")),
         };
         crate::lang_misc::fill_stack_trace_element(
-            ctx,
+            &mut *scope,
             ste,
             &e.class_name,
             &cls_dotted,
@@ -4615,9 +4658,11 @@ pub(crate) fn build_stack_trace_element_array(
             e.source_file.as_deref(),
             e.line_number,
         );
-        ctx.set_array_element(arr, i, Value::Object(Some(ste)));
+        let arr = scope.get(&arr_h);
+        let ste = scope.get(&ste_h);
+        scope.set_array_element(arr, i, Value::Object(Some(ste)));
     }
-    Ok(arr)
+    Ok(scope.get(&arr_h))
 }
 
 /// `Thread.getStackTrace0()` вЂ” the live stack of the receiver thread (or, for
@@ -6512,8 +6557,20 @@ pub(crate) fn native_classloader_define_class1(
     // `WebappClassLoader` serving `/WEB-INF/lib` jars) would otherwise fail to
     // define a class whose super lives in the same jar (JSTL `JstlCoreTLV` в†’
     // `JstlBaseTLV`). No-op for built-in/app-loader defines.
-    if let Some(Value::Object(Some(loader_obj))) = args.first() {
-        preload_supertypes_via_loader(ctx, *loader_obj, &bytes);
+    // GC: `preload_supertypes_via_loader` LOADS CLASSES, and `define_class_full`
+    // / `get_class_mirror` below allocate, so the loader read out of `args` is a
+    // pre-call address at every later use. `args` is the snapshot
+    // `safe_native_call_impl` took before this native was entered; a collection
+    // that happens INSIDE the callback does not rewrite it. Pin once and re-read
+    // at each use. Three sibling entry points carry the identical shape — this
+    // is one of them. See `internal/audits/wide-tranche-triage-20260907.md`.
+    let loader_pin = match args.first() {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
+    if let Some((p, o)) = loader_pin {
+        let loader_obj = ctx.read_native_pin(p, o);
+        preload_supertypes_via_loader(ctx, loader_obj, &bytes);
     }
 
     // `CRATONVM_DBG_DEFINE=1` + `CRATONVM_DBG_DUPCLASS_FILTER=<substring>` --
@@ -6550,21 +6607,25 @@ pub(crate) fn native_classloader_define_class1(
             let mirror = ctx.get_class_mirror(class_id);
             // The JDK's Class.getClassLoader bytecode reads this instance
             // field directly. Keep it aligned with the VM's loader registry.
-            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+            if let Some((p, o)) = loader_pin {
+                let loader_obj = ctx.read_native_pin(p, o);
                 crate::classloader::register_defining_loader(
                     ctx.vm_identity(),
                     class_id.as_u32(),
-                    *loader_obj,
+                    loader_obj,
                 );
-                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
+                let loader_obj = ctx.read_native_pin(p, o);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
-            if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                match classify_duplicate_define(ctx, *loader_obj, &name, loader_id, &msg) {
+            if let Some((p, o)) = loader_pin {
+                let loader_obj = ctx.read_native_pin(p, o);
+                match classify_duplicate_define(ctx, loader_obj, &name, loader_id, &msg) {
                     DuplicateDefine::SameLoaderObject => {
-                        return Err(duplicate_define_error(ctx, *loader_obj, &name));
+                        let loader_obj = ctx.read_native_pin(p, o);
+                        return Err(duplicate_define_error(ctx, loader_obj, &name));
                     }
                     DuplicateDefine::ServeExisting(mirror) => {
                         return Ok(Some(Value::Object(Some(mirror))));
@@ -6631,8 +6692,20 @@ pub(crate) fn native_classloader_define_class2(
         _ => None,
     };
 
-    if let Some(Value::Object(Some(loader_obj))) = args.first() {
-        preload_supertypes_via_loader(ctx, *loader_obj, &bytes);
+    // GC: `preload_supertypes_via_loader` LOADS CLASSES, and `define_class_full`
+    // / `get_class_mirror` below allocate, so the loader read out of `args` is a
+    // pre-call address at every later use. `args` is the snapshot
+    // `safe_native_call_impl` took before this native was entered; a collection
+    // that happens INSIDE the callback does not rewrite it. Pin once and re-read
+    // at each use. Three sibling entry points carry the identical shape — this
+    // is one of them. See `internal/audits/wide-tranche-triage-20260907.md`.
+    let loader_pin = match args.first() {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
+    if let Some((p, o)) = loader_pin {
+        let loader_obj = ctx.read_native_pin(p, o);
+        preload_supertypes_via_loader(ctx, loader_obj, &bytes);
     }
 
     let opts = cratonvm_native_api::DefineClassFull {
@@ -6642,21 +6715,25 @@ pub(crate) fn native_classloader_define_class2(
     match ctx.define_class_full(&name, &bytes, loader_id, opts) {
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
-            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+            if let Some((p, o)) = loader_pin {
+                let loader_obj = ctx.read_native_pin(p, o);
                 crate::classloader::register_defining_loader(
                     ctx.vm_identity(),
                     class_id.as_u32(),
-                    *loader_obj,
+                    loader_obj,
                 );
-                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
+                let loader_obj = ctx.read_native_pin(p, o);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
-            if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                match classify_duplicate_define(ctx, *loader_obj, &name, loader_id, &msg) {
+            if let Some((p, o)) = loader_pin {
+                let loader_obj = ctx.read_native_pin(p, o);
+                match classify_duplicate_define(ctx, loader_obj, &name, loader_id, &msg) {
                     DuplicateDefine::SameLoaderObject => {
-                        return Err(duplicate_define_error(ctx, *loader_obj, &name));
+                        let loader_obj = ctx.read_native_pin(p, o);
+                        return Err(duplicate_define_error(ctx, loader_obj, &name));
                     }
                     DuplicateDefine::ServeExisting(mirror) => {
                         return Ok(Some(Value::Object(Some(mirror))));
@@ -6779,16 +6856,29 @@ pub(crate) fn native_classloader_define_class0(
         nest_host_class_name,
         ..Default::default()
     };
+    // GC: `preload_supertypes_via_loader` LOADS CLASSES, and `define_class_full`
+    // / `get_class_mirror` below allocate, so the loader read out of `args` is a
+    // pre-call address at every later use. `args` is the snapshot
+    // `safe_native_call_impl` took before this native was entered; a collection
+    // that happens INSIDE the callback does not rewrite it. Pin once and re-read
+    // at each use. Three sibling entry points carry the identical shape — this
+    // is one of them. See `internal/audits/wide-tranche-triage-20260907.md`.
+    let loader_pin = match args.first() {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
     match ctx.define_class_full(&effective_name, &bytes, loader_id, opts) {
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
-            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+            if let Some((p, o)) = loader_pin {
+                let loader_obj = ctx.read_native_pin(p, o);
                 crate::classloader::register_defining_loader(
                     ctx.vm_identity(),
                     class_id.as_u32(),
-                    *loader_obj,
+                    loader_obj,
                 );
-                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
+                let loader_obj = ctx.read_native_pin(p, o);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
         }

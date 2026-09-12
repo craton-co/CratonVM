@@ -1,3 +1,4 @@
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.net.InetSocketAddress;
@@ -15,6 +16,7 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
@@ -488,10 +490,151 @@ public class RJdkNio {
         }
     }
 
+    /**
+     * `FileInputStream.skip` is an `lseek`, not a read-and-discard, and the
+     * predicate that chooses between them.
+     *
+     * These four answers were a recorded residual from 2026-08-28 to
+     * 2026-09-10, twice diagnosed as a dispatch defect and twice "fixed"
+     * inertly, because the real cause was one native reading its RECEIVER as
+     * its `FileDescriptor` parameter and therefore answering `isRegularFile0`
+     * false for every file ever opened. `skip` is
+     * `if (isRegularFile()) skip0(n); else super.skip(n);`, so a false there
+     * silently substitutes `InputStream`'s read-and-discard default — which
+     * cannot skip past the end and cannot refuse a negative count.
+     *
+     * The whole point of pinning it here is that neither half is visible from
+     * the other: a `skip` that works proves the predicate, and the predicate is
+     * private. Ask the observable.
+     */
+    static void fileInputStreamSkipIsAnLseek(Path dir) throws Exception {
+        Path f = dir.resolve("skip.bin");
+        Files.write(f, new byte[] { 1, 2 });
+
+        try (FileInputStream in = new FileInputStream(f.toFile())) {
+            check(in.read() == 1, "first byte");
+            check(in.read() == 2, "second byte");
+            check(in.read() == -1, "EOF");
+            // PAST the end: lseek succeeds and reports the full count.
+            // Read-and-discard answers 0, which is what this vector is here to
+            // fail on.
+            long skipped = in.skip(4);
+            check(skipped == 4, "skip(4) at EOF must report 4, got " + skipped);
+            long pos = in.getChannel().position();
+            check(pos == 6, "channel position after skipping past EOF must be 6, got " + pos);
+        }
+
+        try (FileInputStream in = new FileInputStream(f.toFile())) {
+            check(in.skip(2) == 2, "skip(2) over a 2-byte file");
+            check(in.read() == -1, "at EOF after skipping the whole file");
+            check(in.skip(100) == 100, "skip past the end reports the full count");
+        }
+
+        try (FileInputStream in = new FileInputStream(f.toFile())) {
+            boolean threw = false;
+            try {
+                in.skip(-1);
+            } catch (IOException expected) {
+                threw = true;
+            }
+            // lseek before the start fails EINVAL. Answering 0 makes a rewind
+            // attempt look like a no-op that succeeded.
+            check(threw, "skip(-1) at position 0 must throw IOException");
+        }
+
+        Files.delete(f);
+        System.out.println("CK RJdkNio skipIsAnLseek");
+    }
+
+    /**
+     * A `Path` this VM hands out carries the platform implementation's own
+     * instance layout, not a private two-slot one.
+     *
+     * `getClass()` reports `sun.nio.fs.UnixPath` / `WindowsPath`, and until
+     * 2026-09-10 the natives wrote the path STRING into that class's `fs` slot
+     * and the owning filesystem into its `byte[] path` slot — invisible for
+     * exactly as long as this VM's own natives were the only readers, and 102
+     * differences against HotSpot the moment real bytecode read one.
+     *
+     * Asserted from Java, with no reflection: every method below is one the
+     * real class implements out of a field the old layout left null, so a
+     * regression shows up as a wrong ANSWER rather than as an internals check
+     * that a future JDK could invalidate.
+     */
+    static void pathCarriesTheRealLayout(Path dir) throws Exception {
+        Path p = Path.of("a/b");
+        // Separator-normalised, the same way `normalize=` is done at line 166
+        // of this file. On Windows BOTH VMs answer `a\b`, byte-identical, so
+        // asserting the POSIX spelling fails the HOTSPOT ORACLE -- and an oracle
+        // that cannot pass voids the whole cross-VM diff for this vector, which
+        // is how it read as a VM regression for two binaries running. Verified on
+        // both VMs before relaxing it: the path STRUCTURE is still asserted, only
+        // the host's separator is not.
+        check(p.toString().replace('\\', '/').equals("a/b"), "Path.toString: " + p);
+        check(p.equals(Path.of("a/b")), "two equal Paths must be equal");
+        check(p.hashCode() == Path.of("a/b").hashCode(), "equal Paths share a hashCode");
+        check(p.getFileName().toString().equals("b"), "getFileName: " + p.getFileName());
+        check(p.getParent().toString().equals("a"), "getParent: " + p.getParent());
+        check(p.getNameCount() == 2, "getNameCount: " + p.getNameCount());
+        check(p.compareTo(Path.of("a/b")) == 0, "compareTo self");
+        check(p.resolve("c").toString().replace('\\', '/').equals("a/b/c"),
+                "resolve: " + p.resolve("c"));
+        // A Path built by the walk/attribute machinery rather than by `of`,
+        // because those are separate producers of the same carrier and a slot
+        // map they do not share is how the two drift.
+        Path made = dir.resolve("layout.txt");
+        Files.write(made, new byte[] { 7 });
+        check(made.getFileName().toString().equals("layout.txt"), "resolved Path filename");
+        check(Files.size(made) == 1, "a Path from resolve() still reaches the file");
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir)) {
+            boolean seen = false;
+            for (Path e : ds) {
+                if (e.getFileName().toString().equals("layout.txt")) {
+                    seen = true;
+                    check(Files.size(e) == 1, "a Path from a DirectoryStream reaches the file");
+                }
+            }
+            check(seen, "the directory stream must yield the file just written");
+        }
+        Files.delete(made);
+        System.out.println("CK RJdkNio pathLayout");
+    }
+
+    /**
+     * The default `FileSystemProvider` is a class `new` could have produced.
+     *
+     * It was minted as the ABSTRACT `java.nio.file.spi.FileSystemProvider`
+     * itself (JVMS 6.5 makes that an `InstantiationError`), which is why
+     * `Files.probeContentType` died with a `NoSuchMethodError` naming
+     * `getFileTypeDetector()`: the real bytecode calls it on a
+     * `sun.nio.fs.UnixFileSystemProvider` and the abstract base declares no
+     * such method.
+     */
+    static void defaultProviderIsConcrete(Path dir) throws Exception {
+        java.nio.file.spi.FileSystemProvider prov = FileSystems.getDefault().provider();
+        check(prov != null, "the default filesystem has a provider");
+        check(!java.lang.reflect.Modifier.isAbstract(prov.getClass().getModifiers()),
+                "the default provider's class must not be abstract: " + prov.getClass().getName());
+        check(!prov.getClass().isInterface(),
+                "the default provider's class must not be an interface: " + prov.getClass().getName());
+        check("file".equals(prov.getScheme()), "default provider scheme: " + prov.getScheme());
+        // The call that died. Its ANSWER is host-dependent (null is legal when
+        // the host has no mime.types), so what is asserted is that it returns
+        // at all rather than what it returns.
+        Path t = dir.resolve("probe.txt");
+        Files.write(t, "hello".getBytes(StandardCharsets.UTF_8));
+        Files.probeContentType(t);
+        Files.delete(t);
+        System.out.println("CK RJdkNio providerIsConcrete");
+    }
+
     public static void main(String[] args) throws Exception {
         Path dir = java.nio.file.Files.createTempDirectory("rjdknio");
         try {
             filesApi(dir);
+            fileInputStreamSkipIsAnLseek(dir);
+            pathCarriesTheRealLayout(dir);
+            defaultProviderIsConcrete(dir);
             randomAccessAndMapping(dir);
             fileChannelIsOpenTracksCloseNotPosition(dir);
             buffers();

@@ -39,17 +39,78 @@ pub(crate) fn register_phase57_natives(registry: &mut NativeMethodRegistry) {
 
 // ---------------------------------------------------------------------------
 // java.nio.file — Path extras, Files extras, FileVisitResult, OpenOption
-// Path = 1-field synthetic (field 0 = String path)
 // ---------------------------------------------------------------------------
-pub(crate) const P57_PATH_FIELD: usize = 0;
 
-/// Field index on a synthetic `java/nio/file/Path` that holds the
-/// `FileSystem` object the path was created from. `Path.getFileSystem()`
-/// returns this so callers that identity-compare
-/// `path.getFileSystem() == FileSystems.getDefault()` — e.g. cassandra's
-/// `org.apache.cassandra.io.util.File` constructor — observe a match.
-/// Null when the path was created without a known owning FileSystem.
-pub(crate) const P57_PATH_FS_FIELD: usize = 1;
+/// The slot map of a synthetic `java/nio/file/Path`.
+///
+/// **The body lives in `cratonvm_native_api::path_layout`**, because this
+/// carrier has two producing crates — this file's `p57_alloc_path` and the
+/// jar/jrt walkers beside it, plus `native-io`'s watch-key path rebuild — and a
+/// slot map kept here would be a second, drifting copy over there. Read that
+/// module for what the two hard-coded constants this replaced were doing wrong
+/// and why the earlier by-name attempts through the object were inert.
+pub(crate) use cratonvm_native_api::path_layout::slots as p57_path_slots;
+
+/// Resolve (once) and return the Path slot map — the allocator's arm of
+/// [`p57_path_slots`].
+pub(crate) use cratonvm_native_api::path_layout::resolve as p57_path_slots_init;
+
+/// Write `text` into a freshly allocated Path's slots — **the one writer**, so
+/// no producer of this carrier can drift from the map the readers use.
+///
+/// Both slots publish together or not at all. `stringValue` alone would leave
+/// the real `compareTo` (so `equals`), `hashCode` and `initOffsets` — which
+/// `getFileName`/`getParent`/`getNameCount` all go through — reading a null
+/// `byte[]`, which trades a wrong answer for an NPE: worse than either
+/// endpoint, and the lesson `install_real_stream_fields` paid for on
+/// `System.out`.
+///
+/// `stringValue` is written as well as the bytes, so real `toString()` returns
+/// it directly and never has to decode them back through `fs` — the one field
+/// this VM has no real object for.
+///
+/// The encoding is the JDK's own: `UnixPath` stores `Util.toBytes(input)`,
+/// which on any modern JDK is the platform charset's encoding of the path
+/// string — UTF-8 on every host this VM supports.
+///
+/// Returns the (possibly relocated) object: each allocation below is a GC
+/// point, so the caller must use the returned reference and not the one it
+/// passed in.
+pub(crate) fn p57_write_path_fields(
+    ctx: &mut dyn NativeContext,
+    path_obj: ObjectRef,
+    text: &str,
+) -> ObjectRef {
+    let slots = p57_path_slots_init(ctx);
+    let pin = ctx.pin_native_root(path_obj);
+    let s = ctx.create_string(text);
+    let obj = ctx.read_native_pin(pin, path_obj);
+    ctx.set_field(obj, slots.string, Value::Object(Some(s)));
+    if let Some(bytes_slot) = slots.bytes {
+        let raw = text.as_bytes();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, raw.len());
+        ctx.write_byte_array_from(arr, 0, raw);
+        let obj = ctx.read_native_pin(pin, path_obj);
+        ctx.set_field(obj, bytes_slot, Value::Object(Some(arr)));
+    }
+    let obj = ctx.read_native_pin(pin, path_obj);
+    ctx.unpin_native_roots(pin);
+    obj
+}
+
+/// Allocate a synthetic Path at the platform layout's width and store `text`
+/// into it, with no normalisation. [`p57_alloc_path`] is the normalising entry
+/// point; this one is for producers that have already built an exact string
+/// (the jar/jrt encodings, whose sentinel form must not be rewritten).
+pub(crate) fn p57_alloc_path_raw(
+    ctx: &mut dyn NativeContext,
+    text: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let width = p57_path_slots_init(ctx).width;
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", width)?;
+    Ok(p57_write_path_fields(ctx, obj, text))
+}
+
 
 /// Field index on a synthetic `java/nio/file/FileSystem` that, when set, holds
 /// the OS path of a mounted JAR (see `newFileSystem`). Field 0 is the separator.
@@ -240,13 +301,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "toFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+        // WIDTH and the two extra writes: `cratonvm_native_api::file_layout`.
+        // A one-slot File takes the path and silently keeps `prefixLength = 0`,
+        // which is what made real `File` bytecode call every path relative.
+        let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh File (native stale-local family).
         let file_pin = ctx.pin_native_root(file);
         let s = ctx.create_string(&p);
         let file = ctx.read_native_pin(file_pin, file);
         ctx.set_field(file, 0, Value::Object(Some(s)));
+        cratonvm_native_api::file_layout::write(ctx, file, s, &p);
         ctx.unpin_native_roots(file_pin);
         Ok(Some(Value::Object(Some(file))))
     });
@@ -432,7 +498,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             if let Some((jar, entry)) = p57_jar_uri_to_entry_path(&uri_text) {
                 let fs = p57_alloc_jar_filesystem(ctx, &jar)?;
                 let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry))?;
-                ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
+                ctx.set_field(result, p57_path_slots().fs, Value::Object(Some(fs)));
                 return Ok(Some(Value::Object(Some(result))));
             }
             // Opaque file-scheme URIs (`file:.`, `file:foo`) are not
@@ -549,7 +615,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // --- Path.getFileSystem() → the FileSystem this Path belongs to ---
     // FileSystem = 2-field synthetic (field 0 = separator String).
     // If the Path was produced by `FileSystem.getPath`, return that exact
-    // FileSystem object (stored in P57_PATH_FS_FIELD) so identity checks
+    // FileSystem object (stored in the `fs` slot) so identity checks
     // hold; otherwise fall back to a default FileSystem.
     r.register(
         path,
@@ -557,7 +623,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/FileSystem;",
         |ctx, args| {
             if let Ok(this) = obj_arg(args, 0) {
-                if let Value::Object(Some(fs)) = ctx.get_field(this, P57_PATH_FS_FIELD) {
+                if let Value::Object(Some(fs)) = ctx.get_field(this, p57_path_slots().fs) {
                     return Ok(Some(Value::Object(Some(fs))));
                 }
                 // Encoded virtual-FS paths produced during a walk carry no owning
@@ -678,8 +744,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 // `toString()` renders with '/' (the zipfs/jrtfs separator), not
                 // the host '\' — javac keys its package map on
                 // `root.relativize(dir).toString()`.
-                if let Value::Object(Some(fs)) = ctx.get_field(this, P57_PATH_FS_FIELD) {
-                    ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
+                if let Value::Object(Some(fs)) = ctx.get_field(this, p57_path_slots().fs) {
+                    ctx.set_field(result, p57_path_slots().fs, Value::Object(Some(fs)));
                 }
                 return Ok(Some(Value::Object(Some(result))));
             }
@@ -1171,7 +1237,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // `Path.getFileSystem()` returns the *same* object — required by
             // identity checks like cassandra's `File(Path)` constructor
             // (`path.getFileSystem() == FileSystems.getDefault()`).
-            ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(this)));
+            ctx.set_field(result, p57_path_slots().fs, Value::Object(Some(this)));
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -1316,11 +1382,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the list alloc below — a moving young GC there would
             // relocate the fresh array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(0));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(0));
             ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Object(Some(list))))
         },
@@ -1371,7 +1446,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let rp = p57_alloc_path(ctx, &jarfs_encode(&jar, ""))?;
                     if let Some((h, orig)) = this_pin {
                         let this = ctx.read_native_pin(h, orig);
-                        ctx.set_field(rp, P57_PATH_FS_FIELD, Value::Object(Some(this)));
+                        ctx.set_field(rp, p57_path_slots().fs, Value::Object(Some(this)));
                     }
                     rp
                 }
@@ -1382,7 +1457,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let rp = p57_alloc_path(ctx, &jrtfs_encode(&jh, ""))?;
                     if let Some((h, orig)) = this_pin {
                         let this = ctx.read_native_pin(h, orig);
-                        ctx.set_field(rp, P57_PATH_FS_FIELD, Value::Object(Some(this)));
+                        ctx.set_field(rp, p57_path_slots().fs, Value::Object(Some(this)));
                     }
                     rp
                 }
@@ -1398,11 +1473,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(arr, 0, Value::Object(Some(root_path)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(1));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(1));
             ctx.unpin_native_roots(this_pin.map(|(h, _)| h).unwrap_or(root_path_pin));
             Ok(Some(Value::Object(Some(list))))
         },
@@ -1495,11 +1579,22 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // --- FileSystemProvider minimal methods ---
     let fsp = "java/nio/file/spi/FileSystemProvider";
     r.register(fsp, "getScheme", "()Ljava/lang/String;", |ctx, args| {
-        // Read scheme from instance field 0 (populated by provider()/installedProviders()).
-        // Falls back to "file" for legacy callers that allocated without a scheme slot.
-        if let Some(this) = obj_arg(args, 0).ok() {
-            if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
-                return Ok(Some(Value::Object(Some(s))));
+        // The scheme is a PRIVATE slot above the concrete provider class's own
+        // layout — `file_system_provider_base` is the same accessor
+        // `p57_alloc_provider` writes through, and it collapses to 0 for any
+        // receiver this crate did not allocate (a stub-mode object, or a real
+        // `sun.nio.fs.*Provider` built by JDK bytecode), which is exactly the
+        // legacy behaviour.
+        //
+        // Falls back to "file" when the slot holds no String — the answer for
+        // the default provider, and the only provider a legacy caller that
+        // allocated without a scheme slot could have meant.
+        if let Ok(this) = obj_arg(args, 0) {
+            let base = file_system_provider_base(ctx, this);
+            if let Value::Object(Some(s)) = ctx.get_field(this, base) {
+                if ctx.read_string(s).is_some() {
+                    return Ok(Some(Value::Object(Some(s))));
+                }
             }
         }
         let s = ctx.create_string("file");
@@ -2390,11 +2485,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(arr, 2, Value::Object(Some(jrt_p)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(3));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(3));
             ctx.unpin_native_roots(file_pin);
             Ok(Some(Value::Object(Some(list))))
         },
@@ -2471,7 +2575,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             if let Some((jar, entry)) = p57_jar_uri_to_entry_path(&uri_text) {
                 let fs = p57_alloc_jar_filesystem(ctx, &jar)?;
                 let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry))?;
-                ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
+                ctx.set_field(result, p57_path_slots().fs, Value::Object(Some(fs)));
                 return Ok(Some(Value::Object(Some(result))));
             }
             // `URI.getPath()` first -- the DECODED path component (see the
@@ -2678,11 +2782,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the list alloc below — a moving young GC there would
             // relocate the fresh array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(list, 0, Value::Int(0));
-            ctx.set_field(list, 1, Value::Object(Some(arr)));
-            ctx.set_field(list, 2, Value::Int(0));
+            // By NAME, not by raw slot. These three writes were
+            // `set_field(list, 0/1/2, ..)` against the REAL JDK layout
+            // (`AbstractList.modCount`, `ArrayList.elementData`,
+            // `ArrayList.size`) -- an absolute extent of 3 on a class this
+            // code does not own, which is what the T9C gate scores against the
+            // synthetic table's 2 and what that gate's own "rule when this
+            // fails" says to replace. Resolving by name is layout-independent:
+            // correct here, and in synthetic mode a write that finds no such
+            // field is dropped rather than landing on the wrong slot.
+            ctx.set_field_by_name(list, "modCount", Value::Int(0));
+            ctx.set_field_by_name(list, "elementData", Value::Object(Some(arr)));
+            ctx.set_field_by_name(list, "size", Value::Int(0));
             ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Object(Some(list))))
         },
@@ -6613,29 +6726,55 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "newFileChannel",
         "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;",
         |ctx, args| {
+            // `args` IS A PRE-CALL SNAPSHOT. `safe_native_call_impl` pins every
+            // argument, so nothing here can be collected — but it rebuilds the
+            // snapshot from those pins only for a collection it runs itself,
+            // BEFORE the callback. `p57_read_path` allocates, and any other
+            // thread can request a collection at any safepoint, so by the time
+            // `args.get(2)` is read below the option set may have MOVED and the
+            // slice still names its old address. Reading it here, before the
+            // first allocation, and keeping it in a handle is what makes the
+            // two `set` dereferences below safe.
+            //
+            // Same family as the FileDescriptor construction further down, and
+            // as the print natives fixed on 2026-09-06 — see
+            // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
             let path_obj = obj_arg(args, 1)?;
-            let p = p57_read_path(ctx, path_obj);
-            // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW/READ/
-            // TRUNCATE_EXISTING via toString.
-            let set_obj = match args.get(2) {
+            let set_obj_at_entry = match args.get(2) {
                 Some(Value::Object(Some(o))) => Some(*o),
                 _ => None,
             };
             let (mut writable, mut create, mut append, mut read_opt, mut truncate) =
                 (false, false, false, false, false);
-            if let Some(set) = set_obj {
-                // Try to iterate by calling toString() on the Set first (cheap & robust)
-                if let Ok(Some(Value::Object(Some(s)))) =
-                    ctx.invoke_virtual(set, "toString", "()Ljava/lang/String;", &[])
-                {
-                    let s = ctx.read_string(s).unwrap_or_default();
-                    writable = s.contains("WRITE") || s.contains("APPEND");
-                    create = s.contains("CREATE"); // matches CREATE and CREATE_NEW
-                    append = s.contains("APPEND");
-                    read_opt = s.contains("READ");
-                    truncate = s.contains("TRUNCATE_EXISTING");
+            let (p, set_obj) = {
+                let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+                let path_h = scope.root(path_obj);
+                let set_h = set_obj_at_entry.map(|o| scope.root(o));
+                let path_now = scope.get(&path_h);
+                let p = p57_read_path(&mut *scope, path_now);
+                // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW/
+                // READ/TRUNCATE_EXISTING via toString.
+                if let Some(h) = set_h.as_ref() {
+                    let set = scope.get(h);
+                    // Try to iterate by calling toString() on the Set first
+                    // (cheap & robust)
+                    if let Ok(Some(Value::Object(Some(s)))) =
+                        scope.invoke_virtual(set, "toString", "()Ljava/lang/String;", &[])
+                    {
+                        let s = scope.read_string(s).unwrap_or_default();
+                        writable = s.contains("WRITE") || s.contains("APPEND");
+                        create = s.contains("CREATE"); // matches CREATE and CREATE_NEW
+                        append = s.contains("APPEND");
+                        read_opt = s.contains("READ");
+                        truncate = s.contains("TRUNCATE_EXISTING");
+                    }
                 }
-            }
+                // `toString` ran interpreted bytecode; re-read the set for the
+                // `fsp_scan_open_options` call below rather than handing it the
+                // address it had before.
+                let set_now = set_h.as_ref().map(|h| scope.get(h));
+                (p, set_now)
+            };
             // JDK FileChannel.open contract: a channel with neither READ nor
             // WRITE is read-only; WRITE without READ is write-only.
             let readable = read_opt || !writable;
@@ -6724,17 +6863,49 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // FileChannelImpl.open(fd, path, readable, writable, sync, direct,
             //   parent) — mirrors FileOutputStream.getChannel's call shape.
             let real_channel = (|| -> Option<Value> {
-                let fd_obj = match ctx.new_object("java/io/FileDescriptor").ok()?? {
-                    Value::Object(Some(o)) => o,
-                    _ => return None,
+                // GC DISCIPLINE. The `FileDescriptor` and the path `String`
+                // below are freshly allocated and NOTHING in Java refers to
+                // either until `FileChannelImpl.open` stores them, so a Rust
+                // local is each one's only reference — across `create_string`,
+                // which allocates, and `ensure_class_initialized`, which runs
+                // `FileChannelImpl`'s class initializer, i.e. arbitrary
+                // bytecode. Under a moving collector the locals go stale;
+                // under the Generational collector's NON-MOVING young sweep an
+                // unreachable object is ZEROED IN PLACE, and a zeroed
+                // `FileDescriptor` reads its `fd`/`handle` back as 0.
+                //
+                // That is the shape of
+                // `known-issues/springboot/generational-non-moving-sweep-zeroes-a-live-filechannel-20260906.md`,
+                // whose symptom is `FileChannel.map: invalid fd` from a
+                // channel that opened cleanly. `native_fcimpl_open` and
+                // `new_native_thread_set` in `native-io` were converted on
+                // 2026-09-06; this site is the same construction one provider
+                // layer up and was missed, because it lives in a CLOSURE
+                // registered inside `register_phase57_nio_file` and both
+                // shipped audits index by top-level `fn`.
+                //
+                // Local reproducer: `test_classes/gc/NioChannelChurn.java`.
+                let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+                let fd_h = {
+                    let o = match scope.new_object("java/io/FileDescriptor").ok()?? {
+                        Value::Object(Some(o)) => o,
+                        _ => return None,
+                    };
+                    scope.root(o)
                 };
                 // `handle` is the Windows fd slot fd_from_descriptor prefers;
                 // also set `fd` for the POSIX read path.
-                ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
-                ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id as i32));
-                let path_str = ctx.create_string(&p);
-                ctx.ensure_class_initialized("sun/nio/ch/FileChannelImpl").ok()?;
-                match ctx.invoke(
+                let fd_obj = scope.get(&fd_h);
+                scope.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
+                let fd_obj = scope.get(&fd_h);
+                scope.set_field_by_name(fd_obj, "fd", Value::Int(fd_id as i32));
+                let path_h = {
+                    let o = scope.create_string(&p);
+                    scope.root(o)
+                };
+                scope.ensure_class_initialized("sun/nio/ch/FileChannelImpl").ok()?;
+                let (fd_obj, path_str) = (scope.get(&fd_h), scope.get(&path_h));
+                match scope.invoke(
                     "sun/nio/ch/FileChannelImpl",
                     "open",
                     "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;",
@@ -7505,13 +7676,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "toFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+        // WIDTH and the two extra writes: `cratonvm_native_api::file_layout`.
+        // A one-slot File takes the path and silently keeps `prefixLength = 0`,
+        // which is what made real `File` bytecode call every path relative.
+        let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh File (native stale-local family).
         let file_pin = ctx.pin_native_root(file);
         let s = ctx.create_string(&p);
         let file = ctx.read_native_pin(file_pin, file);
         ctx.set_field(file, 0, Value::Object(Some(s)));
+        cratonvm_native_api::file_layout::write(ctx, file, s, &p);
         ctx.unpin_native_roots(file_pin);
         Ok(Some(Value::Object(Some(file))))
     });
@@ -8732,9 +8908,41 @@ pub(crate) fn p57_line_separator(ctx: &dyn NativeContext) -> String {
         .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string())
 }
 
+/// The path String out of a Path's own slot — **the one read**, shared by
+/// [`p57_read_path`]'s fast path and [`extract_path_string`].
+///
+/// Two arms, and neither can mis-fire: `read_string` REFUSES a non-String, so
+/// asking the historical slot 0 of a NEW-layout Path yields `None` (it holds
+/// the `fs` object) rather than a mis-decoded path, and asking the mapped slot
+/// of a LEGACY-layout object — a mock, or one built before
+/// `sun.nio.fs.UnixPath` was loadable — is an out-of-range read the accessor
+/// answers `None` for. That is what lets one function serve both layouts
+/// without a mode flag.
+///
+/// **No Java re-entry.** Both arms are plain field reads, which is the property
+/// `extract_path_string`'s callers relied on before this existed;
+/// `p57_read_path`'s `toString()` fallback stays where it was, above only the
+/// callers that already accepted it.
+pub(crate) fn p57_path_slot_string(ctx: &dyn NativeContext, path_obj: ObjectRef) -> Option<String> {
+    let slots = p57_path_slots();
+    if let Value::Object(Some(s)) = ctx.get_field(path_obj, slots.string) {
+        if let Some(t) = ctx.read_string(s) {
+            return Some(t);
+        }
+    }
+    if slots.string != 0 {
+        if let Value::Object(Some(s)) = ctx.get_field(path_obj, 0) {
+            if let Some(t) = ctx.read_string(s) {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
     // Fast path: CratonVM's own synthetic Path layout stores the path String
-    // directly at field 0 (P57_PATH_FIELD).
+    // directly in its `string` slot (see `P57PathSlots`).
     //
     // Real-JDK Path implementations we don't control the layout of -- e.g. a
     // decorator/wrapper Path like Quarkus's `io.quarkus.fs.util.sysfs.
@@ -8760,10 +8968,8 @@ pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) ->
     // concrete Path (including delegating wrappers, via their real bytecode
     // delegating implementation) implements correctly -- whenever the fast
     // path doesn't yield a String.
-    if let Value::Object(Some(s)) = ctx.get_field(path_obj, P57_PATH_FIELD) {
-        if let Some(raw) = ctx.read_string(s) {
-            return p57_to_os_path(&raw);
-        }
+    if let Some(raw) = p57_path_slot_string(ctx, path_obj) {
+        return p57_to_os_path(&raw);
     }
     // STACK-OVERFLOW GUARD (found 2026-07-19 investigating a real crash: JIT
     // method-stats work on an unrelated ES/Lucene test hit
@@ -9604,11 +9810,11 @@ pub(crate) mod p57_normalize_relativize_tests {
     }
 }
 
-/// True if `path_obj`'s recorded owning FileSystem (P57_PATH_FS_FIELD) is a
+/// True if `path_obj`'s recorded owning FileSystem (the `fs` slot) is a
 /// virtual (mounted-jar or runtime-image) FileSystem. Used by `Path.toString`
 /// to render '/' for relative paths that belong to such a FS.
 pub(crate) fn path_owned_by_virtual_fs(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> bool {
-    if let Value::Object(Some(fs)) = ctx.get_field(path_obj, P57_PATH_FS_FIELD) {
+    if let Value::Object(Some(fs)) = ctx.get_field(path_obj, p57_path_slots().fs) {
         matches!(ctx.get_field(fs, P57_FS_JAR_FIELD), Value::Object(Some(_)))
             || matches!(ctx.get_field(fs, P57_FS_JRT_FIELD), Value::Object(Some(_)))
     } else {
@@ -9699,9 +9905,12 @@ pub(crate) fn p57_alloc_path(
     ctx: &mut dyn NativeContext,
     path: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    // 2 fields: [0] = path String, [1] = owning FileSystem (P57_PATH_FS_FIELD,
-    // null unless set by `FileSystem.getPath`).
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
+    // THE PLATFORM CLASS'S OWN LAYOUT, resolved by name — see `P57PathSlots`
+    // for what this replaced and why it could not be done by name through the
+    // object. `width` is `sun.nio.fs.UnixPath`'s real instance-field count, so
+    // `hash` and `offsets` exist for the real bytecode to fill lazily.
+    let width = p57_path_slots_init(ctx).width;
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", width)?;
     // Canonicalise separators to '/' internally so Path operations
     // (normalize/equals/resolve/hashCode) and the file-IO natives all see one
     // form. Windows accepts '\' as a separator and HotSpot's WindowsPath stores
@@ -9723,65 +9932,7 @@ pub(crate) fn p57_alloc_path(
     // trailing-separator defect.
     #[cfg(not(windows))]
     let stored = p57_trim_path_trailing_separator(path);
-    // Pin across the create_string below — a moving young GC there would
-    // relocate the fresh Path (native stale-local family).
-    let obj_pin = ctx.pin_native_root(obj);
-    let s = ctx.create_string(&stored);
-    let obj = ctx.read_native_pin(obj_pin, obj);
-    ctx.set_field(obj, P57_PATH_FIELD, Value::Object(Some(s)));
-    // THE TWO INDICES ABOVE LAND ON THE WRONG FIELDS, and the fix is bigger
-    // than this function. Recorded here because the shape is not obvious from
-    // the code and cost a build to establish.
-    //
-    // `sun.nio.fs.UnixPath` is a REAL, fully loaded class in this VM -- 52
-    // declared methods and 7 declared fields, byte-identical to HotSpot's, and
-    // it declares `toString`. What is handed out is a real instance of it with
-    // none of those fields filled in. Read back through reflection
-    // (`--add-opens java.base/sun.nio.fs=ALL-UNNAMED`):
-    //
-    //   field         HotSpot                      this VM
-    //   path          byte[3] = a/b                NULL
-    //   stringValue   NULL                         NULL
-    //   fs            sun.nio.fs.LinuxFileSystem   String = "a/b"
-    //
-    // The instance slots are `fs`(0) `path`(1) `stringValue`(2) `hash`(3)
-    // `offsets`(4). So `P57_PATH_FIELD`(0) writes the path STRING where a
-    // `UnixFileSystem` belongs, and `P57_PATH_FS_FIELD`(1) writes the owning
-    // filesystem where a `byte[]` belongs -- two type-confused slots, invisible
-    // for as long as our own natives read them back by the same indices.
-    //
-    // TWO WAYS OF FILLING `stringValue` WERE TRIED AND BOTH MEASURED INERT.
-    // Recorded together because the reason is the same and it is not the one
-    // the first attempt assumed.
-    //
-    //   set_field_by_name(obj, "stringValue", ..)                    no-op
-    //   resolve_field_index_by_class_id(class_id_of_object(obj), ..) no-op
-    //
-    // NOT a width problem: `try_alloc_concurrent_synthetic` allocates at
-    // `max(requested, real)` slots, so all five of `UnixPath`'s are there. It
-    // is an IDENTITY problem -- that allocator deliberately "keeps the
-    // requested identity" so field writes use the requested layout, so this
-    // object's `ClassId` is `java/nio/file/Path`, the INTERFACE, while Java's
-    // `getClass()` reports `sun.nio.fs.UnixPath`. Every name-based route
-    // resolves against the interface and misses.
-    //
-    // Which also means the reflection read that showed `stringValue = NULL` is
-    // not evidence of an empty slot: reflection resolves through the real
-    // class, which this object is not filed under. Two different mechanisms,
-    // one wrong conclusion available from each.
-    //
-    // Both reverted: code that cannot fire is worse than the absence of it.
-    //
-    // The real repair is to allocate as `sun/nio/fs/UnixPath` at its true width
-    // and store into the named slots -- `fs` for the owning filesystem (which is
-    // what that field MEANS), `path` for the bytes, `stringValue` for the
-    // string -- and move the 17 `P57_PATH_FIELD`/`P57_PATH_FS_FIELD` sites onto
-    // by-name access. That is a change to the hottest allocation in
-    // `java.nio.file` and wants its own measurement, including throughput;
-    // every unarmed row is 0-diff today, so it buys the RETIREMENT of this
-    // family, not a correctness fix.
-    ctx.unpin_native_roots(obj_pin);
-    Ok(obj)
+    Ok(p57_write_path_fields(ctx, obj, &stored))
 }
 
 /// The `OpenOption`s the nio open paths act on, as scanned by
@@ -13274,6 +13425,85 @@ pub(crate) fn attribute_view_short_name(class_name: &str) -> Option<&'static str
 /// (JVMS 6.5). Ordered; `alloc_concrete` takes the first entry that is present
 /// AND instantiable, so the abstract `UnixFileStore` parent is safe to keep as
 /// a last-resort entry.
+/// The concrete `FileSystemProvider` HotSpot 25 builds for the DEFAULT
+/// filesystem — `sun.nio.fs.LinuxFileSystemProvider` on Linux,
+/// `WindowsFileSystemProvider` on Windows — where this VM answered the ABSTRACT
+/// `java.nio.file.spi.FileSystemProvider` itself.
+///
+/// **This was the last fabricated-abstract receiver in `java.nio.file`**, and
+/// the one L4 §4.4 nominated out of its lane: `Files.probeContentType`'s real
+/// bytecode reaches `DefaultFileTypeDetector.create()`, which calls
+/// `getFileTypeDetector()` on `DefaultFileSystemProvider.instance()`. The
+/// abstract base declares no such method, so the call died with
+///
+/// ```text
+/// NoSuchMethodError: java.nio.file.spi.FileTypeDetector
+///                    java.nio.file.spi.FileSystemProvider.getFileTypeDetector()
+/// ```
+///
+/// and took a whole probe run with it. Same shape and the same two halves as
+/// `FILE_STORE_IMPLS` and `DIR_STREAM_IMPLS`: mint the concrete class AND
+/// mirror the registrations onto it, because dispatch keys on the receiver's
+/// runtime class (`H11-1`).
+///
+/// # NOT USED YET, and the measurement that stopped it — 2026-09-10
+///
+/// Both halves were written, built and run. The result is that a CONCRETE
+/// provider needs a CONCRETE PATH first, and this is the measurement that says
+/// so:
+///
+/// ```text
+/// Files.isExecutable(p)
+///   at sun/nio/fs/UnixPath.toUnixPath(UnixPath.java:177)
+///   at sun/nio/fs/UnixFileSystemProvider.isExecutable(UnixFileSystemProvider.java:347)
+///   -> java.nio.file.ProviderMismatchException
+/// ```
+///
+/// Mirroring moves the rows this file REGISTERS. It cannot move the ones it
+/// does not: `isExecutable` has no native here, so with a concrete receiver the
+/// real `UnixFileSystemProvider.isExecutable` bytecode runs, and its first act
+/// is `UnixPath.toUnixPath(obj)` — an `instanceof UnixPath` test. This VM's
+/// Paths are stamped with the INTERFACE `java/nio/file/Path` (the
+/// `get_class_display` alias makes `getClass()` report `UnixPath`, and
+/// `instanceof` correctly does not), so the test fails and every unregistered
+/// provider method becomes a `ProviderMismatchException`. `L4FilesSweep` went
+/// from 0 to 172 differing lines, dead at row 226 of 395.
+///
+/// **So the order is Path first, provider second**, and the Path half is the
+/// larger change: ~100 registrations on `java/nio/file/Path` would have to be
+/// mirrored onto `sun/nio/fs/UnixPath` in the same commit, because a native
+/// registered on an INTERFACE fires through no door once the receiver is a
+/// concrete class. Left as ONE nomination with both halves named, rather than
+/// as two that look independent.
+///
+/// The scheme's private slot landed anyway (`file_system_provider_base`), so
+/// the layout half of this change is already in place and the mint is a
+/// three-line edit when the Path half is ready.
+pub(crate) const FILE_SYSTEM_PROVIDER_IMPLS: &[&str] = &[
+    "sun/nio/fs/LinuxFileSystemProvider",
+    "sun/nio/fs/MacOSXFileSystemProvider",
+    "sun/nio/fs/BsdFileSystemProvider",
+    "sun/nio/fs/AixFileSystemProvider",
+    "sun/nio/fs/SolarisFileSystemProvider",
+    "sun/nio/fs/WindowsFileSystemProvider",
+    "sun/nio/fs/UnixFileSystemProvider",
+];
+/// How many private slots a `FileSystemProvider` this crate mints carries: one,
+/// the scheme String. The real classes answer `getScheme()` from a constant and
+/// declare no field for it, so it has to be a private slot ABOVE their layout —
+/// writing it at 0 put it where `UnixFileSystemProvider.theFileSystem` lives.
+pub(crate) const FILE_SYSTEM_PROVIDER_SLOTS: usize = 1;
+
+/// Where a minted `FileSystemProvider`'s private slot starts on `this`.
+///
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it
+/// makes reaching for `<clinit>` or any Java re-entry while resolving a
+/// private-slot base a COMPILE ERROR. See [`file_store_base`] for the full
+/// account of what that guard is worth.
+pub(crate) fn file_system_provider_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    cratonvm_native_api::appended_slots::base_for_object(ctx, this, FILE_SYSTEM_PROVIDER_SLOTS)
+}
+
 pub(crate) const FILE_STORE_IMPLS: &[&str] = &[
     "sun/nio/fs/LinuxFileStore",
     "sun/nio/fs/MacOSXFileStore",
@@ -13287,7 +13517,19 @@ pub(crate) const FILE_STORE_IMPLS: &[&str] = &[
 pub(crate) const FILE_STORE_SLOTS: usize = 1;
 
 /// Where a minted `FileStore`'s private slot starts on `this`.
-pub(crate) fn file_store_base(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+///
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it
+/// makes reaching for `<clinit>` or any Java re-entry while resolving a
+/// private-slot base a COMPILE ERROR. (Scope, stated exactly in
+/// `appended_slots::base_for_class_id`: `&dyn` blocks every `&mut self` method,
+/// which is where `<clinit>` and re-entry live, but NOT a `&self` method using
+/// interior mutability.) Until 2026-09-07 this path reached `ensure_class_initialized`
+/// and therefore `<clinit>`, so an ordinary private field read was a Java
+/// re-entry that could move — or under the generational young sweep zero — every
+/// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
+/// would silently make that possible again; the borrow checker is the only
+/// guard that survives a reader who has not read this comment.
+pub(crate) fn file_store_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     cratonvm_native_api::appended_slots::base_for_object(ctx, this, FILE_STORE_SLOTS)
 }
 
@@ -13306,7 +13548,19 @@ pub(crate) const DIR_STREAM_IMPLS: &[&str] = &[
 pub(crate) const DIR_STREAM_SLOTS: usize = 3;
 
 /// Where a minted `DirectoryStream`'s private map starts on `this`.
-pub(crate) fn dir_stream_base(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+///
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it
+/// makes reaching for `<clinit>` or any Java re-entry while resolving a
+/// private-slot base a COMPILE ERROR. (Scope, stated exactly in
+/// `appended_slots::base_for_class_id`: `&dyn` blocks every `&mut self` method,
+/// which is where `<clinit>` and re-entry live, but NOT a `&self` method using
+/// interior mutability.) Until 2026-09-07 this path reached `ensure_class_initialized`
+/// and therefore `<clinit>`, so an ordinary private field read was a Java
+/// re-entry that could move — or under the generational young sweep zero — every
+/// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
+/// would silently make that possible again; the borrow checker is the only
+/// guard that survives a reader who has not read this comment.
+pub(crate) fn dir_stream_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     cratonvm_native_api::appended_slots::base_for_object(ctx, this, DIR_STREAM_SLOTS)
 }
 
@@ -13767,13 +14021,28 @@ pub(crate) fn p57_alloc_provider(
     ctx: &mut dyn NativeContext,
     scheme_str: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let provider = try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1)?;
+    // STILL THE ABSTRACT CLASS, and that is now a MEASURED decision rather than
+    // an oversight. See `FILE_SYSTEM_PROVIDER_IMPLS` for what minting the
+    // concrete class costs today and what has to land first.
+    //
+    // The scheme is written through `file_system_provider_base` rather than at a
+    // literal 0, so the slot map is already the one the concrete mint needs:
+    // slot 0 on `sun.nio.fs.UnixFileSystemProvider` is `theFileSystem`, and a
+    // String there is the same type-confused-slot species `path_layout` closed
+    // one class over. On the abstract stamp the base is 0 and nothing changes.
+    let width = cratonvm_native_api::appended_slots::base_for_class(
+        ctx,
+        "java/nio/file/spi/FileSystemProvider",
+    ) + FILE_SYSTEM_PROVIDER_SLOTS;
+    let provider =
+        try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", width)?;
+    let base = file_system_provider_base(ctx, provider);
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh provider (native stale-local family).
     let provider_pin = ctx.pin_native_root(provider);
     let scheme = ctx.create_string(scheme_str);
     let provider = ctx.read_native_pin(provider_pin, provider);
-    ctx.set_field(provider, 0, Value::Object(Some(scheme)));
+    ctx.set_field(provider, base, Value::Object(Some(scheme)));
     ctx.unpin_native_roots(provider_pin);
     Ok(provider)
 }
@@ -16577,13 +16846,16 @@ pub(crate) fn file_alloc_units(
     ctx: &mut dyn NativeContext,
     path: &[u16],
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+    let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh File (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string_from_units(path);
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(s)));
+    let text = String::from_utf16_lossy(path);
+    cratonvm_native_api::file_layout::write(ctx, obj, s, &text);
     ctx.unpin_native_roots(obj_pin);
     Ok(obj)
 }
@@ -16669,13 +16941,15 @@ pub(crate) fn file_alloc(
     ctx: &mut dyn NativeContext,
     path: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
+    let w = cratonvm_native_api::file_layout::alloc_width(ctx);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", w)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh File (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string(path);
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(s)));
+    cratonvm_native_api::file_layout::write(ctx, obj, s, path);
     ctx.unpin_native_roots(obj_pin);
     Ok(obj)
 }
@@ -17327,30 +17601,35 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let ok = fs_set_permission(&path, FS_ACCESS_WRITE, writable, owner_only);
         Ok(Some(Value::Int(i32::from(ok))))
     });
+    // THE ONE-ARGUMENT FORM WAS THE ONE THIS BLOCK'S OWN COMMENT MISSED.
+    //
+    // `setReadable(Z)`, `setReadable(ZZ)`, `setWritable(Z)`, `setWritable(ZZ)`
+    // and `setExecutable(ZZ)` all delegate to `fs_set_permission`. This one
+    // hand-rolled its own body, and it was wrong on BOTH platforms:
+    //
+    //   * on Windows it answered `std::fs::metadata(path).is_ok()` -- "does
+    //     this file exist?" -- so `setExecutable(false)` reported TRUE. That is
+    //     exactly the fabricated success the comment above says was removed
+    //     from the other three; it survived here because the earlier sweep
+    //     never asked the DISABLE direction on Windows. The JDK's
+    //     `WinNTFileSystem` cannot revoke execute and reports the request back:
+    //     `enable`. Measured against HotSpot 25 by `apps/probes/L4FileSweep.java`,
+    //     the row `setExecutable false` -- HotSpot `false`, CratonVM `true`, in
+    //     BOTH `--real-jdk` and `--jdk-only`;
+    //
+    //   * on Unix it toggled `0o111`, all three execute bits, where the
+    //     one-argument form is DEFINED as the two-argument form with
+    //     `ownerOnly = true` -- so it should touch `0o100` only.
+    //     `fs_set_permission` already makes that distinction, which is the
+    //     second reason to call it rather than to re-derive it.
+    //
+    // Delegating fixes both and leaves one implementation of the rule.
     r.register(file, "setExecutable", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let _path = file_read_path(ctx, this);
-        let _exec = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
-        // On unix, toggle 0o100 bit; on Windows, no-op (treat as success)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let ok = std::fs::metadata(&_path)
-                .and_then(|meta| {
-                    let mut perms = meta.permissions();
-                    let mode = perms.mode();
-                    let new_mode = if _exec { mode | 0o111 } else { mode & !0o111 };
-                    perms.set_mode(new_mode);
-                    std::fs::set_permissions(&_path, perms)
-                })
-                .is_ok();
-            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
-        }
-        #[cfg(not(unix))]
-        {
-            let ok = std::fs::metadata(&_path).is_ok();
-            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
-        }
+        let path = file_read_path(ctx, this);
+        let exec = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let ok = fs_set_permission(&path, FS_ACCESS_EXECUTE, exec, true);
+        Ok(Some(Value::Int(i32::from(ok))))
     });
     r.register(file, "setExecutable", "(ZZ)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -20130,10 +20409,15 @@ pub(crate) fn basic_file_attributes_store(
 
 /// Extract path string from a Path argument (field 0 = String)
 pub(crate) fn extract_path_string(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> String {
+    // SLOT 0 UNTIL 2026-09-10, and that is what broke first when the Path slot
+    // map moved: this helper serves `Files.size`, `readAttributes` and the
+    // attribute-view family, so a stale index here empties the path for a whole
+    // registrar while `p57_read_path`'s callers stay green. One reader, so the
+    // next move cannot split them again.
     let raw = match arg {
-        Some(Value::Object(Some(path_obj))) => match ctx.get_field(*path_obj, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => return String::new(),
+        Some(Value::Object(Some(path_obj))) => match p57_path_slot_string(ctx, *path_obj) {
+            Some(t) => t,
+            None => return String::new(),
         },
         _ => return String::new(),
     };
@@ -22416,9 +22700,9 @@ pub(crate) fn p98_walk_file_tree(
     } else {
         return Ok(Some(path_val));
     };
-    let root_str = match ctx.get_field(path_obj, 0) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => return Ok(Some(path_val)),
+    let root_str = match p57_path_slot_string(ctx, path_obj) {
+        Some(t) => t,
+        None => return Ok(Some(path_val)),
     };
     let visitor_class_id = ctx.class_id_of_object(visitor);
     let visitor_class_name = ctx.class_name_of_id(visitor_class_id);
@@ -22699,12 +22983,8 @@ pub(crate) fn p98_index_javac_archive_packages(
             root_path_pin
         } else {
             let encoded = jarfs_encode(&jar, &entry);
-            let path = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
-            let path_pin = p98_pin(ctx, path);
-            let path_string = ctx.create_string(&encoded);
-            let path_now = p98_read_pin(ctx, path_pin);
-            ctx.set_field(path_now, 0, Value::Object(Some(path_string)));
-            path_pin
+            let path = p57_alloc_path_raw(ctx, &encoded)?;
+            p98_pin(ctx, path)
         };
         let relative_string = ctx.create_string(&relative);
         let relative_string_pin = p98_pin(ctx, relative_string);
@@ -22851,11 +23131,8 @@ pub(crate) fn p98_walk_dir(
             for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
                 let es = jarfs_encode(&jar, &child);
                 if is_dir {
-                    let epo = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
+                    let epo = p57_alloc_path_raw(ctx, &es)?;
                     let epo_pin = p98_pin(ctx, epo);
-                    let s = ctx.create_string(&es);
-                    let epo_now = p98_read_pin(ctx, epo_pin);
-                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
                     if !p98_walk_dir(
                         ctx,
                         &es,
@@ -22868,11 +23145,8 @@ pub(crate) fn p98_walk_dir(
                         return Ok(false);
                     }
                 } else if !skip_file_callbacks {
-                    let epo = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
+                    let epo = p57_alloc_path_raw(ctx, &es)?;
                     let epo_pin = p98_pin(ctx, epo);
-                    let s = ctx.create_string(&es);
-                    let epo_now = p98_read_pin(ctx, epo_pin);
-                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
                     let fa = p98_alloc_basic_file_attributes(
                         ctx,
                         false,
@@ -22901,11 +23175,8 @@ pub(crate) fn p98_walk_dir(
             for (child, is_dir) in jrtfs_list_dir_classified(&java_home, &entry) {
                 let es = jrtfs_encode(&java_home, &child);
                 if is_dir {
-                    let epo = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
+                    let epo = p57_alloc_path_raw(ctx, &es)?;
                     let epo_pin = p98_pin(ctx, epo);
-                    let s = ctx.create_string(&es);
-                    let epo_now = p98_read_pin(ctx, epo_pin);
-                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
                     if !p98_walk_dir(
                         ctx,
                         &es,
@@ -22918,11 +23189,8 @@ pub(crate) fn p98_walk_dir(
                         return Ok(false);
                     }
                 } else if !skip_file_callbacks {
-                    let epo = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
+                    let epo = p57_alloc_path_raw(ctx, &es)?;
                     let epo_pin = p98_pin(ctx, epo);
-                    let s = ctx.create_string(&es);
-                    let epo_now = p98_read_pin(ctx, epo_pin);
-                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
                     let fa = p98_alloc_basic_file_attributes(
                         ctx,
                         false,
@@ -23252,7 +23520,12 @@ pub(crate) fn posix_permission_bits_from_set(ctx: &mut dyn NativeContext, set: O
     let _ = ctx.ensure_class_initialized(pfp);
     let cid = ctx.class_id_by_name(pfp);
     let mut mode = 0u32;
+    // GC-safety: `Set.contains` is a virtual dispatch into real bytecode
+    // (`hashCode`/`equals` on the caller's own set), run once per permission
+    // constant. `set` is a bare Rust parameter, stale from the second turn on.
+    let set_pin = ctx.pin_native_root(set);
     for i in 0..BITS.len().min(POSIX_FILE_PERMISSION_CONSTANTS.len()) {
+        let set = ctx.read_native_pin(set_pin, set);
         let Some(c) = cid else { break };
         let Some(slot) = ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i])
         else {
@@ -23635,7 +23908,12 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             let _ = ctx.ensure_class_initialized(pfp);
             let cid = ctx.class_id_by_name(pfp);
             let mut out = String::with_capacity(9);
+            // GC-safety: `Set.contains` below is a virtual dispatch into the
+            // caller's own set, run once per permission constant, and `set` is
+            // carried in from outside the loop.
+            let set_pin = ctx.pin_native_root(set);
             for i in 0..9 {
+                let set = ctx.read_native_pin(set_pin, set);
                 let present = if let Some(c) = cid {
                     match ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i]) {
                         Some(slot) => {

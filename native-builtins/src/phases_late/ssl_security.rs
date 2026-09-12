@@ -3436,6 +3436,64 @@ fn ssl_sock_auth_update<F: FnOnce(&mut (i32, i32, i32))>(
     f(entry);
 }
 
+/// The `KeyManagerFactory`/`TrustManagerFactory` instances a caller has
+/// successfully `init`ed, by identity hash.
+///
+/// Neither class has a spare slot to put the flag in — slot 1 of both is the
+/// real class's `factorySpi`, which `jsse_factory_is_ours` reads and this file
+/// therefore never writes (see its note) — so the state lives beside the two
+/// id tables this module already keys the same way.
+///
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Every acquisition takes
+/// the guard after `identity_hash_code` has produced the key, does one set
+/// operation, and drops it before anything re-enters Java — the same shape,
+/// and the same level, as this module's two id tables.
+fn jsse_factory_initialized(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<i32>> {
+    static T: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<i32>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashSet::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
+}
+
+fn mark_jsse_factory_initialized(ctx: &dyn NativeContext, this: ObjectRef) {
+    let ih = ctx.identity_hash_code(this);
+    if ih != 0 {
+        jsse_factory_initialized().lock().insert(ih);
+    }
+}
+
+/// Refuse `getKeyManagers()`/`getTrustManagers()` on a factory nobody `init`ed.
+///
+/// MEASURED on HotSpot 25.0.4+7 — both are
+/// `IllegalStateException: <Impl> is not initialized`, and this VM answered
+/// with one manager built from whatever keystore state happened to be lying
+/// around. That is the same shape as the `SSLContext` gate two files over: a
+/// caller whose `init` never ran, or threw and was swallowed, got a working
+/// object with nobody's configuration in it.
+///
+/// `impl_name` is the JDK's own class name in the message —
+/// `KeyManagerFactoryImpl` / `TrustManagerFactoryImpl` — not the interface's.
+fn require_jsse_factory_initialized(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    impl_name: &str,
+) -> Result<(), MethodCallFailed> {
+    let ih = ctx.identity_hash_code(this);
+    if ih != 0 && jsse_factory_initialized().lock().contains(&ih) {
+        return Ok(());
+    }
+    Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+        message: format!("{impl_name} is not initialized"),
+    }
+    .into())
+}
+
 pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -3478,6 +3536,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             )?;
             ctx.set_field(obj, NEW13_CTX_PROTOCOL, Value::Object(Some(proto_ref)));
             ctx.set_field(obj, NEW13_CTX_INIT, Value::Int(0));
+            crate::jca::ssl_context_spi::mark_context_uninitialized(ctx, obj);
             ctx.set_field(obj, NEW13_CTX_KM, Value::Object(None));
             ctx.set_field(obj, NEW13_CTX_TM, Value::Object(None));
             ctx.set_field(obj, NEW13_CTX_RANDOM, Value::Object(None));
@@ -3499,6 +3558,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let proto = ctx.create_string("TLSv1.3");
             ctx.set_field(obj, NEW13_CTX_PROTOCOL, Value::Object(Some(proto)));
             ctx.set_field(obj, NEW13_CTX_INIT, Value::Int(1));
+            crate::jca::ssl_context_spi::mark_context_initialized(ctx, obj);
             ctx.set_field(obj, NEW13_CTX_KM, Value::Object(None));
             ctx.set_field(obj, NEW13_CTX_TM, Value::Object(None));
             ctx.set_field(obj, NEW13_CTX_RANDOM, Value::Object(None));
@@ -3658,6 +3718,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, NEW13_CTX_TM, tm_arg);
             ctx.set_field(this, NEW13_CTX_RANDOM, sr_arg);
             ctx.set_field(this, NEW13_CTX_INIT, Value::Int(1));
+            crate::jca::ssl_context_spi::mark_context_initialized(&**ctx, this);
 
             // Keep the legacy p68 context coherent with the rustls-backed
             // transport bridge.  A real-JDK dispatch may reach this handler
@@ -3689,6 +3750,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             ) {
                 return r;
             }
+            crate::jca::ssl_context_spi::require_context_initialized(ctx, obj_arg(args, 0)?)?;
             // Field 0 is the originating SSLContext, matching the factory
             // shape consumed by the HttpURLConnection TLS bridge.
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1)?;
@@ -3722,6 +3784,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             ) {
                 return r;
             }
+            crate::jca::ssl_context_spi::require_context_initialized(ctx, obj_arg(_args, 0)?)?;
             let obj =
                 try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 0)?;
             Ok(Some(Value::Object(Some(obj))))
@@ -3761,6 +3824,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             ) {
                 return r;
             }
+            let this = obj_arg(_args, 0)?;
+            crate::jca::ssl_context_spi::require_context_initialized(ctx, this)?;
             let obj = ssleng_alloc(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -3778,6 +3843,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             ) {
                 return r;
             }
+            let this = obj_arg(_args, 0)?;
+            crate::jca::ssl_context_spi::require_context_initialized(ctx, this)?;
             let obj = ssleng_alloc(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -6509,6 +6576,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 &[args.get(1).copied().unwrap_or(Value::Object(None))],
             );
         }
+        mark_jsse_factory_initialized(ctx, obj_arg(args, 0)?);
         Ok(None)
     });
     r.register(
@@ -6559,6 +6627,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     &[args.get(1).copied().unwrap_or(Value::Object(None))],
                 );
             }
+            mark_jsse_factory_initialized(ctx, this);
             Ok(None)
         },
     );
@@ -6621,6 +6690,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     &[],
                 );
             }
+            require_jsse_factory_initialized(ctx, this, "TrustManagerFactoryImpl")?;
             let ih = ctx.identity_hash_code(this);
             let tm_id = if ih != 0 {
                 tmf_tm_id_by_identity()
@@ -6698,6 +6768,20 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // when nobody has, so the existing SunX509/NewSunX509/PKIX
             // callers are unaffected.
             let algorithm = args.get(0).copied().unwrap_or(Value::Object(None));
+            // MEASURED on HotSpot 25.0.4+7:
+            // `KeyManagerFactory.getInstance(null)` is
+            // `NullPointerException: null algorithm name`
+            // (`Objects.requireNonNull(algorithm, "null algorithm name")`),
+            // NOT a `NoSuchAlgorithmException`. The empty-string fallback
+            // below turned it into ` KeyManagerFactory not available` — the
+            // wrong TYPE, so a `catch (NoSuchAlgorithmException)` swallowed a
+            // programming error the JDK reports as one.
+            if matches!(algorithm, Value::Object(None)) {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("null algorithm name".to_string()),
+                }
+                .into());
+            }
             let algo_str = match algorithm {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
@@ -6858,6 +6942,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 );
             }
         }
+        mark_jsse_factory_initialized(ctx, obj_arg(args, 0)?);
         Ok(None)
     });
     // STUB-REMOVAL (wave 2): this used to return normally without doing
@@ -6957,6 +7042,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     &[],
                 );
             }
+            require_jsse_factory_initialized(ctx, this, "KeyManagerFactoryImpl")?;
             let ih = ctx.identity_hash_code(this);
             let ks_id = if ih != 0 {
                 kmf_keystore_id_by_identity()
@@ -9095,6 +9181,23 @@ pub(crate) mod new13_tests {
             Ok(Some(Value::Object(Some(o)))) => o,
             other => panic!("getInstance should return a factory, got {other:?}"),
         };
+        // `getTrustManagers()` now refuses an un-`init`ed factory, exactly as
+        // `TrustManagerFactoryImpl` does — so this test has to init one
+        // before it can ask what the manager's CLASS is, which is the only
+        // thing it was ever about. `init((KeyStore) null)` is the
+        // platform-trust-store form and needs no fixture.
+        let init = r
+            .find(
+                "javax/net/ssl/TrustManagerFactory",
+                "init",
+                "(Ljava/security/KeyStore;)V",
+            )
+            .unwrap();
+        init(
+            &mut ctx,
+            &[Value::Object(Some(factory)), Value::Object(None)],
+        )
+        .expect("init((KeyStore) null) should succeed");
         let get_tms = r
             .find(
                 "javax/net/ssl/TrustManagerFactory",

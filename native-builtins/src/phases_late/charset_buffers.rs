@@ -590,10 +590,27 @@ pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
     });
     r.register(cs, "aliases", "()Ljava/util/Set;", |ctx, _args| {
         // Return empty HashSet
-        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+        // Built through the REAL `HashSet.<init>`, not by writing raw slots.
+        // The three slots this used to write (bucket array, size, capacity)
+        // are the MAP layout, on a class whose one real field is `map`
+        // (`Ljava/util/HashMap;`) -- so a reader resolving `map` by name, which
+        // is what `hs_map_slot` and any surviving JDK bytecode both do, found
+        // an `Object[]` where a map belongs. It is the same shape
+        // `publish_map_table` records fixing on the map side.
+        //
+        // It also pinned the class's synthetic slot floor at 3 against one
+        // real field, which pads `java/util/HashSet` (and `LinkedHashSet`,
+        // which declares none of its own) out of the compact layout entirely.
+        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+        let set_pin = ctx.pin_native_root(set);
+        let _ = ctx.invoke(
+            "java/util/HashSet",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(set))],
+        );
+        let set = ctx.read_native_pin(set_pin, set);
+        ctx.unpin_native_roots(set_pin);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(cs, "displayName", "()Ljava/lang/String;", |ctx, args| {
@@ -1446,13 +1463,6 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         };
         let start = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let end = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        let cur_pos = match ctx.get_field_by_name(this, "position") {
-            Value::Int(v) => v,
-            _ => match ctx.get_field(this, CB_FIELD_POS) {
-                Value::Int(v) => v,
-                _ => 0,
-            },
-        };
         let cur_off = match ctx.get_field_by_name(this, "offset") {
             Value::Int(v) => v,
             _ => 0,
@@ -1488,10 +1498,21 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             Some(a) => a,
             None => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
         };
-        // CharBuffer.toString(int start, int end) reads start..end (exclusive)
-        // RELATIVE to the current position — see HeapCharBuffer.toString.
-        let abs_start = cur_off + cur_pos + start;
-        let abs_end = cur_off + cur_pos + end;
+        // ABSOLUTE buffer indices, which is what every real `toString(int,
+        // int)` in the JDK takes: `HeapCharBuffer` is
+        // `new String(hb, start + offset, end - start)` and `StringCharBuffer`
+        // is `str.subSequence(start + offset, end + offset)` — one `offset`
+        // term and NO `position` term in either.
+        //
+        // This arm added `position` too until 2026-09-12, and nothing saw it,
+        // because the `toString()` beside it passed `0, limit - position` to
+        // compensate. A native that owns both ends of a convention agrees with
+        // itself whatever the convention is; only real bytecode is a second
+        // opinion, and lane 4 wave 4's retirement of `toString()` is what
+        // finally asked for one. Twelve rows of
+        // `apps/probes/L4CharBufferSweep.java` moved by exactly `position`.
+        let abs_start = cur_off + start;
+        let abs_end = cur_off + end;
         let arr_len = ctx.array_length(arr) as i32;
         let s_lo = abs_start.max(0).min(arr_len);
         let s_hi = abs_end.max(s_lo).min(arr_len);
@@ -1555,9 +1576,16 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                 _ => pos,
             },
         };
-        // toString() is documented as toString(position(), limit()). For
-        // synthetic/heap buffers our `cb_to_string_range` historically treats
-        // the range as relative, so keep the old 0..remaining call here.
+        // `toString()` IS `toString(position(), limit())` — the JDK's own body,
+        // one line, and now this one too.
+        //
+        // It used to pass `0, limit - position` for every receiver except a
+        // `StringCharBuffer`, because `cb_to_string_range`'s heap arm added the
+        // position itself. That was TWO conventions for one method, picked by
+        // the receiver's class name, each correct only beside the other half of
+        // its own pair — and the pair broke the moment lane 4 wave 4 retired
+        // this registration and put the real `CharBuffer.toString()` on one end
+        // of it. Both ends are absolute now.
         //
         // BUT the range convention differs by receiver, and this registration
         // is reached by BOTH routes while the `StringCharBuffer` one below is
@@ -1576,22 +1604,17 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         //
         // Dispatch on the receiver's real class so ONE implementation serves
         // both routes; the twin below stays as the direct-dispatch entry.
-        let is_string_cb = ctx
-            .class_name_of_id(ctx.class_id_of_object(this))
-            .map(|n| n == "java/nio/StringCharBuffer")
-            .unwrap_or(false);
-        let args2 = if is_string_cb {
-            // Absolute: JDK `StringCharBuffer.toString(start, end)` is
-            // `str.subSequence(start + offset, end + offset)`.
-            [Value::Object(Some(this)), Value::Int(pos), Value::Int(lim)]
-        } else {
-            [
-                Value::Object(Some(this)),
-                Value::Int(0),
-                Value::Int(lim - pos),
-            ]
-        };
-        cb_to_string_range(ctx, &args2)
+        // The receiver-class split went with the second convention. It existed
+        // so the reflective route — which resolves `toString()` against the
+        // DECLARING class — and the bytecode route would agree on a
+        // `StringCharBuffer`; with one convention there is nothing left for
+        // them to disagree about. `ts.wrapSR.reflective` and
+        // `ts.heap.reflective` in `apps/probes/L4CharBufferSweep.java` are the
+        // two rows that hold both routes to it.
+        cb_to_string_range(
+            ctx,
+            &[Value::Object(Some(this)), Value::Int(pos), Value::Int(lim)],
+        )
     });
     r.register(
         "java/nio/StringCharBuffer",

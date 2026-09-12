@@ -1338,12 +1338,12 @@ pub(crate) fn capture_huc_key_managers_ctx_key_body(
 /// stable ClientConfig to retain TLS 1.3 tickets across URL requests.
 pub(crate) fn capture_huc_ssl_context(
     ctx: &mut dyn NativeContext,
-    mut ctx_obj: ObjectRef,
+    ctx_obj: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
-    let ident = ctx_identity(ctx, ctx_obj)?;
+    let ident = ctx_identity(ctx, *ctx_obj)?;
     set_huc_default_client_identity(ident);
-    capture_huc_key_managers_ctx_key(ctx, &mut ctx_obj)?;
-    capture_huc_trust_managers_ctx_key(ctx, ctx_obj)?;
+    capture_huc_key_managers_ctx_key(ctx, ctx_obj)?;
+    capture_huc_trust_managers_ctx_key(ctx, *ctx_obj)?;
 
     let ident = huc_default_client_identity();
     let km_ctx_key = huc_default_key_managers_ctx_key();
@@ -1367,7 +1367,7 @@ pub(crate) fn capture_huc_ssl_context(
 pub(crate) fn capture_huc_ssl_context_for_connection(
     ctx: &mut dyn NativeContext,
     connection: ObjectRef,
-    ctx_obj: ObjectRef,
+    ctx_obj: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
     let default_identity = huc_default_identity_slot().lock().clone();
     let default_roots = huc_default_trust_roots_slot().lock().clone();
@@ -5741,6 +5741,12 @@ struct SslServerSocketState {
     /// `InetAddress.getHostAddress()` of the address the caller passed.
     /// Answers `getInetAddress()` / `getLocalSocketAddress()`.
     bind_address: String,
+    /// `1` once a listener exists for this socket, `0` for one that
+    /// `SSLServerSocketFactory.createServerSocket()` (the NO-ARG overload)
+    /// made and nobody has bound. `isBound()` cannot be "we have a record of
+    /// it" any more, because there is now a construction path that records an
+    /// UNBOUND socket.
+    bound: i32,
     /// `InetAddress.toString()` of the address actually bound, captured at
     /// creation time from the caller's own object, because that rendering
     /// (`hostname/literal`, hostname omitted when the address was built from a
@@ -5762,6 +5768,7 @@ fn ssl_server_socket_state_miss() -> SslServerSocketState {
         listener_id: -1,
         local_port: 0,
         closed: 1,
+        bound: 0,
         bind_address: String::new(),
         bind_display: String::new(),
     }
@@ -5845,9 +5852,23 @@ fn sss_apply_client_auth(
         sss_client_auth_states().lock().insert(key, (0, 0));
         return Ok(None);
     }
-    let listener_id = ssl_server_socket_state(ctx, this)
-        .map(|state| state.listener_id)
-        .unwrap_or(-1);
+    let state = ssl_server_socket_state(ctx, this);
+    // An UNBOUND socket — the no-arg `SSLServerSocketFactory
+    // .createServerSocket()` overload — has no listener to rebuild yet, so
+    // recording the flag is the whole of the work and NOT the
+    // silently-ignored setter this function exists to prevent: `bind` refuses
+    // such a socket outright (see its registration), so no listener can ever
+    // come up without the verifier the caller asked for.
+    if state
+        .as_ref()
+        .is_some_and(|state| state.bound == 0 && state.closed == 0)
+    {
+        sss_client_auth_states()
+            .lock()
+            .insert(key, (i32::from(need), i32::from(want)));
+        return Ok(None);
+    }
+    let listener_id = state.map(|state| state.listener_id).unwrap_or(-1);
     if listener_id < 0 {
         return Err(RuntimeError::IOException {
             message: "SSLServerSocket is closed".into(),
@@ -5924,6 +5945,7 @@ pub(crate) fn register_t27_natives(r: &mut NativeMethodRegistry) {
     register_https_url_connection(r);
     register_self_test(r);
     register_alpn_accessor(r);
+    register_client_socket_mode_accessors(r);
     // E31: must run after `register_p68_ssl` (lib.rs calls this function at
     // ~18540, that one at 18474) — but nothing else registers this triple in
     // either mode, so the ordering is a property to preserve rather than a
@@ -6234,6 +6256,7 @@ fn create_ssl_server_socket(
             listener_id: id,
             local_port: local_port as i32,
             closed: 0,
+            bound: 1,
             bind_address: bind_address.to_string(),
             bind_display: bind_display.to_string(),
         },
@@ -6249,7 +6272,7 @@ fn create_ssl_server_socket(
 /// `sun.security.ssl.SSLServerSocketImpl` adds by OVERRIDING
 /// `ServerSocket.toString()`.
 fn sss_to_string(state: Option<&SslServerSocketState>) -> String {
-    match state {
+    match state.filter(|state| state.bound != 0) {
         Some(state) => format!(
             "[SSL: ServerSocket[addr={},localport={}]]",
             state.bind_display, state.local_port
@@ -6381,6 +6404,58 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
             create_ssl_server_socket(ctx, args, port, &bind_address, &bind_display)
         },
     );
+    // `createServerSocket()` — the NO-ARG overload, which this file did not
+    // have.
+    //
+    // `javax.net.ssl.SSLServerSocketFactory` inherits it from
+    // `javax.net.ServerSocketFactory`, and `phases_early` registers a native
+    // THERE that answers `new java.net.ServerSocket()`. Dispatch asks the
+    // registry about the receiver's class chain, so an
+    // `SSLServerSocketFactory` receiver reached that one: every caller of
+    // `((SSLServerSocketFactory) SSLServerSocketFactory.getDefault())
+    // .createServerSocket()` got a PLAIN `java.net.ServerSocket` back.
+    //
+    // Two rows of `L6TlsParamSweep` (`SSLServerSocket surface`, `SSLServerSocket
+    // params round-trip`) died on the cast HotSpot does not have to make:
+    //
+    // ```text
+    //   ClassCastException: class java.net.ServerSocket cannot be cast to
+    //   class javax.net.ssl.SSLServerSocket
+    // ```
+    //
+    // and the caller who did NOT cast got the worse half — a plaintext
+    // listener from a factory whose whole name says TLS.
+    //
+    // `SSLServerSocketFactoryImpl.createServerSocket()` is
+    // `new SSLServerSocketImpl(context)`: an SSLServerSocket with no listener
+    // behind it, whose parameters can be set and read before anything binds.
+    // That is what this records — an UNBOUND socket, the first this file has
+    // ever had, which is why `SslServerSocketState::bound` exists.
+    r.register(
+        sssf,
+        "createServerSocket",
+        "()Ljava/net/ServerSocket;",
+        |ctx, _args| {
+            let obj =
+                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS)?;
+            set_ssl_server_socket_state(
+                ctx,
+                obj,
+                SslServerSocketState {
+                    listener_id: -1,
+                    // `getLocalPort()` on an unbound `ServerSocket` is -1, not
+                    // 0 — the miss state's 0 is for a socket this file has no
+                    // record of at all.
+                    local_port: -1,
+                    closed: 0,
+                    bound: 0,
+                    bind_address: String::new(),
+                    bind_display: String::new(),
+                },
+            );
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
     r.register(
         sssf,
         "getDefault",
@@ -6396,11 +6471,11 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "getDefaultCipherSuites",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let suites = [
-                "TLS_AES_128_GCM_SHA256",
-                "TLS_AES_256_GCM_SHA384",
-                "TLS_CHACHA20_POLY1305_SHA256",
-            ];
+            // Single source of truth — see `SUPPORTED_CIPHER_SUITE_NAMES`.
+            // Three TLS 1.3 names stood here while `SSLSocketFactory` and
+            // `SSLContext` answered all fifteen, so one VM gave two answers
+            // to the same question depending on which factory was asked.
+            let suites = SUPPORTED_CIPHER_SUITE_NAMES;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, suites.len());
             for (i, &s) in suites.iter().enumerate() {
                 let str_obj = ctx.create_string(s);
@@ -6640,6 +6715,20 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
                 "Socket is closed",
             ));
         }
+        // An UNBOUND socket from the no-arg `createServerSocket()` overload
+        // is the one case that is not already bound — and this file cannot
+        // bring a listener up for it: `create_ssl_server_socket` resolves its
+        // TLS identity from the FACTORY it was called on, and a socket keeps
+        // no rooted reference to that factory. Refuse loudly rather than bind
+        // a plaintext listener behind an `SSLServerSocket`, which is what the
+        // inherited `ServerSocketFactory` native used to hand out here.
+        if ssl_server_socket_state(ctx, this).is_some_and(|state| state.bound == 0) {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/net/SocketException",
+                "binding an unbound SSLServerSocket is not implemented; \n                 use SSLServerSocketFactory.createServerSocket(int)",
+            ));
+        }
         Err(crate::phases_early::throw_jca_exc(
             ctx,
             "java/net/SocketException",
@@ -6804,14 +6893,15 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     // nomination predicted is not what the oracle prints.
     r.register(sss, "isBound", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Every socket this module hands out is created already bound (all
-        // three `createServerSocket` overloads open the listener up front and
-        // there is no unbound-construction path — see `bind` below, which
-        // throws "Already bound" for exactly that reason). So "we have a
-        // record of it" IS "it is bound", and a miss is the only `false`.
-        Ok(Some(Value::Int(i32::from(
-            ssl_server_socket_state(ctx, this).is_some(),
-        ))))
+        // "We have a record of it" is no longer "it is bound": the NO-ARG
+        // `createServerSocket()` overload records an UNBOUND socket, which is
+        // the whole reason `SslServerSocketState::bound` exists. A miss is
+        // still `false`.
+        Ok(Some(Value::Int(
+            ssl_server_socket_state(ctx, this)
+                .map(|state| state.bound)
+                .unwrap_or(0),
+        )))
     });
     r.register(
         sss,
@@ -7178,6 +7268,151 @@ fn gc_stable_objref_key(ctx: &dyn NativeContext, o: ObjectRef) -> u64 {
     ctx.identity_hash_code(o) as u32 as u64
 }
 
+/// The client-socket half of the G25 fix.
+///
+/// `javax.net.ssl.SSLSocket` is abstract exactly like `SSLServerSocket`, and
+/// this VM allocates instances of it directly (`try_alloc_concurrent_synthetic`
+/// a few hundred lines above), so any method with no native and no concrete
+/// body raises `AbstractMethodError: ... has no Code attribute` rather than
+/// answering. G25 fixed the SERVER socket's three; the client socket kept
+/// them, and `L6TlsParamSweep` row 77 is the one that surfaced:
+///
+/// ```text
+///   HotSpot   connected=false clientMode=true need=false want=false createSessions=true …
+///   CratonVM  THREW java.lang.AbstractMethodError msg=method
+///             javax/net/ssl/SSLSocket.getEnableSessionCreation()Z has no Code attribute
+/// ```
+///
+/// One throw takes the whole row with it, so the four properties printed
+/// beside it were unobservable too.
+///
+/// The two validating setters come with it for the same reason they came with
+/// the server socket's: a setter that accepts an unsupported suite silently is
+/// a configuration error the caller never hears about, and the messages are
+/// transcribed from HotSpot rather than invented.
+fn register_client_socket_mode_accessors(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let ss = "javax/net/ssl/SSLSocket";
+
+    // A client socket IS in client mode, and session creation is on: the
+    // mirror image of `SSS_MODE_DEFAULT`, whose first element is 0 because a
+    // SERVER socket is not.
+    r.register(ss, "getEnableSessionCreation", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key = gc_stable_objref_key(ctx, this);
+        let state = sss_mode_states()
+            .lock()
+            .get(&key)
+            .copied()
+            .unwrap_or((1, 1));
+        Ok(Some(Value::Int(state.1)))
+    });
+    // A socket from `SSLSocketFactory.createSocket()` IS in client mode:
+    // measured `clientMode=true` on HotSpot where this VM answered false,
+    // because the only `getUseClientMode` registered was the SERVER socket's
+    // and its default is the opposite.
+    r.register(ss, "getUseClientMode", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key = gc_stable_objref_key(ctx, this);
+        let state = sss_mode_states()
+            .lock()
+            .get(&key)
+            .copied()
+            .unwrap_or((1, 1));
+        Ok(Some(Value::Int(state.0)))
+    });
+    r.register(ss, "setUseClientMode", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = i32::from(args.get(1).and_then(|value| value.as_int()).unwrap_or(0) != 0);
+        let key = gc_stable_objref_key(ctx, this);
+        let mut table = sss_mode_states().lock();
+        let entry = table.entry(key).or_insert((1, 1));
+        entry.0 = on;
+        Ok(None)
+    });
+    r.register(ss, "setEnableSessionCreation", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = i32::from(args.get(1).and_then(|value| value.as_int()).unwrap_or(0) != 0);
+        let key = gc_stable_objref_key(ctx, this);
+        let mut table = sss_mode_states().lock();
+        let entry = table.entry(key).or_insert((1, 1));
+        entry.1 = on;
+        Ok(None)
+    });
+
+    r.register(
+        ss,
+        "setEnabledCipherSuites",
+        "([Ljava/lang/String;)V",
+        |ctx, args| {
+            // Null first, then membership: the order is observable, and
+            // `setEnabledCipherSuites(null)` reports "CipherSuites cannot be
+            // null" on HotSpot rather than complaining about a null suite.
+            let Some(Value::Object(Some(arr))) = args.get(1) else {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "CipherSuites cannot be null".into(),
+                }
+                .into());
+            };
+            for i in 0..ctx.array_length(*arr) {
+                let name = match ctx.get_array_element(*arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                };
+                let name = name.unwrap_or_default();
+                if !SUPPORTED_CIPHER_SUITE_NAMES.contains(&name.as_str()) {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("Unsupported CipherSuite: {name}"),
+                    }
+                    .into());
+                }
+            }
+            Ok(None)
+        },
+    );
+    r.register(
+        ss,
+        "setEnabledProtocols",
+        "([Ljava/lang/String;)V",
+        |ctx, args| {
+            let Some(Value::Object(Some(arr))) = args.get(1) else {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Protocols cannot be null".into(),
+                }
+                .into());
+            };
+            for i in 0..ctx.array_length(*arr) {
+                let name = match ctx.get_array_element(*arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                };
+                let name = name.unwrap_or_default();
+                // The protocol names this stack reports through
+                // `getSupportedProtocols`, plus the legacy spellings JSSE
+                // still names. Anything else is a caller's typo, and HotSpot
+                // says so rather than ignoring it.
+                const KNOWN: &[&str] = &[
+                    "TLSv1.3",
+                    "TLSv1.2",
+                    "TLSv1.1",
+                    "TLSv1",
+                    "SSLv3",
+                    "SSLv2Hello",
+                ];
+                if !KNOWN.contains(&name.as_str()) {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("Unsupported protocol: {name}"),
+                    }
+                    .into());
+                }
+            }
+            Ok(None)
+        },
+    );
+    r.set_category(__prev_cat);
+}
+
 fn register_alpn_accessor(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -7530,11 +7765,11 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         factory: ObjectRef,
         connection: Option<ObjectRef>,
     ) -> Result<(), MethodCallFailed> {
-        if let Some(sslctx) = resolve_sslcontext_from_factory(ctx, factory) {
+        if let Some(mut sslctx) = resolve_sslcontext_from_factory(ctx, factory) {
             if let Some(connection) = connection {
-                capture_huc_ssl_context_for_connection(ctx, connection, sslctx)?;
+                capture_huc_ssl_context_for_connection(ctx, connection, &mut sslctx)?;
             } else {
-                capture_huc_ssl_context(ctx, sslctx)?;
+                capture_huc_ssl_context(ctx, &mut sslctx)?;
             }
         }
         Ok(())
@@ -11662,6 +11897,7 @@ mod tests {
             listener_id: 7,
             local_port: 60553,
             closed: 0,
+            bound: 1,
             bind_address: bind_address.to_string(),
             bind_display: bind_display.to_string(),
         }
@@ -16328,12 +16564,20 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
             let list = with_engine(id, |s| s.enabled_ciphers.clone()).unwrap_or_default();
+            // E42, again, one class over: the default was THREE hard-coded
+            // TLS 1.3 names while this same registrar's
+            // `getSupportedCipherSuites` twenty lines up answers all fifteen
+            // of `SUPPORTED_CIPHER_SUITE_NAMES`. HotSpot has no
+            // enabled/supported distinction on a fresh engine (measured:
+            // 31 == 31, element-wise), so a caller intersecting its own list
+            // with `getEnabledCipherSuites()` — netty's `JdkSslContext`
+            // does exactly that — silently lost every TLS 1.2 suite this VM
+            // can actually negotiate.
             let names: Vec<String> = if list.is_empty() {
-                vec![
-                    "TLS_AES_256_GCM_SHA384".into(),
-                    "TLS_AES_128_GCM_SHA256".into(),
-                    "TLS_CHACHA20_POLY1305_SHA256".into(),
-                ]
+                SUPPORTED_CIPHER_SUITE_NAMES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
             } else {
                 list
             };
@@ -18186,14 +18430,34 @@ fn register_alpn_on_parameters(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let mut list: Vec<String> = Vec::new();
-            if let Some(Value::Object(Some(arr))) = args.get(1) {
-                let len = ctx.array_length(*arr);
-                for i in 0..len {
-                    if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
-                        if let Some(t) = ctx.read_string(s) {
-                            list.push(t);
+            // `SSLParameters.setApplicationProtocols` VALIDATES, and the two
+            // checks are the ones an ALPN caller most needs: a null array and
+            // a null-or-empty element. MEASURED on HotSpot 25.0.4+7
+            // (`L6TlsParamSweep` rows 30, 31, 33) — this engine accepted all
+            // three, so `new String[]{"h2", null}` became an advertised
+            // protocol list with a hole in it and the failure surfaced at
+            // handshake time, on the wire, in another process.
+            let Some(Value::Object(Some(arr))) = args.get(1) else {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "protocols was null".into(),
+                }
+                .into());
+            };
+            let arr = *arr;
+            let len = ctx.array_length(arr);
+            let mut list: Vec<String> = Vec::with_capacity(len);
+            for i in 0..len {
+                let element = match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                };
+                match element {
+                    Some(text) if !text.is_empty() => list.push(text),
+                    _ => {
+                        return Err(RuntimeError::IllegalArgumentException {
+                            message: "An element of protocols was null/empty".into(),
                         }
+                        .into())
                     }
                 }
             }
@@ -18214,7 +18478,13 @@ fn register_alpn_on_parameters(r: &mut NativeMethodRegistry) {
                 .lock()
                 .get(&engine_objref_key(ctx, this))
                 .cloned()
-                .unwrap_or_else(|| vec!["h2".into(), "http/1.1".into()]);
+                // A fresh `SSLParameters` advertises NOTHING: HotSpot's
+                // `getApplicationProtocols()` on one nobody has configured is
+                // a zero-length array, not this VM's invented `[h2,
+                // http/1.1]`. A caller that reads the list to decide whether
+                // ALPN was requested was told yes by every parameters object
+                // in the VM.
+                .unwrap_or_default();
             // GC NOTE: `create_string` allocates, so the array is rooted
             // across the loop — see `x509_manager::materialize_string_array`.
             let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);

@@ -695,6 +695,16 @@ fn expected_arity(op: &Op) -> (usize, usize) {
         Op::MonitorEnter | Op::MonitorExit => (3, 3),
         // cov-05 — [ctrl, mem, obj], same shape as `MonitorEnter` above.
         Op::InstanceOf { .. } | Op::CheckCast { .. } => (3, 3),
+        // [ctrl, mem, obj] — same shape again. It takes `ctrl` because it can
+        // DEOPT (null receiver, or a subclass that overrode the accessor) and
+        // `mem` because it reads the instance.
+        // [ctrl, mem, receiver] plus a delta for the one family that takes
+        // one. `UnboxOp::arity` is the single source of truth, so a family
+        // added there cannot fall out of step with this.
+        Op::Unbox { op, .. } => {
+            let n = 3 + op.arity();
+            (n, n)
+        }
         // cov-07 — [ctrl, mem, exc], a terminator like `Op::Return` above but
         // with a fixed arity: unlike a return, a throw always carries a value.
         Op::Throw => (3, 3),
@@ -1161,18 +1171,99 @@ fn check_frame_states(graph: &Graph, v: &mut Violations) {
     // other is used at a program point it does not describe — a *plausible*
     // deopt frame rather than the correct one, which is the failure mode with
     // no visible symptom. The front end's linear bytecode walk visits each `pc`
-    // once, so this holds today; the check is what keeps it holding.
-    let mut first_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    // once, so this holds for anything it builds; the check is what keeps it
+    // holding.
+    //
+    // ## Unless every duplicate is CLAIMED
+    //
+    // A pass that copies a region — `ir_optimize::unroll` — makes several
+    // program points out of one bci on purpose, and each copy needs a frame of
+    // its own. Both consumers above have a per-copy path that does not go
+    // through the bci: `resolve_frame_state_for_site` prefers the snapshot the
+    // trapping node NAMES (`Node::frame_snapshot`), and `build_deopt_points`
+    // anchors a named snapshot at an offset inside its own copy
+    // (`snapshot_native`). So a duplicate bci is safe exactly when every
+    // snapshot at it is named by some node — at which point no consumer is
+    // resolving it by position, and there is nothing to discard.
+    //
+    // An UNCLAIMED duplicate is still the original bug, and is still reported.
+    // That is the case this relaxation must not swallow: it is what a
+    // half-finished copy looks like, where one iteration got a snapshot and its
+    // nodes were never stamped with it.
+    let mut claimed: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut node_bcis: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for node in &graph.nodes {
+        if node.op == Op::Dead {
+            continue;
+        }
+        if let Some(si) = node.frame_snapshot {
+            claimed.insert(si);
+        }
+        if let Some(pc) = node.bytecode_pc {
+            node_bcis.insert(pc);
+        }
+    }
+    let mut at_bci: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
     for (si, sp) in graph.safepoints.iter().enumerate() {
-        if let Some(&prev) = first_at.get(&sp.bci) {
+        at_bci.entry(sp.bci).or_default().push(si);
+    }
+    let mut duplicated: Vec<(usize, Vec<usize>)> = at_bci
+        .into_iter()
+        .filter(|(_, sis)| sis.len() > 1)
+        .collect();
+    duplicated.sort_unstable();
+    for (bci, sis) in duplicated {
+        // A bci NO live node carries emits no code, so nothing can resume
+        // there: `build_deopt_points` anchors through `bci_native`, which is
+        // populated only from nodes, and every guard resumes at some node's own
+        // `bytecode_pc`. Duplicates at such a bci are unconsultable rather than
+        // ambiguous -- and they are normal after an unroll, because the post-
+        // unroll constant fold retires the very nodes that made those bcis
+        // real. Only a duplicated bci the code actually EMITS is the bug this
+        // check is for. See `ir_optimize::plan_copy_frames`, which draws the
+        // same line on the producing side.
+        if !node_bcis.contains(&bci) {
+            continue;
+        }
+        let unclaimed: Vec<usize> = sis
+            .iter()
+            .copied()
+            .filter(|si| !claimed.contains(&(*si as u32)))
+            .collect();
+        if !unclaimed.is_empty() {
             v.add(format!(
-                "safepoint[{si}] and safepoint[{prev}] both describe bci {} — the bci-keyed \
-                 consumers take the first match, so one of the two frame states is silently \
-                 discarded and the other resumes a program point it does not describe",
-                sp.bci
+                "safepoint(s) {unclaimed:?} of {sis:?} describe bci {bci} without being named by \
+                 any node's `frame_snapshot` — the bci-keyed consumers take the first match, so \
+                 one of these frame states is silently discarded and another resumes a program \
+                 point it does not describe"
             ));
-        } else {
-            first_at.insert(sp.bci, si);
+        }
+    }
+
+    // A named snapshot must exist and must agree with the node about which
+    // bytecode index the frame resumes at. `Graph::set_node_frame_snapshot`
+    // refuses to install anything else, so a violation here means a snapshot
+    // index was written past it or the snapshot list was rewritten underneath
+    // one — either way the node would deopt into the wrong instruction with a
+    // frame that looks entirely plausible.
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if node.op == Op::Dead {
+            continue;
+        }
+        let Some(si) = node.frame_snapshot else {
+            continue;
+        };
+        match graph.safepoints.get(si as usize) {
+            None => v.add(format!(
+                "node {id} names safepoint[{si}], which does not exist ({} snapshots)",
+                graph.safepoints.len()
+            )),
+            Some(sp) if node.bytecode_pc != Some(sp.bci) => v.add(format!(
+                "node {id} at bci {:?} names safepoint[{si}], which resumes at bci {}",
+                node.bytecode_pc, sp.bci
+            )),
+            Some(_) => {}
         }
     }
 
@@ -1733,6 +1824,7 @@ mod tests {
             ty: IrType::Int,
             inputs: vec![7].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         };
         assert!(!is_memory_token_input(&compact, 1));
         let full = Node {
@@ -1740,6 +1832,7 @@ mod tests {
             ty: IrType::Int,
             inputs: vec![1, 2, 3].into(),
             bytecode_pc: None,
+            frame_snapshot: None,
         };
         assert!(is_memory_token_input(&full, 1));
         assert!(!is_memory_token_input(&full, 0));
@@ -1769,11 +1862,17 @@ mod tests {
     /// two snapshots at one bci silently discard one of the two frame states.
     /// The survivor then describes a program point that is not the one it
     /// resumes at — a wrong frame with no symptom at the point of the defect.
+    ///
+    /// The nodes carry bci 4 deliberately: a duplicated bci is only a defect
+    /// when the code actually emits something there, and an UNCLAIMED
+    /// duplicate is what the check is for. See
+    /// [`two_claimed_snapshots_at_one_bci_are_a_copied_body`] for the other
+    /// side of the rule.
     #[test]
     fn two_snapshots_at_one_bci_are_rejected() {
         let mut g = linear_graph();
-        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
-        let b = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let a = g.add(Op::Const(1), IrType::Int, vec![], Some(4));
+        let b = g.add(Op::Const(2), IrType::Int, vec![], Some(4));
         g.safepoints.push(crate::ir::SafepointSnapshot {
             bci: 4,
             locals: vec![a],
@@ -1787,8 +1886,71 @@ mod tests {
         });
         let err = verify_graph(&g, "test", VerifyOptions::default()).unwrap_err();
         let m = message(&err);
-        assert!(m.contains("both describe bci 4"), "{m}");
+        assert!(m.contains("describe bci 4"), "{m}");
         assert!(m.contains("silently discarded"), "{m}");
+    }
+
+    /// Two snapshots at one bci are FINE when every one of them is named by a
+    /// node — that is a copied loop body, not a collision.
+    ///
+    /// The relaxation this check grew for `ir_optimize::unroll`'s per-copy
+    /// deopt frames, and it is paired with
+    /// [`two_snapshots_at_one_bci_are_rejected`] on purpose: the two fixtures
+    /// differ only in whether the nodes claim their snapshots, so neither can
+    /// pass by the check having quietly stopped running.
+    #[test]
+    fn two_claimed_snapshots_at_one_bci_are_a_copied_body() {
+        let mut g = linear_graph();
+        let a = g.add(Op::Const(1), IrType::Int, vec![], Some(4));
+        let b = g.add(Op::Const(2), IrType::Int, vec![], Some(4));
+        g.push_safepoint(crate::ir::SafepointSnapshot {
+            bci: 4,
+            locals: vec![a],
+            stack: vec![],
+        });
+        g.push_safepoint(crate::ir::SafepointSnapshot {
+            bci: 4,
+            locals: vec![b],
+            stack: vec![],
+        });
+        assert!(g.set_node_frame_snapshot(a, 0));
+        assert!(g.set_node_frame_snapshot(b, 1));
+        assert!(
+            verify_graph(&g, "test", VerifyOptions::default()).is_ok(),
+            "two snapshots at one bci, each claimed by the node it describes, \
+             is what a per-copy unroll produces",
+        );
+
+        // Drop ONE claim and the collision is back: nothing names snapshot 1,
+        // so the by-bci scan resolves that program point to snapshot 0.
+        g.nodes[b as usize].frame_snapshot = None;
+        let err = verify_graph(&g, "test", VerifyOptions::default()).unwrap_err();
+        assert!(message(&err).contains("describe bci 4"), "{}", message(&err));
+    }
+
+    /// A duplicated bci NO node carries is unconsultable, not ambiguous.
+    ///
+    /// `build_deopt_points` anchors through `bci_native`, which is populated
+    /// only from nodes, and every guard resumes at some node's own
+    /// `bytecode_pc` — so nothing can ever ask about a bci the code does not
+    /// emit. This is the normal state of a graph after a full unroll, whose
+    /// post-unroll constant fold retires the very nodes that made the body's
+    /// bcis real.
+    #[test]
+    fn duplicate_snapshots_at_an_unemitted_bci_are_not_a_violation() {
+        let mut g = linear_graph();
+        let k = g.add(Op::Const(1), IrType::Int, vec![], Some(9));
+        for _ in 0..2 {
+            g.push_safepoint(crate::ir::SafepointSnapshot {
+                bci: 4,
+                locals: vec![k],
+                stack: vec![],
+            });
+        }
+        assert!(
+            verify_graph(&g, "test", VerifyOptions::default()).is_ok(),
+            "no node carries bci 4, so neither snapshot can be reached",
+        );
     }
 
     /// Distinct bcis are the normal case and must stay clean, including when
@@ -1813,7 +1975,7 @@ mod tests {
     #[test]
     fn the_duplicate_bci_check_is_part_of_the_frame_state_lane() {
         let mut g = linear_graph();
-        let k = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let k = g.add(Op::Const(1), IrType::Int, vec![], Some(4));
         g.safepoints.push(crate::ir::SafepointSnapshot {
             bci: 4,
             locals: vec![k],

@@ -209,6 +209,32 @@ fn identity_handle_table() -> &'static Mutex<HashMap<i32, i64>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Every receiver `open_and_register` has ever handed an archive handle to,
+/// by identity hash. APPEND-ONLY, deliberately: `identity_handle_table` drops
+/// its entry at `close`, and a closed `JarFile` is still a REAL archive whose
+/// `close`/`getName` must keep answering from the natives rather than from a
+/// real JDK body that would NPE on the `res` field CratonVM never populates.
+///
+/// Read from the interpreter's redefine-immunity gate through
+/// [`identity_is_known_archive`]; see `zip_immunity_waived_for_receiver` in
+/// `vm/src/runtime/interpreter/native_override.rs` for what it decides.
+fn known_archive_ids() -> &'static Mutex<std::collections::HashSet<i32>> {
+    static T: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Has an archive ever been opened ON the object with this identity hash?
+///
+/// `false` for a `JarFile`/`ZipFile` instance that no constructor ever ran on
+/// -- which on this VM means exactly one thing in practice: a Mockito INLINE
+/// mock, allocated by objenesis. Such a receiver has no handle for the natives
+/// to find and no `res` field graph for the real JDK body to read, so the
+/// natives can only answer `null`/0 for it, silently, without recording the
+/// invocation the test is verifying.
+pub fn identity_is_known_archive(id: i32) -> bool {
+    known_archive_ids().lock().contains(&id)
+}
+
 /// `System.identityHashCode(this)` — stable per object across GC.
 fn identity_hash(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
     match ctx.invoke(
@@ -410,15 +436,21 @@ fn open_and_register(
     if io_flags().dbg_jar {
         eprintln!("[JAR] open handle={handle} table_len={table_len} path={validated_path:?}");
     }
+    // GC: `create_string` allocates and the store that follows goes through
+    // `this`.
+    let pin = ctx.pin_native_root(this);
     set_jar_handle(ctx, this, handle);
     // Recovery key for `get_jar_handle` when the object has no writable handle
     // slot (plain ZipFile): map its identity hash → handle.
     if let Some(id) = identity_hash(ctx, this) {
         identity_handle_table().lock().insert(id, handle);
+        known_archive_ids().lock().insert(id);
     }
     // Also store the name on the parent ZipFile's `name` field if present.
     let name_str = ctx.create_string(path_str);
+    let this = ctx.read_native_pin(pin, this);
     ctx.set_field_by_name(this, "name", Value::Object(Some(name_str)));
+    ctx.unpin_native_roots(pin);
     Ok(None)
 }
 
@@ -634,12 +666,29 @@ fn alloc_zip_entry(
         .creation
         .map(|time| zip_filetime(ctx, time))
         .transpose()?;
+    // GC: the comment above is half right. Materializing the three times
+    // BEFORE the entry keeps `entry` out of a bare local — and leaves `mtime`,
+    // `atime`, `ctime` and `name_str` in bare locals instead, across a
+    // `create_string`, a `new_array`, an `ensure_class_initialized` and two
+    // `alloc_object`s, with every one of them stored into the entry at the end.
+    // Pin those four (and the extra array); `entry` is minted last and stored
+    // through immediately, so it needs nothing.
+    let mtime_pin = mtime.map(|o| (ctx.pin_native_root(o), o));
+    let atime_pin = atime.map(|o| (ctx.pin_native_root(o), o));
+    let ctime_pin = ctime.map(|o| (ctx.pin_native_root(o), o));
     let name_str = ctx.create_string(name);
+    let name_pin = ctx.pin_native_root(name_str);
     let extra = extra.map(|bytes| {
         let array = ctx.new_array(ArrayElementType::Byte, bytes.len());
         ctx.write_byte_array_from(array, 0, &bytes);
         array
     });
+    let extra_pin = extra.map(|a| (ctx.pin_native_root(a), a));
+    let pin_base = mtime_pin
+        .or(atime_pin)
+        .or(ctime_pin)
+        .map(|(h, _)| h)
+        .unwrap_or(name_pin);
     let (entry, real_layout) = match ctx.ensure_class_initialized("java/util/zip/ZipEntry") {
         Ok(cid) => {
             let real = ctx.class_num_total_fields(cid);
@@ -651,6 +700,12 @@ fn alloc_zip_entry(
         }
         Err(_) => (ctx.alloc_object(ClassId::new(0), 6), false),
     };
+    let name_str = ctx.read_native_pin(name_pin, name_str);
+    let extra = extra_pin.map(|(h, a)| ctx.read_native_pin(h, a));
+    let mtime = mtime_pin.map(|(h, o)| ctx.read_native_pin(h, o));
+    let atime = atime_pin.map(|(h, o)| ctx.read_native_pin(h, o));
+    let ctime = ctime_pin.map(|(h, o)| ctx.read_native_pin(h, o));
+    ctx.unpin_native_roots(pin_base);
     if real_layout {
         // Do not dual-write synthetic slots here: in the real JDK layout slot
         // 1 is `xdostime`, not `method`. The old write of `method` to slot 1
@@ -963,6 +1018,9 @@ fn build_byte_array_input_stream(
     // a 4 MiB class-bytes entry is one memcpy instead of 4M
     // `Value::Int` allocations + 4M dispatches.
     ctx.write_byte_array_from(array, 0, data);
+    // GC: `array` must survive the class initialization and the `alloc_object`
+    // below; it is the constructor's argument.
+    let array_pin = ctx.pin_native_root(array);
     let bais_class = "java/io/ByteArrayInputStream";
     let cid = ctx.ensure_class_initialized(bais_class).map_err(|_| {
         MethodCallFailed::InternalError(VmError::Internal {
@@ -971,12 +1029,17 @@ fn build_byte_array_input_stream(
     })?;
     // Construct via <init>([B) — the standard BAIS ctor.
     let obj = ctx.alloc_object(cid, ctx.class_num_total_fields(cid).max(4));
+    // GC: `obj` is what this returns, and `<init>` runs Java in between.
+    let obj_pin = ctx.pin_native_root(obj);
+    let array = ctx.read_native_pin(array_pin, array);
     ctx.invoke(
         bais_class,
         "<init>",
         "([B)V",
         &[Value::Object(Some(obj)), Value::Object(Some(array))],
     )?;
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(array_pin);
     Ok(obj)
 }
 
@@ -1027,6 +1090,12 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         })
     })?;
     let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
+    // GC: `<init>` runs Java, then one `alloc_zip_entry` (several allocations
+    // each) and one `add` per entry — a jar with N entries gives `list` N
+    // chances to move before it is returned. Jasper's TLD scan runs this 121
+    // times per embedded-container start.
+    let list_pin = ctx.pin_native_root(list);
+    let mut list = list;
     ctx.invoke(al_class, "<init>", "()V", &[Value::Object(Some(list))])?;
     for meta in entries {
         let ze = alloc_zip_entry(
@@ -1039,6 +1108,7 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
             meta.extra,
             meta.times,
         )?;
+        list = ctx.read_native_pin(list_pin, list);
         ctx.invoke(
             al_class,
             "add",
@@ -1046,6 +1116,8 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
             &[Value::Object(Some(list)), Value::Object(Some(ze))],
         )?;
     }
+    list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -1163,6 +1235,9 @@ fn native_jarfile_get_manifest(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
     // Feed the bytes to a fresh Manifest via new Manifest(InputStream).
     let bais = build_byte_array_input_stream(ctx, &mf_bytes)?;
+    // GC: `bais` is the constructor argument below and has to survive the
+    // Manifest class initialization and allocation.
+    let bais_pin = ctx.pin_native_root(bais);
     let mf_class = "java/util/jar/Manifest";
     let mf_cid = ctx.ensure_class_initialized(mf_class).map_err(|_| {
         MethodCallFailed::InternalError(VmError::Internal {
@@ -1170,12 +1245,16 @@ fn native_jarfile_get_manifest(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         })
     })?;
     let mf_obj = ctx.alloc_object(mf_cid, ctx.class_num_total_fields(mf_cid).max(2));
+    let mf_pin = ctx.pin_native_root(mf_obj);
+    let bais = ctx.read_native_pin(bais_pin, bais);
     ctx.invoke(
         mf_class,
         "<init>",
         "(Ljava/io/InputStream;)V",
         &[Value::Object(Some(mf_obj)), Value::Object(Some(bais))],
     )?;
+    let mf_obj = ctx.read_native_pin(mf_pin, mf_obj);
+    ctx.unpin_native_roots(bais_pin);
     Ok(Some(Value::Object(Some(mf_obj))))
 }
 

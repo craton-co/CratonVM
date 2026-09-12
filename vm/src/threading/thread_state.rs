@@ -270,6 +270,15 @@ impl ThreadExecState {
             // Blocked: `fold_pointer_map_into_blocked` remaps the deposited
             // snapshot and composes `fixup` / `slot_origins`; the thread
             // applies them in `check_post_block_gc`.
+            //
+            // That was only true of INTERPRETER frames until 2026-09-08. A
+            // thread blocked in a native with COMPILED frames below it keeps
+            // its live oops in JIT frame slots, register images and the shadow
+            // stack, and the wake remapped none of them — the JIT half existed
+            // but was wired into the leaked-region fallback and gated off by
+            // default. `apply_blocked_wake_jit_remap` now runs on the ordinary
+            // wake, which is what makes `PermittedWithRewrite` a true statement
+            // about this state rather than one about half of it.
             ThreadExecState::NativeBlocked => RelocationRule::PermittedWithRewrite,
             // Not yet `stw_ready`: the startup loop waits the pause out via
             // `arrive_and_wait_excluded` and applies the returned map.
@@ -430,6 +439,12 @@ const TABLE: &[(ThreadExecState, ThreadExecState)] = &[
     // The same OS thread re-attaching after `DetachCurrentThread`
     // (native/jni.rs::attach_foreign_thread). The registry entry is new; the
     // shadow cell is revived.
+    //
+    // This row is now redundant with `is_legal`, which blesses EVERY edge out
+    // of `Terminated` because a carrier outlives the virtual threads whose
+    // deaths it records. It stays because it is the one such edge anybody has
+    // a call site for, and a reader looking for where re-attach is modelled
+    // should find it in the table.
     (S::Terminated, S::Starting),
 ];
 
@@ -439,9 +454,50 @@ const TABLE: &[(ThreadExecState, ThreadExecState)] = &[
 /// (nested blocking regions share one `in_blocked_region` flag, and a nested
 /// JIT entry only deepens `GLOBAL_JIT_DEPTH`). Treating those as violations
 /// would report the *counting* discipline, not a state error.
+///
+/// # A cell in `Terminated` is not a dead OS thread, so every edge out of it
+/// is legal
+///
+/// The shadow record is **per OS thread**; the states it tracks belong to a
+/// **logical** thread. Those are the same object only for platform threads.
+/// A carrier multiplexes virtual threads: when one of them dies, `mark_dead`
+/// records `Terminated` on the CARRIER's cell, and the carrier then picks up
+/// the next continuation and records whatever that one is doing. The tripwire
+/// read every one of those as a dead thread coming back to life.
+///
+/// Measured 2026-09-11, one `VthreadProbe` run (10 000 virtual threads, debug
+/// binary, `CRATONVM_STRESS_THREAD_STATES` at its `cfg!(debug_assertions)`
+/// default):
+///
+/// ```text
+/// 8314  Terminated -> JavaRunning      gc_barrier::leave_blocked_region_flagged
+/// 1667  Terminated -> JavaRunning      thread_registry::mark_stw_ready
+///    3  Terminated -> SafepointParked  gc_barrier::leave_blocked_region_flagged:drain
+///    2  Terminated -> SafepointParked  gc_barrier::arrive_and_wait_inner:excluded
+///    2  SafepointParked -> Terminated  gc_barrier::arrive_and_wait_inner:resume
+/// ```
+///
+/// 9 986 reports, one per virtual thread, 4.2 MB of `tracing::error!` on a
+/// probe whose real output is 759 bytes. `(Terminated, Starting)` in the table
+/// is the SAME phenomenon seen once, at one site — a JNI thread re-attaching —
+/// and blessing that single edge is what made the other four look like
+/// defects. `try_record_transition` has always called `revive_current_cell()`
+/// for `from == Terminated`, so revival was already a modelled concept; only
+/// the legality check had not been told about it.
+///
+/// This deliberately gives up on one thing: a genuinely resurrected thread,
+/// recorded on the same cell, now reads as a revival. The record cannot tell
+/// the two apart — under M:N the cell is the carrier's and the identity is
+/// the continuation's — so the choice is between missing that and reporting
+/// every virtual thread in the process. See
+/// `docs/internal/retired/vthread-and-prestart-probe-caps-FIXED-20260911.md`.
 #[inline]
 pub fn is_legal(from: ThreadExecState, to: ThreadExecState) -> bool {
     if from == to {
+        return true;
+    }
+    // Revival, not resurrection -- see the section above.
+    if from == ThreadExecState::Terminated {
         return true;
     }
     let mut i = 0;
@@ -1012,15 +1068,64 @@ impl ThreadStateCensus {
             .sum()
     }
 
-    /// Threads whose state forbids relocation. A non-zero answer is the
-    /// shadow-side statement of the
-    /// `mark_moving_young_coverage_incomplete_because` obligation.
+    /// Threads whose state forbids relocation.
+    ///
+    /// **This count includes the COLLECTING thread and therefore discriminates
+    /// nothing on its own.** `JavaRunning` and `VmRunning` are both
+    /// [`RelocationRule::Forbidden`], and the thread taking the census is in
+    /// one of them by construction, so the answer is never zero: measured at
+    /// `blockers=1` on all 452 collector decisions across four reps, relocating
+    /// and not. Anything built on `relocation_blockers() > 0` fires on every
+    /// cycle — including this method's own former doc, which called a non-zero
+    /// answer "the shadow-side statement of the
+    /// `mark_moving_young_coverage_incomplete_because` obligation".
+    ///
+    /// Use [`Self::peer_relocation_blockers`] for that statement.
     pub fn relocation_blockers(&self) -> u64 {
         ThreadExecState::ALL
             .iter()
             .filter(|s| s.relocation_rule() == RelocationRule::Forbidden)
             .map(|s| self.get(*s))
             .sum()
+    }
+
+    /// PEER threads whose state both forbids relocation and says their refs are
+    /// unrewritable — the shadow-side statement of the
+    /// `mark_moving_young_coverage_incomplete_because` obligation, with the
+    /// initiator subtracted so a zero is reachable.
+    ///
+    /// The two predicates are ANDed on purpose. `relocation_rule() ==
+    /// Forbidden` alone counts a second mutator merely RUNNING, which a
+    /// stop-the-world is about to park through a path that rewrites it
+    /// ([`ThreadExecState::SafepointParked`] is `PermittedWithRewrite`). What
+    /// the obligation is about is a peer whose refs live somewhere no pointer
+    /// map consumer reaches — registers and JIT spill slots — which is exactly
+    /// [`ThreadExecState::may_hold_unrewritable_object_refs`].
+    ///
+    /// `initiator` is the collecting thread's own state, and exactly one thread
+    /// is subtracted from THAT state's population — not from the total. The
+    /// distinction is the whole point: subtracting from the total would cancel
+    /// a genuine `CompiledUninterruptible` peer against an initiator recorded
+    /// in a different state, turning the one reading that matters into a zero.
+    ///
+    /// The census is taken without stopping the world, so the initiator may
+    /// already have been recorded elsewhere; that shows up as a population of
+    /// zero for its state and nothing is subtracted.
+    pub fn peer_relocation_blockers(&self, initiator: ThreadExecState) -> u64 {
+        let qualifies = |s: ThreadExecState| {
+            s.relocation_rule() == RelocationRule::Forbidden
+                && s.may_hold_unrewritable_object_refs()
+        };
+        let total: u64 = ThreadExecState::ALL
+            .iter()
+            .filter(|s| qualifies(**s))
+            .map(|s| self.get(*s))
+            .sum();
+        if qualifies(initiator) && self.get(initiator) > 0 {
+            total.saturating_sub(1)
+        } else {
+            total
+        }
     }
 }
 
@@ -1219,14 +1324,18 @@ mod tests {
     fn representative_illegal_transitions_are_rejected() {
         // `S` is the module-level alias for `ThreadExecState`, glob-imported
         // above.
-        // Terminated is terminal except for an OS-thread re-attach.
+        // Terminated is NOT terminal, and this loop used to assert that it
+        // was -- `!is_legal(S::Terminated, to)`, "a dead thread must not
+        // resume as {to}". The cell belongs to an OS thread and the state
+        // belongs to a LOGICAL one, which are the same object only for
+        // platform threads: a carrier records `Terminated` for every virtual
+        // thread that dies on it and then goes on working. One 10 000-vthread
+        // `VthreadProbe` run produced 9 986 reports out of `Terminated`, one
+        // per virtual thread, against 2 genuine ones. See `is_legal`.
         for to in ThreadExecState::ALL {
-            if to == S::Terminated || to == S::Starting {
-                continue;
-            }
             assert!(
-                !is_legal(S::Terminated, to),
-                "a dead thread must not resume as {to}"
+                is_legal(S::Terminated, to),
+                "a carrier that outlived a virtual thread must be able to record {to}"
             );
         }
         // A thread parked at the barrier cannot die: it must resume first
@@ -1525,8 +1634,66 @@ mod tests {
             "…and specifically as CompiledUninterruptible: {during:?}"
         );
 
+        // The PEER form is the one an obligation check can key on: the raw
+        // count above includes the collecting thread (`JavaRunning` /
+        // `VmRunning` are `Forbidden` too), so it is never zero and
+        // discriminates nothing. Subtracting a `VmRunning` initiator must
+        // still leave the compiled peer visible.
+        assert!(
+            during.peer_relocation_blockers(ThreadExecState::VmRunning) >= 1,
+            "the compiled peer must survive subtracting a VmRunning initiator: {during:?}"
+        );
+
         release_tx.send(()).expect("release send");
         worker.join().expect("relocation worker must not panic");
+    }
+
+    #[test]
+    fn peer_relocation_blockers_exclude_merely_running_threads() {
+        // A census holding ONLY running mutators states no obligation: a
+        // running thread is parked by the safepoint through a path that
+        // rewrites it (`SafepointParked` is `PermittedWithRewrite`). What the
+        // obligation is about is a peer whose refs live where no pointer map
+        // consumer reaches, which is `may_hold_unrewritable_object_refs`.
+        let mut census = ThreadStateCensus {
+            per_state: [0; ThreadExecState::COUNT],
+            terminated_total: 0,
+        };
+        census.per_state[ThreadExecState::JavaRunning.as_u8() as usize] = 3;
+        census.per_state[ThreadExecState::SafepointParked.as_u8() as usize] = 2;
+        census.per_state[ThreadExecState::NativeBlocked.as_u8() as usize] = 4;
+        // `JavaRunning` is `Forbidden`, so the raw count is non-zero…
+        assert_eq!(census.relocation_blockers(), 3);
+        // …while the peer form reads zero: no state here can hold a ref the
+        // collection cannot rewrite.
+        assert_eq!(
+            census.peer_relocation_blockers(ThreadExecState::VmRunning),
+            0
+        );
+
+        // One peer uninterruptibly inside compiled code IS the obligation, and
+        // a `VmRunning` initiator must not be subtracted from it — the census
+        // records no thread in that state, so there is nothing of the
+        // initiator's to take away.
+        census.per_state[ThreadExecState::CompiledUninterruptible.as_u8() as usize] = 1;
+        assert_eq!(
+            census.peer_relocation_blockers(ThreadExecState::VmRunning),
+            1
+        );
+        // …but a `VmRunning` initiator IS subtracted from the `VmRunning`
+        // population once that population exists, which is what makes a zero
+        // reachable at all.
+        census.per_state[ThreadExecState::VmRunning.as_u8() as usize] = 1;
+        assert_eq!(
+            census.peer_relocation_blockers(ThreadExecState::VmRunning),
+            1
+        );
+        // And with the compiled peer gone, the lone initiator cancels itself.
+        census.per_state[ThreadExecState::CompiledUninterruptible.as_u8() as usize] = 0;
+        assert_eq!(
+            census.peer_relocation_blockers(ThreadExecState::VmRunning),
+            0
+        );
     }
 
     #[test]

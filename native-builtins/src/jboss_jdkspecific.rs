@@ -501,13 +501,19 @@ fn populate_boot_layer_modules_body(
         // `:242` the layer one), and fixing the layer alone moved the failure
         // by zero lines.
         //
-        // Registering against the SYSTEM loader is what the real
+        // Registering against the application loader is what the real
         // `ModuleLayer.defineModules` does for boot-layer modules resolved from
         // `--module-path`: they are defined to the application loader, and its
-        // catalog is what the lookup walks. `getServicesCatalog` creates the
-        // catalog if absent, and `register(Module)` reads
-        // `descriptor.provides()`, so a module that declares none is a no-op
-        // rather than a special case.
+        // catalog is what the lookup walks. That is true of `--module-path`
+        // modules and NOT of the JDK's own, which the real JVM defines to the
+        // platform loader (`jdk.localedata`, `jdk.zipfs`) or the boot loader
+        // (`java.base`) -- so the callee asks each module which loader it
+        // belongs to rather than sending every one to the system loader, which
+        // is what it used to do and what left
+        // `ServiceLoader.loadInstalled` empty for every service.
+        // `getServicesCatalog` creates the catalog if absent, and
+        // `register(Module)` reads `descriptor.provides()`, so a module that
+        // declares none is a no-op rather than a special case.
         let module = ctx.read_native_pin(module_pin, module);
         register_module_in_loader_catalog(ctx, module);
 
@@ -517,41 +523,144 @@ fn populate_boot_layer_modules_body(
     Ok(())
 }
 
-/// Add `module` to the system class loader's `ServicesCatalog`.
+/// Add `module` to the `ServicesCatalog` of the loader the module ACTUALLY
+/// belongs to.
 ///
-/// Best-effort by design: every step is a real-JDK call that a synthetic-JDK
-/// build may not have, and a missing services catalog must not take the boot
-/// layer down with it. A caller that gets no catalog is exactly where it was
-/// before this existed.
+/// This used to register every module against
+/// `ClassLoader.getSystemClassLoader()` unconditionally. That is right for the
+/// case it was written for -- boot-layer modules resolved from
+/// `--module-path`, which a real `ModuleLayer.defineModules` does define to the
+/// application loader -- and wrong for every JDK module, which the real JVM
+/// defines to the PLATFORM loader (`jdk.localedata`, `jdk.zipfs`,
+/// `jdk.charsets`) or to the BOOT loader (`java.base`).
+///
+/// The consequence was that `ServiceLoader.loadInstalled(S)` -- which is
+/// `load(S, ClassLoader.getPlatformClassLoader())` -- returned **nothing, for
+/// every service**, because nothing had ever been registered in the platform
+/// loader's catalog. `ServiceLoader.load(S)` kept working because the
+/// thread-context loader is the application loader, i.e. exactly the catalog
+/// everything had been dumped into. Measured before this change:
+///
+/// ```text
+///                                     load()   loadInstalled()
+///   HotSpot 21  LocaleDataMetaInfo       2           2
+///   HotSpot 21  FileSystemProvider       2           2
+///   CratonVM 21 LocaleDataMetaInfo       2           0
+///   CratonVM 21 FileSystemProvider       2           0
+/// ```
+///
+/// Nothing throws on that path: an empty `ServiceLoader` iteration is
+/// indistinguishable from a service that genuinely has no providers, so every
+/// caller silently takes its no-provider arm. The visible symptom was
+/// `CLDRLocaleProviderAdapter`, whose static initialiser uses `loadInstalled`
+/// to find the supplementary `LocaleDataMetaInfo`: it got null, kept only
+/// `java.base`'s 5 base language tags instead of 1063, truthfully reported that
+/// it does not support `de-DE`, and `LocaleProviderAdapter.getAdapter` fell
+/// through to `FallbackLocaleProviderAdapter` -- whose root/English data IS the
+/// US separators every non-English locale was answering with.
+/// See docs/internal/retired/serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-FIXED-20260909.md
+///
+/// The boot loader is NOT `getServicesCatalog(null)`. `ServiceLoader` reads
+/// boot-module providers from `BootLoader.getServicesCatalog()` specifically
+/// (`ModuleServicesLookupIterator` branches on `loader == null` before it ever
+/// consults `ServicesCatalog`), so a plain `Module.getClassLoader()` swap would
+/// have silently dropped `java.base`'s own providers instead of moving them.
+/// That branch is why this is not a one-line change.
+///
+/// Best-effort by design, unchanged: every step is a real-JDK call that a
+/// synthetic-JDK build may not have, and a missing services catalog must not
+/// take the boot layer down with it. A caller that gets no catalog is exactly
+/// where it was before this existed.
 fn register_module_in_loader_catalog(ctx: &mut dyn NativeContext, module: ObjectRef) {
     let module_pin = ctx.pin_native_root(module);
-    let loader = match ctx.invoke(
-        "java/lang/ClassLoader",
-        "getSystemClassLoader",
-        "()Ljava/lang/ClassLoader;",
-        &[],
-    ) {
-        Ok(Some(Value::Object(Some(l)))) => l,
-        _ => {
+
+    // The module's OWN loader. `Module.getClassLoader()` answers null for a
+    // boot-loader module, which is a real answer here and not a failure.
+    let loader = match ctx.invoke_virtual(module, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+    {
+        Ok(Some(Value::Object(l))) => l,
+        // Could not ask. Fall back to the previous behaviour rather than
+        // skipping the module: the app-loader catalog is where `--module-path`
+        // modules belong, and half a catalog beats none.
+        _ => match ctx.invoke(
+            "java/lang/ClassLoader",
+            "getSystemClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(l)))) => Some(l),
+            _ => {
+                ctx.unpin_native_roots(module_pin);
+                return;
+            }
+        },
+    };
+
+    let loader_pin = loader.map(|l| (ctx.pin_native_root(l), l));
+    let loader = loader_pin.map(|(pin, l)| ctx.read_native_pin(pin, l));
+
+    let catalog = match loader {
+        // A named loader (platform or app): its own catalog.
+        Some(l) => ctx.invoke(
+            "jdk/internal/module/ServicesCatalog",
+            "getServicesCatalog",
+            "(Ljava/lang/ClassLoader;)Ljdk/internal/module/ServicesCatalog;",
+            &[Value::Object(Some(l))],
+        ),
+        // Boot loader. `ServiceLoader` looks here and nowhere else for
+        // boot-module providers.
+        None => ctx.invoke(
+            "jdk/internal/loader/BootLoader",
+            "getServicesCatalog",
+            "()Ljdk/internal/module/ServicesCatalog;",
+            &[],
+        ),
+    };
+    // If the module's own catalog could not be obtained, fall back to the
+    // system loader's rather than registering the module NOWHERE. Before this
+    // change every module went into the system catalog, so returning here would
+    // make a `BootLoader.getServicesCatalog` that this build cannot call a
+    // REGRESSION -- `java.base`'s providers would stop being visible to
+    // `ServiceLoader.load` as well, which is strictly worse than the defect
+    // being fixed. Best-effort means degrading to the old behaviour, not to
+    // nothing.
+    let catalog = match catalog {
+        Ok(Some(Value::Object(Some(c)))) => Some(c),
+        _ => match ctx.invoke(
+            "java/lang/ClassLoader",
+            "getSystemClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(sys)))) => {
+                let sys_pin = ctx.pin_native_root(sys);
+                let sys = ctx.read_native_pin(sys_pin, sys);
+                let c = match ctx.invoke(
+                    "jdk/internal/module/ServicesCatalog",
+                    "getServicesCatalog",
+                    "(Ljava/lang/ClassLoader;)Ljdk/internal/module/ServicesCatalog;",
+                    &[Value::Object(Some(sys))],
+                ) {
+                    Ok(Some(Value::Object(Some(c)))) => Some(c),
+                    _ => None,
+                };
+                ctx.unpin_native_roots(sys_pin);
+                c
+            }
+            _ => None,
+        },
+    };
+    let catalog = match catalog {
+        Some(c) => c,
+        None => {
+            if let Some((pin, _)) = loader_pin {
+                ctx.unpin_native_roots(pin);
+            }
             ctx.unpin_native_roots(module_pin);
             return;
         }
     };
-    let loader_pin = ctx.pin_native_root(loader);
-    let loader = ctx.read_native_pin(loader_pin, loader);
-    let catalog = match ctx.invoke(
-        "jdk/internal/module/ServicesCatalog",
-        "getServicesCatalog",
-        "(Ljava/lang/ClassLoader;)Ljdk/internal/module/ServicesCatalog;",
-        &[Value::Object(Some(loader))],
-    ) {
-        Ok(Some(Value::Object(Some(c)))) => c,
-        _ => {
-            ctx.unpin_native_roots(loader_pin);
-            ctx.unpin_native_roots(module_pin);
-            return;
-        }
-    };
+
     let catalog_pin = ctx.pin_native_root(catalog);
     let catalog = ctx.read_native_pin(catalog_pin, catalog);
     let module = ctx.read_native_pin(module_pin, module);
@@ -562,7 +671,9 @@ fn register_module_in_loader_catalog(ctx: &mut dyn NativeContext, module: Object
         &[Value::Object(Some(catalog)), Value::Object(Some(module))],
     );
     ctx.unpin_native_roots(catalog_pin);
-    ctx.unpin_native_roots(loader_pin);
+    if let Some((pin, _)) = loader_pin {
+        ctx.unpin_native_roots(pin);
+    }
     ctx.unpin_native_roots(module_pin);
 }
 
@@ -689,6 +800,23 @@ fn build_module(
     layer: ObjectRef,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let registered = ctx.module_is_registered(name);
+    // `layer` arrives as a bare `ObjectRef`. Everything below it —
+    // `try_alloc_concurrent_synthetic`, `create_string`,
+    // `build_module_descriptor` — can run a moving young collection, and a
+    // relocated `layer` then gets STORED into the new Module's slot 0.
+    //
+    // That is not hypothetical and it is not benign: it is the defect
+    // `docs/known-issues/springboot/bindabletests-local-holds-an-interior-word-
+    // of-a-retired-tlab-filler-20260909.md` chased for two days. Under
+    // `CRATONVM_DBG_GC_STRESS` the pre-move address is handed back to the
+    // allocator within a cycle or two, so `Module.getLayer()` returns whatever
+    // was minted there next, and `[rset-verify]` reported the resulting
+    // `java/lang/Module slot=0 -> <dead young address>` edge on 3 560 of 3 594
+    // moving cycles. The caller already pins `layer` across
+    // `populate_boot_layer_modules` for exactly this reason; the pin has to
+    // extend through this function too, because this is where the allocations
+    // are.
+    let layer_pin = ctx.pin_native_root(layer);
     if registered {
         if let Some(cached) = ctx.get_cached_module_mirror(Some(name)) {
             // `Class.getModule()`'s builder never sets `layer`; seed it so
@@ -697,13 +825,21 @@ fn build_module(
                 ctx.get_field_by_name(cached, "layer"),
                 Value::Object(Some(_))
             ) {
+                let layer = ctx.read_native_pin(layer_pin, layer);
                 ctx.set_field_by_name(cached, "layer", Value::Object(Some(layer)));
             }
             record_module_packages(ctx, cached, name);
+            ctx.unpin_native_roots(layer_pin);
             return Ok(cached);
         }
     }
-    let module = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT)?;
+    let module = match try_alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT) {
+        Ok(m) => m,
+        Err(e) => {
+            ctx.unpin_native_roots(layer_pin);
+            return Err(e);
+        }
+    };
     let pin = ctx.pin_native_root(module);
     let name_str = ctx.create_string(name);
     let module = ctx.read_native_pin(pin, module);
@@ -711,11 +847,18 @@ fn build_module(
     // NB: no raw slot write here. Slot 0 of a REAL `java.lang.Module` is
     // `layer`, not `name` — see the `MODULE_FIELD_COUNT` doc comment for the
     // Elasticsearch failure a slot-indexed write on this object already cost.
+    let layer = ctx.read_native_pin(layer_pin, layer);
     ctx.set_field_by_name(module, "layer", Value::Object(Some(layer)));
-    let desc = build_module_descriptor(ctx, name)?;
+    let desc = match build_module_descriptor(ctx, name) {
+        Ok(d) => d,
+        Err(e) => {
+            ctx.unpin_native_roots(layer_pin);
+            return Err(e);
+        }
+    };
     let module = ctx.read_native_pin(pin, module);
     ctx.set_field_by_name(module, "descriptor", Value::Object(Some(desc)));
-    ctx.unpin_native_roots(pin);
+    ctx.unpin_native_roots(layer_pin);
     // Recorded off-object in `module_packages_table` (see its doc comment)
     // instead of a field slot; `native_module_get_packages` reads it back
     // the same way.
@@ -2547,23 +2690,98 @@ mod tests {
         );
     }
 
+    /// `Module.getPackages()` returns a set in the REAL `HashSet` shape: one
+    /// field, `map`, holding a populated `HashMap`.
+    ///
+    /// The layout is declared to the mock so `build_real_layout_string_hashset`
+    /// takes its real branch, which is the branch a real-JDK run takes and the
+    /// one `build_package_set`'s doc is about. This assertion used to read
+    /// `ctx.get_field(set, 1)` and expect an element COUNT there, which is the
+    /// fabricated `(array, size, capacity)` shape -- on a class whose one real
+    /// instance field is `map`, so slot 1 is off the end of it. That shape is
+    /// what `getPackages().size()` answering 0 came from in the first place,
+    /// and the last unconditional write of it (the helper's fallback arm) went
+    /// with the synthetic slot floor on 2026-09-12. Asserting it here would
+    /// have required putting that write back.
     #[test]
     fn module_get_packages_returns_populated_set_for_java_base() {
         let mut ctx = MockNativeContext::new();
+        // The real JDK 25 layouts, so `build_real_layout_string_hashset` takes
+        // its REAL branch -- the branch a real-JDK run takes. `declare` below
+        // registers the class id the way `ensure_class_initialized` does and
+        // then attaches the field metadata `resolve_field_index` reads.
+        fn declare(ctx: &mut MockNativeContext, class_name: &str, fields: &[(&str, &str)]) {
+            let cid = ctx
+                .ensure_class_initialized(class_name)
+                .expect("mock class registration cannot fail");
+            let metadata = fields
+                .iter()
+                .enumerate()
+                .map(|(slot_index, (name, descriptor))| cratonvm_native_api::FieldMetadata {
+                    name: (*name).to_string(),
+                    descriptor: (*descriptor).to_string(),
+                    access_flags: 0,
+                    slot_index,
+                    declaring_class_id: cid,
+                    is_static: false,
+                })
+                .collect();
+            ctx.set_declared_fields(cid, metadata);
+        }
+        declare(
+            &mut ctx,
+            "java/util/HashMap",
+            &[
+                ("table", "[Ljava/util/HashMap$Node;"),
+                ("size", "I"),
+                ("threshold", "I"),
+                ("loadFactor", "F"),
+                ("entrySet", "Ljava/util/Set;"),
+            ],
+        );
+        declare(
+            &mut ctx,
+            "java/util/HashMap$Node",
+            &[
+                ("hash", "I"),
+                ("key", "Ljava/lang/Object;"),
+                ("value", "Ljava/lang/Object;"),
+                ("next", "Ljava/util/HashMap$Node;"),
+            ],
+        );
+        declare(
+            &mut ctx,
+            "java/util/HashSet",
+            &[("map", "Ljava/util/HashMap;")],
+        );
+
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         let module = build_module(&mut ctx, "java.base", layer)
             .expect("build_module must succeed for a synthetic layer");
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
-        if let Value::Object(Some(set)) = result {
-            // slot 1 = size must match BOOT_JDK_PACKAGES.len()
-            match ctx.get_field(set, 1) {
-                Value::Int(n) => assert!(n > 0, "size must be > 0, got {}", n),
-                other => panic!("expected Int for size, got {:?}", other),
-            }
-        } else {
-            panic!("expected non-null Set");
+        let Value::Object(Some(set)) = result else {
+            panic!("expected non-null Set, got {:?}", result);
+        };
+        // Slot 0 is `HashSet.map`, the class's ONLY instance field.
+        let Value::Object(Some(map)) = ctx.get_field(set, 0) else {
+            panic!(
+                "HashSet.map must hold the backing HashMap, got {:?}",
+                ctx.get_field(set, 0)
+            );
+        };
+        // Slot 1 of the map is `HashMap.size`, and it is where the package
+        // count actually lives.
+        match ctx.get_field(map, 1) {
+            Value::Int(n) => assert!(n > 0, "backing map size must be > 0, got {}", n),
+            other => panic!("expected Int for HashMap.size, got {:?}", other),
+        }
+        // The table is a real bucket array, not the element array the
+        // fabricated shape used to put at slot 0 of the SET.
+        match ctx.get_field(map, 0) {
+            Value::Object(Some(_)) => {}
+            other => panic!("expected a bucket array in HashMap.table, got {:?}", other),
         }
     }
 

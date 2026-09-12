@@ -1563,6 +1563,86 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             }
             false
         }
+        /// Allocate the copy-on-write destination array with everything that
+        /// must survive it PINNED, and hand back their post-allocation
+        /// addresses.
+        ///
+        /// `ctx.new_array` ALLOCATES, and an allocation is a collection point.
+        /// Every mutator below then reads the OLD array, writes the receiver's
+        /// `array` field and releases the receiver's monitor — so all three
+        /// have to be re-read afterwards. A stale `old` copies out of memory
+        /// the sweep may have reclaimed; a stale `this` writes the swap into
+        /// it; and a stale monitor makes `MonitorTable::exit` dereference a
+        /// dead header, which is an `EXCEPTION_ACCESS_VIOLATION` when the young
+        /// slot was reclaimed and a PERMANENTLY LEAKED lock when it merely
+        /// moved (every later writer on that list then blocks forever).
+        fn cowal_pinned_new_array(
+            ctx: &mut dyn NativeContext,
+            len: usize,
+            this: &mut ObjectRef,
+            old_arr: &mut Option<ObjectRef>,
+            elem: &mut Value,
+        ) -> ObjectRef {
+            let base = ctx.pin_native_root(*this);
+            let old_h = old_arr.map(|a| ctx.pin_native_root(a));
+            let elem_h = match *elem {
+                Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+                _ => None,
+            };
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+            *this = ctx.read_native_pin(base, *this);
+            if let (Some(a), Some(h)) = (*old_arr, old_h) {
+                *old_arr = Some(ctx.read_native_pin(h, a));
+            }
+            if let (Value::Object(Some(o)), Some(h)) = (*elem, elem_h) {
+                *elem = Value::Object(Some(ctx.read_native_pin(h, o)));
+            }
+            ctx.unpin_native_roots(base);
+            new_arr
+        }
+
+        /// First index whose element matches `needle`, with the scan's three
+        /// references kept current across `cowal_element_matches`.
+        ///
+        /// That helper calls `Object.equals` — USER code, so it allocates and
+        /// can collect on every turn. The loops that used to inline this scan
+        /// held `this`, the array and the needle as pre-scan addresses and
+        /// dereferenced all three on the next turn.
+        fn cowal_find_pinned(
+            ctx: &mut dyn NativeContext,
+            this: &mut ObjectRef,
+            old_arr: &mut Option<ObjectRef>,
+            needle: &mut Value,
+            size: usize,
+        ) -> Option<usize> {
+            let base = ctx.pin_native_root(*this);
+            let old_h = old_arr.map(|a| ctx.pin_native_root(a));
+            let needle_h = match *needle {
+                Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+                _ => None,
+            };
+            let mut found = None;
+            for i in 0..size {
+                let Some(old) = *old_arr else { break };
+                let elem = ctx.get_array_element(old, i);
+                let n = *needle;
+                let matched = cowal_element_matches(ctx, elem, n);
+                *this = ctx.read_native_pin(base, *this);
+                if let (Some(a), Some(h)) = (*old_arr, old_h) {
+                    *old_arr = Some(ctx.read_native_pin(h, a));
+                }
+                if let (Value::Object(Some(o)), Some(h)) = (*needle, needle_h) {
+                    *needle = Value::Object(Some(ctx.read_native_pin(h, o)));
+                }
+                if matched {
+                    found = Some(i);
+                    break;
+                }
+            }
+            ctx.unpin_native_roots(base);
+            found
+        }
+
         // Reads — re-routed to use real-COWAL layout when available.  The
         // previous registrations delegated to `native_al_*` which assumed
         // ArrayList slot semantics; on a real COWAL receiver they read the
@@ -1616,46 +1696,34 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             ))
         });
         registry.register(cowal, "contains", "(Ljava/lang/Object;)Z", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let needle = args.get(1).copied().unwrap_or(Value::Object(None));
-            let (data, size) = cowal_read_state(ctx, this);
-            if let Some(arr) = data {
-                for i in 0..size {
-                    let elem = ctx.get_array_element(arr, i);
-                    if cowal_element_matches(ctx, elem, needle) {
-                        return Ok(Some(Value::Int(1)));
-                    }
-                }
-            }
-            Ok(Some(Value::Int(0)))
+            let mut needle = args.get(1).copied().unwrap_or(Value::Object(None));
+            let (mut data, size) = cowal_read_state(ctx, this);
+            let found = cowal_find_pinned(ctx, &mut this, &mut data, &mut needle, size);
+            Ok(Some(Value::Int(i32::from(found.is_some()))))
         });
         registry.register(cowal, "indexOf", "(Ljava/lang/Object;)I", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(-1))),
             };
-            let needle = args.get(1).copied().unwrap_or(Value::Object(None));
-            let (data, size) = cowal_read_state(ctx, this);
-            if let Some(arr) = data {
-                for i in 0..size {
-                    let elem = ctx.get_array_element(arr, i);
-                    if cowal_element_matches(ctx, elem, needle) {
-                        return Ok(Some(Value::Int(i as i32)));
-                    }
-                }
-            }
-            Ok(Some(Value::Int(-1)))
+            let mut needle = args.get(1).copied().unwrap_or(Value::Object(None));
+            let (mut data, size) = cowal_read_state(ctx, this);
+            let found = cowal_find_pinned(ctx, &mut this, &mut data, &mut needle, size);
+            Ok(Some(Value::Int(found.map_or(-1, |i| i as i32))))
         });
         registry.register(cowal, "toArray", "()[Ljava/lang/Object;", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let (data, size) = cowal_read_state(ctx, this);
-            let out = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+            let (mut data, size) = cowal_read_state(ctx, this);
+            // `new_array` collects; `data` is dereferenced right after it.
+            let mut no_elem = Value::Object(None);
+            let out = cowal_pinned_new_array(ctx, size, &mut this, &mut data, &mut no_elem);
             if let Some(arr) = data {
                 for i in 0..size {
                     ctx.set_array_element(out, i, ctx.get_array_element(arr, i));
@@ -1690,14 +1758,16 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         // `internalConfigurationAnnotationProcessor` before Spring Boot
         // could finish bootstrapping its main config class.
         registry.register(cowal, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let (data_opt, size) = cowal_read_state(ctx, this);
+            let (mut data_opt, size) = cowal_read_state(ctx, this);
             // Copy into snapshot array (matches COWAL semantics: writes after
             // iterator creation do not affect what the iterator sees).
-            let snap = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+            // `new_array` collects, and `data_opt` is read out right after it.
+            let mut no_elem = Value::Object(None);
+            let snap = cowal_pinned_new_array(ctx, size, &mut this, &mut data_opt, &mut no_elem);
             if let Some(data) = data_opt {
                 for i in 0..size {
                     let elem = ctx.get_array_element(data, i);
@@ -1740,7 +1810,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             "set",
             "(ILjava/lang/Object;)Ljava/lang/Object;",
             |ctx, args| {
-                let this = match args.first() {
+                let mut this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),
                 };
@@ -1748,9 +1818,9 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                     Some(Value::Int(i)) => *i,
                     _ => return Ok(Some(Value::Object(None))),
                 };
-                let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+                let mut new_val = args.get(2).copied().unwrap_or(Value::Object(None));
                 ctx.monitor_enter(this);
-                let (old_arr, size) = cowal_read_state(ctx, this);
+                let (mut old_arr, size) = cowal_read_state(ctx, this);
                 // See the `get` registration above for why this throws rather
                 // than answering `null`.
                 if raw_idx < 0 || raw_idx as usize >= size {
@@ -1766,7 +1836,8 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                     );
                 }
                 let idx = raw_idx as usize;
-                let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+                let new_arr =
+                    cowal_pinned_new_array(ctx, size, &mut this, &mut old_arr, &mut new_val);
                 let mut old_val = Value::Object(None);
                 if let Some(old) = old_arr {
                     for i in 0..size {
@@ -1785,14 +1856,15 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             },
         );
         registry.register(cowal, "add", "(Ljava/lang/Object;)Z", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+            let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.monitor_enter(this);
-            let (old_arr, size) = cowal_read_state(ctx, this);
-            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
+            let (mut old_arr, size) = cowal_read_state(ctx, this);
+            let new_arr =
+                cowal_pinned_new_array(ctx, size + 1, &mut this, &mut old_arr, &mut elem);
             if let Some(old) = old_arr {
                 for i in 0..size {
                     ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -1808,23 +1880,19 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             "addIfAbsent",
             "(Ljava/lang/Object;)Z",
             |ctx, args| {
-                let this = match args.first() {
+                let mut this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Int(0))),
                 };
-                let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+                let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
                 ctx.monitor_enter(this);
-                let (old_arr, size) = cowal_read_state(ctx, this);
-                if let Some(old) = old_arr {
-                    for i in 0..size {
-                        let cur = ctx.get_array_element(old, i);
-                        if cowal_element_matches(ctx, cur, elem) {
-                            ctx.monitor_exit(this);
-                            return Ok(Some(Value::Int(0)));
-                        }
-                    }
+                let (mut old_arr, size) = cowal_read_state(ctx, this);
+                if cowal_find_pinned(ctx, &mut this, &mut old_arr, &mut elem, size).is_some() {
+                    ctx.monitor_exit(this);
+                    return Ok(Some(Value::Int(0)));
                 }
-                let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
+                let new_arr =
+                    cowal_pinned_new_array(ctx, size + 1, &mut this, &mut old_arr, &mut elem);
                 if let Some(old) = old_arr {
                     for i in 0..size {
                         ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -1837,7 +1905,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             },
         );
         registry.register(cowal, "add", "(ILjava/lang/Object;)V", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
@@ -1845,9 +1913,9 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Int(i)) => *i,
                 _ => return Ok(None),
             };
-            let elem = args.get(2).copied().unwrap_or(Value::Object(None));
+            let mut elem = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.monitor_enter(this);
-            let (old_arr, size) = cowal_read_state(ctx, this);
+            let (mut old_arr, size) = cowal_read_state(ctx, this);
             // `add(int, E)` uses `rangeCheckForAdd`, so `index == size` is
             // legal and the exception is the PLAIN `IndexOutOfBoundsException`
             // (measured on HotSpot 25), unlike the absolute accessors above.
@@ -1862,7 +1930,8 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 .into());
             }
             let idx = raw_idx as usize;
-            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
+            let new_arr =
+                cowal_pinned_new_array(ctx, size + 1, &mut this, &mut old_arr, &mut elem);
             if let Some(old) = old_arr {
                 for i in 0..idx.min(size) {
                     ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -1879,7 +1948,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             Ok(None)
         });
         registry.register(cowal, "remove", "(I)Ljava/lang/Object;", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -1888,7 +1957,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             ctx.monitor_enter(this);
-            let (old_arr, size) = cowal_read_state(ctx, this);
+            let (mut old_arr, size) = cowal_read_state(ctx, this);
             // See the `get` registration above.
             if raw_idx < 0 || raw_idx as usize >= size {
                 ctx.monitor_exit(this);
@@ -1901,7 +1970,9 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 );
             }
             let idx = raw_idx as usize;
-            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size - 1);
+            let mut no_elem = Value::Object(None);
+            let new_arr =
+                cowal_pinned_new_array(ctx, size - 1, &mut this, &mut old_arr, &mut no_elem);
             let mut removed = Value::Object(None);
             if let Some(old) = old_arr {
                 for i in 0..idx {
@@ -1918,25 +1989,17 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         });
         // remove(Object)Z — remove first occurrence by value.
         registry.register(cowal, "remove", "(Ljava/lang/Object;)Z", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let needle = args.get(1).copied().unwrap_or(Value::Object(None));
+            let mut needle = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.monitor_enter(this);
-            let (old_arr, size) = cowal_read_state(ctx, this);
-            let mut found_idx: Option<usize> = None;
-            if let Some(old) = old_arr {
-                for i in 0..size {
-                    let elem = ctx.get_array_element(old, i);
-                    if cowal_element_matches(ctx, elem, needle) {
-                        found_idx = Some(i);
-                        break;
-                    }
-                }
-            }
+            let (mut old_arr, size) = cowal_read_state(ctx, this);
+            let found_idx = cowal_find_pinned(ctx, &mut this, &mut old_arr, &mut needle, size);
             if let Some(idx) = found_idx {
-                let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size - 1);
+                let new_arr =
+                    cowal_pinned_new_array(ctx, size - 1, &mut this, &mut old_arr, &mut needle);
                 if let Some(old) = old_arr {
                     for i in 0..idx {
                         ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -1954,12 +2017,14 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             }
         });
         registry.register(cowal, "clear", "()V", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
             ctx.monitor_enter(this);
-            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            let mut none_arr: Option<ObjectRef> = None;
+            let mut no_elem = Value::Object(None);
+            let new_arr = cowal_pinned_new_array(ctx, 0, &mut this, &mut none_arr, &mut no_elem);
             cowal_write_array(ctx, this, new_arr);
             ctx.monitor_exit(this);
             Ok(None)
@@ -2233,7 +2298,13 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 _ => return Ok(None),
             };
             let arr_len = ctx.array_length(entries);
+            // GC-safety: `accept` is an arbitrary user lambda; the consumer and
+            // the bucket array are both carried across every turn.
+            let action_pin = ctx.pin_native_root(action);
+            let entries_pin = ctx.pin_native_root(entries);
             for i in 0..arr_len {
+                let action = ctx.read_native_pin(action_pin, action);
+                let entries = ctx.read_native_pin(entries_pin, entries);
                 if let Value::Object(Some(entry)) = ctx.get_array_element(entries, i) {
                     let key = ctx.get_field(entry, 0);
                     let val = ctx.get_field(entry, 1);
@@ -2304,16 +2375,27 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 if let Some(Value::Object(Some(iter))) =
                     ctx.invoke_virtual(*coll, "iterator", "()Ljava/util/Iterator;", &[])?
                 {
+                    // GC-safety: `hasNext`/`next` are real bytecode and
+                    // `m18_lbq_add_internal` grows a backing array; the queue
+                    // being filled and the iterator driving it are both carried
+                    // in from outside.
+                    let this_pin = ctx.pin_native_root(this);
+                    let iter_pin = ctx.pin_native_root(iter);
                     loop {
+                        let this = ctx.read_native_pin(this_pin, this);
+                        let iter = ctx.read_native_pin(iter_pin, iter);
                         let has = ctx.invoke_virtual(iter, "hasNext", "()Z", &[])?;
                         if has != Some(Value::Int(1)) {
                             break;
                         }
+                        let iter = ctx.read_native_pin(iter_pin, iter);
                         let elem = ctx
                             .invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[])?
                             .unwrap_or(Value::Object(None));
+                        let this = ctx.read_native_pin(this_pin, this);
                         m18_lbq_add_internal(ctx, this, elem);
                     }
+                    ctx.unpin_native_roots(this_pin);
                 }
             }
             Ok(None)
@@ -2637,10 +2719,20 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     return Ok(Some(Value::Int(0)));
                 }
             };
+            // GC-safety: `Collection.add` is real bytecode and can grow the
+            // target; the drained queue, its backing array and the destination
+            // are all carried across every turn.
+            let this_pin = ctx.pin_native_root(this);
+            let arr_pin = ctx.pin_native_root(arr);
+            let coll_pin = ctx.pin_native_root(coll);
             for i in 0..size as usize {
+                let arr = ctx.read_native_pin(arr_pin, arr);
+                let coll = ctx.read_native_pin(coll_pin, coll);
                 let elem = ctx.get_array_element(arr, i);
                 ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
             }
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             ctx.set_field(this, 1, Value::Int(0));
             ctx.monitor_notify_all(this)?;
             ctx.monitor_exit(this);
@@ -2680,12 +2772,17 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             Ok(None)
         });
         registry.register(abq, "put", "(Ljava/lang/Object;)V", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
             let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+            // GC-safety: this loop parks on the monitor, which is the widest
+            // collection window there is, and dereferences `this` on the next
+            // turn.
+            let this_pin = ctx.pin_native_root(this);
             loop {
+                let mut this = ctx.read_native_pin(this_pin, this);
                 ctx.monitor_enter(this);
                 let size = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
@@ -2711,7 +2808,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     ctx.monitor_exit(this);
                     return Ok(None);
                 }
-                monitor_wait_release(ctx, this, Some(10))?;
+                monitor_wait_release(ctx, &mut this, Some(10))?;
             }
         });
         registry.register(abq, "offer", "(Ljava/lang/Object;)Z", |ctx, args| {
@@ -2783,11 +2880,15 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             Ok(Some(Value::Int(1)))
         });
         registry.register(abq, "take", "()Ljava/lang/Object;", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // GC-safety: parks on the monitor and dereferences `this` on
+            // the next turn.
+            let this_pin = ctx.pin_native_root(this);
             loop {
+                let mut this = ctx.read_native_pin(this_pin, this);
                 ctx.monitor_enter(this);
                 let size = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
@@ -2799,7 +2900,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     ctx.monitor_exit(this);
                     return Ok(Some(result));
                 }
-                monitor_wait_release(ctx, this, Some(10))?;
+                monitor_wait_release(ctx, &mut this, Some(10))?;
             }
         });
         registry.register(abq, "poll", "()Ljava/lang/Object;", |ctx, args| {
@@ -2825,7 +2926,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             "poll",
             "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
             |ctx, args| {
-                let this = match args.first() {
+                let mut this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),
                 };
@@ -2841,7 +2942,11 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
 
+                // GC-safety: parks on the monitor and dereferences `this`
+                // on the next turn.
+                let this_pin = ctx.pin_native_root(this);
                 loop {
+                    let mut this = ctx.read_native_pin(this_pin, this);
                     ctx.monitor_enter(this);
                     let size = match ctx.get_field(this, 1) {
                         Value::Int(n) => n,
@@ -2859,7 +2964,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                         return Ok(Some(Value::Object(None))); // timed out
                     }
                     let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-                    monitor_wait_release(ctx, this, Some(wait_ms))?;
+                    monitor_wait_release(ctx, &mut this, Some(wait_ms))?;
                 }
             },
         );
@@ -3015,11 +3120,19 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 Value::Int(n) => n,
                 _ => 0,
             };
+            // GC-safety: as in the LBQ drain above.
+            let this_pin = ctx.pin_native_root(this);
+            let arr_pin = ctx.pin_native_root(arr);
+            let coll_pin = ctx.pin_native_root(coll);
             for i in 0..size {
+                let arr = ctx.read_native_pin(arr_pin, arr);
+                let coll = ctx.read_native_pin(coll_pin, coll);
                 let idx = ((head + i) % cap) as usize;
                 let elem = ctx.get_array_element(arr, idx);
                 ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
             }
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             ctx.set_field(this, 1, Value::Int(0));
             ctx.set_field(this, 2, Value::Int(0));
             ctx.monitor_notify_all(this)?;
@@ -3044,11 +3157,17 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-        let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-        ctx.set_field(this, 0, Value::Object(Some(keys)));
-        ctx.set_field(this, 1, Value::Object(Some(vals)));
-        ctx.set_field(this, 2, Value::Int(0));
+        // `this` and the first array both predate the second allocation.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let keys_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+        let keys_h = scope.root(keys_obj);
+        let vals = scope.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+        let this = scope.get(&this_h);
+        let keys = scope.get(&keys_h);
+        scope.set_field(this, 0, Value::Object(Some(keys)));
+        scope.set_field(this, 1, Value::Object(Some(vals)));
+        scope.set_field(this, 2, Value::Int(0));
         Ok(None)
     });
 
@@ -3062,24 +3181,47 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let key = args.get(1).copied().unwrap_or(Value::Object(None));
-            let val = args.get(2).copied().unwrap_or(Value::Object(None));
-            ctx.monitor_enter(this);
-            let size = match ctx.get_field(this, 2) {
+            // `compareTo` below runs arbitrary Java on every probe of the
+            // search loop, and the grow arm allocates twice. The receiver, both
+            // arrays and both arguments cross all of that, so the whole body
+            // works through the scope and re-reads each address after anything
+            // that can collect.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let key_h = match args.get(1) {
+                Some(Value::Object(Some(o))) => Some(scope.root(*o)),
+                _ => None,
+            };
+            let val_h = match args.get(2) {
+                Some(Value::Object(Some(o))) => Some(scope.root(*o)),
+                _ => None,
+            };
+            let key_plain = args.get(1).copied().unwrap_or(Value::Object(None));
+            let val_plain = args.get(2).copied().unwrap_or(Value::Object(None));
+            let key = |scope: &cratonvm_native_api::NativeHandleScope| match &key_h {
+                Some(h) => Value::Object(Some(scope.get(h))),
+                None => key_plain,
+            };
+            let val = |scope: &cratonvm_native_api::NativeHandleScope| match &val_h {
+                Some(h) => Value::Object(Some(scope.get(h))),
+                None => val_plain,
+            };
+            scope.monitor_enter(this);
+            let size = match scope.get_field(this, 2) {
                 Value::Int(n) => n as usize,
                 _ => 0,
             };
-            let keys_arr = match ctx.get_field(this, 0) {
-                Value::Object(Some(a)) => a,
+            let keys_src_h = match scope.get_field(this, 0) {
+                Value::Object(Some(a)) => scope.root(a),
                 _ => {
-                    ctx.monitor_exit(this);
+                    scope.monitor_exit(this);
                     return Ok(Some(Value::Object(None)));
                 }
             };
-            let vals_arr = match ctx.get_field(this, 1) {
-                Value::Object(Some(a)) => a,
+            let vals_src_h = match scope.get_field(this, 1) {
+                Value::Object(Some(a)) => scope.root(a),
                 _ => {
-                    ctx.monitor_exit(this);
+                    scope.monitor_exit(this);
                     return Ok(Some(Value::Object(None)));
                 }
             };
@@ -3087,16 +3229,21 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
             // Find insertion point via linear scan (compareTo)
             let mut pos = size;
             for i in 0..size {
-                let existing_key = ctx.get_array_element(keys_arr, i);
+                let keys_arr = scope.get(&keys_src_h);
+                let existing_key = scope.get_array_element(keys_arr, i);
                 if let Value::Object(Some(ek)) = existing_key {
+                    let probe = key(&scope);
                     if let Ok(Some(Value::Int(cmp))) =
-                        ctx.invoke_virtual(ek, "compareTo", "(Ljava/lang/Object;)I", &[key])
+                        scope.invoke_virtual(ek, "compareTo", "(Ljava/lang/Object;)I", &[probe])
                     {
                         if cmp == 0 {
                             // Key exists — replace value
-                            let old = ctx.get_array_element(vals_arr, i);
-                            ctx.set_array_element(vals_arr, i, val);
-                            ctx.monitor_exit(this);
+                            let vals_arr = scope.get(&vals_src_h);
+                            let old = scope.get_array_element(vals_arr, i);
+                            let v = val(&scope);
+                            scope.set_array_element(vals_arr, i, v);
+                            let this = scope.get(&this_h);
+                            scope.monitor_exit(this);
                             return Ok(Some(old));
                         } else if cmp > 0 {
                             pos = i;
@@ -3107,38 +3254,58 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
             }
 
             // Grow if needed
-            let cap = ctx.array_length(keys_arr);
+            let keys_arr = scope.get(&keys_src_h);
+            let cap = scope.array_length(keys_arr);
             if size >= cap {
                 let new_cap = cap * 2;
-                let new_keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
-                let new_vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                let new_keys_obj =
+                    scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                let new_keys_h = scope.root(new_keys_obj);
+                let new_vals = scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                let new_keys = scope.get(&new_keys_h);
+                let keys_arr = scope.get(&keys_src_h);
+                let vals_arr = scope.get(&vals_src_h);
+                let this = scope.get(&this_h);
+                let key = key(&scope);
+                let val = val(&scope);
                 for i in 0..size {
-                    ctx.set_array_element(new_keys, i, ctx.get_array_element(keys_arr, i));
-                    ctx.set_array_element(new_vals, i, ctx.get_array_element(vals_arr, i));
+                    let k = scope.get_array_element(keys_arr, i);
+                    scope.set_array_element(new_keys, i, k);
+                    let v = scope.get_array_element(vals_arr, i);
+                    scope.set_array_element(new_vals, i, v);
                 }
-                ctx.set_field(this, 0, Value::Object(Some(new_keys)));
-                ctx.set_field(this, 1, Value::Object(Some(new_vals)));
+                scope.set_field(this, 0, Value::Object(Some(new_keys)));
+                scope.set_field(this, 1, Value::Object(Some(new_vals)));
                 // Re-fetch after resize
                 let keys_arr = new_keys;
                 let vals_arr = new_vals;
                 // Shift right from pos
                 for i in (pos..size).rev() {
-                    ctx.set_array_element(keys_arr, i + 1, ctx.get_array_element(keys_arr, i));
-                    ctx.set_array_element(vals_arr, i + 1, ctx.get_array_element(vals_arr, i));
+                    let k = scope.get_array_element(keys_arr, i);
+                    scope.set_array_element(keys_arr, i + 1, k);
+                    let v = scope.get_array_element(vals_arr, i);
+                    scope.set_array_element(vals_arr, i + 1, v);
                 }
-                ctx.set_array_element(keys_arr, pos, key);
-                ctx.set_array_element(vals_arr, pos, val);
+                scope.set_array_element(keys_arr, pos, key);
+                scope.set_array_element(vals_arr, pos, val);
             } else {
                 // Shift right from pos
+                let keys_arr = scope.get(&keys_src_h);
+                let vals_arr = scope.get(&vals_src_h);
                 for i in (pos..size).rev() {
-                    ctx.set_array_element(keys_arr, i + 1, ctx.get_array_element(keys_arr, i));
-                    ctx.set_array_element(vals_arr, i + 1, ctx.get_array_element(vals_arr, i));
+                    let k = scope.get_array_element(keys_arr, i);
+                    scope.set_array_element(keys_arr, i + 1, k);
+                    let v = scope.get_array_element(vals_arr, i);
+                    scope.set_array_element(vals_arr, i + 1, v);
                 }
-                ctx.set_array_element(keys_arr, pos, key);
-                ctx.set_array_element(vals_arr, pos, val);
+                let k = key(&scope);
+                let v = val(&scope);
+                scope.set_array_element(keys_arr, pos, k);
+                scope.set_array_element(vals_arr, pos, v);
             }
-            ctx.set_field(this, 2, Value::Int((size + 1) as i32));
-            ctx.monitor_exit(this);
+            let this = scope.get(&this_h);
+            scope.set_field(this, 2, Value::Int((size + 1) as i32));
+            scope.monitor_exit(this);
             Ok(Some(Value::Object(None)))
         },
     );
@@ -3446,7 +3613,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
         });
         // transfer(E) — blocking: adds element and waits until it is consumed
         registry.register(ltq, "transfer", "(Ljava/lang/Object;)V", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
@@ -3460,7 +3627,11 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 _ => 0,
             };
             ctx.monitor_exit(this);
+            // GC-safety: parks on the monitor until a consumer takes the
+            // element, and dereferences `this` on the next turn.
+            let this_pin = ctx.pin_native_root(this);
             loop {
+                let mut this = ctx.read_native_pin(this_pin, this);
                 let size_now = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
                     _ => 0,
@@ -3469,7 +3640,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                     return Ok(None);
                 }
                 ctx.monitor_enter(this);
-                monitor_wait_release(ctx, this, Some(5))?;
+                monitor_wait_release(ctx, &mut this, Some(5))?;
             }
         });
         // tryTransfer(E) — non-blocking: add if there's a waiting consumer
@@ -3530,7 +3701,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
             "poll",
             "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
             |ctx, args| {
-                let this = match args.first() {
+                let mut this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),
                 };
@@ -3545,7 +3716,11 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+                // GC-safety: parks on the monitor -- the widest collection
+                // window there is -- and dereferences `this` on the next turn.
+                let this_pin = ctx.pin_native_root(this);
                 loop {
+                    let mut this = ctx.read_native_pin(this_pin, this);
                     ctx.monitor_enter(this);
                     let size = match ctx.get_field(this, 1) {
                         Value::Int(n) => n,
@@ -3563,17 +3738,21 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                         return Ok(Some(Value::Object(None)));
                     }
                     let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-                    monitor_wait_release(ctx, this, Some(wait_ms))?;
+                    monitor_wait_release(ctx, &mut this, Some(wait_ms))?;
                 }
             },
         );
         // take() — blocking
         registry.register(ltq, "take", "()Ljava/lang/Object;", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // GC-safety: parks on the monitor and dereferences `this` on
+            // the next turn.
+            let this_pin = ctx.pin_native_root(this);
             loop {
+                let mut this = ctx.read_native_pin(this_pin, this);
                 ctx.monitor_enter(this);
                 let size = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
@@ -3585,7 +3764,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                     ctx.monitor_exit(this);
                     return Ok(Some(result));
                 }
-                monitor_wait_release(ctx, this, Some(10))?;
+                monitor_wait_release(ctx, &mut this, Some(10))?;
             }
         });
         // peek() — non-blocking
@@ -3763,7 +3942,9 @@ pub(crate) fn native_rl_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let tid = ctx.thread_id() as i64;
     let key = rl_key(ctx, this);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let mut this = ctx.read_native_pin(this_pin, this);
         // Atomically claim (or reentrantly re-claim) the lock under the
         // side-table mutex. `claimed` is true iff this call now holds it.
         let claimed = rl_with(key, |st| {
@@ -3797,7 +3978,7 @@ pub(crate) fn native_rl_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             // absorb that here, restore the flag via `thread_interrupt` on
             // our own thread object, and keep retrying instead of
             // propagating the exception out of a method that must not throw.
-            if let Err(e) = monitor_wait_release(ctx, this, Some(5)) {
+            if let Err(e) = monitor_wait_release(ctx, &mut this, Some(5)) {
                 if is_interrupted_exception(&e) {
                     let self_thread = ctx.current_thread_object();
                     ctx.thread_interrupt(self_thread);
@@ -3893,7 +4074,9 @@ pub(crate) fn native_rl_try_lock_timeout(
     }
     let key = rl_key(ctx, this);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let mut this = ctx.read_native_pin(this_pin, this);
         let claimed = rl_with(key, |st| {
             if st.owner == RL_UNOWNED || st.owner == tid {
                 st.owner = tid;
@@ -3912,7 +4095,7 @@ pub(crate) fn native_rl_try_lock_timeout(
         }
         let wait_ms = remaining.as_millis().min(5).max(1) as u64;
         ctx.monitor_enter(this);
-        monitor_wait_release(ctx, this, Some(wait_ms))?;
+        monitor_wait_release(ctx, &mut this, Some(wait_ms))?;
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(
@@ -4620,7 +4803,9 @@ fn sem_acquire_blocking(ctx: &mut dyn NativeContext, this: ObjectRef, n: i32) ->
     // Install the holder up-front (re-binding `this` across the possible
     // allocation) so no allocation happens inside the monitor section.
     let mut this = sem_prepare(ctx, this);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let mut this = ctx.read_native_pin(this_pin, this);
         // GC-SAFEPOINT FIX (STW cross-thread JIT-takeover barrier deadlock,
         // same class as native_cdl_await's fix in commit 51a508e1): a raw
         // `ctx.monitor_enter` never marks this thread GC-blocked, so a
@@ -4894,7 +5079,6 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
     let es = "java/util/concurrent/ExecutorService";
     let exec = "java/util/concurrent/Executors";
     let tp = "java/util/concurrent/ThreadPoolExecutor";
-    let aes = "java/util/concurrent/AbstractExecutorService";
     let tf = "java/util/concurrent/ThreadFactory";
 
     // Executors factory methods — return synthetic executor objects
@@ -4936,18 +5120,32 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
         native_es_submit_callable,
     );
-    registry.register(
-        aes,
-        "submit",
-        "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
-        native_es_submit_runnable,
-    );
-    registry.register(
-        aes,
-        "submit",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
-        native_es_submit_callable,
-    );
+    // 2026-09-11, lane 5 residual §9.3 — the four
+    // `java/util/concurrent/AbstractExecutorService` registrations that stood
+    // here are DELETED, not retired.
+    //
+    // `submit(Runnable)`, `submit(Callable)`, `submit(Runnable, T)` and
+    // `invokeAny(Collection)` were registered on an ABSTRACT class. A dispatch
+    // door asks the registry about the DECLARING class of the resolved method,
+    // and every concrete executor in the image — `ThreadPoolExecutor`,
+    // `ForkJoinPool` — carries its own registration of the same names, so the
+    // abstract one is never the answer. `apps/probes/L5ExecutorSweep.java`
+    // builds the one receiver shape that could reach it (a direct subclass
+    // declaring only `execute`) and the rows still read `invocations: 0`, on
+    // every probe run and in all 132 `--jdk-only` corpus reports.
+    //
+    // Lane 0 §1: a door that never opens is dead weight, not a §1.4 shadow, so
+    // this is a deletion and the triples are deliberately NOT in
+    // `RETIRED_SHADOW_L5_TRIPLES` — a retirement table entry would claim a
+    // dispatch nobody has ever observed.
+    //
+    // What still names this class: `native_es_submit_runnable` and
+    // `native_es_submit_callable` (`lucene_es.rs`) and the two closures below
+    // pass it to `invoke_special_bytecode_only` as the class whose BYTECODE to
+    // run for a genuinely-real executor. That call does not consult the
+    // registry, so it is unaffected by these deletions — and with them gone it
+    // is now the only way this class name reaches dispatch, which is the state
+    // those guards were written assuming.
     // JDK-ONLY-WAVE2 (2026-08-06): `native_es_execute` is adjudicated a
     // `SyntheticStub`, not the ambient kind this registrar would otherwise give
     // it. It is a compatibility stand-in for CratonVM's synthetic 2-field
@@ -5062,6 +5260,41 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
 
     // RD.6: submit(Runnable, T) — bind the given result.
     let submit_rt_closure = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
+        // BUG-CCE-0716, and this overload was the one it MISSED. Its two
+        // siblings -- `native_es_submit_runnable` and
+        // `native_es_submit_callable` -- both delegate a genuinely-real
+        // receiver to `AbstractExecutorService`'s own bytecode; this one ran
+        // the task inline on the CALLING thread and handed back an
+        // already-completed future, so a real `ThreadPoolExecutor` never saw
+        // the task at all.
+        //
+        // The tell is the pool's own accounting, and `apps/probes/L5TpeCount.java`
+        // reads it per submission shape on a 2-worker pool given 3 tasks and
+        // then shut down and joined -- at which point every count is
+        // determined:
+        //
+        //   shape                 HotSpot            CratonVM (before)
+        //   execute               completed=3        completed=3
+        //   submit(Callable)      completed=3        completed=3
+        //   submit(Runnable)      completed=3        completed=3
+        //   submit(Runnable, T)   completed=3        completed=0   <-- here
+        //   invokeAll             completed=3        completed=3
+        //   invokeAny             completed=1        completed=0   <-- and here
+        //
+        // A count is the mild half of it: the task also ran on the wrong
+        // THREAD, which is the difference a start-gate `CountDownLatch`
+        // deadlocks on (see `spawn_runnable_on_real_thread`'s note on the
+        // eager-inline policy this is the last of).
+        if let Some(Value::Object(Some(this))) = args.first() {
+            if crate::executor_is_real(ctx, *this) {
+                return ctx.invoke_special_bytecode_only(
+                    "java/util/concurrent/AbstractExecutorService",
+                    "submit",
+                    "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;",
+                    args,
+                );
+            }
+        }
         if let Some(Value::Object(Some(runnable))) = args.get(1) {
             ctx.invoke_virtual(*runnable, "run", "()V", &[])?;
         }
@@ -5081,12 +5314,8 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;",
         submit_rt_closure,
     );
-    registry.register(
-        aes,
-        "submit",
-        "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;",
-        submit_rt_closure,
-    );
+    // See the §9.3 note above: the `AbstractExecutorService` copy of this
+    // overload was deleted with the other three.
 
     // RD.6: invokeAll(Collection<Callable>) -> List<Future> — run sequentially.
     let invoke_all_closure = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
@@ -5129,6 +5358,21 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(c))) => *c,
             _ => return Ok(Some(Value::Object(None))),
         };
+        // Same omission as `submit_rt_closure` above, and the same remedy: a
+        // genuinely-real executor runs `AbstractExecutorService.invokeAny`,
+        // so the task is submitted to the pool rather than called inline on
+        // the caller. `L5TpeCount` reads `completed=0` against HotSpot's `1`
+        // without this.
+        if let Some(Value::Object(Some(this))) = args.first() {
+            if crate::executor_is_real(ctx, *this) {
+                return ctx.invoke_special_bytecode_only(
+                    "java/util/concurrent/AbstractExecutorService",
+                    "invokeAny",
+                    "(Ljava/util/Collection;)Ljava/lang/Object;",
+                    args,
+                );
+            }
+        }
         let iter_val = ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[])?;
         let mut last_err: Option<cratonvm_types::error::MethodCallFailed> = None;
         if let Some(Value::Object(Some(iter))) = iter_val {
@@ -5171,12 +5415,8 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/Collection;)Ljava/lang/Object;",
         invoke_any_closure,
     );
-    registry.register(
-        aes,
-        "invokeAny",
-        "(Ljava/util/Collection;)Ljava/lang/Object;",
-        invoke_any_closure,
-    );
+    // See the §9.3 note above: the `AbstractExecutorService` copy of
+    // `invokeAny` was deleted with the other three.
 }
 
 /// Bug D (kafka-suite-0617) — submit a `Runnable` to a real, **bounded** pool of
@@ -5475,7 +5715,9 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ord).max(0) as u64;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let mut this = ctx.read_native_pin(this_pin, this);
         let done = match ctx.get_field(this, FUT_FIELD_DONE) {
             Value::Int(d) => d,
             _ => 0,
@@ -5492,7 +5734,7 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let wait_ms = remaining.as_millis().min(5).max(1) as u64;
         ctx.monitor_enter(this);
-        monitor_wait_release(ctx, this, Some(wait_ms))?;
+        monitor_wait_release(ctx, &mut this, Some(wait_ms))?;
     }
 }
 
@@ -7796,8 +8038,29 @@ where
         });
     }
     let out = body(ctx, this, &fixed);
-    ctx.unpin_native_roots(base);
+    // `body` RE-ENTERS JAVA (`invoke_virtual` into `HashMap.get`,
+    // `ArrayList.set`, ...), so a collection can run inside it and move the
+    // mutex just as the contended entry above can. The refresh after
+    // `monitor_enter_gc_safe` covers only the wait; the exit needs its own,
+    // and it has to happen BEFORE `unpin_native_roots(base)` truncates the
+    // stack that owns `mutex_h`.
+    //
+    // Without it `monitor_exit` dereferenced the PRE-BODY address:
+    // `MonitorTable::exit` opens with `header_of(obj_ref)`, so a mutex whose
+    // young slot the collection had reclaimed faulted there —
+    // `EXCEPTION_ACCESS_VIOLATION` inside `native_sync_map_get` /
+    // `sync_collection_delegate`, reproduced in seconds by
+    // `probes/OldToYoungBarrierSweep.java` under
+    // `--XX:UseGc Generational` with and without the JIT, and absent under
+    // ZGC only because its wrapper objects had not been relocated yet.
+    // The quiet face is worse than the loud one: a mutex that merely MOVED
+    // exits a monitor at its old address, so the real one is never released
+    // and every later waiter on that wrapper blocks forever.
+    let mutex = ctx.read_native_pin(mutex_h, mutex);
     ctx.monitor_exit(mutex);
+    // Unpin LAST: `monitor_exit` is the final use of a pinned reference, and
+    // the previous order released the pins while one was still live.
+    ctx.unpin_native_roots(base);
     out
 }
 
@@ -10793,7 +11056,7 @@ fn native_rwl_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let Some((owner, is_write)) = rwl_view_target(ctx, view) else {
+    let Some((mut owner, is_write)) = rwl_view_target(ctx, view) else {
         return Ok(None);
     };
     let tid = ctx.thread_id() as i64;
@@ -10814,7 +11077,7 @@ fn native_rwl_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             }
         };
         if still_blocked {
-            if let Err(e) = monitor_wait_release(ctx, owner, Some(5)) {
+            if let Err(e) = monitor_wait_release(ctx, &mut owner, Some(5)) {
                 if is_interrupted_exception(&e) {
                     let self_thread = ctx.current_thread_object();
                     ctx.thread_interrupt(self_thread);

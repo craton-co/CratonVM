@@ -1,0 +1,180 @@
+# =============================================================================
+# class-overrides.tsv — per-class runner accommodations for run-hib.sh
+#
+# THIS FILE IS TRACKED IN GIT ON PURPOSE.
+#
+# `apps/` is gitignored wholesale (.gitignore:12), so everything else in
+# apps/hib-suite-runner/ carries no history: it cannot be diffed, blamed, or
+# restored, and it has already been silently lost twice —
+#   * 2026-07-16: the driver files (rerun.sh, common.args, CratonRunner.java,
+#     testlist.txt, ...) were truncated to zero bytes by local disk exhaustion
+#     and were restored from a hib-suite-runner.tar backup three weeks stale;
+#   * 2026-07-22 -> 2026-07-31: the per-class timeout/mode accommodation for
+#     DefaultCatalogAndSchemaTest was implemented, validated, documented as
+#     "Resolved", and then vanished from run-hib.sh with nothing to flag it.
+#     See docs/known-issues/... (now fixed-suite-bugs/hibernate/
+#     qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md).
+#
+# run-hib.sh and this table are force-added (`git add -f`) past the apps/
+# ignore so a future truncation or stale-backup restore shows up as a normal
+# `git status` modification instead of disappearing invisibly.
+#
+# -----------------------------------------------------------------------------
+# FORMAT — tab-separated, three columns. `#` comments and blank lines ignored.
+#
+#   <fully.qualified.TestClass>   <timeout-seconds | ->   <extra VM flags | ->
+#
+#   timeout   a FLOOR, not an absolute: the class runs with
+#             max(this, the run's --timeout/$TIMEOUT). `-` = no override.
+#   flags     extra CratonVM flags appended for this class only, AFTER the
+#             @common.args argfile — so a `-D` here beats the same `-D` in
+#             common.args (last one wins, on CratonVM and HotSpot alike).
+#             They used to be placed BEFORE the argfile, which silently made
+#             every `-D` entry a no-op; changed 2026-09-11 for JpaLargeBlobTest
+#             below, which needs common.args' per-test
+#             `-Djunit.jupiter.execution.timeout.default=120s` raised.
+#             Space-separated. Already-present flags are not duplicated.
+#             `-` = none.
+#
+# Verify the table is actually live before trusting a suite run:
+#     ./run-hib.sh overrides
+# A run whose header does not print `overrides=N (loaded)` is running without
+# these accommodations and will misreport the classes below.
+# -----------------------------------------------------------------------------
+
+# DefaultCatalogAndSchemaTest — 132-method @ParameterizedClass matrix, each
+# method bootstrapping a SessionFactory and generating DDL. Legitimately far
+# slower than the suite's flat 300s per-class cap, so it needs a floor; without
+# one `timeout` kills it at 300s and it is reported HANG with ms=0 and no
+# @@RESULT, forever. Root cause of the original hang: fixed-suite-bugs/
+# hibernate/qualfiedtablenaming-hang-cluster-20260721-FIXED.md
+#
+# THE OLD RATIONALE HERE WAS STALE, AND SO WERE ITS NUMBERS. It said the class
+# was "deliberately quarantined to the interpreter (41cdfdf94)" via
+# NamingHelper.hashedName -> BigInteger.toString(35) ->
+# java/math/MutableBigInteger, and quoted clean runtimes of 620,902-1,804,813
+# ms. That quarantine was REMOVED on 2026-07-31 with the last static ban mirrors
+# (see the #[ignore] on `hibernate_biginteger_divide_cluster_is_never_background_enqueued`
+# in jit/src/tiered.rs) — the comment outlived the defect by six weeks and would
+# have sent the next reader hunting a JIT ban that no longer exists.
+#
+# What the time actually was, measured 2026-08-11 on Azure Linux with
+# `perf record`: `Arena::alloc` at 76% of all CPU, i.e. the arena span tier's
+# unbounded first-fit scan (fixed by keying it on size, gc/src/arena.rs). JIT-ON
+# was 3.8x SLOWER than --nojit before that fix and is faster than it after.
+# Sequential, same box, same 1500m heap, 132/132 both sides:
+#   real HotSpot   30s
+#   CratonVM      516s   (was ~2300s)
+# Still 17x, hence the floor stays — but 3600s is now generous rather than
+# barely sufficient, and a full-suite shard run measured 2194s under six-way
+# contention, so do not lower it without re-measuring under load.
+org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest	3600	-
+
+# OffsetDateTimeTest / ZonedDateTimeTest — legitimately slow, not a hang.
+# Both were originally read as witnesses of the moving-young-inert-under-JIT
+# throughput tax
+# (docs/known-issues/hibernate/moving-young-inert-under-jit-throughput-tax-20260730.md).
+# That is Generational-collector reasoning and the default collector moved to
+# ZGC on 2026-08-10; the cost under the CURRENT default was measured directly
+# on 2026-08-11 with `perf record`, and it was the ZGC conservative-root
+# interior-pointer walk (80.7% of all CPU samples in `VmHeap::is_heap_addr`),
+# fixed by the backwards object-start bit scan in `gc/src/zgc.rs`. Post-fix,
+# ZonedDateTimeTest runs found=608 ok=404 failed=0 aborted=204 in 381s on Azure
+# Linux at --Xmx 1500m — byte-identical counts to real HotSpot, which takes
+# 17s. So: still 20x+ HotSpot, still well over the suite's flat 300s cap, and
+# still not a hang. Not the same defect as DefaultCatalogAndSchemaTest above —
+# this is throughput, not correctness — but the mechanism (a flat cap too tight
+# for a legitimately slow class) is identical, so the same floor applies.
+org.hibernate.orm.test.type.temporal.OffsetDateTimeTest	900	-
+org.hibernate.orm.test.type.temporal.ZonedDateTimeTest	900	-
+
+# SmokeTests — same shape, arrived at from the opposite direction. Until
+# 2026-08-11 this class did not reach its own timeout at all: it died with
+# `OutOfMemoryError: Java heap space` allocating ANTLR's `DFAState[8192]`
+# (65552 bytes) into a free list holding 1.13 GiB whose largest hole was 65528
+# bytes — the ZGC TLAB chunk size, which on a non-compacting heap is the
+# granularity of free-list holes (fixed by raising ZGC_TLAB_MAX_CHUNK to
+# 512 KiB; see gc/src/zgc.rs). With that gone it is merely slow: found=17
+# ok=16 failed=0 skipped=1 in 322s at --Xmx 1500m, matching real HotSpot's
+# counts exactly (HotSpot: 10s). 322s is just past the flat 300s cap, and the
+# margin closes further under host load, so it needs the same floor as the
+# temporal pair rather than a 10% one.
+org.hibernate.orm.test.sql.exec.SmokeTests	900	-
+
+# ASTParserLoadingTest — the one entry here whose slowness is NOT the VM's.
+#
+# It is the class whose 300s kill caused the cross-class stale-schema cascade
+# (fixed-suite-bugs/hibernate/mysql-cross-class-stale-schema-shared-worker-db-
+# 20260822.md): killed at the cap, it left its 54 tables behind for every later
+# class on the shard that shares a table name. The harness now resets a shard's
+# worker database after a kill, so the cascade is closed either way — but with
+# no floor the class is still reported HANG with no per-test breakdown, which is
+# exactly how its supposed "21 real failures" stayed unexamined for a week.
+#
+# MEASURED 2026-08-27, one fresh MySQL 8.0.46 database per arm, same box, same
+# common.args, serial on an idle machine:
+#
+#   real HotSpot 25.0.3+9   104 ok, 0 failed   502s
+#   CratonVM (ZGC, 1500m)   104 ok, 0 failed   633s     <- 1.26x, not 25x
+#
+# HotSpot is over the cap too, which is the whole point: the wall is the
+# DATABASE, not the VM. Both arms issue a byte-identical 8533 SQL statements,
+# of which 6495 (76%) are DDL — 5616 `truncate table` alone, i.e. the fixture
+# truncating its ~54 tables after each of 104 tests. On InnoDB a TRUNCATE is a
+# tablespace drop-and-recreate, and that is what the 500-600s is.
+#
+# The floor is 3600 rather than ~1200 because the wall scales with load on the
+# DATABASE, not on the CPU: six concurrent copies (one fresh schema each, as a
+# six-way shard run would produce) took 1452-1456s each. That is also where the
+# page's headline "1447s" came from.
+org.hibernate.orm.test.hql.ASTParserLoadingTest	3600	-
+
+# JpaLargeBlobTest — the first class to be killed by the PER-TEST cap rather
+# than the per-class one, and it needs both columns to survive.
+#
+# The body is one test method that hands H2 a `LobInputStream` and asks it to
+# store `LobEntity.BLOB_LENGTH` = 100,000,000 bytes. `available()` returns 1,
+# so `InputStream.read(byte[],int,int)`'s default implementation falls back to
+# one `read()` call per byte, and each of those 100 million calls executes
+# `new Random().nextInt()` — a fresh Random per byte. It is a pure
+# allocate-and-nanoTime loop, nothing to do with the database.
+#
+# MEASURED 2026-09-11, same box (32 cores), same common.args, ZGC, --Xmx 1500m,
+# fork-per-class, 3 runs per arm:
+#
+#   real HotSpot 25.0.3+9   ok=1   6.5s / 7.1s / 8.4s
+#   CratonVM (ZGC, c1c2)    ok=1   144s idle; 270s and 277s with one other
+#                                  CratonVM copy of the same class on the box
+#
+# ~18x, the same order as OffsetDateTimeTest/ZonedDateTimeTest/SmokeTests above,
+# so: slow, not hung.
+#
+# WHY THE FLAGS COLUMN IS NEEDED TOO. 144s is over common.args' per-test
+# `-Djunit.jupiter.execution.timeout.default=120s`, which is a JUnit-level cap
+# and is NOT raised by the timeout column. Left at 120s the run does not fail
+# fast either: JUnit's SAME_THREAD timeout only interrupts, the byte loop never
+# checks the flag, and the interrupted run then takes LONGER than the
+# uninterrupted one — 238s/270s/286s over 3 runs, ending in
+# `TimeoutException: jpaBlobStream(...) timed out after 120 seconds`. That is
+# the whole 2026-09-11 suite observation: at 6 shards x 2 JIT arms the same work
+# crossed the flat 300s wall cap first and was recorded HANG rc=124 with ms=0 in
+# BOTH arms. Verified as JUnit behaviour, not a CratonVM one: HotSpot with the
+# cap forced to 1s/3s behaves identically (runs to completion, 11.3s/11.6s vs
+# an 8s baseline, then reports the same TimeoutException).
+#
+# So the floor alone would convert HANG into FAIL, and the flag alone would
+# leave it HANG. 900s on both, matching the temporal/SmokeTests floors and
+# leaving room for the 12-way contention a full two-arm run produces.
+#
+# CORRECTS TWO DOCS. known-issues/hibernate/
+# jpalargeblobtest-per-native-call-floor-20260830.md and the retired
+# jpalargeblob-random-state-side-table-FIXED-20260830.md both say the 120s is
+# "`@Timeout(120)`, a METHOD-level JUnit annotation, which no runner property
+# widens". There is no `@Timeout` anywhere in JpaLargeBlobTest.java; the 120s is
+# common.args' `junit.jupiter.execution.timeout.default`, and raising it does
+# widen the budget (measured: the same run that reports TimeoutException at 120s
+# reports ok=1 at 900s). That wrong sentence is why this class had no override.
+# The throughput finding on that page stands — 2318 ns/byte there, ~1440 today
+# after 5903d40ca inlined Long.longValue/Integer.intValue — it is only the
+# "cannot be widened" claim that is false.
+org.hibernate.orm.test.lob.JpaLargeBlobTest	900	-Djunit.jupiter.execution.timeout.default=900s

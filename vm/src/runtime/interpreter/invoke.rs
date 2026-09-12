@@ -359,7 +359,14 @@ pub(crate) fn invokevirtual_site_final_owner(
         store,
     )?;
     let owner = store.get(declaring_id).map(|c| c.name.to_string())?;
-    if final_devirt_native_shadow(shared, cm, cp_class_id, declaring_id, method_name, descriptor) {
+    if final_devirt_native_shadow(
+        shared,
+        cm,
+        cp_class_id,
+        declaring_id,
+        method_name,
+        descriptor,
+    ) {
         cratonvm_jit::FINAL_DEVIRT_NATIVE_SHADOW_REFUSED
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if crate::runtime::env_cache::dbg_jitc() {
@@ -450,7 +457,10 @@ fn final_devirt_native_shadow(
     // declaring class are the only receivers there are.
     for id in [cp_class_id, declaring_id] {
         if let Some(class) = store.get(id) {
-            if registry.find(&class.name, method_name, descriptor).is_some() {
+            if registry
+                .find(&class.name, method_name, descriptor)
+                .is_some()
+            {
                 return true;
             }
         }
@@ -1275,7 +1285,39 @@ pub(super) fn execute_invoke_kind(
     //
     // Costs one byte compare per non-special invoke on a name the caller has
     // already resolved; the body is reached only when the invariant is broken.
+    // ... and an array-typed call site whose receiver is NULL owes the same
+    // JEP 358 message every other `invokevirtual` owes. The receiver-driven
+    // `match` below has a `Value::Object(None)` arm that builds it; the
+    // array-typed branch is chosen BEFORE that match is reached, so a null
+    // array receiver used to skip the null check entirely and fall through to
+    // dispatch. `Object.clone()` is on `force_native_over_real_jdk_bytecode`'s
+    // list, so it reached `native_object_clone`, whose own null arm can only
+    // say `clone on null` — it is inside a native and has no bytecode context
+    // to name the expression from. MEASURED on JDK 25.0.3+9, BOTH modes:
+    //
+    //   static String[] sa;  sa.clone()
+    //     HotSpot   Cannot invoke "[Ljava.lang.String;.clone()"
+    //                 because "NpeCloneProbe.sa" is null
+    //     was       clone on null
+    //
+    // `arraylength` and `aaload` on the same null field were already right, so
+    // this was the one null-deref opcode family on an array that was not.
     if !is_special && method_class_name.starts_with('[') {
+        if matches!(args.first(), Some(Value::Object(None))) {
+            let npe_msg = helpful_npe_invoke_message(
+                shared,
+                thread,
+                frame_idx,
+                &method_class_name,
+                &method_name,
+                &method_descriptor,
+                num_params,
+            );
+            return Err(RuntimeError::NullPointerException {
+                message: Some(npe_msg),
+            }
+            .into());
+        }
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
             if shared.mem.heap.kind_of(recv) != cratonvm_types::ObjectKind::Array {
                 crate::memory::reclaim_guard::report_impossible_dispatch_terminal(
@@ -1372,18 +1414,24 @@ pub(super) fn execute_invoke_kind(
                     // zeroed-out GC from-space memory. Fall back to the constant
                     // pool method_ref class so dispatch has a chance to succeed.
                     if cid == ClassId::new(0) {
-                        // H1: Stale-pointer detection. Pre-fix, fresh
-                        // TLAB-allocated `new Object()` instances had
-                        // `identity_hash_code: 0` (the lazy-assignment
-                        // comment was aspirational and never wired up),
-                        // and a class with `cid=0`+`fields=0` produces
-                        // an all-zero first 16 bytes that this detector
-                        // could not distinguish from genuine stale
-                        // memory. The fix landed in `init_object_header`
-                        // (TLAB fast path) which now mints a non-zero
-                        // hash at allocation time, matching the
-                        // non-TLAB allocators in `gc::heap`/
-                        // `gc::gen_heap`/`gc::g1`.
+                        // H1: Stale-pointer detection. A `cid=0`+`fields=0`
+                        // object — `new Object()` — used to produce an
+                        // all-zero first 16 bytes that this detector could
+                        // not distinguish from genuine stale memory. That
+                        // has been fixed twice: first by minting an eager
+                        // identity hash in `init_object_header`, which the
+                        // 2026-08-06/07 header shrink undid when the hash
+                        // moved into the mark word and went lazy; then by
+                        // `GC_FLAG_HEADER` (2026-09-08), which puts the
+                        // distinction in the header itself rather than in a
+                        // value that has to be minted.
+                        //
+                        // The second fix is the durable one, and not only for
+                        // this detector: an all-zero header is also
+                        // unparseable by the young non-moving sweep's linear
+                        // walk, which is what
+                        // `h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908`
+                        // is about.
                         //
                         // The detector still fires the warn! when the
                         // header is genuinely all-zero — a true
@@ -1531,53 +1579,47 @@ pub(super) fn execute_invoke_kind(
                                     }
                                 }
                             }
-                            // A bare `new Object()` IS all-zero, legitimately.
+                            // A bare `new Object()` is no longer all-zero, so
+                            // the `java/lang/Object` demotion this block used to
+                            // carry is GONE.
                             //
-                            // `ObjectHeader::new` documents the mark word as
-                            // "no identity hash installed", `MARK_NEUTRAL`,
-                            // `ObjectKind::Object` and `ArrayElementType::
-                            // Reference` are all `0`, and a no-field `Object`
-                            // has `class_id = 0` and `shape = 0` — so every one
-                            // of the 16 bytes this detector reads is zero for a
-                            // healthy, freshly allocated `java.lang.Object`.
-                            // The comment on `init_object_header` still claims
-                            // a fix that made this impossible ("identity_hash_
-                            // code is now eagerly assigned at allocation time,
-                            // caller passes next_identity_hash()"), but the
-                            // 2026-08-06/07 header shrink folded the hash into
-                            // the mark word and left `ObjectHeader::new` with no
-                            // hash parameter at all, so the fast path cannot
-                            // assign one and the false positive is back.
+                            // The history is worth keeping, because it is the
+                            // same defect twice. `ObjectHeader::new` leaves
+                            // `MARK_NEUTRAL`, `ObjectKind::Object` and
+                            // `ArrayElementType::Reference` at `0`, and a
+                            // no-field `Object` has `class_id = 0` and
+                            // `shape = 0` — so every one of the 16 bytes this
+                            // detector reads was zero for a healthy, freshly
+                            // allocated `java.lang.Object`. An eager identity
+                            // hash used to hide that; the 2026-08-06/07 header
+                            // shrink folded the hash into the mark word and made
+                            // it lazy, and the false positive came back at a
+                            // 100% rate — six lines of Java, all four
+                            // collectors. This site's answer was to demote the
+                            // warn to debug for `Object`-declared call sites,
+                            // with the trade stated explicitly: a genuinely
+                            // stale receiver there logs at debug instead.
                             //
-                            // It fires on `new Object()` used as a lock or
-                            // sentinel — six lines of Java reproduce it, on all
-                            // four collectors — and the cost is not the log
-                            // line: this warning is the tripwire for the
-                            // reclaimed-live-receiver family (CRATONVM_DBG_BUG03
-                            // / _SWEEP_ZERO / _STALE_RECV all hang off it), and
-                            // a tripwire that fires on healthy code is one
-                            // nobody reads.
+                            // `GC_FLAG_HEADER` (2026-09-08) removed the premise
+                            // instead. A published header is never sixteen zero
+                            // bytes now, so `header_bytes == [0u8; 16]` means
+                            // what this detector always wanted it to mean, and
+                            // the trade is no longer worth making: by the old
+                            // comment's own reasoning it was only worth it
+                            // "against a 100% false-positive rate here". Zero
+                            // "Stale pointer detected" lines across the 92-vector
+                            // regression suite on all three collectors and the
+                            // H2 corpus after the change.
                             //
-                            // Demoted, not deleted, and only when the CP class
-                            // is `java/lang/Object` itself — i.e. an
-                            // `Object`-declared call site (hashCode/equals/
-                            // toString/...), where the fallback the detector
-                            // takes is the CORRECT dispatch for a real bare
-                            // `Object` anyway. The trade is explicit: a
-                            // genuinely stale receiver at an `Object`-declared
-                            // site now logs at debug instead of warn. That is
-                            // worth it against a 100% false-positive rate here,
-                            // and it is exactly the call already made two lines
-                            // below for `java/lang/ClassLoader`.
-                            //
-                            // WildFly / JBoss Modules often hits this path on
+                            // `java/lang/ClassLoader` KEEPS its demotion — it
+                            // was never about the all-zero-by-design shape.
+                            // WildFly / JBoss Modules hits this path on
                             // `ClassLoader`-typed invokevirtual sites when a
-                            // receiver lost its header but CP resolution is
-                            // already `java/lang/ClassLoader`; the CP fallback
-                            // succeeds and a WARN was mostly noise.
-                            if method_class_name.as_ref() == "java/lang/Object"
-                                || method_class_name.as_ref() == "java/lang/ClassLoader"
-                            {
+                            // receiver has genuinely lost its header but CP
+                            // resolution already says `java/lang/ClassLoader`;
+                            // the CP fallback succeeds and the WARN was mostly
+                            // noise.
+                            if method_class_name.as_ref() == "java/lang/ClassLoader" {
                                 tracing::debug!(
                                     "Stale pointer detected in invokevirtual receiver \
                                      (ptr={:p}, all-zero header) — falling back to CP class {}",
@@ -2811,6 +2853,29 @@ pub fn descriptor_return_ref(descriptor: &str) -> &str {
 
 pub fn split_method_descriptor_ref(descriptor: &str) -> (Vec<&str>, &str) {
     let bytes = descriptor.as_bytes();
+    // A descriptor that does not open with `(` is MALFORMED, and this function
+    // used to PANIC on it rather than reject it: `i` starts at 1 to skip the
+    // `(`, the two loops are bounded by `bytes.len()`, but the tail slice
+    // `&descriptor[i..]` is not -- so an EMPTY descriptor reached
+    // `&""[1..]` and panicked with "start byte index 1 is out of bounds for
+    // string of length 0".
+    //
+    // That panic crosses the native boundary. Measured 2026-09-10: with
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW` armed on core reflection,
+    // `MethodHandles.Lookup.unreflect(Method)` arrives here with an empty
+    // descriptor; the panic is logged as a "Native method panic caught" and
+    // then aborts the VM with `internal error`, which killed lane 3's
+    // instrument at row 126 of 245 and made the whole arm unscorable. A
+    // malformed descriptor must not be able to take the VM down.
+    //
+    // `descriptor_return_ref` directly above already states the house rule for
+    // this input -- it "returns `""` for a descriptor with no `')'`
+    // (malformed), which every consumer already treats as not-`V`, not-a-match"
+    // -- so the hardening existed and had been applied to one of the two
+    // neighbouring parsers. This is the other one.
+    if bytes.first() != Some(&b'(') {
+        return (Vec::new(), "");
+    }
     // Pre-size from the `(...)` span: one token is at least one byte, and no
     // real descriptor holds more than a handful. Without this the per-call Vec
     // reallocated through `RawVec::grow_one` on the lambda path.
@@ -3220,6 +3285,29 @@ pub(super) fn coerce_arg(
 // Getting from a call site's SAM descriptor to the implementation method,
 // and making the arguments fit: `interpreter/lambda.rs`.
 
+/// How a cached-native dispatch learns its return tag.
+///
+/// The tag decides one thing — whether the native's result is pushed onto the
+/// caller's operand stack — and it is needed only when the native actually
+/// returned a value, which is why [`RetTag::Scan`] stays lazy.
+#[derive(Clone, Copy)]
+pub(super) enum RetTag<'a> {
+    /// Read off the call site's cached `DescriptorFacts`; nothing to compute.
+    Known(u8),
+    /// Scan `descriptor` for the byte after `')'`, as this path always did.
+    Scan(&'a str),
+}
+
+impl RetTag<'_> {
+    #[inline]
+    fn resolve(self) -> u8 {
+        match self {
+            RetTag::Known(tag) => tag,
+            RetTag::Scan(descriptor) => crate::jit::return_type(descriptor),
+        }
+    }
+}
+
 /// [`invoke_cached_native_callback`] for the two inline-cache `Native` arms,
 /// which hold the resolved [`NativeMethodId`] and can therefore ask whether the
 /// slot claims **leaf** — see
@@ -3244,25 +3332,21 @@ pub(super) fn invoke_cached_native_callback_leaf_aware(
     callback: cratonvm_native_api::NativeCallback,
     native_id: cratonvm_native_api::NativeMethodId,
     args: &[Value],
-    method_descriptor: &str,
+    ret: RetTag<'_>,
 ) -> Result<(), MethodCallFailed> {
     if !shared.natives.native_methods.is_leaf_id(native_id) {
-        return invoke_cached_native_callback(
-            shared,
-            thread,
-            frame_idx,
-            callback,
-            args,
-            method_descriptor,
+        return invoke_cached_native_callback_impl(
+            shared, thread, frame_idx, callback, args, ret, false,
         );
     }
+    super::site_cache::site_stats::bump(super::site_cache::site_stats::NATFACTS_LEAF);
     // The native ring is deliberately not entered. It exists so a watchdog can
     // name the native a hung thread is inside; a leaf cannot block, so it can
     // never be the answer to that question, and `record_enter`/`record_exit`
     // are two of the calls this path exists to remove.
     let result = crate::vm::safe_native_call_leaf(shared, thread, callback, args)?;
     if let Some(value) = result {
-        let ret = crate::jit::return_type(method_descriptor);
+        let ret = ret.resolve();
         if ret != b'V' {
             let value = coerce_value_for_return(value, ret);
             push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
@@ -3279,7 +3363,7 @@ pub(super) fn invoke_cached_native_callback_impl(
     frame_idx: usize,
     callback: cratonvm_native_api::NativeCallback,
     args: &[Value],
-    method_descriptor: &str,
+    ret: RetTag<'_>,
     objects_prevalidated: bool,
 ) -> Result<(), MethodCallFailed> {
     // Widening: small integer index -> usize (non-negative, fits in pointer width)
@@ -3292,7 +3376,7 @@ pub(super) fn invoke_cached_native_callback_impl(
     cratonvm_native_api::native_ring::record_exit(_ring_idx);
     let result = result?;
     if let Some(value) = result {
-        let ret = crate::jit::return_type(method_descriptor);
+        let ret = ret.resolve();
         // A void method must not leave anything on the caller's operand stack,
         // even if its native happens to return `Some(_)` (many natives return
         // the receiver / a status for convenience). The slow path
@@ -3329,7 +3413,7 @@ pub(super) fn invoke_cached_native_callback(
         frame_idx,
         callback,
         args,
-        method_descriptor,
+        RetTag::Scan(method_descriptor),
         false,
     )
 }
@@ -3349,7 +3433,7 @@ pub(super) fn invoke_cached_native_callback_prevalidated(
         frame_idx,
         callback,
         args,
-        method_descriptor,
+        RetTag::Scan(method_descriptor),
         true,
     )
 }
@@ -3593,6 +3677,26 @@ pub(super) fn try_stackless_invoke(
     cratonvm_native_api::registry::lookup_census::probe(
         cratonvm_native_api::registry::lookup_census::INVOKE_STACKLESS,
     );
+
+    // The receiver, for the two redefine-immunity gates below. Only the ZIP arm
+    // of the immunity looks at it (see `zip_immunity_waived_for_receiver`), and
+    // only after a redefinition has actually happened, so this costs a slice
+    // index on every invoke and nothing else.
+    let receiver_for_immunity = match args.first() {
+        Some(Value::Object(Some(obj))) => Some(*obj),
+        _ => None,
+    };
+
+    // `CRATONVM_DBG_DEADREF_STORE`: were the arguments ALREADY dead on entry?
+    //
+    // `[deadref-arg]` fires where the arguments are laid into the callee's
+    // locals, which is the last statement of a long prologue and cannot say
+    // whether the collection that killed them ran inside that prologue or
+    // before this function was ever called. Asking the same question at entry
+    // splits it: a hit HERE means the caller handed down a slice it had already
+    // held across a collection, and the fix belongs upstream; a hit only at the
+    // frame build means the prologue is what needs bracketing.
+    crate::runtime::frame::note_dead_arg_pub(args, "try_stackless_invoke ENTRY");
 
     // Memo for the constant `DowncallHandle.type()` triple resolved in the
     // receiver-class-gated arm below (native-dispatch-memoization §3, B4).
@@ -4004,7 +4108,13 @@ pub(super) fn try_stackless_invoke(
             // native instead. Skip an ancestor's native the same way the
             // receiver-class check does.
             let parent_redefined = native_shadow_suppressed_in(&cm, &parent.name)
-                && !redefine_immune_forced_native(&parent.name, method_name, descriptor);
+                && !redefine_immune_forced_native_for_receiver(
+                    shared,
+                    &parent.name,
+                    method_name,
+                    descriptor,
+                    receiver_for_immunity,
+                );
             if !parent_redefined {
                 if let Some(cb) =
                     shared
@@ -4031,8 +4141,13 @@ pub(super) fn try_stackless_invoke(
     // Reflection-metadata natives stay authoritative (see
     // `redefine_immune_reflection_native`).
     let native_cb = if native_shadow_suppressed_by_redefine(shared, class_name)
-        && !redefine_immune_forced_native(class_name, method_name, descriptor)
-    {
+        && !redefine_immune_forced_native_for_receiver(
+            shared,
+            class_name,
+            method_name,
+            descriptor,
+            receiver_for_immunity,
+        ) {
         None
     } else {
         native_cb
@@ -4502,15 +4617,29 @@ pub(super) fn try_stackless_invoke(
     // `java.lang.reflect.Method` must not disable annotation reflection.
     let force_interface_default_native = declaring_is_interface
         && !is_static
-        && should_force_registered_native_over_bytecode(
+        && should_force_registered_native_over_bytecode_for_receiver(
             shared,
             &class_name_arc,
             method_name,
             descriptor,
+            receiver_for_immunity,
         );
+    // This is the gate that actually decides for `java/util/zip/ZipFile.close`
+    // and `.getName` on a Mockito inline mock. Measured 2026-09-10: with the
+    // other five converted and this one left receiver-blind,
+    // `CRATONVM_DBG_ZIPIMMUNE=off` intercepted and stubbed the mock perfectly
+    // while the receiver-aware waiver recorded zero invocations — the
+    // `[zipimmune]` trace showed the `java/util/zip/ZipFile` consultation
+    // arriving with no waiver line beside it, i.e. from here.
     if (!(declaring_is_interface && !is_static) || force_interface_default_native)
         && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
-            || redefine_immune_forced_native(&class_name_arc, method_name, descriptor))
+            || redefine_immune_forced_native_for_receiver(
+                shared,
+                &class_name_arc,
+                method_name,
+                descriptor,
+                receiver_for_immunity,
+            ))
     {
         // `find` -> `resolve_id` + `callback_of`: one hash either way
         // (`resolve_id(..).and_then(callback_of)` is documented to equal
@@ -5265,7 +5394,47 @@ mod param_tags_tests {
                 crate::jit::return_type(d),
                 "DescriptorFacts::ret_tag disagrees with jit::return_type for {d:?}"
             );
+            // The claim the cached-native arms rest on, stated directly:
+            // when the tag array is complete, reading `param_tags[i]` is the
+            // same byte `pop_coerced_invoke_args_*` would have obtained by
+            // scanning the descriptor it re-resolved. `native_site_facts_usable`
+            // admits exactly this shape.
+            if !facts.param_tags_overflow {
+                for i in 0..facts.param_tag_len as usize {
+                    assert_eq!(
+                        facts.param_tags[i],
+                        scanned.get(d, i),
+                        "cached-native facts tag {i} disagrees with the scan for {d:?}"
+                    );
+                }
+            }
         }
+    }
+
+    /// `native_site_facts_usable` must refuse exactly the two shapes the tag
+    /// array cannot describe, and admit everything else.
+    ///
+    /// It is the whole guard between the facts-driven argument pop and the
+    /// general helper, and both of its refusals are silent-wrong-answer shapes
+    /// rather than crashes: an overflowing descriptor has no tags past the
+    /// eighth parameter, and a `num_params` that disagrees with the tokenised
+    /// count means the entry and the descriptor describe different methods.
+    #[test]
+    fn cached_native_facts_are_refused_for_the_shapes_they_cannot_describe() {
+        use crate::runtime::interpreter::native_site_facts_usable;
+        let ok = cratonvm_jit_api::DescriptorFacts::of("(IJLjava/lang/String;)V");
+        assert!(native_site_facts_usable(&ok, 3, false));
+        assert!(native_site_facts_usable(&ok, 3, true));
+        // A count that disagrees with the tokenised one.
+        assert!(!native_site_facts_usable(&ok, 2, false));
+        assert!(!native_site_facts_usable(&ok, 4, false));
+        // More parameters than the inline tag array holds.
+        let over = cratonvm_jit_api::DescriptorFacts::of("(IIIIIIIII)V");
+        assert!(over.param_tags_overflow);
+        assert!(!native_site_facts_usable(&over, 9, false));
+        // Zero parameters is the commonest cached-native shape of all.
+        let none = cratonvm_jit_api::DescriptorFacts::of("()I");
+        assert!(native_site_facts_usable(&none, 0, true));
     }
 
     /// Slot 0 of a non-static call is the receiver and must answer `b'L'`

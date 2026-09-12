@@ -442,7 +442,7 @@ pub struct CachedBytecodeMethod {
     /// `intercept_force_registered_native_cached` at 1.67% and
     /// `real_http_url_connection_native` at **1.50%** of the interpreted-invoke
     /// arm, with a `memcpy` arm underneath (`str::eq` bottoms out in `memcmp`).
-    /// See `known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`.
+    /// See `docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md`.
     ///
     /// The *argument*- and *receiver*-dependent halves of those arms are NOT
     /// memoized and must not be: a null second argument, an Objenesis-shaped
@@ -884,6 +884,21 @@ pub mod npe_action {
     pub const ASTORE_CHAR: u8 = 16;
     /// `sastore` into a null `short[]`.
     pub const ASTORE_SHORT: u8 = 17;
+    /// `invokevirtual` / `invokeinterface` / `invokespecial` on a null
+    /// RECEIVER, recorded by every helper that detects one: the generic
+    /// `jit_invoke_dispatch`, the monomorphic `jit_invoke_virtual_mic`, and the
+    /// seven direct-bound intrinsics that stand in for one of these calls.
+    ///
+    /// Unlike every code above it this one names no fixed message — HotSpot's
+    /// action half is `Cannot invoke "Owner.name(sig)"`, which depends on the
+    /// call site — so `jit_action_message` maps it to `None` and it changes no
+    /// fallback. What it carries is the OPCODE FAMILY that trapped, which is
+    /// what lets `runtime::interpreter::jit_npe_message` corroborate the bci it
+    /// recovered from the frame's safepoint-id slot before reading an opcode
+    /// there. The dispatch call is a published safepoint (the emitter stores
+    /// `cur_bc_pc` immediately before it and files an oop map), so that slot
+    /// holds THIS invoke's bci while the helper runs.
+    pub const INVOKE_RECEIVER: u8 = 18;
 }
 /// Bit the JIT may set in `jit_getfield`'s `field_index` argument to say
 /// **"this receiver is already proven to be an oop"**.
@@ -946,10 +961,35 @@ pub const GETFIELD_RECEIVER_PROVEN_OOP: u64 = 1 << 62;
 /// `u16`-sized, so a real slot index cannot reach either.
 pub const GETFIELD_EXPECT_REFERENCE: u64 = 1 << 61;
 
+/// Where the NPE trap-SITE key sits in `jit_getfield`'s `field_index`
+/// argument, and how wide it is.
+///
+/// The key is what lets a null receiver at a `getfield` carry HotSpot's JEP 358
+/// message out of compiled code. The helper's null arm has the receiver (null)
+/// and the slot index, and neither names the FIELD or the bci — so on its own
+/// it can only raise an unmessaged `NullPointerException`, which is exactly
+/// what it did until 2026-09-11. The emitter knows both; it records them as a
+/// trap site (`x64::inlining::record_npe_trap_site`) and passes the key here,
+/// and `runtime::interpreter::jit_npe_message` reads the opcode back out of the
+/// trapping method's own bytecode.
+///
+/// Bits 32..56, i.e. above any real slot index (a class-file field table is
+/// `u16`-sized) and below the two flags at 61/62. `0` means "no site
+/// described", which is what every emitter arm without a bci passes and what
+/// the feature's kill switch produces.
+pub const GETFIELD_NPE_SITE_SHIFT: u32 = 32;
+
+/// The 24 bits [`GETFIELD_NPE_SITE_SHIFT`] names. 24 because
+/// `record_npe_trap_site` caps its ids at 24 bits for the same reason: the
+/// inline-null-check trampolines carry a key in one imm32 beside an action
+/// byte.
+pub const GETFIELD_NPE_SITE_MASK: u64 = 0x00ff_ffff << GETFIELD_NPE_SITE_SHIFT;
+
 /// Every bit in `jit_getfield`'s `field_index` argument that is a flag rather
 /// than part of the index. Masked off in one place so a third flag cannot be
 /// added without the strip site seeing it.
-pub const GETFIELD_FLAG_BITS: u64 = GETFIELD_RECEIVER_PROVEN_OOP | GETFIELD_EXPECT_REFERENCE;
+pub const GETFIELD_FLAG_BITS: u64 =
+    GETFIELD_RECEIVER_PROVEN_OOP | GETFIELD_EXPECT_REFERENCE | GETFIELD_NPE_SITE_MASK;
 
 /// Build `jit_getfield`'s third argument.
 ///
@@ -959,10 +999,17 @@ pub const GETFIELD_FLAG_BITS: u64 = GETFIELD_RECEIVER_PROVEN_OOP | GETFIELD_EXPE
 /// author did not know a safety bit had appeared, silently opts out of it and
 /// the hole reopens at exactly one `getfield` arm. One encoder means a new flag
 /// reaches every site by construction.
+///
+/// `npe_trap_key` is the id `x64::inlining::record_npe_trap_site` issued for
+/// this site, or `0` for "not described" — see [`GETFIELD_NPE_SITE_SHIFT`]. It
+/// rides in the same argument for the same reason the two flags do: the helper
+/// table's field count, byte size and offsets are pinned by const assertions in
+/// `helpers_abi.rs`, and spare bits in an argument need none of that.
 pub const fn getfield_index_arg(
     field_index: u32,
     is_reference: bool,
     receiver_proven_oop: bool,
+    npe_trap_key: u32,
 ) -> u64 {
     let mut arg = field_index as u64;
     if is_reference {
@@ -973,7 +1020,20 @@ pub const fn getfield_index_arg(
             arg |= GETFIELD_RECEIVER_PROVEN_OOP;
         }
     }
+    // Masked, not asserted: `record_npe_trap_site` already refuses to issue an
+    // id at or above 2^24, and a `const fn` cannot panic usefully anyway. A key
+    // that somehow exceeded the field would otherwise spill into the slot index
+    // and index the object out of bounds.
+    arg |= ((npe_trap_key as u64) << GETFIELD_NPE_SITE_SHIFT) & GETFIELD_NPE_SITE_MASK;
     arg
+}
+
+/// Recover the NPE trap-site key from [`getfield_index_arg`]'s result. `0` when
+/// the site was not described.
+#[must_use]
+pub const fn getfield_npe_site_of(arg: i64) -> u32 {
+    // Truncation: the field is 24 bits wide by construction.
+    (((arg as u64) & GETFIELD_NPE_SITE_MASK) >> GETFIELD_NPE_SITE_SHIFT) as u32
 }
 
 /// Recover the slot index from [`getfield_index_arg`]'s result — the DECODER
@@ -1008,7 +1068,8 @@ mod getfield_arg_tests {
     use super::*;
 
     /// [`getfield_index_of`] inverts [`getfield_index_arg`] for every flag
-    /// combination, and the flag mask covers exactly the two flags.
+    /// combination AND every trap-site key, and the flag mask covers exactly
+    /// the three passengers.
     ///
     /// The pair exists because a DECODE site that misses a flag does not fail a
     /// bounds check — it overflows `idx * SLOT_SIZE`. Two test doubles have
@@ -1018,20 +1079,37 @@ mod getfield_arg_tests {
         for slot in [0u32, 1, 7, u16::MAX as u32] {
             for is_ref in [false, true] {
                 for proven in [false, true] {
-                    let arg = getfield_index_arg(slot, is_ref, proven);
-                    assert_eq!(
-                        getfield_index_of(arg as i64),
-                        i64::from(slot),
-                        "slot {slot} (is_ref={is_ref}, proven={proven})"
-                    );
-                    assert_eq!(
-                        arg & GETFIELD_EXPECT_REFERENCE != 0,
-                        is_ref,
-                        "the reference flag must ride only on the reference path"
-                    );
+                    for key in [0u32, 1, 0x00ff_ffff] {
+                        let arg = getfield_index_arg(slot, is_ref, proven, key);
+                        assert_eq!(
+                            getfield_index_of(arg as i64),
+                            i64::from(slot),
+                            "slot {slot} (is_ref={is_ref}, proven={proven}, key={key})"
+                        );
+                        assert_eq!(
+                            getfield_npe_site_of(arg as i64),
+                            key,
+                            "the trap-site key must survive beside the flags"
+                        );
+                        assert_eq!(
+                            arg & GETFIELD_EXPECT_REFERENCE != 0,
+                            is_ref,
+                            "the reference flag must ride only on the reference path"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    /// A key wider than its field is TRUNCATED, never allowed to spill into the
+    /// slot index. `record_npe_trap_site` refuses to issue one, so this pins the
+    /// second line of defence rather than a reachable case.
+    #[test]
+    fn an_oversized_trap_key_cannot_reach_the_slot_index() {
+        let arg = getfield_index_arg(7, false, false, u32::MAX);
+        assert_eq!(getfield_index_of(arg as i64), 7);
+        assert_eq!(getfield_npe_site_of(arg as i64), 0x00ff_ffff);
     }
 
     /// A real slot cannot reach either flag bit, which is the property that
@@ -1039,12 +1117,12 @@ mod getfield_arg_tests {
     #[test]
     fn a_class_file_slot_index_cannot_reach_the_flag_bits() {
         // A class-file field table is `u16`-sized.
-        let widest = getfield_index_arg(u16::MAX as u32, false, false);
+        let widest = getfield_index_arg(u16::MAX as u32, false, false, 0);
         assert_eq!(widest & GETFIELD_FLAG_BITS, 0);
         assert_eq!(
             GETFIELD_FLAG_BITS,
-            GETFIELD_RECEIVER_PROVEN_OOP | GETFIELD_EXPECT_REFERENCE,
-            "a third flag must join the mask, or every decoder silently keeps it"
+            GETFIELD_RECEIVER_PROVEN_OOP | GETFIELD_EXPECT_REFERENCE | GETFIELD_NPE_SITE_MASK,
+            "a fourth passenger must join the mask, or every decoder silently keeps it"
         );
     }
 }

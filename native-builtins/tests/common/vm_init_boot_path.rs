@@ -60,9 +60,13 @@
 //! Stated rather than left for a reader to assume, because two of the three
 //! were found while fixing the locator:
 //!
-//! 1. **That the replay CALLS every name in [`VM_INIT_SEQUENCE`].** Rust has no
-//!    reflection over a function body. The list is checked against `vm_init`;
-//!    the replay is checked against the list by review.
+//! 1. ~~**That the replay CALLS every name in [`VM_INIT_SEQUENCE`].**~~ ASSERTED
+//!    since 2026-09-11 by [`the_replay_calls_every_name_in_the_sequence`], which
+//!    reads THIS file off disk exactly as [`vm_init_source`] reads `vm_init.rs`
+//!    -- "Rust has no reflection over a function body" was true and beside the
+//!    point. It passed as written, 46 of 46 in order, so the review had held;
+//!    the assertion is here so the next merge does not need it to hold again.
+//!    Two sibling lists were broken by clean `git merge`s the same week.
 //! 2. **Registration entry points whose name does not begin with `register_`.**
 //!    The scan takes bare `register_*` calls at statement start, so
 //!    `vm_init`'s call to `init_service_loader_bootstrap` (`vm_init.rs`, a `pub
@@ -603,5 +607,136 @@ fn the_inline_registrations_in_vm_init_are_enumerated() {
         stub_stated.len(),
         stub_stated,
         INLINE_SYNTHETIC_STUBS_IN_VM_INIT
+    );
+}
+
+/// This file, off disk — the same trick [`vm_init_source`] plays on `vm_init.rs`.
+///
+/// Reading the working tree rather than a frozen copy is what makes the test
+/// below a witness instead of a third hand-maintained list.
+fn boot_path_file_source() -> Option<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("common")
+        .join("vm_init_boot_path.rs");
+    match std::fs::read_to_string(&path) {
+        Ok(src) => Some(src),
+        Err(_) => {
+            println!("vm_init_boot_path.rs not on disk at {path:?}; witness skipped");
+            None
+        }
+    }
+}
+
+/// The text of [`vm_init_real_jdk_boot_path`]'s body, comment lines removed.
+///
+/// Comments are stripped because this file MENTIONS registrar names in prose on
+/// purpose, and the 2026-08-12 locator defect (module header) was a comment
+/// being read as source. A call is a call only if it is code.
+fn replay_body_code(src: &str) -> Option<String> {
+    let start = src.find("pub fn vm_init_real_jdk_boot_path(")?;
+    let rest = &src[start..];
+    let end = rest.find("\n}\n")?;
+    Some(
+        rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Find `name(` where `name` starts at an identifier boundary.
+fn call_position(code: &str, name: &str) -> Option<usize> {
+    let needle = format!("{name}(");
+    let mut from = 0usize;
+    while let Some(rel) = code[from..].find(&needle) {
+        let at = from + rel;
+        let ok = at == 0
+            || !code[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if ok {
+            return Some(at);
+        }
+        from = at + needle.len();
+    }
+    None
+}
+
+/// SOURCE WITNESS — the replay must CALL every name in [`VM_INIT_SEQUENCE`], in
+/// that order.
+///
+/// The module header lists this first under "What this witness still does not
+/// assert": the list is checked against `vm_init.rs`, and *"the replay is
+/// checked against the list by review."* Review is not a gate, and what it
+/// costs when it is wrong is not a wrong number but a silent one — a registrar
+/// named in the sequence and missing from the replay leaves whatever registered
+/// the triple EARLIER in place, so every census over
+/// [`vm_init_real_jdk_boot_path`] reports the kind of a row the shipping VM
+/// overwrites. That is §1 of `W7-30-stub-ratchet-boot-path-scope.md` exactly,
+/// and that page records the species being found twice by a disagreeing second
+/// measurement and never by the gate.
+///
+/// "Rust has no reflection over a function body" is true and beside the point.
+/// [`the_replayed_sequence_matches_vm_init`] already reads `vm_init.rs` off
+/// disk; this file is on disk in the same way.
+///
+/// ORDER is asserted for the reason the sibling test gives: registration is
+/// last-write-wins, so a replay that makes the right calls in the wrong order
+/// is a replay of a different VM. Positions are first occurrences, which is
+/// exact here because no name is called twice; a future second call would need
+/// this to compare spans instead.
+///
+/// Feature-independent by construction: it reads source text, so the calls
+/// inside the `#[cfg(feature = "management")]` block count as present whether
+/// or not that feature is on. That is correct for a witness about the MODEL —
+/// whether a given build compiles them is what `MEASURED_CONFIG` is for.
+#[test]
+fn the_replay_calls_every_name_in_the_sequence() {
+    let Some(src) = boot_path_file_source() else {
+        return;
+    };
+    let code = replay_body_code(&src)
+        .expect("`vm_init_real_jdk_boot_path`'s body is in this file and ends at a bare `}`");
+
+    let mut missing: Vec<&str> = Vec::new();
+    let mut positions: Vec<(usize, &str)> = Vec::new();
+    for name in VM_INIT_SEQUENCE {
+        match call_position(&code, name) {
+            Some(at) => positions.push((at, *name)),
+            None => missing.push(*name),
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "{} name(s) in VM_INIT_SEQUENCE are never called by \
+         `vm_init_real_jdk_boot_path`: {missing:?}. Every registration such a \
+         registrar makes is missing from this replay's registry, or — worse, \
+         because it is silent — present at the kind of whatever registered the \
+         triple earlier and was meant to be overwritten. Add the call where \
+         `vm_init` makes it.",
+        missing.len()
+    );
+
+    let mut last: usize = 0;
+    let mut last_name = "";
+    for (at, name) in &positions {
+        assert!(
+            *at >= last,
+            "the replay calls `{name}` before `{last_name}`, and VM_INIT_SEQUENCE \
+             — which is itself checked against vm_init.rs — has them the other way \
+             round. Registration is last-write-wins, so every census over this \
+             replay would count the kind of the row the shipping VM discards."
+        );
+        last = *at;
+        last_name = name;
+    }
+
+    println!(
+        "boot-path replay: all {} VM_INIT_SEQUENCE names called, in order",
+        positions.len()
     );
 }

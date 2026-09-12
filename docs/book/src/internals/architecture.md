@@ -26,7 +26,7 @@ lints.)
 | `cratonvm-jit` | `jit/` | x86-64 / AArch64 JIT compiler |
 | `cratonvm-jit-cuda` | `jit-cuda/` | Java bytecode → PTX lowering for GPU offload |
 | `cuda-bridge` | `cuda-bridge/` | Thin CUDA Driver API bridge for GPU offload |
-| `craton-gpu` | `craton-gpu/` | Build-time Java annotation sources for GPU offload |
+| `cratonvm-gpu` | `craton-gpu4j/` | Build-time Java annotation sources for GPU offload, from the gpu4j repo |
 | `cratonvm-classloading` | `classloading/` | Class loading, linking & bytecode verification |
 | `cratonvm-gc` | `gc/` | Garbage collectors & memory management |
 | `cratonvm-jfr` | `jfr/` | Java Flight Recorder |
@@ -46,7 +46,7 @@ builds on Rust **1.80+**
 vm-cli → vm → {classloading, gc, jit, native-builtins, native-collections,
                native-io, native-awt, jfr}
               → {reader, types, native-api, jit-api, jit-cuda,
-                 cuda-bridge, craton-gpu}
+                 cuda-bridge, craton-gpu4j}
 
 native-builtins → {native-builtins-crypto, native-builtins-security}
 

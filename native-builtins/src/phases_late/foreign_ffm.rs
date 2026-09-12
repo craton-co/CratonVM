@@ -39,8 +39,11 @@ pub(crate) fn p67_layout_object(
     // `probes/W2ValueLayoutProbe` the moment that preseed stopped running:
     // every constant reported `order() == BIG_ENDIAN` while
     // `ByteOrder.nativeOrder()` two lines above answered LITTLE_ENDIAN.
-    ctx.set_field(obj, slots.name, Value::Object(None));
-    // LAST, because the real arm allocates and can move `obj`.
+    // Each of the three below can ALLOCATE and so can move `obj`; each hands
+    // back the current reference and none of them may be reordered above a
+    // plain `set_field` that uses a stale one.
+    let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
+    let obj = p67_layout_set_carrier(ctx, obj, minted)?;
     let obj = p67_layout_set_order(ctx, obj, cfg!(target_endian = "little"))?;
     Ok(obj)
 }
@@ -95,6 +98,16 @@ pub(crate) struct P67LayoutSlots {
     /// A sequence's stored element count (`elemCount`), 4 on the fabricated
     /// carrier.
     pub(crate) element_count: usize,
+    /// True when this carrier IS the real JDK class -- it declares
+    /// `byteSize`, `byteAlignment` and `name` itself, so every index above is
+    /// a real field index and every field must hold what the real bytecode
+    /// reads there. False for the carriers this file fabricates, whose slots
+    /// mean only what this file says they mean.
+    ///
+    /// The two differ in CONTENT as well as in indices, which is the whole
+    /// reason this flag exists: `AbstractLayout.name` is an
+    /// `Optional<String>`, not a `String`. See [`p67_layout_set_name`].
+    pub(crate) real: bool,
 }
 
 /// How a carrier records byte order -- the one place the two conventions are
@@ -138,6 +151,7 @@ fn p67_layout_slots_inner(
         ctx.resolve_field_index_by_class_id(class_id, "name"),
     ) {
         return P67LayoutSlots {
+            real: true,
             byte_size,
             byte_alignment,
             name,
@@ -176,6 +190,7 @@ fn p67_layout_slots_inner(
         }
     };
     P67LayoutSlots {
+        real: false,
         byte_size: 0,
         byte_alignment: 1,
         name,
@@ -250,13 +265,90 @@ pub(crate) fn p67_layout_set_order(
     }
 }
 
+/// The layout's name as a bare `String` reference, or null.
+///
+/// **The field does not hold the same thing on both carriers.** A real
+/// `jdk.internal.foreign.layout.AbstractLayout` declares
+/// `Optional<String> name`, and the carriers this file fabricates keep the bare
+/// reference. Every reader in this file wants the bare one, so the unwrap lives
+/// here -- one place -- and [`p67_layout_set_name`] is its inverse.
 pub(crate) fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
     let slots = p67_layout_slots(ctx, layout);
-    if ctx.object_num_fields(layout) > slots.name {
-        ctx.get_field(layout, slots.name)
-    } else {
-        Value::Object(None)
+    if ctx.object_num_fields(layout) <= slots.name {
+        return Value::Object(None);
     }
+    let stored = ctx.get_field(layout, slots.name);
+    if !slots.real {
+        return stored;
+    }
+    match stored {
+        // A real carrier minted by REAL bytecode holds an `Optional`; one
+        // minted here holds whatever `p67_layout_set_name` put there, which is
+        // also an `Optional`. Either way the value is its slot 0.
+        Value::Object(Some(opt)) if ctx.object_num_fields(opt) > 0 => ctx.get_field(opt, 0),
+        _ => Value::Object(None),
+    }
+}
+
+/// Write `name` in the convention THIS carrier's class declares, and return the
+/// layout -- which the real arm can MOVE, because it allocates an `Optional`.
+///
+/// A real `AbstractLayout.name` is an `Optional<String>` and every real reader
+/// calls `Optional.isPresent()` on it straight away, so a bare `String` there
+/// is not merely unread -- it is a `NullPointerException` out of
+/// `AbstractLayout.name()`, and a null there is one out of `equals`, which is
+/// what `ValueLayout.JAVA_INT.withName("k").equals(...)` threw in BOTH modes
+/// before this existed. The same shape as `java.io.File`'s `prefixLength` in
+/// lane 4 wave 1: the VM writes the slot it reads and nothing else, and the
+/// defect is invisible until real bytecode reads the field.
+pub(crate) fn p67_layout_set_name(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    raw: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let slots = p67_layout_slots(ctx, layout);
+    if ctx.object_num_fields(layout) <= slots.name {
+        return Ok(layout);
+    }
+    if !slots.real {
+        ctx.set_field(layout, slots.name, raw);
+        return Ok(layout);
+    }
+    let pin = ctx.pin_native_root(layout);
+    let opt = p67_optional(ctx, raw)?;
+    let layout = ctx.read_native_pin(pin, layout);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(layout, slots.name, Value::Object(Some(opt)));
+    Ok(layout)
+}
+
+/// Write `carrier`, the `Class` a real value layout keeps on
+/// `ValueLayouts$AbstractValueLayout`, when the carrier class declares one.
+///
+/// Nothing wrote it before, and the native `carrier()` derives its answer from
+/// the class NAME instead -- so the method answered correctly while the field
+/// behind it was null, and the first real bytecode to read it
+/// (`AbstractValueLayout.equals`, `toString`, `varHandle`) got a
+/// `NullPointerException`. Returns the layout because the class mirror can be
+/// allocated and the allocation can move it.
+pub(crate) fn p67_layout_set_carrier(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    class_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(layout);
+    let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, "carrier") else {
+        return Ok(layout);
+    };
+    if ctx.object_num_fields(layout) <= slot {
+        return Ok(layout);
+    }
+    let pin = ctx.pin_native_root(layout);
+    let mirror = p67_class_mirror(ctx, p67_layout_carrier_name(class_name))?;
+    let layout = ctx.read_native_pin(pin, layout);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(layout, slot, Value::Object(Some(mirror)));
+    Ok(layout)
 }
 
 pub(crate) fn p67_layout_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -355,8 +447,8 @@ pub(crate) fn p67_layout_with_name(
         }
         None => Value::Object(None),
     };
-    ctx.set_field(cloned, name_slot, name);
     ctx.unpin_native_roots(this_pin);
+    let cloned = p67_layout_set_name(ctx, cloned, name)?;
     Ok(Some(Value::Object(Some(cloned))))
 }
 
@@ -423,8 +515,15 @@ pub(crate) fn p67_layout_with_byte_alignment(
         _ => 0,
     };
     if alignment <= 0 || (alignment & (alignment - 1)) != 0 {
+        // MEASURED, not guessed: `AbstractLayout.withByteAlignment(3)` on
+        // Temurin 25 throws `IllegalArgumentException: Invalid alignment: 3`.
+        // The longer "alignment constraint" spelling belongs to
+        // `Arena.allocate(8, 3)`, which is a different refusal in a different
+        // class and keeps its own wording (see `panama.rs`, where the JDK's
+        // odd " : " spacing is also preserved). The KIND is the contract and
+        // was already right; the text is what a log reader diffs.
         return Err(RuntimeError::IllegalArgumentException {
-            message: format!("Invalid alignment constraint: {alignment}"),
+            message: format!("Invalid alignment: {alignment}"),
         }
         .into());
     }
@@ -859,8 +958,7 @@ pub(crate) fn p67_layout_with_order(
     // `p67_layout_object` has already stamped the HOST's order; this is the
     // caller's, which is the whole point of `withOrder`.
     let obj = p67_layout_set_order(ctx, obj, little)?;
-    let name_slot = p67_layout_slots(ctx, obj).name;
-    ctx.set_field(obj, name_slot, inherited_name);
+    let obj = p67_layout_set_name(ctx, obj, inherited_name)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1323,7 +1421,7 @@ pub(crate) fn p67_segment_check_scope(
     ctx: &mut dyn NativeContext,
     segment: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
-    if let Value::Object(Some(scope)) = ctx.get_field_by_name(*segment, "scope") {
+    if let Value::Object(Some(mut scope)) = ctx.get_field_by_name(*segment, "scope") {
         if p67_session_is_real(ctx, scope) {
             // The one GC point in this function. Pin across it and hand the
             // caller the forwarded reference; every other branch below only
@@ -1346,7 +1444,7 @@ pub(crate) fn p67_segment_check_scope(
         // unconditionally here was a second fail-open: the one shape that
         // resolves a session was the one shape that skipped the check.
         if p67_session_modelled(ctx, scope) {
-            p67_session_check_valid(ctx, scope)?;
+            p67_session_check_valid(ctx, &mut scope)?;
             return Ok(());
         }
         // Neither — so this is not a scope at all, and accepting it would be a
@@ -1360,9 +1458,9 @@ pub(crate) fn p67_segment_check_scope(
     // `p67_receiver_session`, which mints a fresh (always-open) session when it
     // finds nothing — that would make every check trivially pass.
     if ctx.object_num_fields(*segment) > P67_SEGMENT_ARENA {
-        if let Value::Object(Some(owner)) = ctx.get_field(*segment, P67_SEGMENT_ARENA) {
-            if let Some(session) = p67_arena_session(ctx, owner) {
-                p67_session_check_valid(ctx, session)?;
+        if let Value::Object(Some(mut owner)) = ctx.get_field(*segment, P67_SEGMENT_ARENA) {
+            if let Some(mut session) = p67_arena_session(ctx, owner) {
+                p67_session_check_valid(ctx, &mut session)?;
             } else if crate::panama::pe_session_modelled(ctx, owner) {
                 // G19-1: the slot's third tenant — the session ITSELF, which is
                 // what `panama::pe_segment_slice` stamps onto a slice and what
@@ -1375,7 +1473,7 @@ pub(crate) fn p67_segment_check_scope(
                 // in `p67_receiver_session`: the local `p67_session_modelled`
                 // would accept slot 2's OTHER tenant, an `ofArray` mirror's
                 // backing array, and read an element as a state word.
-                p67_session_check_valid(ctx, owner)?;
+                p67_session_check_valid(ctx, &mut owner)?;
             }
         }
     }
@@ -1449,13 +1547,15 @@ fn p67_wrong_thread(ctx: &mut dyn NativeContext) -> MethodCallFailed {
 /// wrong thread reports the thread error even once it has been closed.
 fn p67_session_check_valid(
     ctx: &mut dyn NativeContext,
-    session: ObjectRef,
+    session: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
-    if !p67_session_modelled(ctx, session) {
+    // `&mut` receiver: see `ks_require_loaded` in `tls.rs` for why this is the
+    // shape rather than a proof about today's callers.
+    if !p67_session_modelled(ctx, *session) {
         return Ok(());
     }
-    let slots = p67_session_slots(ctx, session);
-    let owner = match ctx.get_field(session, slots.owner) {
+    let slots = p67_session_slots(ctx, *session);
+    let owner = match ctx.get_field(*session, slots.owner) {
         Value::Object(Some(owner)) => Some(owner),
         _ => None,
     };
@@ -1464,7 +1564,7 @@ fn p67_session_check_valid(
             return Err(p67_wrong_thread(ctx));
         }
     }
-    if p67_session_state(ctx, session) == 0 {
+    if p67_session_state(ctx, *session) == 0 {
         return Err(RuntimeError::IllegalStateException {
             message: "Already closed".to_string(),
         }
@@ -1475,13 +1575,13 @@ fn p67_session_check_valid(
 
 fn p67_session_acquire(
     ctx: &mut dyn NativeContext,
-    session: ObjectRef,
+    session: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
     p67_session_check_valid(ctx, session)?;
-    if p67_session_modelled(ctx, session) {
-        let count = p67_session_acquires(ctx, session);
-        let slots = p67_session_slots(ctx, session);
-        ctx.set_field(session, slots.acquires, Value::Int(count.saturating_add(1)));
+    if p67_session_modelled(ctx, *session) {
+        let count = p67_session_acquires(ctx, *session);
+        let slots = p67_session_slots(ctx, *session);
+        ctx.set_field(*session, slots.acquires, Value::Int(count.saturating_add(1)));
     }
     Ok(())
 }
@@ -1582,21 +1682,21 @@ fn p67_session_run_close_actions(
 /// running the resource list — `close()` is `justClose()` plus the cleanup run.
 fn p67_session_just_close(
     ctx: &mut dyn NativeContext,
-    session: ObjectRef,
+    session: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
     p67_session_check_valid(ctx, session)?;
-    if !p67_session_modelled(ctx, session) {
+    if !p67_session_modelled(ctx, *session) {
         return Ok(());
     }
-    let acquired = p67_session_acquires(ctx, session);
+    let acquired = p67_session_acquires(ctx, *session);
     if acquired > 0 {
         return Err(RuntimeError::IllegalStateException {
             message: format!("Session is acquired by {acquired} clients"),
         }
         .into());
     }
-    let slots = p67_session_slots(ctx, session);
-    ctx.set_field(session, slots.state, Value::Int(0));
+    let slots = p67_session_slots(ctx, *session);
+    ctx.set_field(*session, slots.state, Value::Int(0));
     Ok(())
 }
 
@@ -1610,8 +1710,8 @@ fn p67_session_add_action_synthetic(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    p67_session_check_valid(ctx, this)?;
+    let mut this = obj_arg(args, 0)?;
+    p67_session_check_valid(ctx, &mut this)?;
     let Some(Value::Object(Some(action))) = args.get(1) else {
         return Ok(None);
     };
@@ -1684,11 +1784,8 @@ pub(crate) fn p67_layout_named_member(
     layout: ObjectRef,
     target_name: &str,
 ) -> Option<ObjectRef> {
-    let members = match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
-        Value::Object(Some(arr)) => arr,
-        _ => return None,
-    };
-    for i in 0..ctx.array_length(members) {
+    let (members, member_count) = p67_group_members(ctx, layout)?;
+    for i in 0..member_count {
         let member = match ctx.get_array_element(members, i) {
             Value::Object(Some(member)) => member,
             _ => continue,
@@ -1883,14 +1980,14 @@ pub(crate) fn p67_layout_render(ctx: &dyn NativeContext, layout: ObjectRef) -> S
         } else {
             ""
         };
-        let parts = match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
-            Value::Object(Some(arr)) => (0..ctx.array_length(arr))
+        let parts = match p67_group_members(ctx, layout) {
+            Some((arr, count)) => (0..count)
                 .map(|i| match ctx.get_array_element(arr, i) {
                     Value::Object(Some(m)) => p67_layout_render(ctx, m),
                     _ => String::new(),
                 })
                 .collect::<Vec<_>>(),
-            _ => Vec::new(),
+            None => Vec::new(),
         };
         format!("[{}]", parts.join(sep))
     } else {
@@ -1909,7 +2006,36 @@ pub(crate) fn p67_layout_render(ctx: &dyn NativeContext, layout: ObjectRef) -> S
             "java/lang/foreign/MemorySegment" => "a",
             _ => "?",
         };
-        format!("{letter}{size}")
+        // THE CASE IS THE BYTE ORDER. `ValueLayouts$AbstractValueLayout`
+        // uppercases the letter for a big-endian layout and leaves it lower
+        // for little -- so `JAVA_INT` prints `i4` on this host and
+        // `JAVA_INT.withOrder(BIG_ENDIAN)` prints `I4`. This rendered the
+        // lower-case letter for both, which made a layout REPORT AN ORDER IT
+        // DOES NOT HAVE while `order()` beside it answered correctly: the
+        // silent-wrong-answer shape lane 4 owns, in the one method a caller
+        // reads to find out what it is holding. Groups, sequences and padding
+        // have no order and never reach here.
+        let letter = if p67_layout_is_little(ctx, layout) {
+            letter.to_string()
+        } else {
+            letter.to_uppercase()
+        };
+        // An ADDRESS layout with a target renders it after a colon --
+        // `ADDRESS.withTargetLayout(JAVA_INT)` is `a8:i4`, not `a8`. The target
+        // is part of the string `decorateLayoutString` then wraps, so it goes
+        // in here rather than beside the `%` prefix or the `(name)` suffix.
+        let target = match ctx
+            .resolve_field_index_by_class_id(ctx.class_id_of_object(layout), "targetLayout")
+        {
+            Some(slot) if ctx.object_num_fields(layout) > slot => {
+                match ctx.get_field(layout, slot) {
+                    Value::Object(Some(t)) => format!(":{}", p67_layout_render(ctx, t)),
+                    _ => String::new(),
+                }
+            }
+            _ => String::new(),
+        };
+        format!("{letter}{size}{target}")
     };
 
     // A VALUE layout whose alignment is not its size prints an `<align>%`
@@ -1992,12 +2118,239 @@ pub(crate) fn p67_classify_path_element(
     P67PathElement::Unsupported(class_name)
 }
 
-/// The member layouts of a group layout (slot 2), if it has any.
-fn p67_group_members(ctx: &dyn NativeContext, layout: ObjectRef) -> Option<ObjectRef> {
-    match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
-        Value::Object(Some(arr)) if ctx.array_length(arr) > 0 => Some(arr),
-        _ => None,
+/// The member layouts of a group layout, as `(array, count)`.
+///
+/// **The field does not hold the same thing on both carriers.** A real
+/// `jdk.internal.foreign.layout.AbstractGroupLayout` declares
+/// `List<MemoryLayout> elements`; the carriers this file fabricates keep a bare
+/// array in the payload slot. Every reader in this file wants the array, so the
+/// unwrap lives here -- one place -- and [`p67_group_set_members`] is its
+/// inverse.
+///
+/// **The COUNT comes back beside the array** because an `ArrayList` has
+/// capacity past its size: reading `array_length` off its `elementData` would
+/// invent trailing null members and a group would grow silently, which is the
+/// quiet-wrong-answer shape this lane owns.
+///
+/// The list is recognised by its `elementData` field rather than by a class
+/// name -- the same by-name rule every carrier note in this file gives, and the
+/// only one available anyway: a reference array's header class id is its
+/// COMPONENT's, so the payload cannot be asked for its own name. No layout
+/// class declares `elementData`.
+pub(crate) fn p67_group_members(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+) -> Option<(ObjectRef, usize)> {
+    let payload = match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    // ASK WHETHER IT IS AN ARRAY; do not infer it from a field name. A
+    // reference array's header class id is its COMPONENT's, and
+    // `AbstractGroupLayout` itself declares `elements` -- so a name probe
+    // against an array of layouts can answer yes for the wrong reason.
+    if ctx.object_is_array(payload) {
+        let n = ctx.array_length(payload);
+        return (n > 0).then_some((payload, n));
     }
+    let payload_class = ctx.class_id_of_object(payload);
+    // `ArrayList`: `elementData` has capacity past `size`, so the SIZE decides.
+    if let Some(data) = ctx.resolve_field_index_by_class_id(payload_class, "elementData") {
+        let size = ctx
+            .resolve_field_index_by_class_id(payload_class, "size")
+            .and_then(|i| ctx.get_field(payload, i).as_int())
+            .unwrap_or(0)
+            .max(0) as usize;
+        let arr = match ctx.get_field(payload, data) {
+            Value::Object(Some(arr)) => arr,
+            _ => return None,
+        };
+        let n = std::cmp::min(size, ctx.array_length(arr));
+        return (n > 0).then_some((arr, n));
+    }
+    // `ImmutableCollections$ListN` keeps the array in `elements` and IS its
+    // length -- `size()` returns `elements.length`, so there is no separate
+    // count to read.
+    //
+    // NOT DECODED: `List12`, the one- and two-element shape, which holds `e0`
+    // and `e1` and has no backing array at all. Nothing in this tree gives a
+    // layout one -- every group minted here carries a `ListN`, and
+    // `AbstractGroupLayout`'s `List.copyOf` returns an immutable list
+    // unchanged -- and if that ever stops being true the symptom is a group
+    // reporting ZERO members, which `struct.withName.members` in
+    // `apps/probes/L4FfmLayoutSweep.java` is the row that catches.
+    if let Some(data) = ctx.resolve_field_index_by_class_id(payload_class, "elements") {
+        if let Value::Object(Some(arr)) = ctx.get_field(payload, data) {
+            let n = ctx.array_length(arr);
+            return (n > 0).then_some((arr, n));
+        }
+    }
+    None
+}
+
+/// An UNMODIFIABLE `List` over `arr[..len]`, built by NAME.
+///
+/// **Unmodifiable, and that is measured rather than tidy.**
+/// `AbstractGroupLayout.memberLayouts()` is `return elements;` -- one
+/// `getfield` -- so whatever this builds is what a caller gets, and HotSpot
+/// answers `UnsupportedOperationException` to `memberLayouts().add(...)`. An
+/// `ArrayList` here would hand out a mutable view of a layout's members, and a
+/// `MemoryLayout` is specified immutable.
+///
+/// `java.util.ImmutableCollections$ListN` is the shape `List.of(...)` mints:
+/// `size()` is `elements.length`, so the array must be EXACTLY the member count
+/// and there is no separate size field to disagree with it. `len` is asserted
+/// against the array rather than trusted, because a list whose backing array is
+/// longer than its count is precisely the silent-extra-member defect
+/// [`p67_group_members`] returns a count to avoid.
+fn p67_new_member_list(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    len: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    const LIST_N: &str = "java/util/ImmutableCollections$ListN";
+    let arr = if ctx.array_length(arr) == len {
+        arr
+    } else {
+        // Copy down to the exact length. Nothing in this file produces a
+        // longer array today; the branch exists so that if something does, the
+        // list reports the members it has rather than the slots it was given.
+        let pin = ctx.pin_native_root(arr);
+        let exact = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+        let arr = ctx.read_native_pin(pin, arr);
+        for i in 0..len {
+            let v = ctx.get_array_element(arr, i);
+            ctx.set_array_element(exact, i, v);
+        }
+        ctx.unpin_native_roots(pin);
+        exact
+    };
+    let pin = ctx.pin_native_root(arr);
+    // LOAD IT FIRST. `resolve_field_index` resolves the class GLOBALLY by name
+    // and answers `None` for one that is not loaded yet -- which under
+    // COMPATIBLE mode it is not, because nothing has called `List.of` by then.
+    // Without this the fallback below fires, the group carries a MUTABLE list,
+    // and `AbstractGroupLayout`'s constructor then `List.copyOf`s it into a
+    // `List12` on the next `withName` -- a shape with `e0`/`e1` and no backing
+    // array, which `p67_group_members` cannot decode, so the group reports
+    // ZERO members. Measured exactly that way on 2026-09-12: strict 2, compat
+    // 0, on `structLayout(..).withName("st").memberLayouts().size()`.
+    let list_class = ctx.ensure_class_initialized(LIST_N).ok();
+    let elements_slot = list_class
+        .and_then(|cid| ctx.resolve_field_index_by_class_id(cid, "elements"))
+        .or_else(|| ctx.resolve_field_index(LIST_N, "elements"));
+    let allow_nulls_slot = list_class
+        .and_then(|cid| ctx.resolve_field_index_by_class_id(cid, "allowNulls"))
+        .or_else(|| ctx.resolve_field_index(LIST_N, "allowNulls"));
+    let Some(elements_slot) = elements_slot else {
+        // No such class in this image: fall back to the mutable shape rather
+        // than to nothing, which is what this returned before 2026-09-12.
+        let data_slot = ctx
+            .resolve_field_index("java/util/ArrayList", "elementData")
+            .unwrap_or(0);
+        let size_slot = ctx
+            .resolve_field_index("java/util/ArrayList", "size")
+            .unwrap_or(1);
+        let n_fields = std::cmp::max(data_slot, size_slot) + 1;
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields)?;
+        let arr = ctx.read_native_pin(pin, arr);
+        ctx.unpin_native_roots(pin);
+        ctx.set_field(list, data_slot, Value::Object(Some(arr)));
+        ctx.set_field(list, size_slot, Value::Int(len as i32));
+        return Ok(list);
+    };
+    let n_fields = std::cmp::max(elements_slot, allow_nulls_slot.unwrap_or(0)) + 1;
+    let list = try_alloc_concurrent_synthetic(ctx, LIST_N, n_fields)?;
+    let arr = ctx.read_native_pin(pin, arr);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(list, elements_slot, Value::Object(Some(arr)));
+    // EXPLICITLY false rather than merely unwritten: an untouched slot reads
+    // back through the R-niche rule as `Int(0)`, which is the same `false` --
+    // but the rest of this file writes its flags and the one place that did not
+    // is the 2026-08-10 endian defect.
+    if let Some(slot) = allow_nulls_slot {
+        ctx.set_field(list, slot, Value::Int(0));
+    }
+    Ok(list)
+}
+
+/// Write the member layouts in the convention THIS carrier's class declares,
+/// and return the layout -- which the real arm can MOVE, because it allocates.
+///
+/// A real `AbstractGroupLayout.elements` is a `List<MemoryLayout>` and its own
+/// `toString`, `equals`, `hashCode` and `memberLayouts` all call `List` methods
+/// on it straight away, so a bare array there is not merely unread: it is a
+/// `NoSuchMethodError` out of the first real body to touch the group. Same
+/// shape as `AbstractLayout.name` holding a `String` where the JDK declares an
+/// `Optional`, one class up the hierarchy.
+pub(crate) fn p67_group_set_members(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    members: ObjectRef,
+    len: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let slots = p67_layout_slots(ctx, layout);
+    if ctx.object_num_fields(layout) <= slots.payload {
+        return Ok(layout);
+    }
+    if !slots.real {
+        ctx.set_field(layout, slots.payload, Value::Object(Some(members)));
+        return Ok(layout);
+    }
+    let pin = ctx.pin_native_root(layout);
+    let list = p67_new_member_list(ctx, members, len)?;
+    let layout = ctx.read_native_pin(pin, layout);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(layout, slots.payload, Value::Object(Some(list)));
+    Ok(layout)
+}
+
+/// Write `kind` and `minByteAlignment`, the two fields a real
+/// `AbstractGroupLayout` declares that no carrier here ever wrote.
+///
+/// `kind` is an `AbstractGroupLayout$Kind` and the real `toString` reads
+/// `kind.delimTag` to pick `[a|b]` over `[ab]`, while `equals` compares it --
+/// so a null there is a `NullPointerException` on the first real body, and a
+/// WRONG one is a union that prints like a struct. The constant is taken from
+/// the enum's own statics rather than fabricated, so there is exactly one
+/// `STRUCT` object in the VM and `==` on it answers what the JDK's own code
+/// expects.
+pub(crate) fn p67_group_set_kind(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    is_union: bool,
+    min_byte_alignment: i64,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(layout);
+    if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, "minByteAlignment") {
+        if ctx.object_num_fields(layout) > slot {
+            ctx.set_field(layout, slot, Value::Long(min_byte_alignment));
+        }
+    }
+    let Some(kind_slot) = ctx.resolve_field_index_by_class_id(class_id, "kind") else {
+        return Ok(layout);
+    };
+    if ctx.object_num_fields(layout) <= kind_slot {
+        return Ok(layout);
+    }
+    let pin = ctx.pin_native_root(layout);
+    let kind = (|| {
+        let cid = ctx
+            .ensure_class_initialized("jdk/internal/foreign/layout/AbstractGroupLayout$Kind")
+            .ok()?;
+        let name = if is_union { "UNION" } else { "STRUCT" };
+        let idx = ctx.static_field_index_by_name(cid, name)?;
+        match ctx.get_static_field(cid, idx) {
+            Value::Object(Some(obj)) => Some(obj),
+            _ => None,
+        }
+    })();
+    let layout = ctx.read_native_pin(pin, layout);
+    ctx.unpin_native_roots(pin);
+    if let Some(kind) = kind {
+        ctx.set_field(layout, kind_slot, Value::Object(Some(kind)));
+    }
+    Ok(layout)
 }
 
 /// Offset of a group member, computed with the SAME alignment rule
@@ -2011,7 +2364,7 @@ fn p67_group_member_offset(
     group: ObjectRef,
     mut select: impl FnMut(usize, Option<&str>) -> bool,
 ) -> Option<(i64, ObjectRef)> {
-    let members = p67_group_members(ctx, group)?;
+    let (members, member_count) = p67_group_members(ctx, group)?;
 
     // A UNION PUTS EVERY MEMBER AT OFFSET 0 (F16, 2026-08-13). This loop used
     // to accumulate for any group, which was invisible while `unionLayout`
@@ -2029,7 +2382,7 @@ fn p67_group_member_offset(
         .is_some_and(|n| n.contains("UnionLayout"));
 
     let mut offset = 0_i64;
-    for i in 0..ctx.array_length(members) {
+    for i in 0..member_count {
         let member = match ctx.get_array_element(members, i) {
             Value::Object(Some(m)) => m,
             _ => continue,
@@ -2933,23 +3286,23 @@ pub(crate) fn lucene_buffered_checksum_flush_body(ctx: &mut dyn NativeContext, t
 
 pub(crate) fn lucene_buffered_checksum_write(
     ctx: &mut dyn NativeContext,
-    mut this: ObjectRef,
+    this: &mut ObjectRef,
     bytes: &[u8],
 ) {
-    let buffer = match ctx.get_field_by_name(this, "buffer") {
+    let buffer = match ctx.get_field_by_name(*this, "buffer") {
         Value::Object(Some(buffer)) => buffer,
         _ => return,
     };
     let cap = ctx.array_length(buffer);
     let mut upto = ctx
-        .get_field_by_name(this, "upto")
+        .get_field_by_name(*this, "upto")
         .as_int()
         .unwrap_or(0)
         .max(0) as usize;
     if upto.saturating_add(bytes.len()) > cap {
-        lucene_buffered_checksum_flush(ctx, &mut this);
+        lucene_buffered_checksum_flush(ctx, this);
         upto = ctx
-            .get_field_by_name(this, "upto")
+            .get_field_by_name(*this, "upto")
             .as_int()
             .unwrap_or(0)
             .max(0) as usize;
@@ -2960,16 +3313,16 @@ pub(crate) fn lucene_buffered_checksum_write(
     for (i, b) in bytes.iter().enumerate() {
         ctx.set_array_element(buffer, upto + i, Value::Int(*b as i8 as i32));
     }
-    ctx.set_field_by_name(this, "upto", Value::Int((upto + bytes.len()) as i32));
+    ctx.set_field_by_name(*this, "upto", Value::Int((upto + bytes.len()) as i32));
 }
 
 pub(crate) fn lucene_buffered_checksum_update_int(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    lucene_buffered_checksum_write(ctx, this, &value.to_le_bytes());
+    lucene_buffered_checksum_write(ctx, &mut this, &value.to_le_bytes());
     Ok(None)
 }
 
@@ -2977,13 +3330,13 @@ pub(crate) fn lucene_buffered_checksum_update_long(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     let value = match args.get(1) {
         Some(Value::Long(v)) => *v,
         Some(Value::Int(v)) => *v as i64,
         _ => 0,
     };
-    lucene_buffered_checksum_write(ctx, this, &value.to_le_bytes());
+    lucene_buffered_checksum_write(ctx, &mut this, &value.to_le_bytes());
     Ok(None)
 }
 
@@ -2991,7 +3344,7 @@ pub(crate) fn lucene_buffered_checksum_update_longs(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     let arr = obj_arg(args, 1)?;
     let mut off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
@@ -3001,7 +3354,7 @@ pub(crate) fn lucene_buffered_checksum_update_longs(
             Value::Int(v) => v as i64,
             _ => 0,
         };
-        lucene_buffered_checksum_write(ctx, this, &value.to_le_bytes());
+        lucene_buffered_checksum_write(ctx, &mut this, &value.to_le_bytes());
         off += 1;
     }
     Ok(None)
@@ -3203,8 +3556,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // the session's IllegalStateException rather than silently
             // re-clearing the flag, and the cleanups have to run while the
             // arena is still open.
-            if let Some(session) = p67_arena_session(ctx, this) {
-                p67_session_just_close(ctx, session)?;
+            if let Some(mut session) = p67_arena_session(ctx, this) {
+                p67_session_just_close(ctx, &mut session)?;
                 p67_session_run_close_actions(ctx, session)?;
             }
             ctx.set_field(this, slots.open, Value::Int(0));
@@ -3333,8 +3686,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         if let Some(real) = p67_session_delegate(ctx, args, "acquire0", "()V") {
             return real;
         }
-        let this = obj_arg(args, 0)?;
-        p67_session_acquire(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        p67_session_acquire(ctx, &mut this)?;
         Ok(None)
     });
     r.register(
@@ -3347,13 +3700,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             {
                 return real;
             }
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             let action = obj_arg(args, 1)?;
             // The acquire count is what keeps the session alive across the
             // callback: a nested `close()` sees a non-zero count and refuses,
             // exactly as the JDK's `whileAlive` does. Released even when the
             // action throws, or the session could never be closed afterwards.
-            p67_session_acquire(ctx, this)?;
+            p67_session_acquire(ctx, &mut this)?;
             let this_pin = ctx.pin_native_root(this);
             let result = ctx.invoke_virtual(action, "run", "()V", &[]);
             let this = ctx.read_native_pin(this_pin, this);
@@ -3419,16 +3772,16 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         if let Some(real) = p67_session_delegate(ctx, args, "checkValidStateRaw", "()V") {
             return real;
         }
-        let this = obj_arg(args, 0)?;
-        p67_session_check_valid(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        p67_session_check_valid(ctx, &mut this)?;
         Ok(None)
     });
     r.register(session, "checkValidState", "()V", |ctx, args| {
         if let Some(real) = p67_session_delegate(ctx, args, "checkValidState", "()V") {
             return real;
         }
-        let this = obj_arg(args, 0)?;
-        p67_session_check_valid(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        p67_session_check_valid(ctx, &mut this)?;
         Ok(None)
     });
     r.register(
@@ -3465,8 +3818,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         if let Some(real) = p67_session_delegate(ctx, args, "close", "()V") {
             return real;
         }
-        let this = obj_arg(args, 0)?;
-        p67_session_just_close(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        p67_session_just_close(ctx, &mut this)?;
         p67_session_run_close_actions(ctx, this)?;
         Ok(None)
     });
@@ -3474,8 +3827,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         if let Some(real) = p67_session_delegate(ctx, args, "justClose", "()V") {
             return real;
         }
-        let this = obj_arg(args, 0)?;
-        p67_session_just_close(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        p67_session_just_close(ctx, &mut this)?;
         Ok(None)
     });
 
@@ -4037,14 +4390,23 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 max_align = max_align.max(member_align);
             }
             let members_pin = ctx.pin_native_root(members);
-            let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/StructLayoutImpl", 4)?;
+            let obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "jdk/internal/foreign/layout/StructLayoutImpl",
+                4,
+            )?;
             let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             let members = ctx.read_native_pin(members_pin, members);
+            let member_count = ctx.array_length(members);
             ctx.set_field(obj, slots.byte_size, Value::Long(size));
             ctx.set_field(obj, slots.byte_alignment, Value::Long(max_align));
-            ctx.set_field(obj, slots.payload, Value::Object(Some(members)));
-            ctx.set_field(obj, slots.name, Value::Object(None));
             ctx.unpin_native_roots(members_pin);
+            // The three below each ALLOCATE and so can move `obj`; each hands
+            // back the current reference and none may be reordered above a
+            // plain `set_field` that would then use a stale one.
+            let obj = p67_group_set_members(ctx, obj, members, member_count)?;
+            let obj = p67_group_set_kind(ctx, obj, false, max_align)?;
+            let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4176,9 +4538,9 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, slots.byte_alignment, Value::Long(elem_align.max(1)));
             let element = ctx.read_native_pin(element_pin, element);
             ctx.set_field(obj, slots.payload, Value::Object(Some(element)));
-            ctx.set_field(obj, slots.name, Value::Object(None));
             ctx.set_field(obj, slots.element_count, Value::Long(count));
             ctx.unpin_native_roots(element_pin);
+            let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4244,14 +4606,23 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // it. Minting one through `p67_layout_object` answers the right
             // byteSize and then loses every member.
             let members_pin = ctx.pin_native_root(members);
-            let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/UnionLayoutImpl", 4)?;
+            let obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "jdk/internal/foreign/layout/UnionLayoutImpl",
+                4,
+            )?;
             let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             let members = ctx.read_native_pin(members_pin, members);
+            let member_count = ctx.array_length(members);
             ctx.set_field(obj, slots.byte_size, Value::Long(size));
             ctx.set_field(obj, slots.byte_alignment, Value::Long(max_align));
-            ctx.set_field(obj, slots.payload, Value::Object(Some(members)));
-            ctx.set_field(obj, slots.name, Value::Object(None));
             ctx.unpin_native_roots(members_pin);
+            // The three below each ALLOCATE and so can move `obj`; each hands
+            // back the current reference and none may be reordered above a
+            // plain `set_field` that would then use a stale one.
+            let obj = p67_group_set_members(ctx, obj, members, member_count)?;
+            let obj = p67_group_set_kind(ctx, obj, true, max_align)?;
+            let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4304,7 +4675,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // member decode fell back to "alignment = size".
             ctx.set_field(obj, slots.byte_alignment, Value::Long(1));
             ctx.set_field(obj, slots.payload, Value::Object(None));
-            ctx.set_field(obj, slots.name, Value::Object(None));
+            let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4612,30 +4983,20 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             "memberLayouts",
             "()Ljava/util/List;",
             |ctx, args| {
-                let members =
-                    match obj_arg(args, 0).ok().and_then(|this| {
-                        match ctx.get_field(this, p67_layout_slots(ctx, this).payload) {
-                            Value::Object(Some(arr)) => Some(arr),
-                            _ => None,
-                        }
-                    }) {
-                        Some(arr) => arr,
-                        None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
-                    };
-                let len = ctx.array_length(members);
-                let members_pin = ctx.pin_native_root(members);
-                let data_slot = ctx
-                    .resolve_field_index("java/util/ArrayList", "elementData")
-                    .unwrap_or(0);
-                let size_slot = ctx
-                    .resolve_field_index("java/util/ArrayList", "size")
-                    .unwrap_or(1);
-                let n_fields = std::cmp::max(data_slot, size_slot) + 1;
-                let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields)?;
-                let members = ctx.read_native_pin(members_pin, members);
-                ctx.set_field(list, data_slot, Value::Object(Some(members)));
-                ctx.set_field(list, size_slot, Value::Int(len as i32));
-                ctx.unpin_native_roots(members_pin);
+                // Through the shared reader, which knows both conventions: a
+                // real carrier's `elements` IS a `List` already and wrapping it
+                // in a second one answered a list of one list.
+                let (members, len) = match obj_arg(args, 0)
+                    .ok()
+                    .and_then(|this| p67_group_members(ctx, this))
+                {
+                    Some(pair) => pair,
+                    None => (
+                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+                        0,
+                    ),
+                };
+                let list = p67_new_member_list(ctx, members, len)?;
                 Ok(Some(Value::Object(Some(list))))
             },
         );

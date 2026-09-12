@@ -2303,11 +2303,26 @@ fn t9c_synthetic_field_tables_cover_their_factories() {
 
     let mut short: Vec<String> = Vec::new();
     for (class_name, (requested, site)) in &wanted {
-        let declared = cratonvm_classloading::synthetic_stub_instance_field_count(class_name);
-        // A class with NO entry declares zero and is not exposed: the table is
-        // consulted only for classes CratonVM synthesizes, and a name with no
-        // arm has no synthesized form for `new` to size. Only a class that HAS
-        // an entry can be too short.
+        // The CHAIN total, not the class's own contribution. `n` in
+        // `alloc_concurrent_synthetic(ctx, name, n)` is an absolute slot
+        // extent: the natives that write such an object index it from 0,
+        // through the inherited prefix. `LinkedHashMap` keeps
+        // `LHM_FIELD_HEAD = 3` / `TAIL = 4` -- its own two fields, after
+        // `HashMap`'s three -- so an own-count of 2 covers an extent of 5.
+        //
+        // Comparing the own-count reported a three-slot shortfall that does
+        // not exist, and the only way to silence it was to over-declare the
+        // table. That is where `LinkedHashMap`'s claim of five OWN fields came
+        // from, and in real-JDK mode an over-declared floor pads a real class
+        // past its declared width, which costs it the compact layout outright
+        // (`ClassStore::build_compact_layout` refuses any padded class). A
+        // gate that can only be satisfied by making objects bigger is worth
+        // fixing rather than working around.
+        let declared = cratonvm_classloading::synthetic_stub_total_field_count(class_name);
+        // A class with NO entry anywhere in its chain declares zero and is not
+        // exposed: the table is consulted only for classes CratonVM
+        // synthesizes, and a name with no arm has no synthesized form for
+        // `new` to size. Only a class that HAS an entry can be too short.
         if declared == 0 {
             continue;
         }
@@ -2327,6 +2342,209 @@ fn t9c_synthetic_field_tables_cover_their_factories() {
         short.len(),
         short.join("\n")
     );
+}
+
+/// The companion gate to T9C, running the other way: a class whose synthetic
+/// slot floor has been declared SYNTHETIC-ONLY must have no factory that
+/// builds it in the fabricated shape on a receiver that may be real.
+///
+/// # What the exemption is, and why it needs a gate
+///
+/// `synthetic_stub_fields` is one number read in two places that mean
+/// different things: it DEFINES the layout of a fabricated stub, and it FLOORS
+/// the layout of a class defined from real class-file bytes. For six
+/// collection classes the second reading was a fiction -- their real layouts
+/// are narrower, nothing writes past the real width, and padding them cost the
+/// compact layout for EVERY slot (`ClassStore::build_compact_layout` refuses
+/// any padded class, because a padded slot has no descriptor and its oop-map
+/// entry would be a guess). `java.util.Properties` was 4.5x HotSpot empty and
+/// `HashSet` 2.0x for exactly that.
+///
+/// `FLOOR_EXEMPT_CLASSES` skips the floor for them. Lowering a floor fails
+/// SILENTLY -- an out-of-range `set_field` is dropped, not raised -- so the
+/// exemption is only sound while its premise holds: **no native writes a raw
+/// absolute slot at or past the real extent on a receiver of that class in
+/// real-JDK mode.** This gate holds the half of that population which is
+/// mechanical: every literal `alloc_concurrent_synthetic(_, "cls", n)` site,
+/// whose `n` is the shape the caller intends to write.
+///
+/// # The one legitimate exception
+///
+/// A site that has already asked `ctx.is_class_synthetic_stub(..)` knows it is
+/// on a fabricated receiver, where the wide shape IS the layout.
+/// `wildfly_security::count_carrying_hash_set` is the model: three slots under
+/// the gate, `build_real_layout_string_hashset` without it. Such a site may ask
+/// for the fabricated width, and is recognised by that call appearing in the
+/// lines above it.
+///
+/// # Rule when this fails
+///
+/// Convert the factory; do not widen the table. The conversion is always the
+/// same shape: ask for the real width and go through the class's own `<init>`
+/// (`native-builtins::build_real_hash_set` does it for every `Set`-returning
+/// native in the tree). Widening the table back puts the class over the padding
+/// cliff again and costs 2x-4.5x on every instance of it.
+#[test]
+fn t9d_floor_exempt_classes_have_no_oversized_factories() {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    files.sort();
+    assert!(
+        files.len() > 100,
+        "T9D GATE: only found {} .rs files -- the walker is broken, not the tree",
+        files.len()
+    );
+
+    let exempt = cratonvm_classloading::FLOOR_EXEMPT_CLASSES;
+    assert!(
+        !exempt.is_empty(),
+        "T9D GATE: the exemption table is empty -- either the screen was removed \
+         or this gate is pointed at the wrong symbol"
+    );
+
+    // Half 1: the exemption must still be BUYING something. An entry whose
+    // fabricated extent no longer exceeds the real one pads nothing, so it is a
+    // stale claim about a class rather than a live exemption -- and a stale
+    // claim is what a reader would trust next time the table moves.
+    let mut pointless = Vec::new();
+    for (class, real_extent) in exempt {
+        let declared = cratonvm_classloading::synthetic_stub_total_field_count(class);
+        if declared <= *real_extent {
+            pointless.push(format!(
+                "  {class}: fabricated extent {declared} no longer exceeds the real \
+                 {real_extent}, so the exemption pads nothing -- drop the entry"
+            ));
+        }
+    }
+    assert!(
+        pointless.is_empty(),
+        "T9D GATE: {} stale entr(ies) in FLOOR_EXEMPT_CLASSES:\n{}",
+        pointless.len(),
+        pointless.join("\n")
+    );
+
+    // Half 2: no factory may build an exempt class in the fabricated shape
+    // unless it has established that the receiver IS fabricated.
+    let mut oversized: Vec<String> = Vec::new();
+    for path in &files {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let src = strip_comments(&raw);
+        for (class_name, count, offset) in literal_synthetic_allocations_anywhere(&src) {
+            let Some((_, real_extent)) = exempt.iter().find(|(c, _)| *c == class_name) else {
+                continue;
+            };
+            if count <= *real_extent || synthetic_stub_gate_precedes(&src, offset) {
+                continue;
+            }
+            let line = src[..offset].matches('\n').count() + 1;
+            oversized.push(format!(
+                "  {}:{line} asks for {count} slots of {class_name}, whose real \
+                 layout declares {real_extent}",
+                path.strip_prefix(root).unwrap_or(path).display()
+            ));
+        }
+    }
+    assert!(
+        oversized.is_empty(),
+        "T9D GATE: {} factor(ies) build a floor-exempt class in its FABRICATED \
+         shape on a receiver that may be real. Every slot past the real extent is \
+         silently DISCARDED there, and the object is the wrong shape for the \
+         class's own bytecode besides:\n{}\n\
+         Fix the factory (real width + the class's own `<init>`), or gate it on \
+         `ctx.is_class_synthetic_stub(..)` if the fabricated shape really is what \
+         that arm means. Do NOT widen the table.",
+        oversized.len(),
+        oversized.join("\n")
+    );
+}
+
+/// `java/util/ArrayDeque` declares exactly the three slots the real class does.
+///
+/// It is not in `FLOOR_EXEMPT_CLASSES` because it needs no exemption: its fourth
+/// slot held a `size` that `ad_state` stopped reading on 2026-08-30 (the count
+/// is derived from `head`/`tail`, the way the JDK itself derives it), so the
+/// table was simply narrowed to three. A fourth pads the real class by one and
+/// costs it the compact layout for all three -- 232 bytes empty against
+/// HotSpot's 112, which is how it was found. This freezes the narrowing so it
+/// cannot grow back by accident the way `LinkedHashMap`'s floor did.
+#[test]
+fn array_deque_synthetic_table_matches_the_real_class() {
+    assert_eq!(
+        cratonvm_classloading::synthetic_stub_total_field_count("java/util/ArrayDeque"),
+        3,
+        "java/util/ArrayDeque must declare exactly `elements`/`head`/`tail`; a \
+         fourth slot pads the real class out of the compact layout and nothing \
+         reads it (`ad_state` derives the count)"
+    );
+}
+
+/// Every literal `alloc_concurrent_synthetic(_, "a/b/C", N)` in `src`, whatever
+/// the receiver is spelled as, with the byte offset of the site.
+///
+/// The receiver-spelling filter T9C applies (`ctx` exactly) is right for its
+/// question and wrong for this one: `ModuleLayer.modules()` allocates through a
+/// `&mut *scope` handle-scope borrow, and that is a production site building a
+/// real `java.util.HashSet`. Only the `#[cfg(test)]` fixtures' `&mut ctx` -- a
+/// mock context allocating shapes no bytecode `new` can produce -- is excluded.
+fn literal_synthetic_allocations_anywhere(src: &str) -> Vec<(String, usize, usize)> {
+    const NEEDLE: &str = "alloc_concurrent_synthetic(";
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find(NEEDLE) {
+        let site = from + rel;
+        let open = site + NEEDLE.len();
+        from = open;
+        let Some(rest) = src.get(open..) else { break };
+        let Some(close_rel) = rest.find(')') else {
+            break;
+        };
+        let args = &rest[..close_rel];
+        let mut parts = args.split(',');
+        let Some(recv) = parts.next().map(str::trim) else {
+            continue;
+        };
+        if recv == "&mut ctx" {
+            continue;
+        }
+        let Some(name_part) = parts.next() else {
+            continue;
+        };
+        let name_part = name_part.trim();
+        if !(name_part.starts_with('"') && name_part.ends_with('"') && name_part.len() > 2) {
+            continue;
+        }
+        let Some(count_part) = parts.next() else {
+            continue;
+        };
+        let Ok(count) = count_part.trim().parse::<usize>() else {
+            continue;
+        };
+        out.push((name_part[1..name_part.len() - 1].to_string(), count, site));
+    }
+    out
+}
+
+/// Whether the allocation at `offset` sits under an `is_class_synthetic_stub`
+/// test.
+///
+/// Scoped to the 40 lines before the site rather than to the enclosing function
+/// because the enclosing function is not cheaply findable in a token-free scan,
+/// and 40 lines is longer than any arm this actually covers
+/// (`count_carrying_hash_set`'s gate is two lines above its allocation). The
+/// direction of the inexactness is the safe one for a gate that must not cry
+/// wolf: it can only ever EXCUSE a site, never invent one, and an excused site
+/// is still visible to the raw-slot half of the screen.
+fn synthetic_stub_gate_precedes(src: &str, offset: usize) -> bool {
+    let start = src[..offset]
+        .char_indices()
+        .rev()
+        .filter(|(_, c)| *c == '\n')
+        .nth(39)
+        .map_or(0, |(i, _)| i);
+    src[start..offset].contains("is_class_synthetic_stub(")
 }
 
 /// Every literal `alloc_concurrent_synthetic(ctx, "a/b/C", N)` in `src`.

@@ -38,7 +38,7 @@
 use std::ffi::CString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
-use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
@@ -173,12 +173,82 @@ fn lookup_all_host_addr_impl(
     if filtered.is_empty() {
         return Err(unknown_host(format!("{host}: no matching family")));
     }
-    let arr = ctx.new_ref_array(ClassId::new(0), filtered.len());
+    // Every mirror is an allocation (plus the strings inside it), so the array
+    // has to be re-read from its handle at each store rather than carried as
+    // the address `new_ref_array` happened to return.
+    let mut scope = NativeHandleScope::new(ctx);
+    let arr_obj = scope.new_ref_array(ClassId::new(0), filtered.len());
+    let arr_h = scope.root(arr_obj);
     for (i, ip) in filtered.iter().enumerate() {
-        let mirror = alloc_inet_address_mirror(ctx, &host, ip);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror?)));
+        let mirror = alloc_inet_address_mirror(&mut *scope, &host, ip)?;
+        let arr = scope.get(&arr_h);
+        scope.set_array_element(arr, i, Value::Object(Some(mirror)));
     }
-    Ok(Some(Value::Object(Some(arr))))
+    Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
+}
+
+/// `Inet6AddressImpl.lookupAllHostAddr(String, int)` — the JDK 25 spelling.
+///
+/// The `int` is `InetAddressResolver.LookupPolicy.characteristics()`, and its
+/// four defined bits are the whole contract:
+///
+/// ```text
+///   IPV4       0x01   include IPv4 results
+///   IPV6       0x02   include IPv6 results
+///   IPV4_FIRST 0x04   order IPv4 before IPv6
+///   IPV6_FIRST 0x08   order IPv6 before IPv4
+/// ```
+///
+/// **Why this exists as a separate entry point.** `Inet4AddressImpl`'s native
+/// really is one-argument, and this file registered the one-argument spelling
+/// for BOTH impls. On JDK 19+ that is not `Inet6AddressImpl`'s native: the
+/// image declares `lookupAllHostAddr(String, int)` there, so the registration
+/// named a method the image does not have and the method the image DOES have
+/// had no implementation. `InetAddress.getByName` reaches it through
+/// `InetAddress$PlatformResolver.lookupByName`, which is why the failure
+/// surfaced as an `UnsatisfiedLinkError` from ordinary `getByName` rather than
+/// from anything IPv6-flavoured.
+///
+/// Zero characteristics is treated as "both families, platform order": a
+/// policy that selects neither family can only fail, and the JDK never
+/// constructs one — `LookupPolicy.of(0)` is rejected at its own factory.
+fn lookup_all_host_addr_policy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    const IPV4: i32 = 0x01;
+    const IPV6: i32 = 0x02;
+    const IPV4_FIRST: i32 = 0x04;
+    const IPV6_FIRST: i32 = 0x08;
+
+    let host = read_string_arg(ctx, args, 1)?;
+    let characteristics = match args.get(2) {
+        Some(Value::Int(i)) => *i,
+        _ => IPV4 | IPV6,
+    };
+    let want4 = characteristics & IPV4 != 0 || characteristics & (IPV4 | IPV6) == 0;
+    let want6 = characteristics & IPV6 != 0 || characteristics & (IPV4 | IPV6) == 0;
+
+    let resolved = resolve_addrs(&host)?;
+    let mut filtered: Vec<IpAddr> = resolved
+        .into_iter()
+        .filter(|ip| if ip.is_ipv4() { want4 } else { want6 })
+        .collect();
+    if characteristics & IPV4_FIRST != 0 {
+        filtered.sort_by_key(|ip| u8::from(ip.is_ipv6()));
+    } else if characteristics & IPV6_FIRST != 0 {
+        filtered.sort_by_key(|ip| u8::from(ip.is_ipv4()));
+    }
+    if filtered.is_empty() {
+        return Err(unknown_host(format!("{host}: no matching family")));
+    }
+
+    let mut scope = NativeHandleScope::new(ctx);
+    let arr_obj = scope.new_ref_array(ClassId::new(0), filtered.len());
+    let arr_h = scope.root(arr_obj);
+    for (i, ip) in filtered.iter().enumerate() {
+        let mirror = alloc_inet_address_mirror(&mut *scope, &host, ip)?;
+        let arr = scope.get(&arr_h);
+        scope.set_array_element(arr, i, Value::Object(Some(mirror)));
+    }
+    Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +679,19 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     r.register(INET4_IMPL, "init", "()V", |_ctx, _args| Ok(None));
 
     // ---- Inet6AddressImpl ----
+    // The JDK 25 image declares this native with the LookupPolicy
+    // characteristics int; `javap -p -s java.net.Inet6AddressImpl` is the
+    // authority and says `(Ljava/lang/String;I)`. `Inet4AddressImpl`'s really
+    // is one-argument, which is why the two registrations differ.
+    r.register(
+        INET6_IMPL,
+        "lookupAllHostAddr",
+        "(Ljava/lang/String;I)[Ljava/net/InetAddress;",
+        lookup_all_host_addr_policy,
+    );
+    // Kept: the one-argument spelling names no method of the JDK 25 image, but
+    // this VM's own callers reach it directly and a removal is a separate
+    // measurement from the addition above.
     r.register(
         INET6_IMPL,
         "lookupAllHostAddr",

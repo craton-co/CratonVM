@@ -75,7 +75,7 @@
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use cratonvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::try_alloc_concurrent_synthetic;
 
@@ -162,11 +162,28 @@ fn mlkem_spi_class(idx: i32) -> Option<&'static str> {
 /// Offset at which our appended synthetic state begins — the real class's total
 /// declared field count, so reference writes never land on a slot the real
 /// layout declares with an incompatible descriptor.
+/// The fifth caller of the ONE base helper, not the fifth copy of it.
+///
+/// This was a private re-implementation: `ensure_class_initialized`, then
+/// `class_num_total_fields`, with no fabricated-stub arm. It is now a forwarder
+/// to `cratonvm_native_api::appended_slots::base_for_class`, whose module header
+/// names these four `native-builtins/src/jca/` copies by hand as the ones still
+/// outstanding.
+///
+/// Two things change, and one deliberately does not.
+///
+///   * It stops running `<clinit>`. `base_for_class` answers an already-loaded
+///     class from `class_id_by_name`, so a JCA private-slot read is no longer a
+///     Java re-entry that can move every unpinned `ObjectRef` its caller holds.
+///   * It gains the fabricated-stub arm, which collapses the base to 0 on a
+///     stub whose fields ARE the private map.
+///   * The NUMBER does not change. Measured with a paired probe that computed
+///     both answers on the same call: identical on every class either mode
+///     reached (real-JDK `KeyPairGenerator` 2, `Signature` 4, `KeyFactory` 5,
+///     `KeyAgreement` 6, `KEM` 4; synthetic-JDK all 0), with no value ever
+///     moving between calls.
 fn synthetic_base_offset(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
-    let cid = ctx
-        .ensure_class_initialized(class_name)
-        .unwrap_or(ClassId::new(0));
-    ctx.class_num_total_fields(cid)
+    cratonvm_native_api::appended_slots::base_for_class(ctx, class_name)
 }
 
 fn this_arg(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {

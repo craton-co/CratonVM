@@ -3221,16 +3221,32 @@ pub(crate) fn native_surefire_system_property_manager_load_properties(
         "org/apache/maven/surefire/booter/PropertiesWrapper",
         2,
     )?;
+    // Pin BEFORE the next allocation, not after the store. The pin used to be
+    // taken one statement too late: `wrapper` was carried across the
+    // `HashMap` allocation AND `native_map_init` (which allocates the table),
+    // and the `properties` store then wrote into the pre-move copy — the same
+    // receiver-side shape as
+    // `native_assertj_lightweight_comparable_assert`'s `objects` store, and
+    // equally invisible to `[deadref-store]`, which only screens the VALUE.
+    let wrapper_pin = ctx.pin_native_root(wrapper);
     // Allocate a tiny placeholder map for the `properties` field so any
     // bytecode that touches the field (not via our overrides) sees a
     // non-null Map. Use a HashMap (well-known to our natives) rather
     // than ConcurrentHashMap to keep the placeholder layout-stable.
-    let placeholder = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8)?;
+    // 3, not 8: nothing here writes a slot -- `native_map_init` and the
+    // `properties` field take the object as it is -- and a literal wider
+    // than the table is what the T9C gate scores the table short against.
+    let placeholder = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
+    let placeholder_pin = ctx.pin_native_root(placeholder);
     if let Ok(_) =
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(placeholder))])
     {}
-    ctx.set_field_by_name(wrapper, "properties", Value::Object(Some(placeholder)));
+    let placeholder = ctx.read_native_pin(placeholder_pin, placeholder);
+    let wrapper_live = ctx.read_native_pin(wrapper_pin, wrapper);
+    ctx.set_field_by_name(wrapper_live, "properties", Value::Object(Some(placeholder)));
+    ctx.unpin_native_roots(placeholder_pin);
     for (k, v) in &parsed {
+        let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
         crate::properties_sidetable::store_property_in_sidetable(ctx, wrapper, k, v);
         // `PropertiesWrapper.getProperty` is compiled as `this.properties.get(key)`.
         // If dispatch hits the real `HashMap` instead of our sidetable-backed
@@ -3333,10 +3349,17 @@ pub(crate) fn native_forkedbooter_create_surefire_properties_if_file_exists(
         Err(_) => return Ok(Some(Value::Object(None))),
     };
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+    // `try_alloc_concurrent_synthetic` below allocates (and can initialise a
+    // class), so `arr` has to be rooted across it: an unpinned `ObjectRef`
+    // carried over an allocation is the defect family this file already
+    // carries two other instances of.
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i32));
     }
     let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.set_field(stream, 1, Value::Int(0));
     ctx.set_field(stream, 2, Value::Int(0));
@@ -3387,7 +3410,9 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
         "org/apache/maven/surefire/booter/spi/SurefireMasterProcessChannelProcessorFactory",
         "org/apache/maven/surefire/booter/spi/LegacyMasterProcessChannelProcessorFactory",
     ];
+    let conn_obj_pin = ctx.pin_native_root(conn_obj);
     for class_name in candidates {
+        let conn_obj = ctx.read_native_pin(conn_obj_pin, conn_obj);
         let Some(factory) = instantiate_factory(ctx, class_name)? else {
             continue;
         };
@@ -3412,7 +3437,9 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
     }
     // If capability checks are unreliable, at least require connect() to accept
     // the normalized transport string before returning.
+    let conn_obj_pin = ctx.pin_native_root(conn_obj);
     for class_name in candidates {
+        let conn_obj = ctx.read_native_pin(conn_obj_pin, conn_obj);
         let Some(factory) = instantiate_factory(ctx, class_name)? else {
             continue;
         };
@@ -4757,21 +4784,47 @@ fn native_assertj_lightweight_comparable_assert(
             let class_id = ctx.ensure_class_initialized(class_name)?;
             Ok(ctx.alloc_object(class_id, ctx.class_num_total_fields(class_id)))
         };
-        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
+        // EVERY store into the assertion goes through this, and it re-reads the
+        // pin rather than trusting a handle taken earlier.
+        //
+        // `static_object` and `alloc_blank` both call
+        // `ensure_class_initialized`, which runs a `<clinit>` — arbitrary Java,
+        // arbitrary allocation, arbitrary relocation of `assertion`. This
+        // function used to refresh the handle at SOME of the stores and reuse a
+        // stale one at others, which is not a style difference: the `objects`
+        // store reused the handle taken before
+        // `org/assertj/core/internal/Objects`'s `<clinit>` ran, so on the one
+        // call where that `<clinit>` was still pending the field was written
+        // into the pre-move copy and the surviving object kept `objects ==
+        // null`. That is `BindableTests`'
+        // `whenTypeCouldUseJavaBeanOrValueObjectJavaBeanBindingCanBeSpecified`
+        // failing an AssertJ NPE under `CRATONVM_DBG_GC_STRESS <= 262144`, and
+        // it is invisible to every `[deadref-*]` probe because the STORED VALUE
+        // was live throughout — only the RECEIVER was stale.
+        //
+        // Refreshing per store rather than per paragraph is what makes the
+        // property local: no reader has to check what ran since the last
+        // refresh.
+        let set_on_assertion = |ctx: &mut dyn NativeContext, field: &str, value: Value| {
+            let live = ctx.read_native_pin(assertion_pin, assertion);
+            ctx.set_field_by_name(live, field, value);
+        };
         let actual = value_pin
             .map(|pin| Value::Object(Some(ctx.read_native_pin(pin, value.unwrap()))))
             .unwrap_or(Value::Object(None));
-        ctx.set_field_by_name(assertion_live, "actual", actual);
+        set_on_assertion(ctx, "actual", actual);
+        // `myself` is the object's OWN address, so the read and the store have
+        // to straddle nothing at all.
+        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
         ctx.set_field_by_name(
             assertion_live,
             "myself",
             Value::Object(Some(assertion_live)),
         );
         let objects = static_object(ctx, "org/assertj/core/internal/Objects", "INSTANCE");
-        ctx.set_field_by_name(assertion_live, "objects", objects);
+        set_on_assertion(ctx, "objects", objects);
         let conditions = static_object(ctx, "org/assertj/core/internal/Conditions", "INSTANCE");
-        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
-        ctx.set_field_by_name(assertion_live, "conditions", conditions);
+        set_on_assertion(ctx, "conditions", conditions);
         // WritableAssertionInfo's constructor only assigns the representation;
         // allocating the simple state carrier directly avoids re-entering the
         // interpreter for every successful one-shot assertion. It must still
@@ -4816,7 +4869,12 @@ fn native_assertj_lightweight_comparable_assert(
                 "CONFIGURATION_PROVIDER",
             );
             if let Value::Object(Some(provider)) = provider {
-                let resolved = ctx
+                // `invoke_virtual` runs Java, so `provider` is a bare
+                // `ObjectRef` held across an allocation from the moment the
+                // call returns — and the `unwrap_or_else` fallback below reads
+                // a field THROUGH it. Pin it for the span it is used over.
+                let provider_pin = ctx.pin_native_root(provider);
+                let called = ctx
                     .invoke_virtual(
                         provider,
                         "representation",
@@ -4825,20 +4883,26 @@ fn native_assertj_lightweight_comparable_assert(
                     )
                     .ok()
                     .flatten()
-                    .filter(|v| matches!(v, Value::Object(Some(_))))
+                    .filter(|v| matches!(v, Value::Object(Some(_))));
+                let resolved = match called {
+                    Some(v) => v,
                     // Fall back to the field itself if the accessor is
                     // unavailable; leaving it null is never acceptable.
-                    .unwrap_or_else(|| ctx.get_field_by_name(provider, "representation"));
+                    None => {
+                        let provider = ctx.read_native_pin(provider_pin, provider);
+                        ctx.get_field_by_name(provider, "representation")
+                    }
+                };
+                ctx.unpin_native_roots(provider_pin);
                 if matches!(resolved, Value::Object(Some(_))) {
                     representation = resolved;
                 }
             }
         }
-        let info = ctx.read_native_pin(info_pin, info);
-        ctx.set_field_by_name(info, "representation", representation);
+        let info_live = ctx.read_native_pin(info_pin, info);
+        ctx.set_field_by_name(info_live, "representation", representation);
+        set_on_assertion(ctx, "info", Value::Object(Some(info_live)));
         ctx.unpin_native_roots(info_pin);
-        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
-        ctx.set_field_by_name(assertion_live, "info", Value::Object(Some(info)));
         let creator = match ctx.new_object_initialized(
             "org/assertj/core/error/AssertionErrorCreator",
             "()V",
@@ -4847,9 +4911,8 @@ fn native_assertj_lightweight_comparable_assert(
             Some(Value::Object(Some(creator))) => creator,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
-        ctx.set_field_by_name(
-            assertion_live,
+        set_on_assertion(
+            ctx,
             "assertionErrorCreator",
             Value::Object(Some(creator)),
         );
@@ -4858,39 +4921,39 @@ fn native_assertj_lightweight_comparable_assert(
             // default except explicit zero/null stores, so a blank object is
             // observably equivalent and remains fully mutable.
             let comparators = alloc_blank(ctx, "java/util/TreeMap")?;
-            let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
-            ctx.set_field_by_name(
-                assertion_live,
+            set_on_assertion(
+                ctx,
                 "comparatorsByPropertyOrField",
                 Value::Object(Some(comparators)),
             );
         } else {
             let strings = static_object(ctx, "org/assertj/core/internal/Strings", "INSTANCE");
-            let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
-            ctx.set_field_by_name(assertion_live, "strings", strings);
+            set_on_assertion(ctx, "strings", strings);
             let failures = static_object(ctx, "org/assertj/core/internal/Failures", "INSTANCE");
-            let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
-            ctx.set_field_by_name(assertion_live, "failures", failures);
+            set_on_assertion(ctx, "failures", failures);
         }
         let comparables = alloc_blank(ctx, "org/assertj/core/internal/Comparables")?;
         let comparables_pin = ctx.pin_native_root(comparables);
+        // One `static_object` per store, each read immediately before the store
+        // it feeds. Reading BOTH statics first and then storing both left
+        // `comparison_strategy` held across `Failures`' `<clinit>` — the same
+        // value-side hazard the receiver-side one above is, and equally silent.
         let comparison_strategy = static_object(
             ctx,
             "org/assertj/core/internal/StandardComparisonStrategy",
             "INSTANCE",
         );
+        let comparables_live = ctx.read_native_pin(comparables_pin, comparables);
+        ctx.set_field_by_name(comparables_live, "comparisonStrategy", comparison_strategy);
         let failures = static_object(ctx, "org/assertj/core/internal/Failures", "INSTANCE");
-        let comparables = ctx.read_native_pin(comparables_pin, comparables);
-        ctx.set_field_by_name(comparables, "comparisonStrategy", comparison_strategy);
-        ctx.set_field_by_name(comparables, "failures", failures);
+        let comparables_live = ctx.read_native_pin(comparables_pin, comparables);
+        ctx.set_field_by_name(comparables_live, "failures", failures);
+        let comparables_live = ctx.read_native_pin(comparables_pin, comparables);
         ctx.unpin_native_roots(comparables_pin);
-        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
-        ctx.set_field_by_name(
-            assertion_live,
-            "comparables",
-            Value::Object(Some(comparables)),
-        );
-        Ok(Some(Value::Object(Some(assertion_live))))
+        set_on_assertion(ctx, "comparables", Value::Object(Some(comparables_live)));
+        Ok(Some(Value::Object(Some(
+            ctx.read_native_pin(assertion_pin, assertion),
+        ))))
     })();
     if let Some(value_pin) = value_pin {
         ctx.unpin_native_roots(value_pin);

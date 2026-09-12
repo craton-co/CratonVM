@@ -45,6 +45,70 @@ fn inline_live_slot_clamp_disabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP").is_some()
 }
 
+/// How many reservations the open-inline-locals floor MOVED — i.e. how many
+/// would have handed out a word an enclosing spliced callee's locals still own.
+///
+/// A SECOND counter rather than a second use of [`INLINE_LIVE_SLOT_CLAMPS`],
+/// because the two guard different things: that one protects the caller's
+/// OPERAND stack from a rewound cursor, this one protects a spliced callee's
+/// LOCALS from every path that lowers the cursor. A single number could not say
+/// which a result should be credited to — and this defect exists in the first
+/// place because a single number (308 overlap reports) could not say which half
+/// of it was the hazard.
+static INLINE_LOCALS_FLOOR_BUMPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn note_inline_locals_floor() {
+    INLINE_LOCALS_FLOOR_BUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Engagement count for the open-inline-locals floor. Printed by
+/// `jit-method-stats` beside [`inline_live_slot_clamps`]. Zero means the guard
+/// never engaged on this run, which is what any report crediting it has to say.
+pub fn inline_locals_floor_bumps() -> u64 {
+    INLINE_LOCALS_FLOOR_BUMPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR=1` — measurement-only escape hatch
+/// restoring the pre-fix reservation start, so the fix can be A/B'd in ONE
+/// binary.
+///
+/// Separate from `CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP` on purpose: that
+/// switch removes the operand-stack clamp, whose absence is a known miscompile
+/// (bc-java `LEATest`), so an A/B through it would price two changes at once
+/// and one of them is not this one. Turning THIS one off reinstates a store
+/// onto a live enclosing local; it is not a supported configuration.
+pub(super) fn inline_locals_floor_disabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR").is_some()
+}
+
+/// DIAGNOSTIC (`CRATONVM_DBG_JIT_LOCALS_FLOOR=1`): one line per reservation the
+/// open-inline-locals floor considered, while a splice is nested.
+///
+/// It prints BOTH outcomes on purpose. `BUMPED` is the guard doing its job.
+/// `KEPT` is a reservation the ONE-SIDED rule would have moved and the range
+/// rule left alone -- the population that turned out to be a miscompile, so a
+/// run can COUNT it instead of inferring it from a bug report.
+/// `inline_locals_floor_bumps()` counts only the first kind.
+pub(super) fn dbg_note_locals_floor(
+    why: super::SpillReason,
+    cursor: i32,
+    slots: usize,
+    start: i32,
+    outcome: &str,
+    compiler: &super::Compiler,
+) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_LOCALS_FLOOR").is_none() {
+        return;
+    }
+    eprintln!(
+        "[jit-locals-floor] {outcome} {why:?} cursor={cursor} slots={slots} start={start} one_sided_floor={} scopes={} in {}",
+        compiler.open_inline_locals_floor(),
+        compiler.inline_oop_scopes.len(),
+        compiler.method_label,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The spliced direct call's oop map, keyed at the RETURN ADDRESS
 // ---------------------------------------------------------------------------
@@ -396,7 +460,12 @@ fn restamp_outcome(
 /// of the synthetic pcs this backend stamps (`ENTRY_POLL_BC_PC`,
 /// `SP_ID_UNSET_BC_PC`), both of which are far above it and are rejected by
 /// the same one test.
-const INLINE_FRAME_MAX_BCI: usize = 65_536;
+///
+/// `pub(crate)` since 2026-09-11: `ir_lower::record_npe_trap_site` is the
+/// optimizing tier's twin of [`record_npe_trap_site`] and screens its bci
+/// against the same bound. A second copy of the constant there would be a
+/// second place to fix when the bound is re-derived.
+pub(crate) const INLINE_FRAME_MAX_BCI: usize = 65_536;
 
 // ---------------------------------------------------------------------------
 // The guarded-virtual MISS EDGE, and why it has to poison its own bci
@@ -656,6 +725,25 @@ impl NpeTrapMap {
             .ok()
             .map(|i| &self.sites[i].1)
     }
+
+    /// Build a map from rows a backend collected itself.
+    ///
+    /// The single-pass backend records through the thread-local session
+    /// ([`record_npe_trap_site`] / [`finish_npe_trap_recording`]) because its
+    /// emitter is reached from a dozen places that would otherwise all have to
+    /// be handed a table. The OPTIMIZING backend lowers one graph in one
+    /// function and already carries its sibling table (`inline_frame_rows`) as
+    /// a plain field, so it collects these the same way and hands them over
+    /// here. Two producers, one consumer, and the ids are per-ARTIFACT either
+    /// way — `get` binary-searches within one map and never across two.
+    ///
+    /// Sorted here rather than trusted: a lowerer that pushed out of order
+    /// would otherwise turn every lookup into a silent miss or, worse, a hit on
+    /// a neighbouring site.
+    pub fn from_rows(mut sites: Vec<(u32, NpeTrapSite)>) -> Self {
+        sites.sort_unstable_by_key(|(id, _)| *id);
+        NpeTrapMap { sites }
+    }
 }
 
 /// Whether compiles record a trapping bci for their inline null checks.
@@ -870,7 +958,7 @@ impl InlineFrameMap {
     ///
     /// `code_len` is the artifact's final code length; a row past it describes
     /// bytes that are not in the artifact and is dropped.
-    fn from_rows(rows: Vec<InlineFrameRow>, code_len: usize) -> Self {
+    pub(crate) fn from_rows(rows: Vec<InlineFrameRow>, code_len: usize) -> Self {
         // Rewind backstop. Rows are appended in emission order, so their
         // offsets are strictly increasing UNLESS the buffer was rewound
         // between two of them. When it was, every row at or above the new
@@ -1054,7 +1142,10 @@ fn inline_frame_recording() -> bool {
 /// `CompiledMethod::method_label` uses, built from the same three strings the
 /// invalidation triple is built from.
 fn inline_site_label(site: &crate::InlineSite) -> String {
-    format!("{}.{}:{}", site.class_name, site.method_name, site.descriptor)
+    format!(
+        "{}.{}:{}",
+        site.class_name, site.method_name, site.descriptor
+    )
 }
 
 fn push_inline_frame_scope(label: String, class_id: u32, entry_bci: usize) {
@@ -2797,7 +2888,7 @@ impl Compiler {
                         let obj_slot = self.pop_stack();
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
+                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag, cpc);
                         crate::metrics::note_getfield_arm(0);
                         self.emit_call_absolute(self.helpers.getfield);
                         // The checked helper returns the `i64::MIN` deopt/NPE
@@ -3891,7 +3982,11 @@ impl Compiler {
         // ENCLOSING callee's pc -- `inline_walk_at.0`, read HERE, before
         // `try_emit_inline_body` overwrites it and does not restore it.
         let inline_frame_rows_checkpoint = inline_frame_rows_len();
-        push_inline_frame_scope(inline_site_label(site), site.class_id, self.inline_walk_at.0);
+        push_inline_frame_scope(
+            inline_site_label(site),
+            site.class_id,
+            self.inline_walk_at.0,
+        );
         let inline_ok = self.try_emit_inline_body(outer_pc, site);
         pop_inline_frame_scope();
         let published = self.deopt_stubs.len() > deopt_stubs_checkpoint

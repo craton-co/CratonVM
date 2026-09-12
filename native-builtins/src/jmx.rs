@@ -4,7 +4,9 @@
 //! JMX (Java Management Extensions) native method implementations.
 //! Provides MBeanServer and platform MXBeans for runtime monitoring.
 
-use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry, ThreadJmxSnapshot};
+use cratonvm_native_api::{
+    NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry, ThreadJmxSnapshot,
+};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
@@ -2259,12 +2261,16 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             let mgr_cid = ctx
                 .ensure_class_initialized("sun/management/MemoryManagerImpl")
                 .unwrap_or(ClassId::new(0));
-            let arr = ctx.new_ref_array(mgr_cid, 1);
+            let mut scope = NativeHandleScope::new(ctx);
+            let arr_obj = scope.new_ref_array(mgr_cid, 1);
+            let arr_h = scope.root(arr_obj);
             // GarbageCollectorImpl extends MemoryManagerImpl + implements
             // GarbageCollectorMXBean — single instance covers both the
             // manager list and (via the instanceof filter) the GC list.
-            let gc = alloc_garbage_collector_impl(ctx, "G1 Young Generation")?;
-            ctx.set_array_element(arr, 0, Value::Object(Some(gc)));
+            // Building it allocates, so the array's address is re-read after.
+            let gc = alloc_garbage_collector_impl(&mut *scope, "G1 Young Generation")?;
+            let arr = scope.get(&arr_h);
+            scope.set_array_element(arr, 0, Value::Object(Some(gc)));
             Ok(Some(Value::Object(Some(arr))))
         },
         NativeKind::Bridge,
@@ -5394,15 +5400,15 @@ fn alloc_snapshot_thread_info(
             -1
         }),
     );
-    ctx.set_field_by_name(
-        info,
-        "blockedCount",
-        Value::Long(if contention_enabled {
-            snapshot.blocked_count
-        } else {
-            0
-        }),
-    );
+    // THE COUNTS ARE NOT GATED, ONLY THE TIMES. `ThreadInfo.getBlockedTime()`
+    // and `getWaitedTime()` are specified to return -1 while thread contention
+    // monitoring is disabled; `getBlockedCount()` and `getWaitedCount()` carry
+    // no such clause and are always available. Gating all four made
+    // `getBlockedCount()` read 0 on a thread that was BLOCKED at that very
+    // instant -- the case the number exists for -- while HotSpot 25 reports 1
+    // on the same probe with contention monitoring left off
+    // (`probes/JmxMonitorOwnership.java`, which is the oracle for this).
+    ctx.set_field_by_name(info, "blockedCount", Value::Long(snapshot.blocked_count));
     ctx.set_field_by_name(
         info,
         "waitedTime",
@@ -5412,15 +5418,7 @@ fn alloc_snapshot_thread_info(
             -1
         }),
     );
-    ctx.set_field_by_name(
-        info,
-        "waitedCount",
-        Value::Long(if contention_enabled {
-            snapshot.waited_count
-        } else {
-            0
-        }),
-    );
+    ctx.set_field_by_name(info, "waitedCount", Value::Long(snapshot.waited_count));
     ctx.set_field_by_name(info, "lockOwnerId", Value::Long(snapshot.lock_owner_id));
     ctx.set_field_by_name(info, "priority", Value::Int(5));
     ctx.set_field_by_name(info, "stackTrace", Value::Object(Some(stack_trace)));
@@ -5907,14 +5905,21 @@ fn register_thread_mxbean_for(cls: &'static str, r: &mut NativeMethodRegistry) {
     // KEEP (the two below): false is the measurement, and CONFIRMED 2026-07-28
     // to be a different datum from the lock OWNERSHIP the two flags above turn
     // on — contention monitoring means TIMING every blocked and waiting interval
-    // per thread, and nothing in the VM records those durations. Re-checked
-    // after the write side landed: `ThreadJmxSnapshot` carries no blocked/waited
-    // time or count field at all, `alloc_snapshot_thread_info` therefore writes
-    // the -1/0 sentinels for `blockedTime`/`blockedCount`/`waitedTime`/
-    // `waitedCount`, and the only `blocked_count` in the tree
-    // (`threading/gc_barrier.rs`) counts GC-barrier arrivals, not Java monitor
-    // contention. So `ThreadInfo.getBlockedTime()`/`getWaitedTime()` have no
-    // source at all.
+    // per thread, and this flag governs only that timing.
+    //
+    // AMENDED 2026-09-08. The paragraph here used to add that
+    // "`ThreadJmxSnapshot` carries no blocked/waited time or count field at
+    // all", and that is no longer true: the registry counts a block on the way
+    // IN and `thread_jmx_snapshot` carries all four numbers. The counts were
+    // nevertheless being zeroed alongside the times, which is a spec error, not
+    // a missing source — `getBlockedTime()`/`getWaitedTime()` are specified to
+    // return -1 while contention monitoring is disabled, and
+    // `getBlockedCount()`/`getWaitedCount()` are specified with no such clause.
+    // HotSpot 25 reports `getBlockedCount() == 1` for a thread blocked on a
+    // monitor with contention monitoring left off; CratonVM reported 0 for the
+    // same thread at the same instant. See `alloc_snapshot_thread_info` and
+    // `probes/JmxMonitorOwnership.java`. This flag stays `false` — the TIMES
+    // still have no source.
     // The JMM's answer for an unsupported optional feature is exactly `false`,
     // and a `false` from `...Supported()` makes
     // `setThreadContentionMonitoringEnabled` throw
@@ -6361,13 +6366,21 @@ pub(crate) fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, 
         "java/lang/management/OperatingSystemMXBean",
         5,
     )?;
-    init_os_mxbean_fields(ctx, obj);
+    let mut obj = obj;
+    init_os_mxbean_fields(ctx, &mut obj);
     Ok(obj)
 }
 
 /// Populate the 5 synthetic `OperatingSystemMXBean` slots — shared by the
 /// factory path and the `<init>` native.
-fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) {
+    // GC: three `create_string` calls, each followed by a store THROUGH `obj`.
+    // The receiver is `&mut` so the caller's copy is corrected too, and every
+    // unconverted caller is a compile error — the remedy this file's gate
+    // prescribes (`WORKER-5-NOTE-10` §7.3). The audit only started reporting
+    // this once `ctx.create_string` was added to its level-0 set; it had been
+    // missing while three tokens that match nothing in the tree were present.
+    let pin = ctx.pin_native_root(*obj);
     // REAL: OS name / arch / version come from the live process, and all three
     // come from the SAME place the corresponding system property does — the
     // `os.name` / `os.arch` / `os.version` properties the VM seeds at startup
@@ -6386,26 +6399,30 @@ fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| String::from(std::env::consts::OS));
     let name = ctx.create_string(&os_name);
-    ctx.set_field(obj, 0, Value::Object(Some(name)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.set_field(*obj, 0, Value::Object(Some(name)));
     let os_arch = ctx
         .get_system_property("os.arch")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| String::from(std::env::consts::ARCH));
     let arch = ctx.create_string(&os_arch);
-    ctx.set_field(obj, 1, Value::Object(Some(arch)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.set_field(*obj, 1, Value::Object(Some(arch)));
     let os_version = ctx
         .get_system_property("os.version")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| String::from("unknown"));
     let version = ctx.create_string(&os_version);
-    ctx.set_field(obj, 2, Value::Object(Some(version)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.set_field(*obj, 2, Value::Object(Some(version)));
     // Container-aware processor count (cgroup CPU quota under container support).
     let cpus = ctx.available_processor_count();
-    ctx.set_field(obj, 3, Value::Int(cpus));
+    ctx.set_field(*obj, 3, Value::Int(cpus));
     // Slot 4 = system load average. `getSystemLoadAverage()` answers live
     // rather than from this slot, but seed it with the same real value so a
     // direct slot read is not the only place still reporting -1.0.
-    ctx.set_field(obj, 4, Value::Double(system_load_average()));
+    ctx.set_field(*obj, 4, Value::Double(system_load_average()));
+    ctx.unpin_native_roots(pin);
 }
 
 fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
@@ -6423,7 +6440,8 @@ fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
         // below would otherwise read null / untyped default slots.
         r.register(cls, "<init>", "()V", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            init_os_mxbean_fields(ctx, this);
+            let mut this = this;
+            init_os_mxbean_fields(ctx, &mut this);
             Ok(None)
         });
 
@@ -6494,13 +6512,14 @@ fn register_operating_system_mxbean_extensions(r: &mut NativeMethodRegistry) {
 
 fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/CompilationMXBean", 3)?;
-    init_compilation_mxbean_fields(ctx, obj);
+    let mut obj = obj;
+    init_compilation_mxbean_fields(ctx, &mut obj);
     Ok(obj)
 }
 
 /// Populate the 3 synthetic `CompilationMXBean` slots — shared by the factory
 /// path and the `<init>` native.
-fn init_compilation_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+fn init_compilation_mxbean_fields(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) {
     // name = CratonVM's real JIT identity (not a fabricated foreign name).
     // REAL: slots 1 and 2 are seeded from the ONE accessor
     // `NativeContext::jit_total_compile_time_ms`, so a bean can never be built
@@ -6509,15 +6528,19 @@ fn init_compilation_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     // trusting these slots — a compile-time snapshot taken at bean construction
     // would be frozen at ~0 for the whole run — but seeding them keeps a caller
     // that reads the fields directly consistent with the getters.
+    // GC: `create_string`, then three stores through `obj`.
+    let pin = ctx.pin_native_root(*obj);
     let name = ctx.create_string("CratonVM JIT");
-    ctx.set_field(obj, 0, Value::Object(Some(name)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(*obj, 0, Value::Object(Some(name)));
     let compile_ms = ctx.jit_total_compile_time_ms();
     ctx.set_field(
-        obj,
+        *obj,
         1,
         Value::Long(compile_ms.map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX))),
     );
-    ctx.set_field(obj, 2, Value::Int(i32::from(compile_ms.is_some())));
+    ctx.set_field(*obj, 2, Value::Int(i32::from(compile_ms.is_some())));
 }
 
 fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
@@ -6528,7 +6551,8 @@ fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
     // is null on an unconstructed bean.
     r.register(cls, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        init_compilation_mxbean_fields(ctx, this);
+        let mut this = this;
+        init_compilation_mxbean_fields(ctx, &mut this);
         Ok(None)
     });
 
@@ -6666,27 +6690,41 @@ fn register_virtual_thread_scheduler_mxbean(r: &mut NativeMethodRegistry) {
 fn alloc_gc_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let obj =
         try_alloc_concurrent_synthetic(ctx, "java/lang/management/GarbageCollectorMXBean", 4)?;
-    init_gc_mxbean_fields(ctx, obj);
+    let mut obj = obj;
+    init_gc_mxbean_fields(ctx, &mut obj);
     Ok(obj)
 }
 
 /// Populate the 4 synthetic `GarbageCollectorMXBean` slots — shared by the
 /// factory path and the `<init>` native.
-fn init_gc_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+fn init_gc_mxbean_fields(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) {
+    // GC: FIVE references cross an allocation here — `obj`, the pool-name
+    // array, and the first two of the three strings that go into it, each of
+    // which is minted before the next `create_string`.
+    let pin = ctx.pin_native_root(*obj);
     let name = ctx.create_string("CratonVM GC");
-    ctx.set_field(obj, 0, Value::Object(Some(name)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.set_field(*obj, 0, Value::Object(Some(name)));
     let gc_count = ctx.gc_collection_count() as i64;
-    ctx.set_field(obj, 1, Value::Long(gc_count)); // collectionCount (real)
-    ctx.set_field(obj, 2, Value::Long(0)); // collectionTime
-                                           // field 3 = memoryPoolNames (String[])
+    ctx.set_field(*obj, 1, Value::Long(gc_count)); // collectionCount (real)
+    ctx.set_field(*obj, 2, Value::Long(0)); // collectionTime
+                                            // field 3 = memoryPoolNames (String[])
     let pool_names = ctx.new_ref_array(ClassId::new(0), 3);
+    let pool_pin = ctx.pin_native_root(pool_names);
     let eden = ctx.create_string("Eden");
+    let eden_pin = ctx.pin_native_root(eden);
     let survivor = ctx.create_string("Survivor");
+    let survivor_pin = ctx.pin_native_root(survivor);
     let old_gen = ctx.create_string("Old Gen");
+    let pool_names = ctx.read_native_pin(pool_pin, pool_names);
+    let eden = ctx.read_native_pin(eden_pin, eden);
+    let survivor = ctx.read_native_pin(survivor_pin, survivor);
     ctx.set_array_element(pool_names, 0, Value::Object(Some(eden)));
     ctx.set_array_element(pool_names, 1, Value::Object(Some(survivor)));
     ctx.set_array_element(pool_names, 2, Value::Object(Some(old_gen)));
-    ctx.set_field(obj, 3, Value::Object(Some(pool_names)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.set_field(*obj, 3, Value::Object(Some(pool_names)));
+    ctx.unpin_native_roots(pin);
 }
 
 fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
@@ -6698,7 +6736,8 @@ fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
     // `String[]` return from `getMemoryPoolNames()` NPEs its callers).
     r.register(cls, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        init_gc_mxbean_fields(ctx, this);
+        let mut this = this;
+        init_gc_mxbean_fields(ctx, &mut this);
         Ok(None)
     });
 
@@ -6990,61 +7029,6 @@ fn jmx_attribute_not_found(ctx: &mut dyn NativeContext, attr: &str) -> MethodCal
     )
 }
 
-/// Fallback: build a synthetic 2-slot `java.util.HashSet` stand-in. Only used
-/// if a real `java.util.HashSet` cannot be constructed in this context (e.g. a
-/// unit-test mock with no JDK classes). A real query path always builds a real
-/// HashSet via [`build_real_hash_set`] — a synthetic stand-in's real `size()` /
-/// `iterator()` read its (empty) backing map, so callers see an empty set
-/// regardless of contents (the TC0622 defect).
-fn build_synthetic_hash_set(
-    ctx: &mut dyn NativeContext,
-    elems: &[ObjectRef],
-) -> Result<ObjectRef, MethodCallFailed> {
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
-    let backing = ctx.new_ref_array(ClassId::new(0), elems.len());
-    for (i, e) in elems.iter().enumerate() {
-        ctx.set_array_element(backing, i, Value::Object(Some(*e)));
-    }
-    ctx.set_field(set, 0, Value::Object(Some(backing)));
-    ctx.set_field(set, 1, Value::Int(elems.len() as i32));
-    ctx.set_field_by_name(set, "size", Value::Int(elems.len() as i32));
-    Ok(set)
-}
-
-/// Build a REAL `java.util.HashSet` and populate it via real `add(Object)`
-/// bytecode so `size()`, `iterator()`, `contains()`, `removeAll()` all behave.
-/// GC-safe: the elements are parked in a single ref-array and the set is pinned
-/// across the (allocating) `add` calls, so a moving collector can't strand them.
-/// Falls back to the synthetic stand-in only if the real class is unavailable.
-fn build_real_hash_set(
-    ctx: &mut dyn NativeContext,
-    elems: &[ObjectRef],
-) -> Result<ObjectRef, MethodCallFailed> {
-    // Park the elements in one heap array we can re-read across each add().
-    let arr = ctx.new_ref_array(ClassId::new(0), elems.len());
-    for (i, e) in elems.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Object(Some(*e)));
-    }
-    let base = ctx.pin_native_root(arr);
-    let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
-        Ok(Some(Value::Object(Some(s)))) => s,
-        _ => {
-            ctx.unpin_native_roots(base);
-            return Ok(build_synthetic_hash_set(ctx, elems)?);
-        }
-    };
-    let set_pin = ctx.pin_native_root(set);
-    for i in 0..elems.len() {
-        let arr_now = ctx.read_native_pin(base, arr);
-        let elem = ctx.get_array_element(arr_now, i);
-        let set_now = ctx.read_native_pin(set_pin, set);
-        let _ = ctx.invoke_virtual(set_now, "add", "(Ljava/lang/Object;)Z", &[elem]);
-    }
-    let result = ctx.read_native_pin(set_pin, set);
-    ctx.unpin_native_roots(base);
-    Ok(result)
-}
-
 /// Build a `javax.management.ObjectInstance(name, className)` for `bean` under
 /// `name`. `className` is the bean's runtime class (dotted), empty if unknown.
 fn build_object_instance(
@@ -7128,8 +7112,16 @@ fn mbs_query_set(
     let set = match ctx.new_object_initialized("java/util/HashSet", "()V", &[]) {
         Ok(Some(Value::Object(Some(s)))) => s,
         _ => {
-            // Real HashSet unavailable (test mock): best-effort unfiltered
-            // synthetic set of the original names, preserving prior behaviour.
+            // `new_object_initialized` refused (a unit-test mock with no JDK
+            // classes): best-effort UNFILTERED set of the original names,
+            // preserving prior behaviour. It is built through
+            // `crate::build_real_hash_set`, which allocates and invokes
+            // `<init>` itself -- the shape this arm used to fall back to wrote
+            // an element array at absolute slot 0 and a count at slot 1, which
+            // is the MAP layout on a class whose one real field is `map`, so
+            // every real `Set` method answered for an empty set. There is no
+            // mode in which that second shape was right, and its raw slot
+            // writes were part of what pinned `java/util/HashSet`'s slot floor.
             let s = ctx.read_native_pin(server_pin, server);
             let len = mbs_onames(ctx, s).map(|a| ctx.array_length(a)).unwrap_or(0);
             let mut elems = Vec::with_capacity(len);
@@ -7141,7 +7133,7 @@ fn mbs_query_set(
                 }
             }
             ctx.unpin_native_roots(server_pin);
-            return Ok(build_synthetic_hash_set(ctx, &elems)?);
+            return Ok(crate::build_real_hash_set(ctx, &elems)?);
         }
     };
     let set_pin = ctx.pin_native_root(set);
@@ -7464,29 +7456,49 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
                 let onames_opt = mbs_onames(ctx, this);
                 let old_len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
                 if old_len > 0 {
-                    let new_names = ctx.new_ref_array(ClassId::new(0), old_len - 1);
-                    let new_beans = ctx.new_ref_array(ClassId::new(0), old_len - 1);
-                    let new_onames = ctx.new_ref_array(ClassId::new(0), old_len - 1);
+                    // Three allocations in a row: each one can move the arrays
+                    // allocated before it, and the receiver and the three
+                    // source arrays as well. Root everything, then read every
+                    // address back once the last allocation is behind us.
+                    let mut scope = NativeHandleScope::new(ctx);
+                    let this_h = scope.root(this);
+                    let names_src_h = names_opt.map(|n| scope.root(n));
+                    let beans_src_h = beans_opt.map(|b| scope.root(b));
+                    let onames_src_h = onames_opt.map(|o| scope.root(o));
+                    let new_names_obj = scope.new_ref_array(ClassId::new(0), old_len - 1);
+                    let new_names_h = scope.root(new_names_obj);
+                    let new_beans_obj = scope.new_ref_array(ClassId::new(0), old_len - 1);
+                    let new_beans_h = scope.root(new_beans_obj);
+                    let new_onames = scope.new_ref_array(ClassId::new(0), old_len - 1);
+                    let new_names = scope.get(&new_names_h);
+                    let new_beans = scope.get(&new_beans_h);
+                    let names_opt = names_src_h.as_ref().map(|h| scope.get(h));
+                    let beans_opt = beans_src_h.as_ref().map(|h| scope.get(h));
+                    let onames_opt = onames_src_h.as_ref().map(|h| scope.get(h));
+                    let this = scope.get(&this_h);
                     let mut w = 0usize;
                     for rd in 0..old_len {
                         if rd == idx {
                             continue;
                         }
                         if let Some(names) = names_opt {
-                            ctx.set_array_element(new_names, w, ctx.get_array_element(names, rd));
+                            let v = scope.get_array_element(names, rd);
+                            scope.set_array_element(new_names, w, v);
                         }
                         if let Some(beans) = beans_opt {
-                            ctx.set_array_element(new_beans, w, ctx.get_array_element(beans, rd));
+                            let v = scope.get_array_element(beans, rd);
+                            scope.set_array_element(new_beans, w, v);
                         }
                         if let Some(onames) = onames_opt {
-                            ctx.set_array_element(new_onames, w, ctx.get_array_element(onames, rd));
+                            let v = scope.get_array_element(onames, rd);
+                            scope.set_array_element(new_onames, w, v);
                         }
                         w += 1;
                     }
-                    ctx.set_field(this, MBS_NAMES, Value::Object(Some(new_names)));
-                    ctx.set_field(this, MBS_BEANS, Value::Object(Some(new_beans)));
-                    ctx.set_field(this, MBS_ONAMES, Value::Object(Some(new_onames)));
-                    ctx.set_field(this, MBS_COUNT, Value::Int((old_len - 1) as i32));
+                    scope.set_field(this, MBS_NAMES, Value::Object(Some(new_names)));
+                    scope.set_field(this, MBS_BEANS, Value::Object(Some(new_beans)));
+                    scope.set_field(this, MBS_ONAMES, Value::Object(Some(new_onames)));
+                    scope.set_field(this, MBS_COUNT, Value::Int((old_len - 1) as i32));
                 }
             }
             Ok(None)

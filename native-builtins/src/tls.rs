@@ -251,25 +251,22 @@ fn throw_tls_algorithm_exc(ctx: &mut dyn NativeContext, msg: &str) -> MethodCall
 
 /// Refuse a factory request from an `SSLContext` that was never `init()`ed.
 ///
-/// Real JSSE (`sun.security.ssl.SSLContextImpl.engineGetSocketFactory`) throws
-/// `IllegalStateException("SSLContext is not initialized")`. This module used
-/// to hand out a factory regardless, so a caller that skipped `init()` — or
-/// whose `init()` threw and was swallowed — got a factory whose key and trust
-/// managers were never installed, and no signal that anything was missing.
+/// The decision and the message both live in
+/// [`crate::jca::ssl_context_spi::require_context_initialized`], with the two
+/// live registrars. This wrapper keeps the `method` argument the call sites
+/// pass, and deliberately DROPS it from the message: HotSpot's is the bare
+/// `SSLContext is not initialized`, and a helpfully longer one is a
+/// difference a caller comparing messages can see.
 fn require_initialized_context(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-    method: &str,
+    _method: &str,
 ) -> Result<(), MethodCallFailed> {
     if matches!(ctx.get_field(this, CTX_INITIALIZED), Value::Int(1)) {
         return Ok(());
     }
     Err(cratonvm_types::error::RuntimeError::IllegalStateException {
-        message: format!(
-            "SSLContext is not initialized; call SSLContext.init(KeyManager[], \
-             TrustManager[], SecureRandom) before {method}. Refusing to return a \
-             factory with no key or trust managers installed."
-        ),
+        message: "SSLContext is not initialized".to_string(),
     }
     .into())
 }
@@ -1566,10 +1563,17 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
     );
 
     // getApplicationProtocols() -> String[]
-    // Returns the ALPN list the caller configured. The h2/http-1.1 pair is the
-    // fallback for a block nobody has configured (and for the shorter
-    // SSLParameters objects other modules allocate, whose slot 5 does not
-    // exist) — it is what this module has always advertised.
+    // Returns the ALPN list the caller configured, and NOTHING when nobody has
+    // configured one: HotSpot's answer for a fresh `SSLParameters` is a
+    // zero-length array. This copy advertised `h2/http-1.1` for an
+    // unconfigured block, which is a claim the caller never made — and a
+    // caller that reads the list to decide whether ALPN was requested was told
+    // yes by every parameters object in the VM.
+    //
+    // `t27_tls.rs::register_alpn_on_parameters` registers the same triple with
+    // a side-table implementation and wins in a full build; the two are kept
+    // in step deliberately, because "which copy won" is not a question a
+    // caller's behaviour should depend on.
     r.register(
         cls,
         "getApplicationProtocols",
@@ -1579,7 +1583,7 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(arr)) = ctx.get_field(this, PAR_APP_PROTOCOLS) {
                 return Ok(Some(Value::Object(Some(arr))));
             }
-            let arr = build_string_array(ctx, &["h2", "http/1.1"]);
+            let arr = build_string_array(ctx, &[]);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -1598,8 +1602,34 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let list = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, PAR_APP_PROTOCOLS, list);
+            // Same two checks as the side-table copy in `t27_tls.rs`: a null
+            // array and a null-or-empty element are both
+            // `IllegalArgumentException` on HotSpot, and an ALPN list with a
+            // hole in it fails on the wire, in another process, minutes later.
+            let Some(Value::Object(Some(arr))) = args.get(1) else {
+                return Err(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: "protocols was null".into(),
+                    }
+                    .into(),
+                );
+            };
+            let arr = *arr;
+            for i in 0..ctx.array_length(arr) {
+                let element = match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                };
+                if !element.is_some_and(|text| !text.is_empty()) {
+                    return Err(
+                        cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                            message: "An element of protocols was null/empty".into(),
+                        }
+                        .into(),
+                    );
+                }
+            }
+            ctx.set_field(this, PAR_APP_PROTOCOLS, Value::Object(Some(arr)));
             Ok(None)
         },
     );
@@ -2225,10 +2255,19 @@ fn ks_throw(ctx: &mut dyn NativeContext, class_name: &str, msg: &str) -> MethodC
 /// `initialized` field, and any receiver that already has a store bound in
 /// `keystore.rs`'s registry was loaded through `engineLoad` by definition.
 /// Only a receiver that satisfies none of the three is genuinely uninitialized.
-fn ks_require_loaded(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
-    if matches!(ctx.get_field(this, 1), Value::Int(1))
-        || matches!(ctx.get_field_by_name(this, "initialized"), Value::Int(1))
-        || crate::keystore::keystore_id_from_object(ctx, this) != 0
+fn ks_require_loaded(
+    ctx: &mut dyn NativeContext,
+    this: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    // Receiver by `&mut` per the gate's own remedy (`WORKER-5-NOTE-10` §7.3).
+    // TODAY every allocation in this function is on the path that THROWS, and
+    // every caller propagates with `?` — so no caller currently reaches a use
+    // of a stale receiver. That is a property of the callers, not of this
+    // function, and it is not one a reader can check at the call site. The
+    // `&mut` makes the shape impossible instead of making this instance safe.
+    if matches!(ctx.get_field(*this, 1), Value::Int(1))
+        || matches!(ctx.get_field_by_name(*this, "initialized"), Value::Int(1))
+        || crate::keystore::keystore_id_from_object(ctx, *this) != 0
     {
         return Ok(());
     }
@@ -2363,8 +2402,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "getCertificate",
         "(Ljava/lang/String;)Ljava/security/cert/Certificate;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             crate::keystore::keystore_get_certificate(ctx, args)
         },
     );
@@ -2379,8 +2418,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "getCertificateChain",
         "(Ljava/lang/String;)[Ljava/security/cert/Certificate;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             crate::keystore::keystore_get_certificate_chain(ctx, args)
         },
     );
@@ -2391,8 +2430,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "getKey",
         "(Ljava/lang/String;[C)Ljava/security/Key;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             let key = crate::keystore::keystore_get_key(ctx, args)?;
             // `engine_get_key` decrypts JKS-shrouded key material with the
             // password it was just handed. If the stored DER is STILL an
@@ -2425,8 +2464,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "containsAlias",
         "(Ljava/lang/String;)Z",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             crate::keystore::keystore_contains_alias(ctx, args)
         },
     );
@@ -2440,15 +2479,15 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     // registered in both modes (phases_early phase53 for synthetic-JDK,
     // `keystore::register_keystore_real` for real-JDK).
     r.register(cls, "aliases", "()Ljava/util/Enumeration;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ks_require_loaded(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        ks_require_loaded(ctx, &mut this)?;
         crate::keystore::keystore_aliases(ctx, args)
     });
 
     // size() -> int  (a readout of the real entry count, not a counter)
     r.register(cls, "size", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ks_require_loaded(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        ks_require_loaded(ctx, &mut this)?;
         crate::keystore::keystore_size(ctx, args)
     });
 
@@ -2465,8 +2504,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "setCertificateEntry",
         "(Ljava/lang/String;Ljava/security/cert/Certificate;)V",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             let id = crate::keystore::keystore_ensure_store_id(ctx, this);
             let alias = ks_alias(ctx, args);
             crate::keystore::keystore_set_certificate_entry_native(ctx, args)?;
@@ -2495,8 +2534,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "setKeyEntry",
         "(Ljava/lang/String;Ljava/security/Key;[C[Ljava/security/cert/Certificate;)V",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             let id = crate::keystore::keystore_ensure_store_id(ctx, this);
             let alias = ks_alias(ctx, args);
             crate::keystore::keystore_set_key_entry_native(ctx, args)?;
@@ -2514,8 +2553,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
 
     // deleteEntry(String alias) -> void
     r.register(cls, "deleteEntry", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ks_require_loaded(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        ks_require_loaded(ctx, &mut this)?;
         let id = crate::keystore::keystore_ensure_store_id(ctx, this);
         crate::keystore::keystore_delete_entry_native(ctx, args)?;
         ks_sync_count(ctx, this, id);
@@ -2543,7 +2582,7 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     //      a JKS body round-trips through `load()` whatever type string the
     //      caller asked `getInstance` for.
     r.register(cls, "store", "(Ljava/io/OutputStream;[C)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         let out = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
             _ => {
@@ -2563,7 +2602,7 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
             )?;
             return Ok(None);
         }
-        ks_require_loaded(ctx, this)?;
+        ks_require_loaded(ctx, &mut this)?;
         let id = crate::keystore::keystore_id_from_object(ctx, this);
         if id == 0 {
             // `loaded` is set, yet no store is bound: the only way to reach
@@ -2587,8 +2626,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "isCertificateEntry",
         "(Ljava/lang/String;)Z",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ks_require_loaded(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, &mut this)?;
             crate::keystore::keystore_is_certificate_entry(ctx, args)
         },
     );
@@ -2596,8 +2635,8 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     // isKeyEntry(String alias) -> boolean  (true for private AND secret keys,
     // matching both the JDK contract and what `getKey` above will hand back)
     r.register(cls, "isKeyEntry", "(Ljava/lang/String;)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ks_require_loaded(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        ks_require_loaded(ctx, &mut this)?;
         crate::keystore::keystore_is_key_entry(ctx, args)
     });
     r.set_category(__prev_cat);

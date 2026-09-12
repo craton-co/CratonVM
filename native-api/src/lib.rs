@@ -11,6 +11,10 @@
 /// `native-builtins` forwards to it. See W7-68-live-under-allocations.md and
 /// W7-49-slot-index-recensus.md §8.
 pub mod appended_slots;
+/// Can `new` legally produce an instance of this class? The JVMS 6.5
+/// predicate behind every fabricated-abstract-receiver fix, shared by the
+/// crate that MINTS such receivers and the one that REPORTS their class.
+pub mod array_store;
 pub mod capability;
 pub mod charset;
 /// Class-identity answers a native can act on: the ambiguous-vs-absent
@@ -23,11 +27,13 @@ pub mod class_identity;
 pub mod delegated_close;
 pub mod fd_table;
 pub mod ffi;
+/// What a `java.io.File` this VM builds has to contain for the JDK own
+/// `File` bytecode to agree with it -- `path` and `prefixLength`, written
+/// beside the slot-0 string every producer already writes. Six producers
+/// across two crates, which is why the rule lives here rather than in one
+/// of them. Sibling of [`path_layout`] and [`appended_slots`].
+pub mod file_layout;
 pub mod init_level;
-/// Can `new` legally produce an instance of this class? The JVMS 6.5
-/// predicate behind every fabricated-abstract-receiver fix, shared by the
-/// crate that MINTS such receivers and the one that REPORTS their class.
-pub mod array_store;
 pub mod instantiable;
 pub mod intrinsic;
 /// The layout-alias census — the one detector that sees every native object
@@ -48,6 +54,10 @@ pub mod no_image_receiver;
 /// `sun.jnu.encoding` and the three stream encodings, which JEP 400 did NOT
 /// pin to UTF-8 (only `file.encoding`).
 pub mod os_encoding;
+/// The slot map of a synthetic `java/nio/file/Path`, resolved from the
+/// platform implementation class instead of hard-coded. Two crates produce
+/// that carrier, so its layout is decided in one place.
+pub mod path_layout;
 pub mod poly_call_site;
 /// Where an absorbed failure is **recorded** — `PrintStream`/`PrintWriter`'s
 /// `trouble` flag (read back by `checkError()`) and a `Handler`'s
@@ -79,6 +89,13 @@ pub mod socket_input_stream_read;
 /// accessors for it and a map with two owners drifts —
 /// W7-72-ssc-socket-and-filechannel.md.
 pub mod synthetic_file_channel;
+/// Turn named rows of the retirement tables back OFF at runtime, so
+/// bisecting a wave costs a run instead of a ~25-minute build. A
+/// DIAGNOSTIC: unset -- every shipping configuration -- it is inert, and
+/// `the_default_is_inert_across_every_retired_row` asserts that against the
+/// whole table rather than a sample. Sibling of [`retired_shadow`], whose
+/// tables it reads and never writes.
+pub mod unretire;
 pub mod vm_scoped;
 
 /// Lightweight `NativeContext` mock available to tests and to other

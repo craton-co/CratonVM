@@ -293,9 +293,16 @@ pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(empty))));
             }
         };
-        let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+        // `new_array` can collect, and `keys_arr` was read out of the heap
+        // before it: copy through the scope so the source address is the
+        // post-allocation one.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let keys_h = scope.root(keys_arr);
+        let result = scope.new_array(cratonvm_types::ArrayElementType::Reference, size);
+        let keys_arr = scope.get(&keys_h);
         for i in 0..size {
-            ctx.set_array_element(result, i, ctx.get_array_element(keys_arr, i));
+            let v = scope.get_array_element(keys_arr, i);
+            scope.set_array_element(result, i, v);
         }
         Ok(Some(Value::Object(Some(result))))
     });
@@ -355,18 +362,62 @@ fn jndi_put_binding(
 
     // Grow if needed
     let cap = ctx.array_length(keys_arr);
+    let mut bindings = bindings;
     if size >= cap {
         let new_cap = cap * 2;
-        let new_keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
-        let new_vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+    // GC: the grow path ALLOCATES, and everything it then touches is a Rust
+    // local holding a pre-allocation address — the old array it copies from,
+    // the element it stores, and the receiver it publishes into. Under a
+    // moving collector those go stale; under the Generational non-moving young
+    // sweep an object nothing else roots is ZEROED in place. Root them for the
+    // duration of the grow and re-read each one at its use. See
+    // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
+        // TWO allocations here, so even `new_keys` is stale by the time
+        // `new_vals` returns.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let bindings_h = scope.root(bindings);
+        let keys_h = scope.root(keys_arr);
+        let vals_h = scope.root(vals_arr);
+        let name_h = match name {
+            Value::Object(Some(o)) => Some(scope.root(o)),
+            _ => None,
+        };
+        let value_h = match value {
+            Value::Object(Some(o)) => Some(scope.root(o)),
+            _ => None,
+        };
+        let nk = scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+        let nk_h = scope.root(nk);
+        let nv = scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+        let nv_h = scope.root(nv);
         for i in 0..size {
-            ctx.set_array_element(new_keys, i, ctx.get_array_element(keys_arr, i));
-            ctx.set_array_element(new_vals, i, ctx.get_array_element(vals_arr, i));
+            let ks = scope.get(&keys_h);
+            let kv = scope.get_array_element(ks, i);
+            let kd = scope.get(&nk_h);
+            scope.set_array_element(kd, i, kv);
+            let vs = scope.get(&vals_h);
+            let vv = scope.get_array_element(vs, i);
+            let vd = scope.get(&nv_h);
+            scope.set_array_element(vd, i, vv);
         }
-        ctx.set_field(bindings, 0, Value::Object(Some(new_keys)));
-        ctx.set_field(bindings, 1, Value::Object(Some(new_vals)));
-        ctx.set_array_element(new_keys, size, name);
-        ctx.set_array_element(new_vals, size, value);
+        let (b, kd, vd) = (scope.get(&bindings_h), scope.get(&nk_h), scope.get(&nv_h));
+        scope.set_field(b, 0, Value::Object(Some(kd)));
+        let b = scope.get(&bindings_h);
+        scope.set_field(b, 1, Value::Object(Some(vd)));
+        let name_now = match &name_h {
+            Some(h) => Value::Object(Some(scope.get(h))),
+            None => name,
+        };
+        let value_now = match &value_h {
+            Some(h) => Value::Object(Some(scope.get(h))),
+            None => value,
+        };
+        let kd = scope.get(&nk_h);
+        scope.set_array_element(kd, size, name_now);
+        let vd = scope.get(&nv_h);
+        scope.set_array_element(vd, size, value_now);
+        // The count store below runs after the scope closes.
+        bindings = scope.get(&bindings_h);
     } else {
         ctx.set_array_element(keys_arr, size, name);
         ctx.set_array_element(vals_arr, size, value);
@@ -898,37 +949,64 @@ fn stax_create_event_reader(
 ) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
     let events = stax_parse_events(xml);
     let event_count = events.len();
-    let events_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, event_count + 2);
+    // Everything here is a young object built next to another allocation: the
+    // event array survives one element (and up to two strings) per event, and
+    // each event survives the strings stored into it. Hold the array in the
+    // scope and re-read it — and the element — at every store.
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let events_arr_obj =
+        scope.new_array(cratonvm_types::ArrayElementType::Reference, event_count + 2);
+    let events_h = scope.root(events_arr_obj);
 
     // START_DOCUMENT event
-    let start_doc = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
-    ctx.set_field(start_doc, 0, Value::Int(STAX_START_DOCUMENT));
-    ctx.set_array_element(events_arr, 0, Value::Object(Some(start_doc)));
+    let start_doc = try_alloc_concurrent_synthetic(
+        &mut *scope,
+        "javax/xml/stream/events/XMLEvent",
+        3,
+    )?;
+    scope.set_field(start_doc, 0, Value::Int(STAX_START_DOCUMENT));
+    let events_arr = scope.get(&events_h);
+    scope.set_array_element(events_arr, 0, Value::Object(Some(start_doc)));
 
     for (i, ev) in events.iter().enumerate() {
-        let event_obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
-        ctx.set_field(event_obj, 0, Value::Int(ev.event_type));
+        let event_obj = try_alloc_concurrent_synthetic(
+            &mut *scope,
+            "javax/xml/stream/events/XMLEvent",
+            3,
+        )?;
+        let event_h = scope.root(event_obj);
+        scope.set_field(event_obj, 0, Value::Int(ev.event_type));
         if let Some(ref name) = ev.name {
-            let s = ctx.create_string(name);
-            ctx.set_field(event_obj, 1, Value::Object(Some(s)));
+            let s = scope.create_string(name);
+            let event_obj = scope.get(&event_h);
+            scope.set_field(event_obj, 1, Value::Object(Some(s)));
         }
         if let Some(ref text) = ev.text {
-            let s = ctx.create_string(text);
-            ctx.set_field(event_obj, 2, Value::Object(Some(s)));
+            let s = scope.create_string(text);
+            let event_obj = scope.get(&event_h);
+            scope.set_field(event_obj, 2, Value::Object(Some(s)));
         }
-        ctx.set_array_element(events_arr, i + 1, Value::Object(Some(event_obj)));
+        let events_arr = scope.get(&events_h);
+        let event_obj = scope.get(&event_h);
+        scope.set_array_element(events_arr, i + 1, Value::Object(Some(event_obj)));
     }
 
-    // END_DOCUMENT event
-    let end_doc = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
-    ctx.set_field(end_doc, 0, Value::Int(STAX_END_DOCUMENT));
-    ctx.set_array_element(events_arr, event_count + 1, Value::Object(Some(end_doc)));
+    let end_doc = try_alloc_concurrent_synthetic(
+        &mut *scope,
+        "javax/xml/stream/events/XMLEvent",
+        3,
+    )?;
+    scope.set_field(end_doc, 0, Value::Int(STAX_END_DOCUMENT));
+    let events_arr = scope.get(&events_h);
+    scope.set_array_element(events_arr, event_count + 1, Value::Object(Some(end_doc)));
 
     let total = (event_count + 2) as i32;
-    let reader = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLEventReader", 3)?;
-    ctx.set_field(reader, 0, Value::Object(Some(events_arr)));
-    ctx.set_field(reader, 1, Value::Int(total));
-    ctx.set_field(reader, 2, Value::Int(0));
+    let reader =
+        try_alloc_concurrent_synthetic(&mut *scope, "javax/xml/stream/XMLEventReader", 3)?;
+    let events_arr = scope.get(&events_h);
+    scope.set_field(reader, 0, Value::Object(Some(events_arr)));
+    scope.set_field(reader, 1, Value::Int(total));
+    scope.set_field(reader, 2, Value::Int(0));
     Ok(Some(Value::Object(Some(reader))))
 }
 
@@ -939,36 +1017,65 @@ fn stax_create_stream_reader(
 ) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
     let events = stax_parse_events(xml);
     let event_count = events.len();
-    let events_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, event_count + 2);
+    // Everything here is a young object built next to another allocation: the
+    // event array survives one element (and up to two strings) per event, and
+    // each event survives the strings stored into it. Hold the array in the
+    // scope and re-read it — and the element — at every store.
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let events_arr_obj =
+        scope.new_array(cratonvm_types::ArrayElementType::Reference, event_count + 2);
+    let events_h = scope.root(events_arr_obj);
 
-    let start_doc = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
-    ctx.set_field(start_doc, 0, Value::Int(STAX_START_DOCUMENT));
-    ctx.set_array_element(events_arr, 0, Value::Object(Some(start_doc)));
+    // START_DOCUMENT event
+    let start_doc = try_alloc_concurrent_synthetic(
+        &mut *scope,
+        "javax/xml/stream/events/XMLEvent",
+        3,
+    )?;
+    scope.set_field(start_doc, 0, Value::Int(STAX_START_DOCUMENT));
+    let events_arr = scope.get(&events_h);
+    scope.set_array_element(events_arr, 0, Value::Object(Some(start_doc)));
 
     for (i, ev) in events.iter().enumerate() {
-        let event_obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
-        ctx.set_field(event_obj, 0, Value::Int(ev.event_type));
+        let event_obj = try_alloc_concurrent_synthetic(
+            &mut *scope,
+            "javax/xml/stream/events/XMLEvent",
+            3,
+        )?;
+        let event_h = scope.root(event_obj);
+        scope.set_field(event_obj, 0, Value::Int(ev.event_type));
         if let Some(ref name) = ev.name {
-            let s = ctx.create_string(name);
-            ctx.set_field(event_obj, 1, Value::Object(Some(s)));
+            let s = scope.create_string(name);
+            let event_obj = scope.get(&event_h);
+            scope.set_field(event_obj, 1, Value::Object(Some(s)));
         }
         if let Some(ref text) = ev.text {
-            let s = ctx.create_string(text);
-            ctx.set_field(event_obj, 2, Value::Object(Some(s)));
+            let s = scope.create_string(text);
+            let event_obj = scope.get(&event_h);
+            scope.set_field(event_obj, 2, Value::Object(Some(s)));
         }
-        ctx.set_array_element(events_arr, i + 1, Value::Object(Some(event_obj)));
+        let events_arr = scope.get(&events_h);
+        let event_obj = scope.get(&event_h);
+        scope.set_array_element(events_arr, i + 1, Value::Object(Some(event_obj)));
     }
 
-    let end_doc = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
-    ctx.set_field(end_doc, 0, Value::Int(STAX_END_DOCUMENT));
-    ctx.set_array_element(events_arr, event_count + 1, Value::Object(Some(end_doc)));
+    let end_doc = try_alloc_concurrent_synthetic(
+        &mut *scope,
+        "javax/xml/stream/events/XMLEvent",
+        3,
+    )?;
+    scope.set_field(end_doc, 0, Value::Int(STAX_END_DOCUMENT));
+    let events_arr = scope.get(&events_h);
+    scope.set_array_element(events_arr, event_count + 1, Value::Object(Some(end_doc)));
 
     let total = (event_count + 2) as i32;
-    let reader = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLStreamReader", 4)?;
-    ctx.set_field(reader, 0, Value::Object(Some(events_arr)));
-    ctx.set_field(reader, 1, Value::Int(total));
-    ctx.set_field(reader, 2, Value::Int(0));
-    ctx.set_field(reader, 3, Value::Int(STAX_START_DOCUMENT));
+    let reader =
+        try_alloc_concurrent_synthetic(&mut *scope, "javax/xml/stream/XMLStreamReader", 4)?;
+    let events_arr = scope.get(&events_h);
+    scope.set_field(reader, 0, Value::Object(Some(events_arr)));
+    scope.set_field(reader, 1, Value::Int(total));
+    scope.set_field(reader, 2, Value::Int(0));
+    scope.set_field(reader, 3, Value::Int(STAX_START_DOCUMENT));
     Ok(Some(Value::Object(Some(reader))))
 }
 
@@ -1532,21 +1639,43 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
                 "ISO-8859-2",
                 "ISO-8859-15",
             ];
-            let map = try_alloc_concurrent_synthetic(ctx, "java/util/TreeMap", 3)?;
-            let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, charsets.len());
-            let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, charsets.len());
+            // The map and the two arrays are built first and then survive
+            // four allocations per charset, so all three go in the scope, and
+            // the key string survives the charset allocation beside it.
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let map_obj = try_alloc_concurrent_synthetic(&mut *scope, "java/util/TreeMap", 3)?;
+            let map_h = scope.root(map_obj);
+            let keys_obj =
+                scope.new_array(cratonvm_types::ArrayElementType::Reference, charsets.len());
+            let keys_h = scope.root(keys_obj);
+            let vals_obj =
+                scope.new_array(cratonvm_types::ArrayElementType::Reference, charsets.len());
+            let vals_h = scope.root(vals_obj);
             for (i, name) in charsets.iter().enumerate() {
-                let key = ctx.create_string(name);
-                let charset = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 2)?;
-                let name_s = ctx.create_string(name);
-                ctx.set_field(charset, 0, Value::Object(Some(name_s)));
-                ctx.set_field(charset, 1, Value::Object(None)); // aliases
-                ctx.set_array_element(keys, i, Value::Object(Some(key)));
-                ctx.set_array_element(vals, i, Value::Object(Some(charset)));
+                let key = scope.create_string(name);
+                let key_h = scope.root(key);
+                let charset = try_alloc_concurrent_synthetic(
+                    &mut *scope,
+                    "java/nio/charset/Charset",
+                    2,
+                )?;
+                let charset_h = scope.root(charset);
+                let name_s = scope.create_string(name);
+                let charset = scope.get(&charset_h);
+                scope.set_field(charset, 0, Value::Object(Some(name_s)));
+                scope.set_field(charset, 1, Value::Object(None)); // aliases
+                let keys = scope.get(&keys_h);
+                let vals = scope.get(&vals_h);
+                let key = scope.get(&key_h);
+                scope.set_array_element(keys, i, Value::Object(Some(key)));
+                scope.set_array_element(vals, i, Value::Object(Some(charset)));
             }
-            ctx.set_field(map, 0, Value::Object(Some(keys)));
-            ctx.set_field(map, 1, Value::Object(Some(vals)));
-            ctx.set_field(map, 2, Value::Int(charsets.len() as i32));
+            let map = scope.get(&map_h);
+            let keys = scope.get(&keys_h);
+            let vals = scope.get(&vals_h);
+            scope.set_field(map, 0, Value::Object(Some(keys)));
+            scope.set_field(map, 1, Value::Object(Some(vals)));
+            scope.set_field(map, 2, Value::Int(charsets.len() as i32));
             Ok(Some(Value::Object(Some(map))))
         },
     );

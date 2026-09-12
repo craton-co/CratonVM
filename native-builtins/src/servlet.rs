@@ -307,7 +307,23 @@ fn jython_new_module(
     name: &str,
     dict: Value,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    // GC: a reference held in a Rust local across an allocating or Java-re-entering
+    // call goes stale under a moving collector, and under the Generational
+    // non-moving young sweep an unrooted object is ZEROED in place. Pin and
+    // re-read. `safe_native_call_impl` truncates `native_pin_roots` when the native
+    // returns, so an unmatched pin costs nothing on an error path. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    // `create_string` allocates, so `dict` — held since entry — is a pre-call
+    // address by the time it is handed to the constructor.
+    let dict_pin = match dict {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
     let name_obj = ctx.create_string(name);
+    let dict = match dict_pin {
+        Some((p, o)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        None => dict,
+    };
     let module = match ctx.new_object_initialized(
         "org/python/core/PyModule",
         "(Ljava/lang/String;Lorg/python/core/PyObject;)V",
@@ -1088,7 +1104,9 @@ fn java_list_get(ctx: &mut dyn NativeContext, list: ObjectRef, index: i32) -> Op
 fn java_string_list_contains(ctx: &mut dyn NativeContext, list: ObjectRef, key: ObjectRef) -> bool {
     let key_text = ctx.read_string(key);
     if let Some(size) = java_list_size(ctx, list) {
+        let list_pin = ctx.pin_native_root(list);
         for index in 0..size {
+            let list = ctx.read_native_pin(list_pin, list);
             let Some(item) = java_list_get(ctx, list, index) else {
                 continue;
             };
@@ -4436,6 +4454,73 @@ fn s2_bb_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
     cratonvm_native_io::buffer_is_read_only(ctx, buf)
 }
 
+/// The abstract public buffer classes this crate stamps on a carrier it
+/// allocated itself.
+///
+/// A name test, but on the PUBLIC API classes, not on the JDK's generated
+/// implementation names — `java.nio.IntBuffer` cannot be renamed by a JDK
+/// release without breaking every program in the world, which is not true of
+/// `ByteBufferAsIntBufferRB`.
+#[inline]
+fn s2_is_our_buffer_carrier(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(buf);
+    matches!(
+        ctx.class_name_arc_of_id(cid).as_deref(),
+        Some(
+            "java/nio/ByteBuffer"
+                | "java/nio/CharBuffer"
+                | "java/nio/IntBuffer"
+                | "java/nio/LongBuffer"
+                | "java/nio/ShortBuffer"
+                | "java/nio/FloatBuffer"
+                | "java/nio/DoubleBuffer"
+        )
+    )
+}
+
+/// [`s2_bb_is_read_only`], **plus the answer for a receiver that keeps its
+/// read-only-ness in an OVERRIDDEN METHOD rather than in the field.**
+///
+/// `buffer_is_read_only` reads the `isReadOnly` FIELD by name, and that field
+/// is the whole answer for `HeapByteBufferR` and friends, whose constructors
+/// set it. It is NOT the answer for the `ByteBufferAs<T>Buffer R{B,L}` family —
+/// the views `ByteBuffer.as<T>Buffer().asReadOnlyBuffer()` returns — which
+/// leave the field FALSE and override `isReadOnly()` to return `true`. Measured
+/// on Temurin 25.0.4+7:
+///
+/// ```text
+/// viewRo.isReadOnly()                 HotSpot true    this VM true
+/// IntBuffer.isReadOnly (the FIELD)    HotSpot false   this VM false
+/// viewRo.put(new int[]{5}, 0, 1)      HotSpot ReadOnlyBufferException
+///                                     this VM no-throw, and bb.getInt(0) == 5
+/// ```
+///
+/// **A silent write through a read-only handle, into the caller's own
+/// `ByteBuffer`.** It reached exactly one door and no other: the JDK's
+/// read-only view classes DECLARE `put(int)` and `put(int,int)` — so those
+/// dispatch to their own bodies and refuse — and do NOT declare
+/// `put(int[],int,int)`, whose most-derived declaration is on the abstract
+/// `IntBuffer` this crate registers against. *The door asks about the
+/// DECLARING class*, so one of a family's three `put` overloads was ours and
+/// two were the JDK's, which is why the scalar row passed and the bulk row did
+/// not.
+///
+/// The second question is one virtual call and is asked only of a receiver this
+/// crate did not allocate; our own carriers carry the flag in the field and
+/// answer before it.
+fn s2_buf_read_only(ctx: &mut dyn NativeContext, buf: ObjectRef) -> bool {
+    if s2_bb_is_read_only(ctx, buf) {
+        return true;
+    }
+    if s2_is_our_buffer_carrier(ctx, buf) {
+        return false;
+    }
+    matches!(
+        ctx.invoke_virtual(buf, "isReadOnly", "()Z", &[]),
+        Ok(Some(Value::Int(v))) if v != 0
+    )
+}
+
 /// The WRITE half of [`s2_bb_is_read_only`], for the four view producers.
 ///
 /// `slice()`, `slice(int,int)` and `duplicate()` inherit the source's flag and
@@ -7639,7 +7724,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             /// (`DirectIntBufferRS`).
             fn $put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
-                if s2_bb_is_read_only(ctx, this) {
+                if s2_buf_read_only(ctx, this) {
                     return Err(RuntimeError::ReadOnlyBufferException.into());
                 }
                 let v = args.get(1).cloned().unwrap_or(Value::Int(0));
@@ -7659,7 +7744,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             /// `put(index, x)` — see `$put`. Same class, same null message.
             fn $put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
-                if s2_bb_is_read_only(ctx, this) {
+                if s2_buf_read_only(ctx, this) {
                     return Err(RuntimeError::ReadOnlyBufferException.into());
                 }
                 let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
@@ -7861,7 +7946,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             /// guard since F5; the typed views never did.
             fn $compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
-                if s2_bb_is_read_only(ctx, this) {
+                if s2_buf_read_only(ctx, this) {
                     return Err(RuntimeError::ReadOnlyBufferException.into());
                 }
                 let pos = s2_bb_pos(ctx, this);
@@ -7943,7 +8028,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             /// reordering would remove.
             fn $put_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
-                if s2_bb_is_read_only(ctx, this) {
+                if s2_buf_read_only(ctx, this) {
                     return Err(RuntimeError::ReadOnlyBufferException.into());
                 }
                 let src = obj_arg(args, 1)?;
@@ -8837,16 +8922,14 @@ fn s2_keys_as_set(
     selected_only: bool,
 ) -> Result<Value, MethodCallFailed> {
     let n = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
-    // GC-safety: `alloc_concurrent_synthetic`/`new_ref_array` below allocate
-    // and can trigger a collection that relocates `sel`/`set` (both read
-    // again after); pin both for the whole function.
+    // GC-safety: the set builder below allocates (a ref array, the set, the
+    // backing map, and a node per `add`) and can trigger a collection that
+    // relocates `sel`; pin it for the whole function.
     let sel_pin = ctx.pin_native_root(sel);
-    let mut set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
-    let set_pin = ctx.pin_native_root(set);
     let sel = ctx.read_native_pin(sel_pin, sel);
     let keys_v = ctx.get_field(sel, S2SEL_KEYS);
+    let mut ready: Vec<ObjectRef> = Vec::new();
     if let Value::Object(Some(keys_arr)) = keys_v {
-        let mut ready: Vec<ObjectRef> = Vec::new();
         for i in 0..n {
             if let Value::Object(Some(k)) = ctx.get_array_element(keys_arr, i) {
                 let rops = ctx.get_field(k, 3).as_int().unwrap_or(0);
@@ -8855,24 +8938,15 @@ fn s2_keys_as_set(
                 }
             }
         }
-        // GC-safety: `ready`'s elements were captured before `new_ref_array`
-        // below (which allocates); pin each and re-read the forwarded
-        // reference before writing it into the fresh array.
-        let ready_pins: Vec<_> = ready.iter().map(|&k| ctx.pin_native_root(k)).collect();
-        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ready.len());
-        set = ctx.read_native_pin(set_pin, set);
-        for (i, (&k, &pin)) in ready.iter().zip(ready_pins.iter()).enumerate() {
-            let k = ctx.read_native_pin(pin, k);
-            ctx.set_array_element(arr, i, Value::Object(Some(k)));
-        }
-        ctx.set_field(set, 0, Value::Object(Some(arr)));
-        ctx.set_field(set, 1, Value::Int(ready.len() as i32));
-    } else {
-        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
-        set = ctx.read_native_pin(set_pin, set);
-        ctx.set_field(set, 0, Value::Object(Some(arr)));
-        ctx.set_field(set, 1, Value::Int(0));
     }
+    // A REAL `java.util.HashSet`, through its own `<init>` and `add`.
+    //
+    // This used to write the key array to absolute slot 0 and a count to slot
+    // 1 -- the MAP layout on a class whose one real instance field is `map` --
+    // so a servlet container's `selector.selectedKeys().iterator()` walked a
+    // `map` holding an `Object[]` and saw no keys at all. `build_real_hash_set`
+    // pins every element across its own allocations.
+    let set = crate::build_real_hash_set(ctx, &ready)?;
     ctx.unpin_native_roots(sel_pin);
     Ok(Value::Object(Some(set)))
 }

@@ -1255,7 +1255,7 @@ pub fn build_key_manager_state(keystore_id: i32) -> KeyManagerState {
     }
     let mut private_key_aliases = Vec::new();
     for (alias, entry) in &store.entries {
-        if let keystore::EntryKind::PrivateKey { key_der, chain } = &entry.kind {
+        if let keystore::EntryKind::PrivateKey { key_der, chain, .. } = &entry.kind {
             if chain.is_empty() {
                 continue;
             }
@@ -4270,7 +4270,9 @@ fn extract_revocation_config(
         Ok(Some(Value::Object(Some(it)))) => it,
         _ => return None,
     };
+    let iter_obj_pin = ctx.pin_native_root(iter_obj);
     loop {
+        let iter_obj = ctx.read_native_pin(iter_obj_pin, iter_obj);
         match ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(1))) => {}
             _ => return None,
@@ -4390,7 +4392,9 @@ fn extract_pkix_trust_anchor_ders(ctx: &mut dyn NativeContext, mfp: ObjectRef) -
         Ok(Some(Value::Object(Some(it)))) => it,
         _ => return out,
     };
+    let iter_obj_pin = ctx.pin_native_root(iter_obj);
     loop {
+        let iter_obj = ctx.read_native_pin(iter_obj_pin, iter_obj);
         match ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(1))) => {}
             _ => break,
@@ -5445,7 +5449,9 @@ fn extended_tm_sni_host_name(ctx: &mut dyn NativeContext, session: ObjectRef) ->
         Ok(Some(Value::Int(n))) => n,
         _ => return None,
     };
+    let names_pin = ctx.pin_native_root(names);
     for i in 0..size {
+        let names = ctx.read_native_pin(names_pin, names);
         let Ok(Some(Value::Object(Some(sn)))) =
             ctx.invoke_virtual(names, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)])
         else {
@@ -6333,6 +6339,7 @@ mod tests {
                 kind: crate::keystore::EntryKind::PrivateKey {
                     key_der: vec![0x30, 0x00],
                     chain: vec![server_only.clone()],
+                    protected: None,
                 },
             },
         );
@@ -6359,6 +6366,7 @@ mod tests {
                     kind: crate::keystore::EntryKind::PrivateKey {
                         key_der: vec![0x30, 0x00],
                         chain: vec![der.clone()],
+                        protected: None,
                     },
                 },
             );

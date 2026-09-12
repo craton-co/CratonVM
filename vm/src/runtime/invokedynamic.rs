@@ -2079,6 +2079,33 @@ fn allocate_lambda_proxy_from_values(
             .get(&(shared.vm_identity, proxy_class_id, site_pc))
             .copied()
         {
+            // `CRATONVM_DBG_DEADREF_STORE`: is what the cache hands back still
+            // a live object?
+            //
+            // This table is a GC root source and a remap target
+            // (`gc_scan_lambda_singleton_roots` / `gc_update_lambda_singleton_refs`,
+            // wired in `memory/native_roots.rs`), so a stale entry here means
+            // one of those two halves did not run for a collection that moved
+            // the instance — which no other instrument in the tree can see,
+            // because the value is in neither a frame slot nor a heap field.
+            if cratonvm_types::flags().gc.dbg_deadref_store {
+                if let Some(reason) = shared
+                    .mem
+                    .heap
+                    .dead_young_ref_reason(cached.as_ptr() as usize)
+                {
+                    static N: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 8 {
+                        eprintln!(
+                            "[deadref-singleton] #{n} {reason} the zero-capture lambda                              singleton cache returned 0x{:x} for cid={:#x} site_pc={site_pc} —                              the cached instance names no live object, so the cache was not                              remapped for some collection that moved it.",
+                            cached.as_ptr() as usize,
+                            proxy_class_id.as_u32(),
+                        );
+                    }
+                }
+            }
             return Ok(cached);
         }
     }
@@ -2098,6 +2125,84 @@ fn allocate_lambda_proxy_from_values(
     // field. Every later dispatch through that proxy read the captured
     // field, found the (now-vacated) old address, and resolved a garbage/
     // zeroed class id there instead of the real receiver class.
+    // `CRATONVM_DBG_DEADREF_STORE`: is a capture ALREADY dead before the pin?
+    //
+    // The pin below protects a capture from the allocation that follows; it
+    // cannot resurrect one that was dead when it reached the operand stack.
+    // Those two produce the same end state — a proxy field naming reclaimed
+    // memory — and the heap-side trap in `GenerationalHeap::set_field` reports
+    // the STORE either way, which names this function and stops. Checking here,
+    // with the Java frames still in hand, says which of the two it is and where
+    // the value came from.
+    if cratonvm_types::flags().gc.dbg_deadref_store {
+        for (i, c) in captures.iter().enumerate() {
+            let Value::Object(Some(o)) = c else { continue };
+            let Some(reason) = shared.mem.heap.dead_young_ref_reason(o.as_ptr() as usize) else {
+                continue;
+            };
+            // WHICH FRAMES ALREADY HOLD IT.
+            //
+            // The chain above says where the value is being consumed; it does
+            // not say where it entered. A dead value that appears only in the
+            // innermost frames was manufactured during argument passing; one
+            // that the OUTERMOST frame also holds arrived from that frame's own
+            // code and the search continues above it. Printing the slot on
+            // every frame turns that from a guess into a reading, and it is one
+            // pass over a stack that is about to fail anyway.
+            let dead = o.as_ptr() as usize;
+            let stack: Vec<String> = thread
+                .frames
+                .iter()
+                .rev()
+                .take(10)
+                .map(|f| {
+                    let mut holds: Vec<String> = Vec::new();
+                    for li in 0..f.locals_len() {
+                        if let Value::Object(Some(v)) = f.get_local(li as u16) {
+                            if v.as_ptr() as usize == dead {
+                                holds.push(format!("local[{li}]"));
+                            }
+                        }
+                    }
+                    for si in 0..f.stack.len() {
+                        if let Value::Object(Some(v)) = f.stack.get_value(si) {
+                            if v.as_ptr() as usize == dead {
+                                holds.push(format!("stack[{si}]"));
+                            }
+                        }
+                    }
+                    format!(
+                        "    at {}.{} pc={}{}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.pc,
+                        if holds.is_empty() {
+                            String::new()
+                        } else {
+                            format!("   <-- HOLDS IT in {}", holds.join(", "))
+                        },
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[deadref-capture] {reason} capture[{i}] = 0x{:x} was ALREADY dead when the                  lambda proxy popped it off the operand stack (cid={:#x}, {} captures) — the                  pin below cannot help, the value was wrong before this call.                  moved_away_to={:?} (needs CRATONVM_DBG_VACATED_FRAMES; Some means the                  referent was RELOCATED and a rewrite was missed, None means it was never                  relocated — reclaimed while referenced, or never a valid reference)
+in_native_pins={} frames={}
+{}",
+                o.as_ptr() as usize,
+                proxy_class_id.as_u32(),
+                num_captures,
+                cratonvm_gc::gc_quiescence::moved_away_to(o.as_ptr() as usize),
+                thread
+                    .native_pin_roots
+                    .iter()
+                    .any(|r| r.as_ptr() as usize == dead),
+                thread.frames.len(),
+                stack.join("
+"),
+            );
+        }
+    }
+
     let pin_base = thread.native_pin_roots.len();
     let mut handles: Vec<Option<usize>> = Vec::with_capacity(captures.len());
     for c in captures.iter() {

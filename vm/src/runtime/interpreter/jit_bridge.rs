@@ -1420,8 +1420,15 @@ pub(super) fn compile_osr_artifact(
                             // DEOPTS on a miss, so a bci the profile says is
                             // hardly ever a `String` must not get one. See
                             // `cratonvm_jit::receiver_profile_rejects_guard`.
-                            .filter(|&(_, _, _, guard_class_id)| {
+                            .filter(|&(entry, _, _, guard_class_id)| {
                                 if guard_class_id == 0 || !cratonvm_jit::receiver_despec_enabled() {
+                                    return true;
+                                }
+                                // A declining intrinsic's guard miss is a CALL,
+                                // not a deopt, so this screen has nothing to
+                                // protect against — see
+                                // `string_intrinsic_declines_to_a_call`.
+                                if cratonvm_jit::string_intrinsic_declines_to_a_call(entry) {
                                     return true;
                                 }
                                 let supported = cratonvm_jit::receiver_profile_supports_guard(
@@ -1452,6 +1459,45 @@ pub(super) fn compile_osr_artifact(
                                 !(by_profile || by_despec)
                             })
                         {
+                            // A declining intrinsic needs its own
+                            // `JitInvokeInfo` at THIS door too: the emitted
+                            // fast path declines into this exact dispatch, and
+                            // a site the resolver registers as an intrinsic
+                            // never reaches the generic `invoke_info.push`
+                            // below. Fixing only the method-entry door left
+                            // every once-invoked hot loop — which is every
+                            // method this door exists for — failing to compile
+                            // and running interpreted.
+                            if cratonvm_jit::string_intrinsic_declines_to_a_call(entry) {
+                                let class_box: Box<str> =
+                                    target_class.to_string().into_boxed_str();
+                                let method_box: Box<str> = mn.to_string().into_boxed_str();
+                                let desc_box: Box<str> = desc.to_string().into_boxed_str();
+                                let class_ref = &*class_box as *const str;
+                                let method_ref = &*method_box as *const str;
+                                let desc_ref = &*desc_box as *const str;
+                                owned_jit_strings2.push(class_box);
+                                owned_jit_strings2.push(method_box);
+                                owned_jit_strings2.push(desc_box);
+                                // SAFETY: the three `Box<str>` were just pushed
+                                // to `owned_jit_strings2`, which outlives the
+                                // `JitInvokeInfo` and the code compiled against
+                                // it.
+                                let info = Box::new(crate::jit::JitInvokeInfo {
+                                    class_name: unsafe { &*class_ref },
+                                    method_name: unsafe { &*method_ref },
+                                    descriptor: unsafe { &*desc_ref },
+                                    // Receiver-INCLUDED, unlike
+                                    // `JitDirectCall.num_params`.
+                                    num_jit_args: num_params + 1,
+                                    return_type: ret,
+                                    invoke_kind,
+                                    declaring_class_id: class_id.as_u32(),
+                                });
+                                let info_ptr: *const _ = &*info;
+                                owned_jit_invoke_infos2.push(info);
+                                invoke_info.push((pc, info_ptr));
+                            }
                             direct_calls2.push((
                                 pc,
                                 crate::jit::JitDirectCall {
@@ -3335,7 +3381,11 @@ pub(super) fn compile_osr_artifact(
     }
     if !osr_reused {
         crate::jit::disasm::maybe_dump(
-            "osr",
+            // The DOOR and the BACKEND are different questions and only the
+            // first was ever printed. `used_ir_backend` has recorded the
+            // second all along; a reader chasing a miscompiled body needs both
+            // to know which emitter to go and read.
+            if compiled.used_ir_backend { "osr/ir" } else { "osr/sp" },
             &class_name_arc,
             &method_name_arc,
             &descriptor_arc,
@@ -3560,6 +3610,121 @@ fn osr_optimizing_already_refused(key: (u32, u64, usize)) -> bool {
         .unwrap_or(false)
 }
 
+/// May the optimizing tier splice a callee containing `ldc` / `ldc_w` /
+/// `ldc2_w`? **Default ON**; `CRATONVM_JIT_IR_SPLICE_LDC=0` restores the
+/// blanket refusal, so one binary can be A/B'd against its own pre-change
+/// behaviour. See the `0x12 | 0x13 | 0x14` arm of the splice scanner.
+fn ir_splice_ldc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_LDC").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
+/// Optimizing OSR artifacts this door has already built and ACCEPTED, keyed
+/// exactly like the refusal memo beside it.
+///
+/// # Why this exists
+///
+/// Only refusals were remembered. A success was wrapped in a fresh `Arc`,
+/// entered, and dropped when the OSR'd frame left — so the next back edge
+/// rebuilt the same artifact from bytecode, and the one after that, for the
+/// life of the process. The single-pass door has never worked this way: it
+/// publishes its artifact and every later entry reports `OSR-reuse`.
+///
+/// Measured before this, on a counted-loop probe entered 20 000 times
+/// (`CRATONVM_JIT_METRICS=1`): **502 compiles of one method**, 63.3 ms of
+/// compile wall on a 262 ms run — 24 % of the process, spent rebuilding a body
+/// that was byte-identical every time. Switching the door off with
+/// `CRATONVM_JIT_OSR_OPTIMIZING=0` recovered all of it, which is what
+/// identified the cache rather than the codegen as the cost.
+///
+/// # Lifetime
+///
+/// The map holds an `Arc`, so a cached artifact's `ExecutableBuffer` stays
+/// mapped for the life of the process. That is *safer* than the previous
+/// behaviour, not less safe: an artifact used to be unmapped as soon as the
+/// last OSR frame in it returned, which is precisely the retired-code hazard
+/// `ExecutableBuffer::drop` and `defer_jit_owner` exist to police. Retained
+/// executable code is this VM's standing policy.
+///
+/// # Redefinition
+///
+/// Unlike the refusal memo — where a stale entry costs only a missed
+/// optimization — a stale entry HERE would run pre-redefinition code. So the
+/// read is gated on `class_was_redefined` for the exact class, and a redefined
+/// class is never served from, nor added to, the cache. `any_class_redefined`
+/// makes that one relaxed load on every run that never redefines anything.
+static OSR_OPTIMIZING_ACCEPTED: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(u32, u64, usize), Arc<cratonvm_jit::CompiledMethod>>,
+    >,
+> = std::sync::OnceLock::new();
+
+/// The artifact this door built for `key`, when it may still be entered.
+///
+/// Re-checks the two properties the build site checked before accepting, rather
+/// than trusting that they were checked once: an entry stub for THIS pc, and a
+/// body that cannot return the deopt sentinel. They are properties of the
+/// artifact and cannot change while it is cached, so this is a cheap assertion
+/// of the contract at the point of use, not a second policy.
+fn osr_optimizing_cached(
+    shared: &SharedVm,
+    class_id: ClassId,
+    key: (u32, u64, usize),
+    entry_pc: usize,
+) -> Option<Arc<cratonvm_jit::CompiledMethod>> {
+    if osr_optimizing_cache_disabled() {
+        return None;
+    }
+    if crate::runtime::redefine_state::class_was_redefined(shared, class_id) {
+        return None;
+    }
+    let cached = OSR_OPTIMIZING_ACCEPTED
+        .get_or_init(Default::default)
+        .lock()
+        .ok()?
+        .get(&key)
+        .cloned()?;
+    // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
+    if cached.ir_osr_entry_addr(entry_pc as u32).is_some() && cached.ir_osr_sentinel_free {
+        Some(cached)
+    } else {
+        None
+    }
+}
+
+/// Keep an accepted optimizing OSR artifact for the next entry at this pc.
+fn remember_osr_optimizing_artifact(
+    key: (u32, u64, usize),
+    artifact: &Arc<cratonvm_jit::CompiledMethod>,
+) {
+    if osr_optimizing_cache_disabled() {
+        return;
+    }
+    if let Ok(mut m) = OSR_OPTIMIZING_ACCEPTED.get_or_init(Default::default).lock() {
+        m.insert(key, Arc::clone(artifact));
+    }
+}
+
+/// `CRATONVM_JIT_OSR_OPTIMIZING_CACHE=0` restores the pre-cache behaviour —
+/// rebuild the artifact on every entry — so the two arms can be measured from
+/// ONE binary. Comparing an intermittent event across two builds is not a
+/// comparison; this is the same argument `CRATONVM_JIT_OSR_OPTIMIZING_MEMO`
+/// makes for the refusal memo, and the same spelling.
+fn osr_optimizing_cache_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_OPTIMIZING_CACHE").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
 /// Record a refusal so the next attempt at this pc skips straight to
 /// single-pass.
 ///
@@ -3650,9 +3815,23 @@ pub(super) fn try_osr(
     // Anything else falls through to the single-pass path below, unchanged.
     let osr_opt_key =
         osr_optimizing_refusal_key(class_id, &method_name, &method_descriptor, entry_pc);
-    let ir_osr: Option<Arc<cratonvm_jit::CompiledMethod>> = if osr_optimizing_tier_enabled()
-        && !osr_optimizing_already_refused(osr_opt_key)
-    {
+    // The artifact this door built the LAST time it was asked for this pc.
+    //
+    // Reusing it is the whole point: without this the door is a compiler, not a
+    // cache, and the single-pass door beside it — which publishes its artifact
+    // and reports `OSR-reuse` on every later entry — was the only one of the
+    // two that behaved like a tier.
+    let ir_osr: Option<Arc<cratonvm_jit::CompiledMethod>> = if !osr_optimizing_tier_enabled() {
+        None
+    } else if let Some(cached) = osr_optimizing_cached(shared, class_id, osr_opt_key, entry_pc) {
+        cratonvm_jit::metrics::record_osr_event("osr_optimizing_artifact_reused");
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] osr optimizing REUSE {class_name}.{method_name} pc={entry_pc}"
+            );
+        }
+        Some(cached)
+    } else if !osr_optimizing_already_refused(osr_opt_key) {
         // The frame's own handle when it has one, and a resolution when it does
         // not. `main` is entered by the launcher rather than through the invoke
         // cache, so its frame carries no `CachedBytecodeMethod` — and a method
@@ -3699,7 +3878,13 @@ pub(super) fn try_osr(
                 };
                 // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
                 if cm.ir_osr_entry_addr(entry_pc as u32).is_some() && cm.ir_osr_sentinel_free {
-                    Some(Arc::new(cm))
+                    // Keep it. Every OSR entry at this pc used to rebuild this
+                    // artifact from bytecode and drop it again when the frame
+                    // left — see `remember_osr_optimizing_artifact` for the
+                    // measurement that motivates the cache.
+                    let artifact = Arc::new(cm);
+                    remember_osr_optimizing_artifact(osr_opt_key, &artifact);
+                    Some(artifact)
                 } else {
                     note_osr_optimizing_refusal(osr_opt_key);
                     None
@@ -3725,7 +3910,7 @@ pub(super) fn try_osr(
             // and the disassembly said it had not; the disassembly was of
             // another artifact.
             crate::jit::disasm::maybe_dump(
-                "osr-optimizing",
+                if c.used_ir_backend { "osr-optimizing/ir" } else { "osr-optimizing/sp" },
                 &class_name_arc,
                 &method_name_arc,
                 &descriptor_arc,
@@ -4106,21 +4291,22 @@ pub(super) fn try_osr(
         // drain did until 2026-09-06 — `jit_npe_message_gated` had no
         // production caller at all.
         //
-        // LATENT, and deliberately so: measured 2026-09-06, this cannot change
-        // an observable message today. The ONLY setter of an action code is
-        // `jit_npe_with_action`, which pairs it with `set_jit_deopt_pending`,
-        // so a recorded action always bails to the interpreter, which replays
-        // the trapping bytecode and raises the FULLER message with the
-        // `because "…" is null` clause (HotSpot-exact — see
-        // `vm/tests/jit_npe_message_from_compiled_code.rs`). The other setter,
-        // `stash_jit_pending_npe_action`, has no callers. So every NPE that
-        // actually reaches this drain carries `NONE`, and
-        // `jit_action_message(NONE)` is `None`.
+        // It was LATENT when it was wired, and measured to be: on 2026-09-06
+        // the only setter of an action code was `jit_npe_with_action`, which
+        // pairs it with `set_jit_deopt_pending`, so a recorded action always
+        // bailed to the interpreter and every NPE that reached this drain
+        // carried `NONE`. It was wired anyway because the alternative is a
+        // silent drop — which is exactly how this machinery came to be fully
+        // built, unit-tested and connected to nothing.
         //
-        // Wired anyway because the alternative is a silent drop: a future stub
-        // that records an action WITHOUT deopting would otherwise lose it here
-        // with nothing to notice, which is exactly how this machinery came to
-        // be fully built, unit-tested and connected to nothing.
+        // It stopped being latent on 2026-09-11. The helpers that detect a null
+        // RECEIVER — `jit_getfield`, `jit_invoke_dispatch`,
+        // `jit_invoke_virtual_mic` and the direct-bound intrinsics — record a
+        // trap-site key or an `INVOKE_RECEIVER` code and DO reach here, because
+        // they do not deopt; that is the defect
+        // `the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`
+        // is about. The code is now read by `jit_npe_message` as the
+        // corroboration for a bci, and as the fallback message when it declines.
         let npe_action = crate::jit::helpers::take_jit_pending_npe_action();
         // Round-9/10 HIGH fix: route the NPE through the OSR'd method's own
         // exception table rather than losing it. The OSR target IS the method
@@ -4141,7 +4327,11 @@ pub(super) fn try_osr(
             shared,
             thread,
             RuntimeError::NullPointerException {
-                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                // See `super::jit_npe_message` — the trapping method's own
+                // bytecode first, the action-only string as the fallback.
+                message: super::jit_npe_message::jit_npe_message(
+                    shared,
+                    npe_snapshot.as_deref(),
                     npe_action,
                 ),
             },
@@ -6382,8 +6572,23 @@ pub(super) fn compile_optimizing_artifact(
             resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc, None)
         };
         // The optimizing tier's own inline resolver for this callee compile.
+        // No direct-bind resolver, and here the reason is scope rather than
+        // capability: this is the CALLEE-compile path, entered from planning
+        // for another method, and the only binder in reach
+        // (`callee_compiler`) compiles what it is asked about. Handing it to a
+        // resolver that runs inside planning would let one compile drive
+        // another through a door with no depth budget of its own. The calls a
+        // body spliced here leaves behind keep the dispatch helper; the main
+        // path below is where the rows are produced.
         let c_ir_inline_resolver = |callee_class: &str, callee_method: &str, callee_desc: &str| {
-            resolve_ir_inline_site(shared, callee_cid, callee_class, callee_method, callee_desc)
+            resolve_ir_inline_site(
+                shared,
+                callee_cid,
+                callee_class,
+                callee_method,
+                callee_desc,
+                None,
+            )
         };
         // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
         // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
@@ -6558,7 +6763,7 @@ pub(super) fn compile_optimizing_artifact(
             );
         }
         crate::jit::disasm::maybe_dump_annotated(
-            "callee",
+            if compiled.used_ir_backend { "callee/ir" } else { "callee/sp" },
             &callee_cached.class_name,
             &callee_cached.method_name,
             &callee_cached.method_descriptor,
@@ -6639,6 +6844,23 @@ pub(super) fn compile_optimizing_artifact(
 
     // The optimizing tier's own inline resolver — see `resolve_ir_inline_site`
     // for how its admission set differs in both directions.
+    //
+    // `callee_compiler` as the direct-bind resolver, which is the SAME one this
+    // compile hands `try_compile` for its own call sites and the same one the
+    // single-pass `inline_resolver` above hands its spliced bodies. Until
+    // 2026-09-09 this argument was absent, and the note where it should have
+    // been said "`IrBuilder` has no direct-call lowering inside a relocated
+    // body to bake an entry into". That was true; it no longer is
+    // (`ir_direct_calls` is keyed by combined-buffer pc and
+    // `append_ir_inline_site` fills it), and while it was true every
+    // statically-bound call an optimizing splice left behind lowered to
+    // `jit_invoke_dispatch` and resolved its callee BY NAME on every
+    // execution — the measured 3.5x loss the sibling's own comment describes,
+    // paid on the tier that is supposed to be the fast one.
+    //
+    // Using the same resolver as the sibling matters beyond symmetry: it bounds
+    // its own recursion (depth, cycle, fan-out), which is why the sibling's
+    // comment gives reuse as the reason not to write a lookup by hand here.
     let ir_inline_resolver = |callee_class: &str,
                               callee_method: &str,
                               callee_desc: &str|
@@ -6649,6 +6871,11 @@ pub(super) fn compile_optimizing_artifact(
             callee_class,
             callee_method,
             callee_desc,
+            if cratonvm_jit::ir_splice_direct_call_enabled() {
+                Some(&callee_compiler as InlineDirectBind<'_>)
+            } else {
+                None
+            },
         )
     };
     // Main-path small-method inlining is GATED default-OFF behind
@@ -6813,7 +7040,7 @@ pub(super) fn try_jit_upgrade_with_gate(
     // deploy interpreted — the method was rejected here *before* it was ever
     // counted, which is why `jit-method-stats` reported it neither compiled nor
     // `hot_but_stuck_in_interpreter`. See
-    // docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
+    // docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md.
     //
     // Default-OFF pending the A/B and the concurrency soak: `CRATONVM_JIT=sync-methods`.
     if cached.is_synchronized && !jit_sync_methods_enabled() {
@@ -7027,7 +7254,7 @@ pub(super) fn try_jit_upgrade_with_gate(
         );
     }
     crate::jit::disasm::maybe_dump(
-        "upgrade",
+        if compiled_arc.used_ir_backend { "upgrade/ir" } else { "upgrade/sp" },
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -8462,10 +8689,22 @@ pub(super) fn try_jit_compile_callee_slow(
     };
 
     // The optimizing tier's own inline resolver. Same three-name question, a
-    // different admission set — see `resolve_ir_inline_site`. No direct-bind
-    // resolver: a spliced body's remaining calls go through the dispatch helper
-    // on this path, and `IrBuilder` has no direct-call lowering inside a
-    // relocated body to bake an entry into.
+    // different admission set — see `resolve_ir_inline_site`.
+    //
+    // This passed NO direct-bind resolver until 2026-09-09, on the stated
+    // grounds that "`IrBuilder` has no direct-call lowering inside a relocated
+    // body to bake an entry into". That was true and is no longer: the
+    // `ir_direct_calls` map is keyed by COMBINED-BUFFER pc, `ir_lower`'s
+    // `Op::Call` arm looks a spliced pc up in it like any other, and
+    // `append_ir_inline_site` now produces the rows. Without the binder here
+    // those rows are all empty, so every statically-bound call a splice left
+    // behind kept resolving its callee BY NAME on every execution — the
+    // measured 3.5x loss the single-pass sibling's comment above describes,
+    // paid on the tier that is supposed to be the fast one.
+    //
+    // The same lookup-only closure the single-pass sibling uses, and for the
+    // same reason: it binds an ALREADY-compiled callee and never compiles one,
+    // so planning cannot recurse into compilation here.
     let ir_inline_resolver = |callee_class: &str,
                               callee_method: &str,
                               callee_desc: &str|
@@ -8476,6 +8715,11 @@ pub(super) fn try_jit_compile_callee_slow(
             callee_class,
             callee_method,
             callee_desc,
+            if cratonvm_jit::ir_splice_direct_call_enabled() {
+                Some(&direct_callee_lookup as InlineDirectBind<'_>)
+            } else {
+                None
+            },
         )
     };
 
@@ -8562,7 +8806,7 @@ pub(super) fn try_jit_compile_callee_slow(
         );
     }
     crate::jit::disasm::maybe_dump(
-        "full",
+        if compiled.used_ir_backend { "full/ir" } else { "full/sp" },
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -9603,6 +9847,7 @@ pub(super) fn resolve_ir_inline_site(
     callee_class: &str,
     callee_method: &str,
     callee_desc: &str,
+    direct_bind: Option<InlineDirectBind<'_>>,
 ) -> Option<cratonvm_jit::InlineSite> {
     resolve_inline_site_from(
         shared,
@@ -9612,7 +9857,7 @@ pub(super) fn resolve_ir_inline_site(
         callee_method,
         callee_desc,
         0,
-        None,
+        direct_bind,
         true,
     )
 }
@@ -10015,6 +10260,8 @@ fn resolve_inline_site_from(
     // This is the row whose absence bailed `VolumeShort2.loadFromArray` out of
     // the IR tier altogether, and with it out of escape analysis.
     let mut ir_new_sites: Vec<(usize, u16)> = Vec::new();
+    // IR-tier only: `(pc, cp_idx, is_checkcast)` for the body's type checks.
+    let mut ir_typecheck_sites: Vec<(usize, u16, bool)> = Vec::new();
     // IR-tier only: pcs of the body's return opcodes. A relocated body is walked
     // straight through with no merge bookkeeping, so exactly one return, at the
     // end, is the shape the splice can honour.
@@ -10036,20 +10283,95 @@ fn resolve_inline_site_from(
             }
             0xbb | 0xbd | 0xc5 => no!("new/anewarray/multianewarray"),
             0xbf => no!("athrow"),
+            // `checkcast` / `instanceof`. Refused for both tiers until
+            // 2026-09-09, and for the optimizing tier the refusal was the same
+            // shape as `ir-splice-static-field`'s: `IrBuilder` has had both
+            // arms since cov-05, keyed by pc off `checkcast_info` /
+            // `instanceof_info`, and nothing rebased a spliced body's rows into
+            // them. The survey that motivated those arms counted 306 events on
+            // this pair -- the largest single whole-method refusal, more than
+            // every opcode gap combined -- because every typed read out of an
+            // untyped container is a `checkcast`.
+            //
+            // Unlike `getstatic`, the rows are RESOLVED here rather than
+            // already carried: `InlineSite` had no typecheck field, and the
+            // target class can only be named through the CALLEE's constant
+            // pool. See the resolution below, which refuses the body when a
+            // target is not loaded rather than admitting it with rows missing:
+            // a missing row bails the whole METHOD, so the caller would lose
+            // its optimizing compile over a callee it merely wanted inlined.
+            //
+            // The single-pass emitter still has no arm for either, so its
+            // refusal is unchanged.
+            0xc0 | 0xc1 if ir_mode => {
+                if !cratonvm_jit::ir::ir_splice_typecheck_enabled() {
+                    no!("ir-splice-typecheck");
+                }
+                if scan_pc + 2 >= code_len {
+                    return None;
+                }
+                let cp_idx = ((code[scan_pc + 1] as u16) << 8) | code[scan_pc + 2] as u16; // Cast: bytecode operand decoding
+                ir_typecheck_sites.push((scan_pc, cp_idx, code[scan_pc] == 0xc0));
+                scan_pc += 3;
+                continue;
+            }
             0xc0 | 0xc1 => no!("checkcast/instanceof"),
             0xc2 | 0xc3 => no!("monitorenter/monitorexit"),
             // A relocated body's control flow would need the merge/loop-header
             // bookkeeping `IrBuilder` computes over the CALLER's code alone.
             // Straight-line only, v1.
-            0x99..=0xa9 | 0xc6 | 0xc7 | 0xc8 | 0xc9 if ir_mode => no!("ir-splice-branch"),
+            // `jsr` / `ret` / `jsr_w` — subroutines. Refused unconditionally
+            // and separately from the ordinary branches below: `IrBuilder` has
+            // no lowering for a return address, and the verifier's CFG for one
+            // is not the shape `normally_reachable_pcs` walks. No JDK-9+
+            // compiler emits them.
+            0xa8 | 0xa9 | 0xc9 if ir_mode => no!("ir-splice-subroutine"),
+            // Ordinary intra-body control flow — every `if`, `goto` and
+            // `goto_w`. Refused until 2026-09-09 with the note "straight-line
+            // only, v1", and the missing piece was one pre-scan: the builder
+            // ran the verifier's CFG analysis over the CALLER's bytecode alone,
+            // so a relocated body's merge targets and loop headers were invisible
+            // to it. `IrBuilder::build` now runs the same analysis over each
+            // spliced body and rebases the result — see its `ir_splice_branch_enabled`
+            // block, which reads the SAME switch this arm does.
+            //
+            // The cost of the refusal was not marginal: a callee with an `if`
+            // is most callees. On a four-callee probe it refused the one
+            // remaining body after the `ldc` refusal was lifted.
+            //
+            // Still refused, by the check further down and independently of
+            // this: a body with more than one `return`, or a `return` that is
+            // not its last instruction. Branching bodies that funnel to a
+            // single trailing return — a ternary, an accumulate-then-return, a
+            // loop — are what this admits.
+            0x99..=0xa7 | 0xc6 | 0xc7 | 0xc8
+                if ir_mode && !cratonvm_jit::ir::ir_splice_branch_enabled() =>
+            {
+                no!("ir-splice-branch")
+            }
             // The only guard `IrBuilder` emits is div-zero, and a guard inside a
             // spliced region deopts to "re-execute the invoke" rather than to
             // itself. Keeping division out means a spliced region carries no
             // guard of its own at all.
             0x6c | 0x6d | 0x70 | 0x71 if ir_mode => no!("ir-splice-division"),
-            // `InlineSite` records a raw `i64` for these; the builder needs the
-            // value AND whether it is a float/double. See `resolve_ir_inline_site`.
-            0x12 | 0x13 | 0x14 if ir_mode => no!("ir-splice-ldc"),
+            // `ldc` / `ldc_w` / `ldc2_w` were refused here until 2026-09-09,
+            // and the reason was plumbing rather than modelling: `InlineSite`
+            // recorded a raw `i64` and dropped the float/double tag the builder
+            // needs to choose between `Op::Const` and `Op::ConstF`. The tag now
+            // rides along in `InlineSite::ldc_fp_pcs` and
+            // `append_ir_inline_site` rebases both tables into
+            // `IrInlineTables`, so the builder's own `0x12 | 0x13` and `0x14`
+            // arms resolve a spliced constant exactly as they resolve one in
+            // the caller's own code.
+            //
+            // The refusal was expensive out of all proportion to its cause: a
+            // constant wider than `sipush` is ordinary Java, and on a
+            // four-callee probe this term alone refused two of the four. What
+            // is still refused is what the RESOLVER refuses — an `ldc` naming a
+            // String, a Class, a MethodHandle, a MethodType or a condy site,
+            // each of which has resolution side effects (interning, class
+            // loading, `<clinit>`) that a spliced immediate would skip.
+            0x12 | 0x13 | 0x14 if ir_mode && !ir_splice_ldc_enabled() => no!("ir-splice-ldc"),
             0xac..=0xb1 if ir_mode => {
                 ir_return_pcs.push(scan_pc);
                 scan_pc += 1;
@@ -10064,10 +10386,51 @@ fn resolve_inline_site_from(
                 scan_pc += 1;
                 continue;
             }
-            // No `static_field_info` is rebased into the builder's tables, so a
-            // spliced `getstatic` would find no row and bail the whole method
-            // AFTER the walk had committed to the body.
-            0xb2 | 0xb3 if ir_mode => no!("ir-splice-static-field"),
+            // `getstatic` was refused here until 2026-09-09, with the note
+            // "no `static_field_info` is rebased into the builder's tables, so
+            // a spliced `getstatic` would find no row and bail the whole
+            // method AFTER the walk had committed to the body". That was an
+            // accurate description of the plumbing and not of any modelling
+            // problem: `static_field_info` below has resolved these rows for
+            // the single-pass inliner since it existed, and
+            // `append_ir_inline_site` now rebases them into
+            // `IrInlineTables::static_field_info`, which the builder's own
+            // `0xb2` arm reads exactly as it reads a caller's site.
+            //
+            // The refusal was expensive out of proportion to its cause, in the
+            // same way the `ldc` one was: `getstatic` is the single largest
+            // opcode in the ir-coverage survey (92 of 273 events), because a
+            // static-table read behind an accessor is what framework code is
+            // mostly made of.
+            //
+            // `putstatic` (0xb3) stays refused, and this one IS modelling. The
+            // builder has no arm for it at all, and a static reference write
+            // owes an SATB pre-barrier that lives on the single-pass
+            // `jit_putstatic_*` path — statics are a Rust-side table, not the
+            // heap, so no collector `set_field` barrier covers them.
+            0xb3 if ir_mode => no!("ir-splice-putstatic"),
+            //
+            // Handled here rather than by falling through to the ordinary
+            // `0xb2 | 0xb3` arm below, because that arm is guarded by
+            // `inline_no_static` — `CRATONVM_INLINE_ALLOW_STATIC`, which is
+            // OFF by default. That switch belongs to the single-pass inline
+            // mini-emitter (`x64/inlining.rs`), which materialises a static
+            // read as a baked address and is the reason the gate exists. The
+            // optimizing tier does not go through that emitter at all: its
+            // `0xb2` arm builds an `Op::LoadStatic` whose lowering picks
+            // between the direct load and `helpers.getstatic` on the
+            // resolver's own already-initialised answer. Falling through would
+            // have made this feature a no-op under its own default and left
+            // the refusal UNNAMED, which is the failure the `no!` macro at the
+            // top of this function exists to prevent.
+            0xb2 if ir_mode => {
+                if !cratonvm_jit::ir::ir_splice_getstatic_enabled() {
+                    no!("ir-splice-static-field");
+                }
+                has_static_field_ops = true;
+                scan_pc += 3;
+                continue;
+            }
             // invokevirtual / invokestatic / invokeinterface inside the
             // spliced body. These used to reject the site outright — the
             // emitter had no arm for them and, more fundamentally, nothing
@@ -10153,11 +10516,31 @@ fn resolve_inline_site_from(
         scan_pc += inline_instr_length(code, scan_pc);
     }
 
-    // The relocated body is walked straight through from its first byte to its
-    // return, with the caller's frame parked in `SpliceFrame`. More than one
-    // return means an early exit the walk would never reach the second half of;
-    // a return that is not last means live code after it.
-    if ir_mode && (ir_return_pcs.len() != 1 || ir_return_pcs[0] + 1 != code_len) {
+    // The relocated body is walked from its first byte through to `code_len`
+    // with the caller's frame parked in `SpliceFrame`, so the LAST instruction
+    // must be a `return` — otherwise the walk runs off the end of the body into
+    // whatever `lib.rs` appended next.
+    //
+    // More than one return was refused outright until 2026-09-09, on the
+    // grounds that the walk leaves the splice at the first one and would never
+    // reach the code after it. It no longer leaves: `IrBuilder::splice_return`
+    // turns each return into an edge into a continuation built at the body's
+    // end (`finish_multi_return_splice`), which is the ordinary
+    // several-predecessors join the builder already performs for a caller's own
+    // branches. Default OFF — `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1` lifts the
+    // refusal, and `ir_splice_multi_return_enabled` says why it is not lifted
+    // by default (it is neutral on throughput and forfeits the optimizing OSR
+    // door while `emit_osr_entry_stubs` is unfixed);
+    // the builder reads the SAME switch, and neither half may be flipped alone.
+    //
+    // Every `return` opcode is one byte, so "last instruction" is exactly
+    // `last + 1 == code_len` with no length table needed.
+    let multi_return_ok = ir_mode && cratonvm_jit::ir::ir_splice_multi_return_enabled();
+    if ir_mode
+        && (ir_return_pcs.is_empty()
+            || ir_return_pcs[ir_return_pcs.len() - 1] + 1 != code_len
+            || (!multi_return_ok && ir_return_pcs.len() != 1))
+    {
         no!("ir-splice-not-single-trailing-return");
     }
 
@@ -10183,6 +10566,45 @@ fn resolve_inline_site_from(
     let Some(callee_class_info) = cm.get_class(declaring_id) else {
         no!("declaring-class-info-unavailable");
     };
+
+    // Resolve the body's `checkcast` / `instanceof` targets against the
+    // CALLEE's constant pool -- the only pool that can name them.
+    //
+    // Admitted only when the target class is already RESOLVED AND LOADED, which
+    // is the same bar the caller's own sites are held to and for the same
+    // reason: the not-yet-loaded path runs `jit_typecheck_resolve`, which can
+    // call a user classloader's `loadClass`, arbitrary Java this tier does not
+    // host inside a helper call. `resolve_jit_new_site` answers exactly that
+    // question for a `CONSTANT_Class` entry, which is the shape both opcodes
+    // take, so this reuses it rather than adding a second resolver; the field
+    // count and init flags it also carries are irrelevant here.
+    //
+    // An unresolved target refuses the whole CALLEE, the same trade as
+    // `ir-splice-new-site-unresolved`: a missing row bails the METHOD, so
+    // admitting the body without one costs the CALLER its optimizing compile
+    // over a callee it merely wanted inlined. Refusing costs the site its
+    // inline and nothing else.
+    //
+    // The builder's `0xc0`/`0xc1` arms appear to be gentler -- a missing row
+    // reaches `plant_uncommon_trap`. It is gated off by default
+    // (`ir_unresolved_class_trap_enabled`), so the plant refuses and the arm
+    // bails; and with it ON the trap fires and, inside a splice, deopts to
+    // re-execute the invoke on every call. Neither setting makes admitting an
+    // unresolved body the right move.
+    let mut ir_typecheck_info: Vec<(usize, u32, String, bool)> = Vec::new();
+    for &(tpc, cp_idx, is_checkcast) in &ir_typecheck_sites {
+        let Some(cratonvm_jit::JitNewSite::Resolved {
+            class_id: target_id,
+            ..
+        }) = resolve_jit_new_site(&cm, declaring_id, cp_idx)
+        else {
+            no!("ir-splice-typecheck-target-not-loaded");
+        };
+        let Some(name) = callee_class_info.constant_pool.get_class_name(cp_idx) else {
+            no!("ir-splice-typecheck-target-unnamed");
+        };
+        ir_typecheck_info.push((tpc, target_id, name.to_string(), is_checkcast));
+    }
 
     // Validate the deferred invokespecial sites: every one must be a
     // resolver-PROVEN no-op super-constructor call, or the whole callee is
@@ -10446,6 +10868,12 @@ fn resolve_inline_site_from(
     // still CALLED — it just is not spliced — which is what "cannot model it"
     // has to mean.
     let mut ldc_info = Vec::new();
+    // Callee PCs whose constant is a float or a double. The optimizing tier
+    // cannot splice a body without this — see `InlineSite::ldc_fp_pcs` — and
+    // recording it here rather than re-deriving it downstream is what keeps the
+    // tag and the value from disagreeing: both come out of the same
+    // constant-pool match.
+    let mut ldc_fp_pcs: Vec<usize> = Vec::new();
     if has_ldc {
         let mut fpc = 0;
         while fpc < code_len {
@@ -10453,7 +10881,10 @@ fn resolve_inline_site_from(
                 let cp_idx = code[fpc + 1] as u16; // Cast: bytecode operand decoding
                 let val = match callee_class_info.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
-                    Some(ConstantPoolEntry::Float(v)) => (*v as f32).to_bits() as i32 as i64, // Cast: JIT ABI -- float bits to i64
+                    Some(ConstantPoolEntry::Float(v)) => {
+                        ldc_fp_pcs.push(fpc);
+                        (*v as f32).to_bits() as i32 as i64 // Cast: JIT ABI -- float bits to i64
+                    }
                     _ => return None,
                 };
                 ldc_info.push((fpc, val));
@@ -10462,7 +10893,10 @@ fn resolve_inline_site_from(
                 let cp_idx = ((code[fpc + 1] as u16) << 8) | code[fpc + 2] as u16; // Cast: bytecode operand decoding
                 let val = match callee_class_info.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
-                    Some(ConstantPoolEntry::Float(v)) => (*v as f32).to_bits() as i32 as i64, // Cast: JIT ABI -- float bits to i64
+                    Some(ConstantPoolEntry::Float(v)) => {
+                        ldc_fp_pcs.push(fpc);
+                        (*v as f32).to_bits() as i32 as i64 // Cast: JIT ABI -- float bits to i64
+                    }
                     _ => return None,
                 };
                 ldc_info.push((fpc, val));
@@ -10484,7 +10918,10 @@ fn resolve_inline_site_from(
                 let cp_idx = ((code[fpc + 1] as u16) << 8) | code[fpc + 2] as u16; // Cast: bytecode operand decoding
                 let val = match callee_class_info.constant_pool.get(cp_idx)? {
                     ConstantPoolEntry::Long(v) => *v,
-                    ConstantPoolEntry::Double(v) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                    ConstantPoolEntry::Double(v) => {
+                        ldc_fp_pcs.push(fpc);
+                        v.to_bits() as i64 // Cast: JIT ABI -- float bits to i64
+                    }
                     _ => return None,
                 };
                 ldc2w_info.push((fpc, val));
@@ -10541,6 +10978,15 @@ fn resolve_inline_site_from(
                 type_tag,
                 resolved.is_volatile,
             ));
+        } else if ir_mode {
+            // An unresolvable site is DROPPED for the single-pass emitter,
+            // which bails that one site and keeps the rest of the body. The
+            // optimizing tier has no such fallback: a `getstatic` with no row
+            // bails the whole METHOD, after the splice has been committed to.
+            // Refuse the body instead — the callee is still compiled and still
+            // called, it is just not spliced. Same trade, and the same
+            // sentence, as `ir-splice-new-site-unresolved`.
+            no!("ir-splice-static-field-unresolved");
         }
     }
 
@@ -10887,6 +11333,7 @@ fn resolve_inline_site_from(
         static_field_info,
         ldc_info,
         ldc2w_info,
+        ldc_fp_pcs,
         needs_heap,
         class_name: inlined_body_class_name,
         class_id: inlined_body_class_id,
@@ -10900,6 +11347,7 @@ fn resolve_inline_site_from(
         resolved_invoke_infos: Vec::new(),
         nested_sites,
         ir_new_info,
+        ir_typecheck_info,
     })
 }
 
@@ -11518,7 +11966,14 @@ pub(super) fn execute_jit_call(
             shared,
             thread,
             RuntimeError::NullPointerException {
-                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                // Rebuilt from the trapping method's OWN bytecode when the
+                // snapshot names the site, so a compiled row carries the same
+                // JEP 358 message its interpreted row does; falls back to the
+                // action-only string this used to build. See
+                // `super::jit_npe_message`.
+                message: super::jit_npe_message::jit_npe_message(
+                    shared,
+                    npe_snapshot.as_deref(),
                     sig.npe_action,
                 ),
             },
@@ -11705,7 +12160,14 @@ pub(super) fn execute_jit_call(
             // — e.g. one that scalar-replaced an object, whose snapshot records
             // machine provenance the mapper can't re-materialize — falls straight
             // through to the safe re-run instead of relying on the mapper bail.
-            if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
+            // ADDITIVE second arm: `can_deopt_resume` is false on every
+            // optimizing-tier artifact in a production build, so without it
+            // this sink fell through to the whole-method re-run below and ran
+            // any side effect the compiled body had ALREADY committed a second
+            // time, silently. See `sink_precise_resume_allowed`.
+            if (cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume)
+                || sink_precise_resume_allowed_for(cached, &rframe)
+            {
                 // deopt-osr Step 9: epoch staleness guard + de-speculation
                 // wiring (record the deopt, evict, escalate to not-entrant /
                 // not-compilable, advance the live epoch). Resumes the trapping
@@ -11905,7 +12367,26 @@ pub(super) fn execute_jit_call_decoded(
     let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     // Too many args for the register-only JIT ABI, or a mismatch between the
     // decoded args and the declared count → interpreter fallback (Ok(None)).
+    //
+    // This is the LAST place a site that passed every tier-up condition and
+    // found a compiled body can still be interpreted, and until the second
+    // census (`CRATONVM_DBG_PROMOTE_REFUSE`) nothing named it: the site falls
+    // through to the interpreted frame push with the operand stack untouched,
+    // indistinguishable from never having been admitted at all. See
+    // `interp_census::promote_refuse_enabled`.
     if np > max_java_params || args_slice.len() != np {
+        if crate::runtime::interp_census::promote_refuse_enabled() {
+            crate::runtime::interp_census::record_decoded_call_refusal(
+                if np > max_java_params {
+                    "decoded_call_abi_too_many_args"
+                } else {
+                    "decoded_call_arg_count_mismatch"
+                },
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
         return Ok(None);
     }
     // Decode each Java arg to its raw JIT-ABI bit pattern (Int → sign-extended
@@ -12041,7 +12522,14 @@ pub(super) fn execute_jit_call_decoded(
             shared,
             thread,
             RuntimeError::NullPointerException {
-                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                // Rebuilt from the trapping method's OWN bytecode when the
+                // snapshot names the site, so a compiled row carries the same
+                // JEP 358 message its interpreted row does; falls back to the
+                // action-only string this used to build. See
+                // `super::jit_npe_message`.
+                message: super::jit_npe_message::jit_npe_message(
+                    shared,
+                    npe_snapshot.as_deref(),
                     sig.npe_action,
                 ),
             },
@@ -12172,7 +12660,14 @@ pub(super) fn execute_jit_call_decoded(
             // checks and de-speculation live inside
             // `real_frame_deopt_resume_and_despeculate`; any refusal falls
             // through to the safe re-run below.
-            if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
+            // ADDITIVE second arm: `can_deopt_resume` is false on every
+            // optimizing-tier artifact in a production build, so without it
+            // this sink fell through to the whole-method re-run below and ran
+            // any side effect the compiled body had ALREADY committed a second
+            // time, silently. See `sink_precise_resume_allowed`.
+            if (cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume)
+                || sink_precise_resume_allowed_for(cached, &rframe)
+            {
                 if let Some(r) = real_frame_deopt_resume_and_despeculate(
                     shared, thread, compiled, cached, &rframe,
                 ) {
@@ -12229,6 +12724,14 @@ pub(super) fn execute_jit_call_decoded(
     // (the previous "same result" claim is false for any method with side
     // effects). With the flag clear we fall through and push the real value.
     if result == i64::MIN && deopt_signaled {
+        if crate::runtime::interp_census::promote_refuse_enabled() {
+            crate::runtime::interp_census::record_decoded_call_refusal(
+                "decoded_call_deopt",
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
         return Ok(None);
     }
 
@@ -12461,7 +12964,14 @@ pub(super) fn execute_jit_call_oneshot(
             shared,
             thread,
             RuntimeError::NullPointerException {
-                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                // Rebuilt from the trapping method's OWN bytecode when the
+                // snapshot names the site, so a compiled row carries the same
+                // JEP 358 message its interpreted row does; falls back to the
+                // action-only string this used to build. See
+                // `super::jit_npe_message`.
+                message: super::jit_npe_message::jit_npe_message(
+                    shared,
+                    npe_snapshot.as_deref(),
                     sig.npe_action,
                 ),
             },
@@ -12640,7 +13150,13 @@ pub(crate) fn resume_deopted_body(
     if ir_deopt_resume_enabled() && resume_from_ir_deopt(shared, thread, cached, rframe).is_some() {
         return run_pushed_frame_to_completion(shared, thread, frames_depth_on_entry).map(Some);
     }
-    if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
+    // ADDITIVE second arm — see `sink_precise_resume_allowed`. Without it this
+    // function's own doc ("the only correct answer for a body that has already
+    // committed a side effect") described something it could not do on an
+    // optimizing-tier artifact, which is the tier the defect it cites needs.
+    if (cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume)
+        || sink_precise_resume_allowed_for(cached, rframe)
+    {
         if real_frame_deopt_resume_and_despeculate(shared, thread, compiled, cached, rframe)
             .is_some()
         {

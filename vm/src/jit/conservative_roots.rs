@@ -1803,9 +1803,6 @@ fn dbg_no_prune() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_PRUNE").is_some())
 }
 
-/// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate (Windows-only diagnostic), same
-/// per-native-call hot-path rationale as [`dbg_no_prune`].
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 /// H2-CID0 (2026-08-05) — times the unregistered-JIT-frame memo said "clean"
 /// while a real scan of the same range found a frame.
 ///
@@ -2025,6 +2022,153 @@ fn unreg_memo_hiwater_enabled() -> bool {
     })
 }
 
+thread_local! {
+    /// Is the running `scan_active_jit_frames` the COLLECTION's own root pass,
+    /// rather than one of the per-native-call snapshot publishers?
+    ///
+    /// The above-chain conservative band is affordable once per collection and
+    /// not once per native call, and only the collection's pass is what the
+    /// collector marks from — so the two need telling apart. Set by
+    /// [`scan_active_jit_frames_for_collection`], which is the entry point
+    /// `memory::roots::collect_roots` uses.
+    static GC_ROOT_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True while the collection's own root pass is running on this thread.
+#[inline]
+pub fn gc_root_pass_active() -> bool {
+    GC_ROOT_PASS.with(|c| c.get())
+}
+
+/// [`scan_active_jit_frames`] as the COLLECTION's root pass — the entry point
+/// `memory::roots::collect_roots` calls, and the only one that scans the band
+/// above the JIT entry chain. Restores the previous value rather than clearing,
+/// so a nested call (there is none today) cannot silently downgrade the outer
+/// pass.
+pub fn scan_active_jit_frames_for_collection(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
+    let prev = GC_ROOT_PASS.with(|c| c.replace(true));
+    scan_active_jit_frames(heap, out);
+    GC_ROOT_PASS.with(|c| c.set(prev));
+}
+
+/// Engagement census for the above-chain conservative band.
+///
+/// A band that is never scanned and a band that is scanned and finds nothing
+/// read the same way in a passing run, and this repair exists because a page
+/// spent a day on an instrument that could not tell those apart. `passes` is
+/// the denominator, `roots` what the band contributed, `bytes` how much stack
+/// it had to read to get them.
+pub mod above_chain {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static PASSES: AtomicU64 = AtomicU64::new(0);
+    pub static ROOTS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn note(roots: usize, bytes: usize) {
+        PASSES.fetch_add(1, Ordering::Relaxed);
+        ROOTS.fetch_add(roots as u64, Ordering::Relaxed);
+        BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// `(passes, roots, bytes)` — for the shutdown census.
+    pub fn census() -> (u64, u64, u64) {
+        (
+            PASSES.load(Ordering::Relaxed),
+            ROOTS.load(Ordering::Relaxed),
+            BYTES.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// OPT-IN gate for the above-chain conservative band
+/// (`CRATONVM_JIT_ABOVE_CHAIN_SCAN=1`), and it is opt-in because it was
+/// MEASURED not to be the fix it was written as.
+///
+/// The hypothesis was that the BindableTests ByteBuddy reclaim's missed root
+/// lives in `[max(entry_sp), stack_high)` — the VM's own Rust frames between
+/// the outermost interpreter entry and the compiled call — because
+/// `CRATONVM_DBG_FULLSTACK_SCAN=1` cures that failure and its only difference
+/// from the normal path is scanning the whole stack. It is not, or not only:
+/// with this band walked on every collection (4978 passes, 3 056 492 roots,
+/// 1.0 GB of stack read) the failure is unchanged, and so is it with the
+/// widest possible CHAIN band (`CRATONVM_NO_PRECISE_JIT_MAPS=1`) and with the
+/// A5 filter's veto removed (`CRATONVM_JIT_UNREG_ACCEPT_RESIDUE=1`). What is
+/// left of the fullstack diagnostic's difference is that it also scans on the
+/// per-native-call snapshot publishers — see [`above_chain_all_paths`].
+///
+/// Kept, default off, as the lever that reading measures rather than a fix:
+/// a default-on gigabyte of stack reads per run buys nothing demonstrated.
+/// See
+/// `docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_scan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_SCAN").is_some()
+    })
+}
+
+/// `CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS=1` — also walk the band on the
+/// per-native-call snapshot publishers, not only on the collection's own root
+/// pass.
+///
+/// This is the difference between the band repair and
+/// `CRATONVM_DBG_FULLSTACK_SCAN`, and it is a flag rather than a default
+/// because it is the expensive half: `update_root_snapshot` runs on every
+/// object-returning native call, and paying a live-stack walk there is what
+/// makes the fullstack diagnostic 2-3x slower than the run it is diagnosing.
+/// Kept so the two can be told apart by measurement instead of argument.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_all_paths() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_ALL_PATHS").is_some()
+    })
+}
+
+/// `CRATONVM_JIT_ABOVE_CHAIN_FROM_SP=1` — start the band at the SCANNER's SP
+/// rather than at the top of the JIT entry chain.
+///
+/// The chain scan is supposed to cover `[scanner_sp, max(entry_sp))` already,
+/// but only for entries with no precise oop map: a PRECISE entry contributes
+/// its map's slots and no band at all. This makes the two hypotheses
+/// separable without also changing which paths scan.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_from_sp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ABOVE_CHAIN_FROM_SP").is_some()
+    })
+}
+
+/// `CRATONVM_DBG_ABOVE_CHAIN_KB=<n>` — cap the above-chain band at `n` KiB.
+///
+/// Diagnostic only, and the reason it exists: the band's upper bound is the
+/// thread's stack top, so "the fix works" says nothing about WHERE the missed
+/// root was. Bisecting `n` until the failure returns names the depth, which is
+/// the first step in replacing this conservative band with a precise root.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn above_chain_scan_cap_bytes() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_ABOVE_CHAIN_KB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&kb| kb > 0)
+            .map(|kb| kb * 1024)
+    })
+}
+
+/// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate, same per-native-call hot-path
+/// rationale as [`dbg_no_prune`].
+///
+/// Its doc comment and a `#[cfg(any(windows, linux))]` used to sit ~200 lines
+/// above, orphaned where the function had been before it moved — so the
+/// attribute landed on [`UNREG_MEMO_SUPPRESSED`] instead, cfg-gating a counter
+/// that `vm-cli` reads unconditionally. Both are reunited with the function
+/// here; the gate itself needs no cfg (the flag is read on every target, only
+/// its CONSUMER in `scan_active_jit_frames` is windows/linux).
 fn dbg_fullstack_scan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -2546,6 +2690,54 @@ fn unreg_jit_accept_residue() -> bool {
     })
 }
 
+/// Opt-in for the residue test on the unregistered-JIT-frame probe's RELOCATION
+/// LICENCE -- `CRATONVM_JIT_UNREG_RESIDUE_LICENCE=1` lets a cycle relocate when
+/// every accepted hit is explained by the returned-frame residue mark.
+///
+/// **DEFAULT OFF since 2026-09-08, and the default is the measured one.** This
+/// shipped default-ON the same day and corrupts the heap. The reasoning that
+/// made it look safe is quoted here because it is nearly right:
+///
+/// > Marking is unaffected either way: the full band is conservatively scanned
+/// > on every accepted hit under both settings, so this switch can only change
+/// > how often the collector is ALLOWED TO COMPACT, never what it RETAINS.
+///
+/// Retention is indeed unaffected -- and retention is not the failure. Granting
+/// the licence lets ZGC RELOCATE a marked object while a raw word in that same
+/// band still holds its old address, and nothing rewrites a conservative root.
+/// The object survives; the pointer to it does not.
+///
+/// Measured on dev@d7768380b, ONE binary, concurrent paired arms,
+/// `MvsCreate 500000` at `-Xmx2g` on ZGC -- a heap where BOTH arms complete, so
+/// the control is a real control rather than an OOM:
+///
+/// | | `rc=0` |
+/// |---|---:|
+/// | licence granted | **8/10** |
+/// | licence withheld | **10/10** |
+///
+/// with faces `MVStoreException: Chunk 13 not found` and, unambiguously,
+/// `ClassCastException: class [B cannot be cast to class [J` -- one address
+/// carrying two different array headers. Pooled with the equivalent arms of an
+/// independent implementation of the same idea: 35 of 43 against 43 of 43,
+/// Fisher's exact p ~ 0.005.
+///
+/// The ZGC OOM this licence was built to fix is real and comes back when it is
+/// withheld. A loud OOM is a better default than silent corruption; the repair
+/// is to give the shallow band above `cover_hi` precise roots so the pin is not
+/// needed at all. See
+/// `docs/known-issues/gc/zgc-residue-licence-relocates-under-a-conservative-root-20260908.md`.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn unreg_residue_licence_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNREG_RESIDUE_LICENCE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 /// Cached `CRATONVM_JIT_RANGE_SCAN_LEGACY` gate — see `native_stack_has_jit_frame`.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn jit_range_scan_legacy() -> bool {
@@ -2586,6 +2778,212 @@ fn moving_young_frame_live_hi(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> 
         hi = hi.max(map.live_frame_hi);
     }
     (hi > 0).then_some(hi)
+}
+
+/// Consume-side register-oop-mask census: `(frames_with_mask, frames_no_mask,
+/// words_excluded)`. The emit side has its own
+/// (`cratonvm_jit::reg_oop_mask_cause`); this one says whether the map that was
+/// published actually reached a frame walk.
+static REGOOP_FRAMES_MASKED: AtomicUsize = AtomicUsize::new(0);
+static REGOOP_FRAMES_UNMASKED: AtomicUsize = AtomicUsize::new(0);
+static REGOOP_WORDS_EXCLUDED: AtomicUsize = AtomicUsize::new(0);
+static DEADSPILL_WORDS_EXCLUDED: AtomicUsize = AtomicUsize::new(0);
+static OUTGOING_WORDS_EXCLUDED: AtomicUsize = AtomicUsize::new(0);
+
+/// `(frames_with_mask, frames_without, blind-spill words excluded,
+/// dead-operand-spill words excluded, outgoing-reserve words excluded)`.
+pub fn reg_oop_mask_census() -> (usize, usize, usize, usize, usize) {
+    (
+        REGOOP_FRAMES_MASKED.load(Ordering::Relaxed),
+        REGOOP_FRAMES_UNMASKED.load(Ordering::Relaxed),
+        REGOOP_WORDS_EXCLUDED.load(Ordering::Relaxed),
+        DEADSPILL_WORDS_EXCLUDED.load(Ordering::Relaxed),
+        OUTGOING_WORDS_EXCLUDED.load(Ordering::Relaxed),
+    )
+}
+
+/// The register-oop mask of the ACTIVE safepoint in this frame
+/// ([`cratonvm_jit::OopMapEntry::reg_oop_mask`]), or `None` for "no claim".
+///
+/// Same resolution as [`moving_young_frame_live_hi`], and the same
+/// most-conservative merge when several maps share the safepoint id: the UNION
+/// of their masks, and `None` the moment any one of them abstains. A mask is a
+/// licence to STOP scanning slots, so the merge has to widen, not narrow -- an
+/// intersection would let one map's silence delete another's live register.
+fn active_reg_oop_mask(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<u16> {
+    if !gc_reg_oop_maps_enabled() {
+        return None;
+    }
+    let sp_id = active_safepoint_id(rbp, cm)?;
+    let mut any = false;
+    let mut mask = 0u16;
+    for map in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
+        mask |= map.reg_oop_mask?;
+        any = true;
+    }
+    any.then_some(mask)
+}
+
+/// `CRATONVM_GC_REG_OOP_MAPS=0` -- ignore every published
+/// [`cratonvm_jit::OopMapEntry::reg_oop_mask`] and scan the whole blind-spill
+/// image again. **Default ON.**
+///
+/// The consume-side half of the bisect pair; `CRATONVM_JIT_REG_OOP_MAPS=0` is
+/// the emit-side one. This one takes effect at the next collection, which is
+/// what an investigation on a warm VM wants.
+fn gc_reg_oop_maps_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_REG_OOP_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// Is `off` in the OUTGOING-argument reserve of a frame whose active safepoint
+/// proved it staged no reference there?
+///
+/// The reserve is the deepest part of the frame: the ABI shadow space and the
+/// room `SUB RSP, frame_size` set aside for stack arguments. The prologue never
+/// initialises it, so before this frame writes anything it holds whatever a
+/// previous, deeper frame left below the old stack pointer -- dead values from
+/// a call that already returned, which the conservative scan then marks and
+/// (under G1) pins a region for. On H2 `TestValueMemory` Type 3 that class is
+/// 314 of the 380 unrewritable band words.
+///
+/// # What licenses skipping it
+///
+/// A reference the frame ITSELF stages there is a different matter, and the
+/// compiler already reports it: `pending_staged_args_unmapped` is set when a
+/// reference is staged into "the native-ABI outgoing-argument area
+/// (`emit_stack_arg_setup`), the direct-call service slots, or an inlined
+/// callee's parameter locals", and its own doc calls that fail-closed. That bit
+/// is exactly what makes [`crate::jit::conservative_roots::active_reg_oop_mask`]
+/// abstain, so **a `Some` mask already carries the proof** and this predicate
+/// needs no second channel: no reference of this frame's is in the reserve, and
+/// what predates the frame is not this frame's to keep alive.
+///
+/// The deopt `SavedRegisters` block is NOT covered by that argument -- it is a
+/// register image the deopt stub reads back -- and it shares `region_name`'s
+/// bucket with the reserve. `FrameLayout::outgoing_lo` is published so the two
+/// can be told apart; when it is `0` the producer made no claim and this
+/// returns `false`.
+#[inline]
+fn is_dead_outgoing_reserve(
+    layout: &cratonvm_jit::FrameLayout,
+    off: i32,
+    reg_mask: Option<u16>,
+) -> bool {
+    if !gc_outgoing_arg_roots_enabled() || reg_mask.is_none() {
+        return false;
+    }
+    layout.outgoing_lo > 0 && off >= layout.outgoing_lo
+}
+
+/// `CRATONVM_GC_OUTGOING_ARG_ROOTS=0` -- keep marking the outgoing-argument
+/// reserve. **Default ON**, i.e. it is skipped on frames whose safepoint proved
+/// it staged no reference there.
+///
+/// The third bisect lever, beside `CRATONVM_GC_REG_OOP_MAPS` and
+/// `CRATONVM_GC_DEAD_SPILL_ROOTS`. Separate because it rests on a third claim.
+fn gc_outgoing_arg_roots_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_OUTGOING_ARG_ROOTS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// Is `off` an operand-spill slot the active safepoint has already RECLAIMED?
+///
+/// `OopMapEntry::live_frame_hi` is the operand-spill cursor at the moment the
+/// safepoint was emitted, and its own doc states the consequence: slots at a
+/// larger offset are "inside the `max_stack`-sized spill reserve but above the
+/// live operand stack and the staged invoke-argument buffer, so their contents
+/// are dead -- the spill cursor reclaims by moving, it does not clear." What is
+/// in them is whatever the deepest earlier operand stack left there, and in
+/// allocation-heavy code that is a stale object pointer.
+///
+/// The tree already spends this claim: [`band_slot_is_verifiable`] returns
+/// `false` here, which is how the moving-young coverage proof excuses these
+/// words from shadow-stack publication. Relocation is already unsound if the
+/// claim is wrong, because nothing rewrites them.
+///
+/// This is a STRONGER use of the same claim, and the difference is worth
+/// stating plainly: excusing a word from publication over-retains when the
+/// claim is wrong, whereas dropping it from the root set FREES. That is why it
+/// carries its own switch and why the oracle
+/// (`CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1`) checks these words alongside the
+/// register-mask ones rather than trusting the argument.
+///
+/// The class test is `region_name`'s, not a bare `[spill_lo, spill_hi)` range:
+/// that ladder puts LICM hoist slots, scalar-replacement fields and the
+/// reserved-locals tail AHEAD of `operand-spill`, and those are not reclaimed
+/// by the cursor.
+#[inline]
+fn spill_slot_is_dead_above_cursor(
+    layout: &cratonvm_jit::FrameLayout,
+    off: i32,
+    live_hi: Option<i32>,
+) -> bool {
+    if !gc_dead_spill_roots_enabled() {
+        return false;
+    }
+    let Some(hi) = live_hi else {
+        return false;
+    };
+    off >= hi && layout.region_name(off) == "operand-spill"
+}
+
+/// `CRATONVM_GC_DEAD_SPILL_ROOTS=0` -- keep marking operand-spill slots above
+/// the safepoint's live cursor. **Default ON**, i.e. they are dropped.
+///
+/// The bisect lever for [`spill_slot_is_dead_above_cursor`], and the companion
+/// of `CRATONVM_GC_REG_OOP_MAPS`. The two narrowings are independent switches
+/// because they rest on DIFFERENT claims -- one on the compiler's register
+/// model, one on the spill cursor -- and a regression has to be attributable to
+/// one of them.
+fn gc_dead_spill_roots_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_DEAD_SPILL_ROOTS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// Does the mask permit a live reference in the blind-spill slot at `off`?
+///
+/// `true` for every offset OUTSIDE the spill image -- this decides one region
+/// and must not answer for the rest of the band.
+#[inline]
+fn spill_slot_may_hold_oop(
+    layout: &cratonvm_jit::FrameLayout,
+    off: i32,
+    reg_mask: Option<u16>,
+) -> bool {
+    let Some(mask) = reg_mask else {
+        return true;
+    };
+    let Some(idx) = layout.spill_image_index(off) else {
+        return true;
+    };
+    // A slot index the mask cannot represent is one this build does not model.
+    // Scan it: the mask is a licence, and it does not extend past its width.
+    idx >= 16 || mask & (1u16 << idx) != 0
 }
 
 /// Whether `exact_rbp` recorded for a chain entry actually belongs to a
@@ -5065,6 +5463,19 @@ pub struct ActiveCompiledFrame {
     /// `true` on an EMPTY chain is meaningless and never read: there is nothing
     /// to expand.
     pub chain_exact: bool,
+    /// Did [`Self::bci`] come from an NPE trap site the EMITTER described
+    /// (`apply_npe_trap_site`), rather than from the safepoint-id slot?
+    ///
+    /// Both answers are good enough to print a LINE, which is why the walk has
+    /// never had to distinguish them. Rebuilding a JEP 358 *message* from the
+    /// bci is a stronger use: it reads the opcode at that index and names the
+    /// field or method it references, so a bci that is merely the last
+    /// safepoint this frame passed — rather than the program point that
+    /// trapped — yields a fluent sentence about the wrong dereference. A trap
+    /// site is recorded AT the null check it describes and cannot be stale.
+    ///
+    /// See `runtime::interpreter::jit_npe_message`, the only reader.
+    pub trap_site_exact: bool,
 }
 
 /// One level of a compiled frame's inline chain, as a stack walk consumes it.
@@ -5262,16 +5673,31 @@ fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> 
 ///
 /// Key 2 is the safepoint-id slot read back as a bci, and since 2026-09-02
 /// [`activation_bci`] can answer that for an `used_ir_backend` artifact too
-/// (through `CompiledMethod::safepoint_bci_table`). It still reaches no chain:
-/// an IR artifact's `inline_frame_map` is EMPTY, because
-/// `record_inline_frame_row` is called only from the single-pass splicer and
-/// one compile produces one artifact, so `compiled_frame_inline_chain` returns
-/// on the `is_empty()` guard before either key is consulted. Key 1 is a CODE
-/// LAYOUT fact -- the byte offset of a return address in this artifact's own
-/// buffer -- and carries no assumption about which backend emitted it, so it
-/// needs no refusal either. IR-tier inlining therefore still contributes no
-/// frames; it needs its own producer, keyed off `InlineScopeTable`, and that is
-/// a separate change from giving the tier a line.
+/// (through `CompiledMethod::safepoint_bci_table`). Key 1 is a CODE LAYOUT
+/// fact -- the byte offset of a return address in this artifact's own buffer
+/// -- and carries no assumption about which backend emitted it. Neither needs
+/// a backend refusal, and since 2026-09-08 neither gets one: an IR artifact
+/// that spliced a body now arrives here with a POPULATED `inline_frame_map`
+/// and its inlined callees are reported like any other.
+///
+/// Until then they were not. `record_inline_frame_row` is called only from the
+/// single-pass splicer, so an IR artifact's map was empty and this function
+/// returned on the `is_empty()` guard before either key was consulted -- and
+/// IR-tier inlining contributed no frames at all. That was invisible while the
+/// optimizing tier claimed few methods and became a live trace defect when it
+/// claimed more: measured 2026-09-08 on `probes/StackTraceAfterOsr.java`,
+/// `after_main_osr` printed `len=3 [leaf mid* outer* probe main]` against the
+/// interpreter's `len=5`, the two starred frames being bodies the IR splicer
+/// had inlined into `probe`.
+///
+/// The producer is `ir_lower`'s `note_inline_frame_return_site`, and it is
+/// keyed off `ir::IrInlineFrameSites` -- the COMBINED-BUFFER pc -- not off
+/// `InlineScopeTable` as this note used to predict. The reason is key 2's own
+/// ambiguity: a spliced region is covered by the caller's snapshot at the
+/// `invoke` pc, so every level of a NESTED splice reports one bci and
+/// `from_rows` (correctly) poisons rows that disagree under it. Combined-pc
+/// ranges are disjoint by construction, so they name one body and one nesting
+/// exactly -- which is what key 1, the exact return address, then carries.
 ///
 /// # The fail-closed rule
 ///
@@ -5397,6 +5823,11 @@ pub fn apply_npe_trap_site(frames: &mut [ActiveCompiledFrame], trap_key: u32) {
     if want_bci {
         if let Ok(bci) = i32::try_from(site.bci) {
             top.bci = bci;
+            // The emitter recorded this bci AT the null check it describes, so
+            // it names the trapping program point rather than the last
+            // safepoint the frame passed. That is the difference
+            // `jit_npe_message` needs before it will read the opcode there.
+            top.trap_site_exact = true;
             cratonvm_jit::note_compiled_frame_line(cratonvm_jit::FRAME_LINE_ANSWERED_NPE_TRAP);
         }
     }
@@ -5633,6 +6064,9 @@ pub fn active_compiled_frames() -> Vec<ActiveCompiledFrame> {
                     (Vec::new(), false)
                 };
                 out.push(ActiveCompiledFrame {
+                    // The walk reads the safepoint-id slot; only
+                    // `apply_npe_trap_site` can promise an exact trap site.
+                    trap_site_exact: false,
                     interp_depth: e.interp_depth,
                     label: cm.method_label.clone(),
                     owner_class_id: cm.owner_class_id,
@@ -6139,13 +6573,101 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                         // unchanged from pre-fix behavior. Only the detection
                         // scan itself is narrowed above, never the marking scope
                         // once something is actually found.
-                        scan_one_frame(search_lo, high, heap, out);
-                        cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
-                        // The frame's oops are now MARKED but still not
-                        // rewritable, so the cycle cannot be a moving one.
-                        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
-                            cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
-                        );
+                        // A5 UNREGISTERED-FRAME SWEEP. Like the whole-band
+                        // fallback, it has no per-frame layout, so it publishes
+                        // neither half of the movable/unrewritable partition and
+                        // every object it marks becomes an unarguable G1 pin.
+                        // Counted separately because it covers a SPAN rather
+                        // than a frame, so one accept can contribute many.
+                        let __a5_before = out.len();
+                        // Recover FRAMES from the band and scan each with its
+                        // layout; fall back to the raw span sweep only when
+                        // nothing is recognised. See `scan_a5_band_as_frames`.
+                        if a5_mark_span_enabled() {
+                            if !a5_frame_scan_enabled()
+                                || scan_a5_band_as_frames(search_lo, high, heap, out) == 0
+                            {
+                                scan_one_frame(search_lo, high, heap, out);
+                            }
+                        }
+                        band_path::A5_SWEEPS.fetch_add(1, Ordering::Relaxed);
+                        band_path::A5_ROOTS
+                            .fetch_add(out.len() - __a5_before, Ordering::Relaxed);
+                        // MARKING AND THE RELOCATION LICENCE ARE TWO QUESTIONS,
+                        // and until 2026-09-08 this site answered both with the
+                        // one `accept` above.
+                        //
+                        // `accept`'s residue test is short-circuited by
+                        // `chain_len > 0`, on the argument quoted above it:
+                        // "with entries on the chain, `search_lo` is already
+                        // `cover_hi`, so anything found above it is a frame the
+                        // chain does not cover and must be marked". That is
+                        // right about MARKING and wrong about LIVENESS.
+                        // `JIT_RESIDUE_HI` is MONOTONIC over the thread's whole
+                        // life (its own doc says why), so a shallower JIT call
+                        // that returned long ago leaves residue ABOVE the
+                        // current chain's `cover_hi` — and the band
+                        // `[cover_hi, residue_hi)` is then scanned and its
+                        // leftovers read as a live guardless frame. Every hit
+                        // on the H2 `MvsCreate` ZGC OOM was of exactly that
+                        // shape (`is_residue=true`, `chain_len=1..3`), and the
+                        // refusal it raised cost the collector its only
+                        // defragmentation for the life of the process.
+                        //
+                        // So: keep marking the full band unconditionally (a
+                        // conservative mark is over-retention, never a
+                        // correctness risk, and `roots.rs` republishes these
+                        // addresses as `publish_pinned_jit_roots`, which ZGC
+                        // withholds the PAGE of), and raise the refusal only for
+                        // a hit the residue mark cannot explain.
+                        //
+                        // The re-probe is NOT "believe the first hit was
+                        // residue and stop". `native_stack_has_jit_frame`
+                        // returns the LOWEST hit in the band, so a residue hit
+                        // can hide a genuine one above it; the band
+                        // `[residue_hi, scan_hi)` is one no returned frame on
+                        // this thread can have written, and the one live
+                        // guardless frame this probe exists for — the process
+                        // entry point — sits above every JIT entry the run ever
+                        // makes and therefore inside it.
+                        //
+                        // CLASSIFY FIRST, THEN DECIDE. The census describes what
+                        // the probe SAW and is therefore identical under either
+                        // setting of the kill switch below; only the refusal
+                        // consults the switch. A census that changed with the
+                        // switch could not be used to judge the switch.
+                        let live_hit = match probe {
+                            None => None,
+                            Some((hit_slot, w)) => {
+                                let residue_hi = jit_residue_hi();
+                                if residue_hi == 0 || hit_slot >= residue_hi {
+                                    Some((hit_slot, w))
+                                } else {
+                                    let live_lo = residue_hi.max(search_lo);
+                                    if scan_hi > live_lo {
+                                        native_stack_has_jit_frame(live_lo, scan_hi)
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                        };
+                        if live_hit.is_some() {
+                            cratonvm_gc::gc_quiescence::note_unregistered_jit_frame_live();
+                        } else {
+                            cratonvm_gc::gc_quiescence::note_unregistered_jit_frame_residue();
+                        }
+                        if live_hit.is_some()
+                            || !unreg_residue_licence_enabled()
+                            || unreg_jit_accept_residue()
+                        {
+                            cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+                            // The frame's oops are now MARKED but still not
+                            // rewritable, so the cycle cannot be a moving one.
+                            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                                cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
+                            );
+                        }
                     } else if probe.is_none() {
                         UNREG_JIT_MEMO.with(|c| {
                             let mut m = c.get();
@@ -6174,6 +6696,62 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
         }
         // No live JIT frames on THIS thread — nothing to scan.
         return;
+    }
+    // ABOVE-CHAIN CONSERVATIVE BAND — an OPT-IN LEVER, not a fix. Read
+    // `above_chain_scan_enabled` before reaching for it.
+    //
+    // The chain scan below covers `[scanner_sp, max(entry_sp))` — every frame
+    // BELOW the JIT entry. Nothing covers `[max(entry_sp), stack_high)`, the
+    // VM's own Rust frames between the outermost interpreter entry and the
+    // compiled call, except the A5 probe — and the A5 probe only marks that
+    // band when it first finds a JIT RETURN ADDRESS in it. That is a real hole
+    // in the root set, and closing it was the obvious reading of the
+    // BindableTests ByteBuddy reclaim, because `CRATONVM_DBG_FULLSTACK_SCAN=1`
+    // cures that failure and scanning this band is most of what it does.
+    //
+    // It is not the hole that failure falls through. Walking the band on every
+    // collection (4978 passes, 3 056 492 roots, 1.0 GB of stack read) leaves
+    // 26/27 exactly as it was, and so do the two other levers that widen the
+    // same neighbourhood: `CRATONVM_NO_PRECISE_JIT_MAPS=1` (every chain entry
+    // conservative, so the chain band is at its widest) and
+    // `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE=1` (the A5 filter's veto removed).
+    // What remains of the fullstack diagnostic's difference is the PATH, not
+    // the range: it also scans from `update_root_snapshot`, on every
+    // object-returning native call. See `above_chain_all_paths`, and
+    // `docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+    //
+    // Sound on the same terms as the chain band beside it, which has always
+    // pushed conservative roots on cycles that could still relocate: a live
+    // chain entry makes `gc_quiescence::is_active()` true, and
+    // `collect_garbage_inner` then diverts to the non-moving sweep through
+    // either `has_conservative_roots && !moving_young` or
+    // `unrewritable_conservative_jit_roots` (which additionally requires that
+    // a conservative scan ran this cycle — this one). Nothing is relocated, so
+    // a pointer-shaped `i64` picked up here can only over-retain.
+    //
+    // `CRATONVM_DBG_ABOVE_CHAIN_KB=<n>` caps the band at `n` KiB above the
+    // chain, which is how a holder's depth would be bisected once one is found
+    // up there.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if above_chain_scan_enabled() && (gc_root_pass_active() || above_chain_all_paths()) {
+        let cover_hi = if above_chain_from_sp() {
+            scanner_sp
+        } else {
+            JIT_ENTRY_CHAIN
+                .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
+                .unwrap_or(scanner_sp)
+                .max(scanner_sp)
+        };
+        let high = current_thread_stack_high();
+        let hi = match above_chain_scan_cap_bytes() {
+            Some(cap) => high.min(cover_hi.saturating_add(cap)),
+            None => high,
+        };
+        if hi > cover_hi {
+            let before = out.len();
+            scan_one_frame(cover_hi, hi, heap, out);
+            above_chain::note(out.len() - before, hi - cover_hi);
+        }
     }
     // WS1 JIT-scan cache (see the module-level comment at `JIT_SCAN_CACHE`):
     // reuse the previous scan's roots verbatim unless a Rust↔JIT boundary
@@ -8463,7 +9041,20 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // and not yet stored anywhere tracked — see
     // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`.
     if !frame_bands_enabled() || !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
+        // The WHOLE-BAND fallback. It publishes NEITHER half of the
+        // movable/unrewritable partition -- it has no per-frame layout to
+        // compute one from -- so every object it finds pins its G1 region with
+        // no way to argue otherwise. It also covers `[scanner_sp, rbp_inner)`,
+        // the interpreter/native/Rust frames the compiled method called INTO,
+        // whose words nothing rewrites even in principle.
+        //
+        // Counted because the two paths are indistinguishable in a pin census
+        // and have opposite prospects: a band-path pin can be argued away, a
+        // fallback pin cannot.
+        band_path::FALLBACK.fetch_add(1, Ordering::Relaxed);
         scan_one_frame(scanner_sp, info.frame_base, heap, out);
+    } else {
+        band_path::BANDS.fetch_add(1, Ordering::Relaxed);
     }
     let _ = info.entry_ptr; // reserved for future PC-precise lookup
 }
@@ -8483,6 +9074,59 @@ fn frame_bands_enabled() -> bool {
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_FRAME_BANDS").is_none()
     })
+}
+
+/// Scan ONE compiled frame's own band using its layout, and publish the
+/// movable/unrewritable partition for it.
+///
+/// Returns `false` when the frame's recorded size is unusable, which is the
+/// caller's signal to fall back to a layout-free sweep.
+///
+/// Factored out of [`scan_compiled_frame_bands`] so the A5 unregistered-frame
+/// path can reach it: a frame found by inspection is still a compiled frame
+/// with a layout, and scanning it as one is the difference between a bounded
+/// band that publishes a partition and a raw span sweep that pins everything
+/// it touches.
+fn scan_one_compiled_frame_with_layout(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    heap: &VmHeap,
+    out: &mut Vec<ObjectRef>,
+    remap_covered: bool,
+) -> bool {
+    let frame_size = cm.osr_frame_size;
+    if frame_size <= 0 {
+        return false;
+    }
+    let frame_size = frame_size as usize;
+    const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+    if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+        return false;
+    }
+    // The register-file half of this frame's active oop map. `None` keeps the
+    // whole blind image in the scan, which is what every frame did before
+    // 2026-09-09.
+    let reg_mask = active_reg_oop_mask(rbp, cm);
+    if reg_mask.is_some() {
+        REGOOP_FRAMES_MASKED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        REGOOP_FRAMES_UNMASKED.fetch_add(1, Ordering::Relaxed);
+    }
+    let skip = band_skip_classes();
+    if skip.is_some() || reg_mask.is_some() || gc_dead_spill_roots_enabled() {
+        scan_one_frame_filtered(rbp, frame_size, cm, skip, reg_mask, heap, out);
+    } else {
+        scan_one_frame(rbp - frame_size, rbp, heap, out);
+    }
+    // The band was just read as marking roots, which is what keeps these
+    // objects alive across the pause AND what gets them copied. Say which of
+    // them arrived through a word no channel rewrites, so the pin decision can
+    // veto a movable claim made elsewhere for the same address. Only reachable
+    // with a resolved layout -- a foreign innermost frame has none, and it
+    // already forces the non-moving sweep through `FOREIGN_INNERMOST_RBP`, so
+    // there is no move to veto there.
+    publish_unrewritable_band_roots(rbp, frame_size, cm, reg_mask, heap, remap_covered);
+    true
 }
 
 fn scan_compiled_frame_bands(
@@ -8524,27 +9168,16 @@ fn scan_compiled_frame_bands(
         frames += 1;
         if innermost_is_foreign {
             innermost_is_foreign = false;
+            // Same blindness as the whole-band fallback, for one frame: no
+            // layout, so no partition, so every object here is an unarguable
+            // pin. See `band_path`.
+            band_path::FOREIGN_INNERMOST.fetch_add(1, Ordering::Relaxed);
             scan_one_frame(scanner_sp, rbp, heap, out);
-        } else {
-            let frame_size = cm.osr_frame_size;
-            if frame_size <= 0 {
-                return false;
-            }
-            let frame_size = frame_size as usize;
-            const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
-            if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
-                return false;
-            }
-            scan_one_frame(rbp - frame_size, rbp, heap, out);
-            // The band was just read as marking roots, which is what keeps
-            // these objects alive across the pause AND what gets them copied.
-            // Say which of them arrived through a word no channel rewrites, so
-            // the pin decision can veto a movable claim made elsewhere for the
-            // same address. Only reachable with a resolved layout — the foreign
-            // innermost frame above has none, and it already forces the
-            // non-moving sweep through `FOREIGN_INNERMOST_RBP`, so there is no
-            // move to veto there.
-            publish_unrewritable_band_roots(rbp, frame_size, cm, heap);
+        } else if !scan_one_compiled_frame_with_layout(rbp, cm, heap, out, true) {
+            // `true`: this frame is on the REGISTERED chain, which is the set
+            // `remap_register_image_words` walks, so its register image is
+            // rewritten after a move.
+            return false;
         }
 
         // `[rbp]` and `[rbp + 8]` hold the saved caller RBP and return PC.
@@ -8823,11 +9456,568 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
     );
 }
 
+/// `CRATONVM_JIT_BAND_SKIP=<class>[,<class>...]` — **a MEASUREMENT LEVER, and
+/// unsafe. Default unset, which is byte-for-byte today's scan.**
+///
+/// Drops the named [`cratonvm_jit::FrameLayout::region_name`] classes from the
+/// conservative band scan, so words there stop being marking roots. It exists
+/// to put a NUMBER on what a precise compiled-frame root set could buy, because
+/// the alternative is arguing about it:
+/// `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+/// spent its "where to start" list on two narrowings that measurement then
+/// refuted, and the third — precise oop maps — is a project nobody will start
+/// on a guess about its payoff.
+///
+/// Recognised classes are `region_name`'s own vocabulary; the three worth
+/// measuring are `operand-spill` (words above the safepoint's live cursor —
+/// which is the only class the VM already CLAIMS is dead, see
+/// `OopMapEntry::live_frame_hi`), `outgoing-args-or-deopt-regs` (the
+/// uninitialised outgoing-argument reserve, which holds whatever a previous,
+/// deeper frame left below the old stack pointer), and
+/// `safepoint-gpr-spill-image` (the blind GPR spill, where a dead scratch
+/// register is indistinguishable from a live one without register liveness).
+///
+/// **Do not enable this in production.** Dropping a root frees what it named.
+/// Only `operand-spill` above the live cursor has a written deadness argument
+/// behind it; the other two are conservative backstops and skipping them is a
+/// use-after-free waiting for the right frame. The lever measures the ceiling,
+/// it does not implement the fix.
+fn band_skip_classes() -> Option<&'static [String]> {
+    static G: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        let v = cratonvm_types::flags::runtime_var("CRATONVM_JIT_BAND_SKIP").ok()?;
+        let classes: Vec<String> = v
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        (!classes.is_empty()).then_some(classes)
+    })
+    .as_deref()
+}
+
+/// [`scan_one_frame`] over `[rbp - frame_size, rbp)`, minus two filters:
+///
+/// * the blind-spill slots this safepoint's [`active_reg_oop_mask`] excludes --
+///   the production narrowing, on by default;
+/// * the storage classes [`band_skip_classes`] names -- the unsafe measurement
+///   lever, off by default.
+///
+/// Only reachable when at least one of them has something to say.
+fn scan_one_frame_filtered(
+    rbp: usize,
+    frame_size: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    skip: Option<&[String]>,
+    reg_mask: Option<u16>,
+    heap: &VmHeap,
+    out: &mut Vec<ObjectRef>,
+) {
+    if frame_size == 0 || frame_size > rbp {
+        return;
+    }
+    let live_hi = moving_young_frame_live_hi(rbp, cm);
+    let layout = &cm.frame_layout;
+    let mut addr = (rbp - frame_size + 7) & !7usize;
+    let envelope = heap.conservative_addr_span();
+    while addr + 8 <= rbp {
+        // Cast: a compiled frame is far smaller than i32::MAX bytes.
+        let off = (rbp - addr) as i32;
+        if !spill_slot_may_hold_oop(layout, off, reg_mask) {
+            REGOOP_WORDS_EXCLUDED.fetch_add(1, Ordering::Relaxed);
+            note_excluded_band_word(addr, off, layout, heap, "reg-mask");
+            addr += 8;
+            continue;
+        }
+        if spill_slot_is_dead_above_cursor(layout, off, live_hi) {
+            DEADSPILL_WORDS_EXCLUDED.fetch_add(1, Ordering::Relaxed);
+            note_excluded_band_word(addr, off, layout, heap, "dead-spill");
+            addr += 8;
+            continue;
+        }
+        if is_dead_outgoing_reserve(layout, off, reg_mask) {
+            OUTGOING_WORDS_EXCLUDED.fetch_add(1, Ordering::Relaxed);
+            note_excluded_band_word(addr, off, layout, heap, "outgoing");
+            addr += 8;
+            continue;
+        }
+        if let Some(skip) = skip {
+            let class = layout.region_name(off);
+            // `operand-spill` is skipped only ABOVE the live cursor. Below it
+            // the slots hold the CURRENT operand stack, which is as live as a
+            // root gets -- skipping those would not be measuring a ceiling, it
+            // would be measuring a crash.
+            let skipped = skip.iter().any(|c| c == class)
+                && (class != "operand-spill" || live_hi.is_some_and(|hi| off >= hi));
+            if skipped {
+                addr += 8;
+                continue;
+            }
+        }
+        // SAFETY: aligned read inside this thread's own live compiled frame,
+        // over the same interval `scan_one_frame` reads.
+        let qword = unsafe { (addr as *const usize).read() };
+        addr += 8;
+        if let Some((lo, hi)) = envelope {
+            if qword < lo || qword >= hi {
+                continue;
+            }
+        }
+        if let Some(obj) = heap.is_object_address(qword) {
+            out.push(obj);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The register-oop mask's falsification oracle
+// ---------------------------------------------------------------------------
+//
+// `active_reg_oop_mask` is a licence to DROP roots, so the only question that
+// matters about it is whether it ever drops one that mattered. A count of
+// dropped words cannot answer that -- a blind spill image is full of dead
+// register leftovers, and dropping those is the entire point.
+//
+// The discriminating question is narrower: of the words this mask excluded, how
+// many named an object that NO OTHER ROOT names? Those, and only those, are the
+// ones the collector would now free on the mask's word alone. Everything else
+// is a duplicate the rest of the root set already covers, and its removal
+// cannot change what survives.
+//
+// So the oracle records every excluded word that resolved to an object, and
+// `verify_excluded_spill_words` re-checks them against the FINISHED root set --
+// which is why it cannot run inside the band scan, where the root set is still
+// half-built. A non-zero `only-root` count is a refutation of the mask and
+// should stop the change; a large `duplicate` count beside a zero `only-root`
+// count is what a correct narrowing looks like.
+//
+// `CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1`. Off by default and free when off: the
+// recording site is one already-resolved `OnceLock` load per excluded word.
+
+/// `CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1` -- see the module comment above.
+fn verify_reg_oop_maps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_REG_OOP_MAPS").is_some()
+    })
+}
+
+thread_local! {
+    /// `(object address, frame offset, register name)` for each blind-spill
+    /// word this pass excluded that nevertheless resolved to an object.
+    static EXCLUDED_SPILL_WORDS: std::cell::RefCell<Vec<(usize, i32, &'static str, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Running totals for the oracle. See [`verify_excluded_band_words`].
+static ORACLE_WORDS: AtomicUsize = AtomicUsize::new(0);
+static ORACLE_REACHABLE: AtomicUsize = AtomicUsize::new(0);
+static ORACLE_UNREACHABLE: AtomicUsize = AtomicUsize::new(0);
+static ORACLE_INCOMPLETE: AtomicUsize = AtomicUsize::new(0);
+
+/// `(words, reachable, unreachable, walk_incomplete)`.
+///
+/// **`unreachable` is the number that decides whether the narrowings are
+/// sound**, and `walk_incomplete` is the number that decides whether
+/// `unreachable` may be read at all.
+pub fn reg_oop_mask_oracle() -> (usize, usize, usize, usize) {
+    (
+        ORACLE_WORDS.load(Ordering::Relaxed),
+        ORACLE_REACHABLE.load(Ordering::Relaxed),
+        ORACLE_UNREACHABLE.load(Ordering::Relaxed),
+        ORACLE_INCOMPLETE.load(Ordering::Relaxed),
+    )
+}
+
+/// Record a band word the narrowings excluded, for
+/// [`verify_excluded_band_words`]. Inert unless the oracle is armed.
+#[inline]
+fn note_excluded_band_word(
+    addr: usize,
+    off: i32,
+    layout: &cratonvm_jit::FrameLayout,
+    heap: &VmHeap,
+    why: &'static str,
+) {
+    if !verify_reg_oop_maps() {
+        return;
+    }
+    // SAFETY: the same aligned in-frame read the scan itself would have made at
+    // this address had the narrowing not excluded it.
+    let qword = unsafe { (addr as *const usize).read() };
+    if heap.is_object_address(qword).is_none() {
+        return;
+    }
+    let reg = layout
+        .spill_image_register(off)
+        .unwrap_or_else(|| layout.region_name(off));
+    EXCLUDED_SPILL_WORDS.with(|v| v.borrow_mut().push((qword, off, reg, why)));
+}
+
+/// Clear the oracle's per-pass record. Called by the root gatherer beside the
+/// other per-collection resets.
+pub fn clear_excluded_spill_words() {
+    if !verify_reg_oop_maps() {
+        return;
+    }
+    EXCLUDED_SPILL_WORDS.with(|v| v.borrow_mut().clear());
+}
+
+/// Decide, for each band word the narrowings dropped, whether dropping it can
+/// have changed what survives.
+///
+/// # Why the first version of this was worthless
+///
+/// It asked whether any OTHER ROOT named the same address, and reported the
+/// ones where none did. That is not the question. A genuinely dead object --
+/// exactly what these narrowings exist to release -- is by construction named
+/// only by dead words, so it always "refuted" the change. The instrument fired
+/// 20 times on `TestValueMemory` and could not say whether even one of them
+/// mattered, which is the same as not having an instrument.
+///
+/// # The question that does decide it
+///
+/// **Is the object still TRANSITIVELY REACHABLE from the narrowed root set?**
+///
+/// * reachable -- dropping the word changed nothing. The object survives on
+///   another path and the narrowing is provably free here.
+/// * unreachable -- the object's survival depended on the dropped word. It is
+///   either garbage (the intended win) or a live object the narrowing lost, and
+///   nothing short of the program's own behaviour separates those. Every one of
+///   these is a case that needs a human.
+///
+/// So `unreachable == 0` over a corpus is the licence to ship, and any non-zero
+/// count is a finding to explain rather than a number to watch.
+///
+/// # Reading the walk-incomplete count first
+///
+/// [`cratonvm_gc::gc::for_each_object_reference`] DECLINES on an object it
+/// cannot walk flatly (a G1 humongous object is region-fragmented) and on a
+/// header it cannot decode. Those objects contribute no edges, so the closure
+/// is an UNDER-approximation and "unreachable" is over-reported. A run with a
+/// non-zero `walk_incomplete` cannot have its `unreachable` count read as a
+/// refutation -- that is the trap the previous version fell into from the other
+/// direction, and it is stated here so the next reader does not have to
+/// rediscover it.
+pub fn verify_excluded_band_words(roots: &[ObjectRef], heap: &VmHeap) {
+    if !verify_reg_oop_maps() {
+        return;
+    }
+    let pending: Vec<(usize, i32, &'static str, &'static str)> =
+        EXCLUDED_SPILL_WORDS.with(|v| std::mem::take(&mut *v.borrow_mut()));
+    if pending.is_empty() {
+        return;
+    }
+    // Closure from the NARROWED root set -- the set the collector is about to
+    // use. Capped so a pathological heap cannot turn a debug flag into a hang;
+    // hitting the cap is itself an incomplete walk.
+    const MAX_VISITED: usize = 4_000_000;
+    // UNIFORM, and NOT raiseable per collector. A flat payload read past a
+    // certain size is unsafe on EVERY backend here, because they all place a
+    // large object across spans that are not contiguous in the address space --
+    // G1 as `HumongousStart` plus continuations with their own buffers, ZGC
+    // across pages. This was tried as `if heap.is_g1() { 512K } else { 64M }`
+    // on the reasoning that only G1 fragments, and the 64 MiB arm SEGFAULTED
+    // 3 runs in 6 on `TestValueMemory` under ZGC (0 in 6 with the oracle off,
+    // narrowings on or off, so it was the walk and not the change under test).
+    // The cost of the low cap is real and is reported rather than hidden:
+    // declining H2's 1 000 016-byte `Object[]` leaves its 125 000 elements
+    // looking unreachable, which is why `walk_incomplete` has to be read before
+    // `UNREACHABLE` means anything.
+    const MAX_OBJECT_BYTES: usize = 512 * 1024;
+    let mut seen: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(roots.len() * 2);
+    let mut stack: Vec<usize> = Vec::with_capacity(roots.len());
+    let mut incomplete = 0usize;
+    for r in roots {
+        let a = r.as_ptr() as usize;
+        if seen.insert(a) {
+            stack.push(a);
+        }
+    }
+    while let Some(obj) = stack.pop() {
+        if seen.len() >= MAX_VISITED {
+            incomplete += 1;
+            break;
+        }
+        let mut children: Vec<usize> = Vec::new();
+        // SAFETY: the world is stopped for this collection, and every address
+        // reaching here was validated by `is_object_address` -- the roots by
+        // their producers, the children just below.
+        let walked = unsafe {
+            cratonvm_gc::gc::for_each_object_reference(obj, MAX_OBJECT_BYTES, &mut |c| {
+                children.push(c)
+            })
+        };
+        if !walked {
+            incomplete += 1;
+        }
+        for c in children {
+            if heap.is_object_address(c).is_none() {
+                continue;
+            }
+            if seen.insert(c) {
+                stack.push(c);
+            }
+        }
+    }
+    if incomplete > 0 {
+        ORACLE_INCOMPLETE.fetch_add(incomplete, Ordering::Relaxed);
+    }
+    for (addr, off, reg, why) in pending {
+        ORACLE_WORDS.fetch_add(1, Ordering::Relaxed);
+        if seen.contains(&addr) {
+            ORACLE_REACHABLE.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let n = ORACLE_UNREACHABLE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            eprintln!(
+                "[regoop] UNREACHABLE (#{n}, {why}): band slot off={off} ({reg}) named \
+                 0x{addr:x}, which is NOT reachable from the narrowed root set — this \
+                 narrowing decided its fate. Garbage, or a live object just lost; only \
+                 behaviour tells them apart. walk_incomplete={} so far.",
+                ORACLE_INCOMPLETE.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 /// Total addresses published to the unrewritable-root veto this process.
 static UNREWRITABLE_BAND_ROOTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Addresses published to the unrewritable-root veto since process start.
 ///
+/// Scan the A5 band as FRAMES rather than as a span.
+///
+/// Returns the number of compiled frames it scanned; `0` means it recognised
+/// nothing and the caller must fall back to the raw sweep.
+///
+/// # The problem this solves
+///
+/// When the A5 probe accepts, `[search_lo, high)` is swept whole. That span is
+/// not a frame -- it is every byte of native stack between the scanner and the
+/// entry, including the interpreter, native and Rust frames the compiled code
+/// called into. Every object-looking word in it becomes a marking root with no
+/// layout behind it, so it publishes NEITHER half of the movable/unrewritable
+/// partition and pins its G1 region unarguably. Measured on H2
+/// `TestValueMemory`: `a5_roots=4794` against the band path's `movable=132
+/// unrewritable=298`, and turning the sweep off took Type 3 from ~10000 to
+/// 4882, with the pin set going 34 addresses / 14 regions -> 6 / 5.
+///
+/// # Why frames can be recovered from the span
+///
+/// A compiled x64 frame's return address sits at `[rbp + 8]`, so a slot holding
+/// a return address into JIT code implies `rbp = slot - 8`.
+/// [`a5_slot_has_frame_shape`] already validates that shape -- saved caller RBP
+/// 8-aligned, strictly older, with room for its own return slot -- and it was
+/// written as a pricing instrument for exactly this question. From `rbp` the
+/// frame is an ordinary compiled frame with a `CompiledMethod` and a layout, so
+/// [`scan_one_compiled_frame_with_layout`] applies unchanged.
+///
+/// # Where this is weaker than the sweep, said plainly
+///
+/// The sweep marks every object-looking word in the span; this marks only the
+/// words of frames it RECOGNISES. A live compiled frame whose return slot fails
+/// the shape test is missed, and a missed root is a use-after-free --
+/// `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` is what that costs.
+/// Two things bound the risk and neither is an argument that it is zero:
+/// recognition is the same predicate the coverage probe already trusts, and
+/// recognising nothing at all falls back to the sweep rather than to silence.
+///
+/// It is therefore gated (`CRATONVM_JIT_A5_FRAME_SCAN=0`) and the gate is the
+/// first thing to try against any stale-pointer report.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn scan_a5_band_as_frames(
+    search_lo: usize,
+    high: usize,
+    heap: &VmHeap,
+    out: &mut Vec<ObjectRef>,
+) -> usize {
+    let mut scanned = 0usize;
+    let mut seen_rbp: Vec<usize> = Vec::new();
+    let mut slot = (search_lo + 7) & !7usize;
+    while slot + 8 <= high {
+        // SAFETY: aligned word inside this thread's own native stack, in the
+        // band the caller has already bounded and the sweep would have read.
+        let word = unsafe { (slot as *const usize).read() };
+        let Some(cm_ptr) = cratonvm_jit::lookup_jit_code_range(word) else {
+            slot += 8;
+            continue;
+        };
+        if !is_plausible_return_pc(word) || !a5_slot_has_frame_shape(slot, high) {
+            slot += 8;
+            continue;
+        }
+        let rbp = slot - 8;
+        if seen_rbp.contains(&rbp) {
+            slot += 8;
+            continue;
+        }
+        // SAFETY: a code range retains its `CompiledMethod` metadata for the
+        // lifetime of an active frame -- the same contract the registered walk
+        // and the relocation walker both rest on.
+        let cm: &cratonvm_jit::CompiledMethod =
+            unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+        // `false`: a frame recovered by INSPECTION is not on the entry chain,
+        // and `remap_register_image_words` walks the chain -- so nothing
+        // rewrites this frame's register image and its words must still pin.
+        if scan_one_compiled_frame_with_layout(rbp, cm, heap, out, false) {
+            seen_rbp.push(rbp);
+            scanned += 1;
+            band_path::A5_FRAMES.fetch_add(1, Ordering::Relaxed);
+        }
+        slot += 8;
+    }
+    scanned
+}
+
+/// `CRATONVM_JIT_A5_FRAME_SCAN=1` -- recover frames from the A5 band instead of
+/// sweeping it as a raw span. **Default OFF.**
+///
+/// # Why it is measured, kept, and off
+///
+/// It works, and it is worth 20% of the number it was built for: Type 3 of H2
+/// `TestValueMemory` goes ~10000 -> 7932 and `a5_roots` halves from 4794 to
+/// 2538. It is off because that is not enough to make the test pass, and what
+/// it costs is soundness rather than speed.
+///
+/// The span it replaces is not all JIT frames. `[search_lo, high)` also covers
+/// the VM's own Rust frames and the interpreter frames the compiled code called
+/// into, and a conservative sweep of those is exactly what catches "an object
+/// that has been allocated and not yet stored anywhere tracked" -- the hazard
+/// `scan_compiled_frame_bands`' own comment names, with
+/// `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` behind it. Marking
+/// only the frames a shape test RECOGNISES drops every one of those words.
+///
+/// So the trade is a real use-after-free risk for a partial win on one row.
+/// Turning it on is a decision someone should make deliberately, with a
+/// stale-pointer soak behind it, and not inherit from a default.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn a5_frame_scan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_A5_FRAME_SCAN").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
+/// `CRATONVM_JIT_A5_MARK_SPAN=0` — **a MEASUREMENT LEVER, and unsafe. Default
+/// ON, which is byte-for-byte today's scan.**
+///
+/// Drops the A5 unregistered-frame span sweep, so a compiled frame the entry
+/// chain does not cover contributes no marking roots at all. It exists because
+/// that sweep turned out to dominate the G1 pin set by an order of magnitude --
+/// `a5_roots=4794` against the band path's `movable=132 unrewritable=298` on
+/// H2 `TestValueMemory` -- and the alternative to a number is an argument.
+///
+/// **Do not enable this in production.** The sweep is the backstop for a live
+/// compiled frame with no `JitEntryGuard`; dropping it frees what it named, and
+/// `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` is what that costs.
+/// The lever measures the ceiling of narrowing the sweep, it does not narrow
+/// it.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn a5_mark_span_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_A5_MARK_SPAN").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// Which JIT-root scan path each pass took.
+///
+/// `scan_compiled_frame_bands` walks each compiled frame's own
+/// `[rbp - frame_size, rbp)` WITH its layout, so it can split the band into the
+/// rewritable half and the half nothing rewrites. The fallback cannot: it has
+/// no layout, it sweeps `[scanner_sp, frame_base)` including the non-JIT frames
+/// the compiled code called into, and every object it finds is a pin with no
+/// argument available against it.
+///
+/// A pin census cannot tell the two apart, and their prospects are opposite,
+/// which is the whole reason to count them.
+pub mod band_path {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    pub static BANDS: AtomicUsize = AtomicUsize::new(0);
+    pub static FALLBACK: AtomicUsize = AtomicUsize::new(0);
+    pub static FOREIGN_INNERMOST: AtomicUsize = AtomicUsize::new(0);
+    /// The A5 unregistered-frame sweep, and the roots it contributed. It
+    /// covers a SPAN, not a frame, so the root count is the number that
+    /// matters -- one accept can hand the pin set an unbounded set of
+    /// addresses nothing can argue about.
+    pub static A5_SWEEPS: AtomicUsize = AtomicUsize::new(0);
+    pub static A5_ROOTS: AtomicUsize = AtomicUsize::new(0);
+    /// Frames RECOVERED from an A5 band and scanned with a layout. The
+    /// denominator for the narrowing: `A5_FRAMES=0` with `A5_SWEEPS>0` means
+    /// every accept fell back to the raw span.
+    pub static A5_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(bands, fallback, foreign_innermost, a5_sweeps, a5_roots, a5_frames)`.
+    pub fn snapshot() -> (usize, usize, usize, usize, usize, usize) {
+        let g = |c: &AtomicUsize| c.load(Ordering::Relaxed);
+        (
+            g(&BANDS),
+            g(&FALLBACK),
+            g(&FOREIGN_INNERMOST),
+            g(&A5_SWEEPS),
+            g(&A5_ROOTS),
+            g(&A5_FRAMES),
+        )
+    }
+}
+
+/// Words that were UNVERIFIABLE yet published movable because
+/// `remap_register_image_words` rewrites them anyway.
+///
+/// The number that says whether the "unverifiable" and "unrewritten" sets had
+/// actually drifted apart: a non-zero count is a word that was being pinned for
+/// a rewrite that was already happening.
+static REMAPPED_NOT_PINNED: AtomicUsize = AtomicUsize::new(0);
+
+/// Diagnostic counterpart of [`unrewritable_band_root_count`].
+pub fn remapped_not_pinned_count() -> usize {
+    REMAPPED_NOT_PINNED.load(Ordering::Relaxed)
+}
+
+/// Objects published MOVABLE from a verifiable band word this run.
+///
+/// The complement of [`unrewritable_band_root_count`], and the two are read
+/// together: a movable count of zero with a non-zero unrewritable count means
+/// every band word this workload holds is one nothing rewrites, which is a
+/// different situation from the partition never having been computed.
+static MOVABLE_BAND_ROOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Diagnostic counterpart of [`unrewritable_band_root_count`].
+pub fn movable_band_root_count() -> usize {
+    MOVABLE_BAND_ROOTS.load(Ordering::Relaxed)
+}
+
+/// `CRATONVM_GC_MOVABLE_BAND_ROOTS=0` — stop publishing the verifiable half of
+/// the band partition as movable, i.e. go back to every conservative JIT root
+/// pinning its G1 region. **Default ON.**
+///
+/// The bisect lever for the publication in `publish_unrewritable_band_roots`.
+/// It is separate from `CRATONVM_GC_G1_MOVABLE_PINS` (the CONSUMER) because the
+/// two can fail differently: a wrong publication here is a movable claim for a
+/// word something still reads, while a wrong consumption there is a filter that
+/// ignores the veto. A stale-pointer report has to be attributable to one.
+fn gc_movable_band_roots_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_MOVABLE_BAND_ROOTS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
 /// Diagnostic only. A non-zero count means at least one compiled frame held a
 /// live object in a word `band_slot_is_verifiable` refuses to inspect — i.e.
 /// the pin below is doing work, not just costing a branch.
@@ -8850,11 +10040,38 @@ pub fn unrewritable_band_root_count() -> usize {
 /// exactly the set `remap_register_image_words` would otherwise have to
 /// REWRITE. Pinning is the sound half of that choice — see the module comment
 /// on `UNREWRITABLE_JIT_ROOTS` in `gc_quiescence`.
+/// Which of [`band_slot_is_verifiable`]'s three refusals `off` earned.
+///
+/// Diagnostic vocabulary only, and it must stay in step with that function --
+/// the point of the split is that the three refusals have DIFFERENT repairs
+/// (`callee-saved` and `register-image` can only be pinned; `dead-spill` is a
+/// word nothing reads again, so it need not have been a marking root at all).
+fn unverifiable_region(
+    off: i32,
+    layout: &cratonvm_jit::FrameLayout,
+    live_hi: Option<i32>,
+) -> &'static str {
+    if !layout.callee_saved_shallow && layout.callee_saved_lo > 0 && off >= layout.callee_saved_lo {
+        return "callee-saved";
+    }
+    if layout.is_register_image(off) {
+        return "register-image";
+    }
+    if let Some(hi) = live_hi {
+        if layout.spill_hi > layout.spill_lo && off >= layout.spill_lo && off >= hi {
+            return "dead-spill";
+        }
+    }
+    "verifiable"
+}
+
 fn publish_unrewritable_band_roots(
     rbp: usize,
     frame_size: usize,
     cm: &cratonvm_jit::CompiledMethod,
+    reg_mask: Option<u16>,
     heap: &VmHeap,
+    remap_covered: bool,
 ) {
     if frame_size == 0 || frame_size > rbp {
         return;
@@ -8872,11 +10089,69 @@ fn publish_unrewritable_band_roots(
     while addr + 8 <= hi {
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
+        // A blind-spill slot the map excludes is not a root, so it is not a
+        // pin either. Skipping it here as well as in the scan is what keeps the
+        // two halves the same partition -- pinning a word nothing marks would
+        // hold a region out of a G1 collection set for an object that is no
+        // longer in the root set at all.
+        if !spill_slot_may_hold_oop(&cm.frame_layout, off, reg_mask)
+            || spill_slot_is_dead_above_cursor(&cm.frame_layout, off, live_hi)
+            || is_dead_outgoing_reserve(&cm.frame_layout, off, reg_mask)
+        {
+            addr += 8;
+            continue;
+        }
         if band_slot_is_verifiable(off, &cm.frame_layout, live_hi) {
             // Verified storage. An unpublished movable oop here already forces
             // the non-moving sweep, and a published one is rewritten by
             // `remap_one_jit_frame`, so it needs no pin and pinning it would
             // give back the drain this set exists to preserve.
+            //
+            // SAY SO. That sentence was true and unsaid: nothing published the
+            // verifiable half anywhere, so on G1 -- whose pin set was every
+            // conservative root without exception -- the word pinned its region
+            // regardless, and a REGION is a megabyte at `-Xmx2g`. Publishing
+            // the complement is what lets `jit_pinned_region_set` act on the
+            // partition this function already computes.
+            //
+            // The claim per word is the one above, in two cases. NAMED by the
+            // active map: `remap_one_jit_frame` rewrites the slot, so the
+            // object may move. NOT named, in a region the abstract interpreter
+            // MODELS: the word is DEAD -- `band_slot_is_verifiable_with_map`
+            // spends exactly that claim to excuse it from shadow publication,
+            // and its own measurement is the 74 unpublished words of
+            // `MVStore.closeStore` that were javac's out-of-scope copies. A
+            // dead word needs no rewrite.
+            //
+            // Fail-closed by construction: this publishes only what it can
+            // argue about. A foreign innermost frame has no layout and never
+            // reaches here, so its words stay pinned, and any address ALSO
+            // reaching an unverifiable word is vetoed by
+            // `add_unrewritable_jit_root` below -- the pin set is keyed by
+            // OBJECT, and the veto outranks every movable claim.
+            //
+            // `remap_covered` is REQUIRED, and leaving it out was a defect in
+            // the first version of this: both arms of the claim above name a
+            // rewriter (`remap_one_jit_frame`) or rest on the word being dead,
+            // and the first is only true for a frame the remap actually walks.
+            // A frame recovered by inspection in the A5 band is not on the
+            // entry chain and nothing rewrites its slots, so publishing its
+            // words movable would have licensed moving an object out from under
+            // a slot that keeps pointing at the old address.
+            if gc_movable_band_roots_enabled() && remap_covered {
+                // SAFETY: aligned read inside this thread's own live compiled
+                // frame, bounded by the recorded frame size -- the same word
+                // `scan_one_frame` has already read.
+                let qword = unsafe { (addr as *const usize).read() };
+                let in_envelope = match envelope {
+                    Some((elo, ehi)) => qword >= elo && qword < ehi,
+                    None => true,
+                };
+                if in_envelope && heap.is_object_address(qword).is_some() {
+                    cratonvm_gc::gc_quiescence::add_movable_jit_root(qword);
+                    MOVABLE_BAND_ROOTS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             addr += 8;
             continue;
         }
@@ -8891,8 +10166,51 @@ fn publish_unrewritable_band_roots(
             }
         }
         if heap.is_object_address(qword).is_some() {
+            // UNVERIFIABLE, but not necessarily unrewritten. `band_slot_is_verifiable`
+            // asks whether the JIT's abstract interpreter MODELS the region;
+            // the pin decision needs the different question of whether anything
+            // REWRITES the word, and for one region the answer is already yes.
+            //
+            // `remap_register_image_words` runs on every collection
+            // (`CRATONVM_REGISTER_IMAGE_REMAP`, default on) and rewrites exactly
+            // what `register_image_remap_admits` accepts, which by default is
+            // the callee-saved GPR image. Those words are therefore fixed up
+            // after a move already, and pinning them bought nothing -- it just
+            // held a megabyte-granular G1 region for an object that was going
+            // to be rewritten anyway.
+            //
+            // Two conditions, and both are needed. The region has to be one the
+            // remap admits, and the FRAME has to be one the remap reaches:
+            // `remap_register_image_words` walks the registered entry chain, so
+            // a frame recovered by inspection in the A5 band is not covered and
+            // `remap_covered` is false for it.
+            if remap_covered && register_image_remap_admits(off, &cm.frame_layout) {
+                cratonvm_gc::gc_quiescence::add_movable_jit_root(qword);
+                MOVABLE_BAND_ROOTS.fetch_add(1, Ordering::Relaxed);
+                REMAPPED_NOT_PINNED.fetch_add(1, Ordering::Relaxed);
+                // `addr` was advanced at the read above, so `continue` is the
+                // whole of what this needs to do.
+                continue;
+            }
             cratonvm_gc::gc_quiescence::add_unrewritable_jit_root(qword);
             published += 1;
+            // `CRATONVM_DBG_JIT_ROOTSCAN=1` — WHICH unverifiable region this
+            // word sits in. The three have nothing in common but the verdict:
+            // a callee-saved image holds the CALLER's live registers and can
+            // only be pinned, while a spill slot above the safepoint's live
+            // cursor is one nothing will ever read again. Reporting them under
+            // one `unrewritable=4` cannot separate "must pin" from "need not
+            // even mark", which is the only question with a fix behind it.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_ROOTSCAN").is_some() {
+                eprintln!(
+                    "[bandword] 0x{qword:x} off={off} refusal={} region={}                      live_hi={:?} frame_size={} reg={:?}",
+                    unverifiable_region(off, &cm.frame_layout, live_hi),
+                    cm.frame_layout.region_name(off),
+                    live_hi,
+                    cm.frame_layout.frame_size,
+                    cm.frame_layout.spill_image_register(off),
+                );
+            }
         }
     }
     if published > 0 {
@@ -9198,6 +10516,225 @@ fn report_stale_words_in(
     }
 }
 
+/// Walk this thread's live compiled frame bands and report any word naming an
+/// address the LAST collection vacated.
+///
+/// # Why this exists next to `reclaim_guard::audit_thread_frames`
+///
+/// That auditor tests `thread.frames` -- the INTERPRETER frames -- against the
+/// same ledger, and its report ("a LIVE frame slot still names an address the
+/// LAST collection moved an object away from") is the exact verdict wanted
+/// here. It simply cannot see a compiled frame: a JIT frame's oops live in the
+/// machine stack band, not in a `Frame`. So on a workload whose stale holder is
+/// compiled, the interpreter auditor is silent and the first symptom is the
+/// SIGSEGV.
+///
+/// The ledger is what makes this sharper than
+/// [`report_stale_after_remap`]. That one flags any word equal to a pointer-map
+/// KEY, which on a real stack is mostly dead slop that happens to look like a
+/// moved address (thousands per run). `gc_quiescence::was_vacated` subtracts the
+/// destination set, so a hit is a word naming an address the collector moved an
+/// object AWAY from and did not move anything back INTO -- which is precisely
+/// the read that faults.
+///
+/// No-op unless `CRATONVM_DBG_VACATED_FRAMES` is armed.
+pub fn audit_jit_frames_for_vacated(
+    shared: Option<&crate::vm::SharedVm>,
+    tid: u64,
+    site: &'static str,
+) {
+    if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+        return;
+    }
+    let scanner_sp = current_stack_pointer();
+    JIT_ENTRY_CHAIN.with(|c| {
+        {
+            let mut v = c.borrow_mut();
+            flush_top_rbp_cache_to_chain(v.as_mut_slice());
+        }
+        let chain = c.borrow();
+        for entry in chain.iter() {
+            let Some(info) = entry.precise else { continue };
+            let entry_sp = entry.entry_sp;
+            let mut rbp = info.exact_rbp;
+            if rbp == 0 || rbp & 0x7 != 0 || rbp < scanner_sp || rbp >= entry_sp {
+                continue;
+            }
+            let Some(innermost_cm) = innermost_frame_method(
+                rbp,
+                info.exact_cm_id,
+                entry_sp,
+                scanner_sp,
+                info.compiled_method,
+            ) else {
+                continue;
+            };
+            // SAFETY: same contract as `report_stale_after_remap` -- the chain
+            // entry's CompiledMethod is Arc-owned by the JIT cache while any of
+            // its frames is live.
+            let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
+            let mut frames = 0usize;
+            while frames < 4096 {
+                frames += 1;
+                let frame_size = cm.osr_frame_size;
+                if frame_size <= 0 {
+                    break;
+                }
+                let frame_size = frame_size as usize;
+                const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+                if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+                    break;
+                }
+                report_vacated_words_in(rbp - frame_size, rbp, cm, rbp, shared, tid, site);
+                // SAFETY: `rbp` is a validated frame base in this thread's live
+                // JIT stack interval.
+                let parent_rbp = unsafe { (rbp as *const usize).read() };
+                let ret_addr = unsafe { ((rbp + 8) as *const usize).read() };
+                let Some(parent_cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+                    break;
+                };
+                if parent_rbp <= rbp
+                    || parent_rbp & 0x7 != 0
+                    || parent_rbp >= entry_sp
+                    || parent_rbp < scanner_sp
+                {
+                    break;
+                }
+                // SAFETY: code ranges retain their CompiledMethod metadata for
+                // the lifetime of an active frame.
+                cm = unsafe { &*(parent_cm_ptr as *const cratonvm_jit::CompiledMethod) };
+                rbp = parent_rbp;
+            }
+        }
+    });
+}
+
+/// Hits reported by [`audit_jit_frames_for_vacated`] this process.
+pub static JIT_VACATED_FRAME_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The subset of [`JIT_VACATED_FRAME_HITS`] in a slot `band_slot_is_verifiable`
+/// INSPECTS -- a java local, or an operand-spill slot below the safepoint's
+/// live cursor.
+///
+/// This is the number that separates the two candidate stories. An unverifiable
+/// hit is a dead register image or an abandoned outgoing-argument word, which
+/// is what every conservative frame scan carries and what
+/// `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE` was measured against to no effect. A
+/// VERIFIABLE hit is a slot the coverage machinery claims to describe and the
+/// remap still did not rewrite -- a live oop of a live compiled frame left
+/// naming a vacated address.
+pub static JIT_VACATED_FRAME_HITS_VERIFIABLE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-region tally, indexed by [`vacated_region_bucket`].
+pub static JIT_VACATED_BY_REGION: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Bucket names for [`JIT_VACATED_BY_REGION`], in index order.
+pub const JIT_VACATED_REGION_NAMES: [&str; 8] = [
+    "java-local",
+    "operand-spill",
+    "licm-or-scalar",
+    "callee-saved-gpr-image",
+    "safepoint-gpr-spill-image",
+    "outgoing-args-or-deopt-regs",
+    "reserved-locals-tail",
+    "other",
+];
+
+fn vacated_region_bucket(region: &str) -> usize {
+    match region {
+        "java-local" => 0,
+        "operand-spill" => 1,
+        "licm-ref-hoist" | "licm-arith" | "scalar-replaced-field" => 2,
+        "callee-saved-gpr-image" | "callee-saved-xmm-image" => 3,
+        "safepoint-gpr-spill-image" => 4,
+        "outgoing-args-or-deopt-regs" => 5,
+        "reserved-locals-tail" => 6,
+        _ => 7,
+    }
+}
+
+/// `(total, verifiable, per-region)` for the run's `[jit-vacated-frame]` census.
+pub fn jit_vacated_frame_census() -> (u64, u64, [u64; 8]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut per = [0u64; 8];
+    for (i, c) in JIT_VACATED_BY_REGION.iter().enumerate() {
+        per[i] = c.load(Relaxed);
+    }
+    (
+        JIT_VACATED_FRAME_HITS.load(Relaxed),
+        JIT_VACATED_FRAME_HITS_VERIFIABLE.load(Relaxed),
+        per,
+    )
+}
+
+fn report_vacated_words_in(
+    lo: usize,
+    hi: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    rbp: usize,
+    shared: Option<&crate::vm::SharedVm>,
+    tid: u64,
+    site: &'static str,
+) {
+    if hi <= lo {
+        return;
+    }
+    let mut addr = (lo + 7) & !7usize;
+    const MAX_SCAN_BYTES: usize = 1024 * 1024;
+    let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+    while addr + 8 <= hi {
+        // SAFETY: aligned read inside this thread's own live stack interval,
+        // bounded by the caller's frame bounds.
+        let w = unsafe { (addr as *const usize).read() };
+        if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(w) {
+            let n = JIT_VACATED_FRAME_HITS.fetch_add(1, Ordering::Relaxed);
+            // Cast: a compiled frame is far smaller than i32::MAX.
+            let off_t = (rbp - addr) as i32;
+            let region_t = cm.frame_layout.region_name(off_t);
+            let verifiable_t = band_slot_is_verifiable(
+                off_t,
+                &cm.frame_layout,
+                moving_young_frame_live_hi(rbp, cm),
+            );
+            if verifiable_t {
+                JIT_VACATED_FRAME_HITS_VERIFIABLE.fetch_add(1, Ordering::Relaxed);
+            }
+            JIT_VACATED_BY_REGION[vacated_region_bucket(region_t)].fetch_add(1, Ordering::Relaxed);
+            // Report the VERIFIABLE ones without a budget: they are the finding,
+            // and on a healthy run there are none. The unverifiable tail is dead
+            // slop every conservative scan carries, so it keeps a cap.
+            if verifiable_t || n < 200 {
+                // Cast: a compiled frame is far smaller than i32::MAX.
+                let off = (rbp - addr) as i32;
+                eprintln!(
+                    "[jit-vacated-frame] site={site} tid={tid} method={} off={off} region={}                      verifiable={} resumed_from={} value=0x{w:x} moved_to=0x{moved_to:x}                      class_at_target={}",
+                    cm.method_label,
+                    cm.frame_layout.region_name(off),
+                    band_slot_is_verifiable(
+                        off,
+                        &cm.frame_layout,
+                        moving_young_frame_live_hi(rbp, cm),
+                    ),
+                    is_callee_saved_gpr_image(off, &cm.frame_layout),
+                    class_name_at(shared, moved_to),
+                );
+            }
+        }
+        addr += 8;
+    }
+}
+
 /// Walk every live compiled frame band after a moving collection has remapped
 /// the oop-map slots and report words that still name a moved-from address.
 ///
@@ -9417,7 +10954,7 @@ fn is_callee_saved_gpr_image(off: i32, layout: &cratonvm_jit::FrameLayout) -> bo
 /// by construction, and its zero is not an all-clear for them.
 ///
 /// The experiment this enables is a single A/B on the reproducer in
-/// `known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+/// `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
 /// §10.4 -- `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` on
 /// `io.netty.handler.ipfilter.UniqueIpFilterTest`, which SIGSEGVs 3 runs in 13
 /// with compiled code reading a decommitted span. If widening the write removes
@@ -10262,6 +11799,14 @@ mod tests {
     /// thread would be a claim about frames that do not exist.
     #[test]
     fn a_thread_with_no_jit_frames_deposits_nothing() {
+        // `peer_proven_jit_depth` is a PROCESS global, and
+        // `beginning_a_coverage_cycle_clears_the_peer_ledger` deposits 7 into
+        // it under this latch. Without taking the latch here too, that 7 is
+        // read as this test's own deposit: `left: 7, right: 0`, only ever in
+        // parallel -- alone and under `--test-threads=1` it passes.
+        let _serialised = super::coverage_oracle_gate_tests::COVERAGE_ORACLE_TEST_LATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(current_thread_jit_depth(), 0, "test precondition");
         cratonvm_gc::gc_quiescence::reset_peer_proven_jit_depth();
         publish_peer_jit_coverage_for_stw();
@@ -11268,6 +12813,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: true,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -11306,6 +12852,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: true,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -11347,6 +12894,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -11464,6 +13012,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-8],
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -11477,6 +13026,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16, -24],
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -11490,6 +13040,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![],
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -11550,6 +13101,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: false,
+            reg_oop_mask: None,
             live_frame_hi: 0,
             local_oop_mask: None,
             num_locals: 0,
@@ -11756,7 +13308,7 @@ mod stale_word_oracle_tests {
 
     /// `local_offset(k) == 8*(k+1)`, so offset 40 is local 4 and offset 32 is
     /// local 3. This is the `StringConcatHelper.doConcat` witness that
-    /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` reported as
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` reported as
     /// a missed root: mask `Some(19)` = locals 0, 1 and 4, and the stale word
     /// sat at offset 32 — local 3, which `javap` shows is an `int`
     /// (`25: istore_3`). The oracle has to call that dead storage, not a root.

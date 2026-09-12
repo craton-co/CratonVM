@@ -159,6 +159,9 @@ pub struct ScheduleOptions {
     /// List-schedule the pure nodes inside each block by critical path and
     /// register pressure instead of plain dependence order.
     pub priority_within_blocks: bool,
+    /// Move a single-use operand to sit immediately before the node that reads
+    /// it. See [`pair_single_use_operands`].
+    pub pair_single_use_operands: bool,
     /// Groups of block indices (in the *pre-layout* numbering) that must stay
     /// contiguous and in relative order — the shape an exception handler's
     /// protected range takes once the IR grows exception edges.
@@ -197,6 +200,71 @@ fn sink_late_enabled() -> bool {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
     }
+}
+
+/// Also take the LATEST block at equal loop depth, and read a phi's value
+/// input on its own edge -- **default OFF**; `CRATONVM_JIT_IR_SINK_EQUAL_DEPTH=1`
+/// arms it.
+///
+/// [`sink_pure_nodes`]'s own doc records why the equal-depth half was left out:
+/// it is "a different trade with a different risk", and leaving it out kept the
+/// pass attributable to the one thing it claims. The partial unroller is the
+/// case that makes the trade worth taking, and
+/// `internal/performance/c2-the-partial-unroller-20260911.md` §5 is the
+/// measurement that says so: every copy of an unrolled body sits at the SAME
+/// loop depth as the header, so the strict-decrease rule moves none of them,
+/// all `factor` copies are computed above the first test, and the carried
+/// values spill. That page counts 69 memory operands of 180 in the unrolled
+/// loop against **zero** in the rolled one.
+///
+/// The second half is not a separate option because it is not separable. A
+/// phi's value input is used **on its edge** -- in the matching predecessor
+/// block -- not in the phi's own block. Attributing it to the phi's block makes
+/// a loop header a use site for every carried value, which pins all of them
+/// above the body whatever the depth rule then decides. Equal-depth sinking
+/// without the edge rule therefore moves nothing in a loop, which is the only
+/// place it was built to help.
+///
+/// Read LIVE, deliberately. `ir_per_copy_frames_enabled` documents the trap
+/// this flag would otherwise walk into: the first version of THAT flag cached
+/// in a `OnceLock`, the matrix test ran the OFF arm first, and both arms
+/// reported byte-identical code.
+fn sink_equal_depth_enabled() -> bool {
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SINK_EQUAL_DEPTH").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+    )
+}
+
+/// The block a CONTROL node belongs to, walking up `inputs[0]` until a node
+/// that actually heads a block is reached.
+///
+/// A `Merge`/`Region`/`Start`/`Proj` heads its block and is found on the first
+/// step; an `If` does not, and resolves to the block whose terminator it is.
+/// Same walk `regalloc::ls_ctrl_block_of` makes against a finished
+/// [`Schedule`], written here against the in-progress `blocks` + `node_to_block`
+/// pair because this pass runs before one exists.
+fn ctrl_block_of(
+    graph: &Graph,
+    blocks: &[Block],
+    node_to_block: &[usize],
+    mut ctrl: NodeId,
+) -> Option<usize> {
+    for _ in 0..graph.nodes.len() {
+        if ctrl == NO_NODE {
+            return None;
+        }
+        let blk = *node_to_block.get(ctrl as usize)?;
+        if blk != usize::MAX && blocks.get(blk).map(|b| b.ctrl) == Some(ctrl) {
+            return Some(blk);
+        }
+        let node = graph.nodes.get(ctrl as usize)?;
+        match node.inputs.first() {
+            Some(&next) if next != ctrl => ctrl = next,
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// May `op` be moved to a different block without changing what the method
@@ -298,23 +366,20 @@ fn deepest_common_dominator(dom: &[Vec<bool>], of: &[usize], nb: usize) -> Optio
 /// Move each pure node to the shallowest loop nesting on the dominator path
 /// between where its inputs put it and where its uses need it.
 ///
-/// **Only when the depth strictly decreases.** The classic schedule-late also
-/// prefers the latest block at equal depth, to shorten live ranges; that is a
-/// different trade with a different risk, and leaving it out keeps this pass's
-/// effect attributable to the one thing it claims — taking work out of loops.
+/// **Only when the depth strictly decreases** — unless
+/// [`sink_equal_depth_enabled`], which adds the other half of the classic
+/// schedule-late (prefer the latest block at equal depth, to shorten live
+/// ranges) together with the phi-edge use attribution it needs to reach a loop
+/// at all. That is a different trade with a different risk, which is why it is
+/// a flag and why the depth rule is what a failure falls back to rather than
+/// what it takes down with it.
 ///
 /// # The safepoint obligation, and why a failure reverts everything
 ///
-/// A frame state resolves a value it names from that value's HOME WORD, and the
-/// home is written wherever the node is emitted. So a node this pass moves must
-/// still dominate every block that could anchor a safepoint naming it —
-/// otherwise a deopt inside the loop reads a word nothing has written yet,
-/// which is the "confidently wrong value" failure this area produces.
-///
-/// The check is made against the FINAL placement, and a violation reverts the
-/// whole method rather than the offending node: reverting one node can break
-/// another's dominance (a use pulled back above a def that sank), so undoing
-/// the lot is the only revert that is obviously correct. `reverted` counts it.
+/// [`safepoints_dominate_anchors`] states it. The check is made against the
+/// FINAL placement; a violation first retries the placement WITHOUT the
+/// equal-depth rule, and reverts the whole method only if the depth rule alone
+/// cannot satisfy it either. `reverted` counts that.
 fn sink_pure_nodes(
     graph: &Graph,
     blocks: &mut [Block],
@@ -327,6 +392,76 @@ fn sink_pure_nodes(
     }
     let depth = loop_depths(blocks, dom);
     let original: Vec<usize> = node_to_block.to_vec();
+
+    // Read once per call, not once per process: `sink_equal_depth_enabled`
+    // documents why this may not be cached across compiles.
+    let equal_depth = sink_equal_depth_enabled();
+
+    let mut moved = place_sunk_nodes(graph, blocks, node_to_block, dom, &depth, equal_depth);
+    let mut ok =
+        moved == 0 || safepoints_dominate_anchors(graph, node_to_block, &original, dom, nb);
+    let mut retried = false;
+
+    // The equal-depth rule sinks strictly more nodes than the depth rule alone,
+    // so it has strictly more ways to violate the safepoint obligation — and
+    // the revert is whole-method. Falling straight back to "no sinking at all"
+    // would therefore let the NEW rule cost the OLD one its wins on any method
+    // that happens to name a sunk value in a deopt frame, which is a regression
+    // dressed as a conservative choice. Retry with the rule this pass shipped
+    // with instead, and revert only if THAT also fails.
+    if !ok && equal_depth {
+        node_to_block.copy_from_slice(&original);
+        moved = place_sunk_nodes(graph, blocks, node_to_block, dom, &depth, false);
+        ok = moved == 0 || safepoints_dominate_anchors(graph, node_to_block, &original, dom, nb);
+        retried = true;
+    }
+
+    if moved == 0 {
+        node_to_block.copy_from_slice(&original);
+        return (0, 0);
+    }
+    if !ok {
+        node_to_block.copy_from_slice(&original);
+        return (0, moved);
+    }
+
+    // Rebuild each block's data-node list from the placement. `topo_sort_block`
+    // runs after this and restores dependence order within every block.
+    let placed: Vec<NodeId> = blocks
+        .iter()
+        .flat_map(|b| b.nodes.iter().copied())
+        .collect();
+    for b in blocks.iter_mut() {
+        b.nodes.clear();
+    }
+    for id in placed {
+        let b = node_to_block[id as usize];
+        if b != usize::MAX && b < nb {
+            blocks[b].nodes.push(id);
+        }
+    }
+    if retried && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SINK").is_some() {
+        eprintln!("[ir-sink] equal-depth placement violated a safepoint; fell back to depth-only");
+    }
+    (moved, 0)
+}
+
+/// Choose a block for every sinkable node, writing the choice into
+/// `node_to_block`. Returns how many nodes it moved.
+///
+/// Split out of [`sink_pure_nodes`] so the equal-depth rule can be retried
+/// without it — see the fallback there. Makes no safepoint check of its own:
+/// the obligation is a property of the FINAL placement and is checked once, by
+/// [`safepoints_dominate_anchors`].
+fn place_sunk_nodes(
+    graph: &Graph,
+    blocks: &[Block],
+    node_to_block: &mut [usize],
+    dom: &[Vec<bool>],
+    depth: &[u32],
+    equal_depth: bool,
+) -> usize {
+    let nb = blocks.len();
     let mut moved = 0usize;
 
     // Iterated, because a node can only follow its uses: the `Add` feeding the
@@ -339,6 +474,54 @@ fn sink_pure_nodes(
             let ub = node_to_block[uid];
             if ub == usize::MAX || ub >= nb {
                 continue;
+            }
+            // A phi reads each value input ON ITS OWN EDGE. Attributing those
+            // reads to the phi's block makes a loop header a use site for every
+            // carried value and pins all of them above the body; attributing
+            // them to the matching predecessor is what lets a carried value
+            // sink to the copy that produces the next one. See
+            // `sink_equal_depth_enabled` for why this travels with the
+            // equal-depth rule rather than being its own switch.
+            //
+            // Falls back to the conservative whole-node attribution whenever
+            // the merge's arity does not match the phi's — an unmatched phi is
+            // a shape this pass does not model, and modelling it wrongly would
+            // sink a value past a reader.
+            if equal_depth && matches!(un.op, Op::Phi) {
+                let edges: Option<Vec<usize>> = un
+                    .input_opt(0)
+                    .and_then(|c| graph.nodes.get(c as usize))
+                    .filter(|m| matches!(m.op, Op::Merge | Op::Region))
+                    .filter(|m| m.inputs.len() + 1 == un.inputs.len())
+                    .map(|m| {
+                        m.inputs
+                            .iter()
+                            .map(|&c| {
+                                ctrl_block_of(graph, blocks, node_to_block, c).unwrap_or(usize::MAX)
+                            })
+                            .collect()
+                    });
+                if let Some(edges) = edges {
+                    for (k, &inp) in un.inputs.iter().skip(1).enumerate() {
+                        if inp == NO_NODE {
+                            continue;
+                        }
+                        // When the edge's block is unknown, fall back to the
+                        // phi's own block for THIS input rather than dropping
+                        // the use entirely — a dropped use is a node free to
+                        // sink below a reader.
+                        let eb = match edges[k] {
+                            e if e != usize::MAX && e < nb => e,
+                            _ => ub,
+                        };
+                        if let Some(v) = use_blocks.get_mut(inp as usize) {
+                            if !v.contains(&eb) {
+                                v.push(eb);
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
             for &inp in &un.inputs {
                 if inp == NO_NODE {
@@ -375,9 +558,24 @@ fn sink_pure_nodes(
             }
             let mut best = early;
             for cand in 0..nb {
-                if dominates(dom, early, cand)
-                    && dominates(dom, cand, late)
-                    && depth[cand] < depth[best]
+                if !dominates(dom, early, cand) || !dominates(dom, cand, late) {
+                    continue;
+                }
+                // Shallower loop nesting always wins: that is this pass's
+                // original claim and it is never traded away.
+                if depth[cand] < depth[best] {
+                    best = cand;
+                    continue;
+                }
+                // At equal depth, take the LATEST — the candidate the current
+                // best dominates. Every candidate here dominates `late`, which
+                // dominates every use, so this shortens the live range without
+                // moving the value below any reader. `cand != best` keeps the
+                // reflexive case from counting as a move.
+                if equal_depth
+                    && depth[cand] == depth[best]
+                    && cand != best
+                    && dominates(dom, best, cand)
                 {
                     best = cand;
                 }
@@ -392,26 +590,73 @@ fn sink_pure_nodes(
             break;
         }
     }
-    if moved == 0 {
-        return (0, 0);
-    }
+    moved
+}
 
-    // The safepoint obligation, against the final placement.
+/// Which `graph.safepoints` entry would `ir_lower` resolve for a deopt taken at
+/// this node?
+///
+/// Exactly `ir_lower::resolve_frame_state_for_site`'s rule, and it has to be:
+/// an anchor test that asks a broader question than the lowerer answers reports
+/// conflicts that cannot occur, and a narrower one misses conflicts that can.
+///
+/// * a node carrying a per-copy [`crate::ir::Node::frame_snapshot`] resolves to
+///   THAT snapshot, provided it still names the node's own bci;
+/// * every other node falls back to the first snapshot at its bci, which is the
+///   by-bci scan that was the only path before cloned regions existed.
+///
+/// The distinction is the whole reason an unrolled body can be scheduled per
+/// copy at all: after a clone there are `factor` nodes at one bci, and keying
+/// anchors by bci makes every copy's frame claim every copy's blocks — so a
+/// value sunk into copy 1 reads as failing to dominate copy 0 and the placement
+/// is thrown away. See `internal/performance/c2-per-copy-deopt-frames-20260911.md`.
+fn resolved_snapshot(graph: &Graph, n: &crate::ir::Node) -> Option<usize> {
+    let pc = n.bytecode_pc?;
+    if let Some(si) = n.frame_snapshot {
+        if graph.safepoints.get(si as usize).map(|s| s.bci) == Some(pc) {
+            return Some(si as usize);
+        }
+    }
+    graph.safepoints.iter().position(|s| s.bci == pc)
+}
+
+/// Does every value a safepoint names still dominate every block that could
+/// anchor that safepoint?
+///
+/// A frame state resolves a value it names from that value's HOME WORD, and the
+/// home is written wherever the node is emitted. So a node this pass moved must
+/// still dominate every block that could anchor a safepoint naming it —
+/// otherwise a deopt inside the loop reads a word nothing has written yet,
+/// which is the "confidently wrong value" failure this area produces.
+///
+/// A node still at its original block is skipped: this pass owes nothing for a
+/// placement it did not choose.
+///
+/// The answer is about the WHOLE method, and a violation reverts the whole
+/// method rather than the offending node: reverting one node can break
+/// another's dominance (a use pulled back above a def that sank), so undoing
+/// the lot is the only revert that is obviously correct.
+fn safepoints_dominate_anchors(
+    graph: &Graph,
+    node_to_block: &[usize],
+    original: &[usize],
+    dom: &[Vec<bool>],
+    nb: usize,
+) -> bool {
     let mut anchors: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
     for (nid, n) in graph.nodes.iter().enumerate() {
-        if let Some(pc) = n.bytecode_pc {
+        if let Some(si) = resolved_snapshot(graph, n) {
             let b = node_to_block[nid];
             if b != usize::MAX && b < nb {
-                anchors.entry(pc).or_default().push(b);
+                anchors.entry(si).or_default().push(b);
             }
         }
     }
-    let mut ok = true;
-    'check: for sp in &graph.safepoints {
-        let Some(anchor_blocks) = anchors.get(&sp.bci) else {
-            // No node carries this bci, so `build_deopt_points` finds no
-            // native anchor for it and emits no point at all.
+    for (si, sp) in graph.safepoints.iter().enumerate() {
+        let Some(anchor_blocks) = anchors.get(&si) else {
+            // No node resolves to this snapshot, so `build_deopt_points` finds
+            // no native anchor for it and emits no point at all.
             continue;
         };
         for &v in sp.locals.iter().chain(sp.stack.iter()) {
@@ -426,32 +671,11 @@ fn sink_pure_nodes(
                 continue; // not moved by this pass
             }
             if !anchor_blocks.iter().all(|&ab| dominates(dom, vb, ab)) {
-                ok = false;
-                break 'check;
+                return false;
             }
         }
     }
-    if !ok {
-        node_to_block.copy_from_slice(&original);
-        return (0, moved);
-    }
-
-    // Rebuild each block's data-node list from the placement. `topo_sort_block`
-    // runs after this and restores dependence order within every block.
-    let placed: Vec<NodeId> = blocks
-        .iter()
-        .flat_map(|b| b.nodes.iter().copied())
-        .collect();
-    for b in blocks.iter_mut() {
-        b.nodes.clear();
-    }
-    for id in placed {
-        let b = node_to_block[id as usize];
-        if b != usize::MAX && b < nb {
-            blocks[b].nodes.push(id);
-        }
-    }
-    (moved, 0)
+    true
 }
 
 /// Where a block's frequency estimate came from, and what it is.
@@ -608,6 +832,9 @@ pub struct Schedule {
     pub freq: BlockFrequencies,
     /// What the frequency-driven layout did, or why it did nothing.
     pub layout: LayoutReport,
+    /// Why each single-use operand did or did not end up beside its consumer.
+    /// See [`PairCensus`]; empty when `pair_single_use_operands` is off.
+    pub pairing: PairCensus,
 }
 
 impl Schedule {
@@ -644,6 +871,319 @@ impl Schedule {
 /// block list, each block's node order and therefore the bytes `ir_lower`
 /// emits are unchanged from before block frequencies existed; the only
 /// addition is the read-only [`Schedule::freq`] / [`Schedule::layout`] report.
+/// Uses of each node as an INPUT of another node, indexed by `NodeId`.
+///
+/// The same count `ir_lower`'s carry planner reads, derived the same way, so
+/// "single use" means one thing in both places. A value named by a frame state
+/// is NOT a use here: frame states pin a value's home, which is a separate
+/// question and one [`pair_single_use_operands`] does not touch.
+fn use_counts(graph: &Graph) -> Vec<u32> {
+    let mut out = vec![0u32; graph.nodes.len()];
+    for node in &graph.nodes {
+        for &input in &node.inputs {
+            if input != NO_NODE {
+                if let Some(c) = out.get_mut(input as usize) {
+                    *c = c.saturating_add(1);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Why each `(consumer, operand)` pair did or did not end up adjacent.
+///
+/// # Why this exists
+///
+/// `c2-one-carry-slot-is-the-frame-traffic-ceiling-FIXED-20260910.md` §10 closed
+/// on a number it could not explain: **82% of the carry's candidate windows are
+/// declined for `operand_position`** — the node two positions back is not the
+/// consumer's second operand, so the `[input1, input0, cons]` triple both carry
+/// slots need was never formed. [`pair_single_use_operands`] is the pass that
+/// would form it, it declines for five enumerated reasons, and *"which of those
+/// dominates is not yet counted — the pairing pass has no census, and that is
+/// the next thing to build, not the next thing to fix."*
+///
+/// This is that census. One counter per `continue`, so the five reasons are
+/// five numbers rather than one silence.
+///
+/// # The denominator is the honest one
+///
+/// [`Self::candidates`] counts `(consumer, operand)` pairs where the operand is
+/// a real, distinct node — every pair the pass could conceivably act on, and
+/// nothing else. The sibling census learned this the hard way: its first cut
+/// reported every three consecutive scheduled nodes as the denominator, which
+/// made the dominant cause "not a candidate" and said nothing.
+///
+/// # The identity
+///
+/// `paired + multi_use + no_node + producer_arm + other_block + after_consumer
+/// + already_adjacent + deopt_between == candidates`, checked by
+/// [`Self::closes`] and asserted in debug builds at the call site. A reason
+/// added to the pass and not to the census fails that assertion rather than
+/// quietly reading low — the failure mode
+/// `c2-the-gp-register-file-is-not-the-binding-constraint-20260910.md` §10.1
+/// records, where a census that computed its own answer drifted to zero while
+/// the emission it described did three things.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PairCensus {
+    /// `(consumer, operand)` pairs examined. The denominator.
+    pub candidates: usize,
+    /// Moved to sit immediately before the consumer.
+    pub paired: usize,
+    /// The operand is read by more than one node, so sinking it past a reader
+    /// would be a semantic change rather than a scheduling one.
+    pub multi_use: usize,
+    /// No node behind the operand's id. Structural; expected to be zero.
+    pub no_node: usize,
+    /// The operand's op is not one `ir_lower::op_home_is_one_store_rax`
+    /// certifies, so the carry would refuse it even if it were adjacent.
+    pub producer_arm: usize,
+    /// The operand is scheduled in a different block from its consumer.
+    pub other_block: usize,
+    /// The operand is scheduled AFTER its consumer in this block. A consumer
+    /// that is itself a phi reads across a back edge, so this is not a bug.
+    pub after_consumer: usize,
+    /// Already immediately before the consumer — the pass has nothing to do and
+    /// the carry already sees the shape.
+    pub already_adjacent: usize,
+    /// A node a deopt can arrive at sits between the two positions, so sinking
+    /// the definition past it would leave a frame slot nothing had written.
+    pub deopt_between: usize,
+}
+
+impl PairCensus {
+    /// Does every candidate fall into exactly one bucket?
+    pub fn closes(&self) -> bool {
+        self.paired
+            + self.multi_use
+            + self.no_node
+            + self.producer_arm
+            + self.other_block
+            + self.after_consumer
+            + self.already_adjacent
+            + self.deopt_between
+            == self.candidates
+    }
+
+    /// Add this method's counts to the process-wide totals.
+    fn publish(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        debug_assert!(
+            self.closes(),
+            "a `continue` in pair_single_use_operands has no counter: {self:?}"
+        );
+        let fields = [
+            self.candidates,
+            self.paired,
+            self.multi_use,
+            self.no_node,
+            self.producer_arm,
+            self.other_block,
+            self.after_consumer,
+            self.already_adjacent,
+            self.deopt_between,
+        ];
+        for (slot, v) in IR_PAIR_CENSUS.iter().zip(fields) {
+            slot.fetch_add(v as u64, Relaxed);
+        }
+    }
+}
+
+/// Process-wide pairing totals, in [`PairCensus`] field order.
+///
+/// Unconditional and cheap — nine relaxed adds per scheduled method. A census
+/// you have to switch on is one nobody has for the run they already did, which
+/// is the same reason `IR_CARRY_DEFERRED` is unconditional.
+static IR_PAIR_CENSUS: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// The process-wide pairing census since process start.
+pub fn ir_pair_census() -> PairCensus {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v: Vec<usize> = IR_PAIR_CENSUS
+        .iter()
+        .map(|a| a.load(Relaxed) as usize)
+        .collect();
+    PairCensus {
+        candidates: v[0],
+        paired: v[1],
+        multi_use: v[2],
+        no_node: v[3],
+        producer_arm: v[4],
+        other_block: v[5],
+        after_consumer: v[6],
+        already_adjacent: v[7],
+        deopt_between: v[8],
+    }
+}
+
+/// `CRATONVM_JIT_IR_PAIR_OPERANDS=0` — schedule single-use operands in plain
+/// dependence order again, so `ir_lower`'s carry sees only what the list
+/// scheduler happened to leave adjacent.
+///
+/// Default ON. Both orders compute the same values from the same inputs; what
+/// differs is how many of them the lowerer can keep in a register.
+fn pair_operands_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PAIR_OPERANDS").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// Move a consumer's single-use operands to sit immediately before it, as
+/// `[input1, input0, cons]`.
+///
+/// # What this is for
+///
+/// `ir_lower` gives every node a frame slot, writes the node's result to it and
+/// reloads it at the use. Its carry removes that round trip, but only for
+/// ADJACENT scheduled pairs — it leaves the value in RAX (or copies it to RCX)
+/// and lets the consumer's arm read it where it already is.
+///
+/// Measured on a `s += i ^ (s >>> 3)` loop with `CRATONVM_DBG_IR_LINEAR_SCAN=1`:
+/// of 25 nodes, residency skipped 16 as `single_use` — it will not spend a
+/// callee-saved register plus its prologue save on a value read once — and the
+/// carry that exists to cover exactly those took 2. The rest went through the
+/// frame: `[rbp-78h]` was written and reloaded two instructions later with the
+/// value still live in a register.
+///
+/// Those producers were not ineligible. They were not ADJACENT: `I2L` and the
+/// `Xor` that reads it had the other operand's `UShr` scheduled between them.
+///
+/// # Why the order is `[input1, input0, cons]` and not the reverse
+///
+/// A consumer's arm reads its first operand from RAX and its second from RCX
+/// (`ir_lower::op_reads_rax_then_rcx`). RAX is where a producer's arm already
+/// leaves the value, so `input0` goes adjacent and carries in RAX for free.
+/// `input1` is copied to RCX at its own home store and has to survive
+/// `input0`'s arm — which is why `ir_lower::op_preserves_rcx` exists and is
+/// short. Putting them the other way round would ask a value to survive in RAX,
+/// which every arm overwrites.
+///
+/// # Why sinking a definition later is safe here
+///
+/// It is not safe in general: a value defined later is UNDEFINED at any deopt
+/// arriving in between, and `graph.safepoints` names the full operand stack at
+/// every bci, so an intermediate is named from its definition until its
+/// consumer pops it. Sinking past a point a deopt can arrive at would hand the
+/// interpreter a frame slot nothing had written.
+///
+/// The condition is therefore about what is CROSSED, not about the value: every
+/// node strictly between the operand's old position and its new one must be one
+/// no deopt can arrive at (`ir_lower::op_cannot_deopt`, the same enumeration
+/// `compute_deopt_named_reachable` builds its trapping-bci set from). When that
+/// holds there is no program point between the two positions where a frame
+/// state can be read, so none can observe the difference.
+///
+/// Two further restrictions keep this to the case it was written for:
+///
+///   * the operand is used exactly once, so nothing between it and the consumer
+///     can read it — the reordering is invisible to every other node;
+///   * its op is one `ir_lower::op_home_is_one_store_rax` certifies, the same
+///     allowlist the carry planner requires. Moving a value the carry will
+///     refuse anyway buys nothing and widens the blast radius for no reason.
+///
+/// Returns how many operands moved.
+fn pair_single_use_operands(
+    graph: &Graph,
+    uses: &[u32],
+    nodes: &mut Vec<NodeId>,
+    census: &mut PairCensus,
+) -> usize {
+    let mut moved = 0usize;
+    // Descending, so sinking an operand cannot disturb a consumer this loop has
+    // yet to visit: everything it moves lands below the current index.
+    let mut ci = nodes.len();
+    while ci > 0 {
+        ci -= 1;
+        if ci >= nodes.len() {
+            continue;
+        }
+        let cons = nodes[ci];
+        let Some(cn) = graph.nodes.get(cons as usize) else {
+            continue;
+        };
+        // Reverse operand order: `input1` is sunk first and `input0` lands
+        // below it, giving `[input1, input0, cons]`.
+        let operands: Vec<NodeId> = cn.inputs.iter().copied().take(2).collect();
+        for &prod in operands.iter().rev() {
+            if prod == NO_NODE || prod == cons {
+                continue;
+            }
+            // Denominator: a real operand of a real consumer, both of which
+            // exist. Everything counted below is a subset of this.
+            census.candidates += 1;
+            if uses.get(prod as usize).copied().unwrap_or(0) != 1 {
+                census.multi_use += 1;
+                continue;
+            }
+            let Some(pn) = graph.nodes.get(prod as usize) else {
+                census.no_node += 1;
+                continue;
+            };
+            if !crate::ir_lower::op_home_is_one_store_rax(&pn.op) {
+                census.producer_arm += 1;
+                continue;
+            }
+            // Re-read both positions: a previous sink in this same iteration
+            // has already shifted the consumer down by one.
+            let Some(ci_now) = nodes.iter().position(|&n| n == cons) else {
+                census.other_block += 1;
+                continue;
+            };
+            let Some(pi) = nodes.iter().position(|&n| n == prod) else {
+                // The producer is scheduled in a DIFFERENT block. Sinking
+                // across a block boundary is a different transform with a
+                // different proof obligation, and this pass does not attempt
+                // it.
+                census.other_block += 1;
+                continue;
+            };
+            if pi >= ci_now {
+                census.after_consumer += 1;
+                continue;
+            }
+            if pi + 1 == ci_now {
+                census.already_adjacent += 1;
+                continue;
+            }
+            // The crossing condition: everything in between must be a node no
+            // deopt can arrive at.
+            if !nodes[pi + 1..ci_now].iter().all(|&mid| {
+                graph
+                    .nodes
+                    .get(mid as usize)
+                    .is_some_and(|m| crate::ir_lower::op_cannot_deopt(&m.op))
+            }) {
+                census.deopt_between += 1;
+                continue;
+            }
+            let id = nodes.remove(pi);
+            // `ci_now` was the consumer's index BEFORE the removal, and the
+            // removal was below it, so the consumer now sits at `ci_now - 1`
+            // and the operand belongs immediately before it.
+            nodes.insert(ci_now - 1, id);
+            census.paired += 1;
+            moved += 1;
+        }
+    }
+    moved
+}
+
 pub fn schedule(graph: &Graph) -> Schedule {
     schedule_with_options(graph, &production_schedule_options())
 }
@@ -690,6 +1230,7 @@ pub fn production_schedule_options() -> ScheduleOptions {
     ScheduleOptions {
         layout_hot_paths: hot_layout_enabled(),
         priority_within_blocks: list_sched_enabled(),
+        pair_single_use_operands: pair_operands_enabled(),
         ..ScheduleOptions::default()
     }
 }
@@ -800,20 +1341,49 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
             let term_node = &graph.nodes[term as usize];
             match &term_node.op {
                 Op::If => {
-                    // Find Proj(0) and Proj(1) successors
+                    // The Proj(0) and Proj(1) successors, pushed in PROJECTION
+                    // order.
+                    //
+                    // `ir_lower` names `successors[0]` the TRUE block and
+                    // `successors[1]` the false one, so this order is not a
+                    // presentation detail: it decides which way every
+                    // conditional branch this backend emits goes.
+                    //
+                    // This scan used to push in node-ID order and rely on the
+                    // two agreeing, which they do for every graph `IrBuilder`
+                    // produces — its `if_icmp*` arms add `Proj(0)` and then
+                    // `Proj(1)`, so the lower id is always the true edge. That
+                    // is a property of one producer, not of the IR, and the
+                    // first transform to CLONE an `If` broke it: the partial
+                    // unroller adds each copy's continue-edge projection first
+                    // (it is the one the next copy hangs off), and in a javac
+                    // `if_icmpge` loop that is `Proj(1)`. Every intermediate
+                    // test then branched to the edge meant for its opposite,
+                    // the early exits were never taken, and the loop ran
+                    // `n + factor - 1` iterations — `sum(1)` returned 6.
+                    //
+                    // Sorting by the projection's own index makes the invariant
+                    // a property of this code rather than of node-allocation
+                    // order. It is a no-op on every graph the builder makes.
+                    let mut succs: Vec<(u8, usize)> = Vec::new();
                     for (id, node) in graph.nodes.iter().enumerate() {
-                        if let Op::Proj(_n) = &node.op {
-                            if !node.inputs.is_empty() && node.inputs[0] == term {
-                                let succ_block = node_to_block[id];
-                                if succ_block != usize::MAX {
-                                    if !blocks[block_idx].successors.contains(&succ_block) {
-                                        blocks[block_idx].successors.push(succ_block);
-                                    }
-                                    if !blocks[succ_block].predecessors.contains(&block_idx) {
-                                        blocks[succ_block].predecessors.push(block_idx);
-                                    }
-                                }
-                            }
+                        let Op::Proj(which) = &node.op else { continue };
+                        if node.inputs.first().copied() != Some(term) {
+                            continue;
+                        }
+                        let succ_block = node_to_block[id];
+                        if succ_block == usize::MAX {
+                            continue;
+                        }
+                        succs.push((*which, succ_block));
+                    }
+                    succs.sort_by_key(|&(which, _)| which);
+                    for (_which, succ_block) in succs {
+                        if !blocks[block_idx].successors.contains(&succ_block) {
+                            blocks[block_idx].successors.push(succ_block);
+                        }
+                        if !blocks[succ_block].predecessors.contains(&block_idx) {
+                            blocks[succ_block].predecessors.push(block_idx);
                         }
                     }
                 }
@@ -900,6 +1470,18 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
         if opts.priority_within_blocks {
             priority_sort_block(graph, &mut block.nodes);
         }
+    }
+
+    // Step 5b: put a consumer's single-use operands next to it, so `ir_lower`
+    // can carry them in registers instead of round-tripping them through the
+    // frame. See `pair_single_use_operands`.
+    let mut pairing = PairCensus::default();
+    if opts.pair_single_use_operands {
+        let uses = use_counts(graph);
+        for block in &mut blocks {
+            pair_single_use_operands(graph, &uses, &mut block.nodes, &mut pairing);
+        }
+        pairing.publish();
     }
 
     // Step 6: Estimate how often each block runs, then (optionally) lay the
@@ -992,6 +1574,7 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
         dom,
         freq,
         layout,
+        pairing,
     }
 }
 
@@ -2493,6 +3076,131 @@ mod tests {
         );
     }
 
+    /// The equal-depth half of schedule-late: a pure node whose only use is in
+    /// a later block at the SAME loop depth moves there.
+    ///
+    /// `int f(int a, int b) { if (a != 0) return a + b; return 1; }` — the
+    /// `Add` is computed in the ENTRY block because that is where
+    /// `find_best_block` puts it (schedule-EARLY: the deepest block its inputs,
+    /// two parameters, dominate), and its only reader is the `Return` on the
+    /// taken arm. Both blocks are at depth 0, so the strict-decrease rule this
+    /// pass shipped with moves nothing; the equal-depth rule moves it to the
+    /// block that reads it, where it is also computed on one path instead of
+    /// both.
+    ///
+    /// **The sum is deliberately not stored to a local.** A local is named by
+    /// the deopt frame of every later bci, including the ones on the arm it did
+    /// not sink into, and [`safepoints_dominate_anchors`] then refuses the
+    /// placement — correctly, because a frame on that arm would read a word
+    /// nothing had written. That refusal is the pass working, not the rule
+    /// failing, and a test written on a local would assert the opposite of what
+    /// it looks like it asserts.
+    ///
+    /// Asserted as a DIFFERENCE between the two arms rather than as an absolute
+    /// block index, so a change in how the scheduler numbers blocks cannot make
+    /// this pass vacuously.
+    #[test]
+    fn equal_depth_sink_moves_a_pure_node_to_its_only_reader() {
+        // 0: iload_0   1: ifne +6 (-> 7)
+        // 4: iconst_1  5: ireturn   6: nop
+        // 7: iload_0   8: iload_1   9: iadd   10: ireturn
+        let code = [
+            0x1au8, 0x9a, 0x00, 0x06, 0x04, 0xac, 0x00, 0x1a, 0x1b, 0x60, 0xac, 0, 0,
+        ];
+
+        let block_of_add = |on: &str| -> (usize, usize) {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_SINK_EQUAL_DEPTH", Some(on))],
+                || {
+                    let builder = IrBuilder::new(2, 2);
+                    let mut graph = builder.build(&code, 11).expect("build failed");
+                    ir_optimize::optimize(&mut graph);
+                    let sched = schedule(&graph);
+                    let add = graph
+                        .nodes
+                        .iter()
+                        .position(|n| n.op == Op::Add)
+                        .expect("the method computes a + b");
+                    (sched.node_to_block[add], sched.blocks.len())
+                },
+            )
+        };
+
+        let (off, nblocks) = block_of_add("0");
+        let (on, _) = block_of_add("1");
+        assert!(nblocks >= 2, "branching method should have 2+ blocks");
+        assert_ne!(
+            on, off,
+            "the equal-depth rule did not move the Add out of block {off}"
+        );
+        assert_ne!(on, usize::MAX, "the Add must still be placed somewhere");
+        assert!(on < nblocks, "block index {on} out of range");
+    }
+
+    /// A value a deopt frame names on the arm it did NOT sink into keeps its
+    /// early placement — the obligation [`safepoints_dominate_anchors`] states.
+    ///
+    /// `int f(int a, int b) { int t = a + b; if (a == 0) return 1; return t; }`
+    /// is the same shape as the test above with one edit: the sum goes through
+    /// a LOCAL, so every snapshot from its store onwards names it, including
+    /// the one on the `return 1` arm. Sinking it into the other arm would let a
+    /// deopt there read a word nothing had written. The pass must decline, and
+    /// declining must cost nothing else — which is what the fallback to the
+    /// depth-only rule is for.
+    #[test]
+    fn a_value_a_frame_names_on_the_other_arm_does_not_sink() {
+        // 0: iload_0   1: iload_1   2: iadd   3: istore_2
+        // 4: iload_0   5: ifeq +5 (-> 10)
+        // 8: iload_2   9: ireturn   10: iconst_1  11: ireturn
+        let code = [
+            0x1au8, 0x1b, 0x60, 0x3d, 0x1a, 0x99, 0x00, 0x05, 0x1c, 0xac, 0x04, 0xac, 0, 0,
+        ];
+
+        let block_of_add = |on: &str| -> usize {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_SINK_EQUAL_DEPTH", Some(on))],
+                || {
+                    let builder = IrBuilder::new(2, 3);
+                    let mut graph = builder.build(&code, 12).expect("build failed");
+                    ir_optimize::optimize(&mut graph);
+                    let sched = schedule(&graph);
+                    let add = graph
+                        .nodes
+                        .iter()
+                        .position(|n| n.op == Op::Add)
+                        .expect("the method computes a + b");
+                    sched.node_to_block[add]
+                },
+            )
+        };
+
+        assert_eq!(
+            block_of_add("1"),
+            block_of_add("0"),
+            "a value the other arm's frame names must keep its early placement",
+        );
+    }
+
+    /// The flag is read LIVE, not cached in a `OnceLock`.
+    ///
+    /// `ir_per_copy_frames_enabled` records what a cached scheduling flag costs:
+    /// the matrix test ran the OFF arm first and both arms then reported
+    /// byte-identical code. Two calls in one process, different values, must
+    /// give different answers.
+    #[test]
+    fn equal_depth_flag_is_read_live() {
+        let read = |v: Option<&str>| {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_SINK_EQUAL_DEPTH", v)],
+                sink_equal_depth_enabled,
+            )
+        };
+        assert!(read(Some("1")));
+        assert!(!read(Some("0")));
+        assert!(!read(None), "default is OFF");
+        assert!(read(Some("1")), "a second read must still see the override");
+    }
+
     #[test]
     fn test_schedule_node_to_block_mapping() {
         // int f(int a, int b) { return a + b; }
@@ -2728,6 +3436,65 @@ mod tests {
     // ── Memory-effect ordering ───────────────────────────────────────────
 
     use crate::ir::{MemKind, NodeId as Id};
+
+    /// An `If`'s successors come out in PROJECTION order, whatever order the
+    /// projections were added in.
+    ///
+    /// `ir_lower` names `successors[0]` the true block and `successors[1]` the
+    /// false one, so this ordering decides which way every conditional branch
+    /// the backend emits goes. It held for free as long as `IrBuilder` was the
+    /// only producer — its `if_icmp*` arms add `Proj(0)` and then `Proj(1)`, so
+    /// the lower node id was always the true edge, and this scan pushed in node
+    /// id order.
+    ///
+    /// The first transform to CLONE an `If` broke that. The partial unroller
+    /// adds each copy's continue-edge projection first, because that is the one
+    /// the next copy hangs off, and in a javac `if_icmpge` loop the continue
+    /// edge is `Proj(1)`. Every intermediate test then branched to the edge
+    /// meant for its opposite: the early exits were never taken and the loop
+    /// ran `n + factor - 1` iterations, so `sum(1)` returned 6.
+    ///
+    /// This graph is built the way the unroller builds one — `Proj(1)` first —
+    /// so it fails against a node-id-ordered scan and passes against an
+    /// index-ordered one. A fixture built in the conventional order cannot tell
+    /// the two apart, which is why this one is deliberately backwards.
+    #[test]
+    fn an_ifs_successors_are_ordered_by_projection_not_by_node_id() {
+        let mut g = bare_graph();
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let entry = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let cond = g.add(Op::Param(0), IrType::Int, vec![], None);
+        let if_node = g.add(Op::If, IrType::Control, vec![entry, cond], Some(0));
+        // Backwards on purpose: the FALSE edge gets the lower node id.
+        let false_edge = g.add(Op::Proj(1), IrType::Control, vec![if_node], Some(0));
+        let true_edge = g.add(Op::Proj(0), IrType::Control, vec![if_node], Some(0));
+        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let merge = g.add(
+            Op::Merge,
+            IrType::Control,
+            vec![true_edge, false_edge],
+            Some(1),
+        );
+        let phi = g.add(Op::Phi, IrType::Int, vec![merge, a, b], Some(1));
+        let ret = g.add(Op::Return, IrType::Void, vec![merge, phi], Some(2));
+        g.entry = start;
+        g.exit = ret;
+
+        let schedule = schedule(&g);
+        let if_block = schedule.node_to_block[if_node as usize];
+        let succ = &schedule.blocks[if_block].successors;
+        assert_eq!(succ.len(), 2, "an `If` has exactly two successors");
+        assert_eq!(
+            schedule.blocks[succ[0]].ctrl, true_edge,
+            "successors[0] must be the Proj(0) block — `ir_lower` branches on it \
+             as the TRUE edge",
+        );
+        assert_eq!(
+            schedule.blocks[succ[1]].ctrl, false_edge,
+            "successors[1] must be the Proj(1) block",
+        );
+    }
 
     fn bare_graph() -> Graph {
         Graph {
@@ -3061,6 +3828,128 @@ mod tests {
                 "block {} was reordered illegally",
                 b.id
             );
+        }
+    }
+
+    /// Pairing may only ever REORDER: every block keeps exactly the node set it
+    /// had. A node it dropped or duplicated would be one `ir_lower` emits twice
+    /// or not at all.
+    #[test]
+    fn pairing_preserves_every_block_node_set() {
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0x1b, 0x64, 0xac, 0, 0];
+        let builder = IrBuilder::new(2, 2);
+        let mut graph = builder.build(&code, 8).expect("build failed");
+        ir_optimize::optimize(&mut graph);
+        let off = schedule_with_options(
+            &graph,
+            &ScheduleOptions {
+                pair_single_use_operands: false,
+                ..ScheduleOptions::default()
+            },
+        );
+        let on = schedule_with_options(
+            &graph,
+            &ScheduleOptions {
+                pair_single_use_operands: true,
+                ..ScheduleOptions::default()
+            },
+        );
+        assert_eq!(off.blocks.len(), on.blocks.len());
+        for (a, b) in off.blocks.iter().zip(on.blocks.iter()) {
+            let mut xs = a.nodes.clone();
+            let mut ys = b.nodes.clone();
+            xs.sort_unstable();
+            ys.sort_unstable();
+            assert_eq!(xs, ys, "block {} lost or gained a node", a.id);
+        }
+    }
+
+    /// Pairing only ever sinks, so it cannot move a node above one of its own
+    /// inputs — which is exactly the kind of claim that stops being true when
+    /// someone widens the pass. Asserted over the emitted order rather than
+    /// trusted.
+    #[test]
+    fn pairing_keeps_every_definition_before_its_uses() {
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0x1b, 0x64, 0xac, 0, 0];
+        let builder = IrBuilder::new(2, 2);
+        let mut graph = builder.build(&code, 8).expect("build failed");
+        ir_optimize::optimize(&mut graph);
+        let sched = schedule_with_options(
+            &graph,
+            &ScheduleOptions {
+                pair_single_use_operands: true,
+                ..ScheduleOptions::default()
+            },
+        );
+        for block in &sched.blocks {
+            let mut seen = std::collections::HashSet::new();
+            for &nid in &block.nodes {
+                for &input in &graph.nodes[nid as usize].inputs {
+                    if input == NO_NODE {
+                        continue;
+                    }
+                    if block.nodes.contains(&input) {
+                        assert!(
+                            seen.contains(&input),
+                            "node {nid} reads {input}, which this block defines later"
+                        );
+                    }
+                }
+                seen.insert(nid);
+            }
+        }
+    }
+
+    /// A single-use operand must not be sunk past anything a deopt can arrive
+    /// at: it is undefined there, and `graph.safepoints` names the whole
+    /// operand stack at every bci.
+    ///
+    /// `idiv` is the available trapping node — it deopts on a zero divisor
+    /// after reading its operands.
+    #[test]
+    fn pairing_does_not_sink_past_a_node_a_deopt_can_reach() {
+        let code = [
+            0x1a, // iload_0
+            0x1b, // iload_1
+            0x60, // iadd     <- a single-use operand of the outer iadd
+            0x1a, // iload_0
+            0x1b, // iload_1
+            0x6c, // idiv     <- can deopt
+            0x60, // iadd
+            0xac, // ireturn
+            0, 0,
+        ];
+        let builder = IrBuilder::new(2, 2);
+        let Some(mut graph) = builder.build(&code, 8) else {
+            return;
+        };
+        ir_optimize::optimize(&mut graph);
+        let sched = schedule_with_options(
+            &graph,
+            &ScheduleOptions {
+                pair_single_use_operands: true,
+                ..ScheduleOptions::default()
+            },
+        );
+        for block in &sched.blocks {
+            let Some(div) = block
+                .nodes
+                .iter()
+                .position(|&n| matches!(graph.nodes[n as usize].op, Op::Div))
+            else {
+                continue;
+            };
+            for &i in &graph.nodes[block.nodes[div] as usize].inputs {
+                if i == NO_NODE {
+                    continue;
+                }
+                if let Some(pos) = block.nodes.iter().position(|&x| x == i) {
+                    assert!(
+                        pos < div,
+                        "an operand of the trapping node was sunk past it"
+                    );
+                }
+            }
         }
     }
 

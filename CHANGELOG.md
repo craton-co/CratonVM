@@ -7,6 +7,512 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-12 `Properties` built a 144-byte bucket array that no `Properties` method reads
+
+`java.util.Properties` keeps its entries in three places, and the inherited
+`Hashtable.table` is not one of them: a String->String pair goes to a Rust
+side-table, anything else to the real `map` `ConcurrentHashMap`, and the bucket
+array holds nothing at all -- `map_carrier_class_for_receiver` had the
+measurement in a comment already, `occupied=0` with `size=2`. Both constructors
+allocated one anyway, via `map_init_eager`, because `Properties` is deliberately
+excluded from `CF_HASHTABLE_LAYOUT` and so fell through to the generic arm of
+`map_init_inner` and its `Object[16]`.
+
+```text
+  empty          224.0 -> 80.0     HotSpot 120.3    (1.86x -> 0.67x)
+  four entries  1128.0 -> 984.0    HotSpot 335.4    (3.36x -> 2.93x)
+```
+
+The empty row now sits below HotSpot, which allocates its `ConcurrentHashMap` in
+the constructor where this VM allocates it on demand. The four-entry row is new
+-- `probes/CollectionShapeCause.java` had no `Properties` row in its filled
+table -- and is the measurement that matters: it falls by the SAME 144 bytes as
+the empty row, so the array was carrying nothing rather than being moved. The
+2.93x that remains is `ConcurrentHashMap`'s number, not this class's: on both
+VMs the per-entry cost of a filled `Properties` is the per-entry cost of the CHM
+underneath it (792.0 vs 275.0, 2.88x), and narrowing that has its own record.
+
+The old comment at both call sites named the risk -- "leaving it null would make
+`map_state` report no buckets on a receiver whose native put path does not go
+through `map_resize`" -- and it does not apply here.
+`register_properties_sidetable` runs after `register_collections_natives` in
+both `vm_init` arms and overwrites every Map method on the class, none of which
+touches a bucket table; the one path that could reach them opens with
+`if initial_buckets.is_none() { map_resize(..) }` already; and
+`system_properties_object` has been handing out a bucket-less `Properties` --
+the one `java.home` is read from during bootstrap -- since it was written.
+HotSpot settles it rather than any of that: its own `new Properties()` leaves
+`table` null, `loadFactor` 0.0 and `threshold` 0, so the eager array was a
+divergence as well as a cost. The two VMs now agree field for field on a filled
+one, `map` a 4-entry CHM and `table` null.
+
+`probes/PropertiesBacking.java` is new and is what made the change safe: every
+method `javap -p java.util.Properties` lists bar four, against a HotSpot oracle,
+driven as a gate by `vm/tests/properties_backing.rs`. It caught a live defect
+older than this change. `native_properties_remove` opened with
+`read_java_text(..).unwrap_or_default()` and returned null on an empty result,
+before consulting the CHM -- so removing a non-String key did nothing and said
+nothing:
+
+```text
+  p.put(Integer.valueOf(3), "byIntKey");
+  p.remove(Integer.valueOf(3))  ->  null   (HotSpot: "byIntKey")
+  p.size()                      ->  3      (HotSpot: 2)
+```
+
+The entry survived its own removal and `size`/`keySet`/`containsKey` all went on
+reporting it, with no exception anywhere. The empty String took that same return
+and needed the opposite treatment -- `setProperty` puts it in BOTH stores where
+`put` puts it only in the CHM -- which the probe also caught, on the first cut of
+the fix.
+
+### 2026-09-12 `CopyOnWriteArraySet` was backed by a LinkedHashMap, and `removeIf` was the only method that said so
+
+`register_hashset_natives` mirrors the whole `java.util.HashSet` surface onto
+`CopyOnWriteArraySet`, on the stated premise that it is one of "HashSet's
+real-JDK subclasses that share the same `field 0 = backing map` layout". It is
+neither: it does not extend `HashSet`, and the ONE instance field the real class
+declares is `private final CopyOnWriteArrayList<E> al` — at exactly that slot 0.
+So `native_hs_init` stored a `LinkedHashMap` in a slot declared to hold a list.
+
+Nineteen methods, twenty registered triples, and `removeIf` in neither set — so
+its real body ran:
+
+```text
+  cowSet.removeIf(p)
+    -> NoSuchMethodError: java.util.LinkedHashMap.removeIf(java.util.function.Predicate)
+```
+
+Every other method looked correct because a native stood in front of it. Which
+ones are silent is a function of which triples the registrar happens to carry,
+which is why the guard below is the whole declared surface rather than the one
+method that broke.
+
+It cost the class its size as well. Retained heap against HotSpot on the same
+probe:
+
+```text
+  empty          112.0 -> 72.0     HotSpot 56.1     (2.00x -> 1.28x)
+  four entries   512.0 -> 120.0    HotSpot 88.3     (5.80x -> 1.36x)
+```
+
+The four-entry row is the larger half and had never been measured:
+`probes/CollectionShapeCause.java`'s filled table had no `CopyOnWriteArraySet`
+row, so a `LinkedHashMap` holding four entries — 488 bytes where HotSpot holds a
+six-element `Object[]` — was invisible. It has a row now.
+
+`cow_set_route` takes a real receiver to its own bytecode, method by method,
+from the top of each of the twenty natives — the placement `ksv_route` already
+uses, so the interface-level registrations (`java/util/Set.size()` and friends)
+are guarded by the same test as the exact-class ones. "Real" is a by-NAME
+question, not a mode flag: `is_real_cow_array_set` asks whether the receiver's
+class resolves `al`, so a fabricated stub keeps the map surface, where that
+surface IS the implementation. Delegation rather than a second implementation
+because the object underneath is already right — `CopyOnWriteArrayList` writes
+`lock` and `array` by name, runs the JDK's own constructor, and measures 48.0
+against HotSpot's 40.0. The one method that cannot go that way is `stream()`, a
+`Collection` default whose body builds a real `java.util.stream` pipeline; it
+takes the elements through the delegated `toArray()` and builds this VM's
+carrier, as every other `*_stream` native does.
+
+`probes/CowSetBacking.java` is the coverage that made the move safe — every
+method `javap -p` lists plus the four it inherits, asserting insertion ORDER
+throughout, because that is the observable separating a list-backed set from a
+hash-backed one. `vm/tests/cow_array_set_backing.rs` drives it as a gate and was
+mutation-checked: it FAILS on the pre-fix binary with exactly the
+`NoSuchMethodError` its message describes.
+
+Verified on both arms from the same commit: real-JDK `PASS CowSetBacking` and
+`PASS CollectionSlotFloor`, regression-suite 95/95, tier1 58/58;
+synthetic-JDK verdict-identical to an unchanged tree on both probes (the same 15
+and 14 outcomes, the same 127 `field index OOB`), which is the acceptance
+criterion rather than green.
+
+### 2026-09-12 The synthetic slot floor was ONE number for TWO layouts, and six collection classes paid for it
+
+`synthetic_stub_fields` is read in two places that mean different things. It
+DEFINES the layout of a fabricated stub, and it FLOORS the layout of a class
+defined from real class-file bytes. The second reading is load-bearing for
+`java.net.InetSocketAddress` — one declared field, and a native `<init>` that
+writes raw synthetic indices on the real class. It was a fiction for six
+collection classes, and padding them by even one slot costs the WHOLE object:
+`ClassStore::build_compact_layout` refuses any padded class, because a padded
+slot has no descriptor and its oop-map entry would be a guess, so every slot
+falls back to the legacy uniform 16-byte tagged cell.
+
+Retained heap per empty instance, against HotSpot on the same probe:
+
+```text
+  java.util.Properties                          544 -> 224   (4.5x -> 1.9x)
+  java.util.concurrent.ConcurrentLinkedQueue    112 ->  64   (2.3x -> 1.3x)
+  java.util.concurrent.ConcurrentLinkedDeque    120 ->  72   (2.5x -> 1.5x)
+  java.util.ArrayDeque                          232 -> 184   (2.1x -> 1.6x)
+  java.util.LinkedHashSet                       152 -> 112   (1.9x -> 1.4x)
+  java.util.HashSet                             128 ->  88   (2.0x -> 1.4x)
+  java.util.concurrent.CopyOnWriteArraySet      136 -> 112   (2.4x -> 2.0x)
+```
+
+Six of the seven land in the 1.2x-1.7x band the rest of the collections occupy,
+which is reference width and a separate subject. `CopyOnWriteArraySet` does not,
+and its object IS compact now — the remainder is that this VM's Set surface
+backs it with a `LinkedHashMap` (88 B) where the JDK backs it with a
+`CopyOnWriteArrayList` (48 B). That is a different change.
+
+`ClassManager::apply_synthetic_floor` is now the one place the floor is applied;
+both callers used to open-code the same `max`. `FLOOR_EXEMPT_CLASSES` beside it
+carries the six with the real extent each was screened against, and a class
+whose loaded shape disagrees with that number is reported rather than silently
+exempted. `java.util.ArrayDeque` is NOT in that list: it needed a correction,
+not an exemption — its fourth slot held a count `ad_state` stopped reading on
+2026-08-30, so the table now declares the three the real class declares.
+
+**Six factories had to be converted first, and each was a live defect on its
+own.** They built an array-backed set by writing absolute slots 0/1/2 on a real
+`HashSet` receiver — the MAP layout, on a class whose one real field is
+`map` — so every real `Set` method dereferenced an `Object[]` and answered for
+an EMPTY set: `Selector.selectedKeys()` and `.keys()` (twice, in `net_channels`
+and in `servlet`), `ModuleLayer.modules()` (the twin of the registrar whose
+identical shape NPE'd Tomcat's web-fragment scan),
+`ZoneId.getAvailableZoneIds()`, and the JMX `queryNames`/`queryMBeans`
+fallback. All six now go through one helper that allocates the real width and
+runs the class's own `<init>` and `add`, which is correct in both modes.
+
+**A screen, so the population is a list rather than an argument.**
+`t9d_floor_exempt_classes_have_no_oversized_factories` is T9C run the other way:
+T9C asserts a fabricated table is at least as wide as its own factories, T9D
+asserts a floor-EXEMPT class has no factory wider than its real layout. A site
+that has already asked `is_class_synthetic_stub` is excused, because it knows
+its receiver is fabricated. It also refuses a stale exemption — one that no
+longer pads anything is a claim about a class, not a live exemption.
+
+**`probes/CollectionSlotFloor.java` had been hiding its own tail.** In the
+synthetic-JDK arm — the arm that matters when a floor moves — a missing
+`LinkedList.indexOf` threw at section six of fourteen, so the eight sections
+after it were never reached and their silence read as agreement. Each section
+now runs under a wrapper that records an ERROR row instead of ending the run,
+and the file grew the coverage these six classes needed: deque and FIFO ORDER
+(which `size`/`contains` cannot see), `ArrayDeque` past its ring-buffer wrap,
+and the `Properties` `defaults` chain.
+
+Validated on both arms against binaries built from the same commit: real-JDK
+`CollectionSlotFloor` PASS with the extended sections and an identical
+descriptor-coercion census; synthetic-JDK **verdict-identical** to an unchanged
+tree (the same 14 outcomes, the same 127 `field index OOB` warnings), which is
+the acceptance criterion rather than green. `regression-suite` 93/93, tier1
+58/58, `cratonvm-native-builtins` 4253/0, `cratonvm-classloading` +
+`cratonvm-native-collections` 1179/0.
+
+### 2026-09-11 The receiver species is mostly ARRAYS: 20 more fixed, and a screen so the population cannot grow quietly
+
+The BindableTests residual fixed earlier today was one native holding a
+receiver across a `<clinit>`. Screening the same shape across every native
+crate says it is neither rare nor mostly about `set_field`: the commonest form
+is building a Java array and filling it, which holds the ARRAY's address across
+every element's allocation.
+
+Twenty of those are fixed, each by rooting the reference in a
+`NativeHandleScope` and reading it back after the allocation —
+`Throwable.getStackTrace()` and `Thread.getStackTrace()` (array, element,
+three strings and a class mirror per frame), `fill_stack_trace_element`,
+`System.getenv()`, `Properties.setProperty`'s growth path, `String.lines()`,
+`ConcurrentSkipListMap.put` (its `compareTo` runs Java on every probe of the
+search loop), the JSON tree builder, both StAX readers,
+`Locale.getAvailableLocales`, `InetAddress.getAllByName`, `Module.getModules`,
+`ChoiceFormat`, `BigInteger(int, byte[])`, `ClassLoader.getResources`,
+`PriorityBlockingQueue`, JNDI `list`, the charset map, `ServiceName`,
+`MBeanServer.unregisterMBean` and `XnioWorker.getIoThreads`.
+
+Two screens close behind them:
+
+* `[deadref-recv]` now covers `set_array_element`, `get_array_element` and
+  `get_field`, not just `set_field` — the array store is where this species
+  lives, and a READ through a vacated receiver silently answers whatever the
+  pre-move copy held.
+* `scripts/stale-handle-across-alloc-audit.py` is the static half, a sibling of
+  `stale-receiver-audit.py` (which screens a callee shape and structurally
+  cannot see a body that reuses its own local). Baseline: 283 sites in 202
+  functions — a ratchet, not a target, since a match is not a defect. It scans
+  each closure of a `register_*` function as its own body (without that, 290 of
+  an apparent 573 sites were an allocation in one closure paired with a use in
+  another), and it ships with a selftest that fails if a hazard token stops
+  matching, because a dead token looks exactly like a clean tree.
+
+`docs/internal/audits/natives-stale-handle-across-allocation-20260911.md` has
+the site table, the triage rules and the honest limits.
+
+
+### 2026-09-11 The BindableTests residual was a stale RECEIVER, and the whole probe family only ever screened values
+
+`docs/known-issues/springboot/bindabletests-assertj-objects-field-null-under-gc-stress-20260909.md`
+is retired into
+`docs/internal/springboot/bindabletests-assertj-objects-receiver-stale-across-clinit-20260911.md`.
+
+`Assertions.assertThat(Comparable)` and `assertThat(String)` are CratonVM
+natives: `native_assertj_lightweight_comparable_assert` builds the assertion
+object field by field instead of running `AbstractAssert.<init>`. The store into
+`objects` reused an `assertion` handle read BEFORE the call that runs
+`org/assertj/core/internal/Objects.<clinit>`, so on the first comparable
+assertion in a process — the only call where that `<clinit>` is still pending —
+the `<clinit>`'s allocations moved the assertion and the store landed in a copy
+nothing would read again. The surviving object kept `objects == null`, and
+`BindableTests`'
+`whenTypeCouldUseJavaBeanOrValueObjectJavaBeanBindingCanBeSpecified` failed an
+AssertJ `NullPointerException` at every `CRATONVM_DBG_GC_STRESS <= 262144`.
+Every store in that native now re-reads the pin; three more `ObjectRef`s carried
+across an allocation in the same file are fixed with it.
+
+Why it survived the sweep that fixed ten siblings on 2026-09-09, in two layers.
+Every arm of `CRATONVM_DBG_DEADREF_STORE` screens the VALUE being stored, and
+the value here (`Objects.INSTANCE`, in old gen) was live throughout —
+**`[deadref-recv]`** is the new receiver-side arm of the same switch, pinned by
+a unit test. And this store never reached the heap at all:
+`NativeContext::set_field_by_name` resolves the field against the class of
+whatever is AT the address it is handed and **drops the store silently** when it
+does not resolve, one level above `set_field`, where no heap probe can see it.
+**`[field-by-name-dropped]`** is that arm — counted always, with a non-zero
+total printed at exit, and named per distinct `(class, field)` under the same
+switch. On the unfixed binary it prints
+`recv_class=java/lang/Object recv_class_id=0 field="objects"` with
+`native_assertj_lightweight_comparable_assert` in the backtrace. The dedup is
+load-bearing: the same run drops 2 710 stores, ~2 700 of them one benign shape.
+
+Three instrument gaps closed alongside it. The compact reference store was the
+one heap write primitive with no `cell_watch_check`, so
+`CRATONVM_DBG_WATCH_CELL` answered "nobody wrote it" for a compact object's
+reference field. `[GETFIELD-WATCH]`/`[PUTFIELD-WATCH]` printed the receiver's
+address and nothing else, which cannot tell "the same object, moved" from "a
+different object at a recycled address"; they now print its class, `num_slots`,
+`gc_flags`, whether the heap still calls it an object start, and the field's
+layout-aware byte address. And **`CRATONVM_DBG_OBJ_WATCH=<class-substring>`** is
+new: it follows an OBJECT rather than an address — one `[OBJWATCH]` line per
+evacuation with the source body words, plus one per `set_field` with the Rust
+caller — which is what an address watch cannot do when a semispace is re-served
+from the same base every cycle.
+
+`BindableTests` 27/27 at 65 536, 131 072, 262 144, 262 144 `--nojit`, 393 216,
+524 288 and unset; every `[deadref-*]`, `[tlab-audit]`, `[heap-stale]` and
+`[RESID-DIAG]` counter zero and 42 589 `[rset-verify]` reports with `missing=0`
+on the 262 144 run.
+
+
+### 2026-09-11 The loop control: a folded immediate, and `LEA` for the increment
+
+The residue `c2-a-fused-compare-can-read-its-operands-where-they-are-20260910.md`
+left behind, finished and the page retired.
+
+A fused compare now has four forms instead of two. It already read two resident
+operands in place, and a resident one against a frame slot; it now also folds a
+CONSTANT second operand into the instruction, with the first operand read from
+either its register or its frame slot. `i < 100` is the shape of most Java
+loops, and it used to cost `mov rax,rbx ; mov ecx,64h ; cmp eax,ecx` where
+`cmp ebx,64h` does. `CRATONVM_JIT_IR_CMP_IN_PLACE=0` remains the kill switch for
+all four.
+
+`x + k` and `x - k` lower to one `LEA` where `k` is a constant and `x` is
+resident — `lea eax,[rbx+1]` for `mov rax,rbx ; add eax,1`, or
+`lea r14d,[rbx+1]` for the three-instruction form when the result has a register
+of its own. New flag `CRATONVM_JIT_IR_ADD_LEA=0`.
+
+Instructions AND bytes fall wherever either fires — 189/933 to 186/922 on
+`LoopCtl.spin`, 200/1190 to 196/1178 on `PollReach.hotLoop`, and the two levers
+are additive to the instruction. **No speedup is claimed**: the build host's
+noise floor between two identical binaries reached 14.6% during the A/B, so the
+timing is a null. See
+`docs/internal/retired/c2-a-fused-compare-can-read-its-operands-where-they-are-RETIRED-20260911.md`
+§8 for why, in numbers.
+
+Four `CRATONVM_*` names that were read by code but declared nowhere —
+`CRATONVM_JIT_IR_ADD_LEA`, `CRATONVM_JIT_IR_CMP_IN_PLACE`,
+`CRATONVM_JIT_IR_CARRY_2ND` and `CRATONVM_JIT_IR_PAIR_OPERANDS` — now have rows
+in `flag_groups.rs::INVENTORY` and the generated flag docs, so they are served
+from the latched `VmFlags` snapshot rather than a live `getenv`.
+
+New probes `probes/CmpImm.java` (timing and census) and `probes/CmpImmProbe.java`
+(differential against HotSpot: the `imm8`/`imm32` boundary in both signs, a
+`long` constant outside `i32`, `Integer.MIN_VALUE` as a bound and as an addend,
+a spilled first operand, and a reference against `null`).
+
+
+### 2026-09-10 The safepoint poll's flag byte, from the code cache's own allocator
+
+The second half of the placement problem `CRATONVM_JIT_CODE_NEAR_GLOBALS`
+opened. That strategy moves the CODE to the globals: it hints `mmap` to place
+each buffer within 1.5 GB of `layout_replace_epoch_guard()`, and the safepoint
+flag comes along because it is a few hundred megabytes away in the same
+mimalloc band. It is **default OFF**, so on a default Linux run the code buffer
+is still ~130 TB from the flag and every back-edge poll and method-entry poll
+in the process still emits `MOV R11, imm64 ; TEST BYTE [R11], 0FFh` — 15 bytes
+and a clobbered register — instead of the 7-byte `TEST BYTE [rip+disp32], 0FFh`
+the 2026-09-02 work added. Nothing fails; the fallback reads the same byte and
+branches the same way, which is why it went unnoticed.
+
+For that default configuration the flag now comes from
+`platform::alloc_code_adjacent_cell` — a bump allocator over 64 KiB chunks
+taken from the same `mmap(NULL, …)` / `VirtualAlloc(NULL, …)` that
+`alloc_executable` hands the code cache, carving 64-byte cache-line-isolated
+cells that are never unmapped. `CacheLineFlag` becomes a `&'static AtomicBool`
+into one; its four methods are unchanged, so all 75 `stw_requested` call sites
+are untouched.
+
+**The two strategies now compose, where `82bf52efd` correctly said they could
+not.** `alloc_code_adjacent_cell` returns `None` when
+`CRATONVM_JIT_CODE_NEAR_GLOBALS` is engaged, and `CacheLineFlag` falls back to
+the leaked `Box` — so with that flag on, the flag stays in the allocator band
+its anchor lives in and behaviour is bit-identical to before this change. The
+same reasoning that made `alloc_epoch_page` wrong for the epoch counter makes
+declining the cell right here: whoever owns the placement must own it for every
+cell at once, and `near_globals` owns it whenever it is on.
+
+Placement is a hint either way — the OS picks — so both emitters keep their
+per-site ±2 GB test and their fallback. Two tests assert the reach, one of them
+through `stw_requested_flag_addr` itself, and both skip when `near_globals` is
+engaged.
+
+`execute_frame` hoists the flag REFERENCE once, beside the existing
+`async_exception_slot` hoist. This is not the hoist the loop-top comment
+refuses: that one caches the flag's VALUE at frame entry and would cut poll
+frequency, which is time-to-safepoint. Every poll still loads the byte; what is
+resolved once is the address, which is now a pointer indirection and one whose
+source word shares a line with `gc_generation`, `threads_blocked` and the
+barrier mutex.
+
+Measured Windows x86-64, before and after, same tree: 489 MiB apart before,
+**128 KiB** after, short form on both — Windows already lands in reach, which is
+why `near_globals` does not build there either. **The Linux confirmation is
+still owed and is the one that matters.** See
+`docs/internal/performance/safepoint-poll-flag-was-on-the-rust-heap-FIXED-20260910.md`.
+
+Found while verifying it: `CRATONVM_JIT_RIP_SAFEPOINT_POLL=0`, the lever for
+pricing the two encodings inside one binary, reached only the single-pass
+backend. `ir_lower.rs::emit_safepoint_poll` — the optimizing tier, where
+everything hot is compiled — called its RIP emitter unconditionally, so on a
+real workload the switch moved **2 of 394** poll sites. Both gates in
+`x64/licm.rs` are now `pub(crate)` and the lowerer calls them; the switch moves
+398 of 398, and both arms print the same answer.
+
+### 2026-09-09 `checkcast` / `instanceof` in a spliced callee — the third rebase, and the bug it uncovered
+
+The third instance of one pattern, after `ldc` and `getstatic`: `IrBuilder` has
+had `0xc0`/`0xc1` arms since cov-05, and the splice scanner refused the shape
+for both tiers in one arm — so the optimizing tier inherited a refusal that
+belongs to the single-pass emitter, which genuinely has no arm for either. It
+fell on the commonest accessor in typed Java: the survey that motivated those
+arms counted 306 events on this pair, the largest single whole-method refusal it
+found, more than every opcode gap combined.
+
+Unlike `getstatic`, there were no rows to rebase — `InlineSite` gains
+`ir_typecheck_info` and the resolver fills it against the CALLEE's constant
+pool, the only pool that can name the target. An unresolved target refuses the
+callee, because a missing row bails the whole method. A spliced `checkcast`
+also carries the `has_dispatch` obligation its caller-side twin does: a
+definitive refusal publishes its `ClassCastException` through the `JIT_THREAD`
+TLS the no-dispatch fast entry never sets.
+
+Reach: spliced bodies 2 → 6 on `bench/SpliceCastProbe.java`. Throughput: the
+body it produces is ~30% faster (~133 ms against ~193 ms on
+`bench/SpliceCastArrayProbe.java`, 34 interleaved rounds, a mode the off arm
+never reaches), and the run median is NEUTRAL because that body is installed in
+about a quarter of runs — the tier race, not this lane.
+
+Found in passing and NOT fixed: on `SpliceCastProbe` the optimizing body is ~3x
+slower than the single-pass one in BOTH arms, and `ir blind dispatches:
+own_code=0 in_splice=1` names the suspect — a surviving `invokevirtual`
+(`ArrayList.elementData`) inside a relocated body that got neither a direct bind
+(correctly — it is virtual) nor the MIC/PIC cascade it should have. Written up
+as the next thing to look at. `CRATONVM_JIT_IR_SPLICE_TYPECHECK=0` restores the
+refusal.
+
+### 2026-09-09 A `getstatic` in a callee cost the optimizing tier the inline, and the calls a splice left behind were name resolutions
+
+The C2 tier published a body **15x slower than the C1 body it replaced** on the
+callee shape framework code is mostly made of — a hot method whose accessors
+read statics — and the default acceptance gate only avoided it by abandoning
+the supersede for an unrelated reason on most runs.
+
+Two causes, both plumbing. A callee containing `getstatic` was refused for
+splicing because nothing rebased its already-resolved rows into
+`IrInlineTables`; and a statically-bound call that SURVIVED a splice got no
+`ir_direct_calls` row, so it fell through to `jit_invoke_dispatch` and resolved
+its callee by name on every execution. The second is the expensive one and it
+is worse than not splicing at all: the resolver had bound the callee entry and
+registered it on the artifact's keep-alive list, so the compile paid to pin a
+target for a direct call it never emitted.
+
+Measured per BODY, because whether the optimizing body is installed before a
+timed loop starts is a race and a run median mixes the two: on
+`bench/SpliceStaticProbe.java` the optimizing body goes **~830 ms → ~23 ms**
+(from 15x worse than the single-pass body to 2.4x better), and on
+`bench/SpliceCallProbe.java` **~455 ms → ~57 ms** (from 8.5x worse to parity).
+Single-pass is 56 ms in every arm, every sample checksum-matched to Temurin
+JDK 25. All seven `CratonBench` phases are inside 1% with matching checksums;
+92 of 92 fast-regression vectors match HotSpot. `CRATONVM_JIT_IR_SPLICE_GETSTATIC=0`
+and `CRATONVM_JIT_IR_SPLICE_DIRECT_CALL=0` restore the old behaviour arm for
+arm. `putstatic` stays refused — the builder has no arm for it, and a static
+reference write owes an SATB pre-barrier the single-pass path carries.
+`[c2-supersede] ir blind dispatches: own_code=N in_splice=M` gives the failure a
+reading: a non-zero `in_splice` says that method's optimizing body is very
+likely slower than its single-pass one.
+
+### 2026-09-08 `new Object()` published sixteen zero bytes, so `System.gc()` kept every one of them
+
+`java/lang/Object` is `ClassId(0)`, a field-less object's `shape` is `0`, and
+`MARK_NEUTRAL` / `ObjectKind::Object` / `ArrayElementType::Reference` all encode
+as `0` — so the commonest object in Java reached the heap as sixteen zero bytes,
+byte-for-byte identical to reclaimed, zeroed, unlisted arena space. The young
+non-moving sweep, which every `System.gc()` diverts to, cannot parse that: runs
+of such objects were either stepped over without being freed or treated as a
+walk desync that unwound every reclaim decision since the last anchor. An
+allocation-only workload retained ~100% of its garbage under
+`-XX:+UseGenerationalGC`, ~2.1 MB a round, monotonic, until the collector
+thrashed — `ChurnLoop 40 125000` did not finish inside 300 s.
+
+`GC_FLAG_HEADER` (mark-word bit 59) now says *these bytes are a published object
+header*. It is set by `ObjectHeader::new` and by both JIT inline-allocation
+emitters, never cleared, and preserved by every mark-word transition. HotSpot has
+never had the problem for the same reason it needs no such bit: its unlocked mark
+word is `0b01`. `ChurnLoop` is flat and finishes 40 rounds in 1.4 s;
+`zero_spans`, `zero_empty_runs` and the sweep's `live_inside` refusals all go to
+zero, and `SWEEP_NO_HEADER_FLAG` — new, printed unconditionally in the
+young-sweep census — measures the allocator invariant rather than assuming it.
+
+Second, separable defect on the same page: `Runtime.freeMemory()` answered from
+the young arena's raw bump cursor, which the in-place sweep never retreats, so
+the reported heap filled once and never emptied. `heap_allocated_bytes` now
+answers from `live_bytes_estimate` (`young.used − young.free_list + old.used`),
+which is what its own doc always described.
+
+`org.h2.test.unit.TestValueMemory` under `-XX:+UseGenerationalGC` goes from FAIL
+at Type 0 (`Used memory: 7018`, 7.2x a 3x threshold) to PASS on all 40 types with
+a worst row of 2.30x. The remaining distance to HotSpot's 0.5x is measured and
+attributed: it is conservative JIT-frame root retention, and `--nojit` reads
+976-977 on every arm. That also turned up a failure nobody had run for — the same class
+fails under `-XX:+UseG1GC`, identically on the binary before this work, because
+G1's conservative roots retain at region granularity; split out as
+`docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+rather than folded in here. Full write-up:
+[`docs/internal/fixed-bugs/h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908.md`](docs/internal/fixed-bugs/h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908.md).
+
+The VM had already met these sixteen bytes three times and written each one down
+as a cost rather than a defect, none of them naming the collector: `invoke.rs`
+demoted its "Stale pointer detected" WARN to `debug!` for `java/lang/Object`
+call sites because "a bare `new Object()` IS all-zero, legitimately";
+`h1_tlab_object_header_has_nonzero_hash_at_allocation` was *inverted* from
+`assert_ne!` to `assert_eq!` on exactly that array; and `init_object_header`'s
+doc claimed an eager identity hash that had not existed since the 24 → 16
+shrink. All three are corrected, and the WARN is restored for `Object`
+(`ClassLoader` keeps its separately-justified demotion) — measured at zero
+"Stale pointer detected" lines across the suite, the H2 corpus and the probes on
+all three collectors. The eager hash all three reach for is the wrong repair:
+minting one at allocation makes every `synchronized` block lose its thin-lock
+CAS and inflate a monitor.
+
+Adding the flag also inverted two "list of every defined flag" screens that had
+to grow it in the same commit: `concurrent_mark_object_size`'s `known_flags` —
+without which G1's concurrent mark refused every gray entry as a torn header,
+took `cleanup`'s retain-everything fail-safe and stopped unloading classes — and
+`header_reserved_fields_plausible`, whose `gc_flags` clause became a tautology
+and which now screens the mark word's two reserved bits instead.
+
 ### 2026-09-02 `String` is `final`, and that is what killed its own intrinsic — 170x on `charAt`
 
 `String.charAt` in a compiled counted loop cost ~400 ns/char while a
@@ -608,7 +1114,7 @@ First systematic validation of the GPU offload stack on real hardware (RTX
 day: a morning validation run that found and fixed two dispatch-correctness
 bugs, and an evening feature wave that closed most of the follow-ups the
 morning pass turned up. See
-`docs/known-issues/gpu-offload-followups-20260711.md` for full detail and
+`gpu-offload-followups-20260711.md` for full detail and
 remaining open items.
 
 #### Fixed (morning validation pass)
@@ -631,7 +1137,7 @@ remaining open items.
 #### Known follow-ups
 - `GpuFuture` completion is now poll-driven but still not push-driven: `isDone()`/`getNow()` do a real non-blocking device check and finalize inline, but nothing drives that check without an application thread calling it — no background thread or driver callback completes a future on its own yet.
 - 2-D/nested loops and general (non-loop-guard) branches are still rejected by the analyzer; `)F`/`)D` reductions remain CPU-only by design.
-- Full open-items list in `docs/known-issues/gpu-offload-followups-20260711.md`.
+- Full open-items list in `gpu-offload-followups-20260711.md`.
 
 ---
 

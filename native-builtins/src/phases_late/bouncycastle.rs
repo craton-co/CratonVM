@@ -5525,7 +5525,14 @@ pub(crate) fn bc_digest_update_counter_virtual(
     counter: i64,
 ) -> MethodCallResult {
     let mut value = counter as u64;
+    // GC-safety: `update` is real BouncyCastle bytecode -- it allocates, and a
+    // moving young collection relocates `digest`. `digest` is a bare Rust local
+    // carried into all EIGHT turns of this loop, so from turn two on the
+    // dispatch is on a pre-GC address. Pin once, re-read at the top of the
+    // body (the shadow leaves the outer binding alone).
+    let digest_pin = ctx.pin_native_root(digest);
     for _ in 0..8 {
+        let digest = ctx.read_native_pin(digest_pin, digest);
         ctx.invoke_virtual(
             digest,
             "update",
@@ -5639,7 +5646,23 @@ pub(crate) fn bc_digest_random_next_virtual(
         &mut seed_counter,
     )?;
 
+    // GC-safety: `bc_digest_random_generate_state_virtual` dispatches
+    // `Digest.update`/`doFinal` -- real bytecode that allocates -- and it runs
+    // INSIDE this loop, once per state refill. Every reference the body carries
+    // in from outside (`this`, `digest`, and both byte arrays, one of which is
+    // read and one written on EVERY turn) is a bare Rust local nothing
+    // rewrites. Pin all four and re-read at the top of the body.
+    let this_pin = ctx.pin_native_root(this);
+    let digest_pin = ctx.pin_native_root(digest);
+    let state_pin = ctx.pin_native_root(state_arr);
+    let seed_pin = ctx.pin_native_root(seed_arr);
+    let bytes_pin = ctx.pin_native_root(bytes);
     for i in start..start + len {
+        let this = ctx.read_native_pin(this_pin, this);
+        let digest = ctx.read_native_pin(digest_pin, digest);
+        let state_arr = ctx.read_native_pin(state_pin, state_arr);
+        let seed_arr = ctx.read_native_pin(seed_pin, seed_arr);
+        let bytes = ctx.read_native_pin(bytes_pin, bytes);
         if state_off == state_len {
             bc_digest_random_generate_state_virtual(
                 ctx,
@@ -5652,10 +5675,14 @@ pub(crate) fn bc_digest_random_next_virtual(
             )?;
             state_off = 0;
         }
+        // Re-read once more: the refill above ran bytecode.
+        let state_arr = ctx.read_native_pin(state_pin, state_arr);
+        let bytes = ctx.read_native_pin(bytes_pin, bytes);
         let v = ctx.get_array_element(state_arr, state_off);
         ctx.set_array_element(bytes, i, v);
         state_off += 1;
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -9591,7 +9618,18 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
             let use_aes = kw.len() >= 2;
 
             let _ = iv_last;
+            // GC-safety: the non-AES arm below dispatches `processBlock` -- real
+            // BouncyCastle bytecode -- once per block, and `cipher` and both
+            // counter arrays are bare Rust locals bound before the loop. From
+            // the second block on the dispatch and the two array arguments are
+            // pre-GC addresses.
+            let cipher_pin = ctx.pin_native_root(cipher);
+            let counter_pin = ctx.pin_native_root(counter_arr);
+            let counter_out_pin = ctx.pin_native_root(counter_out_arr);
             for i in 0..len {
+                let cipher = ctx.read_native_pin(cipher_pin, cipher);
+                let counter_arr = ctx.read_native_pin(counter_pin, counter_arr);
+                let counter_out_arr = ctx.read_native_pin(counter_out_pin, counter_out_arr);
                 let next;
                 if byte_count == 0 {
                     // checkLastIncrement — BOTH branches. Anything already
@@ -9642,7 +9680,11 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
                 out_buf[i] = next;
             }
 
-            // Persist mutated state + output.
+            // Persist mutated state + output, through the pins: the loop
+            // above ran bytecode.
+            let counter_arr = ctx.read_native_pin(counter_pin, counter_arr);
+            let counter_out_arr = ctx.read_native_pin(counter_out_pin, counter_out_arr);
+            ctx.unpin_native_roots(cipher_pin);
             ctx.write_byte_array_from(counter_arr, 0, &counter);
             ctx.write_byte_array_from(counter_out_arr, 0, &keystream);
             ctx.set_field_by_name(this, "byteCount", Value::Int(byte_count));
