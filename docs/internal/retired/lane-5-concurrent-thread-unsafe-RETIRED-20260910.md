@@ -1483,6 +1483,29 @@ wave's rows off. It is the previous wave's bookkeeping — lane 1's wave 7 recor
 `13586 / 13954 / 13621` as its own landing-tree totals in its doc comment and
 left the three constants at the values from before it landed.
 
+### 9d.9 The corpus, three arms, both binaries
+
+```text
+  arm                            scheduled   base    trial
+  CRATONVM_ARGS=--jdk-only         136       136/0   136/0
+  SUITE=all                        136       136/0   136/0
+  SUITE=core                        95        95/0    95/0
+```
+
+Both `CV` and `JDK` are set on every arm. `run.sh` defaults `CV` to
+`target/release/cratonvm.exe` and `JDK` to a Windows Java home, neither of which
+exists on this host, and an arm that falls back to them runs nothing and still
+exits clean.
+
+Three arms and only two schedules: `SUITE=core` alone is 95 vectors, and both
+the other arms are 95 plus the 41 `RJdk*` vectors. `CRATONVM_ARGS=--jdk-only`
+adds them because `run.sh` reads the MODE, not because `SUITE` changed — worth
+knowing before reading two 136s as one arm having been skipped.
+
+The first arm's `rev=` line names a scratch commit this branch briefly carried.
+The working tree was byte-identical across that reset, so it is the same tree
+the other five arms ran.
+
 ## 9e. The defect the new probe found on its first run: `invokeCleaner` frees nothing and says nothing
 
 `Unsafe.invokeCleaner(ByteBuffer)` releases a direct buffer's off-heap memory.
