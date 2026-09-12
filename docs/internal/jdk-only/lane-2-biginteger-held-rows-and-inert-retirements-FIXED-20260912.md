@@ -233,6 +233,13 @@ are not the numbers of a binary the sources have moved past.
   SUITE=all                  134 passed, 0 failed
   SUITE=core                  93 passed, 0 failed
 
+  and again on the MERGED tree (25 dev commits), binary 293c7a622331d3ca,
+  working tree clean:
+  probe, both modes           30 rows, 0 differing
+  CRATONVM_ARGS=--jdk-only    41 passed, 0 failed
+  SUITE=all                  134 passed, 0 failed
+  SUITE=core                  93 passed, 0 failed
+
   types                      639 passed, 0 failed
   native-api --lib           429 passed, 0 failed
   native-builtins default   4285 passed, 1 failed   dev-owned, filed
@@ -280,23 +287,32 @@ report.
 
 Retiring these rows hands `mod`, `divide` and `multiply` back to interpreted
 bytecode, which `phases_late.rs` measures at roughly 460x on `BigInteger.mod`.
-Against the same three arms on dev tip without the table:
+BouncyCastle's prime search does ten `mod`s per candidate, so `RJdkSecurity` is
+the vector that would show it.
+
+Two runs, at different host loads, against the same three arms on dev tip without
+the table:
 
 ```text
-                   dev tip   this tree   ratio
-  --jdk-only           60s         93s    1.55
-  SUITE=all           245s        383s    1.56
-  SUITE=core          196s        303s    1.55
+                   dev tip   run 1   ratio    run 2   ratio
+  --jdk-only           60s     93s    1.55      57s    0.95
+  SUITE=all           245s    383s    1.56     289s    1.18
+  SUITE=core          196s    303s    1.55     233s    1.19
 ```
 
-`SUITE=all` and `SUITE=core` do not pass `--jdk-only`, so the retirement cannot
-touch them — and they moved by the same factor. **The 1.55x is the host**, which
-carried load average 15-40 from four sibling lanes throughout, and the
-retirement's own cost is smaller than that noise floor. This is not a claim that
-the cost is zero; it is a statement that these numbers cannot see it, and that no
-vector fails or times out because of it. The controlled comparison that is
-available — default versus `--jdk-only` on one binary in one run — is 11s versus
-15s on the probe.
+**`SUITE=all` and `SUITE=core` do not pass `--jdk-only`, so the retirement cannot
+touch them — they are the control for the arm that can.** In run 1 all three moved
+by the same 1.55x, which is the host (load average 15-40 from four sibling lanes).
+In run 2, on a calmer host, the two control arms are 1.18x while `--jdk-only` is
+0.95x — the one arm the retirement affects did not slow relative to the arms it
+cannot.
+
+So the cost is below this instrument's noise floor on two independent runs. That
+is not a claim that it is zero; it is a claim that no vector fails, none times out,
+and the arm carrying the retirement does not separate from its own controls. A real
+throughput number would need a parameterised `BigInteger` workload rather than a
+pass/fail corpus, which is what
+`a-timeout-carries-no-number-parameterise-the-workload-first` is about.
 
 ## 8. What this does not claim
 
