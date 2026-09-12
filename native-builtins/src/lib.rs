@@ -4294,6 +4294,7 @@ fn native_wildfly_security_manager_get_property_privileged(
 /// `grep capability_gate:: native-builtins/src` is the complete list of gated
 /// sites here; `docs/security/capability-wiring.md` records which of the audit
 /// rows in `docs/security/native-capabilities.md` they close.
+pub mod buffer_session;
 pub mod capability_gate;
 pub mod case_map;
 /// One proleptic-Gregorian calendar for the crate. Four modules had their
@@ -20928,7 +20929,19 @@ pub fn register_essential_natives_with_shims(
             buf,
             "session",
             "()Ljdk/internal/foreign/MemorySessionImpl;",
-            |_ctx, _args| Ok(Some(cratonvm_types::Value::Object(None))),
+            |ctx, args| {
+                // Record which receiver class this shim actually answered for,
+                // so the JIT's thin `session()` helper can answer for the SAME
+                // classes without the ~160 ns generic native funnel — and for
+                // no others. See `crate::buffer_session` for why the eleven
+                // registered names are not the right population to read.
+                //
+                // The value is unchanged: a constant null, as before.
+                if let Some(cratonvm_types::Value::Object(Some(this))) = args.first() {
+                    crate::buffer_session::note_served(ctx.class_id_of_object(*this).as_u32());
+                }
+                Ok(Some(cratonvm_types::Value::Object(None)))
+            },
         );
         // KEEP: genuine no-op. `checkSession()` throws only when the buffer's
         // memory session has been closed; `session()` (registered immediately

@@ -616,7 +616,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-452 tokens.
+453 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -659,6 +659,7 @@ export inherited from a parent shell.
 | `c1-vector-veto` | `CRATONVM_JIT_C1_VECTOR_VETO` |
 | `census-direct-helpers` | `CRATONVM_JIT_CENSUS_DIRECT_HELPERS` |
 | `nio-byte-direct-helpers` | `CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS` |
+| `buffer-session-direct` | `CRATONVM_JIT_BUFFER_SESSION_DIRECT` |
 | `md-update-direct-helper` | `CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER` |
 | `cached-entry-owner-reuse` | `CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE` |
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
@@ -839,6 +840,7 @@ export inherited from a parent shell.
 | `ir-partial-unroll-factor` | `CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR` |
 | `ir-sink-equal-depth` | `CRATONVM_JIT_IR_SINK_EQUAL_DEPTH` |
 | `ir-residency-crossblock` | `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK` |
+| `ir-residency-crossblock-budget` | `CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK_BUDGET` |
 | `c2-accept` | `CRATONVM_C2_ACCEPT` |
 | `c2-accept-memo` | `CRATONVM_C2_ACCEPT_MEMO` |
 | `ir-unresolved-class-trap` | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` |

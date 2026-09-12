@@ -3425,6 +3425,35 @@ fn handshake_listeners(
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
+/// The `endpointIdentificationAlgorithm` a caller set through
+/// `SSLSocket.setSSLParameters`, by the same identity-hash key as
+/// [`ssl_sock_auth_state`].
+///
+/// `SSLParameters` is CONFIGURATION and the JDK round-trips all of it. This
+/// VM read the cipher suites out of the object and dropped everything else, so
+/// `setSSLParameters(p); getSSLParameters()` lost the endpoint-identification
+/// algorithm and the client-auth flags — the caller could not read back what
+/// it had just set. MEASURED, `L6TlsParamSweep` row 83.
+///
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0). Both acquisition sites do
+/// one map operation on an `i32` key computed ABOVE the acquisition, so the
+/// guard is never held across a re-entry into the VM. A raw `parking_lot`
+/// lock here would be a new unordered global in the one crate whose natives
+/// call back into Java; the ratchet in
+/// `native-builtins/tests/lock_discipline_ratchet.rs` says so and is right.
+fn ssl_sock_endpoint_alg(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, String>> {
+    static T: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<i32, String>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            rustc_hash::FxHashMap::default(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
+}
+
 fn ssl_sock_auth_update<F: FnOnce(&mut (i32, i32, i32))>(
     ctx: &dyn NativeContext,
     this: ObjectRef,
@@ -4535,6 +4564,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(ssl_sock, "startHandshake", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // "Socket is not connected" comes FIRST, because there is nothing to
+        // hand shake with. `SSLSocketFactory.getDefault().createSocket()`
+        // returns an unconnected socket and HotSpot's `SSLSocketImpl
+        // .startHandshake` refuses it with a `SocketException`; this returned
+        // normally, which tells a caller a handshake completed on a socket
+        // that has no peer. MEASURED, `L6TlsParamSweep` row 86.
+        if !new13_socket_ever_connected(ctx, this) {
+            return Err(crate::net_phase_e::re1_socket_exception(
+                ctx,
+                "Socket is not connected",
+            ));
+        }
         // A `tls_id` at or above `RUSTLS_SOCK_ID_BASE` is a connection whose
         // handshake has already completed, which is the ONLY case where
         // `startHandshake()` means "renegotiate". `ensure_layered_handshake_started`
@@ -4896,6 +4937,34 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => o,
                 _ => try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4)?,
             };
+            // The rest of the CONFIGURATION this socket carries. The object
+            // above described only the two lists, so a caller who had just
+            // called `setSSLParameters` read back neither its client-auth
+            // choice nor its endpoint-identification algorithm — see
+            // `ssl_sock_endpoint_alg`.
+            let params_pin = ctx.pin_native_root(params);
+            let (_, need, want) = ssl_sock_auth_get(ctx, this);
+            let alg_key = ctx.identity_hash_code(this);
+            let alg = ssl_sock_endpoint_alg().lock().get(&alg_key).cloned();
+            let params = ctx.read_native_pin(params_pin, params);
+            if need != 0 {
+                let _ = ctx.invoke_virtual(params, "setNeedClientAuth", "(Z)V", &[Value::Int(1)]);
+            } else if want != 0 {
+                let _ = ctx.invoke_virtual(params, "setWantClientAuth", "(Z)V", &[Value::Int(1)]);
+            }
+            let params = ctx.read_native_pin(params_pin, params);
+            if let Some(alg) = alg {
+                let s = ctx.create_string(&alg);
+                let params = ctx.read_native_pin(params_pin, params);
+                let _ = ctx.invoke_virtual(
+                    params,
+                    "setEndpointIdentificationAlgorithm",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(s))],
+                );
+            }
+            let params = ctx.read_native_pin(params_pin, params);
+            ctx.unpin_native_roots(params_pin);
             Ok(Some(Value::Object(Some(params))))
         },
     );
@@ -4951,9 +5020,47 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            // Handshake already completed in createSocket for every OTHER
-            // socket shape; the ALPN/cipher preferences a caller sets here
-            // can no longer change anything for those. Accept and discard.
+            // The rest of the object is CONFIGURATION and has to be kept
+            // whether or not a handshake can still use it, because
+            // `getSSLParameters()` must hand it back. Only the cipher list
+            // above can still change a pending handshake; these three are
+            // recorded so the round-trip is not lossy (`L6TlsParamSweep` row
+            // 83 asked for exactly that and read `false null`).
+            if let (Ok(this), Some(Value::Object(Some(params)))) =
+                (obj_arg(args, 0), args.get(1).copied())
+            {
+                let need = matches!(
+                    ctx.invoke_virtual(params, "getNeedClientAuth", "()Z", &[]),
+                    Ok(Some(Value::Int(1)))
+                );
+                let want = matches!(
+                    ctx.invoke_virtual(params, "getWantClientAuth", "()Z", &[]),
+                    Ok(Some(Value::Int(1)))
+                );
+                ssl_sock_auth_update(ctx, this, |s| {
+                    s.1 = i32::from(need);
+                    s.2 = i32::from(want);
+                });
+                let alg = match ctx.invoke_virtual(
+                    params,
+                    "getEndpointIdentificationAlgorithm",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                    _ => None,
+                };
+                let key = ctx.identity_hash_code(this);
+                let mut table = ssl_sock_endpoint_alg().lock();
+                match alg.filter(|a| !a.is_empty()) {
+                    Some(a) => {
+                        table.insert(key, a);
+                    }
+                    None => {
+                        table.remove(&key);
+                    }
+                }
+            }
             Ok(None)
         },
     );
@@ -5039,11 +5146,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getSupportedProtocols",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
-            let s1 = ctx.create_string("TLSv1.3");
-            let s2 = ctx.create_string("TLSv1.2");
-            ctx.set_array_element(arr, 0, Value::Object(Some(s1)));
-            ctx.set_array_element(arr, 1, Value::Object(Some(s2)));
+            // Single source of truth — see `t27_tls::SUPPORTED_PROTOCOL_NAMES`.
+            // This copy was two elements while the engine's was three, so the
+            // VM disagreed with itself about what it supports.
+            let protos = crate::t27_tls::SUPPORTED_PROTOCOL_NAMES;
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), protos.len());
+            for (i, &p) in protos.iter().enumerate() {
+                let s = ctx.create_string(p);
+                ctx.set_array_element(arr, i, Value::Object(Some(s)));
+            }
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -7199,15 +7310,23 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // `registry_ordering_tests::p68_ssl_is_the_last_writer_on_the_ssl_engine_surface`
     // in `tls.rs` is the ratchet that makes a silent reordering fail.
     let ssleng = "javax/net/ssl/SSLEngine";
+    // Slot 0 of the real `sun.security.ssl.SSLEngineImpl` this VM allocates is
+    // `javax.net.ssl.SSLEngine.peerHost`, a REFERENCE. The `Int` written here
+    // was inert and the read handed a String slot back as a boolean, which is
+    // why a fresh engine reported `getUseClientMode() == true` where HotSpot
+    // reports `false` (`L6TlsParamSweep` rows 66 and 89). The role belongs
+    // with the rest of the engine's state.
     r.register(ssleng, "setUseClientMode", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        ctx.set_field(this, 0, Value::Int(v));
+        crate::t27_tls::set_engine_use_client_mode(ctx, this, v != 0);
         Ok(None)
     });
     r.register(ssleng, "getUseClientMode", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Int(i32::from(
+            crate::t27_tls::engine_use_client_mode(ctx, this),
+        ))))
     });
     r.register(ssleng, "setNeedClientAuth", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -7366,7 +7485,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getSupportedProtocols",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let protos = ["TLSv1.3", "TLSv1.2"];
+            // Single source of truth — see `t27_tls::SUPPORTED_PROTOCOL_NAMES`.
+            let protos = crate::t27_tls::SUPPORTED_PROTOCOL_NAMES;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, protos.len());
             for (i, &p) in protos.iter().enumerate() {
                 let str_obj = ctx.create_string(p);
