@@ -2087,8 +2087,13 @@ pub const INVENTORY: &[E] = &[
     // spelling -- the same shape as `no-atomic-intrinsic` above it.
     E { group: Group::JIT, token: "atomic-long-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC"), off_word: None, since: "2026-08-27" },
     E { group: Group::JIT, token: "box-unbox-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC"), off_word: None, since: "2026-09-02" },
+    // Compile-worker counts for the tiered manager's two lanes
+    // (`tiered::compiler_thread_counts`): C1 defaults to 1 worker, C2 to
+    // max(1, log2(cpus)); either is clamped to 1..=64.
+    E { group: Group::JIT, token: "tier-c1-threads", on_key: Some("CRATONVM_TIER_C1_THREADS"), off_key: None, off_word: None, since: "2026-09-12" },
     E { group: Group::JIT, token: "tier-c1-threshold", on_key: Some("CRATONVM_TIER_C1_THRESHOLD"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::JIT, token: "tier-c2-min-invocations", on_key: Some("CRATONVM_TIER_C2_MIN_INVOCATIONS"), off_key: None, off_word: None, since: "2026-06-22" },
+    E { group: Group::JIT, token: "tier-c2-threads", on_key: Some("CRATONVM_TIER_C2_THREADS"), off_key: None, off_word: None, since: "2026-09-12" },
     E { group: Group::JIT, token: "tier-c2-threshold", on_key: Some("CRATONVM_TIER_C2_THRESHOLD"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::JIT, token: "tier-osr-backedge", on_key: Some("CRATONVM_TIER_OSR_BACKEDGE"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::JIT, token: "tier-osr-threshold", on_key: Some("CRATONVM_TIER_OSR_THRESHOLD"), off_key: None, off_word: None, since: "2026-06-22" },
@@ -4164,8 +4169,8 @@ mod tests {
     /// Two knobs that were asked for and are deliberately **not** here.
     ///
     /// `CRATONVM_TIER_BROKER`: `jit/src/tiered.rs` reads no such key — the
-    /// broker is additive and still unwired, and the row exists only as a
-    /// proposal in `docs/jit/compilation-broker.md`.
+    /// standalone `CompilationBroker` it would have gated was deleted
+    /// 2026-09-12 without ever being wired (`docs/jit/compilation-broker.md`).
     /// `CRATONVM_JIT_BYTECODE_UNROLL`: the loop rewriter is armed by a
     /// thread-local (`x64::set_bytecode_loop_rewriter_armed`) and reads no
     /// environment at all.

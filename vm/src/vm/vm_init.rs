@@ -4492,9 +4492,6 @@ impl SharedVm {
                 // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
                 // policy when the environment is unset.
                 tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
-                compilation_broker: parking_lot::Mutex::new(
-                    crate::jit::tiered::CompilationBroker::with_default_policy(),
-                ),
                 deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
                 method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
                 method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
@@ -7972,13 +7969,23 @@ impl SharedVm {
         event: crate::jit::deopt::DeoptEvent,
         tiered_key: &crate::jit::tiered::MethodKey,
     ) -> crate::jit::deopt::DeoptAction {
-        let mut log = self.jit.deopt_log.lock();
-        // The bci-aware policy: a method whose only failing speculation has
-        // already been de-spec'd is recompiled, not blacklisted. See
-        // `DeoptimizationLog::recommend_action_at_bci`.
-        let action = log.recommend_action_at_bci(method_key, event.reason, event.bci);
-        log.record_deopt(method_key, event);
-        self.jit.tiered_manager.on_deoptimization(tiered_key);
+        let reason = event.reason;
+        let bci = event.bci;
+        let action = {
+            let mut log = self.jit.deopt_log.lock();
+            // The bci-aware policy: a method whose only failing speculation has
+            // already been de-spec'd is recompiled, not blacklisted. See
+            // `DeoptimizationLog::recommend_action_at_bci`.
+            let action = log.recommend_action_at_bci(method_key, reason, bci);
+            log.record_deopt(method_key, event);
+            action
+        };
+        // Outside the log lock, and WITH the action: the manager charges a trap
+        // only for an action that threw the body away, so a soft exit no
+        // longer spends the method's C2 (and OSR) allowance.
+        self.jit
+            .tiered_manager
+            .on_deoptimization(tiered_key, reason, bci, action);
         action
     }
 

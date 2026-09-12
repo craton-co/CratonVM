@@ -2262,6 +2262,7 @@ pub(crate) fn build_lambda_impl_cached(
         descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         interp_invocations: std::sync::atomic::AtomicU32::new(0),
+        tiering_settled: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -2360,18 +2361,10 @@ pub(crate) fn bytecode_callee_compiled_or_nominate(
         let _ = try_jit_upgrade_with_gate(shared, cached, gate);
     } else {
         ensure_bg_compiler_started(shared);
-        let tiered_key = crate::jit::tiered::MethodKey::new(
-            cached.class_name.as_ref(),
-            cached.method_name.as_ref(),
-            cached.method_descriptor.as_ref(),
-        );
         // The REAL invocation count, not the stride boundary — see the
         // invokestatic twin, where stride-boundary `+= 1` counting deflated the
         // manager's hotness view 64x.
-        let recommended_tier = shared
-            .jit
-            .tiered_manager
-            .on_method_invocation_observed(&tiered_key, cnt as u64);
+        let recommended_tier = offer_invocation_to_tiered_manager(shared, &*cached, cnt as u64);
         if crate::runtime::env_cache::dbg_jitc() {
             eprintln!(
                 "[cratonvm-jitc] bc-callee-tiered-enqueue {}.{}{} tier={recommended_tier:?} invoc_count={cnt}",
@@ -2535,18 +2528,11 @@ pub(super) fn try_invoke_cached_lambda_impl(
                     lambda_jit::bump(&lambda_jit::NOMINATIONS);
                 } else if should_attempt {
                     ensure_bg_compiler_started(shared);
-                    let tiered_key = crate::jit::tiered::MethodKey::new(
-                        cached.class_name.as_ref(),
-                        cached.method_name.as_ref(),
-                        cached.method_descriptor.as_ref(),
-                    );
                     // Real invocation count — see the invokestatic twin:
                     // stride-boundary `+= 1` counting deflated the manager's
                     // hotness view 64x.
-                    let recommended_tier = shared
-                        .jit
-                        .tiered_manager
-                        .on_method_invocation_observed(&tiered_key, cnt as u64);
+                    let recommended_tier =
+                        offer_invocation_to_tiered_manager(shared, &*cached, cnt as u64);
                     lambda_jit::bump(&lambda_jit::NOMINATIONS);
                     if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(

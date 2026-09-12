@@ -1908,6 +1908,16 @@ pub fn install_crash_handler() {
         if crate::runtime::native_oom::is_native_oom_panic(panic_info) {
             return;
         }
+        // A panic inside a JIT compile is caught one frame up and turned into a
+        // declined compile (`cratonvm_jit::tiered::contain_compile_panic`). Like
+        // the heap-exhaustion unwind above it is not a crash, and writing a
+        // report for it would latch the guard below, leaving the next REAL
+        // crash with no report. Chain to the previous hook so the panic message
+        // itself is still printed.
+        if cratonvm_jit::tiered::compile_panic_is_contained() {
+            prev(panic_info);
+            return;
+        }
         // Prevent recursive entry if the handler itself panics.
         if CRASH_IN_PROGRESS
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
