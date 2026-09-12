@@ -211,13 +211,16 @@ Scope: process-global mutable state reachable from `vm/src/`. Severity classes:
 | V24 | `JNI_NATIVE_METHODS`, `DIRECT_BUFFERS`, `JNI_TABLE_PTR` | `vm/src/native/jni.rs:4730, :6279, :6881` | `RegisterNatives` bindings, direct-buffer addresses, the leaked JNI function table | process (JNI ABI) | PROCESS for the table; the binding map is keyed by a hash that embeds per-VM class identity ⇒ latent CONTAMINATION | no — §6 |
 | V25 | `env_cache::MemoSlot` (≈25 sites) | `vm/src/runtime/env_cache.rs` | latched env-var-derived gates | process config | PROCESS-by-design, **P1 caveat**: the first VM latches; `VmConfig` differences between VMs are invisible to these gates unless `flags::overrides_active()` | no — see P1 note below |
 | V26 | `FLAGS` | `types/src/flags.rs:1906` | the entire `VmFlags` set | process config | **FIRST-WINS** — this is the root of P1. Two VMs cannot have disjoint flags | no — out of scope, §5 |
+| V27 | `BACKGROUND_COMPILER` / `BACKGROUND_COMPILER_INIT` | `jit/src/tiered.rs` (was) | the one compile-worker handle, started through a `std::sync::Once` against whichever manager asked first | per-VM | **FIRST-WINS** — a second VM's `ensure_background_compiler` was a no-op, so its queue was never drained and it never tiered up | **YES** (2026-09-12) — the handle lives on `TieredCompilationManager::background`; each manager starts its own C1 and C2 lane workers and joins them when dropped |
+| V28 | `osr_deny_list` | `jit/src/tiered.rs` (was) | `HashSet<MethodKey>` of name-keyed OSR denials | per-VM | **CONTAMINATION** — one VM's (or one loader's) failed OSR compile denied OSR for every same-named method in the process, permanently | **YES** (2026-09-12) — `CompilerCore::osr_denied`, keyed by a loader-aware `MethodKey` and stamped with the install epoch |
+| V29 | `JIT_BAIL_LIST`, `JIT_BAIL_REASONS`, `OSR_ENTRY_REJECTS` → `JIT_VERDICTS` | `jit/src/lib.rs` | negative compile verdicts keyed by (class, method, descriptor) names | per-VM ideally | CONTENTION — still process-wide (callers hold names, not a VM), so two VMs share verdicts about same-named methods; the worst case is a delayed compile | partial (2026-09-12) — unified into one store whose entries verify full names, expire with the redefine / install epoch and are cleared on unload and redefinition |
 
-Counts: **31 entries** (S1–S5 + V1–V26).
+Counts: **34 entries** (S1–S5 + V1–V29).
 
-* **13 CONTAMINATION** — S1, S2, S3, S4, V1, V3, V4, V5, V6, V7, V8, V11, V13
-  (plus V24, latent).
-* **8 FIRST-WINS** — S5, V2, V9, V10, V12, V20, V21, V26.
-* **4 CONTENTION** — V15, V16, V17, V19.
+* **14 CONTAMINATION** — S1, S2, S3, S4, V1, V3, V4, V5, V6, V7, V8, V11, V13,
+  V28 (plus V24, latent).
+* **9 FIRST-WINS** — S5, V2, V9, V10, V12, V20, V21, V26, V27.
+* **5 CONTENTION** — V15, V16, V17, V19, V29.
 * **6 PROCESS / already correct** — V14, V18, V22, V23, V24, V25.
 
 Disposition of this pass:
