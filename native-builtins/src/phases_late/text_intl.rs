@@ -2624,11 +2624,11 @@ fn bi_delegate_preceding(
     // One exit path for the pin: compute into a Result and release once.
     let out = (|| -> Result<i32, MethodCallFailed> {
         let this_now = ctx.read_native_pin(this_pin, this);
-        let mut pos = match ctx.invoke_virtual(this_now, "following", "(I)I", &[Value::Int(offset)])?
-        {
-            Some(Value::Int(p)) => p,
-            _ => DONE,
-        };
+        let mut pos =
+            match ctx.invoke_virtual(this_now, "following", "(I)I", &[Value::Int(offset)])? {
+                Some(Value::Int(p)) => p,
+                _ => DONE,
+            };
         while pos >= offset && pos != DONE {
             let this_now = ctx.read_native_pin(this_pin, this);
             pos = match ctx.invoke_virtual(this_now, "previous", "()I", &[])? {

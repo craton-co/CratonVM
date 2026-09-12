@@ -54,6 +54,62 @@ would invent a number neither took. What they retire, exactly:
                                                       JRELocaleProviderAdapter
 ```
 
+### Wave 6 — the acceptance, and the first tree taken in BOTH modes
+
+Control `cratonvm-l1w6-base-20260911` is `origin/dev` at `8f09c89b9`
+untouched. Three trial binaries off it, because three of this wave's changes
+answer different questions and a single binary could not have told them
+apart:
+
+```text
+  t1  setText/preceding step aside for real receivers; JarEntry.attr
+  t2  t1 + the BREAKITER pin removed + 19 rows retired
+  t3  t2 + LocaleNames routed to the image's CLDR bundle classes
+```
+
+**161 probes, both modes, per probe:**
+
+```text
+  --jdk-only    base vs t2     0 worse   4 better
+                  L1BreakIterRealProbe      28 -> 0
+                  L1JarTextSweep            22 -> 20
+                  L1LocaleProviderWorkload   8 -> 4
+                  VtHandoffProbe            14 -> 4   <- NOISE, see below
+
+  DEFAULT MODE  base vs t2     0 worse   2 better
+                  L1BreakIterRealProbe      28 -> 16
+                  L1JarTextSweep            38 -> 36
+```
+
+**THE DEFAULT-MODE ARM IS NEW, and it exists because wave 5 landed two
+changes with no mode gate at all** — `map_resize`'s threshold postcondition
+touches every grown HashMap in every mode — and accepted them on a probe tree
+that was `--jdk-only` on both arms. The regression suite covered default
+mode; no differential did.
+
+**`VtHandoffProbe`'s 14 -> 4 IS NOT A RESULT, and the tree cannot tell you
+that.** It is the tree's one mover, and wave 5 already caught it inventing a
+6/6 split. Eight INTERLEAVED pairs, base and trial in the same minute:
+
+```text
+  base : 10 14 14 10 10 10 10  0
+  trial: 10 10 14 10 10 10  0 10
+```
+
+One value set, fully overlapping, and neither arm's tree number (14 and 4)
+even appears in it. The probe's own header says so: "on CratonVM it is 64 on
+an idle host and 55-58 on a loaded one". Counted as neither worse nor better,
+for the third wave running.
+
+It earns its keep immediately. **The pin removal changes nothing in default
+mode**: `L1BreakIterRealProbe` goes 28 -> 16 there, not 28 -> 0, and the 16
+that remain are exactly the `F.*` rows — the four static factories still
+answer this VM's synthetic `java.text.BreakIterator` in compatible mode,
+because a retired triple is re-tagged `SyntheticStub` and a `SyntheticStub`
+still dispatches where there is no `--jdk-only` refusal. The behaviour change
+is confined to the mode that asked for it, which is a claim no `--jdk-only`
+arm can make about itself.
+
 ### Wave 5 — the acceptance
 
 Control `cratonvm-l1w5-base-20260911` is `origin/dev` at `565509592`
@@ -878,11 +934,23 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    exists. The remedy is `Properties`' `replace_real_map` for a red-black tree:
    build the real node graph, make it the authority, then retire. Retiring
    first hands real bytecode an empty map.
+   **Wave 6 priced it on the views probe** (`L1EntrySetRouteProbe`, base 0
+   diffs, armed one class per process): `TreeMap` +18 with reached=143. The
+   engagement means the number is real; the number means the node graph is
+   still missing. Nothing here has changed except that the figure is now
+   taken on a probe that exercises the views rather than on the whole tree.
+
 2. **`LinkedHashMap` + views (102).** `lhm_overlay()`, same shape, same
    remedy — and now also a BLOCKER on someone else's table: wave 3 could not
    retire eight `java/util/HashMap` methods because LinkedHashMap inherits
    this VM's registration for them and its entries are in the overlay. Fixing
    item 2 unblocks those eight for free.
+   **Wave 6: +8 with reached=152** on the same probe -- the smallest armed
+   delta of the four map families, and the one whose blocker is shared with
+   eight `java/util/HashMap` rows wave 3 could not retire. If a single
+   state-model rewrite is to be attempted next in this lane, this is the
+   cheapest per row unblocked.
+
 3. **`HashMap`'s views, iterators, `$Node` and its three view accessors
    (77).** Wave 3 measured these and put them back; §3 has the two throws.
 

@@ -4646,7 +4646,11 @@ static RETIRED_SHADOW_L1_BI_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/text/BreakIterator", "next", "()I"),
     ("java/text/BreakIterator", "preceding", "(I)I"),
     ("java/text/BreakIterator", "previous", "()I"),
-    ("java/text/BreakIterator", "setText", "(Ljava/lang/String;)V"),
+    (
+        "java/text/BreakIterator",
+        "setText",
+        "(Ljava/lang/String;)V",
+    ),
 ];
 
 /// Lane 4 wave 1, 2026-09-11: 140 rows over 10 classes of `java/io/` and

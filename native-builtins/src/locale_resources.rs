@@ -4405,7 +4405,11 @@ mod w6_concrete_bundle_chain_tests {
     #[test]
     fn the_cldr_packages_are_appended_after_the_plain_candidates() {
         let chain = vec![
-            ("sun.util.resources.LocaleNames".to_string(), String::new(), String::new()),
+            (
+                "sun.util.resources.LocaleNames".to_string(),
+                String::new(),
+                String::new(),
+            ),
             (
                 "sun.util.resources.LocaleNames_en".to_string(),
                 "en".to_string(),
