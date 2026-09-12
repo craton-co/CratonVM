@@ -32942,55 +32942,20 @@ fn selfrec_direct_enabled() -> bool {
 /// reference live across the call is neither relocated nor reclaimed, with no
 /// precise oop map required (inc 22 — see `activate-ir-optimizer.md`).
 pub fn static_call_shape(descriptor: &str) -> Option<(usize, u8)> {
-    let bytes = descriptor.as_bytes();
-    if bytes.is_empty() || bytes[0] != b'(' {
+    if !descriptor.starts_with('(') {
         return None;
     }
-    let mut i = 1;
     let mut num_args = 0usize;
-    while i < bytes.len() && bytes[i] != b')' {
-        match bytes[i] {
-            b'I' | b'Z' | b'B' | b'C' | b'S' => {
-                num_args += 1;
-                i += 1;
-            }
+    for tag in DescriptorParamIter::new(descriptor) {
+        match tag {
+            b'I' | b'Z' | b'B' | b'C' | b'S' => num_args += 1,
             // A `long`/`double`/`float` arg is ONE i64 slot in the compact JIT
-            // ABI — the VM marshals every value (incl. FP, as `to_bits() as i64`)
-            // into one INTEGER arg register, not XMM, so each counts as one arg
-            // exactly like an int/ref. `J` args: inc 28; `D`/`F` args: inc 34
-            // (the marshaller stores the slot bits to the staging region and
-            // `decode_dispatch_values` reads them back as `Double`/`Float`). Only
-            // reachable under `ir_emit_long`/`ir_emit_fp` (producing a cat-2/FP
-            // value needs such an opcode), so inert for the default int/ref path.
-            b'J' | b'D' | b'F' => {
-                num_args += 1;
-                i += 1;
-            }
-            b'L' => {
-                num_args += 1;
-                i += 1;
-                while i < bytes.len() && bytes[i] != b';' {
-                    i += 1;
-                }
-                i += 1; // skip ';'
-            }
-            b'[' => {
-                num_args += 1;
-                i += 1;
-                while i < bytes.len() && bytes[i] == b'[' {
-                    i += 1;
-                }
-                if i < bytes.len() && bytes[i] == b'L' {
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != b';' {
-                        i += 1;
-                    }
-                    i += 1;
-                } else if i < bytes.len() {
-                    i += 1; // primitive array element type
-                }
-            }
-            // Any other byte is a malformed descriptor — bail.
+            // ABI: the VM marshals every value (FP as `to_bits() as i64`) into
+            // one INTEGER arg register, not XMM. `J` args: inc 28; `D`/`F`
+            // args: inc 34. Only reachable under `ir_emit_long`/`ir_emit_fp`.
+            b'J' | b'D' | b'F' => num_args += 1,
+            b'L' | b'[' => num_args += 1,
+            // Any other byte is a malformed descriptor.
             _ => return None,
         }
     }
