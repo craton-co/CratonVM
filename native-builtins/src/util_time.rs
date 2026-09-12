@@ -4918,15 +4918,30 @@ fn native_zone_id_get_available(ctx: &mut dyn NativeContext, _args: &[Value]) ->
         "Australia/Sydney",
         "Pacific/Auckland",
     ];
-    // Return as a HashSet — use a simple ArrayList for now (consumers iterate)
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, zones.len());
-    for (i, z) in zones.iter().enumerate() {
+    // A REAL `java.util.HashSet`, built through its own `<init>` and `add`.
+    //
+    // This used to write an element array to absolute slot 0 and a count to
+    // slot 1 -- the MAP layout, on a class whose one real instance field is
+    // `map` -- so `ZoneId.getAvailableZoneIds().contains("UTC")` and
+    // `.size()` both read through a `map` holding an `Object[]` and answered
+    // for an empty set. `create_string` allocates, so each id is pinned from
+    // the moment it exists until it is inside the set.
+    let mut ids: Vec<ObjectRef> = Vec::with_capacity(zones.len());
+    let mut pins: Vec<usize> = Vec::with_capacity(zones.len());
+    for z in zones.iter() {
         let s = ctx.create_string(z);
-        ctx.set_array_element(arr, i, Value::Object(Some(s)));
+        pins.push(ctx.pin_native_root(s));
+        ids.push(s);
     }
-    ctx.set_field(set, 0, Value::Object(Some(arr)));
-    ctx.set_field(set, 1, Value::Int(zones.len() as i32));
+    // Re-read every id through its own handle: the `create_string` calls that
+    // followed it may have moved it.
+    for (i, id) in ids.iter_mut().enumerate() {
+        *id = ctx.read_native_pin(pins[i], *id);
+    }
+    let set = crate::build_real_hash_set(ctx, &ids)?;
+    if let Some(base) = pins.first().copied() {
+        ctx.unpin_native_roots(base);
+    }
     Ok(Some(Value::Object(Some(set))))
 }
 

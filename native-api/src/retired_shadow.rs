@@ -6530,6 +6530,188 @@ static RETIRED_SHADOW_L5R_TRIPLES: &[(&str, &str, &str)] = &[
     ("sun/misc/Unsafe", "unpark", "(Ljava/lang/Object;)V"),
 ];
 
+/// Lane 5's SECOND residual wave, 2026-09-11 — 33 triples over the two
+/// `Unsafe` spellings, and the two halves earned their rows by different
+/// instruments.
+///
+/// # The 13 `sun/misc/Unsafe` rows: the ADDRESS-form accessors
+///
+/// `RETIRED_SHADOW_L5R_TRIPLES` retired 67 rows and left 32 out with a reason
+/// that was honest and narrow: *precondition 4 is per triple however obvious a
+/// sibling looks*. `getByte(J)B`, `getLong(J)J` and `putLong(JJ)V` were in that
+/// wave; `getInt(J)I` and its eleven siblings were not, because nothing in the
+/// tree had ever called them. The page said the remedy was **a probe edit, not
+/// a build**, and this is the edit: `apps/probes/L5SunMiscUnsafe.java` grew
+/// seven `addrRow` cases that allocate, round-trip one type through the
+/// `(long)` accessor pair, and free.
+///
+/// ```text
+///   dial armed on sun/misc/Unsafe   reached 13   yielded 13   declined_no_bytecode 0
+///   per triple                      outcome = bytecode-won on all 13, one row each
+///   the workload                    d(base, armed) = 0 over 57 rows
+///   vs HotSpot                      d(hs, base) = d(hs, armed) = 2  (the ONE
+///                                   `getUnsafe` row, which is the member-filter
+///                                   defect and not this wave's)
+/// ```
+///
+/// 13 dispatches for 14 calls is not a miscount: `getByte(J)B` is already
+/// retired, so it is no longer registered and the dial cannot reach it.
+///
+/// # The 20 `jdk/internal/misc/Unsafe` rows: the delegating accessors
+///
+/// These are §10.4's list, and they are admitted by the rule §4 used for the
+/// sixteen already retired: **a Java method that delegates to an `ACC_NATIVE`
+/// primitive at the SAME offset.** `javap -p jdk.internal.misc.Unsafe` on the
+/// 25 image separates the two populations for you — 68 of the class's methods
+/// are `ACC_NATIVE` and can never be retired (contract §1.5), and these 20 are
+/// all in the other group, `declared` with `has_code`.
+///
+/// # What the class-wide dial says, and why it is not a reason to stop
+///
+/// Arming `jdk/internal/misc/Unsafe` WHOLE takes `UnsafeShadowSweep` from 472
+/// rows to 292 and `rc=0` to `rc=1`. That is the measurement §10.4 predicted
+/// ("the class-wide arm is where `L4BridgeSweep` goes from 499 rows to zero"),
+/// and it is a statement about the CLASS, not about these 20 triples: the same
+/// armed run yields 46 distinct triples to bytecode, and the 26 this table does
+/// not take are exactly the ones that cannot survive it.
+///
+/// **Three families are excluded, each for a reason that is not "we did not get
+/// to it":**
+///
+///   * every `*Unaligned` row — `getIntUnaligned`, `putLongUnaligned` and their
+///     six siblings do byte-offset arithmetic on the offset they are handed.
+///     This VM answers `objectFieldOffset` with a SLOT INDEX, so the JDK's
+///     arithmetic lands nowhere. Permanently blocked, not pending.
+///   * the sub-word atomics — `compareAndExchange{Byte,Short}`,
+///     `compareAndSet{Byte,Short}`, `getAndAdd{Byte,Short}`. Same cause: the
+///     JDK emulates these by masking within an enclosing word at a computed
+///     byte offset.
+///   * the four that report the VM's own numbering — `objectFieldOffset`,
+///     `staticFieldOffset`, `staticFieldBase`, `arrayIndexScale` — plus
+///     `getUnsafe` and `ensureClassInitialized`. Yielding these hands the rest
+///     of the class a number from the other model, which is how one arm turns
+///     into 180 changed lines.
+///
+/// `weakCompareAndSetIntPlain` is absent from this table and its seven siblings
+/// are present. That is not an oversight: the sweep never dispatched it, and a
+/// row whose only evidence is that its siblings passed is exactly what
+/// precondition 4 refuses.
+static RETIRED_SHADOW_L5S_TRIPLES: &[(&str, &str, &str)] = &[
+    (
+        "jdk/internal/misc/Unsafe",
+        "compareAndExchangeIntAcquire",
+        "(Ljava/lang/Object;JII)I",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "compareAndExchangeIntRelease",
+        "(Ljava/lang/Object;JII)I",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "compareAndExchangeLongAcquire",
+        "(Ljava/lang/Object;JJJ)J",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "compareAndExchangeLongRelease",
+        "(Ljava/lang/Object;JJJ)J",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "compareAndExchangeReferenceAcquire",
+        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "compareAndExchangeReferenceRelease",
+        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "getIntAcquire",
+        "(Ljava/lang/Object;J)I",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "getIntOpaque",
+        "(Ljava/lang/Object;J)I",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "getLongAcquire",
+        "(Ljava/lang/Object;J)J",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "getReferenceOpaque",
+        "(Ljava/lang/Object;J)Ljava/lang/Object;",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "putIntRelease",
+        "(Ljava/lang/Object;JI)V",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "putLongRelease",
+        "(Ljava/lang/Object;JJ)V",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "weakCompareAndSetIntAcquire",
+        "(Ljava/lang/Object;JII)Z",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "weakCompareAndSetIntRelease",
+        "(Ljava/lang/Object;JII)Z",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "weakCompareAndSetLongAcquire",
+        "(Ljava/lang/Object;JJJ)Z",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "weakCompareAndSetLongPlain",
+        "(Ljava/lang/Object;JJJ)Z",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "weakCompareAndSetLongRelease",
+        "(Ljava/lang/Object;JJJ)Z",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "weakCompareAndSetReferenceAcquire",
+        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "weakCompareAndSetReferencePlain",
+        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "jdk/internal/misc/Unsafe",
+        "weakCompareAndSetReferenceRelease",
+        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    ("sun/misc/Unsafe", "getAddress", "(J)J"),
+    ("sun/misc/Unsafe", "getChar", "(J)C"),
+    ("sun/misc/Unsafe", "getDouble", "(J)D"),
+    ("sun/misc/Unsafe", "getFloat", "(J)F"),
+    ("sun/misc/Unsafe", "getInt", "(J)I"),
+    ("sun/misc/Unsafe", "getShort", "(J)S"),
+    ("sun/misc/Unsafe", "putAddress", "(JJ)V"),
+    ("sun/misc/Unsafe", "putByte", "(JB)V"),
+    ("sun/misc/Unsafe", "putChar", "(JC)V"),
+    ("sun/misc/Unsafe", "putDouble", "(JD)V"),
+    ("sun/misc/Unsafe", "putFloat", "(JF)V"),
+    ("sun/misc/Unsafe", "putInt", "(JI)V"),
+    ("sun/misc/Unsafe", "putShort", "(JS)V"),
+];
+
 pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor: &str) -> bool {
     if !RETIRED_SHADOW_PREFIXES
         .iter()
@@ -6643,6 +6825,11 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // more. See `RETIRED_SHADOW_L1_ZI_TRIPLES` for why two rows and not forty,
     // and why the table is written but not yet accepted.
     RETIRED_SHADOW_L1_ZI_TRIPLES,
+    // Lane 5's SECOND residual wave, 2026-09-11. Same one-line registration as
+    // the line above it, and the same consequence for forgetting it: the loop
+    // below reads THIS list, so a table that is not named here is a table
+    // nothing consults and 33 rows that read as un-retired.
+    RETIRED_SHADOW_L5S_TRIPLES,
     // 2026-09-11, L1 wave 6: `java/text/BreakIterator`, all seventeen, with
     // the BREAKITER pin in `vm_exec.rs` removed in the same commit. Neither
     // half is correct alone -- retire without lifting the pin and the pin
@@ -7998,13 +8185,111 @@ mod tests {
         }
     }
 
-    /// Three `sun/misc/Unsafe` triples stay OUT of that table, for two
+    /// Sorted, duplicate-free, reachable through the real predicate, and over
+    /// exactly the two classes this wave measured.
+    ///
+    /// The class assertion is not decoration. This is the first lane-5 table to
+    /// span TWO classes, and `jdk/internal/misc/` and `sun/misc/` are separate
+    /// prefixes — a row added under a third class would sail past the sort
+    /// check and answer `false` at the prefix, which reads as "not retired" and
+    /// is invisible in a workload.
+    #[test]
+    fn the_l5s_table_is_sorted_unique_reachable_and_two_classes() {
+        for w in RETIRED_SHADOW_L5S_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        for &(c, m, d) in RETIRED_SHADOW_L5S_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable through the predicate: {c}.{m}{d} — are `jdk/internal/misc/` and `sun/misc/` both still in RETIRED_SHADOW_PREFIXES?"
+            );
+            assert!(
+                c == "jdk/internal/misc/Unsafe" || c == "sun/misc/Unsafe",
+                "this wave is two classes; {c} does not belong in it"
+            );
+        }
+    }
+
+    /// The three families the second residual wave REFUSED, asserted by name.
+    ///
+    /// Each is excluded for a reason that does not expire with more probe rows,
+    /// which is what separates them from `weakCompareAndSetIntPlain` — that one
+    /// is merely undispatched and a future workload may take it. These cannot
+    /// be taken by any workload:
+    ///
+    ///   * `*Unaligned` and the sub-word atomics compute a BYTE offset from the
+    ///     offset they are handed, and this VM hands them a slot index;
+    ///   * `objectFieldOffset` / `staticFieldOffset` / `staticFieldBase` /
+    ///     `arrayIndexScale` ARE that numbering, so yielding one publishes the
+    ///     other model's number to everything downstream.
+    ///
+    /// A future wave that adds one of these will fail here rather than in a
+    /// corpus arm three hours later, which is the whole point of naming them.
+    #[test]
+    fn the_l5s_wave_refuses_the_three_families_that_cannot_be_retired() {
+        for m in [
+            "getIntUnaligned",
+            "getLongUnaligned",
+            "getShortUnaligned",
+            "getCharUnaligned",
+            "putIntUnaligned",
+            "putLongUnaligned",
+            "putShortUnaligned",
+            "putCharUnaligned",
+            "compareAndExchangeByte",
+            "compareAndExchangeShort",
+            "compareAndSetByte",
+            "compareAndSetShort",
+            "getAndAddByte",
+            "getAndAddShort",
+            "objectFieldOffset",
+            "staticFieldOffset",
+            "staticFieldBase",
+            "arrayIndexScale",
+            "getUnsafe",
+        ] {
+            for &(c, tm, _) in RETIRED_SHADOW_L5S_TRIPLES {
+                assert_ne!(
+                    (c, tm),
+                    ("jdk/internal/misc/Unsafe", m),
+                    "jdk/internal/misc/Unsafe.{m} is excluded by measurement, not by omission — see this test's doc comment"
+                );
+            }
+        }
+    }
+
+    /// Three `sun/misc/Unsafe` triples stay OUT of that table, for THREE
     /// different reasons, and the reasons are the point of this test.
     ///
-    /// `ensureClassInitialized` and `shouldBeInitialized` are declared by NO
-    /// supported image — `javap -p sun.misc.Unsafe` finds neither on 17, 21 or
-    /// 25 — so nothing can dispatch them. They are deletions, and a retirement
-    /// entry would claim a dispatch nobody has observed.
+    /// `ensureClassInitialized` and `shouldBeInitialized` were first recorded
+    /// here as "declared by NO supported image ... deletions". **That was
+    /// wrong, and it was wrong the same way the `getUnsafe` row below was.**
+    /// `javap -p sun.misc.Unsafe` declares both, `public`, on **17 and 21**:
+    ///
+    /// ```text
+    ///   17   public boolean shouldBeInitialized(java.lang.Class<?>);
+    ///        public void ensureClassInitialized(java.lang.Class<?>);
+    ///   21   both, identically
+    ///   25   neither — removed
+    /// ```
+    ///
+    /// So they are not deletions: deleting them would take the registration
+    /// away from two of the three supported images. They are a VERSION
+    /// BOUNDARY — live on 17 and 21, gone on 25 — and this lane's workload runs
+    /// on 25, where nothing can dispatch them. Precondition 4 is a dispatch
+    /// observed by the citing instrument, and on this image there can be none,
+    /// so they stay out until someone measures them on a 17 or 21 run.
+    ///
+    /// The lesson is the same one `getUnsafe` taught and is worth more than the
+    /// two rows: **"declared by no supported image" is a claim about THREE
+    /// images.** Checking one and generalising is how both of these got
+    /// misfiled, once from a `NoSuchMethodException` and once from a `javap`
+    /// run on 25 alone.
     ///
     /// `getUnsafe` is here for a DIFFERENT reason and was very nearly recorded
     /// under the first one. It IS declared, public, on all three images; the
@@ -8016,7 +8301,7 @@ mod tests {
     /// `docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`.
     /// Retiring the native would not move that, so the row stays out.
     #[test]
-    fn the_l5r_wave_excludes_three_triples_for_two_different_reasons() {
+    fn the_l5r_wave_excludes_three_triples_for_three_different_reasons() {
         for (m, d) in [
             ("getUnsafe", "()Lsun/misc/Unsafe;"),
             ("ensureClassInitialized", "(Ljava/lang/Class;)V"),
@@ -8024,7 +8309,7 @@ mod tests {
         ] {
             assert!(
                 !triple_is_retired_shadow("sun/misc/Unsafe", m, d),
-                "sun/misc/Unsafe.{m}{d} must stay out of the residual table — see this test's doc comment for which of the two reasons applies"
+                "sun/misc/Unsafe.{m}{d} must stay out of the residual table — see this test's doc comment for which of the three reasons applies"
             );
         }
     }

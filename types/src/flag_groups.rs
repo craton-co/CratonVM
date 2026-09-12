@@ -1685,6 +1685,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-licm-before-unroll", on_key: Some("CRATONVM_JIT_IR_LICM_BEFORE_UNROLL"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-poll-outline", on_key: Some("CRATONVM_JIT_IR_POLL_OUTLINE"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-load-cse", on_key: Some("CRATONVM_JIT_IR_LOAD_CSE"), off_key: None, off_word: None, since: "2026-09-11" },
+    E { group: Group::JIT, token: "ir-load-cse-alias", on_key: Some("CRATONVM_JIT_IR_LOAD_CSE_ALIAS"), off_key: None, off_word: None, since: "2026-09-12" },
     E { group: Group::JIT, token: "ir-licm-hoist-counted", on_key: Some("CRATONVM_JIT_IR_LICM_HOIST_COUNTED"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-per-copy-frames", on_key: Some("CRATONVM_JIT_IR_PER_COPY_FRAMES"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-partial-unroll", on_key: Some("CRATONVM_JIT_IR_PARTIAL_UNROLL"), off_key: None, off_word: None, since: "2026-09-11" },
@@ -1934,6 +1935,11 @@ pub const INVENTORY: &[E] = &[
     // drives `StringBuffer` one character at a time. See
     // `invoke_fast::door_sync_enabled`.
     E { group: Group::JIT, token: "door-sync", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_SYNC"), off_word: None, since: "2026-09-08" },
+    // 2026-09-11. Off restores the per-call `resolve_method_ref` that every
+    // cached-native invoke used to pay for two facts that are constants of
+    // the call site: each parameter's descriptor tag and the return tag.
+    // See `CachedInvokeTarget::Native::facts`.
+    E { group: Group::JIT, token: "cached-native-facts", on_key: None, off_key: Some("CRATONVM_JIT_NO_CACHED_NATIVE_FACTS"), off_word: None, since: "2026-09-11" },
     // `frame-emplace` — off builds the frame on the Rust stack and moves it
     // into the slot instead of constructing it there.
     E { group: Group::JIT, token: "frame-emplace", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_EMPLACE"), off_word: None, since: "2026-09-03" },
@@ -2250,6 +2256,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "hot-lookup-cache", on_key: Some("CRATONVM_JIT_HOT_LOOKUP_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "virtual-nominate-always", on_key: Some("CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "virtual-promote-java-util", on_key: Some("CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL"), off_key: None, off_word: None, since: "2026-09-02" },
+    // 2026-09-11. The fourth of four routes to a direct compiled entry, and
+    // the only one still refusing on the callee's exception table alone. See
+    // `env_cache::jit_virtual_promote_handler_callee`.
+    E { group: Group::JIT, token: "virtual-promote-handler-callee", on_key: Some("CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "native-cf-postcomplete-skip", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "native-cf-postcomplete-direct", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // --- composition residuals, part two: 2026-09-11 -------------------------

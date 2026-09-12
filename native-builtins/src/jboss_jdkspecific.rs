@@ -2690,23 +2690,98 @@ mod tests {
         );
     }
 
+    /// `Module.getPackages()` returns a set in the REAL `HashSet` shape: one
+    /// field, `map`, holding a populated `HashMap`.
+    ///
+    /// The layout is declared to the mock so `build_real_layout_string_hashset`
+    /// takes its real branch, which is the branch a real-JDK run takes and the
+    /// one `build_package_set`'s doc is about. This assertion used to read
+    /// `ctx.get_field(set, 1)` and expect an element COUNT there, which is the
+    /// fabricated `(array, size, capacity)` shape -- on a class whose one real
+    /// instance field is `map`, so slot 1 is off the end of it. That shape is
+    /// what `getPackages().size()` answering 0 came from in the first place,
+    /// and the last unconditional write of it (the helper's fallback arm) went
+    /// with the synthetic slot floor on 2026-09-12. Asserting it here would
+    /// have required putting that write back.
     #[test]
     fn module_get_packages_returns_populated_set_for_java_base() {
         let mut ctx = MockNativeContext::new();
+        // The real JDK 25 layouts, so `build_real_layout_string_hashset` takes
+        // its REAL branch -- the branch a real-JDK run takes. `declare` below
+        // registers the class id the way `ensure_class_initialized` does and
+        // then attaches the field metadata `resolve_field_index` reads.
+        fn declare(ctx: &mut MockNativeContext, class_name: &str, fields: &[(&str, &str)]) {
+            let cid = ctx
+                .ensure_class_initialized(class_name)
+                .expect("mock class registration cannot fail");
+            let metadata = fields
+                .iter()
+                .enumerate()
+                .map(|(slot_index, (name, descriptor))| cratonvm_native_api::FieldMetadata {
+                    name: (*name).to_string(),
+                    descriptor: (*descriptor).to_string(),
+                    access_flags: 0,
+                    slot_index,
+                    declaring_class_id: cid,
+                    is_static: false,
+                })
+                .collect();
+            ctx.set_declared_fields(cid, metadata);
+        }
+        declare(
+            &mut ctx,
+            "java/util/HashMap",
+            &[
+                ("table", "[Ljava/util/HashMap$Node;"),
+                ("size", "I"),
+                ("threshold", "I"),
+                ("loadFactor", "F"),
+                ("entrySet", "Ljava/util/Set;"),
+            ],
+        );
+        declare(
+            &mut ctx,
+            "java/util/HashMap$Node",
+            &[
+                ("hash", "I"),
+                ("key", "Ljava/lang/Object;"),
+                ("value", "Ljava/lang/Object;"),
+                ("next", "Ljava/util/HashMap$Node;"),
+            ],
+        );
+        declare(
+            &mut ctx,
+            "java/util/HashSet",
+            &[("map", "Ljava/util/HashMap;")],
+        );
+
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         let module = build_module(&mut ctx, "java.base", layer)
             .expect("build_module must succeed for a synthetic layer");
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
-        if let Value::Object(Some(set)) = result {
-            // slot 1 = size must match BOOT_JDK_PACKAGES.len()
-            match ctx.get_field(set, 1) {
-                Value::Int(n) => assert!(n > 0, "size must be > 0, got {}", n),
-                other => panic!("expected Int for size, got {:?}", other),
-            }
-        } else {
-            panic!("expected non-null Set");
+        let Value::Object(Some(set)) = result else {
+            panic!("expected non-null Set, got {:?}", result);
+        };
+        // Slot 0 is `HashSet.map`, the class's ONLY instance field.
+        let Value::Object(Some(map)) = ctx.get_field(set, 0) else {
+            panic!(
+                "HashSet.map must hold the backing HashMap, got {:?}",
+                ctx.get_field(set, 0)
+            );
+        };
+        // Slot 1 of the map is `HashMap.size`, and it is where the package
+        // count actually lives.
+        match ctx.get_field(map, 1) {
+            Value::Int(n) => assert!(n > 0, "backing map size must be > 0, got {}", n),
+            other => panic!("expected Int for HashMap.size, got {:?}", other),
+        }
+        // The table is a real bucket array, not the element array the
+        // fabricated shape used to put at slot 0 of the SET.
+        match ctx.get_field(map, 0) {
+            Value::Object(Some(_)) => {}
+            other => panic!("expected a bucket array in HashMap.table, got {:?}", other),
         }
     }
 

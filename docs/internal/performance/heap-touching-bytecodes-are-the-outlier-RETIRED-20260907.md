@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | ✅ RETIRED 2026-09-07. Every ranked item is **taken** (with a kill switch and a pairwise count), **refuted** (with numbers), or **handed off** — and every hand-off is now written at the code it is about, with its instrument in place, rather than only on this page. Nothing is left that this page could carry further. |
 | **Was** | `docs/known-issues/perf/heap-touching-bytecodes-are-the-outlier-20260905.md` (opened 2026-09-05, severity low — no test failed on it) |
-| **Sibling** | `interpreted-invoke-cost-350ns-20260825.md`, whose four passes made this shape visible |
+| **Sibling** | `interpreted-invoke-cost-350ns-RETIRED-20260911.md`, whose four passes made this shape visible |
 
 The open page's own header — *"a ranked list with one item taken and measured;
 the rest is unbuilt"* — was stale against its own body by the time it was read.
