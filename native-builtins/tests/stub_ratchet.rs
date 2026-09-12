@@ -1997,7 +1997,21 @@ use cratonvm_types::compat::CompatibilityMode;
 /// time. Three independent derivations of one delta is what makes it a property
 /// of this branch rather than of a tree, which is the claim a re-freeze makes.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2755;
+/// # 2755 -> 2754, 2026-09-11 — one triple LEFT the stub population
+///
+/// `java/lang/Package.getPackages()[Ljava/lang/Package;` is no longer registered
+/// at all: the four empty-array overrides for the plural package methods were
+/// deleted, so the real JDK bytecode answers them. It was a retired shadow, so
+/// it counted here; the sibling triple deleted with it,
+/// `java/lang/ClassLoader.getPackages`, was a `Bridge` and did not.
+///
+/// A DECREASE is re-frozen in the same change, because this ratchet asserts
+/// `<=`: a baseline left above the tree silently re-admits that many new stubs.
+/// Measured, not derived — four registrations were deleted over two distinct
+/// triples and this count moved by exactly 1, the same 1 in all three arms, with
+/// the strict total and the refusal count each moving by 1 as well. Record:
+/// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2754;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2255,7 +2269,21 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2755;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2728;
+/// # 2728 -> 2727, 2026-09-11 — one triple LEFT the stub population
+///
+/// `java/lang/Package.getPackages()[Ljava/lang/Package;` is no longer registered
+/// at all: the four empty-array overrides for the plural package methods were
+/// deleted, so the real JDK bytecode answers them. It was a retired shadow, so
+/// it counted here; the sibling triple deleted with it,
+/// `java/lang/ClassLoader.getPackages`, was a `Bridge` and did not.
+///
+/// A DECREASE is re-frozen in the same change, because this ratchet asserts
+/// `<=`: a baseline left above the tree silently re-admits that many new stubs.
+/// Measured, not derived — four registrations were deleted over two distinct
+/// triples and this count moved by exactly 1, the same 1 in all three arms, with
+/// the strict total and the refusal count each moving by 1 as well. Record:
+/// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2727;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2435,7 +2463,21 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2728;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2728;
+/// # 2728 -> 2727, 2026-09-11 — one triple LEFT the stub population
+///
+/// `java/lang/Package.getPackages()[Ljava/lang/Package;` is no longer registered
+/// at all: the four empty-array overrides for the plural package methods were
+/// deleted, so the real JDK bytecode answers them. It was a retired shadow, so
+/// it counted here; the sibling triple deleted with it,
+/// `java/lang/ClassLoader.getPackages`, was a `Bridge` and did not.
+///
+/// A DECREASE is re-frozen in the same change, because this ratchet asserts
+/// `<=`: a baseline left above the tree silently re-admits that many new stubs.
+/// Measured, not derived — four registrations were deleted over two distinct
+/// triples and this count moved by exactly 1, the same 1 in all three arms, with
+/// the strict total and the refusal count each moving by 1 as well. Record:
+/// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2727;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

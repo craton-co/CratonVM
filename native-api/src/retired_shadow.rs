@@ -3316,6 +3316,13 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// `intValueExact`, `isProbablePrime`, `longValueExact`, `not`, `shiftLeft`,
 /// `shiftRight`, `testBit`, `toByteArray` — and they are 0-diff over the whole
 /// 13253-row sweep with the JIT on.
+///
+/// # `java/lang/Package.getPackages()` left this table on 2026-09-11
+///
+/// Not un-retired: the four empty-array registrations behind it were DELETED,
+/// so there is no longer a shadow for strict mode to refuse. A retirement row
+/// for a triple nothing registers is rot that reads like a measurement. Record:
+/// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Character", "isJavaLetter", "(C)Z"),
     ("java/lang/Character", "isJavaLetterOrDigit", "(C)Z"),
@@ -3349,7 +3356,6 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Object", "wait", "()V"),
     ("java/lang/Object", "wait", "(J)V"),
     ("java/lang/Package", "equals", "(Ljava/lang/Object;)Z"),
-    ("java/lang/Package", "getPackages", "()[Ljava/lang/Package;"),
     ("java/lang/Package", "hashCode", "()I"),
     ("java/lang/StringUTF16", "getChars", "([BII[CI)V"),
     (
