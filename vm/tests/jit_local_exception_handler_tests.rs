@@ -481,16 +481,30 @@ fn test_an_instanceof_in_a_protected_range_no_longer_refuses_the_method() {
     // not hypothetical here — `loopStep`'s first draft had an `instanceof` in
     // its range and read 0 mismatches in both arms of its own A/B for exactly
     // this reason, which is recorded in the fixture's own comment.
-    assert_eq!(precise_handler_mismatches("instanceofMismatches"), 0);
-
     const CLASS: &str = "cratonvm/JitPreciseHandlerFrame";
     const METHOD: &str = "instanceofStep";
     const DESC: &str = "(IZ)I";
 
+    // `precise_handler_mismatches` inlined, because the verdicts below are kept
+    // per loaded class and asking about them needs this VM's class id.
+    let mut vm = test_vm();
+    let mismatches = match vm.invoke(CLASS, "instanceofMismatches", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        other => panic!("instanceofMismatches returned unexpected value: {other:?}"),
+    };
+    assert_eq!(mismatches, 0);
+    let class_id = vm
+        .shared
+        .classes
+        .class_manager
+        .read()
+        .find_unique_class_by_name(CLASS)
+        .unwrap_or_else(|| panic!("{CLASS} not loaded"));
+
     // No refusal was recorded for it at all. Pre-fix this reads
     // `Some("rbc6-handler-reads-unsafe-local(pc=..,op=0xc1)")` — the pc/opcode
     // suffix is what made the cause visible in the first place.
-    let reason = cratonvm_jit::jit_bail_reason_for(CLASS, METHOD, DESC);
+    let reason = cratonvm_jit::jit_bail_reason_for(class_id, CLASS, METHOD, DESC);
     assert!(
         !reason
             .as_deref()
@@ -498,7 +512,7 @@ fn test_an_instanceof_in_a_protected_range_no_longer_refuses_the_method() {
         "instanceofStep was still refused by the RBC.6 gate: {reason:?}"
     );
     assert!(
-        !cratonvm_jit::is_jit_bail_listed(CLASS, METHOD, DESC),
+        !cratonvm_jit::is_jit_bail_listed(class_id, CLASS, METHOD, DESC),
         "instanceofStep was permanently bail-listed; it compiles now"
     );
 }

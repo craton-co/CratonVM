@@ -620,6 +620,7 @@ pub(super) fn compile_osr_artifact(
             // with the CURRENT epoch, which the install barrier then accepted.
             // Holding the token from here is what closes it.
             let admission = match cratonvm_jit::compile_gate::admit(
+                class_id,
                 &class_name,
                 &method_name,
                 &method_descriptor,
@@ -644,6 +645,7 @@ pub(super) fn compile_osr_artifact(
                             method_name,
                             method_descriptor,
                             cratonvm_jit::jit_bail_reason_for(
+                                class_id,
                                 &class_name,
                                 &method_name,
                                 &method_descriptor,
@@ -661,6 +663,7 @@ pub(super) fn compile_osr_artifact(
             // can only reach it again — 256 times over ten H2 `nioMemLZF:`
             // operations before this memo existed. See `mark_osr_entry_rejected`.
             if crate::jit::is_osr_entry_rejected(
+                class_id,
                 &class_name,
                 &method_name,
                 &method_descriptor,
@@ -691,7 +694,12 @@ pub(super) fn compile_osr_artifact(
                             class_name, method_name, method_descriptor,
                         );
                     }
-                    crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                    crate::jit::mark_jit_bail_listed(
+                        class_id,
+                        &class_name,
+                        &method_name,
+                        &method_descriptor,
+                    );
                     return None;
                 }
             };
@@ -922,7 +930,12 @@ pub(super) fn compile_osr_artifact(
                             class_name, method_name, method_descriptor
                         );
                     }
-                    crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                    crate::jit::mark_jit_bail_listed(
+                        class_id,
+                        &class_name,
+                        &method_name,
+                        &method_descriptor,
+                    );
                     return None;
                 }
                 // Name the ONE site that blocks the method, the way the
@@ -947,7 +960,12 @@ pub(super) fn compile_osr_artifact(
                             pc, op, class_name, method_name, method_descriptor
                         );
                     }
-                    crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                    crate::jit::mark_jit_bail_listed(
+                        class_id,
+                        &class_name,
+                        &method_name,
+                        &method_descriptor,
+                    );
                     return None;
                 }
             }
@@ -3301,6 +3319,7 @@ pub(super) fn compile_osr_artifact(
                 // osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md,
                 // which took a six-arm shape bisect to find for exactly this reason.
                 crate::jit::mark_jit_bail_listed_with_site(
+                    class_id,
                     &class_name,
                     &method_name,
                     &method_descriptor,
@@ -3383,6 +3402,7 @@ pub(super) fn compile_osr_artifact(
     if !osr_reused && !compiled.can_osr_enter(entry_pc) {
         cratonvm_jit::metrics::record_osr_event("osr_refused_entry");
         crate::jit::mark_osr_entry_rejected(
+            class_id,
             &class_name,
             &method_name,
             &method_descriptor,
@@ -4068,6 +4088,7 @@ pub(super) fn try_osr(
                 // `_by`: a refusal that depends on compile-time state expires
                 // when that state is flushed, instead of standing for good.
                 crate::jit::mark_osr_entry_rejected_by(
+                    class_id,
                     &class_name,
                     &method_name,
                     &method_descriptor,
@@ -7048,6 +7069,7 @@ pub(super) fn try_jit_upgrade_with_gate(
         Ok(target) => target,
         Err(payload) => {
             note_contained_mutator_compile_panic(
+                cached.declaring_class_id,
                 &cached.class_name,
                 &cached.method_name,
                 &cached.method_descriptor,
@@ -7124,6 +7146,7 @@ fn try_jit_upgrade_with_gate_uncontained(
     // method that meant tens of thousands of full gate evaluations per
     // suite run while `try_compile` would bail instantly anyway.
     if crate::jit::is_jit_bail_listed(
+        cached.declaring_class_id,
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -7206,6 +7229,7 @@ fn try_jit_upgrade_with_gate_uncontained(
             // early `is_jit_bail_listed` check at the top of this function
             // short-circuits every future retry.
             crate::jit::mark_jit_bail_listed(
+                cached.declaring_class_id,
                 &cached.class_name,
                 &cached.method_name,
                 &cached.method_descriptor,
@@ -7521,7 +7545,22 @@ pub fn try_jit_compile_callee(
     }) {
         Ok(compiled) => compiled,
         Err(payload) => {
-            note_contained_mutator_compile_panic(class_name, method_name, descriptor, &*payload);
+            // The verdict store is keyed per loaded class; resolve the name the
+            // way the probe in `try_jit_compile_callee_uncontained` does. Only
+            // on this (rare) panic arm, with no class-manager guard held.
+            let class_id = shared
+                .classes
+                .class_manager
+                .read()
+                .get_loaded_class_id(class_name)
+                .unwrap_or(ClassId::new(0));
+            note_contained_mutator_compile_panic(
+                class_id,
+                class_name,
+                method_name,
+                descriptor,
+                &*payload,
+            );
             None
         }
     }
@@ -7531,13 +7570,14 @@ pub fn try_jit_compile_callee(
 /// asks for it again, count it under the workers' `worker_panic` scheduling
 /// event, and warn once per process.
 fn note_contained_mutator_compile_panic(
+    class_id: ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     payload: &(dyn std::any::Any + Send),
 ) {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    cratonvm_jit::mark_jit_bail_listed(class_name, method_name, descriptor);
+    cratonvm_jit::mark_jit_bail_listed(class_id, class_name, method_name, descriptor);
     cratonvm_jit::metrics::record_scheduling_event(cratonvm_jit::metrics::SCHEDULING_EVENTS[6]);
     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
@@ -7564,15 +7604,42 @@ fn try_jit_compile_callee_uncontained(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
+    // `try_jit_compile_callee` is `&str`-only (called from both the
+    // interpreter, which has a precise `ClassId`, and raw JIT-ABI
+    // dispatch helpers keyed only by `JitInvokeInfo`'s static strings —
+    // see `JitKey::declaring_class_id`'s doc comment). Resolving the
+    // class globally by name here preserves this function's existing
+    // (pre-existing, not loader-aware) probe/publish behavior; it does
+    // not newly introduce the multi-loader-same-name collision this
+    // session fixed at the interpreter's own dispatch-side cache
+    // consultation (`execute_invoke_kind` / `execute_invokestatic_cached`
+    // / `try_jit_upgrade_with_gate`), which is what a same-named class
+    // loaded by a user `ClassLoader` actually dispatches through.
+    //
+    // Resolved once, up front, because the bail-list below is kept per loaded
+    // class too. `try_jit_compile_callee_slow` records its verdicts under the
+    // class the name resolves to uniquely, and whenever such a class exists
+    // this lookup names the same one.
+    let probe_class_id = shared
+        .classes
+        .class_manager
+        .read()
+        .get_loaded_class_id(class_name)
+        .unwrap_or(ClassId::new(0));
     // RBC.4 — short-circuit permanently-uncompilable methods before the
     // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
-    if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
+    if crate::jit::is_jit_bail_listed(probe_class_id, class_name, method_name, descriptor) {
         if callee_probe_dbg() {
             // Carry the recorded refusal site into the tally key: "bail-listed"
             // alone says only that some earlier compile said no, and the
             // whole point of the tally is to name what has to be fixed.
-            let why = cratonvm_jit::jit_bail_reason_for(class_name, method_name, descriptor)
-                .unwrap_or_else(|| "reason-not-recorded".to_string());
+            let why = cratonvm_jit::jit_bail_reason_for(
+                probe_class_id,
+                class_name,
+                method_name,
+                descriptor,
+            )
+            .unwrap_or_else(|| "reason-not-recorded".to_string());
             callee_probe_note(
                 &format!("BAIL-LISTED[{why}]"),
                 class_name,
@@ -7600,23 +7667,7 @@ fn try_jit_compile_callee_uncontained(
     // the previous `Arc::from` per name was three wasted heap allocations
     // on every dispatch-helper call.
     {
-        // `try_jit_compile_callee` is `&str`-only (called from both the
-        // interpreter, which has a precise `ClassId`, and raw JIT-ABI
-        // dispatch helpers keyed only by `JitInvokeInfo`'s static strings —
-        // see `JitKey::declaring_class_id`'s doc comment). Resolving the
-        // class globally by name here preserves this function's existing
-        // (pre-existing, not loader-aware) probe/publish behavior; it does
-        // not newly introduce the multi-loader-same-name collision this
-        // session fixed at the interpreter's own dispatch-side cache
-        // consultation (`execute_invoke_kind` / `execute_invokestatic_cached`
-        // / `try_jit_upgrade_with_gate`), which is what a same-named class
-        // loaded by a user `ClassLoader` actually dispatches through.
-        let probe_class_id = shared
-            .classes
-            .class_manager
-            .read()
-            .get_loaded_class_id(class_name)
-            .unwrap_or(ClassId::new(0));
+        // `probe_class_id` was resolved at the top of this function.
         // No `class_was_redefined` gate: `redefine_class` calls
         // `jit_cache.clear_all()`, so any entry still present in the cache was
         // necessarily compiled AFTER the most recent redefinition of any
@@ -7943,6 +7994,18 @@ pub(super) fn try_jit_compile_callee_slow(
     // `eager-callee-chain`: a top-level compile starts with a fresh transitive
     // callee-compile budget; a nested one inherits the outer compile's.
     eager_callee_chain_enter_top_level();
+    // Compile verdicts are kept per loaded class. The two refusals below fire
+    // before this function resolves the receiver class, so they look its
+    // identity up only when they fire, with no class-manager guard held. It
+    // is the same unique resolution `callee_class_id` gets further down.
+    let receiver_class_id_for_verdicts = || {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .find_unique_class_by_name(class_name)
+            .unwrap_or(ClassId::new(0))
+    };
     // RFJP.1 (RETIRED, lever-only) — refuse a method whose declaring class
     // transitively extends `java/util/concurrent/ForkJoinTask`. Inert unless
     // `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1`. This is the exit that reported
@@ -7950,6 +8013,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // UniCompose.tryFire` and `$UniRelay.tryFire`.
     if is_fjp_subclass_blocklisted(shared, class_name, None) {
         cratonvm_jit::record_compile_refusal(
+            receiver_class_id_for_verdicts(),
             class_name,
             method_name,
             descriptor,
@@ -7979,6 +8043,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // `SpringRepositoriesExtensionTests` hang).
     if registered_native_will_run(shared, class_name, method_name, descriptor) {
         cratonvm_jit::record_compile_refusal(
+            receiver_class_id_for_verdicts(),
             class_name,
             method_name,
             descriptor,
@@ -7994,7 +8059,9 @@ pub(super) fn try_jit_compile_callee_slow(
             // The receiver's class may simply not be loaded yet — a later
             // attempt can succeed, so this `None` must not be cached.
             *cache_negative = false;
+            // No loaded class to key the reason by: `ClassId(0)`.
             cratonvm_jit::record_compile_refusal(
+                ClassId::new(0),
                 class_name,
                 method_name,
                 descriptor,
@@ -8013,6 +8080,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // Direct dispatcher compilation also bypasses interpreter frame creation.
     if method.is_synchronized() && !allow_synchronized_wrapped_entry {
         cratonvm_jit::record_compile_refusal(
+            callee_class_id,
             class_name,
             method_name,
             descriptor,
@@ -8073,8 +8141,9 @@ pub(super) fn try_jit_compile_callee_slow(
         }
     }
     if scan_refuses {
-        crate::jit::mark_jit_bail_listed(class_name, method_name, descriptor);
+        crate::jit::mark_jit_bail_listed(callee_class_id, class_name, method_name, descriptor);
         cratonvm_jit::record_compile_refusal(
+            callee_class_id,
             class_name,
             method_name,
             descriptor,
@@ -8111,6 +8180,7 @@ pub(super) fn try_jit_compile_callee_slow(
             // function should succeed and start caching the fast entry.
             *cache_negative = false;
             cratonvm_jit::record_compile_refusal(
+                callee_class_id,
                 class_name,
                 method_name,
                 descriptor,
@@ -8136,6 +8206,7 @@ pub(super) fn try_jit_compile_callee_slow(
             .is_some()
     {
         cratonvm_jit::record_compile_refusal(
+            callee_class_id,
             class_name,
             method_name,
             descriptor,
@@ -8195,6 +8266,7 @@ pub(super) fn try_jit_compile_callee_slow(
             &cached.method_descriptor,
         ) {
             cratonvm_jit::record_compile_refusal(
+                callee_class_id,
                 class_name,
                 method_name,
                 descriptor,
@@ -8225,6 +8297,7 @@ pub(super) fn try_jit_compile_callee_slow(
             }) => *name_and_type_index,
             _ => {
                 cratonvm_jit::record_compile_refusal(
+                    callee_class_id,
                     class_name,
                     method_name,
                     descriptor,
@@ -9550,6 +9623,9 @@ pub(super) fn background_compile_task(
     // loop header it emits, so the compile itself is entry-pc-independent.
     if let Some(osr_bci) = task.osr_bci {
         let start = std::time::Instant::now();
+        // The class the compile's verdicts are recorded under: the key's id,
+        // or the one `fetch_osr_compile_inputs` resolves when the key has none.
+        let mut verdict_class_id = task.method_key.class_id;
         let published = if let Some((class_id, padded, max_locals)) = fetch_osr_compile_inputs(
             &shared,
             task.method_key.class_id,
@@ -9557,6 +9633,7 @@ pub(super) fn background_compile_task(
             &task.method_key.method_name,
             &task.method_key.descriptor,
         ) {
+            verdict_class_id = class_id;
             compile_osr_artifact(
                 &shared,
                 class_id,
@@ -9591,6 +9668,7 @@ pub(super) fn background_compile_task(
             // cannot change by bail-listing the method. Only then is OSR denied,
             // and that denial still expires when the install epoch moves.
             let permanent = cratonvm_jit::is_jit_bail_listed(
+                verdict_class_id,
                 &task.method_key.class_name,
                 &task.method_key.method_name,
                 &task.method_key.descriptor,
@@ -9612,6 +9690,7 @@ pub(super) fn background_compile_task(
                 eprintln!(
                     "[cratonvm-jitc]   …and the bail this method last recorded: {}",
                     cratonvm_jit::jit_bail_reason_for(
+                        verdict_class_id,
                         &task.method_key.class_name,
                         &task.method_key.method_name,
                         &task.method_key.descriptor,
@@ -9904,6 +9983,7 @@ pub(super) fn background_compile_task(
                 task.method_key.descriptor.clone(),
             ))
             || cratonvm_jit::is_jit_bail_listed(
+                task.method_key.class_id,
                 &task.method_key.class_name,
                 &task.method_key.method_name,
                 &task.method_key.descriptor,

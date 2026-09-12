@@ -2459,6 +2459,7 @@ pub fn execute(
                         return None;
                     }
                     let admission = cratonvm_jit::compile_gate::admit(
+                        class_id,
                         &class_name_str,
                         method_name,
                         method_descriptor,

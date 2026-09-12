@@ -1,6 +1,6 @@
 # FIXED: the 2026-09-12 JIT code review, finding by finding
 
-**Status: 87 FIXED, 4 PARTIAL, 6 OPEN** across 97 findings. The ledger has
+**Status: 88 FIXED, 3 PARTIAL, 6 OPEN** across 97 findings. The ledger has
 95 lines, because #10/#11 and #18/#19 each share one fix and one line. Every
 commit is on `fix/jit-review-20260912`, merged into `dev`. Each PARTIAL and
 OPEN finding names the known-issue record that tracks what is left.
@@ -98,7 +98,7 @@ the review are the gate that does that.
 | 52 | O(n) copy-on-write registries rebuilt per change | FIXED fe92eb53b |
 | 53 | Two code-retirement systems | FIXED d7f658e9e, 66f629c9f |
 | 54 | 250 ms C2 budget on wall time, for failures and OSR | FIXED f960bed8f |
-| 55 | Tier state, OSR denials, unload keyed by class name | PARTIAL f960bed8f, c9cf67009; `jit-verdicts-are-keyed-by-name-not-loader-20260912.md` |
+| 55 | Tier state, OSR denials, unload keyed by class name | FIXED f960bed8f, c9cf67009, then the verdict store on `fix/jit-review-r2-20260912-verdicts`; `jit-verdicts-are-keyed-by-name-not-loader-FIXED-20260912.md` |
 | 56 | One failed background OSR compile bans OSR forever | FIXED f960bed8f |
 | 57 | Branch-profile window arm/disarm unbalanced | FIXED f960bed8f |
 | 58 | Never-compiling methods lock a global mutex every 64 calls | FIXED f960bed8f |
