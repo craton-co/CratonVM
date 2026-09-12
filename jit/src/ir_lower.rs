@@ -25181,6 +25181,7 @@ mod tests {",
                 bci,
                 locals: Vec::new(),
                 stack: Vec::new(),
+                monitors: Vec::new(),
             });
         }
         let index = Lowerer::first_safepoint_index_by_bci(&graph);

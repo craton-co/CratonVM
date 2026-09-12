@@ -1186,7 +1186,6 @@ impl SafepointSnapshot {
     pub fn stack_opt(&self, idx: usize) -> Option<NodeId> {
         self.stack.get(idx).copied().and_then(node_id_opt)
     }
-    monitors: Vec::new(),
 }
 
 // ── Inlined scopes (deopt caller chains) ─────────────────────────────
