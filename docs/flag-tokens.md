@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-546 tokens.
+548 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -351,6 +351,7 @@ export inherited from a parent shell.
 | `linkage` | `CRATONVM_DBG_LINKAGE` |
 | `linkage-bt` | `CRATONVM_DBG_LINKAGE_BT` |
 | `linker` | `CRATONVM_DBG_LINKER` |
+| `load-cse` | `CRATONVM_DBG_LOAD_CSE` |
 | `loadclass` | `CRATONVM_DBG_LOADCLASS` |
 | `loader-chain` | `CRATONVM_DBG_LOADER_CHAIN` |
 | `loader-trace` | `CRATONVM_DBG_LOADER_TRACE` |
@@ -424,6 +425,7 @@ export inherited from a parent shell.
 | `null-native` | `CRATONVM_DBG_NULL_NATIVE` |
 | `nullthis` | `CRATONVM_DBG_NULLTHIS` |
 | `obj-equals` | `CRATONVM_DBG_OBJ_EQUALS` |
+| `obj-watch` | `CRATONVM_DBG_OBJ_WATCH` |
 | `objects` | `CRATONVM_DBG_OBJECTS` |
 | `objkey` | `CRATONVM_DBG_OBJKEY` |
 | `obsreg` | `CRATONVM_DBG_OBSREG` |
@@ -612,7 +614,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-437 tokens.
+445 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -706,7 +708,10 @@ export inherited from a parent shell.
 | `inline-putfield` | `CRATONVM_NO_JIT_INLINE_PUTFIELD` |
 | `inline-self-guard` | `CRATONVM_JIT_INLINE_SELF_GUARD` |
 | `inline-tlab-new` | `CRATONVM_NO_JIT_INLINE_TLAB_NEW` |
+| `inline-tlab-newarray` | `CRATONVM_NO_JIT_INLINE_TLAB_NEWARRAY` |
 | `intrinsics` | `CRATONVM_DISABLE_INTRINSICS` |
+| `sb-intrinsics` | `CRATONVM_NO_JIT_SB_INTRINSICS` |
+| `staged-arg-slot` | `CRATONVM_NO_JIT_STAGED_ARG_SLOT` |
 | `ir-branchy` | `CRATONVM_NO_IR_BRANCHY` |
 | `ir-call` | `CRATONVM_JIT_IR_CALL` |
 | `ir-call-special` | `CRATONVM_JIT_IR_CALL_SPECIAL` |
@@ -821,6 +826,11 @@ export inherited from a parent shell.
 | `ir-list-sched` | `CRATONVM_JIT_IR_LIST_SCHED` |
 | `ir-carry-rcx-folded` | `CRATONVM_JIT_IR_CARRY_RCX_FOLDED` |
 | `ir-unroll-unreachable-frames` | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES` |
+| `ir-licm-mem-edge` | `CRATONVM_JIT_IR_LICM_MEM_EDGE` |
+| `ir-licm-before-unroll` | `CRATONVM_JIT_IR_LICM_BEFORE_UNROLL` |
+| `ir-poll-outline` | `CRATONVM_JIT_IR_POLL_OUTLINE` |
+| `ir-load-cse` | `CRATONVM_JIT_IR_LOAD_CSE` |
+| `ir-licm-hoist-counted` | `CRATONVM_JIT_IR_LICM_HOIST_COUNTED` |
 | `ir-per-copy-frames` | `CRATONVM_JIT_IR_PER_COPY_FRAMES` |
 | `ir-partial-unroll` | `CRATONVM_JIT_IR_PARTIAL_UNROLL` |
 | `ir-partial-unroll-factor` | `CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR` |
@@ -1278,7 +1288,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_LOADER`
 
-17 tokens.
+18 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1286,6 +1296,7 @@ export inherited from a parent shell.
 | `ann-proxy-latch` | `CRATONVM_LOADER_NO_ANN_PROXY_LATCH` |
 | `allow-jsr-ret` | `CRATONVM_ALLOW_JSR_RET` |
 | `enforce-native-shadow` | `CRATONVM_ENFORCE_NATIVE_SHADOW` |
+| `unretire-native-shadow` | `CRATONVM_UNRETIRE_NATIVE_SHADOW` |
 | `cf-delegating-yield` | `CRATONVM_CF_DELEGATING_YIELD` |
 | `aware-resolution` | `CRATONVM_LOADER_AWARE_RESOLUTION` |
 | `boot-module-registry` | `CRATONVM_BOOT_MODULE_REGISTRY` |

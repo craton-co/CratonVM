@@ -439,6 +439,12 @@ const TABLE: &[(ThreadExecState, ThreadExecState)] = &[
     // The same OS thread re-attaching after `DetachCurrentThread`
     // (native/jni.rs::attach_foreign_thread). The registry entry is new; the
     // shadow cell is revived.
+    //
+    // This row is now redundant with `is_legal`, which blesses EVERY edge out
+    // of `Terminated` because a carrier outlives the virtual threads whose
+    // deaths it records. It stays because it is the one such edge anybody has
+    // a call site for, and a reader looking for where re-attach is modelled
+    // should find it in the table.
     (S::Terminated, S::Starting),
 ];
 
@@ -448,9 +454,50 @@ const TABLE: &[(ThreadExecState, ThreadExecState)] = &[
 /// (nested blocking regions share one `in_blocked_region` flag, and a nested
 /// JIT entry only deepens `GLOBAL_JIT_DEPTH`). Treating those as violations
 /// would report the *counting* discipline, not a state error.
+///
+/// # A cell in `Terminated` is not a dead OS thread, so every edge out of it
+/// is legal
+///
+/// The shadow record is **per OS thread**; the states it tracks belong to a
+/// **logical** thread. Those are the same object only for platform threads.
+/// A carrier multiplexes virtual threads: when one of them dies, `mark_dead`
+/// records `Terminated` on the CARRIER's cell, and the carrier then picks up
+/// the next continuation and records whatever that one is doing. The tripwire
+/// read every one of those as a dead thread coming back to life.
+///
+/// Measured 2026-09-11, one `VthreadProbe` run (10 000 virtual threads, debug
+/// binary, `CRATONVM_STRESS_THREAD_STATES` at its `cfg!(debug_assertions)`
+/// default):
+///
+/// ```text
+/// 8314  Terminated -> JavaRunning      gc_barrier::leave_blocked_region_flagged
+/// 1667  Terminated -> JavaRunning      thread_registry::mark_stw_ready
+///    3  Terminated -> SafepointParked  gc_barrier::leave_blocked_region_flagged:drain
+///    2  Terminated -> SafepointParked  gc_barrier::arrive_and_wait_inner:excluded
+///    2  SafepointParked -> Terminated  gc_barrier::arrive_and_wait_inner:resume
+/// ```
+///
+/// 9 986 reports, one per virtual thread, 4.2 MB of `tracing::error!` on a
+/// probe whose real output is 759 bytes. `(Terminated, Starting)` in the table
+/// is the SAME phenomenon seen once, at one site — a JNI thread re-attaching —
+/// and blessing that single edge is what made the other four look like
+/// defects. `try_record_transition` has always called `revive_current_cell()`
+/// for `from == Terminated`, so revival was already a modelled concept; only
+/// the legality check had not been told about it.
+///
+/// This deliberately gives up on one thing: a genuinely resurrected thread,
+/// recorded on the same cell, now reads as a revival. The record cannot tell
+/// the two apart — under M:N the cell is the carrier's and the identity is
+/// the continuation's — so the choice is between missing that and reporting
+/// every virtual thread in the process. See
+/// `docs/internal/retired/vthread-and-prestart-probe-caps-FIXED-20260911.md`.
 #[inline]
 pub fn is_legal(from: ThreadExecState, to: ThreadExecState) -> bool {
     if from == to {
+        return true;
+    }
+    // Revival, not resurrection -- see the section above.
+    if from == ThreadExecState::Terminated {
         return true;
     }
     let mut i = 0;
@@ -1277,14 +1324,18 @@ mod tests {
     fn representative_illegal_transitions_are_rejected() {
         // `S` is the module-level alias for `ThreadExecState`, glob-imported
         // above.
-        // Terminated is terminal except for an OS-thread re-attach.
+        // Terminated is NOT terminal, and this loop used to assert that it
+        // was -- `!is_legal(S::Terminated, to)`, "a dead thread must not
+        // resume as {to}". The cell belongs to an OS thread and the state
+        // belongs to a LOGICAL one, which are the same object only for
+        // platform threads: a carrier records `Terminated` for every virtual
+        // thread that dies on it and then goes on working. One 10 000-vthread
+        // `VthreadProbe` run produced 9 986 reports out of `Terminated`, one
+        // per virtual thread, against 2 genuine ones. See `is_legal`.
         for to in ThreadExecState::ALL {
-            if to == S::Terminated || to == S::Starting {
-                continue;
-            }
             assert!(
-                !is_legal(S::Terminated, to),
-                "a dead thread must not resume as {to}"
+                is_legal(S::Terminated, to),
+                "a carrier that outlived a virtual thread must be able to record {to}"
             );
         }
         // A thread parked at the barrier cannot die: it must resume first

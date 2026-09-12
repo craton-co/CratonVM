@@ -667,8 +667,14 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
         // Parse pattern: segments separated by '|', each is "limit#format" or "limit<format"
         let segments: Vec<&str> = pattern_str.split('|').collect();
         let count = segments.len();
-        let limits_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
-        let formats_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+        // Two arrays, then a box and a string per segment, and finally three
+        // stores into the receiver: everything here outlives an allocation.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let limits_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, count);
+        let limits_h = scope.root(limits_obj);
+        let formats_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, count);
+        let formats_h = scope.root(formats_obj);
         for (i, seg) in segments.iter().enumerate() {
             let (limit, format_str) = if let Some(pos) = seg.find('#') {
                 let limit: f64 = seg[..pos].trim().parse().unwrap_or(0.0);
@@ -681,15 +687,20 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
                 (0.0, seg.trim())
             };
             // Store limit as a boxed Double synthetic
-            let limit_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Double", 1)?;
-            ctx.set_field(limit_obj, 0, Value::Double(limit));
-            ctx.set_array_element(limits_arr, i, Value::Object(Some(limit_obj)));
-            let fmt_s = ctx.create_string(format_str);
-            ctx.set_array_element(formats_arr, i, Value::Object(Some(fmt_s)));
+            let limit_obj = try_alloc_concurrent_synthetic(&mut *scope, "java/lang/Double", 1)?;
+            scope.set_field(limit_obj, 0, Value::Double(limit));
+            let limits_arr = scope.get(&limits_h);
+            scope.set_array_element(limits_arr, i, Value::Object(Some(limit_obj)));
+            let fmt_s = scope.create_string(format_str);
+            let formats_arr = scope.get(&formats_h);
+            scope.set_array_element(formats_arr, i, Value::Object(Some(fmt_s)));
         }
-        ctx.set_field(this, 0, Value::Object(Some(limits_arr)));
-        ctx.set_field(this, 1, Value::Object(Some(formats_arr)));
-        ctx.set_field(this, 2, Value::Int(count as i32));
+        let this = scope.get(&this_h);
+        let limits_arr = scope.get(&limits_h);
+        let formats_arr = scope.get(&formats_h);
+        scope.set_field(this, 0, Value::Object(Some(limits_arr)));
+        scope.set_field(this, 1, Value::Object(Some(formats_arr)));
+        scope.set_field(this, 2, Value::Int(count as i32));
         Ok(None)
     });
     r.register(cf, "<init>", "([D[Ljava/lang/String;)V", |ctx, args| {
@@ -1549,10 +1560,19 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(e))))
     });
     r.register(rb, "keySet", "()Ljava/util/Set;", |ctx, _args| {
-        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-        ctx.set_field(set, 0, Value::Object(None));
-        ctx.set_field(set, 1, Value::Int(0));
-        ctx.set_field(set, 2, Value::Int(16));
+        // Through the real `HashSet.<init>`: the three slots this used to
+        // write are the MAP layout on a class whose one real field is `map`.
+        // See `phases_late::collections`'s `Collections.singleton`.
+        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+        let set_pin = ctx.pin_native_root(set);
+        let _ = ctx.invoke(
+            "java/util/HashSet",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(set))],
+        );
+        let set = ctx.read_native_pin(set_pin, set);
+        ctx.unpin_native_roots(set_pin);
         Ok(Some(Value::Object(Some(set))))
     });
     r.set_category(__prev_cat);

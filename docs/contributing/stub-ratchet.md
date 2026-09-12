@@ -76,7 +76,7 @@ above the truth for a week.
 
 ## What "the default registry" means, and how it stopped meaning less
 
-The census runs **all six registration passes `vm/src/vm/vm_init.rs` runs** on
+The census runs **every registration pass `vm/src/vm/vm_init.rs` runs** on
 the real-JDK boot path, in its order, behind its `set_drop_real_layout_synthetic`
 flag — see `register_boot_path` in the test.
 
@@ -109,3 +109,103 @@ rules that run *after* the JdkOnly check (`EnumSet`); and one triple can be
 registered with two different kinds (`ByteBuffer.allocate`). It is enforced
 structurally in `register()` and asserted hermetically in
 `native-api/tests/jdk_only_registry.rs` instead. Do not re-add it here.
+
+## Attribute a delta with `CRATONVM_RATCHET_ROWS=1`, not with the dump
+
+The failure message used to say: diff `dump_synthetic_stubs` at this commit and
+at the last freeze. **That diff can be empty while the number has moved by 30.**
+
+This count is **registrations**. `dump_synthetic_stubs` prints **distinct
+triples**. Plenty of triples are registered more than once —
+`ExceptionInInitializerError.<init>()V` from both `lang_misc.rs` and `lib.rs`,
+`Throwable.initCause` from both `lang_misc.rs` and `reflect_annotations.rs` — so
+when one registration is already a `SyntheticStub` and a retirement re-tags the
+other, the count rises by one and the distinct set does not change at all.
+
+Measured 2026-09-11: lane 2's wave 2 moved this gate **+30 / +46 / +30** across
+the three arms with a **byte-identical** dump. The natural misreading of that
+silence is *"my retirement did nothing"*, and the lane nearly abandoned a correct
+50-row table on it. The VM disagreed — `--jdk-only-report` refusals under
+`java/lang` + `java/math` went **95 → 144**, zero survivors.
+
+So: `CRATONVM_RATCHET_ROWS=1` is the attributing instrument, per-registration and
+keyed by registering file. The dump is a summary, and a weaker one than it looks.
+
+## A motionless count is still not proof for rows outside the configuration
+
+Scope, printed on every run as `stub-ratchet(scope):`. Measured that day on one
+tree, **132 `SyntheticStub` rows the shipped VM dispatches sit outside this
+census** — 54 `native-awt`, 25 `jmx`, 21 `native-collections`, 15
+`jar_manifest`, 12 `native-builtins/lib.rs`, 3 elsewhere.
+
+Fourteen of lane 2's fifty were among them, every one a `java/lang/management/*`
+triple registered by `jmx.rs`. In the no-management configuration those are
+invisible **by construction** — widening the boot-path replay would not recover
+them — which is why that arm moved +30 and the management arm +46. Each
+configuration has its own constant and that is where such rows show.
+
+## Take both sides of any comparison from ONE tree, and watch the target dir
+
+Two ways this went wrong the same day, both producing confident wrong numbers:
+
+* **Cross-tree.** This census on current sources against a
+  `--dump-native-registry` from a binary built weeks earlier showed 452
+  disagreements. Same-tree: 2. A census on one tree against a dump from another
+  measures neither.
+* **A shared `CARGO_TARGET_DIR`.** Building both arms into one target dir, the
+  second build printed `Finished in 0.18s`, compiled nothing, and scored one tree
+  with the other's binary — cargo's freshness is by **mtime**, and a `git merge`
+  writes sources older than artefacts built after it. Assert a non-zero
+  `Compiling` count, copy each binary out, and print both sha256s.
+
+`W7-30-stub-ratchet-boot-path-scope.md` §12 carries the full account.
+
+## The strict-registry bound is derived, because the number it guards is meant to fall
+
+`strict_registry_has_zero_synthetic_stubs` and
+`strict_registry_drops_only_the_stubs` both need to know that "zero synthetic
+stubs" is a statement about a populated registry. Until 2026-09-11 they asked
+that as an absolute floor, `strict_total >= STRICT_MIN_TOTAL_REGISTRATIONS`, and
+that constant was re-justified by hand four times in a month: 10,500 -> 10,200
+-> 10,900 -> 10,600.
+
+It is worth being precise about why, because the same shape will be tempting
+again. Strict mode refuses a `SyntheticStub` **at the door**. So a retirement
+wave that re-tags N `Bridge` registrations does two different things to the two
+totals this file prints:
+
+| | compatible | strict |
+|---|---|---|
+| before the wave | T | T - S |
+| after re-tagging N | T (unchanged — a re-tag changes a KIND) | T - S - N |
+
+The compatible total is what `MIN_TOTAL_REGISTRATIONS` guards and it genuinely
+does not move; the strict total falls by exactly N, every time, by design. An
+absolute lower bound on it is therefore not a detector with headroom — it is a
+re-freeze chore with a deadline, and the deadline is however many retirements
+fit in the headroom. Three lanes retiring shadows in one week spends 300 rows in
+days, which is what happened: `bf03c1d38` lowered it for 87 `sun/misc/Unsafe`
+registrations, and the wave before that had already spent most of the rest.
+
+The bound is now `STRICT_UNEXPLAINED_DROP_MAX`, on the GAP rather than the level:
+
+```text
+compat_total - compat_stubs - strict_total <= STRICT_UNEXPLAINED_DROP_MAX
+```
+
+Both terms come from the same run, so no wave moves it. What is left for the
+constant to cover is only `alias_class` fallout — an alias copied off a refused
+stub is never attempted, so one refusal can remove more than one row — which was
+**3** rows when this landed, against a slack of 64.
+
+Two things this makes easier to get right:
+
+* **A wave no longer has to touch this file at all.** Re-freezing
+  `BASELINE_SYNTHETIC_STUBS` is still a wave's job, because that is the number
+  whose movement is the wave's own claim. The strict bound is not.
+* **When it does go red, it means what it says.** A module that fails to
+  register sheds rows on the strict side without adding stubs on the compatible
+  side, so it moves the gap; a retirement moves both sides together and leaves
+  the gap alone. The failure message prints the shortfall, the stub count and the
+  compatible total, so the first question — "is this a wave or a shed module?" —
+  is answered by the message rather than by a second measurement.

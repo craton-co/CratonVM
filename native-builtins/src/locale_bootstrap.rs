@@ -18,7 +18,7 @@
 //! branch of `JRELocaleProviderAdapter.getLocaleServiceProvider` so code
 //! paths that still reach it get `null` instead of an `InternalError`.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::Mutex;
@@ -1061,16 +1061,27 @@ const AVAILABLE_LOCALES: &[(&str, &str)] = &[
 fn get_available_locales(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let cls = "java/util/Locale";
     let locale_cid = ctx.ensure_class_initialized(cls)?;
-    let arr = ctx.new_ref_array(locale_cid, AVAILABLE_LOCALES.len());
+    // One Locale, three Strings and a constructor call per entry: the array,
+    // the locale and each string are all young and all move under the ones that
+    // follow them. Everything crossing an allocation goes through the scope.
+    let mut scope = NativeHandleScope::new(ctx);
+    let arr_obj = scope.new_ref_array(locale_cid, AVAILABLE_LOCALES.len());
+    let arr_h = scope.root(arr_obj);
     for (i, (lang, country)) in AVAILABLE_LOCALES.iter().enumerate() {
-        let loc_obj = match ctx.new_object(cls) {
+        let loc_obj = match scope.new_object(cls) {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => continue,
         };
-        let l = ctx.create_string(lang);
-        let c = ctx.create_string(country);
-        let v = ctx.create_string("");
-        let _ = ctx.invoke(
+        let loc_h = scope.root(loc_obj);
+        let l = scope.create_string(lang);
+        let l_h = scope.root(l);
+        let c = scope.create_string(country);
+        let c_h = scope.root(c);
+        let v = scope.create_string("");
+        let loc_obj = scope.get(&loc_h);
+        let l = scope.get(&l_h);
+        let c = scope.get(&c_h);
+        let _ = scope.invoke(
             cls,
             "<init>",
             "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
@@ -1081,9 +1092,13 @@ fn get_available_locales(ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
                 Value::Object(Some(v)),
             ],
         );
-        ctx.set_array_element(arr, i, Value::Object(Some(loc_obj)));
+        // The constructor ran Java, so both the array and the locale it is
+        // about to hold have to be read again.
+        let arr = scope.get(&arr_h);
+        let loc_obj = scope.get(&loc_h);
+        scope.set_array_element(arr, i, Value::Object(Some(loc_obj)));
     }
-    Ok(Some(Value::Object(Some(arr))))
+    Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
 }
 
 /// `JRELocaleProviderAdapter.getLocaleServiceProvider(Class)`.

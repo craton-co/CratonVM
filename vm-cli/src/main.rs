@@ -367,6 +367,31 @@ fn maybe_dump_shutdown_reports() {
             eprintln!("[cratonvm] generational young uncommit: {bytes} bytes returned to the OS");
         }
     }
+    // FIELD-BY-NAME STORES THAT WENT NOWHERE. `NativeContext::set_field_by_name`
+    // resolves the field against the class of whatever object is AT the address
+    // it is handed, and DROPS the store when it does not resolve. That is a
+    // legitimate outcome for a native setting a field only some subclasses
+    // declare — and it is also what a stale receiver looks like, because a
+    // vacated young address is usually re-served to an unrelated object before
+    // the store runs. The drop happens before the heap is touched, so no
+    // `[deadref-*]` arm, no `[CELLWATCH]` and no `[PUTFIELD-WATCH]` can see it;
+    // this counter is the only place it is visible at all.
+    //
+    // A non-zero number is not a defect by itself. It is the denominator for
+    // `CRATONVM_DBG_DEADREF_STORE=1`, which turns each one into a
+    // `[field-by-name-dropped]` line with the receiver's class and a backtrace.
+    {
+        let dropped = cratonvm_vm::vm::field_by_name_dropped_count();
+        if dropped != 0 {
+            eprintln!(
+                "[cratonvm] set_field_by_name stores dropped: {dropped} — the receiver's class did \
+                 not declare the named field. Expected for natives that set a field only some \
+                 subclasses have; ALSO the shape a stale receiver takes, because the drop happens \
+                 before the heap is touched and no stale-reference probe can see it. \
+                 CRATONVM_DBG_DEADREF_STORE=1 names each one."
+            );
+        }
+    }
     // STATIC ROOT SLOTS -- the engagement number for the slot-carrying
     // root path (`CRATONVM_GC_STATIC_ROOT_SLOTS`). Both halves, for the
     // usual reason: `slots=0` alone cannot distinguish the kill switch
@@ -6055,6 +6080,18 @@ fn run() -> Result<()> {
             "[cratonvm]   of which VarHandle instance-field reads served directly: {}",
             cratonvm_vm::jit::helpers::varhandle_field_read_hit_count()
         );
+        // Compiled `newarray` sites that bump the TLAB inline instead of
+        // calling `jit_newarray`. BOTH halves, always: a workload whose arrays
+        // all took the helper says nothing about the bump, so a zero on the
+        // left has to be distinguishable from "emitted and refused". The
+        // decline reasons are the work list.
+        let (array_bump, array_stub) = cratonvm_jit::x64::inline_array_site_counts();
+        eprintln!(
+            "[cratonvm] compiled newarray sites: inline_tlab_bump={array_bump} stub_only={array_stub}"
+        );
+        for (why, n) in cratonvm_jit::x64::inline_array_declines() {
+            eprintln!("[cratonvm]   inline newarray declined {n}x: {why}");
+        }
         // The same read, reached WITHOUT the funnel — a thin direct call baked
         // into compiled code by `VARHANDLE_READ_DIRECT_FNS`. The pair is the
         // engagement evidence for that bind: `served` counts calls that never

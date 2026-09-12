@@ -1523,7 +1523,11 @@ pub(crate) fn native_es_knn_score_doc_query_init(
         hit_pins.push(ctx.pin_native_root(h.2));
     }
     let docs_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, len);
+    // `docs_arr` is itself a young object, and the very next line allocates:
+    // pin it like everything else that crosses an allocation here.
+    let docs_pin = ctx.pin_native_root(docs_arr);
     let scores_arr = ctx.new_array(cratonvm_types::ArrayElementType::Float, len);
+    let docs_arr = ctx.read_native_pin(docs_pin, docs_arr);
     let score_docs = ctx.read_native_pin(sd_pin, score_docs);
     let reader = ctx.read_native_pin(rd_pin, reader);
     for (i, h) in hits.iter_mut().enumerate() {

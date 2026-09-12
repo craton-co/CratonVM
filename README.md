@@ -47,7 +47,7 @@ install, no `rt.jar`, one self-contained binary.
 CPU, vs HotSpot JDK 25 C2 — same flags both sides, checksum-verified against
 HotSpot on every run (zero mismatches):
 
-| Benchmark                | JDK 25 C2 | CratonVM   | Ratio     | Gap growth    |
+| Benchmark                | JDK 25 C2 | CratonVM   | Ratio     |  Growth       |
 |--------------------------|-----------|------------|-----------|---------------|
 | Arithmetic (2B ops)      | 1,852 ms  | 3,601 ms   | 1.94x     | linear        |
 | Fibonacci(44)            | 1,449 ms  | 5,059 ms   | 3.49x     | linear        |

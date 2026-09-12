@@ -592,6 +592,133 @@ fn inline_tlab_header_writes_stay_inside_the_header() {
     );
 }
 
+/// The ARRAY inline allocator is held to the same publication order as the
+/// object one: **every header word lands before the cursor commits**.
+///
+/// `the_inline_allocator_writes_the_mark_word_unconditionally` next door pins
+/// the object emitter against a store drifting inside a conditional. This pins
+/// the array emitter against the other half of the same failure — a store
+/// drifting after the commit — because that is the ordering BinTrees-18 was:
+/// the bump published the object's address into `thread.tlab.cursor` and only
+/// then wrote the header, leaving a window in which a walker read
+/// `class_id = 0, num_slots = 0`, computed `size = HEADER_SIZE`, and stepped
+/// into the object's own body.
+///
+/// Source-level on purpose, and for the reason its sibling gives: what must
+/// stay pinned is structural, and the emitted bytes cannot show it — the
+/// commit and the header writes are all just `MOV`s.
+#[test]
+fn the_inline_array_allocator_commits_the_cursor_after_every_header_write() {
+    let src = include_str!("objects.rs");
+    let start = src
+        .find("pub(super) fn emit_inline_tlab_newarray")
+        .expect("the inline TLAB array allocator must still exist");
+    let body = &src[start..];
+
+    let mut header_writes = 0usize;
+    let mut commit_at: Option<usize> = None;
+    let mut last_header_at = 0usize;
+    let mut depth = 0i32;
+    for (n, line) in body.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        // The four header stores: class_id, shape, and the two mark-word
+        // halves. `emit_mov_dword_mem_disp32_imm32` covers three of them and
+        // the raw `MOV [R11+ARRAY_LENGTH_OFFSET], ECX` is the fourth.
+        if code.contains("emit_mov_dword_mem_disp32_imm32")
+            || code.contains("ARRAY_LENGTH_OFFSET as u8")
+        {
+            header_writes += 1;
+            last_header_at = n;
+        }
+        // The commit: `MOV [R10 + cursor_off], RAX`.
+        if code.contains("emit_mov_mem_disp32_r64") && commit_at.is_none() {
+            commit_at = Some(n);
+        }
+        for ch in code.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth < 0 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        header_writes, 4,
+        "the array emitter must write class_id, shape and both halves of the \
+         mark word; found {header_writes} header stores"
+    );
+    let commit_at = commit_at.expect("the array emitter must commit the TLAB cursor");
+    assert!(
+        commit_at > last_header_at,
+        "the TLAB cursor commit (line +{commit_at}) precedes a header store \
+         (line +{last_header_at}). The commit is the single linearization \
+         point: publishing it first exposes an object whose header is still \
+         whatever the TLAB slot held, which the collector's linear walk \
+         mis-decodes and steps through into its neighbour."
+    );
+}
+
+/// The array emitter's inline ceiling must be the allocator's own.
+///
+/// `tlab_alloc_array_guarded_refill` refuses anything at or above
+/// `tlab_max_alloc()` and hands it to the ordinary path, which owns the
+/// young-vs-old-gen (humongous) routing decision. An inline bump that admitted
+/// a larger array would take that decision away from it silently.
+///
+/// The constant is duplicated in `objects.rs` because `cratonvm-gc` is a
+/// dev-dependency of this crate — reachable from a test and not from the
+/// emitter. This is the test that makes the duplicate safe.
+#[test]
+fn the_inline_array_cap_tracks_the_allocator_s_own() {
+    assert_eq!(
+        super::Compiler::INLINE_ARRAY_TLAB_MAX_ALLOC,
+        cratonvm_gc::tlab::tlab_max_alloc(),
+        "the inline `newarray` size ceiling has drifted from the TLAB's own \
+         per-allocation cap"
+    );
+}
+
+/// `ArrayElementType`'s discriminants ARE the JVM `newarray` atype values.
+///
+/// The `0xbc` arm decodes its operand byte with
+/// `array_element_type_from_tag(atype)`, which is only the right decode
+/// because of this coincidence — and it is a designed one (the enum's own doc
+/// says "maps to `newarray` atype values"), not an accident. If a
+/// discriminant were renumbered, that arm would allocate a `byte[]` where the
+/// bytecode asked for a `long[]` and the mark word would say so, which no
+/// later check would catch.
+#[test]
+fn the_array_element_discriminants_are_the_jvm_atype_values() {
+    use cratonvm_types::ArrayElementType as E;
+    for (atype, expected) in [
+        (4u8, E::Boolean),
+        (5, E::Char),
+        (6, E::Float),
+        (7, E::Double),
+        (8, E::Byte),
+        (9, E::Short),
+        (10, E::Int),
+        (11, E::Long),
+    ] {
+        assert_eq!(
+            cratonvm_types::array_element_type_from_tag(atype),
+            Some(expected),
+            "JVM atype {atype} must decode to {expected:?} — this is the \
+             mapping `jit_newarray` applies, and the `0xbc` inline arm must \
+             agree with it exactly"
+        );
+    }
+}
+
 // -- arch-2026-07-26 R1: reference-only self-call spill elision ---------
 
 #[test]
@@ -895,10 +1022,19 @@ fn header_offset_emission_site_inventory_matches_the_doc() {
     let cases: [(&str, &str, usize); 7] = [
         ("HEADER_SIZE", " as u8", 22),
         ("HEADER_SIZE", " as i32", 13),
-        ("ARRAY_LENGTH_OFFSET", " as u8", 22),
+        // 2026-09-11: +3 for the STRINGBUILDER_ACCESS / inline-`newarray`
+        // work in `objects.rs` — the array allocator's disp8 screen and its
+        // shape store, and the append body's capacity load. All three are
+        // disp8, which is the hazardous form, and all three are behind the
+        // allocator's own screen: a header that grew past 127 costs the site
+        // its inline path instead of addressing backwards.
+        ("ARRAY_LENGTH_OFFSET", " as u8", 25),
         ("ARRAY_LENGTH_OFFSET", " as i32", 5),
         ("ARRAY_LENGTH_OFFSET", " as i64", 3),
-        ("ARRAY_DATA_OFFSET", " as u8", 13),
+        // 2026-09-11: +2 for the same work — the array allocator's disp8
+        // screen and the `MOV [RDX+R8+ARRAY_DATA_OFFSET], CL` element store in
+        // the append body. Both behind that screen.
+        ("ARRAY_DATA_OFFSET", " as u8", 15),
         ("ARRAY_DATA_OFFSET", " as i32", 0),
     ];
     for (base, suffix, expected) in cases {

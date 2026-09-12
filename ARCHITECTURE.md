@@ -109,17 +109,21 @@ Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
 Measured 2026-09-09 with the command above, one directory at a time;
-`native-api` re-measured twice since, both times because a jdk-only lane added
-a retirement table to `retired_shadow.rs`: L1's 329 triples took it from 37k to
-38,923 on 2026-09-10, and lane T's 906 to 43,982 on 2026-09-11. A campaign that
-adds one table per lane moves this row on every landing, so re-derive it rather
-than assuming the last lane's number still holds.
+`native-api` has since moved on every jdk-only lane landing, because every
+retirement table lives in `retired_shadow.rs`, one row per retired triple plus
+the account justifying it: L1's wave took it from 37k to 38,923; L0+L3+L1's
+waves 3-4+L7 took it to 41,715; lane 4 and `file_layout.rs` to 42,429; lane T's
+table (783 triples after its own carve-out, see the throwable-family lane
+record) brings it to **47,446** on the merge of all of the above. **The 5%
+tolerance on the row below is roughly two waves wide**, so expect to
+re-measure it about every second wave rather than treating a red here as a
+surprise.
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
 | `native-builtins` | 753,000 | `native-awt` | 18,000 |
 | `vm` | 480,000 | `types` | 44,000 |
-| `jit` | 269,000 | `native-api` | 44,000 |
+| `jit` | 269,000 | `native-api` | 47,000 |
 | `gc` | 190,000 | `reader` | 17,000 |
 | `native-collections` | 88,000 | `jfr` | 20,000 |
 | `native-io` | 85,000 | `jit-cuda` | 14,000 |

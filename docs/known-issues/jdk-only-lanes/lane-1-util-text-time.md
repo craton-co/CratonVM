@@ -31,10 +31,10 @@ preconditions and the landing protocol are in
 | PART RETIRED — `HashMap` + views + iterators + `$Node` | 98 | **wave 3**: 21 retired, 77 held. The nine rows that held it were a DIAL ARTEFACT; the twelve probes that hold the 77 are not — §3 |
 | HELD — `Hashtable` + views + `$Entry` | 79 | 4 probes worse |
 | PART RETIRED — `java/util/jar/` | 45 | **wave 4**: everything but `JarFile`, which is the whole of the `+34` — §3 |
-| HELD — `Date` / `TimeZone` / `sun/util/calendar/` | 40 | 5 probes worse; bisected §10 item 6 |
-| HELD — `Locale` + `sun/util/locale/` + `sun/util/resources/` + `Currency` | 35 | 3 probes worse, one truncates 125 → 8; bisected §10 item 6 |
+| HELD — `Date` / `TimeZone` / `sun/util/calendar/` | 40 | 5 probes worse; bisected §10 item 6. **Wave 5 wrote a 2-row table for `ZoneInfoFile`, the one non-vacuous `+0`; unaccepted** |
+| HELD — `Locale` + `sun/util/locale/` + `sun/util/resources/` + `Currency` | 35 | 3 probes worse, one truncates 125 → 8; bisected §10 item 6. **Wave 5 located the blocker under the five vacuous rows and fixed half of it** — §10 item 6 |
 | HELD — the interface and abstract receivers | 28 | §6 — they are NOT dead, and no per-class trial was run |
-| HELD — `HashSet` / `LinkedHashSet` remainder | 13 | lane T holds `register_hashset_natives` |
+| HELD — `HashSet` / `LinkedHashSet` remainder | 13 | lane T holds `register_hashset_natives` (`SET_CLASSES` spans `java/util/` and `java/util/concurrent/`). **Wave 5 repaired its one measured row without retiring anything** — §10 item 7 |
 | PART RETIRED — `java/text/` | 12 | **wave 4**: `Normalizer` only. `BreakIterator` is the whole `+16`, `DateFormat` is vacuous, `ParseException` repairs nothing and its two moving rows are `Throwable`'s — §3 |
 | HELD — `ResourceBundle` + `$Control` | 12 | **armed-clean over 51 probes, red on the trial binary** — §8 |
 | EXCLUDED — no dispatch any probe can produce | 9 | §5 |
@@ -50,7 +50,167 @@ would invent a number neither took. What they retire, exactly:
   wave 4  RETIRED_SHADOW_L1_JT_TRIPLES   29 triples   java/util/jar/Attributes,
                                                       $Name, JarEntry, Manifest,
                                                       java/text/Normalizer
+  wave 5  RETIRED_SHADOW_L1_ZI_TRIPLES    2 triples   sun/util/calendar/ZoneInfoFile
+                                                      -- ACCEPTED, see below
 ```
+
+### Wave 5 — the acceptance
+
+Control `cratonvm-l1w5-base-20260911` is `origin/dev` at `565509592`
+untouched; trial `cratonvm-l1w5-trial-20260911` is that same tree plus this
+wave. Both built first-attempt on the same host, same toolchain, same day.
+
+```text
+  142 probes    0 worse    0 better
+    base differing 29    trial differing 29
+```
+
+**The baseline is 29, and the first reading was 33.** Four probes —
+`L5CasRace`, `L5SubwordAtomics`, `L5UnsafeAccess`, `JcaSunTlsVectors` — read
+as differing because HOTSPOT produced zero rows: it died on an
+`IllegalAccessError` for want of a runtime `--add-exports`, while this VM,
+which does not enforce that module boundary, printed its full output. Every
+row then counted as a difference. With the oracle configured like the VM
+under test all four go to **0 diff**, and `tree5.sh` now carries the exports
+with the 33 → 29 numbers in its comment. Configure the oracle like the thing
+you are testing, or you measure your own harness.
+
+**One probe moved, and it is a coin flip in BOTH arms.** `VtHandoffProbe`
+read 10 → 16 on the tree. Run alone six times per arm it looked damning —
+base `10 10 10 10 10 10`, trial `10 10 0 10 14 10` — which is a different
+claim from the one this probe was disarmed on last wave (there the CONTROL
+was the unstable one) and not something six unpaired runs can settle. Fourteen
+INTERLEAVED pairs, both arms in the same minute:
+
+```text
+  BASE : 10 0 10 10 10 10 10 10 10 10 0 14 10 10     3 excursions
+  TRIAL: 10 14 10 10 10 10 10 10 10 10 14 10 10 10   2 excursions
+```
+
+Same value set `{0, 10, 14}`, and the CONTROL has more excursions than the
+trial. The 6/6 stability was luck. The probe's own doc comment says why it
+cannot adjudicate this at all: *"on CratonVM it is 64 on an idle host and
+55-58 on a loaded one"* — its author measured the row as load-sensitive on
+this VM, and this host is never idle.
+
+#### The corpus, and a red arm that is not this wave's
+
+```text
+                              control          trial
+  jdk-only-strict-probes      FAIL             FAIL
+  regression-suite SUITE=all  133 / 133        133 / 133
+  regression-suite SUITE=core  93 /  93         93 /  93
+```
+
+**Arm 1 fails on `origin/dev` UNTOUCHED**, and the same three probes diverge
+in both arms (`JdkOnlyPlatformProbe`, `ChmKeySetGrowth`, `ChmShadowSweep`).
+Every "new divergence" is a line of this shape:
+
+```text
+  +2026-09-11T21:26:32.831065Z  WARN cas_diag: T19_H6_CAS_DIAG cas_long FAIL #3
+     class=java/util/concurrent/ConcurrentHashMap$CounterCell
+```
+
+— a timestamped CAS-retry DIAGNOSTIC being compared as if it were program
+output. It carries a wall clock, so it can never match a frozen baseline, and
+it only appears when a CAS actually contends. **That arm cannot stay green
+under load regardless of what any lane does**, and it is worth someone's
+attention as a harness defect rather than a VM one.
+
+**The count of those lines nearly cost this wave a false regression, and the
+interleaving is what saved it.** Taken sequentially — three control runs, then
+two trial runs — the two arms did not overlap at all:
+
+```text
+  base  (sequential)  11  9 14  8          range 8-16 combined with the corpus run
+  trial (sequential)  15 15 15
+```
+
+and there was a MECHANISM ready to explain it, which is the dangerous part:
+`try_delegate_real_collection` now runs real bytecode for `size`/`isEmpty` on
+carrier receivers, `ConcurrentHashMap$EntrySetView` is a `SET_VIEW_CARRIERS`
+entry, and the diagnostics name `ConcurrentHashMap$CounterCell`. A `size()`
+that used to answer 0 and now answers correctly makes downstream code do work
+it was skipping — more counter updates, more CAS retries, more lines. The
+story fits. It is also wrong. Six INTERLEAVED pairs:
+
+```text
+  BASE : 12 12 12 15 16 12     range 12-16
+  TRIAL: 10 15 16 16 15 12     range 10-16
+```
+
+Fully overlapping; the CONTROL reaches 16 and the TRIAL goes down to 10. The
+sequential split was the clock, not the binary. **A plausible mechanism is not
+evidence, and on this host a sequential A/B is not a measurement** — the same
+lesson the probe tree's one mover taught two hours earlier, in a different
+instrument.
+
+#### The ratchet
+
+Each arm RUN, none copied from a sibling and none computed as `n + 2`:
+
+```text
+  BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT   2547 -> 2549
+  BASELINE_SYNTHETIC_STUBS_MANAGEMENT      2558 -> 2560
+  BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK   2547 -> 2549
+```
+
+`+2` on every arm, and the account the assertion demands is two rows —
+`ZoneInfoFile.getZoneInfo` and `getZoneInfo0`, the whole of
+`RETIRED_SHADOW_L1_ZI_TRIPLES`. The table's own length and the ratchet are two
+instruments reporting one number.
+
+#### The unit gates
+
+```text
+  native-api --lib                                 400 passed, 0 failed
+  native-collections --lib                         147 passed, 0 failed
+  native-builtins --test stub_ratchet               12 passed, 0 failed
+  native-builtins --test duplicate_registration_gate 7 passed, 0 failed
+  rustfmt --check hunks inside this branch's lines:  0
+```
+
+**Wave 5 IS landed, and its table with it.** The paragraph below was written
+before the acceptance ran and is kept because the reasoning still stands: the
+3,792 engagements bought the table a place in the queue, not a landing. What
+landed it is the trial binary.
+
+**Wave 5 was not landed on the strength of its own table.** Its two rows are
+the one non-vacuous `+0` in item 6's bisection (3,792 door engagements), and
+an armed `+0` is what a LEAKED dial row looks like too — so the 3,792 bought
+the table a queue place and nothing more. The trial binary above is what
+landed it. Beside the table, wave 5 landed four things that needed no
+retirement at all:
+
+```text
+  1  try_delegate_real_collection now runs the receiver's own bytecode when
+     the receiver's own class declares the method   (§10, "not a family")
+  2  map_resize writes HashMap.resize()'s threshold postcondition, which this
+     VM never did                                    (§10 item 7's one row)
+  3  LocaleResources.getBreakIteratorInfo / getBreakIteratorResources answer
+     from the image instead of null                  (§10 items 5, 6, 8)
+  4  a guard that NAMES a table missing from RETIRED_SHADOW_TABLES
+```
+
+Item 4 started as a red-gate fix and was overtaken mid-session, which is worth
+recording as it happened. `triple_is_retired_shadow` consulted ten tables and
+`RETIRED_SHADOW_TABLES` listed eight, so
+`the_tables_const_lists_every_table_the_predicate_consults` asserted `10 == 8`
+and `cargo test -p cratonvm-native-api --lib` was **red on `dev`** — caused by
+this lane's own wave-3/4 merge, and verified by reading `origin/dev` at
+`059eabf7e` rather than inferred from a branch. The const's doc comment
+already carried notes for the same drift at the wave-2 and lane-7 merges;
+that made it the third and fourth occurrence, and the first where the
+omitting lane was the owning one.
+
+**A sibling fixed it better while this branch was being written**, at
+`edc6653d3`: the predicate is now a loop over `RETIRED_SHADOW_TABLES`, so
+there is no second list to drift from. The count guard is gone with it. What
+this wave keeps is the part the loop does not cover —
+`lane_ones_four_tables_are_all_in_the_tables_const`, which NAMES a missing
+table. The omission is rarer now and louder: under the loop, a table absent
+from the const is not consulted at all, so forgetting one silently
+**un-retires a whole wave** rather than merely under-covering it.
 
 All three tables live in `native-api/src/retired_shadow.rs` with the numbers
 per family, and the tests beside them pin every HELD verdict — including the
@@ -725,12 +885,36 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    item 2 unblocks those eight for free.
 3. **`HashMap`'s views, iterators, `$Node` and its three view accessors
    (77).** Wave 3 measured these and put them back; §3 has the two throws.
-   The iterators need **a Hashtable-family iterator carrier of its own** —
-   `java/util/Hashtable$Enumerator` is what HotSpot answers and
-   `deprecated_util.rs` already names it — so that `key_itr_carrier_for`
-   stops minting `HashMap$KeyIterator` for receivers outside the family. Do
-   that, and the views, the accessors and the iterators can move as one set.
-   Until then any subset of them is a half-retirement.
+
+   **CORRECTED 2026-09-11 (wave 5), and the correction matters for who does
+   it.** This item used to say the iterators need "a Hashtable-family
+   iterator carrier of its own". That is half the blocker and not the half
+   the measurement found. `key_itr_carrier_for`
+   (`native-collections/src/lib.rs`) ends in a two-way fallthrough:
+
+   ```rust
+     (false, false) => "java/util/HashMap$KeyIterator",
+     (false, true)  => "java/util/HashMap$EntryIterator",
+   ```
+
+   and `false` there means "not LinkedHashMap-shaped and not CHM" — which
+   includes a `java/util/HashSet` receiver. The row that actually broke was
+   `MethodRefDoorProbe`'s **HashSet** row, not a Hashtable one. So the set
+   needs TWO carriers, not one:
+
+   - `java/util/Hashtable$Enumerator` for the Hashtable family. **L1's**, and
+     cheap: `deprecated_util.rs` already builds a REAL one over the live
+     table (`HASHTABLE_ENUMERATOR_CLASS`, and its comment "never accept a
+     stand-in"), so the carrier exists and only the `key_itr_carrier_for`
+     branch is missing.
+   - a `HashSet`-family iterator carrier. **NOT L1's.** It has to come with
+     `register_hashset_natives`, whose `SET_CLASSES` is `HashSet`,
+     `LinkedHashSet` and `java/util/concurrent/CopyOnWriteArraySet` — two
+     lanes' prefixes, so lane 0 §3's test makes the registrar lane T's whole.
+
+   Item 7 below was already blocked on that registrar; this item is too, and
+   was not recorded as such. Until both carriers exist, any subset of the 77
+   is a half-retirement.
 4. **`Hashtable` + views + `$Entry` (79).** Four probes worse armed, and
    NOT the same answer as `HashMap` was: its fields already match HotSpot
    unarmed and its views survive arming byte-identically
@@ -738,9 +922,56 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    columns). Its own question, unbisected.
 5. **`java/util/jar/JarFile` and `java/text/BreakIterator`.** What is left
    of §7's two vacuous greens after wave 4 took the other six classes: each
-   family's whole regression is ONE class, and each is unbisected BELOW the
-   class. `JarFile` is 32 registrations and `BreakIterator` 17; split by
-   method next, not by prefix. One row of `apps/probes/L1JarTextSweep.java`
+   family's whole regression is ONE class.
+
+   **ANSWERED 2026-09-11 (wave 5), and the answer is that neither wants a
+   method split.** This item asked for a below-class bisection. Both classes
+   turn out to have a single blocker that no subset of their methods escapes,
+   and both were readable out of the source rather than measurable out of a
+   sweep — which is why no build was spent on the split.
+
+   **`JarFile` (32) is a STATE-MODEL blocker, the same class as items 1 and
+   2.** This VM's `JarFile` is a compact synthetic object that does not carry
+   `ZipFile`'s state, and the force-native bridge in
+   `vm/src/runtime/interpreter/invoke.rs` says so in as many words — "its
+   ZipFile state is not present on CratonVM's compact native JarFile
+   representation", and for the `super.close()` bridge beside it, "its `res`
+   field is absent on CratonVM-native JarFiles". Retire any constructor and
+   real `ZipFile` bytecode gets an object with nothing to read, which is
+   precisely the `NullPointerException` on `new JarFile(f)` that the +34 is.
+   The remedy is `Properties`' `replace_real_map` shape again: build the real
+   `ZipFile` state, make it the authority, then retire. Not a method split.
+
+   **And it has TWO PRODUCERS. Wave 5 measured which one wins** rather than
+   leaving the next reader a grep — `the_jarfile_constructor_has_two_producers
+   _and_this_says_which_wins` in `native-builtins/tests/
+   duplicate_registration_gate.rs`, replaying `vm_init`'s real-JDK arm:
+
+   ```text
+     java/util/jar/JarFile.<init>(Ljava/io/File;)V
+         lost at native-io/src/zip_real_jar.rs:1366              [bridge]
+         WINS at native-builtins/src/phases_late/jar_manifest.rs:27  [bridge]
+     java/util/jar/JarFile.<init>(Ljava/io/File;Z)V              ... same pair
+     java/util/jar/JarFile.<init>(Ljava/lang/String;)V           ... same pair
+     java/util/jar/JarFile.<init>(Ljava/lang/String;Z)V          ... same pair
+   ```
+
+   **`register_p59_jar` wins all four shared shapes; `register_jar_natives`'s
+   four are dead in the shipping VM.** Price a `JarFile` retirement against
+   `jar_manifest.rs`, and read `zip_real_jar.rs`'s constructors as what they
+   are — unreachable. (The two-arity-only shapes `(File,Z,I)V` and
+   `(File,Z,I,Runtime$Version)V` are registered by `register_p59_jar` alone
+   and are not in the shadowed census.) `register_jar_natives` also mirrors
+   its surface onto `java/util/zip/ZipFile`; both classes are under
+   `java/util/`, so the registrar is L1's and crosses no lane boundary.
+
+   The count-based ratchets in that file tolerate 1,201 shadowed rows, so this
+   pair was invisible individually — the same shape as the `ZoneInfoFile`
+   duplicate whose note in `native-builtins/src/lib.rs` ends "the later call
+   always wins silently".
+
+   **`BreakIterator` (17) was item 6's blocker wearing a different mask, and
+   wave 5 implemented the fix.** See the item 6 entry below. One row of `apps/probes/L1JarTextSweep.java`
    is already waiting for whoever does — `E.attributesFromJar` reads `null`
    where HotSpot reads the jar's per-entry manifest section, and it is
    `JarFile`'s, not `JarEntry`'s: the class declares no native for
@@ -794,14 +1025,94 @@ Every remaining HELD family has a named blocker. In rough order of rows:
    §7's trap and say nothing at all. That is the measurement the trap
    predicted, and the next step on this family is a probe that reaches a
    provider lookup, not another sweep.
+   **WAVE 5 LOCATED THE PROVIDER BLOCKER AND IMPLEMENTED HALF OF IT.** The
+   five `reached == 0` rows above are one thing, and it is not a provider
+   *lookup* at all — it is a bundle *read*:
+   `LocaleResources.getBreakIteratorInfo` and its sibling
+   `getDateTimePattern` answer `null` because the class-based bundle they
+   need is looked for in a package the image does not have.
+
+   Three places in the tree blame "jdk.localedata's class-based resource
+   bundles are not surfaced through our jimage path"
+   (`vm/src/vm/vm_exec.rs` BREAKITER and BUG-15,
+   `native-builtins/src/reflect_annotations.rs`). **That claim is stale**, and
+   W7-80 already proved it stale for the CLDR families in
+   `locale_resources.rs` — it just never propagated to the other three files.
+   The classes load, instantiate and evaluate out of the jimage this VM boots
+   from. What actually missed is narrower and fixable:
+   `cldr_packages` maps EVERY `sun.text.resources.*` base name onto
+   `sun/text/resources/cldr{,/ext}`, deliberately and correctly for the
+   families CLDR re-generated — and `BreakIteratorInfo` is not one of them.
+   Verified with `jimage list` on a JDK 25.0.3 image rather than assumed:
+
+   ```text
+     java.base       sun/text/resources/BreakIteratorInfo.class
+                     sun/text/resources/{Word,Line,Sentence}BreakIteratorData
+     jdk.localedata  sun/text/resources/ext/BreakIteratorInfo_th.class
+                     sun/text/resources/ext/{Word,Line}BreakIteratorData_th
+   ```
+
+   and no `cldr` sibling of either. So every candidate missed and the family
+   read as absent. `CollationData` is the same shape, which is why
+   `cldr_collation_rule` had to hand-roll its own probe instead of calling
+   `load_cldr_table` — one symptom already in the tree, unexplained.
+
+   Wave 5 adds `non_cldr_packages`, consulted first by `load_cldr_table`, and
+   two natives that answer the exact pair
+   `BreakIteratorProviderImpl.getBreakInstance` reads — both force-listed in
+   the two dispatch gates, because **a registration on a concrete JDK-library
+   method is silent without a gate entry**. The chain, read off the image's
+   own bytecode with `javap -c` rather than from memory (the descriptor is
+   `(Ljava/lang/String;)Ljava/lang/Object;`, not the `[Ljava/lang/String;`
+   this lane would have guessed):
+
+   ```text
+     getBreakInstance(locale, idx, dataKey, dictKey)
+       LocaleResources.getBreakIteratorInfo("BreakIteratorClasses") -> String[3]
+       LocaleResources.getBreakIteratorInfo(dataKey)                -> String
+       LocaleResources.getBreakIteratorResources(dataKey)           -> byte[]
+       new sun.text.RuleBasedBreakIterator(name, bytes)
+   ```
+
+   `getCharacterInstance` is NOT in it — JDK 25 answers that one with an
+   inline `GraphemeBreakIterator` and asks no bundle — which is why the root
+   bundle's `BreakIteratorClasses` has exactly three entries and the three
+   remaining factories pass indices 0/1/2.
+
+   **What is implemented and what is not.** The two readers are. The last
+   step is real `sun.text.RuleBasedBreakIterator` bytecode over the byte[],
+   and that is unmeasured: it needs a trial binary, and until it runs, the
+   BREAKITER allow-list stays where it is. Retiring `java/text/BreakIterator`'s
+   17 is the step AFTER that measurement, not part of it.
+
+   The same `non_cldr_packages` hook is what `getDateTimePattern` would need
+   to stop answering from its hardcoded en/de table, which is item 8's route
+   too. Neither is done here.
+
 7. **`HashSet`/`LinkedHashSet` (13 + lane T's 42)**: blocked on lane T
-   releasing `register_hashset_natives`. Nothing for L1 to do until then —
-   except that wave 3 left it one measured row to start from:
-   `new HashSet<>(List.of("a","b","c"))` gives its backing map
-   `threshold = 16` where HotSpot has 12 (`L1MapFieldProbe`'s
-   `F.hashSet.backing.fields`). HotSpot's `HashSet(Collection)` sizes the map
-   at `max((int)(c.size()/.75f)+1, 16)` and lets `HashMap` derive the
-   threshold from it; this VM writes the capacity into the threshold.
+   releasing `register_hashset_natives`. Nothing to RETIRE until then.
+
+   **The one measured row is repaired in wave 5, and the diagnosis this item
+   carried was wrong.** `L1MapFieldProbe`'s `F.hashSet.backing.fields` reads
+   `threshold = 16` where HotSpot reads 12 for
+   `new HashSet<>(List.of("a","b","c"))`. This item said "this VM writes the
+   capacity into the threshold". It does — and so does HotSpot: while
+   `table == null` the JDK deliberately overloads `threshold` to mean "the
+   size the first `resize()` will allocate", and `map_state`'s capacity
+   reader depends on exactly that overload. The constructor is right.
+
+   What is missing is the OTHER half of `HashMap.resize()`. `map_resize`
+   ends by publishing the new table and the new size, and writes `threshold`
+   only on the `Hashtable` branch — so on the HashMap family the field keeps
+   whatever the constructor parked there and goes stale the moment the table
+   changes size. It is not a HashSet defect at all: **every grown HashMap in
+   this VM has a stale `threshold`**, and the HashSet row is simply where a
+   probe happened to read one. Wave 5 adds the write, with `resize_threshold`
+   extracted as a pure function so the arithmetic has a test that needs no
+   heap (including the non-0.75 load factors and the NaN the constructor
+   screen would have refused).
+
+   Retiring the rows still waits on lane T. Fixing a wrong answer did not.
 8. **`ResourceBundle` (12)**: §8. Blocked on the same locale-provider
    lookup as item 6's `Locale`, and it is the cheapest probe into it —
    `TimeZone.getDisplayName` is one call and the answer is one string.
@@ -828,6 +1139,25 @@ it, because wave 3 measured 0 diffs without it and this helper sits under
 every collection in the VM; it wants its own control, its own trial and its
 own corpus run. §3's wave-3 trace is the evidence, and a comment in the
 source is not a compile-time link to the premise it depends on.
+
+**TAKEN IN WAVE 5, in the narrowest form that fixes it.** Not an
+unconditional swap: the bytecode-only route is taken only when the
+RECEIVER'S OWN CLASS declares the method
+(`ctx.class_declares_method(ctx.class_id_of_object(this), …)`). Every
+`SET_VIEW_CARRIERS` entry does, and that is the input the premise is false
+for. A receiver that only INHERITS the method resolves up to a supertype
+that may be abstract or bodiless, and for those `invoke_special`'s
+native-first lookup is still the safer answer and is unchanged — that is
+the input the sentence was written about.
+
+The premise is now a test rather than a comment:
+`every_set_view_carrier_has_the_natives_that_falsified_the_delegate_premise`
+asks the registry whether each carrier really does have `size`/`isEmpty`
+registered under its real JDK name. If a future change stops registering
+them, the guard goes red and says the branch can be simplified back.
+
+**Unmeasured.** It wants exactly the control, trial and corpus run this
+paragraph always said it did.
 
 ### The locale-provider trap, unchanged and still true
 
@@ -864,6 +1194,25 @@ is worth pricing before the retirement rows.
 - **A Rust side table is not the object.** §9's items 1 and 2 are the same
   defect `java/util/Properties` had, and the remedy is the same: make the real
   object the authority, THEN drop the native.
+- **A "we don't surface X" comment outlives the day someone surfaced X, in
+  every file the fix did not touch.** W7-80 measured that the image's own
+  CLDR bundle classes load fine and rewrote the comments *in
+  `locale_resources.rs`*. Three other files still said the opposite a month
+  later — `vm_exec.rs` twice and `reflect_annotations.rs` once — and one of
+  them is a load-bearing allow-list that pins natives over real bytecode on
+  the strength of the stale claim. When a measurement falsifies a premise,
+  grep the premise's WORDS across the tree, not the function that held it.
+- **`javap` the image before writing a descriptor, even a boring one.**
+  `LocaleResources.getBreakIteratorInfo` returns `Ljava/lang/Object;` and the
+  caller `checkcast`s it; the obvious guess is `[Ljava/lang/String;`, and a
+  registration on the wrong descriptor is not an error, it is silence.
+- **A blanket mapping that is right for the re-generated families is wrong
+  for the ones that were not.** `cldr_packages` sends every
+  `sun.text.resources.*` name to a `cldr` package on purpose and correctly.
+  `BreakIteratorInfo` and `CollationData` have no `cldr` sibling, so for them
+  every candidate missed and the family read as ABSENT rather than as
+  misrouted. The tell was already in the tree: `cldr_collation_rule` had had
+  to hand-roll its own probe, and nobody asked why.
 - **A stored derived quantity forces you to shadow every mutator.** Retire a
   class's mutators and its derived reads in one wave, or the two disagree.
 - **Views and iterators are one unit with their backing class.** Every wave

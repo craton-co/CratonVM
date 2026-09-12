@@ -563,14 +563,22 @@ public class RJdkNio {
      */
     static void pathCarriesTheRealLayout(Path dir) throws Exception {
         Path p = Path.of("a/b");
-        check(p.toString().equals("a/b"), "Path.toString: " + p);
+        // Separator-normalised, the same way `normalize=` is done at line 166
+        // of this file. On Windows BOTH VMs answer `a\b`, byte-identical, so
+        // asserting the POSIX spelling fails the HOTSPOT ORACLE -- and an oracle
+        // that cannot pass voids the whole cross-VM diff for this vector, which
+        // is how it read as a VM regression for two binaries running. Verified on
+        // both VMs before relaxing it: the path STRUCTURE is still asserted, only
+        // the host's separator is not.
+        check(p.toString().replace('\\', '/').equals("a/b"), "Path.toString: " + p);
         check(p.equals(Path.of("a/b")), "two equal Paths must be equal");
         check(p.hashCode() == Path.of("a/b").hashCode(), "equal Paths share a hashCode");
         check(p.getFileName().toString().equals("b"), "getFileName: " + p.getFileName());
         check(p.getParent().toString().equals("a"), "getParent: " + p.getParent());
         check(p.getNameCount() == 2, "getNameCount: " + p.getNameCount());
         check(p.compareTo(Path.of("a/b")) == 0, "compareTo self");
-        check(p.resolve("c").toString().equals("a/b/c"), "resolve: " + p.resolve("c"));
+        check(p.resolve("c").toString().replace('\\', '/').equals("a/b/c"),
+                "resolve: " + p.resolve("c"));
         // A Path built by the walk/attribute machinery rather than by `of`,
         // because those are separate producers of the same carrier and a slot
         // map they do not share is how the two drift.

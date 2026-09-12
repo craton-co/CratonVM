@@ -1355,6 +1355,8 @@ Generational; `cratonvm-jit` 2225 passed.
 | IR-tier fused compare reads its operands in place (register, frame slot or folded immediate) | **ON** | `CRATONVM_JIT_IR_CMP_IN_PLACE=0` |
 | IR-tier `x + k` / `x - k` as one `LEA` | **ON** | `CRATONVM_JIT_IR_ADD_LEA=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
+| IR-tier redundant-read elimination (same cell, same heap, same block) | off — large on the probe written for it (0.627x on `FieldLoop.sumWide` with the memory-edge hoist off) and fires on **nothing** in CratonBench; `c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md` §8 | `CRATONVM_JIT_IR_LOAD_CSE=1` |
+| LICM may hoist a read of a maybe-null base out of a loop whose constant trip count proves the body runs | off — 0.793x on `probes/CountedHoist.java`, unmeasured elsewhere; §9 of the same page | `CRATONVM_JIT_IR_LICM_HOIST_COUNTED=1` |
 | IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |
 | IR-tier inline TLAB bump for `Op::New` | off — the sequence has a defect `RJitMapTierDiff` reproduces 4/10; see `ir_inline_tlab_enabled` | `CRATONVM_JIT_IR_INLINE_TLAB=1` |
 | Thread pointer fetched from a TLS mirror (both tiers) | **ON** where the probe succeeds | `CRATONVM_JIT_TLS_THREAD_FETCH=0` |
@@ -1761,6 +1763,30 @@ layout- or branch-structure-sensitive, and removing a never-taken forward
 inversion**, and it is why the switch is kept rather than the change reverted:
 it is the smallest known perturbation that moves this loop by 20%, which makes
 it the cheapest handle on whatever the real cause is.
+
+**2026-09-11 — RETIRED: the anomaly no longer reproduces.** Re-measured on the
+current tree with `tools/tier-ab/flag-ab.sh` (7 rounds, interleaved, same-config
+control, checksum `1200150000` on every run), `CRATONVM_JIT_IR_THIS_NONNULL` on
+`probes/FieldLoop.java` `sum` is **0.981x — UNMEASURABLE inside a 4.6% floor**.
+It is not 20% slower; it is not measurably anything. Whatever arrangement
+produced the 1.78/1.93-against-1.49/1.61 medians is gone, most likely with the
+phi-copy change in
+`docs/internal/performance/c2-the-phi-copy-staging-register-20260911.md` §5.
+
+So this paragraph's standing recommendation — keep the switch because it is the
+cheapest handle on the residual inversion — no longer holds: there is no longer
+an effect for it to be a handle on. Keep the switch on its own merits (it is
+correct and it elides real checks), not as a lead.
+
+The layout theory it invited was tested and did not survive either.
+`docs/internal/performance/c2-the-loop-body-is-mostly-code-it-never-runs-20260911.md`
+counts this loop at **412 bytes spanned, ~122 executed**, the rest cold code
+emitted inline; `CRATONVM_JIT_IR_POLL_OUTLINE` removes the largest of those
+blocks (229 bytes) and one taken branch per iteration, and it measures
+**0.999x — UNMEASURABLE**. A well-predicted branch over cold bytes costs
+approximately nothing, because fetch follows the predicted target rather than
+the linear address. What actually moved this loop was removing WORK: see the
+same document's §3.
 
 One structural asymmetry is worth naming as a candidate: the receiver
 null-check elision described above — the `this` seed and

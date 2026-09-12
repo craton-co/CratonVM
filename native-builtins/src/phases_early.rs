@@ -7,7 +7,7 @@ use crate::util_concurrent_ext::{
     atomic_array_cas, atomic_array_index, atomic_array_new_length, atomic_array_raw_index,
     atomic_array_rmw,
 };
-use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandle, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -364,21 +364,59 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
     r.set_category(__prev_cat);
 }
 
+/// A `Value` argument held across a call that can allocate.
+///
+/// A reference argument is an address copied out of the caller's frame: the
+/// frame roots the object, but this copy is not updated when the collector
+/// moves it, so it must be rooted in the scope and read back at the point of
+/// use. A primitive needs none of that and is carried verbatim.
+enum ArgSlot {
+    Ref(NativeHandle),
+    Plain(Value),
+}
+
+fn element_handle(scope: &mut NativeHandleScope<'_>, value: Option<Value>) -> ArgSlot {
+    match value {
+        Some(Value::Object(Some(o))) => ArgSlot::Ref(scope.root(o)),
+        Some(v) => ArgSlot::Plain(v),
+        None => ArgSlot::Plain(Value::Object(None)),
+    }
+}
+
+fn element_value(scope: &NativeHandleScope<'_>, slot: &ArgSlot) -> Value {
+    match slot {
+        ArgSlot::Ref(h) => Value::Object(Some(scope.get(h))),
+        ArgSlot::Plain(v) => *v,
+    }
+}
+
 fn native_collections_singleton_list(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let elem = args.first().copied().unwrap_or(Value::Object(None));
-    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonList") {
-        let list = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
-        ctx.set_field_by_name(list, "element", elem);
+    // The argument is an address copied off the caller's operand stack: the
+    // stack itself is a root, but this copy is not, so it is stale the moment
+    // `<clinit>` or the allocation below collects. Root it before anything
+    // runs, and read it back where it is stored.
+    let mut scope = NativeHandleScope::new(ctx);
+    let elem_h = element_handle(&mut scope, args.first().copied());
+    if let Ok(cid) = scope.ensure_class_initialized("java/util/Collections$SingletonList") {
+        let fields = scope.class_num_total_fields(cid);
+        let list = scope.alloc_object(cid, fields);
+        let elem = element_value(&scope, &elem_h);
+        scope.set_field_by_name(list, "element", elem);
         return Ok(Some(Value::Object(Some(list))));
     }
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-    ctx.set_array_element(arr, 0, elem);
-    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
-    ctx.set_field(list, 0, Value::Object(Some(arr)));
-    ctx.set_field(list, 1, Value::Int(1));
+    // The array is built first and the list allocated after it, so the array's
+    // address has to be read back on the far side of that allocation.
+    let arr_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+    let arr_h = scope.root(arr_obj);
+    let elem = element_value(&scope, &elem_h);
+    scope.set_array_element(arr_obj, 0, elem);
+    let list = try_alloc_concurrent_synthetic(&mut *scope, "java/util/ArrayList", 2)?;
+    let arr = scope.get(&arr_h);
+    scope.set_field(list, 0, Value::Object(Some(arr)));
+    scope.set_field(list, 1, Value::Int(1));
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -386,20 +424,33 @@ fn native_collections_singleton_set(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let elem = args.first().copied().unwrap_or(Value::Object(None));
-    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonSet") {
-        let set = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
-        ctx.set_field_by_name(set, "element", elem);
+    let mut scope = NativeHandleScope::new(ctx);
+    let elem_h = element_handle(&mut scope, args.first().copied());
+    if let Ok(cid) = scope.ensure_class_initialized("java/util/Collections$SingletonSet") {
+        let fields = scope.class_num_total_fields(cid);
+        let set = scope.alloc_object(cid, fields);
+        let elem = element_value(&scope, &elem_h);
+        scope.set_field_by_name(set, "element", elem);
         return Ok(Some(Value::Object(Some(set))));
     }
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
-    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
-    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
+    // `set` outlives the map's allocation, `native_map_init` (which allocates a
+    // bucket array) and `native_map_put_pub` (which can run Java for
+    // `hashCode`), so neither it nor the map can be held as a bare address.
+    let set_obj = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashSet", 1)?;
+    let set_h = scope.root(set_obj);
+    let map_obj = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashMap", 3)?;
+    let map_h = scope.root(map_obj);
+    let map_now = scope.get(&map_h);
+    cratonvm_native_collections::native_map_init(&mut *scope, &[Value::Object(Some(map_now))])?;
+    let map_now = scope.get(&map_h);
+    let elem = element_value(&scope, &elem_h);
     cratonvm_native_collections::native_map_put_pub(
-        ctx,
-        &[Value::Object(Some(map)), elem, Value::Object(None)],
+        &mut *scope,
+        &[Value::Object(Some(map_now)), elem, Value::Object(None)],
     )?;
-    ctx.set_field(set, 0, Value::Object(Some(map)));
+    let set = scope.get(&set_h);
+    let map = scope.get(&map_h);
+    scope.set_field(set, 0, Value::Object(Some(map)));
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -407,32 +458,44 @@ fn native_collections_singleton_map(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let key = args.first().copied().unwrap_or(Value::Object(None));
-    let val = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonMap") {
-        let map = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
-        ctx.set_field_by_name(map, "k", key);
-        ctx.set_field_by_name(map, "v", val);
+    let mut scope = NativeHandleScope::new(ctx);
+    let key_h = element_handle(&mut scope, args.first().copied());
+    let val_h = element_handle(&mut scope, args.get(1).copied());
+    if let Ok(cid) = scope.ensure_class_initialized("java/util/Collections$SingletonMap") {
+        let fields = scope.class_num_total_fields(cid);
+        let map = scope.alloc_object(cid, fields);
+        let key = element_value(&scope, &key_h);
+        let val = element_value(&scope, &val_h);
+        scope.set_field_by_name(map, "k", key);
+        scope.set_field_by_name(map, "v", val);
         return Ok(Some(Value::Object(Some(map))));
     }
-    // Create HashMap with 1 entry
-    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
+    // Create HashMap with 1 entry. The map, the bucket array and the node are
+    // three allocations that each move the two before it.
+    let map_obj = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashMap", 3)?;
+    let map_h = scope.root(map_obj);
     let cap = 16;
-    let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
-    ctx.set_field(map, 0, Value::Object(Some(buckets)));
-    ctx.set_field(map, 1, Value::Int(0));
-    ctx.set_field(map, 2, Value::Int(cap as i32));
+    let buckets_obj = scope.new_array(cratonvm_types::ArrayElementType::Reference, cap);
+    let buckets_h = scope.root(buckets_obj);
+    let map = scope.get(&map_h);
+    scope.set_field(map, 0, Value::Object(Some(buckets_obj)));
+    scope.set_field(map, 1, Value::Int(0));
+    scope.set_field(map, 2, Value::Int(cap as i32));
     // Put the single entry using native_map_put logic
     // Simplified: just store it
-    let node = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap$Node", 4)?;
-    ctx.set_field(node, 0, key);
-    ctx.set_field(node, 1, val);
+    let node = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashMap$Node", 4)?;
+    let key = element_value(&scope, &key_h);
+    let val = element_value(&scope, &val_h);
+    scope.set_field(node, 0, key);
+    scope.set_field(node, 1, val);
     let hash = 0i32; // simplified
-    ctx.set_field(node, 2, Value::Int(hash));
-    ctx.set_field(node, 3, Value::Object(None));
+    scope.set_field(node, 2, Value::Int(hash));
+    scope.set_field(node, 3, Value::Object(None));
     let idx = 0;
-    ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
-    ctx.set_field(map, 1, Value::Int(1));
+    let buckets = scope.get(&buckets_h);
+    let map = scope.get(&map_h);
+    scope.set_array_element(buckets, idx, Value::Object(Some(node)));
+    scope.set_field(map, 1, Value::Int(1));
     Ok(Some(Value::Object(Some(map))))
 }
 
@@ -3100,9 +3163,13 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     let props = "java/util/Properties";
     r.register(props, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let data = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 32);
-        ctx.set_field(this, 0, Value::Object(Some(data)));
-        ctx.set_field(this, 1, Value::Int(0));
+        // The receiver's address was taken before this allocation.
+        let mut scope = NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let data = scope.new_array(cratonvm_types::ArrayElementType::Reference, 32);
+        let this = scope.get(&this_h);
+        scope.set_field(this, 0, Value::Object(Some(data)));
+        scope.set_field(this, 1, Value::Int(0));
         Ok(None)
     });
     r.register(
@@ -3200,27 +3267,42 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             // and `size` was still bumped, corrupting the table. Grow the backing
             // array (double capacity, copy, reset field 0) BEFORE the store once it
             // would not fit, mirroring ucl_add_url's growth in classloader.rs.
+            //
+            // The growth allocates, which moves the receiver, the old backing
+            // array and both arguments — all of which are stored below. From
+            // here on every address goes through the scope.
+            let mut scope = NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let old_data_h = scope.root(data);
+            let key_h = element_handle(&mut scope, args.get(1).copied());
+            let val_h = element_handle(&mut scope, args.get(2).copied());
             let data = {
-                let arr_len = ctx.array_length(data);
+                let data = scope.get(&old_data_h);
+                let arr_len = scope.array_length(data);
                 if size * 2 + 1 >= arr_len {
                     // Double capacity (guard the degenerate len==0 case) and copy
                     // every existing slot into the fresh, larger array.
                     let new_cap = (arr_len * 2).max((size + 1) * 2);
                     let new_arr =
-                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                        scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                    let data = scope.get(&old_data_h);
                     for i in 0..arr_len {
-                        let elem = ctx.get_array_element(data, i);
-                        ctx.set_array_element(new_arr, i, elem);
+                        let elem = scope.get_array_element(data, i);
+                        scope.set_array_element(new_arr, i, elem);
                     }
-                    ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+                    let this = scope.get(&this_h);
+                    scope.set_field(this, 0, Value::Object(Some(new_arr)));
                     new_arr
                 } else {
                     data
                 }
             };
-            ctx.set_array_element(data, size * 2, key);
-            ctx.set_array_element(data, size * 2 + 1, val);
-            ctx.set_field(this, 1, Value::Int((size + 1) as i32));
+            let key = element_value(&scope, &key_h);
+            let val = element_value(&scope, &val_h);
+            let this = scope.get(&this_h);
+            scope.set_array_element(data, size * 2, key);
+            scope.set_array_element(data, size * 2 + 1, val);
+            scope.set_field(this, 1, Value::Int((size + 1) as i32));
             // [PERF] Fold the just-appended key into the lookup cache so a
             // load-then-many-reads pattern stays O(1) per op (the `lookup_index`
             // above already (re)built the cache for the pre-append size, so this
@@ -3229,7 +3311,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             // validity token without invalidating the indices (contents copied
             // 1:1). On any inconsistency it drops the entry and the next lookup
             // rebuilds — behavior stays correct either way.
-            props_index_cache::note_append(ctx, this, data, size);
+            props_index_cache::note_append(&mut *scope, this, data, size);
             Ok(Some(Value::Object(None)))
         },
     );
@@ -10444,6 +10526,61 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             },
         );
     }
+
+    // ForkJoinPool.execute(ForkJoinTask) — the SAME side-table policy as
+    // `submit`/`externalSubmit` directly above, and it was missing.
+    //
+    // 2026-09-11, lane 5 residual §9.1. `execute` had no registration ANYWHERE
+    // and was not on `keep_real_forkjoinpool_bridge`'s allow-list, so
+    // `pool.execute(task)` ran the concrete JDK bytecode: the task went into a
+    // real `WorkQueue` and a real worker thread ran its body through the JDK's
+    // own `doExec()`, which never touches this side table. The caller's
+    // following `join()`/`get()` is a Bridge that reads the side table, saw
+    // `done == false`, and RAN THE BODY AGAIN — two threads, one task,
+    // overlapping. `apps/probes/L5FjDouble.java` scores it per shape and says
+    // which of the three double-execution shapes it is.
+    //
+    // The retired lane page read the symptom as the JDK's own WorkQueue being
+    // claimed twice and held 70 `ForkJoinPool`/`ForkJoinTask` rows behind it.
+    // It is not the JDK's: it is one half of this pool's surface on the
+    // side-table model and the other half on the real one, with no agreement
+    // about what "done" means.
+    //
+    // Why inline rather than teaching `join()` to wait for the real worker:
+    // that is the policy `submit` already states three lines up — letting the
+    // concrete submit bytecode enqueue into the real pool exposes
+    // WorkQueue/status machinery CratonVM only partially models, and Fork6Hard
+    // observes stale task/result objects there under GC stress. `execute` is
+    // the same call with the return value dropped, so it gets the same answer;
+    // a lane that moves `submit` off this model moves `execute` with it.
+    r.register(
+        "java/util/concurrent/ForkJoinPool",
+        "execute",
+        "(Ljava/util/concurrent/ForkJoinTask;)V",
+        |ctx, args| {
+            fjp_reject_submission(ctx, args, 1)?;
+            let task = match args.get(1).copied() {
+                Some(Value::Object(Some(r))) => r,
+                // `execute(null)` throws NullPointerException on a real pool,
+                // and `fjp_reject_submission` above is what raises it — by the
+                // time control is here the argument is a non-null task or the
+                // call has already failed. Returning void for anything else
+                // keeps this arm total without inventing a second policy.
+                _ => return Ok(None),
+            };
+            let (done, _) = fjp_state_get(task);
+            if !done {
+                let frame = fjp_pool_frame_enter(ctx, args);
+                let out = fjp_compute_for_submit(ctx, task);
+                fjp_pool_frame_leave(ctx, frame);
+                out?;
+            }
+            // void: `execute` hands nothing back, and a failure surfaces at the
+            // matching `join()`/`get()` exactly as `fjp_compute_for_submit`'s
+            // own doc comment describes for `submit`.
+            Ok(None)
+        },
+    );
 
     // ForkJoinPool.submit(Callable) / submit(Runnable) / submit(Runnable, T) —
     // same Bridge policy as submit(ForkJoinTask) above: these overloads were

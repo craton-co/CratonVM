@@ -73,10 +73,10 @@ Sets are disjoint; the totals below reconcile to 5,549 exactly.
 
 | lane | scope | shadows | classes | reg sites |
 |---|---|---|---|---|
-| **L0** (this page) | `java/lang/Class*`, `java/lang/Module*`, `java/lang/module/` | 131 | 9 | 131 |
+| **L0** (this page) | `java/lang/Class` + `Class$*`, `ClassValue`, `ClassFrameInfo`, `Module*`, `java/lang/module/` — **not** `ClassLoader*` | 104 | 8 | 104 |
 | **LT** — **CLOSED 2026-09-10** | *whole cross-cutting registrars* (see §3) | **1,100** | 87 | **57** |
 | **L1** | `java/util/` (less `concurrent/`), `java/text/`, `sun/util/`, `java/time/` | 963 | 98 | 726 |
-| **L2** | `java/lang/` remainder, `java/math/` | 390 | 57 | 279 |
+| **L2** | `java/lang/` remainder, `java/math/` | 390 | 57 | 279 | <!-- RETIRED 2026-09-11 -->
 | **L3** | `java/lang/reflect/`, `jdk/internal/reflect/`, `sun/reflect/`, `java/lang/invoke/` | 251 | 36 | 246 |
 | **L4** | `java/io/`, `java/nio/`, `sun/nio/`, `jdk/internal/foreign` | 1,110 | 131 | 615 |
 | **L5** | `java/util/concurrent/`, `jdk/internal/misc/`, `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/` | 405 | 23 | 345 |
@@ -84,6 +84,13 @@ Sets are disjoint; the totals below reconcile to 5,549 exactly.
 | **L7** | `java/lang/ClassLoader*`, `jdk/internal/loader/`, **`java/security/SecureClassLoader`** (claimed 2026-09-10, one `<clinit>` row, from L6) **+ the bootstrap failure triage** | 20 | 6 | 18 |
 | — | **UNOWNED, frozen** | 316 | 83 | 291 |
 | | **TOTAL** | **5,549** | **631** | **3,395** |
+
+**A prefix is a string, and `java/lang/Class` is a prefix of
+`java/lang/ClassLoader`.** The first cut of this table was computed that way
+and silently gave L0 all 27 `ClassLoader` rows plus, before the lane-T pass,
+`ClassNotFoundException` and `ClassCastException`. L0's row above is now the
+explicit set and L7's carries the `ClassLoader` rows that were never L0's
+business. If you add a prefix anywhere, check what else it is a prefix of.
 
 **L2's row was re-derived on 2026-09-10 and is 390/57/279, not 434/68/303.**
 The lane re-took the funnel on `7a8b79526` and reconciled the per-class shape
@@ -104,7 +111,7 @@ row whose target was resolved by walking up the hierarchy has found
 seven of L2's bucket-B `<init>` rows are that — six on `java.lang.management`
 INTERFACES, which have no constructor at all. Campaign-wide: 23 such rows over
 21 classes of 1,719. They belong in C/F. See
-[`lane-2-lang-values.md`](lane-2-lang-values.md) §6.
+[`lane-2-lang-values-RETIRED-20260911.md`](../../internal/jdk-only/lane-2-lang-values-RETIRED-20260911.md) §5.
 
 **The 316 unowned rows are frozen, not unassigned-by-accident.** They are
 `jdk/internal/foreign/layout` leftovers, `java/beans`, `sun/java2d`,
@@ -164,7 +171,7 @@ census, never with the scanner.
 |---|---|---|
 | `native-api/src/retired_shadow.rs` — **your own** `RETIRED_SHADOW_L<N>_TRIPLES` | the lane | fill your array literal only |
 | same file — `triple_is_retired_shadow()` chain | **L0** | pre-created; never edit |
-| same file — `RETIRED_SHADOW_PREFIXES` | **L0** | pre-populated; never edit |
+| same file — `RETIRED_SHADOW_PREFIXES` | the lane | append **your** prefix in the same commit as your first entry — see below |
 | same file — the N-way disjointness test | **L0** | never edit; it must fail if you collide |
 | `native-builtins/tests/stub_ratchet.rs` — the three `BASELINE_*` constants | **L0** | **never edit.** Report your measured delta in your commit message |
 | `scripts/baselines/jdk-only-kind-map-25-linux.tsv` — **rows** | the lane | keyed class+name+descriptor, disjoint by construction |
@@ -173,20 +180,58 @@ census, never with the scanner.
 | [`../jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md) | **L0** | propose via your lane page |
 | `apps/probes/L<N>*.java` | the lane | namespace your probes; `apps/` is gitignored, so `git add -f` |
 
-### The skeleton commit makes the chain conflict-free
+### How a lane adds its table without touching another lane's work
 
-L0 lands this **before any lane starts**:
+`triple_is_retired_shadow` is a chain of `||` arms over sorted tables, and the
+disjointness test is a hand-unrolled cascade. Both grow with the number of
+tables, so a lane adds:
 
-1. Nine empty tables, `RETIRED_SHADOW_L0_TRIPLES` … `RETIRED_SHADOW_LT_TRIPLES`.
-2. Nine `||` arms in `triple_is_retired_shadow`, one per table, in a fixed order.
-3. Every lane's prefixes pre-added to `RETIRED_SHADOW_PREFIXES`.
-4. An N-way disjointness test over all tables, and a sortedness test per table.
+1. its own `RETIRED_SHADOW_L<N>_TRIPLES`, with the doc comment carrying its
+   measurement;
+2. one `||` arm in the predicate;
+3. one arm in `the_two_tables_are_disjoint`;
+4. its own sortedness, reachability and held-families tests.
 
-Adding a prefix while its table is empty is **provably inert**: the prefix list
-is only an early-out for the binary search, so a wider list plus an empty table
-answers `false` for exactly the same inputs. That is what makes it safe to land
-all nine prefixes up front — and it is why a lane never has to touch the
-prefixes or the chain, so two lanes never conflict textually in this file.
+Steps 2 and 3 are one line each in a shared function, which is small enough
+that two lanes rarely collide and a collision is a trivial merge.
+
+**An earlier draft of this page promised nine empty tables pre-created up
+front.** That was dropped after building the real thing: an empty table needs a
+sortedness test that trivially passes, a reachability test with nothing to
+reach, and a name in the registry with no measurement behind it -- eight
+placeholders that assert nothing and that a reader has to check are genuinely
+empty rather than genuinely finished. The cascade being O(n2) in the source is
+the honest cost, and it is paid one line at a time by the lane that benefits.
+
+### Prefixes are the exception: they stay narrow and lane-owned
+
+An earlier draft of this page said L0 would pre-add every lane's prefixes,
+arguing that a prefix with an empty table is provably inert. The inertness claim
+is true — the list is only an early-out for the binary search, so a wider list
+plus an empty table answers `false` for the same inputs. **The conclusion drawn
+from it was still wrong**, and `a_prefix_alone_retires_nothing` says why in its
+own comment:
+
+```rust
+// HELD by the arm, and the prefix list does not admit it — belt and
+// braces, because a widening of that list must not silently re-retire
+// what RClassUnloadSweep rejected.
+assert!(!triple_is_retired_shadow("java/lang/ref/Reference", "clear", "()V"));
+```
+
+The narrowness is a *second* guard, deliberately redundant with the tables.
+`java/lang/ref/` is absent on purpose, and `sun/nio/` is admitted only as
+`sun/nio/fs/` and `sun/nio/ch/` because a package-scoped dial sweep scored
+34/36 against retiring it. Pre-adding a broad `java/lang/` or `sun/nio/` would
+keep every current test green **and** delete that guard for the next reader.
+
+So: **each lane appends its own prefix, in the same commit as its first entry
+there.** The list is short and appends land in different places, so the conflict
+risk is small — and forgetting is caught loudly, because an entry outside every
+prefix makes the predicate answer `false` for a row that is present, which the
+registry-driven reachability test fails on. Add the narrowest prefix that covers
+your entry, and if you are widening one that carries a note, beat that note's
+measurement in the same commit.
 
 ### Why the ratchet constants are L0's alone
 
@@ -228,15 +273,22 @@ A release build is **17-50 minutes** and the host is shared. Rules:
 6. Nothing is pushed without the human asking for it. `git push origin HEAD:dev`
    is its own command, keyed on the gate result.
 
-## 7. This lane's own retirement scope
+## 7. This lane's own scope: 104 shadows, all accounted for
 
-131 shadows over 9 classes: `java/lang/Class` (61), `java/lang/ClassLoader`
-(27 — **L7 owns the loader story; L0 owns only rows whose remedy is a `Class`
-question**), `java/lang/Module` (23), `ClassNotFoundException` (15) and
-`ClassCastException` (14) — *both of which belong to lane T's throwable
-registrar, not here* — plus `ModuleLayer`, `ClassValue`, `Class$Atomic`.
+`java/lang/Class` (61), `Module` (23), `ClassFrameInfo` (5),
+`module/ModuleDescriptor$Version` (5), `ModuleLayer` (4), `Class$Atomic` (3),
+`ClassValue` (2), `Class$ReflectionData` (1).
 
-Two are already resolved and are the pattern the other lanes should copy:
+**The account closes exactly: 19 retired + 23 held + 35 withdrawn + 27
+undispatched = 104.** The last two columns are the 2026-09-10/11 correction,
+and the rest of this section is written as it was measured, in order: the wave
+landed 54, the corpus rejected them, the table went empty, and wave 2 landed
+back the 19 that the census could attribute away from every failing vector.
+`RETIRED_SHADOW_L0_TRIPLES.len() == 19` is asserted, so the count and this
+paragraph cannot drift apart the way §7's held set did.
+The two reviewed `Intrinsic`s sit outside that sum -- adjudicating a kind
+removes a triple from the `Bridge` population, so they are no longer shadows to
+count.
 
 - **`Class.getModule` → reviewed `Intrinsic`.** Not `ACC_NATIVE`, so §1.4 makes
   it a shadow; but `Class.module` is written only by a real VM at class
@@ -266,6 +318,393 @@ Two are already resolved and are the pattern the other lanes should copy:
   rows reached through a method reference kept the native and answered
   correctly, so a probe that asked one dispatch route called the family clean.
 
+**Instrument:** `apps/probes/L0ClassModuleSurface.java`, 129 rows over the
+whole surface, measured three ways against HotSpot 25.0.3+9 -- unarmed, and
+with every native declining. `ClassNameSweep` reached only 10 of the 104; this
+probe reaches 77.
+
+```text
+unarmed   8 diff lines of 130      yielded  58 diff lines of 130
+```
+
+Read as an aggregate that says *retire nothing here*, and it would be a wrong
+conclusion drawn from a true number. **Per row — and this table is the
+`CRATONVM_ENFORCE_NATIVE_SHADOW` dial's, which is not the instrument a
+retirement is scored on; §7.1 is why:**
+
+| | rows | verdict |
+|---|---|---|
+| OK → OK | 96 | native right, bytecode right → **retire** |
+| BAD → OK | 4 | native **wrong**, yielding fixes it → **retire** |
+| OK → BAD | 29 | native right, yielding breaks it → **hold** |
+| BAD → BAD | 0 | |
+
+The four unarmed diffs are exactly the BAD → OK rows, so **every disagreement
+this VM has with HotSpot on lane 0's surface is one that retirement repairs.**
+
+### The four repairs, one of which is not cosmetic
+
+```text
+Module.addExports("jdk.internal.misc", unnamed) on java.base
+  HotSpot  threw java.lang.IllegalCallerException
+  native   PERMITTED
+ModuleDescriptor.Version.parse("")
+  HotSpot  IllegalArgumentException: Empty version string
+  native   returned a Version      (validation skipped)
+Version.compareTo x2
+  native   NPE in JDK bytecode, "ts1 is null" -- parse() built a Version whose
+           internal lists were never filled
+```
+
+The first is an access-control check the native does not perform: only a module
+may widen its own exports, and this VM let an unnamed module widen
+`java.base`'s. The rest are the JDK's argument-validation layer, which is the
+surface a retirement usually buys.
+
+### 7.1 Landed 54, withdrew 54: the dial is not the retirement
+
+The wave landed 54 triples behind the prefixes `java/lang/Class` and
+`java/lang/Module` on the strength of the 2×2 above, and the `--jdk-only`
+corpus arm came back **97 of 132** where the four preceding binaries
+(`p4`, `p7`, `p8`, `p9`) had each scored **132/0**. Both prefixes and all 54
+rows are gone; the table ships empty.
+
+**Two independent reasons the dial arm could not have said otherwise:**
+
+* **It arms a different population.** `CRATONVM_ENFORCE_NATIVE_SHADOW=all`
+  makes *every* native decline at a dispatch door. A table of 54 refuses *54
+  registrations*. The 29 `OK → BAD` rows above are the whole surface yielding
+  at once, which is neither an upper nor a lower bound on what 54 rows do — so
+  the 2×2 cannot be read as "the other 100 are safe to retire".
+* **It leaked, and said so.** The run's own census line read
+  `[DIAL_DOOR_CENSUS] armed=true reached=3680 yielded=3593 leaked=87`. 87
+  dispatches reached the dial and were *not* yielded, and a leaked row reports
+  the **native's** answer while reading, in a three-arm diff, as "the bytecode
+  is fine here". `Class.isArray` was one: armed printed `true/false`, matching
+  HotSpot exactly, and the real retirement answers `false/false` — JDK 22+
+  implements `isArray()` as `componentType != null` and this VM never fills
+  that field, which *this table's own held list already recorded*.
+
+Re-measured the way the ops page says (control binary without the table,
+retired binary with it, HotSpot — **no dial anywhere**), on the same 129 probe
+rows:
+
+```text
+the 54 as shipped   117 OK->OK   4 BAD->OK   8 OK->BAD
+after round 1 (-16) 125 OK->OK   4 BAD->OK   0 OK->BAD     table = 38
+```
+
+Round 1's eight `OK → BAD` rows are one mechanism and a tail: `componentType`
+is retired, the VM never fills the field, so `isArray` answers `false` and
+`getTypeName`/`getSimpleName`/`getCanonicalName` fall back to `[[I` for arrays.
+Round 2 took nine more — every `java/lang/Module` row — on `RJdkModule`.
+**Neither round was enough:** at 29 triples, with `OK → BAD == 0` on the probe,
+the corpus still scored 127/132, and the five it lost passed 5/0 on the control
+binary run concurrently through the same harness. So the table was emptied
+rather than shipped on a probe that had stopped being able to see the defect.
+
+**Withdrawal is invisible to the ratchet.** `stub_ratchet` asserts `<=`, so
+removing entries passes silently and the constants sat 16 above the tree with
+every arm green. Recover the real number by setting each baseline to `1` and
+reading the paste-ready line out of the failure.
+
+### 7.2 Which triple? The census attributes it without a build per hypothesis
+
+A build is 65 minutes, so bisecting 29 triples is a day. The per-vector census
+report answers a weaker question for free, and the weaker question is enough:
+**which of the 29 does this vector dispatch at all?** A registration the vector
+never consults cannot be the row that broke it. Measured on `p16` (L0 table
+empty, so all 29 natives present and counted), the five vectors passing 5/0,
+all five reports written, `saturation: none`:
+
+| vector | of the 29, dispatched |
+|---|---|
+| `RClassUnloadSweep` | 5 |
+| `RClassUnloadSweepGen` | 5 |
+| `RJdkModule` | 8 |
+| `RLoaderIdentity` | 6 |
+| `RServiceLoaderDoubleSource` | 6 |
+
+Their **union is 10**: `desiredAssertionStatus`, `forName` ×3,
+`getConstructor`, `getDeclaredConstructor`, `getMethod`, `getPackageName`,
+`isInterface`, `isPrimitive`. Every one is class-loading or member-lookup
+plumbing that a class-unload sweep and a two-source `ServiceLoader` lean on
+directly, which is the sort of coupling a 129-row probe on `java.lang.Class`
+does not reach.
+
+The remaining **19 are touched by none of the five**, and between the two
+halves that closes over the whole corpus rather than over five vectors:
+
+```text
+127 vectors   passed WITH these 19 retired            measured — p14, round 1
+  5 vectors   failed, and dispatch none of the 19     measured — p16 census
+```
+
+The round-1 arm (`p14`, **38 rows**, the 19 among them) scored 127/5, so the 19
+are not a hypothesis about those 127 — they were retired during that run and it
+passed them anyway. `19 ⊂ 29 ⊂ 38`, so the later withdrawals only ever removed
+rows from around them. Bisecting the 10 would say which one is guilty, and that
+is a question about re-adding them, not about shipping these.
+
+That provenance is worth one sentence, because it nearly went in wrong. The
+round-2 log was read as `p15`'s on its timestamp, and it cannot be: it contains
+four completed arms ten minutes after `p15` finished linking. Four arms take
+two hours. **Date a corpus log by what it could physically have run, not by its
+mtime** — the arm scripts of that era piped through `tail`, which cut the
+`== RUN … rev=` header that would have said so outright.
+
+Two things this is not:
+
+* It is not an argument about the *combination*. The table now ships beside
+  L1's 329, L2's 13, L3's 24, L5's 98 and the three phase tables — and
+  individually-safe retirements can interact, which is the Phase 2 finding:
+  236 dial-safe classes armed together broke 54 of 118 vectors. Every number
+  above was measured with L0 alone, so the wave still gets the three arms on
+  its own binary, and that binary is the first one to carry **six** lanes'
+  tables at once. **Done — the result is §7.3.**
+* The 10 are withdrawn *as touched*, not as convicted. Attribution by dispatch
+  over-collects by design: it names every row that could be responsible.
+  `the_l0_attributed_triples_are_not_retired` pins them out, so re-adding one
+  takes the bisection rather than a steady hand.
+
+### 7.3 Verified on `p20`, the binary this branch ships
+
+Measured, not committed to. `cratonvm-p20.exe`, md5
+`f7b43fdc4763597b34c5a52b6dd14dba`, 52m15s release build, pinned 2026-09-11
+16:04 and confirmed distinct from `p19` (`c88f1466…`) and `p18`
+(`e1b6a960…`). It carries **eight lanes' tables** — L0 19, L3 24 (this
+branch), L1 329 + L1_HM 21 + L1_JT 29, L2 13, L5 98, L7 2, plus TRIPLES 102,
+STATELESS 235, PHASE2 1, PHASE3 185 — and three `origin/dev` merges including
+the JIT/C2 work.
+
+| arm | scheduled | result |
+|---|---|---|
+| `CRATONVM_ARGS=--jdk-only` | 133, missing=0 | **133 passed, 0 failed** |
+| `SUITE=all` | 133, missing=0 | **133 passed, 0 failed** |
+| `SUITE=core` | 93, missing=0 | **93 passed, 0 failed** |
+
+`saturation: none` and no harness errors in any arm. The counts are 133/93
+rather than the previous 132/92 because `dev` added a vector,
+**`RJitUnrollImplicitNpe`** — its own regression test for the unrolled
+implicit-null-check fix. That vector passing on THIS binary is the most direct
+evidence available for the interaction this section exists to check: a retired
+shadow means real bytecode runs, and real bytecode is what the JIT then
+compiles, so dev's JIT work and eight lanes' retirements are not independent.
+It is also why the arms were re-run rather than carried forward from `p19`.
+
+The run headers name three different revisions (`2071e9e9b`, `b76e773bf`,
+`f9d75ee18`) because documentation commits landed between arms. Every one is
+docs-only and the binary is the same md5 in all three — the suite takes the
+binary from `CV`, not from the tree — so the numbers are comparable. Recorded
+because the headers show three revisions and a reader should not have to work
+out which difference it was.
+
+#### What these arms cover, and what they do not
+
+Two more `origin/dev` merges landed after they were taken, and the two are not
+the same case. Stating the scope precisely matters more than the numbers.
+
+**The fourth merge (37 commits) does not affect them.** It adds no
+retirements — every table matched `dev`'s except L0's 19 and L3's 24, which are
+this branch's own — so the population these arms score is identical before and
+after. What it changes is `dev`'s JIT/GC and a natives receiver fix: `dev`'s
+work, verified by `dev`'s lanes and CI, and not what this section claims.
+
+**The fifth merge (19 commits) DOES affect them, and they were not re-run.**
+Lane 4 landed `RETIRED_SHADOW_L4_TRIPLES` — 163 registrations' worth, measured
+by the paired ratchet — so the shipping population is now **larger than the one
+p20 carried**. Therefore, plainly:
+
+```text
+verified on p20   L0's 19 + L3's 24, inside an eight-lane binary, three arms
+NOT verified      the same rows beside lane 4's table
+```
+
+Nobody has run the corpus with lane 4's wave and this branch's together. Lane 4
+measured its 163 against a `dev` without L0/L3; this branch measured its 43
+against a `dev` without lane 4. **That combination is this lane's job**, and it
+is the one piece of it that cannot be closed by waiting: `dev` moved three
+times during the session that produced these numbers — 44, 37 and 19 commits —
+and each wave invalidates the previous binary. A sixth would invalidate a fifth
+lap.
+
+So the arms are recorded for the population they measured, with the boundary
+named, rather than implying a verification of the population that ships. **The
+next integration pass owes the corpus one run on a binary carrying L0, L3 and
+L4 together**; everything it needs is here — the build takes 52 minutes, the
+three arms two hours, and §7.3's method is unchanged.
+
+What the fifth merge did NOT weaken: the ratchets were re-measured on it
+(2592/2603/2592, both decompositions landing on the measured value), the whole
+gate set was re-run on it, and lane 4's rows go through the same
+`RETIRED_SHADOW_TABLES` loop as everyone's, so they face the real-JDK keep-arm
+gate automatically.
+
+**Gate set: all five arms `rc=0`.** `cargo test -p cratonvm-types`;
+`-p cratonvm-native-api`; and `-p cratonvm-native-builtins --tests` under each
+of {default, `--features management`, `--features synthetic-jdk`}. The
+`nb-default` number is from a re-run — **11 targets, 4285 passed, 0 failed**.
+Its first attempt aborted on a 2-second `await_termination` deadline in
+`xnio_worker`, which passed in the other two arms of the same run and 3/3
+isolated at 0.02–0.12s under no load. The re-run matters beyond the one test:
+`cargo test --tests` is fail-fast **across targets**, so that abort skipped 10
+of 11 targets and the first arm's count was a prefix, not a result.
+
+**Survivors — and the first number here was wrong, twice over.** Corrected
+2026-09-11 against `p20`'s 133 kept reports:
+
+```text
+                        p19    p20
+all lanes              2271   2323     (+52 = L1's 50 new triples + L7's 2)
+L0 (this lane)           47     47
+L3                       26     26
+L0+L3                    73     73
+refusals with a SURVIVOR  5      5     <- campaign-wide, NOT zero
+```
+
+Two defects in my own instrument produced the earlier "52, 0 survivors":
+
+* **The report has no `name` field.** All 335,160 `synthetic-native-registered`
+  rows carry `method`; my script read `r.get("name")`, got `None`, and
+  collapsed every triple to `(class, None, descriptor)`. The undercount looked
+  entirely plausible — 52 against a real 73.
+* **`java/lang/Class` is a prefix of `java/lang/ClassLoader`**, so the filter
+  counted L7's rows as this lane's. That is the same trap §2 records about this
+  page's OWN ownership table, committed by the person who wrote the warning.
+  `ClassLoader.registerAsParallelCapable()Z` was the row that exposed it.
+
+The `+52` is a free consistency check: lane 1's waves 3-4 are 21 + 29 and lane
+7's table is 2, and the refusal set grew by exactly 52. L0's 47 and L3's 26 are
+unchanged across the two binaries, which is the invariant to want — neither
+lane's table moved in the merge.
+
+**`0 survivors` holds for L0 and L3, and does NOT hold campaign-wide.** The
+`survivor` field was read correctly all along, but only ever asked about this
+lane's prefixes. Asked of every lane, five refusals carry one:
+
+```text
+java/util/logging/Handler.getLevel      survivor intrinsic@phases_early.rs:22252
+java/util/logging/Handler.setLevel      survivor intrinsic@phases_early.rs:22235
+java/util/logging/LogRecord.getLevel    survivor intrinsic@phases_early.rs:22016
+java/util/logging/LogRecord.getMessage  survivor intrinsic@phases_early.rs:22022
+java/util/logging/LogRecord.getSequenceNumber
+                                        survivor intrinsic@phases_early.rs:22165
+```
+
+**These five are inert retirements, and the kind map already explained them.**
+Its header says of this exact family: *the retag fires only on an effective
+category of `Bridge`, and this registration's ambient category was `Intrinsic`*
+— so the table entry never re-tags the WINNING registration, the `Intrinsic`
+keeps serving, and strict mode runs it instead of the bytecode. They are also
+the same five triples as the five legitimate `intrinsic` rows in the baseline,
+which is why those rows are correct and must stay exempt from the 581.
+
+`java/util/logging/` is L1's prefix. Recorded here because this lane runs the
+check; the adjudication is L1's. This is the check that separates
+a retirement from a no-op: `register_inner` refuses a `SyntheticStub` without
+inserting it, but a refusal carrying a non-null `survivor` means an earlier
+registration still owns the slot and still serves, so strict mode runs that
+older native and every probe reads exactly as it did before. Zero survivors
+means all 52 yielded to bytecode.
+
+What this does and does not settle: it answers the combination question the
+bullet above deferred, **for these six tables on this binary**. It is not a
+general claim that individually-safe retirements compose — Phase 2's 236
+dial-safe classes broke 54 of 118 vectors together, and nothing here repeals
+that.
+
+### Held: 23 triples, each with the row that held it
+
+| triples | why |
+|---|---|
+| `Class.descriptorString` | NPE — `componentType` field is null |
+| `Class.getModifiers` | wrong **flag bits** (`public synchronized` for `Object`; `static` lost on a nested interface) |
+| `Class.getAnnotation`/`getAnnotations`/`getDeclaredAnnotation`/`getDeclaredAnnotations`/`getAnnotationsByType`/`getDeclaredAnnotationsByType`, `isAnnotationPresent` (7) | annotations come back **empty** (`[]`, `null`, `0`, `false`) |
+| `Class.newInstance` | `cachedConstructor` is null |
+| `Module.getLayer`, `isExported` ×2, `isOpen` ×2 | answer `false` where HotSpot is `true` |
+| `ModuleLayer.boot`/`findModule`/`modules`/`configuration` | `boot()` yields null |
+| `Class.getPackage`/`getResource`/`getResourceAsStream`, `Module.getResourceAsStream` | **`NoClassDefFoundError`** — blocked pending **L7** |
+
+`the_l0_held_families_are_not_retired` pins all of them -- **after a
+correction.** It enumerated 21 of the 23 for a while, and nothing was red,
+because a missing hold is only a hole: the two absentees were
+`getAnnotationsByType` and `getDeclaredAnnotationsByType`, measured `OK -> BAD`
+on rows 75 and 76 (HotSpot `1`, yielded `0`) and then never typed into the
+array. Five of their seven siblings were pinned, which is the worst case -- the
+family looks guarded.
+
+It surfaced by **closing the population by subtraction and checking the residue
+is empty**: 77 dispatched - 54 retired = 23, the array held 21, and the two
+survivors of `dispatched - retired - held` were exactly the pair. (That
+subtraction is written at the wave's numbers, when 54 were retired. Run today
+it is 77 - 0 - 23 = 54, and the 54 are §7.1's withdrawal — the residue is still
+enumerated, it has just moved column.) The prose
+above said 23 and the code said 21 for the same reason the prose was right,
+that `getAnnotation*` is six methods and the row now spells them out. Any lane
+adding a table should run that subtraction rather than trusting a hand count of
+its own bullet list.
+
+**`Module.isOpen` is held on a judgement, not a measurement, and that is
+stated in the table.** Its rows agree with HotSpot when yielded — but they
+agree at `false`, which is also what a blanket yield returns for the whole
+family, and its sibling `isExported` demonstrably breaks. *An agreement that
+cannot be distinguished from the default answer is not evidence.* It needs a
+receiver whose correct answer is `true`, which `java.base` does not offer an
+unnamed module; until that fixture exists, held.
+
+### Not retired for want of an instrument: 27
+
+Precondition 4 is per-instrument, and these read `invocations == 0` even in the
+probe written to reach them. **14 + 8 + 5:**
+
+**Fourteen cannot be called from Java at all** -- `getClassLoader0`,
+`getEnumConstantsShared`, `reflectionData`, `newReflectionData`, `setSigners`,
+the three `Class$Atomic` CAS methods, `Class$ReflectionData.<init>` and the
+five `ClassFrameInfo` accessors are package-private plumbing reached only from
+inside `java.lang.Class` and the stack walker. No probe will ever move these;
+they need a unit test against the registry, not a Java fixture.
+
+**Eight are `Module.implAdd*`** -- `implAddExports` x2, `implAddExportsNoSync`
+x2, `implAddExportsToAllUnnamed`, `implAddOpens` x2,
+`implAddOpensToAllUnnamed`. Same story one layer out: the module system's own
+bytecode calls them.
+
+**Five are exercised and still do not dispatch,** which is the interesting
+group and not an instrument gap at all:
+
+```text
+Class.forPrimitiveName      probe calls Class.forName("int")          line 212
+Class.getComponentType      probe calls Object[].class.getComponentType()  194
+Class.getProtectionDomain   probe reads its own ProtectionDomain      line 322
+ClassValue.remove           probe calls cv.remove(Integer.class)      line 343
+Version.compareTo           probe compares parsed versions      lines 462-467
+```
+
+`Version.compareTo` is the one with a proven mechanism: row 126's failure names
+`ts1`, a local in `Version.compareTo`'s **own bytecode**, so the JDK's method
+served the call and the registration was never consulted. The other four share
+the signature -- called, counted zero -- and their mechanism is **not
+established per row**, so they are recorded here rather than explained. Five
+registrations that a caller cannot reach are five candidates for deletion
+outright, and that is a different question from retirement.
+
+This is also why precondition 4 is taken per **triple** from
+`--dump-native-registry` and never from "my probe calls this". A row that runs
+green proves something about the JDK's bytecode, not about the native
+underneath it.
+
+### The two reviewed `Intrinsic`s
+
+`Class.getModule` and `Class.getName` are **not** retirements and
+`the_two_reviewed_intrinsics_are_not_retirements` pins that. Yielding gives a
+null module and the internal name form (`java/lang/Object`) — worse than null,
+because nothing throws. `getName` alone repaired 8 of the 9 rows
+`ClassNameSweep` finds differing under the dial, since the JDK derives
+`getTypeName`/`getCanonicalName`/`getSimpleName`/`toString` from it. (This
+sentence read "22 of 24" until the 2026-09-11 merge. The sweep is **85** rows,
+not 24 — see the corrected bullet above, which is the measurement; the 24 was
+from a draft of the probe that never landed.)
+
 ### The §1.4 reviewed-`Intrinsic` protocol, which every lane will need
 
 Some shadows cannot be retired because **§1.4's remedy makes them worse**. The
@@ -283,12 +722,293 @@ contract's exception is a *reviewed* `Intrinsic`, and the review is a probe:
 5. `register` → `register_with_kind(..., NativeKind::Intrinsic)`, with the
    measurement in the rationale, and amend the kind-map row `bridge` →
    `intrinsic`, `kind_stated 0` → `1`.
+6. **`registrar_drift` should now stay green. If it does not, read the bodies
+   before touching the baseline.**
 
-An `Intrinsic` is **exempt at every dispatch door and exempt from the census by
-construction**. That is a real cost: it removes the row from the population the
-dial can ever ask about. Earn it with numbers or leave it a `Bridge`.
+Until 2026-09-10 this step was a trap, and it is worth knowing why because the
+same species will recur. `registrar_drift.rs` matched a registration by
+requiring the byte after `register` to be `(`, so **`register_with_kind(..)`
+was invisible to it** — 757 sites tree-wide, and not a uniform sample of the
+registry: exactly the sites whose kind had been adjudicated. Since
+`register` → `register_with_kind` is *this protocol's own remedy*, every
+adjudication silently deleted the shipping half of whatever drift pair the
+triple was in, and the gate reported the deletion as
 
-## 8. What "done" looks like
+```text
+STALE BASELINE — recorded drift pair(s) no longer drift.
+```
+
+Good news wearing a defect's clothes, once per adjudication. The scanner now
+accepts `_with_kind`, which surfaced **54 real pairs** that the blind spot had
+been covering (see §8 — they are routed, not adjudicated).
+
+So if this gate reddens after your tag:
+
+- **Read both registrations' bodies first.** Same function ⇒ genuinely not
+  drift, and `FIXED_NOT_DRIFTING` is right — with both-modes
+  `--dump-native-registry` evidence, where `overwrote = null` is the
+  load-bearing field. Different closures ⇒ the drift is real and the scanner
+  has gone blind again; fix the scanner, not the baseline. Getting this
+  backwards is how a false "fixed" assertion gets landed — it nearly was here.
+- `DRIFT_TRIPLES` is the **allowed known-drift baseline**, not a defect list.
+  `SSLContext.getProvider` was *added* to it. So an adjudicated triple usually
+  belongs exactly where it already was and needs no baseline edit.
+- Any re-take comes from the gate's own paste-ready block
+  (`-- --nocapture`), never from arithmetic — and
+  `registrar_reachability.rs`'s `FAMILY_DRIFT_EXPOSURE` must be re-taken in the
+  **same commit**, which its own panic prescribes. It cross-checks per family
+  and caught the phantom independently.
+- Say in the record which rows moved and why. Both gates put it the same way:
+  *"a re-take with no explanation is how a ratchet becomes a rubber stamp."*
+
+**And run the gate set as `--tests`, never by naming targets.**
+`cargo test -p <crate> --tests` stops at the first failing target, so a red
+`registrar_drift` hid a red `registrar_reachability` behind it — and naming two
+`--test` targets by hand hid both, which is how the `getModule` adjudication
+shipped with this gate already red.
+
+### 7.5 The INTRINSIC ratchet is one row stale, and `<=` is why nobody saw it
+
+Measured 2026-09-11 on the sixth `origin/dev` merge, by running the stub
+ratchet with `--nocapture` on a **passing** run:
+
+```text
+intrinsic-ratchet [no-management]: 1386 Intrinsic registrations out of 13623
+                                   total (baseline 1387)
+stub-ratchet(scope):  boot 2592 stubs / 13623 rows        <- matches, exactly
+```
+
+The stub side is tight: 2592 is the constant this branch just froze. The
+**intrinsic** side is not — actual 1386 against a frozen 1387 — and the gate
+is green anyway, because like the stub ratchet it asserts `<=`. A DECREASE
+passes silently. This is the hazard `../../contributing/stub-ratchet.md`
+already names, observed live in a sibling ratchet nobody was watching.
+
+**Not re-frozen here, deliberately.** A missing `Intrinsic` has two readings
+and they want opposite responses:
+
+* a reviewed exemption was **removed on purpose** — re-freeze to 1386 and note
+  which row and why; or
+* a reviewed exemption was **lost by accident**, which is a regression: an
+  `Intrinsic` that reverts to `Bridge` re-enters the population the dial and
+  the retirement tables can act on, so a later wave may retire a row that was
+  exempt for a measured reason. L0 §7's protocol exists because those rows
+  break when yielded — `Class.getName` answering the internal form is the
+  worked example.
+
+Re-freezing without knowing which of the two happened is precisely what this
+file's doctrine forbids: a constant is a before-number, and the account is the
+point. **The next step is a census diff naming the row**, not an edit to the
+constant.
+
+Recorded rather than fixed because the change is not this branch's: the count
+was 1387 through this branch's own arms and moved on a `dev` merge that touches
+no retirement table. Whoever removed it has the account; this section just
+makes the number visible, which the `<=` assert does not.
+
+**Worth generalising: read the printed number on a PASSING ratchet run.** Every
+ratchet in this file prints its live value under `--nocapture` whether it
+passes or fails. Reading it takes one command and is the only way a one-sided
+assert tells you the truth in the direction it does not guard.
+
+### 7.4 Lane 1's waves 3 and 4 will fire a BLOCKING CI gate, 2026-09-11
+
+Found while merging `origin/dev`, by checking each lane's table against the
+kind-map baseline rather than by reading the diff.
+
+```text
+table                      rows   in kind map   of those synthetic-stub
+L1_HM (wave 3)               21            21                        0   STALE
+L1_JT (wave 4)               29            29                        0   STALE
+L7                            2             2                        2   ok
+L0                           19            19                       19   ok
+L3                           24            24                       24   ok
+```
+
+The two counts match `dev`'s own commit subjects — *"narrow to the 21 the
+measurement allows"* and *"wave 4 is 29 triples over five classes"* — so this
+is 50 triples, not an artefact of my parser.
+
+**It is a real staleness, not a mask.** Before concluding, I checked the 50 are
+actually retired at runtime: all of them are covered by `RETIRED_SHADOW_PREFIXES`
+(`java/util/` and `java/text/`), so none is the silent
+outside-every-prefix case where a table entry answers "not retired" and the
+kind map is right to still say `bridge`.
+
+**Why this is blocking and not housekeeping.** `regression-suite/bridge-ratchet.sh`
+runs from `.github/workflows/ci.yml` on `ubuntu-latest`, in the BLOCKING job,
+and its own header says that placement is deliberate: left in the advisory
+`jdk-only` job, "a new unadjudicated `Bridge` printed an error and failed
+nothing, which is the decorative-guard shape the lane exists to avoid."
+`scripts/jdk-only-kind-map.py` exits **1** on *"a registration changed kind"* —
+per registration, in EITHER direction. It is not a `<=` count ratchet, so the
+usual "a retirement only lowers the number" reasoning does not apply: 50
+registrations moving `bridge` -> `synthetic-stub` is 50 changed kinds and the
+gate fires.
+
+Nothing in the local gate set sees this. It is a shell gate over a census, so
+`cargo test` is green on a tree that fails CI — which is why every other lane's
+wave left an `amended:` note in that baseline's header and this one did not.
+
+### Correction: it is 581 rows across many waves, not lane 1's 50
+
+Written an hour after the section above, and it narrows what that section got
+right while widening the finding. I checked lane 1's two new tables, found 50
+stale rows, and stopped there — a classic case of measuring the thing I had
+just been reading about. Asking the PREDICATE against every baseline row
+instead gives:
+
+```text
+kind column, for retired triples present in the baseline
+   bridge           581      <- should be synthetic-stub
+   synthetic-stub   422
+   intrinsic          5      <- legitimately not stub; see the LogRecord note
+                                in the baseline's own header
+
+the 581, attributed to the table that retires them
+   RETIRED_SHADOW_L1_TRIPLES        261
+   RETIRED_SHADOW_STATELESS_TRIPLES 234
+   RETIRED_SHADOW_L1_JT_TRIPLES      30
+   RETIRED_SHADOW_TRIPLES            22
+   RETIRED_SHADOW_L1_HM_TRIPLES      22
+   RETIRED_SHADOW_L2_TRIPLES         16
+   RETIRED_SHADOW_PHASE2_TRIPLES      1
+```
+
+The bulk is in the OLD, large tables — L1's main 329 and STATELESS's 235 — not
+in the waves that landed this week. Lane 1's waves 3-4 are 52 of 581.
+
+**Confirmed against a real census, not just the predicate.** The `p19` gate run
+left `target/bridge-ratchet/census.json` (`mode: compatible`, schema 5, 12,889
+rows). For `java/util/ArrayList`:
+
+```text
+census   38 synthetic-stub,  0 bridge
+baseline 37 bridge,          1 synthetic-stub
+```
+
+`ArrayList`'s registrations are not platform-conditional, so the
+Windows/Linux difference cannot account for that. The baseline disagrees with
+what the VM actually registers.
+
+**What I still cannot determine from this host, stated rather than guessed:**
+whether CI is currently red. The comparison that decides it is a LINUX census
+against the linux baseline, and this host can only produce a Windows census
+(`sun/nio/fs/WindowsFileAttributes` shows up in the stale list, which is the
+platform difference being visible). The retirement tables themselves are
+platform-independent, so a Linux census should also report `synthetic-stub` for
+`ArrayList` — which points at CI being red — but that is an inference and the
+measurement is one `ubuntu-latest` run away. **Check it before acting on the
+581.**
+
+So the §7.4 above is right about the mechanism and wrong about the blame. The
+gate cannot run where the work happens; the baseline has drifted behind many
+waves as a result; and the fix is one `--update-baseline` on Linux with a note,
+not 581 hand-edits by anyone.
+
+**The durable repair, and the order matters.** Once the baseline is re-taken on
+Linux, the table-vs-baseline comparison should become an ordinary Rust test so
+that the next wave cannot drift: it needs no VM, no JDK and no census, and it
+runs on Windows where the real gate refuses. Written against the PUBLIC
+predicate rather than the tables it can read every future table for free —
+*for each baseline row, if `triple_is_retired_shadow` says retired then the
+kind must be `synthetic-stub`* — with the five `intrinsic` rows exempted by
+name and the reason from the baseline's own header.
+
+Do NOT add that test before the baseline is repaired. Landing it against a
+581-row drift means shipping it with a 581-entry exemption list, which
+enshrines the drift as the expected state and makes the gate decorative — the
+exact shape the bridge-ratchet's own header says it exists to avoid. Repair
+first, then gate.
+
+### The root cause, MEASURED: this gate cannot run on Windows
+
+Running it here, `CV=p19 JAVA_HOME=<jdk25> sh regression-suite/bridge-ratchet.sh`:
+
+```text
+SCRIPT RC=2
+REFUSED: no kind-map baseline for 25/windows
+         (looked for scripts/baselines/jdk-only-kind-map-25-windows.tsv)
+REFUSING: no committed baseline for 25/windows        <- compatible leg
+REFUSING: no committed baseline for 25/windows/jdk-only  <- strict leg
+BRIDGE-RATCHET: REFUSED (this is not a pass)
+```
+
+**Both legs refuse, exit 2, and only `-25-linux` is committed.** The key is
+`<jdk-feature>/<os>` by design — `image_declaring_method` is a statement about
+one runtime image and the registrars are platform-conditional — so this is
+correct behaviour, not a bug in the gate.
+
+But the consequence is structural and it reframes §7.4 entirely:
+
+* **No lane can verify a kind-map amendment locally.** `run.sh`'s own note says
+  the suite is usually run from Git Bash on Windows, and that is where this
+  campaign's work happens. So protocol step 7's "Kind-map rows" has been done
+  **by hand, unverified, by every lane** — including this one. The gate only
+  ever adjudicates on `ubuntu-latest` in CI.
+* **So lane 1's 50 rows are not that lane being careless.** They are the
+  predictable output of a gate that refuses on the platform the work is done
+  on, and a protocol step that asks for an edit the author cannot check. Any
+  future wave will do the same thing for the same reason.
+* **At least one existing amendment is already wrong**, and the file says so
+  itself: L3's retired rows read `synthetic-stub 0 1` and L0's read
+  `synthetic-stub 1 1`. Those cannot both follow from one deterministic retag.
+  Two hand-derivations, two answers, neither checkable here.
+
+That last point is the one to act on before adding a third style. The
+per-registration diff is what CI adjudicates, so a wrong `kind_stated` in a
+committed amendment fires the gate exactly like a missing row.
+
+**The repair is a measurement, and deliberately not done by hand here.** The
+two existing amendment styles in that file DISAGREE on the middle column —
+L3's retired rows read `synthetic-stub 0 1`, L0's read `synthetic-stub 1 1` —
+and the header's own claim (retag implies `kind_stated` true) matches only one
+of them. With two precedents in conflict, deriving 50 rows from either would be
+a guess wearing a measurement's clothes, in the one file whose doctrine is that
+re-freezing without reading the diff defeats the gate. So:
+
+1. run the census gate on `p20` **on Linux** — it PRINTS the changed rows with
+   their actual new values (`mode: compatible`, the generated
+   `BridgeRatchetCensusProbe`, not the corpus). It cannot be run on this
+   worktree's host at all; see the measurement above. CI's `ubuntu-latest` leg
+   or one of the Azure hosts is the only place this number exists;
+2. paste those values, with an `amended:` note naming lane 1's waves as the
+   cause and this merge as the repair;
+3. re-run to green.
+
+Recorded as lane 0's because this lane owns the shared gates, and noted as a
+REPAIR of the baseline rather than a re-adjudication of lane 1's triples —
+their verdicts are theirs, and nothing here revisits whether the 50 should
+have been retired.
+
+## 8. The 54 newly-visible drift pairs, routed
+
+Widening the scanner surfaced 54 `(pass, triple)` pairs where one triple has
+two implementations, one per compatibility mode: the synthetic-only body wins
+under `--features synthetic-jdk`, and the shipping body is the only one in
+every mode that ships, `--jdk-only` included. **They are recorded in
+`DRIFT_TRIPLES`, not adjudicated** — each needs its own answer to "do the two
+bodies agree?", and several are not cosmetic:
+
+| triple(s) | owning lane |
+|---|---|
+| `ClassLoader.defineClass0` / `1` / `2` | **L7** |
+| `Class.getSuperclass`, `isInstance`, `isAssignableFrom`, `isHidden`, `getPrimitiveClass`, `desiredAssertionStatus0`, `registerNatives` | **L0** |
+| `ObjectStreamClass.hasStaticInitializer`, `initNative` | **L4** |
+| `Unsafe.defineClass0` | **L5** |
+| the remainder | by the ownership table in §2 |
+
+The families whose exposure counts rose are `register_classloader_natives`
+(81→84), `register_enterprise_final_natives` (118→135),
+`register_java_lang_extras_natives` (27→28), `register_phase69_natives`
+(8→11), `register_serialization_natives` (2→4) and
+`register_unsafe_define_class` (1→2).
+
+A lane adjudicating one of these does **not** need a release build: the
+question is whether two bodies agree, which is a source question plus a
+`--dump-native-registry` in both modes.
+
+## 9. What "done" looks like
 
 Per lane: its table covers every bucket-A/B row in its prefix set that passed
 the four preconditions; every row it could not retire is classified in its page

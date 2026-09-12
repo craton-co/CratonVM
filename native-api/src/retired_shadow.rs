@@ -1207,6 +1207,14 @@ static RETIRED_SHADOW_STATELESS_TRIPLES: &[(&str, &str, &str)] = &[
 /// `every_entry_is_reachable_through_the_predicate` and its sibling exist to
 /// catch.
 const RETIRED_SHADOW_PREFIXES: &[&str] = &[
+    // 2026-09-11, lane 4 wave 1. The two wide prefixes of the largest lane:
+    // 1,398 bucket-A/B shadows over 142 classes sit under them. Same rule as
+    // every prefix above -- this admits those packages to one extra binary
+    // search each, and `RETIRED_SHADOW_L4_TRIPLES` decides what is retired. It
+    // retires 140 rows over 10 classes; `jdk/internal/foreign` is deliberately
+    // NOT admitted, because nothing under it came through the funnel.
+    "java/io/",
+    "java/nio/",
     "java/lang/module/",
     "java/text/",
     "java/util/",
@@ -1340,6 +1348,61 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     "java/lang/reflect/InvocationTargetException",
     "java/net/MalformedURLException",
     "java/net/UnknownHostException",
+    // 2026-09-11, L1 wave 5. NARROW, the way lane 7's two are and for the same
+    // reason: `sun/util/` is a large tree whose locale-provider half this lane
+    // has measured as NOT retirable (see `RETIRED_SHADOW_L1_ZI_TRIPLES`'s doc
+    // comment for the five `reached == 0` rows), and admitting the package
+    // would put every one of them one binary search from a future table.
+    // `the_zone_info_file_prefix_retires_only_the_two_measured_rows` is the
+    // guard.
+    "sun/util/calendar/ZoneInfoFile",
+    // 2026-09-11, lane L3 adds NO prefix of its own, and that is the merge
+    // resolution rather than an omission. This branch carried
+    // `java/lang/invoke/` and `java/lang/reflect/` for
+    // `RETIRED_SHADOW_L3_TRIPLES`; `dev` meanwhile added the broad
+    // `java/lang/`, which already admits every one of L3's 24 rows. Two
+    // narrower prefixes behind a wider one are dead weight, and the rule this
+    // module states is the NARROWEST list that covers the tables -- so they
+    // are dropped.
+    //
+    // Worth flagging to whoever owns `java/lang/`: a prefix that broad makes
+    // the TABLE the only guard, where a narrow list is a second one. Nothing
+    // is wrong today -- the tables still decide -- but
+    // `a_prefix_alone_retires_nothing` is weaker than it reads, and narrowing
+    // someone else's prefix is their call, not this lane's.
+    //
+    // L0 adds no prefix either, and the reason CHANGED on 2026-09-11 -- the
+    // sentence here used to say "its table is EMPTY (two corpus rounds
+    // withdrew all 54)", which was true of the withdrawal and is not true of
+    // wave 2. L0 now carries 19 rows: 15 on `java/lang/Class` and 4 on
+    // `java/lang/module/ModuleDescriptor$Version`. Both are already admitted,
+    // by `java/lang/` and `java/lang/module/` respectively, so the narrowest
+    // covering list still does not need an L0 entry. Same conclusion,
+    // different reason, and the old reason would have read as "this lane
+    // retired nothing".
+    // 2026-09-11, lane L6. The whole adjudication, all 1,414 rows of it, is in
+    // `docs/internal/retired/lane-6-net-security-RETIRED-20260910.md`.
+    //
+    // ONE prefix for a lane that owns nine, and deliberately the NARROW
+    // spelling: `java/net/` and not `java/`. Under it, TWO classes of the
+    // fourteen the wave tried.
+    //
+    // `javax/security/auth/x500/` was here through the fifth of six builds and
+    // is not here now: `X500Principal` alone breaks `RSslLiveSession`, because
+    // this VM fills that class's one declared `X500Name` slot with a String.
+    // Every other class the lane tried was measured out the same way, by a
+    // corpus vector rather than by a probe -- the table's header is the
+    // ladder, one row per build.
+    //
+    // The lane's other eight prefixes carry no table at all. Each was armed on
+    // the whole 125-probe tree and each either moved a probe AWAY from HotSpot
+    // (`javax/net/`, and the four security prefixes together) or never reached
+    // the dial (`sun/net/`, `jdk/net/`, `jdk/internal/net/`: 123 of 125 probes
+    // VACUOUS). Adding a prefix whose table is empty is provably inert, but it
+    // would read to the next lane as a claim that something under it was
+    // retired, and `the_lane_l6_security_and_tls_prefixes_are_not_admitted`
+    // exists to keep that claim from being made by accident.
+    "java/net/",
 ];
 
 /// The 2026-08-30 Phase 2 wave: ONE triple, and the size is the finding.
@@ -1424,8 +1487,503 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
 /// the carrier is this VM's own allocation shape, and matching the JDK's class
 /// name is not a thing to fix — not by fabricating a name, and not by
 /// retirement either.
-static RETIRED_SHADOW_PHASE2_TRIPLES: &[(&str, &str, &str)] = &[
-    ("sun/nio/ch/FileChannelImpl", "truncate", "(J)Ljava/nio/channels/FileChannel;"),
+static RETIRED_SHADOW_PHASE2_TRIPLES: &[(&str, &str, &str)] = &[(
+    "sun/nio/ch/FileChannelImpl",
+    "truncate",
+    "(J)Ljava/nio/channels/FileChannel;",
+)];
+
+/// Lane L0's wave, 2026-09-10: `java.lang.Class`, `Module` and
+/// `ModuleDescriptor.Version` -- 54 triples of the lane's 104, with the other
+/// 50 accounted for below rather than left unexamined.
+///
+/// # The instrument, and why the aggregate number is the wrong one to read
+///
+/// `apps/probes/L0ClassModuleSurface.java`, 129 rows over the whole lane
+/// surface, measured three ways against HotSpot 25.0.3+9 -- unarmed, and with
+/// every native declining (`CRATONVM_ENFORCE_NATIVE_SHADOW=all`):
+///
+/// ```text
+/// unarmed   8 diff lines of 130     armed  58 diff lines of 130
+/// ```
+///
+/// Read as an aggregate that says "do not retire anything here", and it would
+/// be the wrong conclusion drawn from a true number. Per ROW:
+///
+/// ```text
+///  96  OK -> OK    the native is right and so is the bytecode  -> RETIRE
+///   4  BAD -> OK   the native is WRONG and yielding fixes it   -> RETIRE
+///  29  OK -> BAD   the native is right, yielding breaks it     -> HELD
+///   0  BAD -> BAD
+/// ```
+///
+/// The four unarmed diffs are exactly the `BAD -> OK` rows, so **every
+/// disagreement this VM has with HotSpot on lane 0's surface is one that
+/// retirement repairs.**
+///
+/// # What the four repairs are, because one is not a cosmetic
+///
+/// ```text
+/// Module.addExports("jdk.internal.misc", unnamed) on java.base
+///   HotSpot  threw java.lang.IllegalCallerException
+///   native   PERMITTED
+/// ModuleDescriptor.Version.parse("")
+///   HotSpot  IllegalArgumentException: Empty version string
+///   native   returned a Version   (validation skipped entirely)
+/// Version.compareTo x2
+///   native   NPE in JDK bytecode: "ts1 is null" -- `parse` built a Version
+///            whose internal lists were never filled
+/// ```
+///
+/// The first is an access-control check the native does not perform: only a
+/// module may widen its own exports, and this VM let an unnamed module widen
+/// `java.base`'s. The rest are the JDK's own argument validation, which is the
+/// surface a retirement usually buys.
+///
+/// # The 23 HELD triples, each with the row that held it
+///
+/// ```text
+/// Class.descriptorString        row 2      NPE: componentType field is null
+/// Class.getModifiers            rows 14-16 wrong FLAG BITS ("public
+///                                          synchronized" for Object; `static`
+///                                          lost on a nested interface)
+/// Class.getAnnotation*, isAnnotationPresent
+///                               rows 71-77 annotations come back EMPTY
+/// Class.newInstance             rows 87-88  cachedConstructor is null
+/// Module.getLayer               row 103     answers false where HotSpot is true
+/// Module.isExported x2          rows 108,110 answers false
+/// Module.isOpen x2              family of isExported -- see the note below
+/// ModuleLayer.boot/findModule/modules/configuration
+///                               rows 118-121 boot() yields null
+/// Class.getPackage, getResource, getResourceAsStream, Module.getResourceAsStream
+///                               rows 13,81-83,105  NoClassDefFoundError,
+///                                          `jdk/internal/loader/ClassLoaders`
+///                                          and `BuiltinClassLoader`
+/// ```
+///
+/// **`Module.isOpen` is held on a judgement, not a measurement, and that is
+/// deliberate.** Its two rows agree with HotSpot when yielded -- but they agree
+/// at `false`, which is also what a blanket yield returns for everything in
+/// this family, and its sibling `isExported` demonstrably breaks. An agreement
+/// that cannot be distinguished from the default answer is not evidence. It
+/// needs a receiver whose correct answer is `true`, which `java.base` does not
+/// provide to an unnamed module; until someone builds that fixture, held.
+///
+/// The last group is not this lane's to fix: the builtin class loader
+/// hierarchy does not link, which is lane L7's named blocker. Those four are
+/// held *pending L7*, not held on their own merits.
+///
+/// # The 27 not retired for want of an instrument
+///
+/// Precondition 4 is per-instrument and these have `invocations == 0` even in
+/// the probe written to reach them. Twelve cannot be called from Java at all --
+/// `Class.getClassLoader0`, `getEnumConstantsShared`, `reflectionData`,
+/// `newReflectionData`, `setSigners`, the three `Class$Atomic` CAS methods,
+/// `Class$ReflectionData.<init>` and the five `ClassFrameInfo` accessors are
+/// package-private plumbing called only from inside `java.lang.Class` and the
+/// stack walker. Eight are `Module.implAdd*`, reached only through
+/// `AccessibleObject` paths this probe does not take.
+///
+/// `ModuleDescriptor$Version.compareTo` and `ClassValue.remove` are the
+/// interesting two: the probe DOES exercise both, and both still count zero.
+/// The row-126 failure names `ts1`, a local in `Version.compareTo`'s own
+/// bytecode, so the JDK's method served the call and the registration was
+/// never dispatched -- an inert row, which is a finding rather than a
+/// retirement, and it is why the count is taken per triple and not per row.
+/// Lane L3 wave 1 -- core reflection's metadata accessors, 24 triples.
+///
+/// Measured 2026-09-10 with `apps/probes/L3ReflectInvokeSurface.java` (254
+/// rows, oracle HotSpot 25.0.3+9, deterministic across two runs) against a
+/// release build of the merged tree. Lane 3's population is **242** bucket-A/B
+/// rows over 35 classes, re-derived from a `--dump-native-registry` taken with
+/// `--explain-jdk-only` -- not the lane page's 251, which came from a different
+/// tree and counted rows lane T owns.
+///
+/// # The aggregate said "retire nothing" and it was wrong again
+///
+/// ```text
+/// d(hs,base) 68 diff lines   d(hs,armed) 224   delta +156
+///
+/// per ROW (254 rows)   OK -> OK   132   retire
+///                      BAD -> OK   10   yielding FIXES it -> retire
+///                      OK -> BAD   88   hold
+///                      BAD -> BAD  24   investigate
+/// ```
+///
+/// 142 of 254 rows are retirable behind a `delta` of +156. Same lesson as L0,
+/// four times the scale.
+///
+/// **The ten `BAD -> OK` rows are the reason to do this at all.** Yielding
+/// repairs the `Field`/`Method`/`Constructor` copy model
+/// (`getDeclaredField("x") == getDeclaredField("x")` is `true` here and `false`
+/// on HotSpot), and with it the `setAccessible` LEAK that follows from handing
+/// back the same object -- one `setAccessible(true)` currently grants access to
+/// every holder of that member. It also restores HotSpot's
+/// `IllegalAccessException` on `privateLookupIn(java.base)`, which is the
+/// documented one-directional residual in `lk_enforce_find_access`. A
+/// retirement that closes an access-control gap is worth more than one that
+/// deletes code.
+///
+/// # 24 of 242, and why the other 218 are not here
+///
+/// A row is not a triple, and this table only contains triples a row-to-triple
+/// mapping can justify: the probe tag names one method of one class, the census
+/// holds exactly ONE A/B triple for that name, `invocations > 0` in the probe's
+/// own run, and **every** row touching it is `OK -> OK` or `BAD -> OK`. 48
+/// (class, name) pairs were reached and rejected, each with its reason
+/// recorded; the four rules that did the rejecting:
+///
+/// * **`invocations == 0`** -- precondition 4, per triple, from the dump.
+/// * **held** -- any `OK -> BAD` row. 88 rows hold, 32 of them `Field`'s
+///   primitive accessors, which the same run explains: the
+///   descriptor-coercion census reports **105** field reads whose value
+///   contradicted the slot's descriptor and was DESTROYED. Ten more are the
+///   generic-signature family, where yielding erases
+///   `Map<String,List<T>>` to `Map` and `T` to `Number`.
+/// * **`BAD -> BAD`** -- the bytecode is wrong too, so "yielding is correct
+///   here" is false. This is what removed `Method.invoke` and
+///   `Constructor.newInstance`, which had looked like clean seven-row and
+///   five-row keeps until the non-nestmate rows 247 and 248 were attributed to
+///   them. Not a regression; not a justified retirement either.
+/// * **agreement at a DEFAULT value** -- L0 held `Module.isOpen` for this and
+///   it removed twelve entries here. The sharpest is `Field.setBoolean`, whose
+///   only row sets `z` to `false` and reads it back: yielded `getBoolean`
+///   answers `false` by default, and `Field.getBoolean` is PROVEN broken by
+///   row 15. Retiring `setBoolean` on `false == false` would be exactly the
+///   mistake the rule exists to prevent.
+///
+/// # What is NOT retired, structurally
+///
+/// The whole `java.lang.invoke` surface except three `MethodType` accessors.
+/// §4 of the lane page predicted `MemberName`/`MethodHandle` would be
+/// VM-coupled and the measurement agrees: 14 `MethodHandles` rows, 8
+/// `MethodHandle` rows and 5 `CallSite` rows hold or are wrong both ways, and
+/// the run's uninstantiable-receiver census names `MethodHandle` and
+/// `VarHandle` as abstract classes a native instantiates. Those rows need the
+/// reviewed-`Intrinsic` protocol or a repair, not a retirement.
+static RETIRED_SHADOW_L3_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/lang/invoke/MethodType", "parameterCount", "()I"),
+    (
+        "java/lang/invoke/MethodType",
+        "returnType",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/invoke/MethodType",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/reflect/Constructor",
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Constructor",
+        "getGenericParameterTypes",
+        "()[Ljava/lang/reflect/Type;",
+    ),
+    ("java/lang/reflect/Constructor", "getModifiers", "()I"),
+    (
+        "java/lang/reflect/Constructor",
+        "getName",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/reflect/Constructor", "getParameterCount", "()I"),
+    (
+        "java/lang/reflect/Constructor",
+        "getParameterTypes",
+        "()[Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Field",
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+    ),
+    ("java/lang/reflect/Field", "getModifiers", "()I"),
+    ("java/lang/reflect/Field", "getName", "()Ljava/lang/String;"),
+    ("java/lang/reflect/Field", "getType", "()Ljava/lang/Class;"),
+    (
+        "java/lang/reflect/Method",
+        "getAnnotatedReturnType",
+        "()Ljava/lang/reflect/AnnotatedType;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getExceptionTypes",
+        "()[Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getGenericExceptionTypes",
+        "()[Ljava/lang/reflect/Type;",
+    ),
+    ("java/lang/reflect/Method", "getModifiers", "()I"),
+    (
+        "java/lang/reflect/Method",
+        "getName",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/reflect/Method", "getParameterCount", "()I"),
+    (
+        "java/lang/reflect/Method",
+        "getParameterTypes",
+        "()[Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getReturnType",
+        "()Ljava/lang/Class;",
+    ),
+    ("java/lang/reflect/Method", "setAccessible", "(Z)V"),
+    (
+        "java/lang/reflect/Method",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+];
+
+/// # 54 became 38 became 29, in two corpus rounds
+///
+/// **Round 2.** With the first 16 withdrawn the arm went 97 -> **127 of 132**,
+/// and the five survivors were all mine: `RClassUnloadSweep`,
+/// `RClassUnloadSweepGen`, `RLoaderIdentity`, `RJdkModule`,
+/// `RServiceLoaderDoubleSource`. Through the harness, control 5/0 against
+/// current 0/5.
+///
+/// All nine `java/lang/Module` triples are withdrawn, and the reason is the
+/// SAME default-value trap a third time. The probe validated
+/// `Module.getName`, `getDescriptor`, `canRead` and `getClassLoader` only at
+/// their default answers -- an UNNAMED module's name (`null`), an unnamed
+/// module's descriptor (`null`), `canRead` in its TRUE direction, and
+/// "java.base's loader is null". **A retirement answering `null`/`true` for
+/// everything satisfies all four**, so all four read as agreements. The corpus
+/// asserts the other side of each, and eight discriminating rows added
+/// afterwards found `Module.getClassLoader` answering `false` for a
+/// PLATFORM-loaded module where HotSpot and the control binary both say
+/// `true`.
+///
+/// Seven of those eight new rows PASS, so `getName`, `getDescriptor`,
+/// `canRead` and `getPackages` are not individually disproven -- they are
+/// withdrawn as a family because the wave that admitted them cannot be trusted
+/// per triple, and a later wave can re-earn them one at a time with a
+/// discriminating row each. That is cheaper than shipping a third round.
+///
+/// **A methodological note on the A/B that nearly went wrong.** Run directly
+/// with `-cp regression-suite/build`, four of the five vectors failed on the
+/// CONTROL binary too and read as "not mine". They need a `--module-path` that
+/// `run.sh` supplies. Re-run through the harness, control scored 5/0. **An
+/// invocation that is not the harness's own is not a control** -- it would
+/// have dismissed four real regressions.
+///
+/// # 54 became 38: the DIAL is not a faithful simulator of a RETIREMENT
+///
+/// **This table shipped 16 triples the corpus disproved, and the reason is
+/// methodological rather than clerical.** Lane L0's wave was validated with
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` -- the shadow dial, which makes a native
+/// DECLINE at a dispatch door -- and never with the retirement itself, which
+/// refuses the REGISTRATION. Those are not the same experiment, and that run's
+/// own census said so in a line nobody read:
+///
+/// ```text
+/// [DIAL_DOOR_CENSUS] armed=true reached=3680 yielded=3593 leaked=87
+/// ```
+///
+/// **87 dispatches reached the dial and were not yielded.** A leaked row
+/// reports the NATIVE's answer while reading, in a three-arm diff, as "the
+/// bytecode is fine here". `Class.isArray` was one of them: the armed arm
+/// printed `true/false`, matching HotSpot exactly, and the real retirement
+/// answers `false/false`.
+///
+/// Re-measured with no dial anywhere -- control binary (pre-table) against
+/// retired binary against HotSpot, on the same 129-row probe:
+///
+/// ```text
+/// 117  OK -> OK      retirement safe
+///   4  BAD -> OK     retirement REPAIRS a disagreement
+///   8  OK -> BAD     retirement BREAKS a correct answer   <- shipped anyway
+/// ```
+///
+/// Those eight cost **35 of 132 vectors** on the `--jdk-only` corpus arm,
+/// which had been 132/0 on four consecutive earlier binaries (`p4`, `p7`,
+/// `p8`, `p9`). The arm is the only instrument that caught it, which is
+/// exactly why the landing protocol lists it and why it must not be skipped
+/// when a goal changes mid-wave -- this wave's arms were deferred when the
+/// session moved to lane L3, and that is how the eight got in.
+///
+/// ## The eight, and why they are really four causes
+///
+/// * **The array family is ONE bad triple with a cascade.** `componentType`
+///   was retired; this VM never fills the `componentType` FIELD (this table's
+///   own held list records `descriptorString` NPE-ing on exactly that); and
+///   JDK 22+ implements `isArray()` as `componentType != null`. So `isArray`
+///   answers `false`, and `getTypeName`/`getSimpleName`/`getCanonicalName`
+///   fall back to the internal form for arrays -- `[[I` where HotSpot says
+///   `int[][]`. Six triples withdrawn for one root cause.
+/// * **Generic and annotated signature resolution** raises
+///   `TypeNotPresentException` for a type that is plainly on the class path.
+///   Four triples.
+/// * **The reflection-data copy model** flips: `field copies not same` goes
+///   `true -> false`, so the VM stops handing out copies. Note the direction,
+///   because lane L3 measured the SAME defect from the other side and found
+///   that yielding REPAIRS copying for `Field`/`Method`/`Constructor`. Same
+///   mechanism, opposite sign, depending on which end owns the accessor.
+/// * **`Class.getClassLoader`** yields null for the application loader, and
+///   **`ClassValue.get`** loses a recomputation. One triple each.
+///
+/// `Module.getClassLoader` is NOT withdrawn: it measured `OK -> OK` on the
+/// no-dial arm and its row is not a default-value agreement.
+///
+/// ## What this means for the next wave, in one line
+///
+/// **A dial arm is a screening instrument, not evidence.** Score a retirement
+/// with two BINARIES -- one without the table, one with it -- and require
+/// `OK -> BAD == 0` before the corpus arm, not after. If a dial arm is used at
+/// all, read its `leaked` counter first: `leaked > 0` means some rows in that
+/// arm never yielded and cannot be cited.
+///
+/// ## Wave 2: the 19 the failing vectors never consult
+///
+/// The 54 were withdrawn as a block for one reason -- `OK -> BAD == 0` held on
+/// the probe and the corpus still lost five vectors, and nothing said WHICH of
+/// the 29 remaining rows did it. Bisecting 29 triples is a build per
+/// hypothesis, 65 minutes each.
+///
+/// The per-vector census answers a weaker question for free: **which of the 29
+/// does this vector dispatch at all?** A registration a vector never consults
+/// cannot be the row that broke it. Measured on `p16` (L0 empty, so all 29
+/// natives present and counted), the five vectors passing 5/0, all five
+/// reports written, `saturation: none`:
+///
+/// ```text
+/// RClassUnloadSweep           5 of 29        union = 10 triples
+/// RClassUnloadSweepGen        5 of 29        desiredAssertionStatus, forName x3,
+/// RJdkModule                  8 of 29        getConstructor, getDeclaredConstructor,
+/// RLoaderIdentity             6 of 29        getMethod, getPackageName,
+/// RServiceLoaderDoubleSource  6 of 29        isInterface, isPrimitive
+/// ```
+///
+/// All ten are class-loading or member-lookup plumbing, which is what a
+/// class-unload sweep and a two-source `ServiceLoader` lean on and what a
+/// 129-row probe over `java.lang.Class` does not reach. The **19** below are
+/// touched by none of the five.
+///
+/// ## Why that covers the corpus and not just five vectors
+///
+/// The round-1 arm -- binary `p14`, **38 rows**, the 19 among them -- scored
+/// **127 passed, 5 failed**. So the 19 are not a hypothesis about those 127:
+/// they were retired *during* that run and those 127 vectors passed anyway.
+/// The five that did not pass are the five attributed above, and none of them
+/// consults a row in the 19. `19 subset 29 subset 38`, so the two later
+/// withdrawals only removed rows from around them. The halves close over 132:
+///
+/// ```text
+/// 127 vectors   passed WITH these 19 retired            measured, p14
+///   5 vectors   failed, and dispatch none of the 19     measured, p16 census
+/// ```
+///
+/// That is why this wave is 19 and not a bisection: the bisection would
+/// identify which of the 10 is guilty, which is a question about re-adding
+/// them, not about shipping these.
+///
+/// What it does NOT cover, and what the arm on this binary is for: the table
+/// now ships alongside L1's, L2's and L3's, and individually-safe retirements
+/// can interact -- Phase 2's 236 dial-safe classes armed together broke 54 of
+/// 118 vectors. Every number above was measured with L0 alone.
+static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
+    // WAVE 2, 2026-09-11. The 54-row wave was withdrawn whole because no
+    // instrument named the row; these 19 are the 29 that survived two
+    // probe rounds, minus the 10 that the five failing corpus vectors
+    // actually dispatch. Attribution is in the lane page's 7.2 and the
+    // 10 are pinned out by `the_l0_attributed_triples_are_not_retired`.
+    (
+        "java/lang/Class",
+        "asSubclass",
+        "(Ljava/lang/Class;)Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "cast",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/Class",
+        "getConstructors",
+        "()[Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredConstructors",
+        "()[Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredMethods",
+        "()[Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingClass",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingConstructor",
+        "()Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingMethod",
+        "()Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnumConstants",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/Class",
+        "getMethods",
+        "()[Ljava/lang/reflect/Method;",
+    ),
+    ("java/lang/Class", "getSigners", "()[Ljava/lang/Object;"),
+    (
+        "java/lang/Class",
+        "getTypeParameters",
+        "()[Ljava/lang/reflect/TypeVariable;",
+    ),
+    ("java/lang/Class", "isAnnotation", "()Z"),
+    ("java/lang/Class", "isEnum", "()Z"),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "hashCode",
+        "()I",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "parse",
+        "(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Version;",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
 ];
 
 /// The 2026-09-09 Phase 3 wave: `ConcurrentHashMap` and `Properties`, as ONE
@@ -6186,7 +6744,7 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// boundary-crossing registrars are carved out of the 992 rows under its prefix
 /// set. This table holds the rows that earned a retirement; every other row in
 /// that population is dispositioned in
-/// `docs/known-issues/jdk-only-lanes/lane-2-lang-values.md`.
+/// `docs/internal/jdk-only/lane-2-lang-values-RETIRED-20260911.md`.
 ///
 /// # `java/lang/Character` — three deprecated statics, and nothing to argue
 ///
@@ -6306,10 +6864,103 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// `intValueExact`, `isProbablePrime`, `longValueExact`, `not`, `shiftLeft`,
 /// `shiftRight`, `testBit`, `toByteArray` — and they are 0-diff over the whole
 /// 13253-row sweep with the JIT on.
+///
+/// **Seven rows removed on the 2026-09-11 catch-up merge with lane T**:
+/// `ExceptionInInitializerError`'s two constructors and `initCause`,
+/// `NullPointerException(String)`, `Throwable.initCause`, and
+/// `UnsatisfiedLinkError`'s two constructors were claimed by BOTH this table
+/// and `RETIRED_SHADOW_LT_TRIPLES` — `no_triple_is_claimed_by_two_tables`
+/// caught it. Lane T's page dates its claim 2026-09-10, a day before this
+/// page's own "blocker cleared 2026-09-11"; per that test's own rule, the
+/// later claim is the duplicate. These seven java/lang/ Throwable-family rows
+/// are lane T's to keep — they are seven of the 783 in
+/// `RETIRED_SHADOW_LT_TRIPLES` and were never independently measured here.
 static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Character", "isJavaLetter", "(C)Z"),
     ("java/lang/Character", "isJavaLetterOrDigit", "(C)Z"),
     ("java/lang/Character", "isSpace", "(C)Z"),
+    ("java/lang/IllegalThreadStateException", "<init>", "()V"),
+    (
+        "java/lang/IllegalThreadStateException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    ("java/lang/Object", "<init>", "()V"),
+    ("java/lang/Object", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/Object", "finalize", "()V"),
+    ("java/lang/Object", "toString", "()Ljava/lang/String;"),
+    ("java/lang/Object", "wait", "()V"),
+    ("java/lang/Object", "wait", "(J)V"),
+    ("java/lang/Package", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/Package", "getPackages", "()[Ljava/lang/Package;"),
+    ("java/lang/Package", "hashCode", "()I"),
+    ("java/lang/StringUTF16", "getChars", "([BII[CI)V"),
+    ("java/lang/VirtualMachineError", "<init>", "()V"),
+    (
+        "java/lang/VirtualMachineError",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/lang/VirtualMachineError",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/VirtualMachineError",
+        "<init>",
+        "(Ljava/lang/Throwable;)V",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getClassLoadingMXBean",
+        "()Ljava/lang/management/ClassLoadingMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getCompilationMXBean",
+        "()Ljava/lang/management/CompilationMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getGarbageCollectorMXBeans",
+        "()Ljava/util/List;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getMemoryMXBean",
+        "()Ljava/lang/management/MemoryMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getOperatingSystemMXBean",
+        "()Ljava/lang/management/OperatingSystemMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getPlatformMXBean",
+        "(Ljava/lang/Class;)Ljava/lang/management/PlatformManagedObject;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getPlatformMXBeans",
+        "(Ljava/lang/Class;)Ljava/util/List;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getRuntimeMXBean",
+        "()Ljava/lang/management/RuntimeMXBean;",
+    ),
+    (
+        "java/lang/management/ManagementFactory",
+        "getThreadMXBean",
+        "()Ljava/lang/management/ThreadMXBean;",
+    ),
+    ("java/lang/management/MemoryUsage", "<init>", "(JJJJ)V"),
+    ("java/lang/management/MemoryUsage", "getCommitted", "()J"),
+    ("java/lang/management/MemoryUsage", "getInit", "()J"),
+    ("java/lang/management/MemoryUsage", "getMax", "()J"),
+    ("java/lang/management/MemoryUsage", "getUsed", "()J"),
     ("java/math/BigInteger", "bitCount", "()I"),
     ("java/math/BigInteger", "bitLength", "()I"),
     ("java/math/BigInteger", "intValueExact", "()I"),
@@ -7261,6 +7912,673 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 1, wave 5 — `sun/util/calendar/ZoneInfoFile`, the one row of the
+/// Date/TimeZone/Locale family that a bisection left standing.
+///
+/// ## Why two rows and not the forty
+///
+/// §10 item 6 of the lane page holds `Date`/`TimeZone`/`sun/util/calendar/`
+/// (40) and `Locale` + providers (35) together, and the reason they were held
+/// together was that nobody had asked them separately. Armed one class at a
+/// time on `LocaleDateTzShadowSweep` (base 2 diffs), 2026-09-11:
+///
+/// ```text
+///   java/util/Locale                       +117 WORSE  rc 1   reached=58
+///   sun/util/calendar/ZoneInfo               +4 WORSE         reached=5723
+///   java/util/TimeZone                       +2 WORSE         reached=53
+///   java/util/Currency                       +2 WORSE         reached=4
+///   sun/util/calendar/ZoneInfoFile           +0 same          reached=3792
+///   java/util/Date                           +0 same          reached=0   VACUOUS
+///   sun/util/locale/provider/CalendarDataUtility      +0      reached=0   VACUOUS
+///   sun/util/locale/provider/JRELocaleProviderAdapter +0      reached=0   VACUOUS
+///   sun/util/locale/provider/LocaleResources          +0      reached=0   VACUOUS
+///   sun/util/resources/Bundles                        +0      reached=0   VACUOUS
+///   sun/util/resources/LocaleData                     +0      reached=0   VACUOUS
+/// ```
+///
+/// Six of the seven `+0` rows are §7's vacuity trap wearing a green coat: the
+/// probe never asks those classes anything, so `reached == 0` and the row says
+/// NOTHING. `ZoneInfoFile` is the one `+0` that means something — 3,792 door
+/// engagements and no diff — and it is the only row here.
+///
+/// **A green dial arm is a candidate, not a verdict, and so is a red one.**
+/// This wave's own sibling finding is that `java/util/HashMap` sat held for two
+/// page revisions on nine rows a trial binary reads as zero
+/// (`RETIRED_SHADOW_L1_HM_TRIPLES`), and the converse — an armed arm that
+/// agrees with base is exactly what a LEAKED dial row also looks like. So the
+/// 3,792 buys this table a place in the queue, not a landing: the acceptance is
+/// a trial binary against the whole probe tree, per the four preconditions in
+/// the ops page §7.
+///
+/// ## What the two rows are
+///
+/// Both are registered in `native-builtins/src/lib.rs` and both answer with
+/// `alloc_synth_timezone` — a `sun/util/calendar/ZoneInfo` this VM builds from
+/// its own tzdb parse, with `ID`/`rawOffset`/`dstSavings` populated. The real
+/// bytecode reads `tzdb.dat` out of the image instead. They are a pair on
+/// purpose: `getZoneInfo` is the public entry point, `getZoneInfo0` the private
+/// one it delegates to, and retiring one without the other would leave a
+/// synthesised object being handed to real bytecode or the reverse — the
+/// half-retirement shape wave 3 measured on `HashMap`'s iterators.
+///
+/// ## What is NOT here, and why the prefix is narrow
+///
+/// `sun/util/locale/provider/` and `sun/util/resources/` are the five vacuous
+/// rows above, and they are all one blocker: `LocaleResources` answers `null`
+/// for the class-based bundle families (`getBreakIteratorInfo`,
+/// `getDateTimePattern`), which is what makes `java/text/BreakIterator`'s
+/// yield throw `AbstractMethodError` and what BUG-15 in
+/// `vm/src/vm/vm_exec.rs` pins a native over. That is one engineering front
+/// under four of the lane's remaining items, and it is §10's, not this table's.
+/// Admitting `sun/util/` as a prefix would put all of it one binary search from
+/// a future table for no gain today, so the prefix names this class alone.
+static RETIRED_SHADOW_L1_ZI_TRIPLES: &[(&str, &str, &str)] = &[
+    (
+        "sun/util/calendar/ZoneInfoFile",
+        "getZoneInfo",
+        "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
+    ),
+    (
+        "sun/util/calendar/ZoneInfoFile",
+        "getZoneInfo0",
+        "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
+    ),
+];
+
+/// Lane 4 wave 1, 2026-09-11: 140 rows over 10 classes of `java/io/` and
+/// `java/nio/`.
+///
+/// A SEVENTH table rather than rows merged into a sibling, for the reason the
+/// second and third give for existing: these were adjudicated by a different
+/// METHOD, and the method is the part worth seeing at a glance.
+///
+/// # The method: a per-family dial sweep, then the SAME families armed together
+///
+/// `apps/probes/l4famsweep.sh` arms `CRATONVM_ENFORCE_NATIVE_SHADOW` on one
+/// receiver family at a time and diffs thirteen lane-4 probes against a real
+/// HotSpot 25 on the same host. On 2026-09-10, with the `FileInputStream.skip`
+/// residual fixed, sixteen of its eighteen families scored **0**:
+///
+/// ```text
+///   java/io/PrintStream  File  FileInputStream  FileOutputStream
+///   java/io/ByteArrayInputStream  ByteArrayOutputStream  DataInputStream
+///   java/io/DataOutputStream  BufferedReader  BufferedWriter
+///   java/io/FilterOutputStream   java/nio/ByteBuffer   java/nio/CharBuffer
+///   java/nio/file/spi/FileSystemProvider   java/nio/file/attribute/
+///   java/nio/channels/FileChannel                                    DIFF 0
+///   java/nio/file/Files                                              DIFF 4
+///   java/nio/file/Path                                             DIFF 100
+/// ```
+///
+/// **Sixteen per-family greens are not one green for the wave.** Phase 2 armed
+/// 270 classes one at a time, called 236 retire-safe, and arming those 236
+/// together failed 54 of 118 corpus vectors. So the families were re-armed as
+/// ONE scope, which is what a wave actually does, and measured against an
+/// unarmed control on the same binary:
+///
+/// ```text
+///   control (dial off)                 0 diffs over 4416 rows, 0 short
+///   the 13 wave-1 families armed       0 diffs over 4416 rows, 0 short
+///   ... plus java/io/PrintStream       0 diffs over 4416 rows, 0 short
+/// ```
+///
+/// # The dial was ASKED, and this is the number that says so
+///
+/// A zero from an instrument that never ran reads exactly like a zero from one
+/// that did. Under the wave-1 scope the dial's own counters report **180 268
+/// dispatches reached and 176 112 YIELDED** across the thirteen probes -- that
+/// many native calls declined and served by real JDK bytecode instead, for
+/// 4 416 rows that stayed byte-identical to HotSpot. `L4TypedBufferSweep`
+/// alone yields 27 849 times and moves no row.
+///
+/// # The funnel
+///
+/// Step 1 of the lane's increment loop, unioned over the whole instrument
+/// rather than one probe: a registry dump per probe (13 dumps, schema 5,
+/// `--explain-jdk-only` so the image columns are populated), and a row is a
+/// candidate only if it **owns its slot**, is kind `Bridge`, its image
+/// declaring method carries `Code` (bucket A or B), and it was **invoked at
+/// least once** in one of those runs.
+///
+/// ```text
+///   bucket C / D / E / F (no bytecode to yield to)      867  not candidates
+///   not a Bridge                                         17
+///   invocations 0 in all 13 runs                        820  unmeasured, not safe
+///   outside a DIFF-0 family                             226  Files, Path, sun/nio/ch, …
+///   CANDIDATES                                          191
+///   backed out by the BUILD (see below)                  -51
+///   RETIRED                                             140
+/// ```
+///
+/// `invocations 0` is the largest exclusion and it is deliberately NOT read as
+/// "unreachable": schema 5's `invocations_complete` bit exists because the
+/// column is a lower bound. Those 820 rows are unmeasured by this instrument,
+/// which is a reason not to retire them here, not a verdict about them.
+///
+/// # What the build found that the dial could not, and why the dial cannot
+///
+/// The screen above said 0 for all thirteen probes with the wave armed. Built,
+/// the same thirteen probes moved **eight rows in strict mode** — and none in
+/// compatible mode, which is the half that identifies the mechanism:
+///
+/// ```text
+///   L4TailSweep2        3 rows   Files.createLink -> UnsupportedOperationException
+///   L4TypedBufferSweep  3 rows   CharBuffer subSequence/toString, wrong WINDOW
+///   TailFamilySweep     2 rows   the same two, through the asCharBuffer view
+///
+/// (`diff` counts both sides, so that is 16 differing LINES. The count that
+/// matters is eight rows, in two families.)
+/// ```
+///
+/// **The dial is not a faithful model of a retirement, and this is the shape of
+/// the gap.** The dial declines a native at DISPATCH, and its decline is
+/// conditional: when the receiver's own class has no concrete body to yield to
+/// (`dispatch_has_code == false`) it answers no and the native runs anyway —
+/// that is the `declined_no_bytecode` column, 4 156 of 180 268 here. A
+/// retirement has no such fallback: the registration is simply not there, and
+/// the call lands wherever real dispatch takes it. Every row the dial scored 0
+/// on *because it declined to decline* is therefore unmeasured by it.
+///
+/// `java/nio/file/spi/FileSystemProvider` is exactly that row. This VM hands
+/// out a fabricated provider stamped with the ABSTRACT class, so `createLink`
+/// has no concrete body, so the dial ran the native and read 0. Retired, the
+/// call reaches the abstract declaration and answers
+/// `UnsupportedOperationException` for all three rows — the
+/// fabricate-an-abstract-class trade, arrived at from the registration side.
+/// All four of its rows are out.
+///
+/// `java/nio/CharBuffer` is the second, and it is §4's named failure mode
+/// rather than a throw: `subSequence(1,3)` answered `cd` where HotSpot answers
+/// `bc`, and `toString()` after `position(2)` answered the empty string. The
+/// real `CharBuffer` bodies derive their window from `position()`/`limit()`,
+/// and this VM's carrier does not keep those where the real accessors read
+/// them, so retiring the accessors hands the real bodies the wrong window. It
+/// produces correct-LOOKING output with the wrong characters, which is the one
+/// outcome the lane page says to design the probe for. All seventeen of its
+/// rows are out. `java/nio/ByteBuffer`'s thirty-four stay: the same accessors,
+/// the same probe, zero rows moved — so this is a CharBuffer carrier defect and
+/// not a buffer-wide one.
+///
+/// The four `ByteBufferAsCharBuffer{B,L,RB,RL}.order()` rows stay too. They were
+/// suspected with CharBuffer and cleared by the re-measurement: `order()` is a
+/// constant, and with CharBuffer's accessors restored those views are at 0.
+///
+/// # The corpus found three more, and the probe tree could not have
+///
+/// The thirteen probes scored 0 in BOTH modes on the built binary -- 4 416 rows,
+/// binary against binary. The `--jdk-only` corpus went **132/132 -> 129/132**,
+/// reproducibly, on the same binary:
+///
+/// ```text
+///   RFileTimes       every timestamp reads 1970-01-01T00:00:00Z
+///   RJdkSecurity     a property-named truststore IGNORED: 122 anchors for 1,
+///                    and a certificate HotSpot REJECTS is ACCEPTED
+///   RSslLiveSession  fails at client.responseCode = 200
+/// ```
+///
+/// `RFileTimes` has one cause and it is the SETTER, not the getter:
+/// `Files.setLastModifiedTime` reads `FileTime.toMillis()` off a fabricated
+/// carrier, gets 0, and stamps the file at the epoch -- so all four read-back
+/// rows follow from one write. Dial-armed attribution names
+/// `java/nio/file/attribute/` for it and `java/io/ByteArrayInputStream` for
+/// `RSslLiveSession`; `java/io/File` armed alone is clean, so `File.lastModified`
+/// reading 1970 was a symptom of the same write and not a second defect.
+///
+/// `RJdkSecurity` reproduces under NO single family and not under all thirteen
+/// armed together -- the dial's blind spot described above, and the dial was
+/// never going to name it. What did was an eight-line probe,
+/// `apps/probes/L4AbsPath.java`, printing path SHAPES rather than paths:
+///
+/// ```text
+///   temp.getPath          abs=true len=32 slashes=2      (correct)
+///   temp.isAbsolute       false                          (HotSpot: true)
+///   temp.getAbsolutePath  abs=true len=45 slashes=5      (the cwd, prepended)
+/// ```
+///
+/// Every `java.io.File` this VM builds kept its path in slot 0 and wrote
+/// nothing else, so real `File` bytecode read `prefixLength = 0` and called
+/// every path relative. Fixed in the commit before this table, in
+/// [`crate::file_layout`], at all six producing call sites across two crates.
+/// **That fix is why the six `prefixLength`-dependent `File` rows below --
+/// `isAbsolute`, `getAbsolutePath`, `getAbsoluteFile`, `getCanonicalPath`,
+/// `getCanonicalFile`, `toURI` -- are retired here rather than carved out.**
+///
+/// Five fabricated carriers in this lane have now been found with their real
+/// fields empty: `Path`, `CharBuffer`, `FileTime`, `FileSystemProvider` and
+/// `File`. The carrier is the blocker, not the retirement.
+///
+/// The whole `--jdk-only` corpus, armed on the trimmed scope, is back at its
+/// unarmed baseline. **That screen belongs before the build, not after it**, and
+/// its absence is what cost this wave five of its seven builds.
+///
+/// # What is held back, and why
+///
+///  * **`java/io/PrintStream`.** It scores 0 armed, alone
+///    and in the wave, and it is still not here: `System.out` and `System.err`
+///    are how every lane reads its probes, so a regression there reads as all
+///    nine lanes failing at once. The lane page requires it in its own wave
+///    with its own commit naming the blast radius. The measurement above is
+///    that wave's evidence, taken early.
+///  * **The five families the builds backed out (51 rows).**
+///    `java/nio/CharBuffer` (17) and `java/nio/file/spi/FileSystemProvider` (4)
+///    from the probe tree; `java/nio/file/attribute/` (12) and
+///    `java/io/ByteArrayInputStream` (9) from the corpus, attributed by dial
+///    sweep; and the file-handle group (9) — `java/io/FileOutputStream`,
+///    `FileCleanable`, `FileDescriptor` and the abstract-receiver
+///    `java/nio/channels/FileChannel` — as an un-attributed GROUP, because
+///    `RJdkSecurity` reproduces under no dial scope at all. Every one of them is
+///    blocked on a CARRIER defect rather than on the retirement: a fabricated
+///    receiver whose real fields this VM never writes.
+///  * **`java/nio/file/Files` (DIFF 4) and `java/nio/file/Path` (DIFF 100).**
+///    Above the floor, so not candidates. `Path`'s 100 are one defect: the
+///    carrier is stamped with the INTERFACE, so `toString()` lands on
+///    `Object.toString()`. See `crate::path_layout`.
+///  * **`sun/nio/ch/`.** The 2026-08-19 package verdict stands; this wave does
+///    not try to beat it.
+///  * **`native-io/src/concrete_receiver.rs:185`**, a cross-lane registrar of
+///    191 rows over 21 classes that lane T owns whole. The funnel filters it by
+///    call site and it removed NOTHING here -- its classes are `sun/nio/ch`,
+///    already outside the wave -- so the filter is a guard for later waves
+///    rather than a thing that fired.
+///  * **`jdk/internal/foreign`.** Nothing under it reached the candidate set,
+///    so its prefix is not admitted either.
+///
+/// The wave's only FFM-adjacent rows went out with CharBuffer:
+/// `session()Ljdk/internal/foreign/MemorySessionImpl;` and `checkSession()V`
+/// were on that class. Nothing retired here touches
+/// `jdk/internal/foreign`, whose carrier is this VM's own allocation shape
+/// rather than the JDK's
+/// (`docs/known-issues/jdk-only/the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md`).
+///
+/// Measured on **linux/x86_64 against JDK 25**. `java/io/File`'s separators,
+/// absolute-path rules and permission methods differ by OS, and the two shell
+/// gates in this campaign are keyed `25/linux` and refuse on Windows, so that
+/// is the platform this table is measured on and the only one.
+static RETIRED_SHADOW_L4_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/io/ByteArrayOutputStream", "<init>", "()V"),
+    ("java/io/ByteArrayOutputStream", "<init>", "(I)V"),
+    ("java/io/ByteArrayOutputStream", "close", "()V"),
+    ("java/io/ByteArrayOutputStream", "flush", "()V"),
+    ("java/io/ByteArrayOutputStream", "reset", "()V"),
+    ("java/io/ByteArrayOutputStream", "size", "()I"),
+    ("java/io/ByteArrayOutputStream", "toByteArray", "()[B"),
+    (
+        "java/io/ByteArrayOutputStream",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/io/ByteArrayOutputStream",
+        "toString",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    (
+        "java/io/ByteArrayOutputStream",
+        "toString",
+        "(Ljava/nio/charset/Charset;)Ljava/lang/String;",
+    ),
+    ("java/io/ByteArrayOutputStream", "write", "(I)V"),
+    ("java/io/ByteArrayOutputStream", "write", "([B)V"),
+    ("java/io/ByteArrayOutputStream", "write", "([BII)V"),
+    ("java/io/DataInputStream", "available", "()I"),
+    ("java/io/DataInputStream", "close", "()V"),
+    ("java/io/DataInputStream", "read", "()I"),
+    ("java/io/DataInputStream", "read", "([BII)I"),
+    ("java/io/DataInputStream", "readBoolean", "()Z"),
+    ("java/io/DataInputStream", "readByte", "()B"),
+    ("java/io/DataInputStream", "readChar", "()C"),
+    ("java/io/DataInputStream", "readDouble", "()D"),
+    ("java/io/DataInputStream", "readFloat", "()F"),
+    ("java/io/DataInputStream", "readFully", "([B)V"),
+    ("java/io/DataInputStream", "readFully", "([BII)V"),
+    ("java/io/DataInputStream", "readInt", "()I"),
+    ("java/io/DataInputStream", "readLong", "()J"),
+    ("java/io/DataInputStream", "readShort", "()S"),
+    ("java/io/DataInputStream", "readUTF", "()Ljava/lang/String;"),
+    ("java/io/DataInputStream", "readUnsignedByte", "()I"),
+    ("java/io/DataInputStream", "readUnsignedShort", "()I"),
+    ("java/io/DataInputStream", "skipBytes", "(I)I"),
+    (
+        "java/io/DataOutputStream",
+        "<init>",
+        "(Ljava/io/OutputStream;)V",
+    ),
+    ("java/io/DataOutputStream", "close", "()V"),
+    ("java/io/DataOutputStream", "flush", "()V"),
+    ("java/io/DataOutputStream", "size", "()I"),
+    ("java/io/DataOutputStream", "write", "(I)V"),
+    ("java/io/DataOutputStream", "write", "([BII)V"),
+    ("java/io/DataOutputStream", "writeBoolean", "(Z)V"),
+    ("java/io/DataOutputStream", "writeByte", "(I)V"),
+    ("java/io/DataOutputStream", "writeChar", "(I)V"),
+    ("java/io/DataOutputStream", "writeDouble", "(D)V"),
+    ("java/io/DataOutputStream", "writeFloat", "(F)V"),
+    ("java/io/DataOutputStream", "writeInt", "(I)V"),
+    ("java/io/DataOutputStream", "writeLong", "(J)V"),
+    ("java/io/DataOutputStream", "writeShort", "(I)V"),
+    (
+        "java/io/DataOutputStream",
+        "writeUTF",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/io/File",
+        "<init>",
+        "(Ljava/io/File;Ljava/lang/String;)V",
+    ),
+    ("java/io/File", "<init>", "(Ljava/lang/String;)V"),
+    (
+        "java/io/File",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+    ),
+    ("java/io/File", "<init>", "(Ljava/net/URI;)V"),
+    ("java/io/File", "canExecute", "()Z"),
+    ("java/io/File", "canRead", "()Z"),
+    ("java/io/File", "canWrite", "()Z"),
+    ("java/io/File", "compareTo", "(Ljava/io/File;)I"),
+    ("java/io/File", "createNewFile", "()Z"),
+    (
+        "java/io/File",
+        "createTempFile",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;",
+    ),
+    ("java/io/File", "delete", "()Z"),
+    ("java/io/File", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/io/File", "exists", "()Z"),
+    ("java/io/File", "getAbsoluteFile", "()Ljava/io/File;"),
+    ("java/io/File", "getAbsolutePath", "()Ljava/lang/String;"),
+    ("java/io/File", "getCanonicalFile", "()Ljava/io/File;"),
+    ("java/io/File", "getCanonicalPath", "()Ljava/lang/String;"),
+    ("java/io/File", "getFreeSpace", "()J"),
+    ("java/io/File", "getName", "()Ljava/lang/String;"),
+    ("java/io/File", "getParent", "()Ljava/lang/String;"),
+    ("java/io/File", "getParentFile", "()Ljava/io/File;"),
+    ("java/io/File", "getPath", "()Ljava/lang/String;"),
+    ("java/io/File", "getTotalSpace", "()J"),
+    ("java/io/File", "getUsableSpace", "()J"),
+    ("java/io/File", "hashCode", "()I"),
+    ("java/io/File", "isAbsolute", "()Z"),
+    ("java/io/File", "isDirectory", "()Z"),
+    ("java/io/File", "isFile", "()Z"),
+    ("java/io/File", "isHidden", "()Z"),
+    ("java/io/File", "lastModified", "()J"),
+    ("java/io/File", "length", "()J"),
+    ("java/io/File", "list", "()[Ljava/lang/String;"),
+    (
+        "java/io/File",
+        "list",
+        "(Ljava/io/FilenameFilter;)[Ljava/lang/String;",
+    ),
+    ("java/io/File", "listFiles", "()[Ljava/io/File;"),
+    (
+        "java/io/File",
+        "listFiles",
+        "(Ljava/io/FileFilter;)[Ljava/io/File;",
+    ),
+    (
+        "java/io/File",
+        "listFiles",
+        "(Ljava/io/FilenameFilter;)[Ljava/io/File;",
+    ),
+    ("java/io/File", "listRoots", "()[Ljava/io/File;"),
+    ("java/io/File", "mkdir", "()Z"),
+    ("java/io/File", "mkdirs", "()Z"),
+    ("java/io/File", "renameTo", "(Ljava/io/File;)Z"),
+    ("java/io/File", "setExecutable", "(Z)Z"),
+    ("java/io/File", "setExecutable", "(ZZ)Z"),
+    ("java/io/File", "setLastModified", "(J)Z"),
+    ("java/io/File", "setReadOnly", "()Z"),
+    ("java/io/File", "setReadable", "(Z)Z"),
+    ("java/io/File", "setReadable", "(ZZ)Z"),
+    ("java/io/File", "setWritable", "(Z)Z"),
+    ("java/io/File", "setWritable", "(ZZ)Z"),
+    ("java/io/File", "toPath", "()Ljava/nio/file/Path;"),
+    ("java/io/File", "toString", "()Ljava/lang/String;"),
+    ("java/io/File", "toURI", "()Ljava/net/URI;"),
+    ("java/io/FilterOutputStream", "close", "()V"),
+    ("java/io/FilterOutputStream", "flush", "()V"),
+    ("java/io/FilterOutputStream", "write", "(I)V"),
+    ("java/io/FilterOutputStream", "write", "([B)V"),
+    ("java/io/FilterOutputStream", "write", "([BII)V"),
+    (
+        "java/nio/ByteBuffer",
+        "allocate",
+        "(I)Ljava/nio/ByteBuffer;",
+    ),
+    (
+        "java/nio/ByteBuffer",
+        "allocateDirect",
+        "(I)Ljava/nio/ByteBuffer;",
+    ),
+    ("java/nio/ByteBuffer", "array", "()[B"),
+    ("java/nio/ByteBuffer", "arrayOffset", "()I"),
+    ("java/nio/ByteBuffer", "capacity", "()I"),
+    ("java/nio/ByteBuffer", "clear", "()Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "clear", "()Ljava/nio/ByteBuffer;"),
+    (
+        "java/nio/ByteBuffer",
+        "compareTo",
+        "(Ljava/nio/ByteBuffer;)I",
+    ),
+    ("java/nio/ByteBuffer", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/nio/ByteBuffer", "flip", "()Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "flip", "()Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "get", "([B)Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "hasArray", "()Z"),
+    ("java/nio/ByteBuffer", "hasRemaining", "()Z"),
+    ("java/nio/ByteBuffer", "hashCode", "()I"),
+    ("java/nio/ByteBuffer", "limit", "()I"),
+    ("java/nio/ByteBuffer", "limit", "(I)Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "limit", "(I)Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "mark", "()Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "mark", "()Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "order", "()Ljava/nio/ByteOrder;"),
+    (
+        "java/nio/ByteBuffer",
+        "order",
+        "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;",
+    ),
+    ("java/nio/ByteBuffer", "position", "()I"),
+    ("java/nio/ByteBuffer", "position", "(I)Ljava/nio/Buffer;"),
+    (
+        "java/nio/ByteBuffer",
+        "position",
+        "(I)Ljava/nio/ByteBuffer;",
+    ),
+    (
+        "java/nio/ByteBuffer",
+        "put",
+        "(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;",
+    ),
+    ("java/nio/ByteBuffer", "put", "([B)Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "put", "([BII)Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "remaining", "()I"),
+    ("java/nio/ByteBuffer", "reset", "()Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "rewind", "()Ljava/nio/Buffer;"),
+    ("java/nio/ByteBuffer", "rewind", "()Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "wrap", "([B)Ljava/nio/ByteBuffer;"),
+    ("java/nio/ByteBuffer", "wrap", "([BII)Ljava/nio/ByteBuffer;"),
+    (
+        "java/nio/ByteBufferAsCharBufferB",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "java/nio/ByteBufferAsCharBufferL",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "java/nio/ByteBufferAsCharBufferRB",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+    (
+        "java/nio/ByteBufferAsCharBufferRL",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+    ),
+];
+
+/// The 2026-09-11 lane-L6 wave: `java/net/HttpURLConnection` and
+/// `ProxySelector.getDefault` -- 15 rows of a lane of 966, after the corpus
+/// refused 109 that the probe tree had cleared.
+///
+/// A fifth table rather than rows merged into a sibling, for the reason the
+/// second gives for existing: these were adjudicated by a different METHOD --
+/// eight differential probes written for this lane, and then six builds of
+/// paired corpus runs -- and the method is the part worth being able to see at
+/// a glance.
+///
+/// # The probe tree cleared 124 rows. The corpus refused 109 of them.
+///
+/// This is the finding of the wave and it goes first, because it re-states one
+/// of the four preconditions and every future lane will meet it.
+///
+/// Armed on the candidate prefixes, **all 125 probes in the tree got no worse**
+/// and five got dramatically better. Built, and run as a two-binary A/B
+/// against a control from the same merged tree, the same five improved --
+/// `L6UriSweep` 80 diff lines to 0, `L6X500Sweep` 276 to 0,
+/// `L6HttpLogicSweep` 64 to 18, `L6InetSweep` 380 to 368, `L6SocketSweep` 42
+/// to 38 -- and **zero probes regressed**. Both instruments said 124 rows.
+///
+/// The `--jdk-only` corpus, paired against that control and run alone, said
+/// 15. The ladder, one build per row:
+///
+/// ```text
+///   #  table                          corpus (paired, alone)   measured out
+///   1  124 rows, 10 classes           trial 126/132            URL, DatagramSocket,
+///                                     ctrl  132/132            MulticastSocket, Inet*  (70)
+///   2   54 rows,  4 classes           trial 130/132            URI (29) -- RJdkBridge1
+///   3   25 rows,  3 classes           RSslLiveSession 3/3 red  nothing: a guess
+///   4   11 rows,  2 classes           RSslLiveSession 3/3 red  nothing: the same guess
+///   5   10 rows, X500Principal alone  RSslLiveSession 3/3 red  X500Principal (10)
+///   6   15 rows                       trial 132/132, ctrl 132/132   --
+/// ```
+///
+/// Builds 3 and 4 are listed because they are the cost of guessing:
+/// `HttpURLConnection` was the plausible culprit for an HTTPS vector, was
+/// dropped twice, was innocent, and is one of the two classes this table
+/// carries.
+///
+/// # Precondition 3 is checked one frame too high
+///
+/// Every refusal is the same species:
+///
+/// ```text
+///   RJdkServices              NPE  URLStreamHandler.openConnection, "this.handler" is null
+///   RServiceLoaderDoubleSource   (same)
+///   RJdkDefineClass           NPE  URLStreamHandler.getDefaultPort,  "this.handler" is null
+///   RJdkNet                   ULE  sun/nio/ch/DatagramChannelImpl.receive0
+///   RJdkNet  (InetAddress)    ULE  java/net/Inet6AddressImpl.lookupAllHostAddr
+///   RNetIfaceScope            every scoped IPv6 address must round-trip, 2 did not
+///   RJdkBridge1               URL.toURI().getPath() lost a lone surrogate to U+FFFD
+///   RSslLiveSession           CK client.responseCode = 200 unclassified
+/// ```
+///
+/// Precondition 3 asks whether the IMAGE METHOD carries `Code` to yield to.
+/// All 124 rows passed it. It does not ask what that code then CALLS:
+///
+///  * `java.net.URL`'s methods are one line each through `this.handler`, a
+///    field only the real constructor writes -- and this VM MINTS `URL`
+///    objects in `classloader.rs` without running it;
+///  * `X500Principal` has one declared instance field, `transient X500Name
+///    thisX500Name`, and `native-builtins/src/jca/x500.rs` documents in its own
+///    header that this VM repurposes that slot to hold a **String**. Any JDK
+///    bytecode on the class dereferences a String as an `X500Name`;
+///  * `java.net.URI` is the same shape one level out: `URL.toURI()` allocates a
+///    real `java.net.URI` and publishes fields into it rather than running its
+///    constructor;
+///  * `InetAddress.getByName` and `DatagramSocket` yield into
+///    `Inet6AddressImpl.lookupAllHostAddr` and
+///    `sun/nio/ch/DatagramChannelImpl.receive0`, both `ACC_NATIVE` and neither
+///    implemented here -- so the retirement trades a shadow for an
+///    `UnsatisfiedLinkError`, one frame deeper than precondition 3 looks.
+///
+/// **So precondition 3 is really: the image method carries `Code`, AND that
+/// code's own callees are satisfiable in this VM.** Four of the six are a
+/// field only a real constructor writes, which is `Class.getModule`'s
+/// situation from lane-0 §7. A VM that allocates a JDK carrier without
+/// constructing it has, for every such class, a shadow that cannot be retired
+/// until the carrier is built properly.
+///
+/// # The dial is a lead in both directions, and a hand-run vector is not a run
+///
+/// Two instrument traps, both paid for here:
+///
+///  * the dial (`CRATONVM_ENFORCE_NATIVE_SHADOW`) was **optimistic** on
+///    `URL`/`DatagramSocket`/`Inet*`, **pessimistic on the wrong vector** for
+///    `X500Principal` (it failed `RJdkX509Intercept`, which passes on every
+///    binary built here), and **silent** about `RSslLiveSession`, the vector
+///    that actually refuses it. It DECLINES at dispatch and arms a PREFIX;
+///    this table re-tags at REGISTRATION and is per-triple;
+///  * `cratonvm --jdk-only -cp build:... RJdkBridge1` passes on a binary whose
+///    HARNESS run of the same vector fails. `run.sh` builds the classpath,
+///    sets the flags and applies the cross-VM diff. The isolation that settles
+///    a vector is `ONLY=<Vector> bash regression-suite/run.sh`, three runs on
+///    each binary.
+///
+/// # Why the lane's other prefixes carry no table
+///
+/// Each was armed ALONE on the whole 125-probe tree:
+///
+/// ```text
+///   javax/net/                                    2 probes worse   L6TlsParamSweep 66 -> 94
+///   java/security/,sun/security/,
+///     javax/crypto/,javax/security/               8 probes worse   SecuritySurfaceSweep 0 -> 2594
+///   sun/net/                                      0               123 of 125 VACUOUS
+///   jdk/net/,jdk/internal/net/                    0               123 of 125 VACUOUS
+/// ```
+///
+/// A VACUOUS arm is not a pass: `sun/net/` and the two `jdk` prefixes reached
+/// the dial in 2 probes of 125, which is precondition 1 and the trap 146 of
+/// Phase 2's 236 candidates fell into.
+///
+/// Three structural reasons sit behind the rest, each recorded in full in
+/// `docs/internal/retired/lane-6-net-security-RETIRED-20260910.md`:
+///
+///  1. **`javax/net/ssl/` and `sun/security/ssl/` are an IMPLEMENTATION.**
+///     This VM's TLS is rustls (`native-builtins/src/t27_tls.rs`, 20,630
+///     lines). Yielding does not restore a JDK behaviour this VM approximates
+///     -- it removes TLS. That is `StrictMath`'s situation: a 0-diff probe is
+///     evidence the family WORKS, never on its own a reason to retire it.
+///  2. **The 67 `HttpsURLConnectionImpl` rows are a null-`delegate`
+///     workaround.** `register_https_delegate_forwarders` exists because this
+///     VM ALLOCATES that carrier rather than constructing it, and each
+///     forwarder runs the SUPERCLASS body the Impl overrides -- the
+///     retirement's own remedy, one level up.
+///  3. **A base-class row loses the dispatch to its own subclass.** 15 of
+///     `InetAddress`'s 18 bucket-A rows are never dispatched, because every
+///     instance is an `Inet4Address` or an `Inet6Address` and the door asks
+///     the registry about the DECLARING class.
+///
+/// # The refusals are not inert
+///
+/// A refusal is a retirement only when nothing already owns the triple:
+/// `JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor`, and a
+/// non-null one means an earlier registration is still serving, so strict mode
+/// runs that older native and every probe reads exactly as before. Measured on
+/// the trial binary over a `--jdk-only-report` of the probe tree: every row of
+/// this table appears in the refusal set and ZERO refusals carry a survivor.
+static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/net/HttpURLConnection", "<init>", "(Ljava/net/URL;)V"),
+    ("java/net/HttpURLConnection", "addRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/net/HttpURLConnection", "getHeaderFieldDate", "(Ljava/lang/String;J)J"),
+    ("java/net/HttpURLConnection", "getInstanceFollowRedirects", "()Z"),
+    ("java/net/HttpURLConnection", "getRequestMethod", "()Ljava/lang/String;"),
+    ("java/net/HttpURLConnection", "getRequestProperties", "()Ljava/util/Map;"),
+    ("java/net/HttpURLConnection", "getRequestProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("java/net/HttpURLConnection", "setChunkedStreamingMode", "(I)V"),
+    ("java/net/HttpURLConnection", "setConnectTimeout", "(I)V"),
+    ("java/net/HttpURLConnection", "setDoOutput", "(Z)V"),
+    ("java/net/HttpURLConnection", "setFixedLengthStreamingMode", "(I)V"),
+    ("java/net/HttpURLConnection", "setReadTimeout", "(I)V"),
+    ("java/net/HttpURLConnection", "setRequestMethod", "(Ljava/lang/String;)V"),
+    ("java/net/HttpURLConnection", "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/net/ProxySelector", "getDefault", "()Ljava/net/ProxySelector;"),
+];
+
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
@@ -7276,6 +8594,178 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
 /// rest of the package tree to one extra binary search each, which is the whole
 /// cost, and `the_held_collection_families_are_not_retired` is the test that
 /// says admitting them changes no answer.
+/// The 2026-09-11 lane-5 RESIDUAL wave: 67 `sun/misc/Unsafe` rows, and the
+/// reason they were held until now was a missing INSTRUMENT, not a blocker.
+///
+/// The retired lane page held all 82 `sun/misc/Unsafe` registrations with
+/// "precondition 1 fails by measurement" — 121 probes reported the dial VACUOUS
+/// on that scope and the 132 `--jdk-only` corpus reports reached 18 of the 82.
+/// Its own §9 said what that was worth: **until a workload exists, the count is
+/// not evidence of anything.** It is not evidence the rows are right, not
+/// evidence they are retirable, and not evidence they are dead.
+///
+/// `apps/probes/L5SunMiscUnsafe.java` is that workload, and with it the four
+/// preconditions read:
+///
+/// ```text
+///   1. the dial was asked              y/r = 76/76 on the workload
+///   2. whole probe tree no worse       134 measured: 0 toward, 1 away, and
+///                                      that row is y/r=0/0 VACUOUS with a
+///                                      line count that moved — not the dial
+///   3. the image target carries Code   outcome=bytecode-won on all 67, and
+///                                      `javap -p sun.misc.Unsafe` reports
+///                                      ZERO native methods on the class —
+///                                      all 99 carry Code and delegate to
+///                                      `theInternalUnsafe`
+///   4. a per-triple dispatch observed  67 distinct triples, one row each
+/// ```
+///
+/// **The wave was 48 rows for an afternoon.** The first workload reached 48 of
+/// them; widening it to the volatile twins, the long atomics and the bulk
+/// memory trio reached 19 more, and this page's own account had said that is
+/// what takes them — *a probe edit, not a build*. It cost one probe edit and
+/// two runs.
+///
+/// Precondition 2 was measured on the 36-row workload and is NOT re-run for
+/// the 19: the battery's question is whether arming this prefix disturbs the
+/// OTHER 133 probes, and widening one probe cannot change their answer. The
+/// row that did change is this probe's own, and it was re-measured directly —
+/// `d(base,armed) = 0` on 50 rows, so arming the prefix changes nothing about
+/// its output at all.
+///
+/// Precondition 3 is not read off a `javap` here: `outcome=bytecode-won` in the
+/// `--jdk-only-report` IS the image's bytecode having run and produced the
+/// answer. And the answer is the same one: the probe is **byte-identical armed
+/// and unarmed**, 36 rows, including the two lines that differ from HotSpot for
+/// an unrelated reason (see below). A retirement that changes no answer while
+/// refusing 48 natives is the definition of a shadow.
+///
+/// # What `sun.misc.Unsafe` actually is on JDK 25, measured
+///
+/// Fully functional. Every field accessor and its volatile twin, all three
+/// `compareAndSwap*`, `getAndAdd`/`getAndSet`, the static-field pair,
+/// `allocateMemory`/`setMemory`/`freeMemory`, `allocateInstance`,
+/// `getLoadAverage`, `park`/`unpark` and `throwException` answer on HotSpot 25
+/// and on CratonVM alike — only a terminal-deprecation WARNING is printed, on
+/// stderr, which the A/B harness drops. The class being deprecated for removal
+/// says nothing about whether it works today.
+///
+/// # The 34 rows NOT here, and why each is out
+///
+///   * **`ensureClassInitialized(Ljava/lang/Class;)V` and
+///     `shouldBeInitialized(Ljava/lang/Class;)Z` are ABSENT from the JDK 25
+///     image** — `javap -p sun.misc.Unsafe` declares neither, and the workload
+///     gets `NoSuchMethodException` for both on HotSpot. Nothing can dispatch
+///     them on a supported image, so they are bucket-F DELETIONS rather than
+///     retirements, the same verdict `AbstractExecutorService`'s four rows got.
+///     Left for a deletion commit with its own census: a retirement table entry
+///     would claim a dispatch nobody has observed, which is the rule this table
+///     is under.
+///   * **`getUnsafe()Lsun/misc/Unsafe;` is NOT absent, and the first version of
+///     this note said it was.** `javap -p sun.misc.Unsafe` prints
+///     `public static sun.misc.Unsafe getUnsafe();` on the 17, 21 AND 25
+///     images. The `NoSuchMethodException` that put it in the list above came
+///     from `getMethod`, and it is the JDK's core-reflection METHOD FILTER
+///     working: `jdk.internal.reflect.Reflection.methodFilterMap` hides this
+///     one method from the reflective surface, which is the door that stops a
+///     library from acquiring `Unsafe` reflectively.
+///
+///     So it is not a deletion candidate, and CratonVM's `getUnsafe` native is
+///     correct — it throws `SecurityException` for a caller off the boot path,
+///     measured against HotSpot. What diverges is that this VM implements no
+///     member filter AT ALL, so the method is reflectively visible here and
+///     invisible there. That is cross-cutting rather than lane 5's, and it has
+///     its own page:
+///     `docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`.
+///     It stays out of this table because the divergence is in the reflective
+///     surface, not in the native, and retiring the native would not move it.
+///
+///     **The lesson is worth more than the row: the image is not the authority
+///     on what reflection answers.** A census built from class files cannot see
+///     this defect, and a `javap` check would have prevented the wrong claim —
+///     which is what eventually caught it.
+///   * **the rest were not dispatched by this workload.** Precondition 4 is
+///     per-triple and this table honours that: a row with no observed dispatch
+///     stays out however obvious its sibling looks. The registered surface on
+///     this class is larger than the workload reaches, and closing the gap is
+///     more probe rows rather than a weaker rule.
+///
+/// # Why this is a separate table from `RETIRED_SHADOW_L5_TRIPLES`
+///
+/// Same reason the Phase 2 table gives for existing: these were adjudicated by
+/// a different instrument, on a different day, against a measurement the
+/// earlier wave explicitly did not have. Merging them would make the earlier
+/// table's account cover rows it never saw.
+static RETIRED_SHADOW_L5R_TRIPLES: &[(&str, &str, &str)] = &[
+    ("sun/misc/Unsafe", "addressSize", "()I"),
+    ("sun/misc/Unsafe", "allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "allocateMemory", "(J)J"),
+    ("sun/misc/Unsafe", "arrayBaseOffset", "(Ljava/lang/Class;)I"),
+    ("sun/misc/Unsafe", "arrayIndexScale", "(Ljava/lang/Class;)I"),
+    ("sun/misc/Unsafe", "compareAndSwapInt", "(Ljava/lang/Object;JII)Z"),
+    ("sun/misc/Unsafe", "compareAndSwapLong", "(Ljava/lang/Object;JJJ)Z"),
+    ("sun/misc/Unsafe", "compareAndSwapObject", "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z"),
+    ("sun/misc/Unsafe", "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V"),
+    ("sun/misc/Unsafe", "freeMemory", "(J)V"),
+    ("sun/misc/Unsafe", "fullFence", "()V"),
+    ("sun/misc/Unsafe", "getAndAddInt", "(Ljava/lang/Object;JI)I"),
+    ("sun/misc/Unsafe", "getAndAddLong", "(Ljava/lang/Object;JJ)J"),
+    ("sun/misc/Unsafe", "getAndSetInt", "(Ljava/lang/Object;JI)I"),
+    ("sun/misc/Unsafe", "getAndSetLong", "(Ljava/lang/Object;JJ)J"),
+    ("sun/misc/Unsafe", "getAndSetObject", "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "getBoolean", "(Ljava/lang/Object;J)Z"),
+    ("sun/misc/Unsafe", "getBooleanVolatile", "(Ljava/lang/Object;J)Z"),
+    ("sun/misc/Unsafe", "getByte", "(J)B"),
+    ("sun/misc/Unsafe", "getByte", "(Ljava/lang/Object;J)B"),
+    ("sun/misc/Unsafe", "getByteVolatile", "(Ljava/lang/Object;J)B"),
+    ("sun/misc/Unsafe", "getChar", "(Ljava/lang/Object;J)C"),
+    ("sun/misc/Unsafe", "getCharVolatile", "(Ljava/lang/Object;J)C"),
+    ("sun/misc/Unsafe", "getDouble", "(Ljava/lang/Object;J)D"),
+    ("sun/misc/Unsafe", "getDoubleVolatile", "(Ljava/lang/Object;J)D"),
+    ("sun/misc/Unsafe", "getFloat", "(Ljava/lang/Object;J)F"),
+    ("sun/misc/Unsafe", "getFloatVolatile", "(Ljava/lang/Object;J)F"),
+    ("sun/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I"),
+    ("sun/misc/Unsafe", "getIntVolatile", "(Ljava/lang/Object;J)I"),
+    ("sun/misc/Unsafe", "getLoadAverage", "([DI)I"),
+    ("sun/misc/Unsafe", "getLong", "(J)J"),
+    ("sun/misc/Unsafe", "getLong", "(Ljava/lang/Object;J)J"),
+    ("sun/misc/Unsafe", "getLongVolatile", "(Ljava/lang/Object;J)J"),
+    ("sun/misc/Unsafe", "getObject", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "getObjectVolatile", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "getShort", "(Ljava/lang/Object;J)S"),
+    ("sun/misc/Unsafe", "getShortVolatile", "(Ljava/lang/Object;J)S"),
+    ("sun/misc/Unsafe", "loadFence", "()V"),
+    ("sun/misc/Unsafe", "objectFieldOffset", "(Ljava/lang/reflect/Field;)J"),
+    ("sun/misc/Unsafe", "pageSize", "()I"),
+    ("sun/misc/Unsafe", "park", "(ZJ)V"),
+    ("sun/misc/Unsafe", "putBoolean", "(Ljava/lang/Object;JZ)V"),
+    ("sun/misc/Unsafe", "putBooleanVolatile", "(Ljava/lang/Object;JZ)V"),
+    ("sun/misc/Unsafe", "putByte", "(Ljava/lang/Object;JB)V"),
+    ("sun/misc/Unsafe", "putByteVolatile", "(Ljava/lang/Object;JB)V"),
+    ("sun/misc/Unsafe", "putChar", "(Ljava/lang/Object;JC)V"),
+    ("sun/misc/Unsafe", "putCharVolatile", "(Ljava/lang/Object;JC)V"),
+    ("sun/misc/Unsafe", "putDouble", "(Ljava/lang/Object;JD)V"),
+    ("sun/misc/Unsafe", "putDoubleVolatile", "(Ljava/lang/Object;JD)V"),
+    ("sun/misc/Unsafe", "putFloat", "(Ljava/lang/Object;JF)V"),
+    ("sun/misc/Unsafe", "putFloatVolatile", "(Ljava/lang/Object;JF)V"),
+    ("sun/misc/Unsafe", "putInt", "(Ljava/lang/Object;JI)V"),
+    ("sun/misc/Unsafe", "putIntVolatile", "(Ljava/lang/Object;JI)V"),
+    ("sun/misc/Unsafe", "putLong", "(JJ)V"),
+    ("sun/misc/Unsafe", "putLong", "(Ljava/lang/Object;JJ)V"),
+    ("sun/misc/Unsafe", "putLongVolatile", "(Ljava/lang/Object;JJ)V"),
+    ("sun/misc/Unsafe", "putObject", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    ("sun/misc/Unsafe", "putObjectVolatile", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    ("sun/misc/Unsafe", "putShort", "(Ljava/lang/Object;JS)V"),
+    ("sun/misc/Unsafe", "putShortVolatile", "(Ljava/lang/Object;JS)V"),
+    ("sun/misc/Unsafe", "reallocateMemory", "(JJ)J"),
+    ("sun/misc/Unsafe", "setMemory", "(Ljava/lang/Object;JJB)V"),
+    ("sun/misc/Unsafe", "staticFieldBase", "(Ljava/lang/reflect/Field;)Ljava/lang/Object;"),
+    ("sun/misc/Unsafe", "staticFieldOffset", "(Ljava/lang/reflect/Field;)J"),
+    ("sun/misc/Unsafe", "storeFence", "()V"),
+    ("sun/misc/Unsafe", "throwException", "(Ljava/lang/Throwable;)V"),
+    ("sun/misc/Unsafe", "unpark", "(Ljava/lang/Object;)V"),
+];
+
 pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor: &str) -> bool {
     if !RETIRED_SHADOW_PREFIXES
         .iter()
@@ -7284,17 +8774,28 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
         return false;
     }
     let key = (class_name, method_name, descriptor);
-    RETIRED_SHADOW_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L2_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L7_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L5_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_LT_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_HM_TRIPLES.binary_search(&key).is_ok()
-        || RETIRED_SHADOW_L1_JT_TRIPLES.binary_search(&key).is_ok()
+    // Driven off `RETIRED_SHADOW_TABLES` rather than one `||` arm per table.
+    // `any` short-circuits exactly as the chain did and each table is still
+    // binary-searched, so this is the same work in the same order of magnitude
+    // — what changes is that a table which is not in the const is not
+    // consulted, instead of being consulted while the const says otherwise.
+    // Both lane 1 and lane 7 shipped a table missing from that const; the
+    // arrangement below cannot reproduce it.
+    //
+    // The const's order differs from the chain's it replaces. That is
+    // immaterial and `no_triple_is_claimed_by_two_tables` is why: no triple is
+    // in two tables, so no input can reach a second table that would answer
+    // differently, and which table answers first is unobservable.
+    RETIRED_SHADOW_TABLES
+        .iter()
+        .any(|table| table.binary_search(&key).is_ok())
+        // `CRATONVM_UNRETIRE_NATIVE_SHADOW` turns named rows back off, so a
+        // wave can be bisected in RUNS rather than one build per hypothesis.
+        // Unset -- every shipping configuration -- this is `false` without
+        // consulting anything; see [`crate::unretire`], whose
+        // `the_default_is_inert_across_every_retired_row` asserts it against
+        // every row of every table above.
+        && !crate::unretire::is_excluded(class_name, method_name, descriptor)
 }
 
 /// Every retired-shadow table, in one slice, so a gate can walk the whole
@@ -7335,27 +8836,88 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // predicate that consults them every time a lane lands, and only this
     // guard closes the gap.
     RETIRED_SHADOW_LT_TRIPLES,
+    // And again on 2026-09-11, one merge later, for lanes L0 and L3 -- same
+    // mechanism, same silence. This const arrived on `dev` while L0's and L3's
+    // tables were being written on this branch, so neither file conflicted and
+    // the predicate chain above ended up consulting NINE tables against this
+    // const's SEVEN. The count assertion is the only thing that noticed.
+    //
+    // The cost was not cosmetic: this const is what feeds
+    // `real_layout_bridge_keeps_are_not_retired_shadows`, so until this line
+    // L0's 19 and L3's 24 were never asked whether their `Bridge` ->
+    // `SyntheticStub` re-tag disarms a `keep_real_*_bridge` arm in REAL-JDK
+    // mode -- the question that took lane 5 from 100 rows to 98.
+    RETIRED_SHADOW_L0_TRIPLES,
+    RETIRED_SHADOW_L3_TRIPLES,
     // And here by the 2026-09-11 merge of lane 7, for exactly the reason the
-    // note above gives — same shape, second occurrence in two days. Lane 7's
+    // note above gives -- same shape, second occurrence in two days. Lane 7's
     // table and this const were also written on branches that never saw each
     // other, `git merge` resolved both files, and the omission was again
-    // invisible to every per-table test. Two in two days says the failure mode
-    // is structural: a new table is added at the bottom of a list in one file
-    // and consulted in another, and nothing textual connects them.
+    // invisible to every per-table test.
     RETIRED_SHADOW_L7_TRIPLES,
-    // Third occurrence: the same 93-commit merge that added lane 7's table
-    // above also carried lane 1's waves 3 and 4 (`java/util/HashMap`'s own
-    // map surface, and `java/util/jar`/`java/text/Normalizer`), each its own
-    // table added on a branch that never saw this const either. Three
-    // landings in two days, not a coincidence -- see the note on
-    // `RETIRED_SHADOW_LT_TRIPLES` above.
+    RETIRED_SHADOW_L4_TRIPLES,
+    // Lane 1's HashMap (21 triples) and jar/text (29 triples over
+    // java/text/Normalizer and java/util/jar/*) waves, added by the 2026-09-11
+    // L7 merge and NOT by lane 1 -- the third and fourth occurrence of this
+    // exact drift in two days, after lane 1's first table and lane 7's.
+    //
+    // They arrived as two more `||` arms in the predicate with no entry here,
+    // which under the old chain meant "consulted, but invisible to every gate
+    // driven off this const". Under the loop the predicate reads this list, so
+    // the same omission would have UN-RETIRED both waves instead of merely
+    // under-covering them -- a louder failure, and the reason the loop is worth
+    // having: the two lists cannot disagree, because there is only one.
+    // Lane 6, added under the loop rather than beside a `||` arm -- which is
+    // the whole difference the loop makes. This lane hit the old failure mode
+    // twice while the chain still existed: once on its own table, once on
+    // lane 1's waves 3 and 4, which were consulted by the chain and missing
+    // from this const on `dev`. Under the loop neither omission is possible,
+    // because forgetting the const row does not under-cover a table -- it
+    // un-retires it, loudly, in the lane's own probe run.
+    RETIRED_SHADOW_L6_TRIPLES,
     RETIRED_SHADOW_L1_HM_TRIPLES,
     RETIRED_SHADOW_L1_JT_TRIPLES,
+    // Lane 5's residual wave, added here in the same 2026-09-11 merge. The
+    // note above is why this line exists at all: the loop below reads THIS
+    // list, so a table missing from it is a table the predicate does not
+    // consult.
+    RETIRED_SHADOW_L5R_TRIPLES,
+    // 2026-09-11, L1 wave 5. Added HERE and nowhere else, which under the loop
+    // above is the whole registration -- there is no chain arm to forget any
+    // more. See `RETIRED_SHADOW_L1_ZI_TRIPLES` for why two rows and not forty,
+    // and why the table is written but not yet accepted.
+    RETIRED_SHADOW_L1_ZI_TRIPLES,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_l4_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L4_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "lane 4's table is binary-searched, so it must be sorted and                  unique: {:?} does not precede {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn every_lane_4_entry_is_reachable_through_the_predicate() {
+        // A table entry under a prefix `triple_is_retired_shadow` rejects
+        // answers `false`, which reads as "not retired" and is INVISIBLE --
+        // the failure mode `every_entry_is_reachable_through_the_predicate`
+        // exists for. Lane 4 needed two new prefixes to be reachable at all.
+        for (c, m, d) in RETIRED_SHADOW_L4_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in the lane 4 table and the predicate cannot see it"
+            );
+        }
+    }
 
     /// [`RETIRED_SHADOW_TABLES`] must list every table the predicate consults.
     ///
@@ -7372,24 +8934,37 @@ mod tests {
     /// the tables or consults one without a `binary_search`, and either is a
     /// change to this file that should be reading this comment.
     #[test]
-    fn the_tables_const_lists_every_table_the_predicate_consults() {
+    fn the_predicate_names_no_table_directly() {
+        // The inverse of the test this replaces, and the reason it can be an
+        // inverse: `triple_is_retired_shadow` now iterates
+        // `RETIRED_SHADOW_TABLES`, so "the const lists every table the
+        // predicate consults" is true by construction and no longer needs
+        // asserting. What DOES need asserting is that nobody reintroduces a
+        // hand-written arm beside the loop — one `|| RETIRED_SHADOW_LX_TRIPLES
+        // .binary_search(..)` would consult a table the const does not list,
+        // and every gate driven off the const would quietly stop covering it.
         let src = include_str!("retired_shadow.rs");
         let body = src
             .split("pub fn triple_is_retired_shadow(")
             .nth(1)
             .expect("the predicate is in this file");
-        let body = body.split("
-}
-").next().expect("the predicate has a body");
-        let consulted = body
-            .matches("RETIRED_SHADOW_")
-            .count()
-            .saturating_sub(body.matches("RETIRED_SHADOW_PREFIXES").count());
+        let body = body.split("\n}\n").next().expect("the predicate has a body");
+        let total = body.matches("RETIRED_SHADOW_").count();
+        let allowed = body.matches("RETIRED_SHADOW_PREFIXES").count()
+            + body.matches("RETIRED_SHADOW_TABLES").count();
         assert_eq!(
-            consulted,
-            RETIRED_SHADOW_TABLES.len(),
-            "`triple_is_retired_shadow` consults {consulted} tables but `RETIRED_SHADOW_TABLES` lists {}. Add the new table to the const — see its doc comment for what is skipped otherwise.",
-            RETIRED_SHADOW_TABLES.len()
+            total, allowed,
+            "`triple_is_retired_shadow` names a retired-shadow table directly. \
+             It must reach every table through `RETIRED_SHADOW_TABLES`, which \
+             is what makes the const the single place a new table is \
+             registered — and what makes every gate driven off the const cover \
+             it. Delete the hand-written arm and add the table to the const."
+        );
+        assert!(
+            body.contains("RETIRED_SHADOW_TABLES"),
+            "`triple_is_retired_shadow` no longer consults \
+             `RETIRED_SHADOW_TABLES` at all — it would answer `false` for every \
+             retired triple, silently un-retiring the whole population."
         );
     }
 
@@ -7432,6 +9007,99 @@ mod tests {
                  sorted and unique: {:?} does not precede {:?}",
                 w[0],
                 w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn every_zone_info_file_entry_is_reachable_through_the_predicate() {
+        for (c, m, d) in RETIRED_SHADOW_L1_ZI_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 1 wave 5's table but answers false —                  the prefix list does not admit it, so the entry is inert and                  silent."
+            );
+        }
+    }
+
+    // NO per-table sortedness or disjointness test for wave 5, deliberately.
+    //
+    // `the_every_table_is_sorted_and_unique` and
+    // `no_triple_is_claimed_by_two_tables` walk `RETIRED_SHADOW_TABLES`, so a
+    // new table is covered by being in the const — the same thing that makes
+    // it consulted. A hand-written sibling list is the shape those two exist
+    // to replace: this wave was written with one, and it named nine tables
+    // and omitted lane 4's, which landed between the writing and the merge.
+    // Adding L4 to it would have fixed today and rotted again on the next
+    // lane.
+
+    /// The narrow prefix admits ONE class, and the table under it retires the
+    /// two rows the bisection measured — not the family, and not the package.
+    ///
+    /// The six classes named here all read `+0` on the same armed sweep as
+    /// `ZoneInfoFile` did, and every one of them read `reached == 0` with it:
+    /// the probe never asked them anything, so their green is §7's vacuity
+    /// trap and says nothing at all. They are spelled out rather than left
+    /// implicit because a future wave reading "+0" off that table without the
+    /// engagement column beside it would admit all six.
+    #[test]
+    fn the_zone_info_file_prefix_retires_only_the_two_measured_rows() {
+        assert_eq!(
+            RETIRED_SHADOW_L1_ZI_TRIPLES.len(),
+            2,
+            "wave 5 is `getZoneInfo` and `getZoneInfo0`. A third row needs its              own trial binary, not this table."
+        );
+        for c in [
+            "java/util/Date",
+            "sun/util/locale/provider/CalendarDataUtility",
+            "sun/util/locale/provider/JRELocaleProviderAdapter",
+            "sun/util/locale/provider/LocaleResources",
+            "sun/util/resources/Bundles",
+            "sun/util/resources/LocaleData",
+        ] {
+            for t in RETIRED_SHADOW_TABLES.iter() {
+                assert!(
+                    !t.iter().any(|(tc, _, _)| *tc == c),
+                    "{c} read `+0` with `reached == 0` on the 2026-09-11 sweep,                      which is a VACUOUS green and not a measurement. It cannot                      be retired on that row."
+                );
+            }
+        }
+    }
+
+    /// Lane 1's four tables are all in `RETIRED_SHADOW_TABLES`, which since
+    /// the 2026-09-11 loop rewrite is the ONLY thing that retires them.
+    ///
+    /// `triple_is_retired_shadow` used to be a chain of `||` arms and this
+    /// const a second, hand-maintained list of the same tables; a table in the
+    /// chain and not the const was consulted but invisible to the gates driven
+    /// off the const. Three lanes shipped that drift in two days — lane 1's
+    /// first table, lane 7's, and then lane 1's waves 3 and 4 — and the guard
+    /// on it compared two COUNTS, so it reported `10 == 8` without ever saying
+    /// which two were missing.
+    ///
+    /// The loop removed the second list, which removes the drift. It also
+    /// raised the stakes of the remaining omission: a table absent from the
+    /// const is now not consulted AT ALL, so forgetting it silently
+    /// UN-RETIRES a whole wave rather than merely under-covering it. That is a
+    /// better failure — it is a behaviour change a probe can see — but it is
+    /// still worth a test that names the table rather than counting.
+    #[test]
+    fn lane_ones_four_tables_are_all_in_the_tables_const() {
+        for (t, name) in [
+            (RETIRED_SHADOW_L1_TRIPLES, "RETIRED_SHADOW_L1_TRIPLES"),
+            (RETIRED_SHADOW_L1_HM_TRIPLES, "RETIRED_SHADOW_L1_HM_TRIPLES"),
+            (RETIRED_SHADOW_L1_JT_TRIPLES, "RETIRED_SHADOW_L1_JT_TRIPLES"),
+            (RETIRED_SHADOW_L1_ZI_TRIPLES, "RETIRED_SHADOW_L1_ZI_TRIPLES"),
+        ] {
+            // Compared BY VALUE, not by pointer. `RETIRED_SHADOW_TABLES` is a
+            // `const`, so each use site materialises its own array and
+            // `ptr::eq` on the slices inside it is not guaranteed to hold
+            // (measured 2026-09-11: it does not, for an entry that IS in the
+            // list). Two tables can only compare equal if they carry identical
+            // rows, and `no_triple_is_claimed_by_two_tables` already forbids
+            // that for every non-empty pair.
+            assert!(
+                RETIRED_SHADOW_TABLES.iter().any(|listed| *listed == t),
+                "{name} is consulted by `triple_is_retired_shadow` but is not in                  `RETIRED_SHADOW_TABLES`, so it is never asked whether it                  disarms a real-JDK keep arm."
             );
         }
     }
@@ -7819,31 +9487,6 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn the_l2_table_is_disjoint_from_the_other_three() {
-        for key in RETIRED_SHADOW_L2_TRIPLES {
-            for (other, name) in [
-                (RETIRED_SHADOW_TRIPLES, "RETIRED_SHADOW_TRIPLES"),
-                (
-                    RETIRED_SHADOW_STATELESS_TRIPLES,
-                    "RETIRED_SHADOW_STATELESS_TRIPLES",
-                ),
-                (
-                    RETIRED_SHADOW_PHASE2_TRIPLES,
-                    "RETIRED_SHADOW_PHASE2_TRIPLES",
-                ),
-            ] {
-                assert!(
-                    other.binary_search(key).is_err(),
-                    "{key:?} is in both lane 2's table and {name}. Two tables \
-                     claiming one triple means two measurements claim it, and \
-                     only one of them can be the record."
-                );
-            }
-        }
-    }
-
     /// Lane 2 retires two families and nothing either side of them.
     ///
     /// The prefix list now admits the whole of `java/lang/` and `java/math/`,
@@ -7852,7 +9495,31 @@ mod tests {
     /// `the_held_collection_families_are_not_retired` does for `java/util/`.
     #[test]
     fn the_l2_table_holds_only_what_lane_2_measured() {
-        const RETIRED_CLASSES: &[&str] = &["java/lang/Character", "java/math/BigInteger"];
+        const RETIRED_CLASSES: &[&str] = &[
+            // wave 1, 2026-09-10
+            "java/lang/Character",
+            "java/math/BigInteger",
+            // wave 2, 2026-09-10 — the families a corpus screen called clean
+            // and nothing else had measured. Each is here because the IMAGE
+            // was asked two questions the corpus cannot: is the shadowed
+            // method reachable at all (an interface receiver, a private
+            // constructor or method, or a signature the image does not
+            // declare is not a shadow), and does the real body reach an
+            // ACC_NATIVE method this VM does not register. Ten rows failed the
+            // first question and are recorded in the lane page rather than
+            // retired; none failed the second.
+            "java/lang/ExceptionInInitializerError",
+            "java/lang/IllegalThreadStateException",
+            "java/lang/NullPointerException",
+            "java/lang/Object",
+            "java/lang/Package",
+            "java/lang/StringUTF16",
+            "java/lang/Throwable",
+            "java/lang/UnsatisfiedLinkError",
+            "java/lang/VirtualMachineError",
+            "java/lang/management/ManagementFactory",
+            "java/lang/management/MemoryUsage",
+        ];
         for (c, m, d) in RETIRED_SHADOW_L2_TRIPLES {
             assert!(
                 RETIRED_CLASSES.contains(c),
@@ -7938,6 +9605,62 @@ mod tests {
             );
         }
 
+        // The ten rows the image says are not shadows. Six are `<init>` on an
+        // INTERFACE, which declares no constructor at all; the rest are a
+        // private constructor, a private method, and two signatures the image
+        // does not declare. Retiring any of them trades a shadow for a
+        // `NoSuchMethodError` — the `Logger.log` eighth-overload shape — so
+        // they are held here as well as filtered by the funnel.
+        for (c, m, d) in [
+            ("java/lang/management/ClassLoadingMXBean", "<init>", "()V"),
+            ("java/lang/management/CompilationMXBean", "<init>", "()V"),
+            (
+                "java/lang/management/GarbageCollectorMXBean",
+                "<init>",
+                "()V",
+            ),
+            ("java/lang/management/MemoryMXBean", "<init>", "()V"),
+            (
+                "java/lang/management/PlatformLoggingMXBean",
+                "<init>",
+                "()V",
+            ),
+            ("java/lang/management/RuntimeMXBean", "<init>", "()V"),
+            ("java/lang/management/ManagementFactory", "<init>", "()V"),
+            (
+                "java/lang/management/ManagementFactory",
+                "loadNativeLib",
+                "()V",
+            ),
+            ("java/lang/management/MemoryUsage", "<init>", "()V"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} was retired, and the image declares no such \
+                 dispatchable method. That is a NoSuchMethodError, not a \
+                 retirement."
+            );
+        }
+
+        // ...and the two that look identical to the funnel and are NOT the
+        // same thing. `Package.equals` resolves to `Object.equals` and
+        // `ExceptionInInitializerError.initCause` to `Throwable.initCause`,
+        // both concrete. A constructor is never inherited; an ordinary method
+        // is, so only the `<init>` rows above are phantoms.
+        for (c, m, d) in [
+            ("java/lang/Package", "equals", "(Ljava/lang/Object;)Z"),
+            (
+                "java/lang/ExceptionInInitializerError",
+                "initCause",
+                "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+            ),
+        ] {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is an inherited CONCRETE method, so it is a real                  bucket-B shadow and wave 2 retired it. If it is being held                  again, say which measurement changed."
+            );
+        }
+
         // The lane's three named blockers, each with a measurement behind it.
         // `StringBuilder` is the JIT intrinsic door (2026-08-28, N2);
         // `System.getProperty` is the property-store inversion; `System$1` is
@@ -8012,6 +9735,117 @@ mod tests {
                 "{t:?} is in the phase-3 table and an earlier one"
             );
         }
+        for t in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE2_TRIPLES.binary_search(t).is_err()
+                    && RETIRED_SHADOW_PHASE3_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in the L6 table and an earlier one"
+            );
+        }
+    }
+
+    /// Sorted and binary-searched like every sibling. An out-of-order entry
+    /// makes the predicate answer `false` for a row that IS present, which
+    /// reads as "not retired" and is invisible in a workload — the one failure
+    /// mode of this file that no gate downstream can see.
+    #[test]
+    fn the_l6_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L6_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// Every L6 entry is asked through the REAL predicate, not through the
+    /// table it lives in.
+    ///
+    /// This wave added a prefix (`java/net/`), which is the case where a
+    /// missing one would be caught — but it is also the case where a
+    /// MIS-SPELLED one would not be, because a table whose every row starts
+    /// with `java/net/` and a prefix list containing `java/nett/` produce a
+    /// predicate that answers `false` for all 114 rows and a build that
+    /// compiles and passes every other test in this file.
+    #[test]
+    fn every_l6_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// The lane's OTHER eight prefixes retire nothing, and that is deliberate.
+    ///
+    /// `javax/net/`, `sun/net/`, `java/security/`, `sun/security/`,
+    /// `javax/crypto/`, `javax/security/`, `jdk/net/` and `jdk/internal/net/`
+    /// were each armed on the whole probe tree and each moved at least one
+    /// probe AWAY from HotSpot — the TLS stack because it is rustls rather
+    /// than a shim, the `HttpsURLConnectionImpl` rows because they forward to
+    /// a superclass body in place of a null `delegate`. Their absence from
+    /// `RETIRED_SHADOW_PREFIXES` is a measured verdict, so this test states it
+    /// as one: if a future wave adds a table under one of them it must delete
+    /// this test in the same commit, which is the point.
+    #[test]
+    fn the_lane_l6_security_and_tls_prefixes_are_not_admitted() {
+        for p in [
+            "javax/net/",
+            "sun/net/",
+            "java/security/",
+            "sun/security/",
+            "javax/crypto/",
+            "javax/security/",
+            "javax/security/auth/x500/",
+            "jdk/net/",
+            "jdk/internal/net/",
+        ] {
+            assert!(
+                !RETIRED_SHADOW_PREFIXES.contains(&p),
+                "{p} is admitted, but no L6 table retires anything under it"
+            );
+        }
+        // `javax/security/auth/x500/` is in that list for a reason worth
+        // stating: it was ADMITTED through the fifth of this wave's six builds
+        // and came back out, because `X500Principal` alone breaks
+        // `RSslLiveSession`. A future lane that re-admits it has to delete the
+        // line above, which is the point.
+        //
+        // ...and the one prefix that IS admitted carries every row of the
+        // table. `java/net/` is wider than the table under it: two classes of
+        // the package are retired and six more were measured out by a corpus
+        // vector each. A prefix admits a package to the binary search; the
+        // table decides what is retired.
+        for (c, _, _) in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                c.starts_with("java/net/"),
+                "{c} is in the L6 table but outside the prefix that admits it"
+            );
+        }
+    }
+
+    /// The four rows lane T holds must NOT be here.
+    ///
+    /// `MalformedURLException` and `UnknownHostException` sit inside this
+    /// lane's prefix set and are produced by `lang_misc.rs`'s throwable-family
+    /// registrar, which spans seven lanes. Lane-0 §3: while lane T holds a
+    /// registrar, no prefix lane may retire any triple that registrar
+    /// produces — even one inside its own prefixes. They were candidates and
+    /// they were dropped; a later wave that adds them without lane T's
+    /// registrar moving is the mistake this test names.
+    #[test]
+    fn the_throwable_family_rows_are_left_to_lane_t() {
+        for (c, _, _) in RETIRED_SHADOW_L6_TRIPLES {
+            assert!(
+                !c.ends_with("Exception"),
+                "{c} is registered by the cross-lane throwable table"
+            );
+        }
     }
 
     /// Sorted and binary-searched like both siblings, and for the same reason:
@@ -8049,6 +9883,97 @@ mod tests {
         }
     }
 
+    /// **The N-way disjointness test**, over [`RETIRED_SHADOW_TABLES`] rather
+    /// than over a list of sibling names typed out by hand.
+    ///
+    /// `docs/known-issues/jdk-only-lanes/lane-0-integration-and-gates.md` §4
+    /// specifies one of these and assigns it to L0, in the skeleton commit that
+    /// was to land before any lane started. That commit never landed — lane 1
+    /// says so in `RETIRED_SHADOW_TABLES`' own comment — so each lane wrote its
+    /// own instead, and on 2026-09-11 they had drifted into covering different
+    /// and partial sets:
+    ///
+    /// ```text
+    ///   L1  no disjointness test at all
+    ///   L2  STATELESS, PHASE2
+    ///   L5  STATELESS, PHASE2, PHASE3
+    ///   L7  STATELESS, PHASE2, PHASE3, L1, L2, L5
+    /// ```
+    ///
+    /// So L1's rows were checked against nothing, and L2xL5, L2xL7, L2xPHASE3
+    /// and L5xL1 were checked by neither side. A per-lane test cannot close
+    /// this: it names its siblings at the moment it is written, and the next
+    /// lane to land is not on the list.
+    ///
+    /// A collision is harmless to the predicate, which ORs, and NOT harmless to
+    /// the record — two waves each report having retired the row and the next
+    /// reader cannot tell which measurement backs the decision. This walks
+    /// every table against every other, so a new table is covered by being in
+    /// the const, which is the same thing that makes it consulted.
+    #[test]
+    fn no_triple_is_claimed_by_two_tables() {
+        use std::collections::BTreeMap;
+        let mut first: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
+        let mut collisions = Vec::new();
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for t in table.iter() {
+                if let Some(prev) = first.insert(*t, i) {
+                    collisions.push((*t, prev, i));
+                }
+            }
+        }
+        assert!(
+            collisions.is_empty(),
+            "{} triple(s) are claimed by two tables of `RETIRED_SHADOW_TABLES`. \
+             Each is retired twice, so two waves each report having retired it \
+             and neither measurement is identifiable as the one behind the \
+             decision. Delete the later claim, keeping the row in the table \
+             whose page measured it: {:?}",
+            collisions.len(),
+            collisions
+        );
+    }
+
+    /// Sorted and unique for EVERY table, for the same reason each lane asserts
+    /// it of its own: the predicate binary-searches, so an out-of-order entry
+    /// answers `false` for a row that is present and retires nothing, silently.
+    /// Driven off the const so a new table cannot arrive unchecked.
+    #[test]
+    fn every_table_is_sorted_and_unique() {
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for w in table.windows(2) {
+                assert!(
+                    w[0] < w[1],
+                    "table {i} of `RETIRED_SHADOW_TABLES` is out of order or \
+                     has a duplicate: {:?} then {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+    }
+
+    /// Every row of every table answers `true` through the REAL predicate.
+    ///
+    /// Per-lane versions of this exist and each covers its own table; this one
+    /// covers the tables nobody wrote one for. A row outside every
+    /// [`RETIRED_SHADOW_PREFIXES`] entry answers `false`, which reads as "not
+    /// retired" and is invisible in a workload — a missing prefix is the one
+    /// edit that silently un-retires a whole wave.
+    #[test]
+    fn every_row_of_every_table_is_reachable() {
+        for (i, table) in RETIRED_SHADOW_TABLES.iter().enumerate() {
+            for (c, m, d) in table.iter() {
+                assert!(
+                    triple_is_retired_shadow(c, m, d),
+                    "table {i}: {c}.{m}{d} is in a retired-shadow table and the \
+                     predicate says it is not retired — almost always a missing \
+                     `RETIRED_SHADOW_PREFIXES` entry"
+                );
+            }
+        }
+    }
+
     /// Sorted, unique and binary-searched like every sibling, and for the same
     /// reason: an out-of-order entry makes the predicate answer `false` for a
     /// row that is present, which reads as "not retired" and is invisible.
@@ -8060,6 +9985,67 @@ mod tests {
                 "out of order or duplicated: {:?} then {:?}",
                 w[0],
                 w[1]
+            );
+        }
+    }
+
+    /// Lane 5's residual wave: sorted, unique, reachable, and one class.
+    ///
+    /// Disjointness is NOT asserted here — the N-way test above covers every
+    /// table in [`RETIRED_SHADOW_TABLES`], which is strictly more than the
+    /// hand-listed loop this test carried before the 2026-09-11 merge. What is
+    /// left is what that test cannot know: that this wave is one class, and
+    /// that every row reaches the predicate (i.e. `sun/misc/` is still a
+    /// prefix — a row under no prefix answers `false` and is invisible).
+    #[test]
+    fn the_l5r_table_is_sorted_unique_reachable_and_one_class() {
+        for w in RETIRED_SHADOW_L5R_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        for &(c, m, d) in RETIRED_SHADOW_L5R_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable through the predicate: {c}.{m}{d} — is `sun/misc/` still in RETIRED_SHADOW_PREFIXES?"
+            );
+            assert_eq!(
+                c, "sun/misc/Unsafe",
+                "this wave is one class; {c} does not belong in it"
+            );
+        }
+    }
+
+    /// Three `sun/misc/Unsafe` triples stay OUT of that table, for two
+    /// different reasons, and the reasons are the point of this test.
+    ///
+    /// `ensureClassInitialized` and `shouldBeInitialized` are declared by NO
+    /// supported image — `javap -p sun.misc.Unsafe` finds neither on 17, 21 or
+    /// 25 — so nothing can dispatch them. They are deletions, and a retirement
+    /// entry would claim a dispatch nobody has observed.
+    ///
+    /// `getUnsafe` is here for a DIFFERENT reason and was very nearly recorded
+    /// under the first one. It IS declared, public, on all three images; the
+    /// `NoSuchMethodException` that first suggested absence was the JDK's
+    /// core-reflection METHOD FILTER hiding it. The native is correct
+    /// (`SecurityException` off the boot path, measured against HotSpot); what
+    /// diverges is that this VM implements no member filter at all, which is
+    /// cross-cutting and has its own page,
+    /// `docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`.
+    /// Retiring the native would not move that, so the row stays out.
+    #[test]
+    fn the_l5r_wave_excludes_three_triples_for_two_different_reasons() {
+        for (m, d) in [
+            ("getUnsafe", "()Lsun/misc/Unsafe;"),
+            ("ensureClassInitialized", "(Ljava/lang/Class;)V"),
+            ("shouldBeInitialized", "(Ljava/lang/Class;)Z"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow("sun/misc/Unsafe", m, d),
+                "sun/misc/Unsafe.{m}{d} must stay out of the residual table — see this test's doc comment for which of the two reasons applies"
             );
         }
     }
@@ -8393,6 +10379,455 @@ Ljava/nio/channels/FileChannel;"
             "toString",
             "()Ljava/lang/String;"
         ));
+    }
+
+    /// Binary-searched like every sibling, so ordering is correctness.
+    #[test]
+    fn the_l0_table_is_sorted_and_unique() {
+        // Refilled by wave 2, so `windows(2)` is real again and the
+        // emptiness assertion that stood guard over the placeholder is
+        // gone. 19 entries, so an out-of-order pair is reachable by this
+        // loop rather than hypothetical.
+        assert_eq!(
+            RETIRED_SHADOW_L0_TRIPLES.len(),
+            19,
+            "wave 2 landed 19; the lane page's 7.2 carries the same count"
+        );
+        for w in RETIRED_SHADOW_L0_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// An entry outside every prefix answers `false`, which reads as "not
+    /// retired" and is invisible in a workload. L0 added `java/lang/Class` and
+    /// `java/lang/Module` for exactly these rows.
+    #[test]
+    fn every_l0_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L0_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// The 10 triples the corpus rejected and §7.2 attributed by dispatch.
+    ///
+    /// Each is consulted by at least one of `RClassUnloadSweep`,
+    /// `RClassUnloadSweepGen`, `RJdkModule`, `RLoaderIdentity` or
+    /// `RServiceLoaderDoubleSource`, every one of which failed with the 29-row
+    /// table in and passed 5/0 on the control binary run concurrently through
+    /// the same harness. They are withdrawn **as touched, not as convicted** --
+    /// attribution by dispatch over-collects on purpose -- so re-adding one is
+    /// legitimate, on a bisection that names it. It just cannot happen by
+    /// hand, silently, which is what this test buys.
+    #[test]
+    fn the_l0_attributed_triples_are_not_retired() {
+        const ATTRIBUTED: &[(&str, &str, &str)] = &[
+            ("java/lang/Class", "desiredAssertionStatus", "()Z"),
+            (
+                "java/lang/Class",
+                "forName",
+                "(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;",
+            ),
+            (
+                "java/lang/Class",
+                "forName",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+            ),
+            (
+                "java/lang/Class",
+                "forName",
+                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
+            ),
+            (
+                "java/lang/Class",
+                "getConstructor",
+                "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+            ),
+            (
+                "java/lang/Class",
+                "getDeclaredConstructor",
+                "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+            ),
+            (
+                "java/lang/Class",
+                "getMethod",
+                "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+            ),
+            ("java/lang/Class", "getPackageName", "()Ljava/lang/String;"),
+            ("java/lang/Class", "isInterface", "()Z"),
+            ("java/lang/Class", "isPrimitive", "()Z"),
+        ];
+        for (c, m, d) in ATTRIBUTED {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} was attributed to a failing vector; see 7.2"
+            );
+        }
+    }
+
+    /// The wave is exactly three class families, and nothing crept in from a
+    /// neighbouring lane. `java/lang/Class` is a PREFIX of
+    /// `java/lang/ClassLoader`, which is L7's, and of the two throwable
+    /// classes that belong to the cross-cutting-registrar lane -- the first
+    /// draft of the lane split got all three wrong, so this is asserted rather
+    /// than trusted.
+    #[test]
+    fn the_l0_wave_stays_inside_lane_zero() {
+        for (c, m, d) in RETIRED_SHADOW_L0_TRIPLES {
+            let ok = *c == "java/lang/Class"
+                || c.starts_with("java/lang/Class$")
+                || c.starts_with("java/lang/ClassValue")
+                || *c == "java/lang/Module"
+                || c.starts_with("java/lang/ModuleLayer")
+                || c.starts_with("java/lang/module/");
+            assert!(ok, "not lane L0's class: {c}.{m}{d}");
+            assert!(
+                !c.starts_with("java/lang/ClassLoader")
+                    && !c.starts_with("java/lang/ClassNotFound")
+                    && !c.starts_with("java/lang/ClassCast"),
+                "another lane's class matched L0's prefix: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// Sorted, for the reason every sibling table is: an out-of-order entry
+    /// makes the predicate answer `false` for a row that IS present, which
+    /// reads as "not retired" and is invisible in a workload.
+    #[test]
+    fn the_l3_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_L3_TRIPLES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// An entry outside every prefix answers `false` silently. L3 added
+    /// `java/lang/reflect/` and `java/lang/invoke/` for exactly these rows and
+    /// deliberately did NOT add its other two scope prefixes, which retire
+    /// nothing yet.
+    #[test]
+    fn every_l3_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_L3_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// Wave 1 is four classes and nothing crept in. In particular the two
+    /// throwables inside lane 3's prefix set --
+    /// `java/lang/reflect/InaccessibleObjectException` and
+    /// `InvocationTargetException` -- belong to the cross-cutting registrar
+    /// lane, not here, and `java/lang/reflect/` admits both.
+    #[test]
+    fn the_l3_wave_stays_inside_lane_three() {
+        for (c, m, d) in RETIRED_SHADOW_L3_TRIPLES {
+            let ok = *c == "java/lang/reflect/Field"
+                || *c == "java/lang/reflect/Method"
+                || *c == "java/lang/reflect/Constructor"
+                || *c == "java/lang/invoke/MethodType";
+            assert!(ok, "not lane L3 wave 1's class: {c}.{m}{d}");
+            assert!(
+                !c.ends_with("Exception"),
+                "lane T's throwable matched L3's prefix: {c}.{m}{d}"
+            );
+        }
+    }
+
+    /// The triples lane L3 measured and DECLINED to retire, one per rejection
+    /// rule, so a later wave cannot quietly take them on the family's
+    /// reputation.
+    ///
+    /// * `Field.getInt`/`getChar`/`getBoolean` and the rest of the primitive
+    ///   accessors are `OK -> BAD`: the same run's descriptor-coercion census
+    ///   reports 105 field reads DESTROYED by primitive-into-reference
+    ///   coercion, and yielded `getChar` answers `0` where HotSpot answers
+    ///   `q`.
+    /// * `Field.getGenericType` is `OK -> BAD` four ways: yielding erases
+    ///   `Map<String,List<T>>` to `Map`, `T` to `Number`, `T[]` to
+    ///   `[LNumber;`.
+    /// * `Method.invoke` and `Constructor.newInstance` are `BAD -> BAD` on the
+    ///   non-nestmate rows 247/248 -- the bytecode is wrong too, so the
+    ///   retirement's own justification is false for them.
+    /// * `Field.setBoolean` and `Method.isBridge` and their kind agree ONLY at
+    ///   a value a blanket yield returns anyway. `setBoolean` is the sharp
+    ///   one: its row reads back `false` through `getBoolean`, which row 15
+    ///   proves broken.
+    #[test]
+    fn the_l3_held_triples_are_not_retired() {
+        for (c, m, d) in [
+            // Primitive field access -- the coercion census explains all of it.
+            ("java/lang/reflect/Field", "getInt", "(Ljava/lang/Object;)I"),
+            (
+                "java/lang/reflect/Field",
+                "getChar",
+                "(Ljava/lang/Object;)C",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getBoolean",
+                "(Ljava/lang/Object;)Z",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getLong",
+                "(Ljava/lang/Object;)J",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getDouble",
+                "(Ljava/lang/Object;)D",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getFloat",
+                "(Ljava/lang/Object;)F",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getByte",
+                "(Ljava/lang/Object;)B",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // Generic signatures erase to raw when yielded.
+            (
+                "java/lang/reflect/Field",
+                "getGenericType",
+                "()Ljava/lang/reflect/Type;",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getAnnotatedType",
+                "()Ljava/lang/reflect/AnnotatedType;",
+            ),
+            // Annotations come back empty -- the same family L0 held.
+            (
+                "java/lang/reflect/Field",
+                "getAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/reflect/Field",
+                "getDeclaredAnnotations",
+                "()[Ljava/lang/annotation/Annotation;",
+            ),
+            // BAD -> BAD: the bytecode is wrong too.
+            (
+                "java/lang/reflect/Method",
+                "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "java/lang/reflect/Constructor",
+                "newInstance",
+                "([Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // Agreement only at a DEFAULT value.
+            (
+                "java/lang/reflect/Field",
+                "setBoolean",
+                "(Ljava/lang/Object;Z)V",
+            ),
+            ("java/lang/reflect/Field", "isSynthetic", "()Z"),
+            ("java/lang/reflect/Field", "isEnumConstant", "()Z"),
+            ("java/lang/reflect/Field", "trySetAccessible", "()Z"),
+            ("java/lang/reflect/Method", "isBridge", "()Z"),
+            ("java/lang/reflect/Method", "isSynthetic", "()Z"),
+            ("java/lang/reflect/Method", "isVarArgs", "()Z"),
+            ("java/lang/reflect/Method", "isDefault", "()Z"),
+            ("java/lang/reflect/Constructor", "isSynthetic", "()Z"),
+            ("java/lang/reflect/Constructor", "isVarArgs", "()Z"),
+            (
+                "java/lang/reflect/Constructor",
+                "getExceptionTypes",
+                "()[Ljava/lang/Class;",
+            ),
+            ("java/lang/reflect/Constructor", "setAccessible", "(Z)V"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} was HELD by lane L3's measurement and must not be \
+                 retired"
+            );
+        }
+    }
+
+    /// The 21 triples lane L0 measured and DECLINED to retire.
+    ///
+    /// Each is `OK -> BAD` in `apps/probes/L0ClassModuleSurface.java`: the
+    /// native answers as HotSpot does and the bytecode does not. Retiring any
+    /// of them trades a correct answer for a wrong one -- and for most of these
+    /// the wrong answer does not throw, which is worse. The table's doc comment
+    /// carries the row numbers and the observed values.
+    /// **23 triples, and it enumerated 21 until an arithmetic reconciliation
+    /// found the other two.** Lane L0's dispatched population is 77 of 104, and
+    /// 77 - 54 retired = 23; the array held 21, so
+    /// `getAnnotationsByType` and `getDeclaredAnnotationsByType` were measured
+    /// `OK -> BAD` (HotSpot `1`, yielded `0`, rows 75 and 76) and then left
+    /// unpinned. Nothing was red: the retirement table did not contain them, so
+    /// every test passed while two members of a family whose other five ARE
+    /// pinned sat unguarded, one wave away from being retired on the family's
+    /// reputation.
+    ///
+    /// The prose said 23 and the code said 21 for the same reason the prose was
+    /// right: `getAnnotation*` is six methods, not four. **Close the population
+    /// by subtraction and check the residue is empty** -- retired + held +
+    /// undispatched must equal the surface, and here the residue was exactly
+    /// the two rows nobody had typed out.
+    #[test]
+    fn the_l0_held_families_are_not_retired() {
+        for (c, m, d) in [
+            // VM-filled state that no Java code can fill.
+            (
+                "java/lang/Class",
+                "descriptorString",
+                "()Ljava/lang/String;",
+            ),
+            ("java/lang/Class", "getModifiers", "()I"),
+            ("java/lang/Class", "newInstance", "()Ljava/lang/Object;"),
+            ("java/lang/Module", "getLayer", "()Ljava/lang/ModuleLayer;"),
+            ("java/lang/ModuleLayer", "boot", "()Ljava/lang/ModuleLayer;"),
+            ("java/lang/ModuleLayer", "modules", "()Ljava/util/Set;"),
+            (
+                "java/lang/ModuleLayer",
+                "configuration",
+                "()Ljava/lang/module/Configuration;",
+            ),
+            (
+                "java/lang/ModuleLayer",
+                "findModule",
+                "(Ljava/lang/String;)Ljava/util/Optional;",
+            ),
+            // The annotation subsystem comes back EMPTY when yielded.
+            (
+                "java/lang/Class",
+                "getAnnotations",
+                "()[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "getDeclaredAnnotations",
+                "()[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "getAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "getDeclaredAnnotation",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+            ),
+            // WITHDRAWN 2026-09-10 after the corpus arm: retired on a dial
+            // arm that leaked, `OK -> BAD` on a no-dial re-measure. See the
+            // table's doc comment.
+            ("java/lang/Class", "arrayType", "()Ljava/lang/Class;"),
+            ("java/lang/Class", "componentType", "()Ljava/lang/Class;"),
+            ("java/lang/Class", "isArray", "()Z"),
+            ("java/lang/Class", "getTypeName", "()Ljava/lang/String;"),
+            ("java/lang/Class", "getSimpleName", "()Ljava/lang/String;"),
+            (
+                "java/lang/Class",
+                "getCanonicalName",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "java/lang/Class",
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            ),
+            (
+                "java/lang/ClassValue",
+                "get",
+                "(Ljava/lang/Class;)Ljava/lang/Object;",
+            ),
+            (
+                "java/lang/Class",
+                "getAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "getDeclaredAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+            ),
+            (
+                "java/lang/Class",
+                "isAnnotationPresent",
+                "(Ljava/lang/Class;)Z",
+            ),
+            // The export/open predicate family.
+            ("java/lang/Module", "isExported", "(Ljava/lang/String;)Z"),
+            (
+                "java/lang/Module",
+                "isExported",
+                "(Ljava/lang/String;Ljava/lang/Module;)Z",
+            ),
+            ("java/lang/Module", "isOpen", "(Ljava/lang/String;)Z"),
+            (
+                "java/lang/Module",
+                "isOpen",
+                "(Ljava/lang/String;Ljava/lang/Module;)Z",
+            ),
+            // Held PENDING LANE L7: the builtin loader hierarchy does not link,
+            // so yielding raises NoClassDefFoundError rather than answering.
+            ("java/lang/Class", "getPackage", "()Ljava/lang/Package;"),
+            (
+                "java/lang/Class",
+                "getResource",
+                "(Ljava/lang/String;)Ljava/net/URL;",
+            ),
+            (
+                "java/lang/Class",
+                "getResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;",
+            ),
+            (
+                "java/lang/Module",
+                "getResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;",
+            ),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is HELD by lane L0's measurement and must not be retired"
+            );
+        }
+    }
+
+    /// `Class.getName` and `Class.getModule` are reviewed `Intrinsic`s, NOT
+    /// retirements, and the difference matters: an `Intrinsic` keeps winning at
+    /// every dispatch door, while a retired triple stops being registered under
+    /// `--jdk-only` at all. Putting either in a retirement table would yield to
+    /// bytecode that answers the internal name form and a null module.
+    #[test]
+    fn the_two_reviewed_intrinsics_are_not_retirements() {
+        for (c, m, d) in [
+            ("java/lang/Class", "getName", "()Ljava/lang/String;"),
+            ("java/lang/Class", "getModule", "()Ljava/lang/Module;"),
+        ] {
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is a reviewed Intrinsic, not a retirement"
+            );
+        }
     }
 
     /// `java/lang/ref/` stays whole, and this is the record of WHY — the
@@ -9436,6 +11871,14 @@ Ljava/nio/channels/FileChannel;"
     /// widening can turn red on lane T's behalf.
     #[test]
     fn no_non_throwable_sibling_is_retired_by_lane_t() {
+        // Asks `RETIRED_SHADOW_LT_TRIPLES` directly, not the aggregate
+        // `triple_is_retired_shadow` predicate: this test's job is "lane T
+        // stayed inside its own scope", not "nothing else in the registry
+        // ever retires these classes". It used to ask the predicate, and
+        // `java/io/File.getName` broke it the day a SIBLING lane (io/nio)
+        // legitimately retired that class on its own table — a real
+        // retirement, correctly attributed to a different table, that this
+        // test had no business objecting to.
         for (c, m, d) in [
             ("java/lang/String", "intern", "()Ljava/lang/String;"),
             (
@@ -9453,8 +11896,11 @@ Ljava/nio/channels/FileChannel;"
             ("java/net/URL", "openConnection", "()Ljava/net/URLConnection;"),
         ] {
             assert!(
-                !triple_is_retired_shadow(c, m, d),
-                "{c}.{m}{d} is retired, and no lane-T entry names that class"
+                RETIRED_SHADOW_LT_TRIPLES
+                    .binary_search(&(c, m, d))
+                    .is_err(),
+                "{c}.{m}{d} is in RETIRED_SHADOW_LT_TRIPLES, and no lane-T entry \
+                 should name that class"
             );
         }
     }

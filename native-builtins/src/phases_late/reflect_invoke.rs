@@ -2930,17 +2930,37 @@ pub(crate) fn build_string_set(
     ctx: &mut dyn NativeContext,
     items: Vec<String>,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    use cratonvm_types::ArrayElementType;
-    let len = items.len();
-    let arr = ctx.new_array(ArrayElementType::Reference, len);
-    for (i, s) in items.iter().enumerate() {
+    // Through the real `HashSet.<init>` and `add`, not by writing raw slots.
+    // The three this used to write are the MAP layout (bucket array, size,
+    // capacity) on a class whose one real field is `map`
+    // (`Ljava/util/HashMap;`), and the elements went into the array in
+    // INSERTION order rather than into hash buckets -- so the set was
+    // findable only by an implementation that agreed to look there. Every
+    // call allocates (the strings, the `<init>` backing map, each `add`'s
+    // node), so the set is pinned across the loop.
+    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+    let set_pin = ctx.pin_native_root(set);
+    let _ = ctx.invoke(
+        "java/util/HashSet",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(set))],
+    );
+    for s in items.iter() {
         let js = ctx.create_string(s);
-        ctx.set_array_element(arr, i, Value::Object(Some(js)));
+        let js_pin = ctx.pin_native_root(js);
+        let set_now = ctx.read_native_pin(set_pin, set);
+        let js = ctx.read_native_pin(js_pin, js);
+        let _ = ctx.invoke_virtual(
+            set_now,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(js))],
+        );
+        ctx.unpin_native_roots(js_pin);
     }
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-    ctx.set_field(set, 0, Value::Object(Some(arr)));
-    ctx.set_field(set, 1, Value::Int(len as i32));
-    ctx.set_field(set, 2, Value::Int(16)); // initial capacity marker
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(set_pin);
     Ok(set)
 }
 
@@ -3297,7 +3317,11 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             .filter(|name| !ctx.module_is_class_path_only(name))
             .collect();
         let len = names.len();
-        let arr = ctx.new_array(ArrayElementType::Reference, len);
+        // The array survives a Module and a String per entry, and then the
+        // HashSet allocation below.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let arr_obj = scope.new_array(ArrayElementType::Reference, len);
+        let arr_h = scope.root(arr_obj);
         for (i, name) in names.iter().enumerate() {
             // 5: `class_manager.rs:15407` declares the synthetic
             // `java/lang/Module` as `instance_fields(5)` and the essential
@@ -3306,16 +3330,20 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             // (`num_fields.max(real)`); asking 2 only fired
             // `report_layout_alias("java/lang/Module", 2, 5)` on every module
             // of every call.
-            let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 5)?;
-            let name_str = ctx.create_string(name);
-            ctx.set_field(m_obj, 0, Value::Object(Some(name_str)));
+            let m_obj = try_alloc_concurrent_synthetic(&mut *scope, "java/lang/Module", 5)?;
+            let m_h = scope.root(m_obj);
+            let name_str = scope.create_string(name);
+            let m_obj = scope.get(&m_h);
+            scope.set_field(m_obj, 0, Value::Object(Some(name_str)));
             // field 1 = layer — we don't set it here to avoid infinite recursion
-            ctx.set_array_element(arr, i, Value::Object(Some(m_obj)));
+            let arr = scope.get(&arr_h);
+            scope.set_array_element(arr, i, Value::Object(Some(m_obj)));
         }
-        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-        ctx.set_field(set, 0, Value::Object(Some(arr)));
-        ctx.set_field(set, 1, Value::Int(len as i32));
-        ctx.set_field(set, 2, Value::Int(16));
+        let set = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashSet", 3)?;
+        let arr = scope.get(&arr_h);
+        scope.set_field(set, 0, Value::Object(Some(arr)));
+        scope.set_field(set, 1, Value::Int(len as i32));
+        scope.set_field(set, 2, Value::Int(16));
         Ok(Some(Value::Object(Some(set))))
     });
 

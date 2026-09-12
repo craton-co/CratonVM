@@ -1101,6 +1101,21 @@ fn buffered_writer_string_region(
 // Native method implementations: java.io.File
 // ---------------------------------------------------------------------------
 
+/// This crate's door onto [`cratonvm_native_api::file_layout`], kept as a
+/// forwarder so the four call sites below read as one operation.
+///
+/// The layout itself lives in `native-api` because `java.io.File` is produced
+/// by this crate AND by `native-builtins`, and a second copy of the rule is how
+/// the two drift apart.
+fn file_write_real_fields(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    path_obj: ObjectRef,
+    path: &str,
+) {
+    cratonvm_native_api::file_layout::write(ctx, this, path_obj, path);
+}
+
 fn native_file_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = this (File), args[1] = path (String)
     let this = match args.first() {
@@ -1121,6 +1136,7 @@ fn native_file_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let path_obj = ctx.create_string(&path_str);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, Value::Object(Some(path_obj)));
+    file_write_real_fields(ctx, this, path_obj, &path_str);
     Ok(None)
 }
 
@@ -1152,6 +1168,7 @@ fn native_file_init_string_string(ctx: &mut dyn NativeContext, args: &[Value]) -
     let path_obj = ctx.create_string(&full);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, Value::Object(Some(path_obj)));
+    file_write_real_fields(ctx, this, path_obj, &full);
     Ok(None)
 }
 
@@ -1207,6 +1224,7 @@ fn native_file_init_file_string(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let path_obj = ctx.create_string(&full);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, Value::Object(Some(path_obj)));
+    file_write_real_fields(ctx, this, path_obj, &full);
     Ok(None)
 }
 
@@ -16510,8 +16528,16 @@ fn native_path_to_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     let s = read_path_str(ctx, this);
+    // WIDTH: `1` was enough while slot 0 was the only slot anyone wrote. A real
+    // image `java.io.File` carries `path`, `prefixLength` and `pathStatus`, and
+    // `file_write_real_fields` skips any index past the object own width -- so a
+    // one-slot File would take the path and silently keep `prefixLength = 0`,
+    // which is the defect that helper exists to close.
     let file = match ctx.ensure_class_initialized("java/io/File") {
-        Ok(cid) => ctx.alloc_object(cid, 1),
+        Ok(cid) => {
+            let n = ctx.class_num_total_fields(cid).max(1);
+            ctx.alloc_object(cid, n)
+        }
         Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     };
     // GC: nothing in Java refers to this object yet, so this Rust local is
@@ -16525,6 +16551,7 @@ fn native_path_to_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let path_str = ctx.create_string(&s);
     let file = ctx.read_native_pin(__pin, file);
     ctx.set_field(file, 0, Value::Object(Some(path_str)));
+    file_write_real_fields(ctx, file, path_str, &s);
     ctx.unpin_native_roots(__pin);
     Ok(Some(Value::Object(Some(file))))
 }
@@ -28851,6 +28878,11 @@ mod io_tests {
 
     #[test]
     fn path_validation_rejects_dotdot() {
+        // PATH_VALIDATION_ENABLED is a process-global atomic, exactly like
+        // PATH_CONFINE_TO_CWD, and this test's verdict depends on it. Take the
+        // same shared guard: without it a parallel test that turns validation
+        // OFF makes this one read a tree it never set up.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(true);
         // A *leading* `..` segment escapes the start directory and is always
         // rejected — the always-on traversal guard, independent of CWD
@@ -28890,6 +28922,11 @@ mod io_tests {
     /// directory (more `..` than preceding names) is still rejected.
     #[test]
     fn path_validation_rejects_net_escaping_dotdot() {
+        // PATH_VALIDATION_ENABLED is a process-global atomic, exactly like
+        // PATH_CONFINE_TO_CWD, and this test's verdict depends on it. Take the
+        // same shared guard: without it a parallel test that turns validation
+        // OFF makes this one read a tree it never set up.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(true);
         // `a/../../b` → one name, two parents → escapes one level above start.
         let result = validate_path("a/../../b.txt");
@@ -28983,6 +29020,11 @@ mod io_tests {
 
     #[test]
     fn path_validation_rejects_null_byte() {
+        // PATH_VALIDATION_ENABLED is a process-global atomic, exactly like
+        // PATH_CONFINE_TO_CWD, and this test's verdict depends on it. Take the
+        // same shared guard: without it a parallel test that turns validation
+        // OFF makes this one read a tree it never set up.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(true);
         let result = validate_path("/etc/passwd\0.txt");
         assert!(result.is_err());
@@ -29008,6 +29050,13 @@ mod io_tests {
 
     #[test]
     fn path_validation_disabled_allows_dotdot() {
+        // Turning validation OFF is process-global: hold the shared guard for
+        // the whole window, or every parallel test that asserts a path is
+        // REJECTED can observe it accepted instead. That is exactly how
+        // `files_validated_path_rejects_dotdot_segment` failed about one run
+        // in twelve of `cargo test -p cratonvm-native-io --lib`, reporting
+        // `Files path with `..` segment accepted: Ok("../../etc/passwd")`.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(false);
         let result = validate_path("/etc/../passwd");
         assert!(result.is_ok());
@@ -29035,6 +29084,13 @@ mod io_tests {
     /// must run even when path validation is otherwise disabled.
     #[test]
     fn path_validation_disabled_still_rejects_null_byte() {
+        // Turning validation OFF is process-global: hold the shared guard for
+        // the whole window, or every parallel test that asserts a path is
+        // REJECTED can observe it accepted instead. That is exactly how
+        // `files_validated_path_rejects_dotdot_segment` failed about one run
+        // in twelve of `cargo test -p cratonvm-native-io --lib`, reporting
+        // `Files path with `..` segment accepted: Ok("../../etc/passwd")`.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(false);
         let result = validate_path("/etc/passwd\0.txt");
         assert!(result.is_err(), "null byte accepted with validation off");
@@ -29079,6 +29135,13 @@ mod io_tests {
     /// C-string boundary).
     #[test]
     fn files_validated_path_rejects_null_byte_even_when_disabled() {
+        // Turning validation OFF is process-global: hold the shared guard for
+        // the whole window, or every parallel test that asserts a path is
+        // REJECTED can observe it accepted instead. That is exactly how
+        // `files_validated_path_rejects_dotdot_segment` failed about one run
+        // in twelve of `cargo test -p cratonvm-native-io --lib`, reporting
+        // `Files path with `..` segment accepted: Ok("../../etc/passwd")`.
+        let _g = crate::test_support::confine_test_lock().lock();
         set_path_validation_enabled(false);
         let result = validated_path("/tmp/evil\0.txt");
         assert!(
