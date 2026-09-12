@@ -70,7 +70,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-550 tokens.
+551 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -509,6 +509,7 @@ export inherited from a parent shell.
 | `s111-dbg` | `CRATONVM_S111_DBG` |
 | `sbload` | `CRATONVM_DBG_SBLOAD` |
 | `sc-close` | `CRATONVM_DBG_SC_CLOSE` |
+| `sc-close-phases` | `CRATONVM_DBG_SC_CLOSE_PHASES` |
 | `sc-read` | `CRATONVM_DBG_SC_READ` |
 | `sc-write` | `CRATONVM_DBG_SC_WRITE` |
 | `scalar-deopt` | `CRATONVM_DBG_SCALAR_DEOPT` |
@@ -1341,7 +1342,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_IO`
 
-9 tokens.
+13 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1351,6 +1352,10 @@ export inherited from a parent shell.
 | `resolve-outbound-host` | `CRATONVM_RESOLVE_OUTBOUND_HOST` |
 | `select-max-block-ms` | `CRATONVM_SELECT_MAX_BLOCK_MS` |
 | `selector-connect-probe` | `CRATONVM_NO_SELECTOR_CONNECT_PROBE` |
+| `net-event-waits` | `CRATONVM_NET_EVENT_WAITS` |
+| `net-jdk-backlog` | `CRATONVM_NET_JDK_BACKLOG` |
+| `httpsrv-keepalive` | `CRATONVM_HTTPSRV_KEEPALIVE` |
+| `net-close-skip-shutdown` | `CRATONVM_NET_CLOSE_SKIP_SHUTDOWN` |
 | `socket-capture` | `CRATONVM_SOCKET_CAPTURE` |
 | `uri-strict-chars` | `CRATONVM_URI_STRICT_CHARS` |
 | `zip-max-entry-bytes` | `CRATONVM_ZIP_MAX_ENTRY_BYTES` |

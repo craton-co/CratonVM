@@ -769,3 +769,72 @@ fn the_jarfile_constructor_has_two_producers_and_this_says_which_wins() {
         rendered.join("\n")
     );
 }
+
+/// `java/lang/ClassLoader.defineClass0` has TWO producers whose ERROR CONTRACTS
+/// disagree, and which one owns the slot is decided by the ARM — not by line
+/// order in any one file.
+///
+/// This is blind spot #2 from this file's own header, made into an assertion for
+/// the one triple where the two bodies do not merely differ in hardening but
+/// disagree about whether a failure is reported at all:
+///
+///   * `register_essential_natives_with_shims` (from `lib.rs`) registers
+///     `lang_system::native_classloader_define_class0`, which PROPAGATES an
+///     initialization failure.
+///   * `classloader::register_classloader_natives` re-registers
+///     `cl_define_class0` over it — and that registrar is reached only from
+///     `register_synthetic_overrides`, which `vm_init` calls only when
+///     `use_synthetic_jdk` is true at runtime. It has no call site in `vm/src`.
+///
+/// So the real-JDK / `--jdk-only` / compatible arms never see `cl_define_class0`
+/// at all, and the synthetic-JDK arm sees ONLY it. That is why reading line
+/// numbers gives the wrong answer here: `lib.rs`'s registration sits ~8k lines
+/// ABOVE the `register_classloader_natives` call, which would suggest the
+/// classloader copy always wins, and in two of three arms it never runs.
+///
+/// Note what `registered_by` names. `register` is `#[track_caller]`, so
+/// provenance is the REGISTRATION SITE, not the file holding the body: the
+/// real-JDK owner reports `lib.rs` even though the body it installs lives in
+/// `lang_system.rs`.
+#[test]
+fn classloader_define_class0_owner_is_decided_by_the_arm() {
+    const DESC: &str = "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;";
+
+    fn owner_of(reg: &NativeMethodRegistry, desc: &str) -> String {
+        reg.census()
+            .into_iter()
+            .filter(|r| {
+                r.class == "java/lang/ClassLoader"
+                    && r.name == "defineClass0"
+                    && r.descriptor == desc
+            })
+            .find(|r| r.owns_slot)
+            .and_then(|r| r.registered_by)
+            .unwrap_or_else(|| "<not registered on this path>".to_string())
+    }
+
+    let mut registry = NativeMethodRegistry::new();
+    vm_init_real_jdk_boot_path(&mut registry);
+    let real = owner_of(&registry, DESC);
+    println!("real-JDK boot path: java/lang/ClassLoader.defineClass0 <- {real}");
+    assert!(
+        real.contains("lib.rs"),
+        "the real-JDK boot path's `ClassLoader.defineClass0` should be the          `register_essential_natives_with_shims` registration (provenance          `lib.rs`, body `lang_system::native_classloader_define_class0`), and it          is `{real}`. If this now reports `classloader.rs`, then          `register_classloader_natives` has joined the real-JDK boot path and the          error contract on every real-image define changed with it — re-read          `define_class_via_full` before refreezing anything."
+    );
+
+    // The other arm, where the OTHER body wins. Gated on the feature because
+    // `register_synthetic_overrides` only exists under it — the Cargo feature
+    // decides what is compiled, the launcher flag decides which library loads.
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        cratonvm_native_builtins::register_synthetic_overrides(&mut registry);
+        let synthetic = owner_of(&registry, DESC);
+        println!(
+            "+ register_synthetic_overrides: java/lang/ClassLoader.defineClass0 <- {synthetic}"
+        );
+        assert!(
+            synthetic.contains("classloader.rs"),
+            "`register_synthetic_overrides` reaches              `classloader::register_classloader_natives`, which re-registers              `defineClass0` last, so the synthetic-JDK arm's owner should be              `classloader.rs` and it is `{synthetic}`. If this arm no longer              overrides, say which registrar stopped running: the two bodies              disagree about more than hardening."
+        );
+    }
+}

@@ -167,7 +167,7 @@ single-dump census and undercounts a class whose rows only one workload reaches.
 | blocked: lane T owns `concrete_receiver.rs:185` | 49 |
 | blocked: `java/nio/file/Files`, armed 4, above the floor | 39 |
 | deferred: `java/io/PrintStream`, its own wave (§5) | 30 |
-| **backed out by a build** (four families, §9.2; CharBuffer's 17 taken as wave 4) | **34** |
+| **backed out by a build** (§9.2; CharBuffer's 17 taken as wave 4, 27 more as wave 5 — all that is left is `FileSystemProvider`'s 4 and the three `ByteArrayInputStream` observers of §9.19) | **7** |
 | blocked: `Path` carrier is stamped with the interface | 11 |
 | reviewed `Intrinsic` | 10 |
 | **total** | **1 254** |
@@ -324,16 +324,22 @@ because the dial could not read a clean floor until they were:
 * **479 rows no probe in this tree reaches**, minus the 146 wave 2 moved out of
   that bucket in one pass -- see §9.7, which is what "the cheapest half" was
   worth.
-* **The four backed-out families that are left (34).** This said FIVE, and
-  said all five were the same thing — a fabricated carrier whose real fields
-  this VM never writes. Wave 4 took `java/nio/CharBuffer` (17) and found that
-  claim false for it: the carrier was repaired on 2026-08-06 and the row that
-  actually broke was a METHOD CONTRACT, `toString(int, int)`, held to two
-  different index conventions by two natives that only ever talked to each
-  other. §9.15 is what that looks like and §9.4 is what a carrier defect looks
-  like; **read a family's own measurement before assuming which of the two it
-  is.**
-* **`java/nio/file/Path` (11) and, behind it, `FileSystemProvider`.** One defect
+* ~~**The four backed-out families that are left (34).**~~ **Taken as wave 5
+  on 2026-09-12, except the provider.** This said FIVE, and said all five were
+  the same thing — a fabricated carrier whose real fields this VM never writes.
+  That claim is now false for four of the five. Wave 4 took
+  `java/nio/CharBuffer` (17) and found a METHOD CONTRACT, `toString(int, int)`,
+  held to two different index conventions by two natives that only ever talked
+  to each other. Wave 5 took the other three (27 rows) and found: a group whose
+  blocker had been FIXED two days before it was written down (§9.17), a READER
+  that assumed a unit (§9.18), and a COUPLING that is not a defect at all
+  (§9.19). §9.15 is what a contract defect looks like and §9.4 is what a
+  carrier defect looks like; **read a family's own measurement before assuming
+  which of the two it is — and re-read it after anything nearby is fixed.**
+* **`java/nio/file/Path` (11) and, behind it, `FileSystemProvider` — which is
+  now the ONLY backed-out family left, and is **nine** bucket-A/B rows rather
+  than the four §9.2 counted (the population grew; re-census before quoting a
+  family's size).** One defect
   and a measured order: the Path carrier is stamped with the INTERFACE, so
   `toString()` lands on `Object.toString()` and no `instanceof UnixPath` in the
   JDK's own `java.nio.file` code can succeed. Minting a concrete provider while
@@ -837,3 +843,184 @@ that row.
 effective category is `Bridge`, and `charAt` is registered as an `intrinsic`. A
 row for it would be inert by construction, which is a different reason from the
 FFM waves' `varHandle` carve-out and is asserted separately.
+
+
+---
+
+### Wave 5 -- 2026-09-12, 27 rows over the three remaining backed-out families
+
+`RETIRED_SHADOW_L4_BACKED_OUT_TRIPLES`, eight classes of `java/io/`,
+`java/nio/channels/` and `java/nio/file/attribute/`. No new prefix: wave 1
+admitted both of the packages these sit under, so the table is the whole of the
+decision. Probe: `apps/probes/L4W5Sweep.java`, 183 rows.
+
+The wave lands **with a fix**, not as a pure shadow removal: `RFileTimes` and
+`RSslLiveSession` -- the two vectors §9.2 named -- both failed on the first
+build of the table, and only one of the two was a defect.
+
+### 9.17 A family can be blocked on a defect that is already fixed
+
+The file-handle group (9) -- `java/io/FileOutputStream`, `FileCleanable`,
+`FileDescriptor` and the abstract-receiver `java/nio/channels/FileChannel` --
+went out of wave 1 as an **un-attributed GROUP**, because `RJdkSecurity`
+reproduced under no dial scope at all and nothing narrower could be said.
+
+§9.4 then found that vector's cause and fixed it: every `java.io.File` this VM
+built kept its path in slot 0 and wrote nothing else, so `prefixLength` read 0
+and `UnixFileSystem.resolve` called every path relative. **Nobody re-tried the
+group.** It is green here in every arm -- probe, corpus, both modes -- and its
+entire blocker was a defect in a different class that had been closed for two
+days when the family was written down as blocked.
+
+That is a third way for a recorded cause to be wrong, beside §9.15's (the
+mechanism was misdiagnosed) and §9.2's (the carrier had been repaired): **the
+cause was right, and then someone fixed it somewhere else.** A backed-out list
+is a snapshot of a tree, and this lane has now been wrong about one in three
+entries on it. Re-measure a blocked family whenever anything it touches moves.
+
+### 9.18 `filetime_read_millis` assumed a unit, and the setter stamped 1970
+
+`RFileTimes` failed on `java/nio/file/attribute/` alone, reproduced a row at a
+time. §9.2's attribution was right; its MECHANISM -- "reads `FileTime.toMillis()`
+off a fabricated carrier" -- was not. The carrier is fine. The READER is not:
+
+```rust
+pub(crate) fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
+    if let Value::Long(v) = ctx.get_field_by_name(ft, "value") { return v; }   // millis?
+    ...
+}
+```
+
+`FileTime` stores a PAIR, and `value` alone is not a time. `FileTime.from(Instant)`
+compiles to `new FileTime(0L, null, instant)` -- identically on 17, 21 and 25,
+`javap -c` -- so `value` is a literal `lconst_0` and the time lives in
+`instant`. The reader answered **0** for every `FileTime` real bytecode had
+built, and `BasicFileAttributeView.setTimes` stamped the file at the epoch:
+`plain.readAttributes.lastModified 1970-01-01T00:00:00Z`, four rows of it.
+
+It was self-consistent for exactly as long as this VM was the only PRODUCER --
+`filetime_alloc` converts to millis before storing and writes
+`unit = MILLISECONDS`, so the writer and the reader agreed on a convention that
+appears nowhere in the class. **This is §9.15's finding in a second place, and
+the generalisation holds: a native that owns both ends of a convention agrees
+with itself whatever the convention is; only real bytecode is a second opinion,
+and a retirement is how you ask for one.**
+
+Fixed rather than carved out. The unit is honoured, `unit == null` falls back to
+the `instant` fields, and both legacy shapes still read. It cannot ask
+`TimeUnit.toMillis` through the VM -- `filetime_read_millis` IS the body
+registered for `FileTime.toMillis()`, so dispatch would re-enter it in
+compatible mode -- so the constant is identified by its `Enum.name` rather than
+by an ordinal slot read, which is a defect this same file has already shipped
+once (`posix_file_permission_stub_clinit`).
+
+### 9.19 A row can be correct, and still not retirable
+
+`RSslLiveSession` failed on `java/io/ByteArrayInputStream` alone, and **nothing
+about those rows is wrong**. They answer as the real bodies do. Three of them --
+`read()I`, `read([BII)I` and `close()V` -- are the only three sites in the VM
+that dispatch `BaisEvent`, which is how this VM makes HotSpot's keep-alive
+DRAIN INSTANT observable: at body EOF and at close the `https` carrier is
+recycled, and every connection-level accessor goes back to throwing
+`IllegalStateException: connection not yet open`.
+
+`drainTrap` drains with the no-arg read and then closes. Retiring both rows
+removed both observation points, the connection was never recycled, and
+`getCipherSuite()` answered where HotSpot throws. **Un-retiring EITHER row alone
+clears the vector**, which is why a single-row bisect reports two causes for one
+failure and why the conjunction has to be read rather than the first PASS.
+
+Carved out, six of nine retired. `read([BII)I` is carved out too, on no vector's
+evidence: it carries the same observer for a caller that drains with the
+three-argument read, and shipping it because nothing went red is how the same
+defect arrives with nothing to find it.
+
+**This is a new kind of blocker for this lane** -- not a carrier, not a
+contract. A general-purpose class's native carries a side effect that a
+different subsystem depends on, and the retirement machinery cannot see it: the
+census says `bridge`, the image says `has_code`, the probe agrees row for row,
+and the only instrument that knows is a corpus vector about TLS sessions.
+
+**Nomination.** Move the observation to a stream the HTTP layer owns. HotSpot's
+`getInputStream()` does not hand back a `ByteArrayInputStream` either -- it
+returns a `HttpInputStream`/`KeepAliveStream` wrapper -- so a VM-owned wrapper
+would be both more faithful and un-retirable by anyone else's wave. Until then
+these three rows stay, and this section is why.
+
+### 9.20 Acceptance
+
+**Four arms, and the wave MOVES the probe toward HotSpot.** Diffed against a
+HotSpot 25 oracle rather than against the control alone:
+
+```text
+  L4W5Sweep, --jdk-only, 183 rows            rows differing from HotSpot
+    A  control (origin/dev f99c2e748)                 8
+    B  this wave                                      4
+    C  this wave, compatible mode      0 differing FROM THE CONTROL
+    D  this wave + UNRETIRE, same binary   0 differing FROM THE CONTROL
+```
+
+Arm D prints `27 table row(s)` over its eight rules at arm time -- the receipt
+that B's movement is this table's and not a neighbour's under a prefix that
+admits the whole of `java/io/`. The four rows it moves are four silent wrong
+answers:
+
+```text
+  FileTime.from(..., NANOSECONDS).toString()    .123Z        -> .123456789Z
+  FileTime.from(..., NANOSECONDS).to(NANOS)     ...123000000 -> ...123456789
+  PosixFilePermissions.fromString("rwx")        a Set        -> IAE
+  FileChannel.isOpen() after the stream closed  true         -> false
+```
+
+The last is §4's species. The receiver is a REAL `sun.nio.ch.FileChannelImpl`
+in all three arms: a native registered on `java/nio/channels/FileChannel` won
+the door for it and answered from this VM's fd table rather than from the
+`closed` field real `close()` had just set.
+
+**The corpus found both defects and the probe tree found neither.** The probe
+was clean on the first build of this table; `RFileTimes` and `RSslLiveSession`
+were not. Attribution cost six runs to a family and nine more to a row, with
+`CRATONVM_UNRETIRE_NATIVE_SHADOW` and no rebuild -- the instrument §9.4
+nominated, doing the job §9.4 wanted it for.
+
+```text
+  CRATONVM_ARGS=--jdk-only   control  136 passed, 0 failed
+                             wave     136 passed, 0 failed
+  SUITE=all                  wave     136 passed, 0 failed
+  SUITE=core                 wave      95 passed, 0 failed
+```
+
+The two `--jdk-only` arms were compared VECTOR BY VECTOR, not by totals: 136
+lines each, zero differing. `TIMEOUT=600`; no timing claim is made from any arm.
+
+**The funnel: 27 of 27.** One row, `FileOutputStream.write([BII)V`, reports
+`invocations_complete: false`, so precondition 4 rests on its `outcome`
+instead -- `native-won` in the control's report. The strict registry drops 33
+registrations over the 27 triples, none of them `native-won` in the wave's
+report against 22 in the control's.
+
+**+33 in three arms, paired on ONE binary:**
+
+```text
+  arm             OFF             ON              delta
+  (default)   3979 / 13590    4012 / 13590        +33 / 0
+  management  4006 / 13958    4039 / 13958        +33 / 0
+  synthetic   3979 / 13625    4012 / 13625        +33 / 0
+```
+
+27 rows and +33 registrations is the unit, not a discrepancy: six triples are
+registered twice and the re-tag flips each registration. Measured on the
+pre-merge tree at `3944/3971/3944 -> 3977/4004/3977` and AGAIN above, after
+lane 5's third residual wave landed on the same three constants in between --
+the same +33 in all three arms, on trees 35 registrations apart, and this
+wave's OFF column is lane 5's ON column exactly. Totals identical in both columns, and +1
+on the `MEASURED_TOTAL_REGISTRATIONS_*` constants -- which the note above them
+already recorded and left one low; re-frozen here to the measured figures.
+
+**Kind map: 32 rows amended**, `bridge -> synthetic-stub`, 25/linux, written
+rather than regenerated. 32 and not 33 because `PosixFilePermission.valueOf` is
+absent from the baseline altogether, and this gate passes and REPORTS a new row.
+After the amendment the wave fires 1 050 flips -- exactly the control's count --
+and names no row of this table.
+
+Measured on linux/x86_64 against JDK 25.

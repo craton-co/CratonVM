@@ -3499,8 +3499,20 @@ fn aio_assc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         None => return Err(ioex("bind: null SocketAddress")),
     };
     let bind_text = decode_addr(ctx, sa).unwrap_or_else(|_| "0.0.0.0:0".to_string());
-    let listener =
-        TcpListener::bind(&bind_text).map_err(|e| ioex(format!("bind {bind_text}: {e}")))?;
+    // `bind(SocketAddress, int)` is registered onto this same native; its
+    // backlog is `args[2]`, and `TcpListener::bind` silently replaced it with
+    // std's 128. A numeric address (what `decode_addr` produces for a resolved
+    // `InetSocketAddress`) binds through the JDK backlog rule; anything else
+    // keeps the name-resolving std path.
+    let backlog = match args.get(2) {
+        Some(Value::Int(b)) => *b,
+        _ => 0,
+    };
+    let listener = match bind_text.parse::<std::net::SocketAddr>() {
+        Ok(addr) => cratonvm_native_api::net_wait::bind_tcp_listener(addr, backlog),
+        Err(_) => TcpListener::bind(&bind_text),
+    }
+    .map_err(|e| ioex(format!("bind {bind_text}: {e}")))?;
     let local_addr = listener
         .local_addr()
         .map_err(|e| ioex(format!("bind {bind_text}: local_addr: {e}")))?;

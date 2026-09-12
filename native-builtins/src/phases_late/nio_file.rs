@@ -19400,9 +19400,55 @@ pub(crate) fn filetime_alloc(
     Ok(ft)
 }
 
-/// Read the millis from a FileTime built by [`filetime_alloc`]: prefer the
-/// real `long value` field (real-JDK mode), else slot 0 (synthetic mode).
+/// Read a `FileTime`'s instant as epoch millis -- from ANY `FileTime`, not only
+/// one [`filetime_alloc`] built.
+///
+/// # `value` is not the time. `(value, unit)` is.
+///
+/// The real class stores a PAIR, and the unit is `null` in the shape
+/// `FileTime.from(Instant)` produces -- `new FileTime(0L, null, instant)`,
+/// identically on 17, 21 and 25 (`javap -c`), with the time in `instant` and
+/// `value` a literal `lconst_0`. So reading `value` and calling it millis
+/// answered **0, the epoch**, for every `FileTime` real bytecode had built, and
+/// `BasicFileAttributeView.setTimes` then stamped the file 1970-01-01.
+///
+/// This was self-consistent for exactly as long as this VM's natives were the
+/// only PRODUCER: [`filetime_alloc`] converts to millis before storing and
+/// writes `unit = MILLISECONDS`, so writer and reader agreed on a convention
+/// that is nowhere in the class. Retiring `from`/`fromMillis` makes real
+/// bytecode a producer, and the convention is then whatever the JDK chose. Lane
+/// 4 wave 5 -- the corpus vector is `RFileTimes`, which no probe reproduced.
+///
+/// The unit is honoured rather than assumed, so a `FileTime` in SECONDS or
+/// NANOSECONDS reads correctly too; that is the same defect one conversion
+/// earlier, and it was live for `FileTime.from(3L, SECONDS)` before this.
 pub(crate) fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
+    // The unit says what `value` MEANS, so it is read first and `value` is
+    // never trusted on its own while a unit is present.
+    if let Value::Object(Some(unit)) = ctx.get_field_by_name(ft, "unit") {
+        if let Value::Long(value) = ctx.get_field_by_name(ft, "value") {
+            if let Some(millis) = time_unit_to_millis(ctx, unit, value) {
+                return millis;
+            }
+        }
+    }
+    // `unit == null` is the `from(Instant)` shape. Read the same two named
+    // fields the `from(Ljava/time/Instant;)` native reads, and for the same
+    // reason: they are the real `java.time.Instant`'s own.
+    if let Value::Object(Some(instant)) = ctx.get_field_by_name(ft, "instant") {
+        let secs = match ctx.get_field_by_name(instant, "seconds") {
+            Value::Long(v) => v,
+            _ => 0,
+        };
+        let nanos = match ctx.get_field_by_name(instant, "nanos") {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        return secs.saturating_mul(1000) + (nanos as i64) / 1_000_000;
+    }
+    // A `FileTime` with neither -- the legacy shape [`filetime_alloc`] writes
+    // when `TimeUnit` could not be initialized, and then the synthetic-jdk
+    // stub, which declares no `value` at all.
     if let Value::Long(v) = ctx.get_field_by_name(ft, "value") {
         return v;
     }
@@ -19410,6 +19456,36 @@ pub(crate) fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i6
         Value::Long(v) => v,
         _ => 0,
     }
+}
+
+/// `TimeUnit.toMillis(value)` without a virtual call, and `None` for a receiver
+/// that is not a `TimeUnit` constant this understands.
+///
+/// **It cannot dispatch.** Its only caller is [`filetime_read_millis`], which is
+/// itself the body registered for `FileTime.toMillis()`, so going through the VM
+/// would re-enter this function whenever that native is the thing that wins --
+/// which is every call in compatible mode.
+///
+/// The constant is identified by its `Enum.name` and not by its ordinal. An
+/// ordinal read is a slot read, and this file already carries a defect from
+/// assuming the `name`/`ordinal` slot ORDER (see `posix_file_permission_stub_
+/// clinit`, which wrote the ordinal where `name()` looks and produced a
+/// nameless enum constant).
+fn time_unit_to_millis(ctx: &dyn NativeContext, unit: ObjectRef, value: i64) -> Option<i64> {
+    let name = match ctx.get_field_by_name(unit, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s)?,
+        _ => return None,
+    };
+    Some(match name.as_str() {
+        "NANOSECONDS" => value / 1_000_000,
+        "MICROSECONDS" => value / 1_000,
+        "MILLISECONDS" => value,
+        "SECONDS" => value.saturating_mul(1_000),
+        "MINUTES" => value.saturating_mul(60_000),
+        "HOURS" => value.saturating_mul(3_600_000),
+        "DAYS" => value.saturating_mul(86_400_000),
+        _ => return None,
+    })
 }
 
 /// Apply the non-null fields passed to `BasicFileAttributeView.setTimes`.

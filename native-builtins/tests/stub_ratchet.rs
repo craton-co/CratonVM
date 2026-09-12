@@ -2311,7 +2311,53 @@ use cratonvm_types::compat::CompatibilityMode;
 /// totals as `13586 / 13954 / 13621`, and left the three constants at the
 /// values from before it landed. The paired arm above measures the same three
 /// numbers with this wave's rows switched off, which is what says so.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4006;
+///
+/// # +33 in every arm, lane 4 wave 5 (2026-09-12)
+///
+/// The three families the wave-1 builds backed out: 27 triples over eight
+/// classes of `java/io/`, `java/nio/channels/` and `java/nio/file/attribute/`.
+///
+/// PAIRED on ONE binary, like the note above and for the same reason. Measured
+/// on the pre-merge tree and AGAIN on this merged one, because lane 5's third
+/// wave landed on the same three constants between the two:
+///
+/// ```text
+///                       no-mgmt   mgmt   syn-jdk   total registrations
+///   OFF (27 rows off)      3979   4006      3979   13590 / 13958 / 13625
+///   ON                     4012   4039      4012   13590 / 13958 / 13625
+/// ```
+///
+/// **+33 against 27 rows, and that is the unit and not a discrepancy.** This
+/// gate counts REGISTRATIONS; six of the 27 triples are registered twice --
+/// `ByteArrayInputStream`'s `available`/`skip` in both `native-io` and
+/// `native-builtins`, and four `FileTime` accessors in two `nio_file`
+/// registrars -- and the `Bridge` -> `SyntheticStub` re-tag flips each
+/// registration separately. 27 + 6 = 33, in all three arms.
+///
+/// The OFF column here is lane 5's ON column, exactly, which is what says the
+/// two waves compose rather than overlap: the same binary with only this
+/// wave's 27 rows disarmed sits on lane 5's landed figures.
+///
+/// Totals identical in both columns -- every stub this wave adds is an existing
+/// `Bridge` relabelled.
+///
+/// The totals are +4 on what the note above measured, and that +4 is the
+/// MERGE's: lane 5 read 13586 / 13954 / 13621 on its tree and this wave read
+/// the same three numbers on its own pre-merge tree, so the four registrations
+/// arrived on `dev` between then and this merge. `MEASURED_TOTAL_
+/// REGISTRATIONS_*` are carried to the measured figures rather than left
+/// stale, which this file has already been caught doing twice -- once by 99
+/// and once by 13, and a stale total misclassifies the NEXT wave's failure.
+///
+/// # 2026-09-12, L1 wave 8 -- +156, third sitting -- control 4012/4039/4012, trial 4168/4195/4168
+///
+/// `dev` moved again between wave 8's re-measurement and its landing, and a
+/// sibling lane re-froze these three constants a second time. Resolved the
+/// same way, and for the same reason: keep BOTH notes and RE-MEASURE, because
+/// two deltas added together is arithmetic, not a measurement. The wave's own
+/// delta has been +156 -- exactly its table's row count -- in every arm of
+/// every sitting, with the totals unmoved.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4195;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2753,7 +2799,16 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4006;
 /// totals as `13586 / 13954 / 13621`, and left the three constants at the
 /// values from before it landed. The paired arm above measures the same three
 /// numbers with this wave's rows switched off, which is what says so.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3979;
+///
+/// # 2026-09-12, L1 wave 8 -- +156, third sitting
+///
+/// `dev` moved again between wave 8's re-measurement and its landing, and a
+/// sibling lane re-froze these three constants a second time. Resolved the
+/// same way, and for the same reason: keep BOTH notes and RE-MEASURE, because
+/// two deltas added together is arithmetic, not a measurement. The wave's own
+/// delta has been +156 -- exactly its table's row count -- in every arm of
+/// every sitting, with the totals unmoved.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 4168;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -3064,7 +3119,16 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3979;
 /// totals as `13586 / 13954 / 13621`, and left the three constants at the
 /// values from before it landed. The paired arm above measures the same three
 /// numbers with this wave's rows switched off, which is what says so.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3979;
+///
+/// # 2026-09-12, L1 wave 8 -- +156, third sitting
+///
+/// `dev` moved again between wave 8's re-measurement and its landing, and a
+/// sibling lane re-froze these three constants a second time. Resolved the
+/// same way, and for the same reason: keep BOTH notes and RE-MEASURE, because
+/// two deltas added together is arithmetic, not a measurement. The wave's own
+/// delta has been +156 -- exactly its table's row count -- in every arm of
+/// every sitting, with the totals unmoved.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 4168;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -3146,7 +3210,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3979;
 /// moves this by ZERO -- the paired ratchet reads the same total with its rows
 /// on and off. The +1 is the previous wave's: lane 1's wave 7 measured this
 /// number on its landing tree and re-froze the stub baselines without it.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13954;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13958;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -3164,7 +3228,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13954;
 /// moves this by ZERO -- the paired ratchet reads the same total with its rows
 /// on and off. The +1 is the previous wave's: lane 1's wave 7 measured this
 /// number on its landing tree and re-froze the stub baselines without it.
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13586;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13590;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -3195,7 +3259,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13586;
 /// moves this by ZERO -- the paired ratchet reads the same total with its rows
 /// on and off. The +1 is the previous wave's: lane 1's wave 7 measured this
 /// number on its landing tree and re-froze the stub baselines without it.
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13621;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13625;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

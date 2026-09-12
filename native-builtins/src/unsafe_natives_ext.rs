@@ -7339,18 +7339,20 @@ mod unsafe_unaligned_read_tests {
         let mut ctx = MockNativeContext::new();
         let bytes = ctx.new_array(Aet::Byte, 64);
         let shorts = ctx.new_array(Aet::Short, 32);
+        // `i * 7 + 1` as a BYTE pattern, wrapping. Written inline as
+        // `i as u8 * 7 + 1` this panics in a debug build from i = 37, where
+        // 37 * 7 = 259 leaves `u8` -- and both loops below had it, so the test
+        // could never reach the widths it was written to cover. One closure so
+        // the byte[] and short[] sides cannot drift apart again.
+        let b = |i: usize| -> u8 { (i as u8).wrapping_mul(7).wrapping_add(1) };
         for i in 0..64usize {
             // Cast: a byte element round-trips as a sign-extended int.
-            ctx.set_array_element(
-                bytes,
-                i,
-                cratonvm_types::Value::Int(i32::from((i as u8 * 7 + 1) as i8)),
-            );
+            ctx.set_array_element(bytes, i, cratonvm_types::Value::Int(i32::from(b(i) as i8)));
         }
         for i in 0..32usize {
             // The same 64 bytes, little-endian, two per element.
-            let lo = u16::from(i as u8 * 2 * 7 + 1);
-            let hi = u16::from((i as u8 * 2 + 1) * 7 + 1);
+            let lo = u16::from(b(i * 2));
+            let hi = u16::from(b(i * 2 + 1));
             ctx.set_array_element(
                 shorts,
                 i,
