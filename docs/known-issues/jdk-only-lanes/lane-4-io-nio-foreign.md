@@ -1003,14 +1003,17 @@ report against 22 in the control's.
 
 ```text
   arm             OFF             ON              delta
-  (default)   3944 / 13586    3977 / 13586        +33 / 0
-  management  3971 / 13954    4004 / 13954        +33 / 0
-  synthetic   3944 / 13621    3977 / 13621        +33 / 0
+  (default)   3979 / 13590    4012 / 13590        +33 / 0
+  management  4006 / 13958    4039 / 13958        +33 / 0
+  synthetic   3979 / 13625    4012 / 13625        +33 / 0
 ```
 
 27 rows and +33 registrations is the unit, not a discrepancy: six triples are
-registered twice and the re-tag flips each registration. The OFF column lands
-exactly on the constants as committed. Totals identical in both columns, and +1
+registered twice and the re-tag flips each registration. Measured on the
+pre-merge tree at `3944/3971/3944 -> 3977/4004/3977` and AGAIN above, after
+lane 5's third residual wave landed on the same three constants in between --
+the same +33 in all three arms, on trees 35 registrations apart, and this
+wave's OFF column is lane 5's ON column exactly. Totals identical in both columns, and +1
 on the `MEASURED_TOTAL_REGISTRATIONS_*` constants -- which the note above them
 already recorded and left one low; re-frozen here to the measured figures.
 

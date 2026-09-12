@@ -11000,15 +11000,21 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
 ///
 /// ```text
 ///   arm             OFF             ON              delta
-///   (default)   3944 / 13586    3977 / 13586        +33 / 0
-///   management  3971 / 13954    4004 / 13954        +33 / 0
-///   synthetic   3944 / 13621    3977 / 13621        +33 / 0
+///   (default)   3979 / 13590    4012 / 13590        +33 / 0
+///   management  4006 / 13958    4039 / 13958        +33 / 0
+///   synthetic   3979 / 13625    4012 / 13625        +33 / 0
 /// ```
 ///
 /// The OFF column is the same binary with this wave's rows disarmed, and it
-/// lands exactly on the constants as committed -- which is what says they were
-/// current and that nothing but this wave moves them. Totals identical in both
-/// columns: every stub added is an existing `Bridge` relabelled.
+/// lands exactly on LANE 5's landed figures -- the third residual wave of that
+/// lane re-froze these same three constants between this wave's first
+/// measurement and its merge. That is what says the two compose rather than
+/// overlap, and it is a stronger statement than the pre-merge sitting could
+/// make: the same +33 in all three arms, measured twice, on trees 35
+/// registrations apart.
+///
+/// Totals identical in both columns: every stub added is an existing `Bridge`
+/// relabelled.
 ///
 /// # Kind map: 32 rows amended, and the gate is no redder than dev
 ///
