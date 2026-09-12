@@ -39,19 +39,21 @@
 //! `x64::tests::scan_admitted_opcodes_are_lowered_or_declared` now fails if a
 //! scan-admitted opcode ever loses its x64 arm again.)
 //!
-//! **The stack shuffles are category- and stack-aware as of 2026-08-18, and
-//! were not before.** This backend keeps TWO simulated operand stacks —
-//! `operand_stack` for int/long/reference and `float_operand_stack` for
-//! float/double — and `pop`/`pop2`/`dup`/`dup_x1`/`dup_x2`/`dup2`/`dup2_x1`/
-//! `dup2_x2`/`swap` each popped a FIXED number of entries from the first one.
-//! A `float`/`double` operand is on the other stack, so those arms shuffled
-//! unrelated integer values and left the FP value untouched — silently, with
-//! no underflow, whenever the integer stack happened to be deep enough. And a
-//! `long` is ONE entry here and TWO JVM slots, so every `pop2`/`dup2*`/
-//! `dup_x2` form except the all-category-1 one touched the wrong number of
-//! entries. All nine arms now consult [`Arm64Backend::int_stack_shuffle_entries`]
-//! and refuse the method when the operands cannot be proven integer-stack
-//! values of a known category.
+//! **The operand stack is ONE typed stack, and each entry records where its
+//! value is (2026-09-12).** An [`Operand`] carries its kind (`I32`, `I64`,
+//! `Ref`, `F32`, `F64`) and its location: a scratch register, or the frame word
+//! reserved for its DEPTH. There used to be two stacks of bare registers -- one
+//! for int/long/reference, one for float/double -- plus a `register -> spill
+//! slot` map, and that design produced three separate miscompiles: the
+//! allocator wrapped onto a live register and popping the new value reloaded
+//! the old one (`a - (b+1+2+3+4)` was -4 for `(100, 5)`); the float allocator
+//! round-robined V0-V7 with no liveness check at all; and the shuffles could
+//! only refuse any form involving a float. Every shuffle now resolves its JVMS
+//! form from the entries' categories (a `long` is one entry and two JVM
+//! slots) and refuses only the forms the JVMS does not define. At every branch
+//! each live entry is put in its depth slot, and each branch target rebuilds
+//! the model from the shape recorded for it, so a value on the stack across a
+//! merge (`c ? x : y`) arrives from both paths in the same place.
 //!
 //! What lowers: constants (`*const_*`, `bipush`, `sipush` — the `ldc` family
 //! has arms but refuses, there being no constant pool here), local load/store for
@@ -202,27 +204,35 @@
 //!   `osr_pc_to_native` table. There is nothing to tier down *from* (this is
 //!   the only tier), so a deopt cannot occur — but equally, no speculative
 //!   optimization may ever be added here without building that first.
-//! - **No stack-overflow bang** in the prologue (x64 emits one). Frames that
-//!   could step past the first guard page (>= 4096 bytes) are refused as of the
-//!   2026-08-01 audit; smaller frames cannot skip the guard.
+//! - **Stack bang (2026-09-12).** The prologue touches every page the frame
+//!   crosses before it moves SP, as x64 does, so stack exhaustion faults on the
+//!   guard page. Frames of 4096 bytes or more used to be refused instead, and
+//!   could not have been allocated anyway: a wide `SUB SP` had no encoding
+//!   until the extended-register ADD/SUB was added.
 //! - **Float locals are not homed in FP registers.** `regalloc::ARM64_LOCAL_FPS`
 //!   offers `D8`–`D15`, which AAPCS64 makes callee-saved, and this backend's
 //!   prologue/epilogue save only GPRs — so homing a float local there destroyed
 //!   the caller's copy. The allocator's FP assignments are ignored (2026-08-01);
-//!   float locals live in frame slots or GPRs.
-//! - **32-bit int ops are lowered to 64-bit X-form instructions.** `iadd`,
-//!   `isub`, `imul`, `ineg`, `ishl`, `ishr`, `iand`, `ior`, `ixor` all use
-//!   the same emitters as their `l*` counterparts, so JVM 32-bit wrapping
-//!   does not happen (`Integer.MAX_VALUE + 1` yields `2147483648`, not
-//!   `Integer.MIN_VALUE`) and `ishl`/`ishr` do not mask the shift amount to
-//!   5 bits. `iushr` masks the *value* to 32 bits but not the shift.
-//!   Fixing this needs W-form variants threaded through the whole operand
-//!   pipeline (loads, compares, returns, `i2l`), which is a backend-wide
-//!   type-discipline change and is **not** attempted piecemeal.
-//! - **32-bit int ops are still lowered to 64-bit X-form** (see the entry
-//!   above). This remains the largest *silent* correctness gap on this backend
-//!   and is deliberately NOT fixed piecemeal; `docs/jit/aarch64-parity.md`
-//!   records the shape a correct fix takes.
+//!   float locals live in frame slots.
+//!
+//! ## The `int` representation (2026-09-12)
+//!
+//! An `I32` operand is held SIGN-EXTENDED in its 64-bit register: the X
+//! register equals the sign extension of its low 32 bits. That is how the VM
+//! passes an `int` argument (`x as i64`) and how `iconst` materializes one, and
+//! it makes every 64-bit reader -- the VM's read of X0, `CBZ X`, an `i2l` -- see
+//! the right value. Every `int` producer is a W-form instruction (whose result
+//! is the JVMS 32-bit wrapped value, and whose variable shifts take the
+//! distance MOD 32) followed by `SXTW`; `f2i`/`d2i` use the 32-bit saturating
+//! `FCVTZS W`; `l2i` is `SXTW`; `i2l` is a relabelling; and `int` compares,
+//! zero tests and switch keys read the W register regardless. The previous
+//! lowering used the X forms of the `long` ops, so `Integer.MAX_VALUE + 1` was
+//! 2147483648 and `1 << 32` was 4294967296.
+//!
+//! `float` is an S register and `double` a D register, end to end: constants,
+//! arithmetic, compares, conversions, locals (four bytes of a frame word for a
+//! `float`) and returns (moved bit-exactly into X0, where the VM reads every
+//! result).
 //! - **Loops were infinite self-branches** until the 2026-07-26 audit. Branch targets
 //!   were discovered lazily as each branch was decoded, so a back-edge target
 //!   (already walked past) never got a label bound, and the encoder left the
@@ -243,36 +253,42 @@
 //! `jit/src/lib.rs` dispatches here from exactly one place: the
 //! `#[cfg(target_arch = "aarch64")]` block at the top of `try_compile_inner`,
 //! which returns unconditionally (the IR pipeline and the x64 backend are
-//! bypassed entirely on that target). Note that this is **not** the only
-//! compile entry the VM uses: `vm/src/runtime/interpreter.rs` and
-//! `vm/src/vm.rs` call `x64::compile*` directly from the eager first-call,
-//! OSR and probe paths with no `target_arch` guard. Those sites are outside
-//! this module and are not fixed here, but an `aarch64` build would emit
-//! x86-64 bytes from them.
+//! bypassed entirely on that target) -- and which compiles NOTHING unless
+//! `CRATONVM_JIT_ARM64` is set (see [`arm64_jit_enabled`]). The VM's two other
+//! compile doors that call `x64::compile_with_param_slots` directly, the eager
+//! first call (`vm/src/runtime/interpreter.rs`) and OSR (`compile_osr_artifact`
+//! in `vm/src/runtime/interpreter/jit_bridge.rs`), return without compiling on
+//! any target but x86-64, so an aarch64 build cannot publish x86-64 bytes.
 //!
 //! Both this module and `aarch64.rs` are compiled unconditionally on every
 //! host (`pub mod` in `lib.rs`, no `cfg`), so their unit tests — including
 //! every instruction-encoding test — run in ordinary x86-64 CI. The code is
 //! not rotting; it is simply far smaller in scope than its name suggests.
 //!
-//! ## Calling Convention (AAPCS64)
+//! ## Calling convention
 //!
-//! - Integer args: X0-X7, return in X0
-//! - Floating-point args: V0-V7, return in V0
-//! - Callee-saved: X19-X28, FP (X29), LR (X30)
-//! - Stack must be 16-byte aligned at all times
+//! The VM calls compiled code as `extern "C" fn(i64, ..) -> i64`: ONE 64-bit
+//! integer register per argument (X0-X7, `this` first; more than eight
+//! arguments refuse the method), and every result read out of X0. A `float`
+//! argument arrives as its zero-extended bit pattern and a `double` as its
+//! bits, and FP results are moved bit-exactly into X0. Argument `i` is homed
+//! in JVM local `compute_param_jvm_slots(..)[i]`, which differs from `i` after
+//! any `long`/`double`. Callee-saved: X19-X28, FP (X29), LR (X30). SP is
+//! 16-byte aligned at all times.
 //!
-//! ## Stack Layout (after prologue)
+//! ## Stack layout (after the prologue)
 //!
 //! ```text
-//! [FP + 16]    = return address (saved LR)
-//! [FP + 8]     = saved FP
-//! [FP]         = <- FP points here
-//! [FP - 8]     = local 0  (or in X19)
-//! [FP - 16]    = local 1  (or in X20)
-//! ...
-//! [FP - N*8]   = spill slots / operand stack
+//! [FP + 8]         saved LR          \  the AAPCS64 frame record
+//! [FP]             saved caller FP   /  (STP X29, X30, [SP, #-16]!; ADD X29, SP, #0)
+//! [FP - 8] ..      callee-saved GPRs (register-homed locals)
+//! ..               frame-homed locals, then one word per operand-stack depth,
+//!                  then the safepoint homes and the safepoint-id word
+//! [SP]             frame bottom
 //! ```
+//!
+//! See [`Arm64FrameLayout::compute`]. The record used to sit at `[FP-16]`, with
+//! FP equal to the caller's SP, which no unwinder or frame-pointer walk expects.
 
 use std::collections::HashMap;
 
@@ -379,6 +395,15 @@ pub enum Arm64Condition {
     Cs,
     /// Carry clear / unsigned lower (C=0)
     Cc,
+    /// Minus / negative (N=1). After `FCMP` this is "less than" and is FALSE on
+    /// unordered, which is what `fcmpg`/`dcmpg` need (`Lt` is true on it).
+    Mi,
+    /// Plus / positive or zero (N=0)
+    Pl,
+    /// Overflow (V=1). After `FCMP`: unordered.
+    Vs,
+    /// No overflow (V=0)
+    Vc,
     /// Always
     Al,
 }
@@ -738,6 +763,182 @@ pub enum Arm64Instruction {
         vm: Arm64Register,
     },
 
+    // -- 32-bit (W) integer forms --
+    //
+    // JVM `int` arithmetic. A W-form result is the JVMS 32-bit wrapped value;
+    // the backend follows each producer with `Sxtw` to restore the
+    // sign-extended form it keeps every `int` in.
+    AddW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        rm: Arm64Register,
+    },
+    SubW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        rm: Arm64Register,
+    },
+    MulW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        rm: Arm64Register,
+    },
+    AndW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        rm: Arm64Register,
+    },
+    OrrW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        rm: Arm64Register,
+    },
+    EorW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        rm: Arm64Register,
+    },
+    /// `LSLV Wd, Wn, Wm`: the amount is taken MOD 32, i.e. `ishl`'s `& 0x1f`.
+    LslW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        rm: Arm64Register,
+    },
+    /// `LSRV Wd, Wn, Wm`, amount MOD 32.
+    LsrW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        rm: Arm64Register,
+    },
+    /// `ASRV Wd, Wn, Wm`, amount MOD 32.
+    AsrW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        rm: Arm64Register,
+    },
+    NegW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+    },
+    AddImmW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        imm: i32,
+    },
+    SubImmW {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        imm: i32,
+    },
+    CmpW {
+        rn: Arm64Register,
+        rm: Arm64Register,
+    },
+    CmpImmW {
+        rn: Arm64Register,
+        imm: i32,
+    },
+    CbzW {
+        rt: Arm64Register,
+        label: u32,
+    },
+    CbnzW {
+        rt: Arm64Register,
+        label: u32,
+    },
+    /// `SXTW Xd, Wn`.
+    Sxtw {
+        rd: Arm64Register,
+        rn: Arm64Register,
+    },
+    /// `SXTH Xd, Wn`.
+    Sxth {
+        rd: Arm64Register,
+        rn: Arm64Register,
+    },
+    /// `SXTB Xd, Wn`.
+    Sxtb {
+        rd: Arm64Register,
+        rn: Arm64Register,
+    },
+    /// `AND Xd, Xn, #imm`, as a bitmask immediate when encodable and through
+    /// IP0 otherwise.
+    AndImm {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        imm: u64,
+    },
+    /// `CSET Xd, cond`: 1 when `cond` holds, else 0.
+    Cset {
+        rd: Arm64Register,
+        cond: Arm64Condition,
+    },
+    /// `CNEG Xd, Xn, cond`: `-Xn` when `cond` holds, else `Xn`.
+    Cneg {
+        rd: Arm64Register,
+        rn: Arm64Register,
+        cond: Arm64Condition,
+    },
+
+    // -- FP width forms --
+    /// `FMOV Sd, Wn` (bit pattern, no conversion).
+    FmovToFpSingle {
+        vd: Arm64Register,
+        rn: Arm64Register,
+    },
+    /// `FMOV Wd, Sn` (bit pattern; zero-extends into Xd).
+    FmovFromFpSingle {
+        rd: Arm64Register,
+        vn: Arm64Register,
+    },
+    /// `FMOV Sd, Sn`.
+    FmovFpSingle {
+        vd: Arm64Register,
+        vn: Arm64Register,
+    },
+    /// `SCVTF Dd, Wn` (`i2d`).
+    ScvtfDoubleW {
+        vd: Arm64Register,
+        rn: Arm64Register,
+    },
+    /// `SCVTF Sd, Xn` (`l2f`).
+    ScvtfSingleX {
+        vd: Arm64Register,
+        rn: Arm64Register,
+    },
+    /// `FCVTZS Wd, Dn` (`d2i`, saturating at the 32-bit bounds).
+    FcvtzsIntW {
+        rd: Arm64Register,
+        vn: Arm64Register,
+    },
+    /// `FCVTZS Xd, Sn` (`f2l`).
+    FcvtzsSingleX {
+        rd: Arm64Register,
+        vn: Arm64Register,
+    },
+
+    // -- Switches --
+    /// `tableswitch`: `key - low` into IP1 (X17), an unsigned bounds check to
+    /// `default`, then a PC-relative jump table (`ADR X16; LDRSW X17, [X16,
+    /// W17, UXTW #2]; ADD X16, X16, X17; BR X16`) followed by one 32-bit
+    /// offset per case. X16/X17 are never allocator-managed, so no case can
+    /// land on the key's own register -- which the old compare chain, whose
+    /// constants came from the scratch allocator, could (`CMP R, R`).
+    TableSwitch {
+        key: Arm64Register,
+        low: i32,
+        default: u32,
+        targets: Vec<u32>,
+    },
+    /// `lookupswitch`: `CMP Wkey, #value` (constants too wide for an
+    /// immediate go through IP0, never a scratch register), `B.EQ` per pair,
+    /// then `B default`.
+    LookupSwitch {
+        key: Arm64Register,
+        pairs: Vec<(i32, u32)>,
+        default: u32,
+    },
+
     // -- System --
     Nop,
     Brk {
@@ -754,6 +955,38 @@ pub enum Arm64Instruction {
         label: u32,
         value: u64,
     },
+}
+
+impl Arm64Instruction {
+    /// An upper bound on the bytes this pseudo-op encodes to.
+    ///
+    /// `Label` and `Comment` emit nothing, a literal emits 8 bytes, immediates
+    /// and far frame accesses expand into a materialization through IP0, and
+    /// a switch carries its own table. See `emit_machine_code_inner`.
+    pub fn max_encoded_bytes(&self) -> usize {
+        match self {
+            Arm64Instruction::Label(_) | Arm64Instruction::Comment(_) => 0,
+            Arm64Instruction::ConstantPoolEntry { .. } => 8,
+            Arm64Instruction::MovImm { .. } => 16,
+            Arm64Instruction::AddImm { .. }
+            | Arm64Instruction::SubImm { .. }
+            | Arm64Instruction::AddImmW { .. }
+            | Arm64Instruction::SubImmW { .. }
+            | Arm64Instruction::CmpImm { .. }
+            | Arm64Instruction::CmpImmW { .. }
+            | Arm64Instruction::AndImm { .. } => 20,
+            Arm64Instruction::Ldr { .. }
+            | Arm64Instruction::Str { .. }
+            | Arm64Instruction::FpLdr { .. }
+            | Arm64Instruction::FpStr { .. } => 24,
+            // SUB + CMP (each up to 20 through IP0), B.HI, ADR, LDRSW, ADD, BR,
+            // and a word per case.
+            Arm64Instruction::TableSwitch { targets, .. } => 60 + 4 * targets.len(),
+            // A CMP (up to 20) and a B.EQ per pair, then B.
+            Arm64Instruction::LookupSwitch { pairs, .. } => 24 * pairs.len() + 4,
+            _ => 4,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -835,25 +1068,33 @@ pub struct Arm64FrameLayout {
 impl Arm64FrameLayout {
     /// Compute the frame layout given method metadata.
     ///
-    /// The layout reserves 16 bytes for FP/LR (saved by STP in the prologue),
-    /// then space for callee-saved registers, then spill slots.  Everything is
-    /// rounded up to a 16-byte boundary.
+    /// ```text
+    /// [FP + 8]     saved LR          \  the AAPCS64 frame record, pushed by
+    /// [FP]         saved caller FP   /  `STP X29, X30, [SP, #-16]!`
+    /// [FP - 8] ..  callee-saved GPRs   (callee_save_offset = -callee_save_bytes)
+    /// ..           spill area          (spill_offset = callee_save_offset - spill_bytes)
+    /// [SP]         frame bottom        (FP - (frame_size - 16))
+    /// ```
+    ///
+    /// `frame_size` counts the 16-byte record as well, and is 16-byte aligned.
+    /// Everything this frame owns is BELOW FP. The record used to sit at
+    /// `[FP-16]`/`[FP-8]` with FP equal to the caller's SP, which is not the
+    /// frame record any unwinder or frame-pointer walk expects.
     pub fn compute(_num_locals: usize, num_spills: usize, saved_regs: &[Arm64Register]) -> Self {
         let num_reg_locals = saved_regs.len();
 
-        // FP/LR pair is saved separately (16 bytes).
         // Callee-saved regs: round count up to even for STP pairing.
         let num_saved = saved_regs.len();
         let callee_save_bytes = ((num_saved + 1) / 2) * 16; // pairs of 8-byte regs
 
         let spill_bytes = num_spills * 8;
 
-        // Total = FP/LR (16) + callee-save area + spill area, aligned to 16.
+        // Total = frame record (16) + callee-save area + spill area, aligned.
         let raw = 16 + callee_save_bytes + spill_bytes;
         let frame_size = align_up(raw, 16) as i32;
 
-        // Offsets are negative from FP.
-        let callee_save_offset = -16 - callee_save_bytes as i32;
+        // Offsets are negative from FP, which points at the frame record.
+        let callee_save_offset = -(callee_save_bytes as i32);
         let spill_offset = callee_save_offset - spill_bytes as i32;
 
         Self {
@@ -918,9 +1159,17 @@ impl Arm64CodeBuffer {
         &self.instructions
     }
 
-    /// Every ARM64 instruction is 4 bytes (fixed-width encoding).
+    /// An UPPER BOUND on the encoded size, in bytes.
+    ///
+    /// Not `len * 4`: this is a pseudo-op stream, in which a `Label` or
+    /// `Comment` encodes to nothing and a `MovImm`, a wide immediate, a far
+    /// frame access or a switch expands to several words. See
+    /// [`Arm64Instruction::max_encoded_bytes`].
     pub fn estimated_size(&self) -> usize {
-        self.instructions.len() * 4
+        self.instructions
+            .iter()
+            .map(Arm64Instruction::max_encoded_bytes)
+            .sum()
     }
 }
 
@@ -928,7 +1177,30 @@ impl Arm64CodeBuffer {
 // Arm64CompileResult
 // ---------------------------------------------------------------------------
 
-/// Output of the compilation pipeline.
+/// Is the aarch64 JIT on at all (`CRATONVM_JIT_ARM64`, **default-OFF**)?
+///
+/// `docs/PLATFORMS.md` says the JIT is disabled off x86-64, and until this
+/// switch existed that was not true on aarch64: `try_compile_inner` compiled
+/// with this backend unconditionally, publishing machine code that no host in
+/// this repository had executed. It stays opt-in until the backend has run on
+/// hardware. Read by the `#[cfg(target_arch = "aarch64")]` block of
+/// `try_compile_inner`, and defined here without a `cfg` so every host
+/// type-checks it.
+pub fn arm64_jit_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_ARM64")
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}
+
 /// Does the aarch64 backend emit GC safepoint polls
 /// (`CRATONVM_JIT_ARM64_SAFEPOINTS`, **default-OFF; opt-in**)?
 ///
@@ -995,6 +1267,7 @@ pub struct Arm64PendingOopMap {
     pub safepoint_id: u32,
 }
 
+/// Output of the compilation pipeline.
 pub struct Arm64CompileResult {
     pub instructions: Vec<Arm64Instruction>,
     pub frame: Arm64FrameLayout,
@@ -1008,13 +1281,10 @@ pub struct Arm64CompileResult {
     /// these into `crate::OopMapEntry` values keyed by real byte offsets --
     /// see [`Arm64PendingOopMap`] for why the compiler cannot do that itself.
     ///
-    /// **Still empty in practice, for a reason that is no longer the writer.**
-    /// The writer is correct now; what is missing is a SAFEPOINT to call it at.
-    /// This backend lowers no allocation, no call and no monitor, and refuses
-    /// back edges, so a compiled method contains no GC-capable point at all --
-    /// see the "Safety-critical gaps" section of the module header. The first
-    /// real safepoint on this backend inherits a correct map writer instead of
-    /// the mis-keyed one that used to be here.
+    /// Empty unless `CRATONVM_JIT_ARM64_SAFEPOINTS` is on: the safepoint polls
+    /// are this backend's only GC-capable points (it lowers no allocation, call
+    /// or monitor), and each poll records exactly one map.
+    pub pending_oop_maps: Vec<Arm64PendingOopMap>,
     /// Frame offset (positive) of the safepoint-id slot, or 0 when none was
     /// reserved. Published onto `CompiledMethod::sp_id_slot_off`, which the
     /// runtime reads as `[frame_base - off]`.
@@ -1024,12 +1294,116 @@ pub struct Arm64CompileResult {
     /// `fully_oop_covered` is computed from -- see `publish_compiled_method`.
     pub safepoint_count: usize,
     pub incomplete_oop_maps: usize,
-    pub pending_oop_maps: Vec<Arm64PendingOopMap>,
 }
 
 // ---------------------------------------------------------------------------
 // Arm64Backend
 // ---------------------------------------------------------------------------
+
+/// The kind of value an operand-stack entry holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperandKind {
+    /// JVM `int` (and `boolean`/`byte`/`char`/`short`), held SIGN-EXTENDED in
+    /// its 64-bit register. See "The `int` representation" in the module
+    /// header.
+    I32,
+    /// JVM `long`.
+    I64,
+    /// An object reference.
+    Ref,
+    /// JVM `float`: an S register, or the low four bytes of a frame word.
+    F32,
+    /// JVM `double`: a D register, or a whole frame word.
+    F64,
+}
+
+impl OperandKind {
+    /// Lives in V0-V7 rather than X9-X15.
+    pub fn is_fp(self) -> bool {
+        matches!(self, OperandKind::F32 | OperandKind::F64)
+    }
+
+    /// Category 2 (JVMS 2.11.1): one entry here, two JVM stack slots.
+    pub fn is_category2(self) -> bool {
+        matches!(self, OperandKind::I64 | OperandKind::F64)
+    }
+}
+
+/// Where an operand-stack entry is right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperandLoc {
+    /// A scratch register: X9-X15 for integer kinds, V0-V7 for FP kinds.
+    Reg(Arm64Register),
+    /// The frame word reserved for the entry's DEPTH, as an FP-relative
+    /// offset (see [`Arm64Backend::spill_offset_for_depth`]).
+    Slot(i32),
+}
+
+/// One simulated operand-stack entry: what it is, and where it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Operand {
+    pub kind: OperandKind,
+    pub loc: OperandLoc,
+    /// Holds an object reference the GC must see. Set for every `Ref` entry --
+    /// only `aconst_null` and `aload*` produce one on this backend -- and
+    /// carried by the stack shuffles, so the marks are exact by construction.
+    pub oop: bool,
+}
+
+impl Operand {
+    /// An entry that lives in `reg`.
+    pub fn in_reg(kind: OperandKind, reg: Arm64Register) -> Self {
+        Self {
+            kind,
+            loc: OperandLoc::Reg(reg),
+            oop: kind == OperandKind::Ref,
+        }
+    }
+}
+
+/// Kinds of the `<x>load`/`<x>store` families, in opcode order: `i l f d a`.
+const LOCAL_KINDS: [OperandKind; 5] = [
+    OperandKind::I32,
+    OperandKind::I64,
+    OperandKind::F32,
+    OperandKind::F64,
+    OperandKind::Ref,
+];
+
+/// Conditions of `ifeq..ifle` and `if_icmpeq..if_icmple`, in opcode order.
+const IF_CONDS: [Arm64Condition; 6] = [
+    Arm64Condition::Eq,
+    Arm64Condition::Ne,
+    Arm64Condition::Lt,
+    Arm64Condition::Ge,
+    Arm64Condition::Gt,
+    Arm64Condition::Le,
+];
+
+/// The bytecode byte at `at`, or `None` past the end.
+fn bc_u8(code: &[u8], at: usize) -> Option<u8> {
+    code.get(at).copied()
+}
+
+/// The big-endian `i16` at `at`, or `None` if it runs past the end.
+fn bc_i16(code: &[u8], at: usize) -> Option<i16> {
+    Some(i16::from_be_bytes([*code.get(at)?, *code.get(at + 1)?]))
+}
+
+/// The big-endian `i32` at `at`, or `None` if it runs past the end.
+fn bc_i32(code: &[u8], at: usize) -> Option<i32> {
+    let b = code.get(at..at.checked_add(4)?)?;
+    Some(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// The bytecode pc a branch at `start_pc` with displacement `offset` targets.
+///
+/// Cast: a target before pc 0 wraps to a huge pc. No label is ever bound
+/// there, so `emit_machine_code` refuses the method -- the same outcome as any
+/// other branch into the middle of nowhere.
+fn branch_target(start_pc: usize, offset: i32) -> usize {
+    (start_pc as i64 + i64::from(offset)) as usize
+}
 
 /// The main ARM64 compilation pipeline.
 ///
@@ -1038,123 +1412,102 @@ pub struct Arm64CompileResult {
 pub struct Arm64Backend {
     buffer: Arm64CodeBuffer,
     frame: Option<Arm64FrameLayout>,
-    /// Register (or spill slot) assignment for each local variable (GPR).
+    /// Register assignment for each local variable (GPR); `None` means the
+    /// local is frame-homed.
     local_regs: Vec<Option<Arm64Register>>,
-    /// FP register assignment for float/double locals.
-    /// When a float local has a dedicated FP register (D8-D15), it is stored here.
+    /// FP register assignment for float/double locals. Always `None`: see the
+    /// comment on the loop that fills it in `compile_pass`.
     float_local_regs: Vec<Option<Arm64Register>>,
-    /// Simulated operand stack (tracks which register holds each stack slot).
-    operand_stack: Vec<Arm64Register>,
-    /// Per-bci operand-stack kinds, for the stack-shuffle opcodes only.
+    /// The simulated operand stack, bottom first -- ONE stack for every kind.
     ///
-    /// This backend keeps TWO simulated stacks — `operand_stack` for
-    /// int/long/reference and `float_operand_stack` for float/double — and its
-    /// shuffle arms only ever touched the first one, by a fixed number of
-    /// entries. Both assumptions are wrong in general: `dup` of a `double`
-    /// shuffles the wrong stack entirely, and every `pop2`/`dup2*` form except
-    /// the all-category-1 one touches a different number of entries than the
-    /// arm popped. See [`Arm64Backend::int_stack_shuffle_entries`].
+    /// Each entry records where ITS value is: a scratch register, or the frame
+    /// word reserved for its depth. This replaces a register-only stack plus a
+    /// `register -> spill slot` map, which could not describe two entries that
+    /// had used the same register: when the round-robin allocator wrapped onto
+    /// a live register it spilled it, recorded `spill_map[R]`, and pushed R
+    /// again for the NEW value, so popping the new value reloaded the OLD one.
+    /// `a - (b+1+2+3+4)` returned -4 for `(100, 5)`. Floats lived on a second
+    /// stack whose allocator had no liveness check and no spill at all.
+    operand_stack: Vec<Operand>,
+    /// Scratch registers the bytecode being lowered has popped and still reads.
+    /// The allocator never hands one out, so a result register cannot overwrite
+    /// an operand the same instruction has yet to consume. Cleared per bytecode.
+    held: Vec<Arm64Register>,
+    /// The operand-stack SHAPE (kind and oop mark per entry) at each branch
+    /// target, recorded by the branches. Every path into a target leaves each
+    /// entry in its depth slot, so the shape is all a target needs to rebuild
+    /// the model. Recorded by pass 1 and read by pass 2, so a backward target
+    /// is known before the walk reaches it.
+    label_states: HashMap<usize, Vec<(OperandKind, bool)>>,
+    /// Whether control falls into the instruction being lowered from the
+    /// previous one (false after `goto`, `*return` and the switches).
+    reachable: bool,
+    /// Per-bci operand-stack kinds from the shared analysis. Consulted only to
+    /// rebuild the model at a pc that no recorded branch describes.
     ///
     /// Populated with EMPTY metadata, which costs nothing here: the analysis
     /// needs field types, call arities and constant-pool tags, and this backend
     /// refuses every method containing a field access, a call of any kind, or
-    /// any `ldc`, so no admissible method has a site the analysis would need
-    /// them for.
+    /// any `ldc`.
     stack_kinds: crate::x64::stack_kinds::StackKindMap,
-    /// Simulated float operand stack (V registers).
-    float_operand_stack: Vec<Arm64Register>,
-    /// Next scratch register to hand out (cycles through X9-X15).
-    scratch_cursor: u8,
-    /// Next float scratch register to hand out (cycles through V0-V7).
-    float_scratch_cursor: u8,
     /// Bytecode PC -> label mapping for branch targets.
     pc_labels: HashMap<usize, u32>,
-    /// Bytecode PC of the instruction currently being lowered.
-    ///
-    /// Read by [`Arm64Backend::label_for_pc`] to classify a branch target as
-    /// forward or backward. A backward target is a loop back-edge, and this
-    /// backend has no safepoint poll to put on one — see the "no GC safepoint
-    /// polls" note in the module header and `docs/jit/aarch64-parity.md`.
+    /// Bytecode PC of the instruction currently being lowered. Read by
+    /// [`Arm64Backend::label_for_pc`] to tell a back-edge from a forward
+    /// branch, and by the safepoint poll for its id and oop-local mask.
     cur_bytecode_pc: usize,
-    /// `max_stack` for this compilation, needed to place the safepoint home
-    /// slots after the operand area.
+    /// `max_stack` for this compilation: the operand area's size, and where
+    /// the safepoint home slots begin.
     max_stack: usize,
     /// Per-bytecode-pc "must be oop" local masks, and whether the dataflow
-    /// reached each pc. Shared with x64 (`compute_local_oop_masks`) -- the
-    /// analysis is pure bytecode. Empty when unsupported (>64 locals), which
-    /// this backend treats as "no claim" and falls back to the conservative
-    /// scan for.
+    /// reached each pc. Shared with x64 (`compute_local_oop_masks`). Empty when
+    /// unsupported (>64 locals), which this backend treats as "no claim".
     local_oop_masks: Vec<u64>,
     local_oop_reached: Vec<bool>,
     /// Which parameter slots hold references on entry. The ENTRY poll answers
-    /// from this: the dataflow's own bci-0 state is seeded with it, but the
-    /// prologue poll runs before the walk, so it reads the seed directly.
-    /// Zero unless [`Arm64Backend::set_method_descriptor`] was called.
+    /// from this. Zero unless [`Arm64Backend::set_method_descriptor`] was called.
     param_oop_mask: u64,
+    /// The JVM local slot of each incoming argument, from the descriptor
+    /// (`compute_param_jvm_slots`), or `None` for the identity layout
+    /// `0..num_params` when no descriptor was supplied.
+    param_jvm_slots: Option<Vec<usize>>,
     /// Frame offsets of reference LOCALS at the safepoint being emitted, folded
-    /// into the map by `emit_oop_map_for_safepoint`. Taken, not copied, so a
-    /// site that stages them without emitting a map cannot leak them into a
-    /// later safepoint.
+    /// into the map by `emit_oop_map_for_safepoint`. Taken, not copied.
     pending_local_oop_slots: Vec<i32>,
+    /// Frame offsets of reference OPERANDS the poll stored for its call. Taken,
+    /// not copied, like the locals.
+    pending_operand_oop_slots: Vec<i32>,
     /// Label for the shared epilogue.
     epilogue_label: u32,
-    /// Number of parameters for the current method (used for self-recursive calls).
+    /// Number of parameter SLOTS for the current method.
     num_params: usize,
     /// Method invoke metadata: maps constant pool index to argument count.
-    /// Populated by the caller (from resolved constant pool invoke entries).
     method_info: HashMap<u16, usize>,
     /// Set to true if a compilation error occurred (e.g. stack underflow).
     pub failed: bool,
-    /// Spill map: register -> frame offset for spilled operand stack entries.
-    spill_map: HashMap<Arm64Register, i32>,
-    /// T1.1.3 — parallel oop-mark vector for `operand_stack`.
-    ///
-    /// `operand_stack_oop_marks[i] == true` means the register at
-    /// `operand_stack[i]` currently holds an object reference. Pushed
-    /// in lock-step with the operand stack by the opcode handlers;
-    /// any push that isn't explicitly tagged defaults to `false` and
-    /// the conservative-sweep fallback in
-    /// `vm/src/jit/conservative_roots.rs::scan_one_frame_precise`
-    /// catches anything we miss.
-    operand_stack_oop_marks: Vec<bool>,
-    /// T1.1.3 — collected oop maps, each keyed by the native PC
-    /// offset (in the finalized instruction stream) of the
-    /// instruction immediately after a safepoint call.
+    /// T1.1.3 — collected oop maps, PC-unresolved; see [`Arm64PendingOopMap`].
     pub pending_oop_maps: Vec<Arm64PendingOopMap>,
     /// Runtime helper addresses. Zeroed until [`Arm64Backend::set_helpers`] is
-    /// called, and `safepoint_flag_addr == 0` is the same "not wired" contract
-    /// the x64 backend uses: the poll emitter then emits nothing at all.
+    /// called; `safepoint_flag_addr == 0` means "not wired" and the poll emits
+    /// nothing, the same contract x64 uses.
     helpers: crate::JitRuntimeHelpers,
     /// Bytecode PCs that are the target of a BACKWARD branch -- loop headers.
-    /// Discovered by pass 1 (see `compile_method_with_info`) and read by pass 2,
-    /// which emits a safepoint poll at each one.
+    /// Discovered by pass 1 and read by pass 2, which polls at each one.
     back_edge_targets: std::collections::HashSet<usize>,
     /// Frame offset (POSITIVE; the slot is at `[FP - sp_id_slot_off]`) of the
     /// word each safepoint stamps its id into, or 0 when none is reserved.
-    ///
-    /// The runtime reads it as `[frame_base - off]` (`active_safepoint_id`),
-    /// which is arch-neutral -- this backend's FP plays the role x64's RBP does.
     sp_id_slot_off: i32,
     /// Safepoints this compilation published a map for, and how many of those
-    /// maps could NOT describe everything live at their site.
-    ///
-    /// The aarch64 analogue of x64's `map_incomplete` accounting, and what
-    /// `fully_oop_covered` is computed from. A COUNT rather than a set of
-    /// bytecode pcs, for the reason x64 learned the hard way: two safepoints
-    /// can share one bci, and a set lets a complete map mask an incomplete one
-    /// beside it.
+    /// maps could NOT describe everything live at their site. A count, not a
+    /// set of pcs: two safepoints can share one bci.
     safepoint_count: usize,
     incomplete_oop_maps: usize,
-    /// Set by the poll when it could not describe this site; consumed by the
-    /// map writer. Taken, not copied, so a site that stages it without emitting
-    /// a map cannot leak the verdict into a later safepoint.
+    /// Set by the poll when it could not describe this site; consumed (taken)
+    /// by the map writer.
     pending_map_incomplete: bool,
     /// Whether this compilation emits safepoint polls, seeded from
-    /// [`arm64_safepoints_enabled`] in `new()`.
-    ///
-    /// A FIELD rather than a direct call to that function, because the function
-    /// latches a `OnceLock` for the life of the process and a test needs both
-    /// arms in one binary. `set_safepoints_enabled` is the only other writer.
+    /// [`arm64_safepoints_enabled`] in `new()`. A field so a test can reach
+    /// both arms of a process-latched switch.
     safepoints_enabled: bool,
 }
 
@@ -1169,7 +1522,7 @@ const SCRATCH_REGS: [Arm64Register; 7] = [
     Arm64Register::X15,
 ];
 
-/// Float scratch registers for the float operand stack (V0-V7, 8 regs).
+/// Float scratch registers for the operand stack (V0-V7, 8 regs).
 const FLOAT_SCRATCH_REGS: [Arm64Register; 8] = [
     Arm64Register::V0,
     Arm64Register::V1,
@@ -1181,6 +1534,44 @@ const FLOAT_SCRATCH_REGS: [Arm64Register; 8] = [
     Arm64Register::V7,
 ];
 
+/// Page size the stack bang probes at. AArch64 Linux, Windows and Darwin all
+/// place at least this much guard below a thread's stack.
+const STACK_BANG_PAGE_BYTES: i32 = 4096;
+
+/// Probes beyond this many refuse the method (a 2 MiB frame), for the same
+/// code-size reason as x64's `MAX_STACK_BANG_PROBES`.
+const MAX_STACK_BANG_PROBES: usize = 512;
+
+/// SP-relative distances (subtracted from SP) the prologue probes before it
+/// moves SP down by `frame_below` bytes, or `None` when the frame needs more
+/// probes than [`MAX_STACK_BANG_PROBES`].
+///
+/// The same scheme as x64's `stack_bang_frame_probe_disps`: one probe per page
+/// the new frame crosses, plus the exact frame bottom when it is not
+/// page-aligned. A frame smaller than a page needs none: it cannot step over
+/// a guard page, so its own first store already lands on the guard.
+fn stack_bang_probe_offsets(frame_below: i32) -> Option<Vec<i32>> {
+    if frame_below < 0 {
+        return None;
+    }
+    let mut offsets = Vec::new();
+    let mut off = STACK_BANG_PAGE_BYTES;
+    while off <= frame_below {
+        if offsets.len() >= MAX_STACK_BANG_PROBES {
+            return None;
+        }
+        offsets.push(off);
+        off = off.checked_add(STACK_BANG_PAGE_BYTES)?;
+    }
+    if frame_below >= STACK_BANG_PAGE_BYTES && frame_below % STACK_BANG_PAGE_BYTES != 0 {
+        if offsets.len() >= MAX_STACK_BANG_PROBES {
+            return None;
+        }
+        offsets.push(frame_below);
+    }
+    Some(offsets)
+}
+
 impl Arm64Backend {
     pub fn new() -> Self {
         Self {
@@ -1189,23 +1580,23 @@ impl Arm64Backend {
             local_regs: Vec::new(),
             float_local_regs: Vec::new(),
             operand_stack: Vec::new(),
+            held: Vec::new(),
+            label_states: HashMap::new(),
+            reachable: true,
             stack_kinds: crate::x64::stack_kinds::StackKindMap::default(),
-            float_operand_stack: Vec::new(),
-            scratch_cursor: 0,
-            float_scratch_cursor: 0,
             pc_labels: HashMap::new(),
             cur_bytecode_pc: 0,
             max_stack: 0,
             local_oop_masks: Vec::new(),
             local_oop_reached: Vec::new(),
             param_oop_mask: 0,
+            param_jvm_slots: None,
             pending_local_oop_slots: Vec::new(),
+            pending_operand_oop_slots: Vec::new(),
             epilogue_label: 0,
             num_params: 0,
             method_info: HashMap::new(),
             failed: false,
-            spill_map: HashMap::new(),
-            operand_stack_oop_marks: Vec::new(),
             pending_oop_maps: Vec::new(),
             // SAFETY: `JitRuntimeHelpers` is a plain struct of `usize`
             // addresses; all-zero is its documented "nothing wired" state, and
@@ -1220,137 +1611,75 @@ impl Arm64Backend {
         }
     }
 
-    /// T1.1.3 — mark the top of the operand stack as holding an
-    /// object reference. Called by opcode handlers after any push
-    /// that produces an oop (`aconst_null`, `aload*`, `aaload`,
-    /// `new`, `anewarray`, `newarray`, object-returning
-    /// `invoke*`). See the parallel `stack_oop_marks` mechanism in
-    /// `jit/src/x64.rs` for the x86-64 counterpart.
+    /// T1.1.3 — mark the top of the operand stack as holding an object
+    /// reference. Production pushes set the mark from the entry's kind; this
+    /// remains for tests that build a stack by hand.
     #[allow(dead_code)]
     fn mark_top_operand_as_oop(&mut self) {
-        // Lazy sync: if the oop-marks vector is shorter than the
-        // operand stack, pad with false entries. This happens when
-        // a handler pushed without going through a marking helper;
-        // the resulting map is a safe under-approximation and the
-        // conservative sweep in the GC walker catches what we miss.
-        while self.operand_stack_oop_marks.len() < self.operand_stack.len() {
-            self.operand_stack_oop_marks.push(false);
-        }
-        if let Some(last) = self.operand_stack_oop_marks.last_mut() {
-            *last = true;
+        if let Some(top) = self.operand_stack.last_mut() {
+            top.oop = true;
         }
     }
 
     /// Record this safepoint's oop map: the frame slots that hold object
     /// references right now, keyed so the encoder can give them a real PC.
     ///
-    /// # Why this does not produce an `OopMapEntry`
+    /// The PC an `OopMapEntry` needs is a BYTE OFFSET, and this backend has a
+    /// pseudo-op stream whose entries are not 4 bytes each, so the map is
+    /// recorded against the pseudo-op INDEX of the instruction that follows
+    /// the safepoint, in an [`Arm64PendingOopMap`], and
+    /// [`emit_machine_code_with_oop_maps`] translates it.
     ///
-    /// It cannot, yet. The PC an `OopMapEntry` needs is a BYTE OFFSET into the
-    /// emitted code, and at compile time this backend has only a pseudo-op
-    /// stream whose entries are not 4 bytes each -- `Label` and `Comment` emit
-    /// nothing, `ConstantPoolEntry` emits 8 bytes, `MovImm`/`AddImm`/`CmpImm`
-    /// and out-of-range `Ldr`/`Str` expand to one to four words. The 2026-08-01
-    /// parity audit found this helper keying its map as
-    /// `instruction_count * 4` and made it fail the method closed rather than
-    /// let a first caller inherit a wrong PC, noting that the fix "is to key
-    /// oop maps off the *encoder's* byte offset (`Aarch64Emitter::offset()` in
-    /// `emit_machine_code`), not off the pseudo-op count -- then delete this
-    /// guard".
-    ///
-    /// This is that fix. The map is recorded against the pseudo-op INDEX of the
-    /// instruction that follows the safepoint, in an
-    /// [`Arm64PendingOopMap`] that cannot be confused for a resolved one, and
-    /// [`emit_machine_code_with_oop_maps`] translates it once the encoder knows
-    /// where each pseudo-op landed. The guard is gone.
-    ///
-    /// # What is still missing, and it is not this
-    ///
-    /// A SAFEPOINT to call this from. The backend lowers no allocation, no call
-    /// and no monitor and refuses back edges, so a compiled method contains no
-    /// GC-capable point -- which is why this still has no production call site
-    /// and `pending_oop_maps` is still empty in practice. What changed is that
-    /// the first one will inherit a correct writer.
-    ///
-    /// This walks the OPERAND stack. Reference LOCALS reach the map through
-    /// `pending_local_oop_slots`, staged by `emit_safepoint_poll`, which stores
-    /// a register-homed one to a reserved home first -- see there for why a
-    /// callee-saved register is not good enough for a relocating collector.
-    #[allow(dead_code)]
+    /// Names: reference operands already in their depth slots, the reference
+    /// operands the poll stored for its call (`pending_operand_oop_slots`),
+    /// and the reference locals it staged (`pending_local_oop_slots`). A
+    /// reference operand still in a REGISTER is not nameable; the poll stores
+    /// every one before calling this, which is why it is the only caller.
     fn emit_oop_map_for_safepoint(&mut self, safepoint_id: u32) {
         if self.failed {
             return;
         }
-        // Lazy resync per the mark helper above.
-        while self.operand_stack_oop_marks.len() < self.operand_stack.len() {
-            self.operand_stack_oop_marks.push(false);
-        }
-        self.operand_stack_oop_marks
-            .truncate(self.operand_stack.len());
-
-        // The pseudo-op that will FOLLOW this safepoint. `instruction_count()`
-        // is `instructions.len()`, i.e. the index the next `emit` will occupy,
-        // which is the same "return address" convention x64 records.
+        // The pseudo-op that will FOLLOW this safepoint: the "return address"
+        // convention x64 records.
         let pseudo_index = match u32::try_from(self.buffer.instruction_count()) {
             Ok(n) => n,
-            // A method with more than 4 billion pseudo-ops cannot occur, but a
-            // silent truncation here would be a wrong PC again. Refuse.
             Err(_) => {
                 self.failed = true;
                 return;
             }
         };
 
+        let mut offsets: Vec<i32> = self
+            .operand_stack
+            .iter()
+            .filter(|o| o.oop)
+            .filter_map(|o| match o.loc {
+                OperandLoc::Slot(off) => Some(off),
+                OperandLoc::Reg(_) => None,
+            })
+            .collect();
+        offsets.extend(std::mem::take(&mut self.pending_operand_oop_slots));
+        offsets.extend(std::mem::take(&mut self.pending_local_oop_slots));
+
         let mut slots: Vec<i16> = Vec::new();
-        for (i, &mark) in self.operand_stack_oop_marks.iter().enumerate() {
-            if !mark {
-                continue;
-            }
-            let reg = match self.operand_stack.get(i) {
-                Some(r) => *r,
-                None => continue,
-            };
-            if let Some(&spill_off) = self.spill_map.get(&reg) {
-                match i16::try_from(spill_off) {
-                    Ok(off16) => {
-                        if !slots.contains(&off16) {
-                            slots.push(off16);
-                        }
-                    }
-                    // A spill slot further than `i16` from FP. The x64 side
-                    // counts this (`map_incomplete_cause::STACK_OFF_TOO_DEEP`)
-                    // and marks the map incomplete; here there is no
-                    // completeness channel yet, so refuse the method rather
-                    // than publish a map that silently drops a live reference.
-                    Err(_) => {
-                        self.failed = true;
-                        return;
-                    }
-                }
-            }
-        }
-        // The reference LOCALS staged by `emit_safepoint_poll`. Taken, not
-        // copied, so a site that stages them without emitting a map cannot leak
-        // them into a later safepoint (the same discipline x64's Stage 3 uses).
-        for off in std::mem::take(&mut self.pending_local_oop_slots) {
+        for off in offsets {
             match i16::try_from(off) {
                 Ok(off16) => {
                     if !slots.contains(&off16) {
                         slots.push(off16);
                     }
                 }
+                // A slot further than `i16` from FP. There is no completeness
+                // channel for this, so refuse rather than publish a map that
+                // silently drops a live reference.
                 Err(_) => {
                     self.failed = true;
                     return;
                 }
             }
         }
-        // PUBLISH EVERY SAFEPOINT, even one with no live reference. An id whose
-        // map is absent cannot be resolved by `find_oop_map_for_safepoint_id`,
-        // and "no map for this id" is indistinguishable from "this frame is not
-        // covered" -- which would sink the claim for a site that is in fact
-        // perfectly clean. x64's Stage A.2 records an entry for every safepoint
-        // under its precise gate for the same reason.
+        // PUBLISH EVERY SAFEPOINT, even one with no live reference: an id whose
+        // map is absent is indistinguishable from an uncovered frame.
         self.safepoint_count += 1;
         if std::mem::take(&mut self.pending_map_incomplete) {
             self.incomplete_oop_maps += 1;
@@ -1362,44 +1691,277 @@ impl Arm64Backend {
         });
     }
 
-    /// Allocate the next scratch register.
+    // -- The operand model ----------------------------------------------------
+
+    /// Whether some operand-stack entry lives in `reg`.
+    fn reg_is_live(&self, reg: Arm64Register) -> bool {
+        self.operand_stack
+            .iter()
+            .any(|o| o.loc == OperandLoc::Reg(reg))
+    }
+
+    /// A scratch register of the requested class that holds nothing the
+    /// current bytecode still needs. The register is HELD until the next
+    /// bytecode.
     ///
-    /// When the operand stack depth exceeds the number of physical scratch
-    /// registers (X9-X15), we spill the oldest live value to the stack frame
-    /// before reusing its register, preventing silent data corruption.
-    fn alloc_scratch(&mut self) -> Arm64Register {
-        let r = SCRATCH_REGS[self.scratch_cursor as usize % SCRATCH_REGS.len()];
-        // If we've wrapped around and this register is still live on the operand
-        // stack, spill it to a frame spill slot before reusing.
-        if self.scratch_cursor as usize >= SCRATCH_REGS.len() {
-            if let Some(pos) = self.operand_stack.iter().position(|&reg| reg == r) {
-                // THE BASE IS THE FRAME-HOMED LOCAL COUNT, not `num_reg_locals`.
-                // Those are complements: `num_reg_locals` counts the locals that
-                // got a REGISTER, while the spill area holds the ones that did
-                // not. Basing operands at the former aliased a local's slot
-                // whenever fewer than half the locals were register-homed, and
-                // ran past the reserved area into the callee-save slots when
-                // more than half were. `num_spills = gpr_spills + max_stack` is
-                // sized for this base.
-                let base = self.local_spill_count();
-                let frame = self.frame.as_ref().unwrap();
-                let spill_slot = base + pos;
-                let offset = frame.spill_offset
-                    + i32::try_from(spill_slot)
-                        .unwrap_or(i32::MAX)
-                        .saturating_mul(8);
-                // Spill the register to its frame slot.
-                self.buffer.emit(Arm64Instruction::Str {
-                    rt: r,
-                    rn: Arm64Register::FP,
-                    offset,
-                });
-                // Record the spill so pop_operand can reload it.
-                self.spill_map.insert(r, offset);
+    /// When every register of the class is live or held, the DEEPEST
+    /// register-located entry is moved to its depth slot first. The entry
+    /// records the move, so its value is found again by depth -- never by
+    /// asking which register it used to be in.
+    fn alloc_reg(&mut self, fp: bool) -> Arm64Register {
+        let pool: &'static [Arm64Register] = if fp {
+            &FLOAT_SCRATCH_REGS
+        } else {
+            &SCRATCH_REGS
+        };
+        if let Some(&reg) = pool
+            .iter()
+            .find(|&&r| !self.held.contains(&r) && !self.reg_is_live(r))
+        {
+            self.held.push(reg);
+            return reg;
+        }
+        let victim = self.operand_stack.iter().position(|o| match o.loc {
+            OperandLoc::Reg(r) => pool.contains(&r) && !self.held.contains(&r),
+            OperandLoc::Slot(_) => false,
+        });
+        let Some(depth) = victim else {
+            // Every register of the class is held by this one bytecode. No
+            // bytecode needs that many; refuse rather than alias.
+            self.failed = true;
+            return pool[0];
+        };
+        let OperandLoc::Reg(reg) = self.operand_stack[depth].loc else {
+            self.failed = true;
+            return pool[0];
+        };
+        if !self.spill_entry(depth) {
+            return pool[0];
+        }
+        self.held.push(reg);
+        reg
+    }
+
+    /// Move entry `depth` from its register into its depth slot. `false` (and
+    /// `failed`) when the slot is outside the reserved operand area.
+    fn spill_entry(&mut self, depth: usize) -> bool {
+        let Some(entry) = self.operand_stack.get(depth).copied() else {
+            self.failed = true;
+            return false;
+        };
+        let OperandLoc::Reg(reg) = entry.loc else {
+            return true;
+        };
+        let Some(offset) = self.spill_offset_for_depth(depth) else {
+            self.failed = true;
+            return false;
+        };
+        self.emit_store_kind(reg, entry.kind, offset);
+        self.operand_stack[depth].loc = OperandLoc::Slot(offset);
+        true
+    }
+
+    /// Put every entry in its depth slot: the one layout that every path into
+    /// a branch target agrees on.
+    fn spill_all(&mut self) {
+        for depth in 0..self.operand_stack.len() {
+            if !self.spill_entry(depth) {
+                return;
             }
         }
-        self.scratch_cursor += 1;
-        r
+    }
+
+    /// Store `reg` (holding a `kind`) to `[FP + offset]` at the kind's width.
+    fn emit_store_kind(&mut self, reg: Arm64Register, kind: OperandKind, offset: i32) {
+        let inst = match kind {
+            OperandKind::F32 | OperandKind::F64 => Arm64Instruction::FpStr {
+                vt: reg,
+                rn: Arm64Register::FP,
+                offset,
+                is_double: kind == OperandKind::F64,
+            },
+            _ => Arm64Instruction::Str {
+                rt: reg,
+                rn: Arm64Register::FP,
+                offset,
+            },
+        };
+        self.buffer.emit(inst);
+    }
+
+    /// Load a `kind` from `[FP + offset]` into `reg` at the kind's width.
+    fn emit_load_kind(&mut self, reg: Arm64Register, kind: OperandKind, offset: i32) {
+        let inst = match kind {
+            OperandKind::F32 | OperandKind::F64 => Arm64Instruction::FpLdr {
+                vt: reg,
+                rn: Arm64Register::FP,
+                offset,
+                is_double: kind == OperandKind::F64,
+            },
+            _ => Arm64Instruction::Ldr {
+                rt: reg,
+                rn: Arm64Register::FP,
+                offset,
+            },
+        };
+        self.buffer.emit(inst);
+    }
+
+    /// Push a value the current bytecode computed into `reg`.
+    fn push_reg(&mut self, kind: OperandKind, reg: Arm64Register) {
+        self.operand_stack.push(Operand::in_reg(kind, reg));
+    }
+
+    /// Push `entry`'s kind and oop mark, now living in `reg`.
+    fn push_like(&mut self, entry: Operand, reg: Arm64Register) {
+        self.operand_stack.push(Operand {
+            loc: OperandLoc::Reg(reg),
+            ..entry
+        });
+    }
+
+    /// Pop the top entry into a register, reloading it from its slot when it
+    /// was spilled. The register is HELD for the rest of this bytecode.
+    /// Underflow sets `failed` and answers `None`.
+    fn pop_entry(&mut self) -> Option<(Arm64Register, Operand)> {
+        let Some(entry) = self.operand_stack.pop() else {
+            self.failed = true;
+            return None;
+        };
+        match entry.loc {
+            OperandLoc::Reg(reg) => {
+                self.held.push(reg);
+                Some((reg, entry))
+            }
+            OperandLoc::Slot(offset) => {
+                let reg = self.alloc_reg(entry.kind.is_fp());
+                self.emit_load_kind(reg, entry.kind, offset);
+                Some((reg, entry))
+            }
+        }
+    }
+
+    /// Pop an entry that must be a `want`. Any other kind is a malformed
+    /// method (the verifier would reject it) or a model bug; either refuses.
+    fn pop_kind(&mut self, want: OperandKind) -> Arm64Register {
+        let fallback = if want.is_fp() {
+            Arm64Register::V0
+        } else {
+            Arm64Register::X0
+        };
+        match self.pop_entry() {
+            Some((reg, entry)) if entry.kind == want => reg,
+            Some(_) => {
+                self.failed = true;
+                fallback
+            }
+            None => fallback,
+        }
+    }
+
+    /// Pop an integer-class (int, long or reference) entry. Returns X0 as a
+    /// sentinel and sets `self.failed = true` on underflow or an FP entry.
+    pub fn pop_operand(&mut self) -> Arm64Register {
+        match self.pop_entry() {
+            Some((reg, entry)) if !entry.kind.is_fp() => reg,
+            Some(_) => {
+                self.failed = true;
+                Arm64Register::X0
+            }
+            None => Arm64Register::X0,
+        }
+    }
+
+    /// Discard the top entry without materializing it.
+    fn drop_top(&mut self) {
+        if self.operand_stack.pop().is_none() {
+            self.failed = true;
+        }
+    }
+
+    /// Re-establish the sign-extended `int` form after a W-form producer.
+    fn emit_sxtw(&mut self, reg: Arm64Register) {
+        self.buffer
+            .emit(Arm64Instruction::Sxtw { rd: reg, rn: reg });
+    }
+
+    /// The kind and oop mark of every entry, bottom first.
+    fn stack_shape(&self) -> Vec<(OperandKind, bool)> {
+        self.operand_stack.iter().map(|o| (o.kind, o.oop)).collect()
+    }
+
+    /// Record `shape` for target `pc`, or refuse the method when a different
+    /// path already recorded a different one.
+    fn check_or_record_shape(&mut self, pc: usize, shape: Vec<(OperandKind, bool)>) {
+        match self.label_states.get(&pc) {
+            Some(existing) if *existing != shape => self.failed = true,
+            Some(_) => {}
+            None => {
+                self.label_states.insert(pc, shape);
+            }
+        }
+    }
+
+    /// Everything a branch to `target` must do before it is emitted: put the
+    /// stack in its canonical all-slots layout, record that shape, and resolve
+    /// the label. Only STORES are emitted, so flags and held registers survive.
+    fn prepare_branch(&mut self, target: usize) -> u32 {
+        self.spill_all();
+        let shape = self.stack_shape();
+        self.check_or_record_shape(target, shape);
+        self.label_for_pc(target)
+    }
+
+    /// The walk is about to fall into branch target `pc`: arrive in the layout
+    /// the branches to it use.
+    fn arrive_at_target(&mut self, pc: usize) {
+        self.spill_all();
+        let shape = self.stack_shape();
+        self.check_or_record_shape(pc, shape);
+    }
+
+    /// Rebuild the model at a pc control cannot fall into: from the shape a
+    /// branch recorded, else from the shared stack-kind analysis. With neither
+    /// the pc is unreachable, and it is lowered against an empty stack -- at
+    /// worst an underflow refuses the method.
+    fn restore_stack_at(&mut self, pc: usize) {
+        let shape = match self.label_states.get(&pc) {
+            Some(s) => Some(s.clone()),
+            None => self.shape_from_analysis(pc),
+        };
+        self.operand_stack.clear();
+        let Some(shape) = shape else {
+            return;
+        };
+        for (depth, (kind, oop)) in shape.into_iter().enumerate() {
+            let Some(offset) = self.spill_offset_for_depth(depth) else {
+                self.failed = true;
+                return;
+            };
+            self.operand_stack.push(Operand {
+                kind,
+                loc: OperandLoc::Slot(offset),
+                oop,
+            });
+        }
+    }
+
+    /// The operand-stack shape at `pc` according to the shared analysis, or
+    /// `None` when it has no answer or an entry is untyped.
+    fn shape_from_analysis(&self, pc: usize) -> Option<Vec<(OperandKind, bool)>> {
+        use crate::x64::stack_kinds::StackKind;
+        self.stack_kinds
+            .get(pc)?
+            .iter()
+            .map(|k| match k {
+                StackKind::Int => Some((OperandKind::I32, false)),
+                StackKind::Long => Some((OperandKind::I64, false)),
+                StackKind::Float => Some((OperandKind::F32, false)),
+                StackKind::Double => Some((OperandKind::F64, false)),
+                StackKind::Ref => Some((OperandKind::Ref, true)),
+                StackKind::Unknown => None,
+            })
+            .collect()
     }
 
     /// Supply the runtime helper addresses this backend needs for a safepoint
@@ -1412,45 +1974,43 @@ impl Arm64Backend {
     /// Override the safepoint-poll decision for this compilation.
     ///
     /// Exists because [`arm64_safepoints_enabled`] latches a `OnceLock`, so a
-    /// test binary can only ever observe one arm of it; both arms have to be
-    /// reachable, since "off is byte-identical to before" is itself a claim
-    /// that needs asserting.
+    /// test binary can only ever observe one arm of it.
     pub fn set_safepoints_enabled(&mut self, on: bool) {
         self.safepoints_enabled = on;
     }
 
-    /// Seed the reference-parameter mask from this method's descriptor.
+    /// Seed the reference-parameter mask and the argument-to-slot layout from
+    /// this method's descriptor.
     ///
-    /// Must be called BEFORE compiling: `compile_pass` feeds it to
-    /// `compute_local_oop_masks` as the dataflow's entry state, and the ENTRY
-    /// poll reads it directly (the prologue runs before the walk, so there is
-    /// no bci to look up there).
-    ///
-    /// Without it the mask is 0, and a reference PARAMETER that is never
-    /// `astore`d is never named -- covered by the conservative scan, but not
-    /// precisely, which is the difference that matters to a relocating
-    /// collector.
+    /// Must be called BEFORE compiling. The mask feeds
+    /// `compute_local_oop_masks` and the entry poll. The slot layout is what
+    /// the prologue homes each argument by: the VM passes ONE register per
+    /// argument, and a `long`/`double` argument occupies TWO JVM local slots,
+    /// so argument `i` is local `i` only while every earlier argument is
+    /// category 1. Without a descriptor the identity layout is assumed, which
+    /// is right for exactly those signatures.
     pub fn set_method_descriptor(&mut self, descriptor: &str, is_static: bool) {
         self.param_oop_mask = crate::compute_param_oop_mask(descriptor, is_static);
+        self.param_jvm_slots = Some(crate::compute_param_jvm_slots(descriptor, is_static).0);
     }
 
     /// Publish this frame's base so the GC root walk can find it.
     ///
     /// The safepoint-id slot is read as `[frame_base - sp_id_slot_off]`, and
-    /// the runtime learns `frame_base` from `set_top_frame_base`, which the x64
-    /// prologue calls through `helpers.frame_record`. Without this call the
-    /// slot is unreadable and every map keyed through it is unreachable -- the
-    /// id would be published into a frame nothing can locate.
-    ///
-    /// Emitted beside the ENTRY POLL rather than in the prologue, and for the
-    /// same reason: it is a CALL, and X0-X7 still hold the incoming arguments
-    /// until `compile_pass` copies them out. FP is the base this backend
+    /// the runtime learns `frame_base` from `set_top_frame_base`, which it is
+    /// told through `helpers.frame_record`. FP is the base this backend
     /// publishes, playing the role x64's RBP does.
     ///
-    /// No helper wired means no call at all -- the same optional-helper
-    /// contract the poll uses.
+    /// Emitted after the arguments are homed and before the entry poll. The
+    /// call clobbers X0-X17 and V0-V7, which is sound only because nothing is
+    /// on the operand stack yet; a non-empty stack here refuses the method
+    /// rather than lose a value across the call.
     fn emit_frame_record(&mut self) {
         if self.failed || !self.safepoints_enabled || self.helpers.frame_record == 0 {
+            return;
+        }
+        if !self.operand_stack.is_empty() {
+            self.failed = true;
             return;
         }
         self.buffer.emit(Arm64Instruction::Mov {
@@ -1468,66 +2028,53 @@ impl Arm64Backend {
 
     /// Emit a cooperative GC safepoint poll.
     ///
-    /// The x64 shape, transliterated (see `x64::Compiler::emit_safepoint_poll`):
-    ///
     /// ```text
     ///     MOVZ/MOVK X16, #safepoint_flag_addr
     ///     LDRB      W17, [X16]          ; ONE byte -- the flag is an AtomicBool
     ///     CBZ       X17, skip           ; clear -> no safepoint requested
-    ///     <spill live operand registers to frame slots>
+    ///     <store every register-located operand, GPR and FP, to its slot>
+    ///     <store register-homed reference locals to their homes>
+    ///     <stamp the safepoint id>
     ///     MOVZ/MOVK X16, #safepoint_slow_path
     ///     BLR       X16
     ///     <oop map recorded at the return address>
-    ///     <reload the spilled operand registers>
+    ///     <reload the locals and the operands>
     ///   skip:
     /// ```
     ///
-    /// # The register choice is the ABI's own answer
+    /// X16/X17 are IP0/IP1, which AAPCS64 reserves for exactly this and which
+    /// hold no operand or local. Java locals live in X19-X28, which the call
+    /// preserves. The operand stack lives in X9-X15 and V0-V7, which it does
+    /// not -- hence the store and reload. Both classes: this used to spill
+    /// only the GPR operands, so a live float or double operand in V0-V7 was
+    /// destroyed by every taken poll.
     ///
-    /// X16/X17 are IP0/IP1, the intra-procedure-call scratch registers AAPCS64
-    /// reserves for exactly this; they are caller-saved and hold no operand or
-    /// local. Java locals live in X19-X28, which are callee-SAVED, so the call
-    /// preserves them. The operand stack lives in X9-X15, which are caller-
-    /// saved and would be destroyed -- hence the spill.
+    /// # Why the stores and reloads sit INSIDE the branch
     ///
-    /// # Why the spill and reload sit INSIDE the branch
-    ///
-    /// `spill_map` is a compile-time model that `pop_operand` consults to decide
-    /// whether to reload. If the spill were emitted only on the taken path but
-    /// recorded in `spill_map` unconditionally, then on the NOT-taken path
-    /// (flag clear -- the overwhelmingly common case) `pop_operand` would emit a
-    /// reload of a frame slot that was never written, reading garbage as a live
-    /// value. So the entries are added for the duration of the map write and
-    /// removed again, and the registers are restored before the join: the model
-    /// on both paths is identical, which is the only way a compile-time model
-    /// and a runtime branch can agree.
+    /// They leave the compile-time model exactly as it was: an operand that was
+    /// in a register is in the same register again on both paths, so the model
+    /// and the two runtime paths agree without a merge.
     ///
     /// # What the GC sees
     ///
-    /// The oop map is recorded at the BLR's return address, naming the frame
-    /// slots the spill just wrote -- the same convention x64 uses. Reference
-    /// locals in callee-saved registers are NOT named: the callee spills
-    /// X19-X28 into its own frame, which the conservative stack walk covers.
-    /// That is sound for a MARKING collector and NOT for a relocating one,
-    /// which cannot rewrite through a conservative scan -- so a moving
-    /// collector on this backend needs register naming first. Same caveat as
-    /// `emit_oop_map_for_safepoint`, restated here because this is the site
-    /// that creates the exposure.
+    /// The map, recorded at the BLR's return address, names every reference
+    /// operand (now in its depth slot) and every reference LOCAL: a frame-homed
+    /// one where it lives, and a register-homed one at the home it was just
+    /// stored to. Register homes are callee-saved, so the value would survive
+    /// on its own -- but inside the CALLEE's save area, where only a
+    /// conservative walk sees it, and a conservative walk cannot rewrite a
+    /// relocated object. The reload afterwards is what carries a moved
+    /// object's new address back into the register.
     fn emit_safepoint_poll(&mut self, entry: bool) {
         if self.failed || !self.safepoints_enabled {
             return;
         }
-        // The "not wired" contract, identical to x64's: no flag address means
-        // no poll code at all, rather than a call through a null pointer.
+        // The "not wired" contract, identical to x64's.
         if self.helpers.safepoint_flag_addr == 0 || self.helpers.safepoint_slow_path == 0 {
             return;
         }
-        // THE SAFEPOINT ID. The bytecode pc of the site, or the synthetic
-        // `ENTRY_POLL_BC_PC` for the method-entry poll -- the same two values
-        // x64 uses, because this is the runtime's contract
-        // (`active_safepoint_id` matches it against `OopMapEntry::bytecode_pc`)
-        // and not an x64 detail. bci 0 is legal, which is why the entry poll
-        // needs a synthetic pc of its own rather than reusing 0.
+        // THE SAFEPOINT ID: the site's bci, or the synthetic `ENTRY_POLL_BC_PC`
+        // for the method-entry poll (bci 0 is a legal site of its own).
         let safepoint_id = if entry {
             crate::x64::safepoint::ENTRY_POLL_BC_PC as u32
         } else {
@@ -1555,49 +2102,34 @@ impl Arm64Backend {
             label: skip,
         });
 
-        // Spill every live operand register that is not already spilled, and
-        // remember which ones WE added so the removal below is exact.
-        let mut added: Vec<Arm64Register> = Vec::new();
-        let live: Vec<Arm64Register> = self.operand_stack.clone();
-        for (depth, reg) in live.iter().enumerate() {
-            if self.spill_map.contains_key(reg) || added.contains(reg) {
+        // Store every register-located operand for the call. An operand that
+        // is already in its slot needs nothing; the map writer names it.
+        let mut stored: Vec<(Arm64Register, OperandKind, i32)> = Vec::new();
+        for depth in 0..self.operand_stack.len() {
+            let operand = self.operand_stack[depth];
+            let OperandLoc::Reg(reg) = operand.loc else {
                 continue;
-            }
+            };
             let Some(offset) = self.spill_offset_for_depth(depth) else {
-                // No slot reserved for this depth. Publishing a poll whose
-                // spill cannot be placed would leave a live reference in a
-                // caller-saved register across a CALL, so refuse the method.
+                // No slot for this depth: a live value would sit in a
+                // caller-saved register across a CALL. Refuse the method.
                 self.failed = true;
                 return;
             };
-            self.buffer.emit(Arm64Instruction::Str {
-                rt: *reg,
-                rn: Arm64Register::FP,
-                offset,
-            });
-            self.spill_map.insert(*reg, offset);
-            added.push(*reg);
+            self.emit_store_kind(reg, operand.kind, offset);
+            if operand.oop {
+                self.pending_operand_oop_slots.push(offset);
+            }
+            stored.push((reg, operand.kind, offset));
         }
 
         // NAME THE REFERENCE LOCALS.
-        //
-        // A frame-homed local is already in a slot, so it only has to be named.
-        // A REGISTER-homed one is the case this exists for: X19-X28 are
-        // callee-saved, so its value survives the call -- but it survives
-        // inside the CALLEE's saved-register area, where only the conservative
-        // walk can see it, and a conservative walk marks without being able to
-        // REWRITE. A relocating collector therefore cannot move an object whose
-        // only root is a register local. Storing it to a reserved home makes it
-        // a nameable, rewritable root; the reload after the call is what carries
-        // a moved object's new address back into the register.
         let mut reg_homed: Vec<(usize, i32)> = Vec::new();
         let claim = self.oop_locals_at_current_pc(entry);
         if claim.is_none() && !self.local_regs.is_empty() {
             // The dataflow could not answer for this site (an unreached pc, or
-            // more than 64 locals), so the map names no locals while some may
-            // be live. Sound only while a conservative scan still runs -- which
-            // is exactly what `fully_oop_covered` switches off, so this method
-            // must not make that claim.
+            // more than 64 locals). Sound only while a conservative scan still
+            // runs, so this method may not claim full coverage.
             self.pending_map_incomplete = true;
         }
         if let Some(mut mask) = claim {
@@ -1608,14 +2140,10 @@ impl Arm64Backend {
                 if i >= self.local_regs.len() {
                     continue;
                 }
-                if self.local_regs.get(i).copied().flatten().is_some() {
-                    let (Some(off), Some(reg)) = (
-                        self.safepoint_home_for_reg_local(i),
-                        self.local_regs.get(i).copied().flatten(),
-                    ) else {
+                if let Some(reg) = self.local_regs.get(i).copied().flatten() {
+                    let Some(off) = self.safepoint_home_for_reg_local(i) else {
                         // No home reserved: refuse rather than leave a live
-                        // reference reachable only through a conservative scan
-                        // while claiming to have named the frame.
+                        // reference reachable only through a conservative scan.
                         self.failed = true;
                         return;
                     };
@@ -1626,28 +2154,12 @@ impl Arm64Backend {
                     });
                     self.pending_local_oop_slots.push(off);
                     reg_homed.push((i, off));
-                } else if entry {
-                    // A frame-homed PARAMETER has no home yet at the entry
-                    // poll: the argument copy above materializes only the
-                    // register-homed ones, so this slot is uninitialized stack.
-                    // Naming it would hand the collector a word nothing wrote.
-                    // Skipped rather than named -- and the method's coverage
-                    // claim goes with it, because "skipped" means a live root
-                    // this map does not describe.
-                    self.pending_map_incomplete = true;
-                    continue;
                 } else {
-                    // Frame-homed: already where the GC can read and rewrite it.
-                    let Some(frame) = self.frame.as_ref() else {
-                        self.failed = true;
-                        return;
-                    };
-                    let slot = self.spill_index_for(i);
-                    let Some(off) = i32::try_from(slot)
-                        .ok()
-                        .and_then(|n| n.checked_mul(8))
-                        .and_then(|n| frame.spill_offset.checked_add(n))
-                    else {
+                    // Frame-homed: already where the GC can read and rewrite
+                    // it. At the ENTRY poll that includes frame-homed reference
+                    // PARAMETERS, which the argument homing stored before this
+                    // poll runs.
+                    let Some(off) = self.local_slot_offset(i) else {
                         self.failed = true;
                         return;
                     };
@@ -1677,13 +2189,9 @@ impl Arm64Backend {
         self.buffer.emit(Arm64Instruction::Blr {
             rn: Arm64Register::X16,
         });
-        // At the return address, with the operand oops in frame slots.
         self.emit_oop_map_for_safepoint(safepoint_id);
 
-        // Reload every register-homed local the GC may have REWRITTEN. Without
-        // this the frame slot carries the object's new address while the
-        // register still holds the old one -- the map would be correct and the
-        // running code would not.
+        // Reload every register-homed local the GC may have REWRITTEN.
         for (i, off) in &reg_homed {
             if let Some(reg) = self.local_regs.get(*i).copied().flatten() {
                 self.buffer.emit(Arm64Instruction::Ldr {
@@ -1693,16 +2201,9 @@ impl Arm64Backend {
                 });
             }
         }
-
-        // Restore, and put the compile-time model back exactly as it was.
-        for reg in &added {
-            if let Some(offset) = self.spill_map.remove(reg) {
-                self.buffer.emit(Arm64Instruction::Ldr {
-                    rt: *reg,
-                    rn: Arm64Register::FP,
-                    offset,
-                });
-            }
+        // ...and every operand, into the register the model says it is in.
+        for (reg, kind, offset) in stored {
+            self.emit_load_kind(reg, kind, offset);
         }
         self.buffer.bind_label(skip);
     }
@@ -1711,15 +2212,11 @@ impl Arm64Backend {
     /// when no claim can be made.
     ///
     /// `None` is a REFUSAL, not "no oop locals": the dataflow is empty above 64
-    /// locals and unreached at pcs only an exception edge can arrive at, and
-    /// treating either as "nothing live" is how a collector loses a root. The
-    /// caller falls back to naming nothing, which leaves those frames to the
-    /// conservative scan -- correct, just less precise.
+    /// locals and unreached at pcs only an exception edge can arrive at.
     fn oop_locals_at_current_pc(&self, entry: bool) -> Option<u64> {
         if entry {
-            // The prologue poll runs before the walk, so there is no bci to
-            // look up; the live oops there are exactly the reference
-            // parameters, which is what seeds the dataflow at bci 0.
+            // The entry poll runs before the walk; the live oops there are
+            // exactly the reference parameters.
             return Some(self.param_oop_mask);
         }
         if self.local_oop_masks.is_empty() {
@@ -1737,13 +2234,10 @@ impl Arm64Backend {
     }
 
     /// Frame offset of the safepoint home reserved for register-homed local
-    /// `index`, or `None` if it has no register (it lives in a spill slot
-    /// already) or no home was reserved.
+    /// `index`, or `None` if it has no register or no home was reserved.
     ///
     /// Homes sit after the operand area: `local_spill_count() + max_stack + k`,
-    /// where `k` numbers the register-homed locals in order. That is the tail
-    /// `num_spills` was extended by, so a home can never collide with a local's
-    /// slot or an operand's.
+    /// where `k` numbers the register-homed locals in order.
     fn safepoint_home_for_reg_local(&self, index: usize) -> Option<i32> {
         self.local_regs.get(index).copied().flatten()?;
         let k = (0..index)
@@ -1761,27 +2255,19 @@ impl Arm64Backend {
         frame.spill_offset.checked_add(scaled)
     }
 
-    /// Frame offset of the spill slot for operand-stack depth `depth`, or
-    /// `None` when that slot is outside the reserved spill area.
+    /// Frame offset of the slot reserved for operand-stack depth `depth`, or
+    /// `None` when `depth` is outside the operand area.
     ///
-    /// MIRRORS `alloc_scratch` EXACTLY, sharing its base through
-    /// [`Self::local_spill_count`]. The two are the only writers of `spill_map`
-    /// and must agree about where a given depth lives, or the oop map names a
-    /// slot nothing wrote.
-    ///
-    /// (An earlier version of this comment said the base was `num_reg_locals`
-    /// because "the spill area holds the register-homed locals FIRST". That is
-    /// backwards -- the spill area holds the locals that got NO register -- and
-    /// copying `alloc_scratch` faithfully copied its bug. See
-    /// `operand_spill_slots_do_not_alias_frame_homed_locals`.)
-    ///
-    /// `alloc_scratch` reaches this arithmetic only for a depth it has already
-    /// proved live, so it can saturate; the poll can be asked about any depth,
-    /// so it bound-checks against the reserved area and refuses instead.
+    /// The operand area is `[local_spill_count(), local_spill_count() +
+    /// max_stack)`. `max_stack` counts JVM slots and every entry takes at least
+    /// one, so every legal depth has a slot. A depth at or past `max_stack`
+    /// would land on a safepoint home or the id word, so it refuses instead.
     fn spill_offset_for_depth(&self, depth: usize) -> Option<i32> {
-        let base = self.local_spill_count();
+        if depth >= self.max_stack {
+            return None;
+        }
         let frame = self.frame.as_ref()?;
-        let spill_slot = base.checked_add(depth)?;
+        let spill_slot = self.local_spill_count().checked_add(depth)?;
         if spill_slot >= frame.num_spills {
             return None;
         }
@@ -1790,9 +2276,6 @@ impl Arm64Backend {
     }
 
     /// Run the shared operand-stack kind analysis over `bytecode`.
-    ///
-    /// See the `stack_kinds` field for why empty metadata is sufficient on
-    /// this backend.
     fn analyze_stack_kinds(bytecode: &[u8]) -> crate::x64::stack_kinds::StackKindMap {
         use crate::x64::stack_kinds::{analyze, StackKindInputs};
         let refs = rustc_hash::FxHashSet::default();
@@ -1808,184 +2291,90 @@ impl Arm64Backend {
         analyze(bytecode, bytecode.len(), &inputs)
     }
 
-    /// How many `operand_stack` entries the stack-shuffle at `pc` may touch,
-    /// or `None` when this backend must refuse the method.
+    /// Whether each of the top `want` entries is category 2, top first, or
+    /// `None` when the stack holds fewer entries.
     ///
-    /// `want` is the number of TOP-OF-STACK entries the arm needs to be
-    /// integer-stack values; the answer is `Some(n)` only when the analysis
-    /// types all of them and none is a `float`/`double`.
-    ///
-    /// **Why a refusal and not a shuffle.** The shuffle arms below were written
-    /// against a single stack of category-1 values, and this backend has
-    /// neither property:
-    ///
-    ///   * A `float`/`double` operand lives on `float_operand_stack`. Popping
-    ///     `operand_stack` for it takes an unrelated value — or underflows into
-    ///     a caller's entry — and pushes the shuffled result onto a stack the
-    ///     consuming arm will not read.
-    ///   * A `long` is ONE entry here and TWO JVM slots, so every
-    ///     `pop2`/`dup2`/`dup2_x1`/`dup2_x2`/`dup_x2` form except the
-    ///     all-category-1 one touches a different number of entries than the
-    ///     arm popped.
-    ///
-    /// Both produce a silently wrong operand stack, which this file's own
-    /// `irem`/`lrem` note already calls worse than a bail: "A silent wrong
-    /// answer is worse than a bail". This is the answer to the question the
-    /// x64 `dup2_x2` page left open — whether that backend's unconditional
-    /// four-pop was live here. It was, and so were four more arms.
-    fn int_stack_shuffle_entries(&mut self, pc: usize, want: usize) -> Option<Vec<bool>> {
-        let kinds = self.stack_kinds.get(pc)?;
-        if kinds.len() < want {
+    /// The stack shuffles are specified in JVM SLOTS and categories, and this
+    /// model has one entry per VALUE, typed. So each shuffle arm resolves its
+    /// JVMS form from these categories, and a form the JVMS does not define
+    /// (a `dup` of a `long`, say) refuses the method.
+    fn top_categories(&self, want: usize) -> Option<Vec<bool>> {
+        let n = self.operand_stack.len();
+        if n < want {
             return None;
         }
-        let mut cats = Vec::with_capacity(want);
-        for k in kinds[kinds.len() - want..].iter().rev() {
-            match k {
-                crate::x64::stack_kinds::StackKind::Int
-                | crate::x64::stack_kinds::StackKind::Ref => cats.push(false),
-                crate::x64::stack_kinds::StackKind::Long => cats.push(true),
-                // Float / Double live on the OTHER stack; Unknown is not a
-                // guess this may make.
-                _ => return None,
-            }
-        }
-        // `cats[0]` is the top, `cats[1]` the entry below it, ...
-        Some(cats)
+        Some(
+            self.operand_stack[n - want..]
+                .iter()
+                .rev()
+                .map(|o| o.kind.is_category2())
+                .collect(),
+        )
     }
 
-    /// The shared `dup2_x1` / `dup2_x2` shuffle:
-    /// `[under.., group..] -> [group.., under.., group..]`, counted in
-    /// `operand_stack` ENTRIES rather than JVM slots.
-    ///
-    /// Both opcodes differ only in how many entries each group is, and both
-    /// resolve that from [`Arm64Backend::int_stack_shuffle_entries`] before
-    /// calling here, so this routine never has to guess a category.
+    /// A fresh register holding a copy of the `kind` value in `reg`.
+    fn copy_value(&mut self, reg: Arm64Register, kind: OperandKind) -> Arm64Register {
+        let dst = self.alloc_reg(kind.is_fp());
+        let inst = match kind {
+            OperandKind::F32 => Arm64Instruction::FmovFpSingle { vd: dst, vn: reg },
+            OperandKind::F64 => Arm64Instruction::FmovFp { vd: dst, vn: reg },
+            _ => Arm64Instruction::Mov { rd: dst, rm: reg },
+        };
+        self.buffer.emit(inst);
+        dst
+    }
+
+    /// The shared duplicate shuffle, `[under.., group..] -> [group'.., under..,
+    /// group..]`, counted in ENTRIES. Every `dup*` form is one of these once
+    /// its categories are resolved: `dup` is (1, 0), `dup_x1` (1, 1), `dup2` of
+    /// two category-1 values (2, 0), and so on.
     fn emit_dup_group_over(&mut self, group_entries: usize, under_entries: usize) {
-        // Pop top-down: `group[0]` is the topmost value.
         let mut group = Vec::with_capacity(group_entries);
         for _ in 0..group_entries {
-            group.push(self.pop_operand());
+            match self.pop_entry() {
+                Some(e) => group.push(e),
+                None => return,
+            }
         }
         let mut under = Vec::with_capacity(under_entries);
         for _ in 0..under_entries {
-            under.push(self.pop_operand());
+            match self.pop_entry() {
+                Some(e) => under.push(e),
+                None => return,
+            }
         }
-        // One fresh scratch per duplicated entry. `alloc_scratch` round-robins,
-        // so take them all before emitting to avoid a copy landing in a
-        // register a later copy is about to overwrite.
-        let copies: Vec<Arm64Register> = (0..group_entries).map(|_| self.alloc_scratch()).collect();
-        for (copy, src) in copies.iter().zip(group.iter()) {
-            self.buffer.emit(Arm64Instruction::Mov {
-                rd: *copy,
-                rm: *src,
-            });
+        let copies: Vec<Arm64Register> = group
+            .iter()
+            .map(|&(reg, e)| self.copy_value(reg, e.kind))
+            .collect();
+        for (&copy, &(_, e)) in copies.iter().zip(group.iter()).rev() {
+            self.push_like(e, copy);
         }
-        for copy in copies.into_iter().rev() {
-            self.push_operand(copy);
+        for &(reg, e) in under.iter().rev() {
+            self.push_like(e, reg);
         }
-        for reg in under.into_iter().rev() {
-            self.push_operand(reg);
+        for &(reg, e) in group.iter().rev() {
+            self.push_like(e, reg);
         }
-        for reg in group.into_iter().rev() {
-            self.push_operand(reg);
-        }
-    }
-
-    /// Push a value onto the simulated operand stack.
-    fn push_operand(&mut self, reg: Arm64Register) {
-        self.operand_stack.push(reg);
-        // LOCKSTEP. The mark vector must grow and shrink with the stack, or a
-        // mark outlives the value it described and is re-read as belonging to
-        // whatever later occupies that index -- naming a primitive as a
-        // reference, or losing a reference entirely. `false` is the right
-        // default: every producer on this backend pushes a primitive except
-        // `aconst_null` and `aload*`, which call `mark_top_operand_as_oop`
-        // immediately after. See
-        // `operand_oop_marks_track_the_value_not_the_index`.
-        self.operand_stack_oop_marks.push(false);
-    }
-
-    /// Pop the top of the simulated operand stack.
-    /// If the register was spilled, emits a reload from the frame slot.
-    /// Returns X0 as sentinel and sets `self.failed = true` on underflow.
-    pub fn pop_operand(&mut self) -> Arm64Register {
-        let reg = self.operand_stack.pop().unwrap_or_else(|| {
-            self.failed = true;
-            Arm64Register::X0
-        });
-        // ...and drop this value's mark with it.
-        self.operand_stack_oop_marks.pop();
-        // If this register was spilled, reload it from the frame slot.
-        if let Some(offset) = self.spill_map.remove(&reg) {
-            self.buffer.emit(Arm64Instruction::Ldr {
-                rt: reg,
-                rn: Arm64Register::FP,
-                offset,
-            });
-        }
-        reg
-    }
-
-    /// Allocate the next float scratch register (round-robin over V0-V7).
-    fn alloc_float_scratch(&mut self) -> Arm64Register {
-        let r = FLOAT_SCRATCH_REGS[self.float_scratch_cursor as usize % FLOAT_SCRATCH_REGS.len()];
-        self.float_scratch_cursor += 1;
-        r
-    }
-
-    /// Push a value onto the simulated float operand stack.
-    fn push_float_operand(&mut self, reg: Arm64Register) {
-        self.float_operand_stack.push(reg);
-    }
-
-    /// Pop the top of the simulated float operand stack.
-    /// Returns V0 as sentinel and sets `self.failed = true` on underflow.
-    fn pop_float_operand(&mut self) -> Arm64Register {
-        self.float_operand_stack.pop().unwrap_or_else(|| {
-            self.failed = true;
-            Arm64Register::V0
-        })
     }
 
     /// Get or create a label for a bytecode PC.
     ///
-    /// Also the single chokepoint where a **loop back-edge** is detected. Every
-    /// branch target on this backend — `goto`, `if*`, `if_icmp*`, `if_acmp*`,
-    /// and every `tableswitch`/`lookupswitch` case and default — is resolved
-    /// through here, so a target at or before the instruction currently being
-    /// lowered is exactly the set of back-edges.
+    /// Also the single chokepoint where a **loop back-edge** is detected: every
+    /// branch target on this backend -- `goto`, `if*`, and every switch case and
+    /// default -- is resolved through here, so a target at or before the
+    /// instruction being lowered is exactly the set of back-edges.
     ///
-    /// **Why that refuses the method (aarch64 parity audit, 2026-08-01).**
-    /// x86-64 emits a cooperative safepoint poll of `helpers.safepoint_flag_addr`
-    /// at method entry and at every loop back-edge
-    /// (`x64::Backend::emit_safepoint_poll` /
-    /// `emit_safepoint_poll_prologue`, enabled by default via
-    /// `x64::jit_safepoint_polls_enabled`). This backend emits none, and
-    /// it cannot: no safepoint-helper address is plumbed into
-    /// `compile_method_with_info`, and even if it were, taking the poll requires
-    /// a CALL — which `emit_invoke` refuses to emit because there is no
-    /// call-target resolution here.
-    ///
-    /// A compiled loop therefore contains no safepoint of any kind. A thread
-    /// inside one never observes a stop-the-world request, so any GC that needs
-    /// to stop it hangs the whole VM — and since the compilable population is
-    /// "leaf pure-arithmetic methods", loops are the *typical* case, not an edge
-    /// case. The module header already documented this hazard; it was
-    /// documented but not defended, and a straight-line-only compiled body is
-    /// the only shape that is actually safe to run. So: bail, and interpret.
-    ///
-    /// This is a liveness bail, deliberately conservative — it refuses reducible
-    /// and irreducible back-edges alike, and refuses a backward `goto` even when
-    /// the loop provably terminates, because "provably terminates" is not the
-    /// property that matters. What matters is bounded time to the next
-    /// safepoint, and without a poll there is no bound.
+    /// A compiled loop needs a safepoint poll: without one a thread inside it
+    /// never observes a stop-the-world request and any GC that needs to stop
+    /// it hangs the VM. With polls on (`CRATONVM_JIT_ARM64_SAFEPOINTS`) the
+    /// target is RECORDED and pass 2 emits a poll at the loop header. With
+    /// polls off there is nothing to put there, so the method is refused and
+    /// interpreted -- deliberately for provably terminating loops too, because
+    /// the property that matters is bounded time to the next safepoint.
     fn label_for_pc(&mut self, pc: usize) -> u32 {
         if pc <= self.cur_bytecode_pc {
             if self.safepoints_enabled {
-                // A loop header. The blanket refusal below existed because a
-                // compiled loop with no poll in it is a region a
-                // stop-the-world request can never interrupt -- so with polls
-                // available, RECORD it and let pass 2 put one there.
                 self.back_edge_targets.insert(pc);
             } else {
                 self.failed = true;
@@ -1997,11 +2386,8 @@ impl Arm64Backend {
     /// Label allocation without the back-edge check.
     ///
     /// Used only by the walk loop's pre-seed step, which binds a label at a PC
-    /// the *discovery* pass already identified as a branch target. That step is
-    /// not itself a branch, so running the back-edge test there would misfire
-    /// (notably at `pc == 0`, where `cur_bytecode_pc` is still its initial `0`).
-    /// The branch that created the target already went through
-    /// [`label_for_pc`], so nothing is missed.
+    /// the discovery pass already identified as a branch target. That step is
+    /// not itself a branch (and at `pc == 0` the check would misfire).
     fn label_for_pc_unchecked(&mut self, pc: usize) -> u32 {
         if let Some(&label) = self.pc_labels.get(&pc) {
             label
@@ -2014,88 +2400,88 @@ impl Arm64Backend {
 
     // -- Prologue / Epilogue ------------------------------------------------
 
-    /// Emit the standard AAPCS64 prologue.
+    /// Emit the AAPCS64 prologue.
+    ///
+    /// ```text
+    ///     STP  X29, X30, [SP, #-16]!   ; the frame record
+    ///     ADD  X29, SP, #0             ; FP -> the record: [FP] = caller FP, [FP+8] = LR
+    ///     <stack bang: SUB X16, SP, #off; STR XZR, [X16] per page crossed>
+    ///     SUB  SP, SP, #(frame_size - 16)
+    ///     STP/STR callee-saved GPRs at [FP - 8 ...]
+    ///     <stamp the safepoint-id slot unset>
+    /// ```
+    ///
+    /// # The frame record is the standard one now
+    ///
+    /// The previous prologue set FP to the caller's SP, leaving the saved pair
+    /// at `[FP-16]`/`[FP-8]`. AAPCS64 (and Darwin, and every unwinder, and the
+    /// frame-pointer walk in `vm/src/jit/helpers.rs`) expects FP to point AT the
+    /// record: `[FP]` = caller's FP, `[FP+8]` = LR. A walk through one of these
+    /// frames read the caller's LR as its FP. Every FP-relative offset is
+    /// rebased accordingly in `Arm64FrameLayout::compute`.
+    ///
+    /// `ADD X29, SP, #0` and not `MOV X29, SP`: `Mov` lowers to `ORR`, where
+    /// register 31 is XZR, so it would set FP to zero.
+    ///
+    /// # The stack bang
+    ///
+    /// Before SP moves, every page the frame will cross is touched, so stack
+    /// exhaustion faults ON the guard page (recoverable) instead of a large
+    /// `SUB SP` stepping clean past it into unrelated memory. x64 does the same
+    /// (`emit_stack_bang_before_frame_alloc`). This replaces the old refusal
+    /// of every frame of 4096 bytes or more.
     fn emit_prologue(&mut self) {
-        let frame = match self.frame.as_ref() {
-            Some(f) => f,
-            None => {
-                self.failed = true;
-                return;
-            }
+        let Some(frame) = self.frame.as_ref() else {
+            self.failed = true;
+            return;
         };
         let frame_size = frame.frame_size;
+        let callee_save_offset = frame.callee_save_offset;
+        let saved_len = frame.saved_regs.len();
 
-        // Bug-fix (ARM64 BUG #2, broken prologue SP/frame geometry):
-        //
-        // The previous prologue emitted a *signed-offset* (non-writeback) STP
-        // `[SP,#-16]`, which does NOT decrement SP, then `MOV FP,SP`, then
-        // `SUB SP,SP,#(frame-16)` under the false assumption that "16 was
-        // already consumed by STP". Because the STP never moved SP, the frame
-        // ended up 16 bytes too small at the bottom and, for a minimal frame,
-        // SP could sit *above* the saved FP/LR slots — corrupting the frame.
-        //
-        // New scheme (AAPCS64-idiomatic, FP at top of frame, all callee-save /
-        // spill offsets remain NEGATIVE from FP exactly as `Arm64FrameLayout`
-        // computes them — no layout change required):
-        //
-        //   1. STP FP, LR, [SP, #-16]!   (writeback) — saves the caller's
-        //      FP/LR and moves SP to old_SP-16. Small fixed offset, always in
-        //      imm7 range, so it is robust for arbitrarily large frames.
-        //   2. SUB SP, SP, #(frame-16)   — allocate the rest of the frame;
-        //      SP now = old_SP - frame_size (the bottom).
-        //   3. ADD FP, SP, #frame        — FP = old_SP (the top). The saved
-        //      caller FP/LR therefore live at [FP-16], matching
-        //      `callee_save_offset = -16 - callee_save_bytes` and the spill
-        //      slots below it.
-        //
-        // The matching epilogue reverses this exactly (see `emit_epilogue`).
         self.buffer.emit(Arm64Instruction::StpPre {
             rt1: Arm64Register::FP,
             rt2: Arm64Register::LR,
             rn: Arm64Register::SP,
             offset: -16,
         });
-
-        // Allocate the remainder of the frame (the writeback STP already
-        // consumed the first 16 bytes).
-        if frame_size > 16 {
-            self.buffer.emit(Arm64Instruction::SubImm {
-                rd: Arm64Register::SP,
-                rn: Arm64Register::SP,
-                imm: frame_size - 16,
-            });
-        }
-
-        // Point FP at the top of the frame (old_SP). After this, the saved
-        // FP/LR pair from step 1 sits at [FP-16].
         self.buffer.emit(Arm64Instruction::AddImm {
             rd: Arm64Register::FP,
             rn: Arm64Register::SP,
-            imm: frame_size,
+            imm: 0,
         });
 
-        // Save callee-saved registers used for locals (in pairs).
-        //
-        // PERF: the previous code cloned the entire `saved_regs` Vec
-        // (`&frame.saved_regs.clone()`) once per compiled method purely to
-        // satisfy the borrow checker — the loop body needs `&mut self` for
-        // `self.buffer.emit(...)`, which cannot coexist with a live borrow of
-        // `self.frame` held across the call. `Arm64Register` is `Copy`, so
-        // instead of cloning the whole Vec we hoist the two scalars we need
-        // (the callee-save base offset and the element count) out of the borrow,
-        // then copy out each register by briefly re-borrowing `self.frame` per
-        // access. No per-method heap allocation; the emission sequence is
-        // byte-for-byte identical to before.
-        let callee_save_offset = frame.callee_save_offset;
-        let saved_len = frame.saved_regs.len();
-        // `frame` is unused past this point — its borrow ends here, freeing the
-        // `self.buffer.emit` calls below to take `&mut self`.
+        let below = frame_size - 16;
+        let Some(probes) = stack_bang_probe_offsets(below) else {
+            self.failed = true;
+            return;
+        };
+        for off in probes {
+            self.buffer.emit(Arm64Instruction::SubImm {
+                rd: Arm64Register::X16,
+                rn: Arm64Register::SP,
+                imm: off,
+            });
+            // Register 31 as a store's Rt is XZR: the probe writes zero.
+            self.buffer.emit(Arm64Instruction::Str {
+                rt: Arm64Register::XZR,
+                rn: Arm64Register::X16,
+                offset: 0,
+            });
+        }
+        if below > 0 {
+            self.buffer.emit(Arm64Instruction::SubImm {
+                rd: Arm64Register::SP,
+                rn: Arm64Register::SP,
+                imm: below,
+            });
+        }
 
+        // Save callee-saved registers used for locals (in pairs), below FP.
         let mut i = 0;
         while i + 1 < saved_len {
+            // Cast: i < 10 (CALLEE_SAVED.len()).
             let offset = callee_save_offset + (i as i32) * 8;
-            // Re-borrow `self.frame` only to copy out the two `Copy` registers;
-            // the borrow ends before `self.buffer.emit` is invoked.
             let frame = self.frame.as_ref().expect("frame present");
             let (rt1, rt2) = (frame.saved_regs[i], frame.saved_regs[i + 1]);
             self.buffer.emit(Arm64Instruction::Stp {
@@ -2107,6 +2493,7 @@ impl Arm64Backend {
             i += 2;
         }
         if i < saved_len {
+            // Cast: i < 10.
             let offset = callee_save_offset + (i as i32) * 8;
             let rt = self.frame.as_ref().expect("frame present").saved_regs[i];
             self.buffer.emit(Arm64Instruction::Str {
@@ -2117,17 +2504,9 @@ impl Arm64Backend {
         }
 
         // STAMP THE SAFEPOINT-ID SLOT with "this frame has not reached a
-        // safepoint yet".
-        //
-        // Leaving it uninitialised is the quiet hazard: whatever the stack
-        // happened to hold can READ as a valid id for the method standing at
-        // this frame base, and a relocating collector would then rewrite the
-        // frame against the wrong program point's map. `SP_ID_UNSET_BC_PC`
-        // (`u32::MAX - 1`) matches no map, so the proof fails CLOSED. It cannot
-        // be 0: bci 0 is a legal safepoint and a very common one.
-        //
-        // X17 is IP1 -- not an argument register -- so unlike the entry poll
-        // this is safe to emit here, before the arguments are consumed.
+        // safepoint yet" (`SP_ID_UNSET_BC_PC`, which matches no map). Left
+        // uninitialised it could read as a valid id. X17 is not an argument
+        // register, so this is safe before the arguments are homed.
         if self.sp_id_slot_off != 0 {
             self.buffer.emit(Arm64Instruction::MovImm {
                 rd: Arm64Register::X17,
@@ -2139,34 +2518,75 @@ impl Arm64Backend {
                 offset: -self.sp_id_slot_off,
             });
         }
-
-        // The method-entry poll used to be emitted HERE, and that was wrong:
-        // `compile_pass` copies the incoming arguments out of X0-X7 into their
-        // local registers AFTER this function returns, so a call emitted here
-        // sits between the arguments arriving and being consumed -- and X0-X7
-        // are caller-saved, so the safepoint slow path is entitled to destroy
-        // every one of them. It now runs just past that copy; see
-        // `the_entry_poll_runs_after_the_argument_copy`.
+        // The method-entry poll is NOT emitted here: X0-X7 still hold the
+        // arguments until `emit_argument_homing`, and the poll's call may
+        // destroy them. See `the_entry_poll_runs_after_the_argument_copy`.
     }
 
-    /// Emit the standard AAPCS64 epilogue.
-    fn emit_epilogue(&mut self) {
-        let frame = match self.frame.as_ref() {
-            Some(f) => f,
-            None => {
-                self.failed = true;
-                return;
+    /// Deposit each incoming argument in its JVM local's home.
+    ///
+    /// The VM passes one 64-bit register per ARGUMENT (`this` first), and an
+    /// `int` arrives sign-extended, a `float` as its zero-extended bit pattern
+    /// and a `double` as its bits. Argument `i` goes to JVM local
+    /// `arg_slots[i]`, which differs from `i` after any `long`/`double`
+    /// argument. A register home gets a `MOV`; a frame home gets a `STR` of
+    /// the whole word, which the local's later loads read at their own width.
+    ///
+    /// The previous prologue moved X_i into local i's register and did nothing
+    /// for a frame-homed local -- which every `float`/`double` local is, since
+    /// the allocator never gives one a GPR -- so every FP parameter, and every
+    /// parameter after a `long`/`double`, read garbage.
+    fn emit_argument_homing(&mut self, arg_slots: &[usize]) {
+        if arg_slots.len() > Arm64CallingConvention::INT_ARG_REGS.len() {
+            // Arguments past the eighth arrive on the stack, which this
+            // prologue does not read.
+            self.failed = true;
+            return;
+        }
+        for (i, &slot) in arg_slots.iter().enumerate() {
+            let arg = Arm64CallingConvention::INT_ARG_REGS[i];
+            match self.local_regs.get(slot).copied() {
+                Some(Some(home)) => {
+                    if home != arg {
+                        self.buffer.emit(Arm64Instruction::Mov { rd: home, rm: arg });
+                    }
+                }
+                Some(None) => {
+                    let Some(offset) = self.local_slot_offset(slot) else {
+                        self.failed = true;
+                        return;
+                    };
+                    self.buffer.emit(Arm64Instruction::Str {
+                        rt: arg,
+                        rn: Arm64Register::FP,
+                        offset,
+                    });
+                }
+                // A parameter slot past `max_locals`: a malformed method.
+                None => {
+                    self.failed = true;
+                    return;
+                }
             }
+        }
+    }
+
+    /// Emit the epilogue: restore the callee-saved GPRs, `ADD SP, X29, #0`
+    /// (again not `MOV`, for the same register-31 reason), `LDP X29, X30,
+    /// [SP], #16`, `RET`.
+    fn emit_epilogue(&mut self) {
+        let Some(frame) = self.frame.as_ref() else {
+            self.failed = true;
+            return;
         };
         let callee_save_offset = frame.callee_save_offset;
         let saved = frame.saved_regs.clone();
 
-        // Bind epilogue label.
         self.buffer.bind_label(self.epilogue_label);
 
-        // Restore callee-saved registers.
         let mut i = 0;
         while i + 1 < saved.len() {
+            // Cast: i < 10.
             let offset = callee_save_offset + (i as i32) * 8;
             self.buffer.emit(Arm64Instruction::Ldp {
                 rt1: saved[i],
@@ -2177,6 +2597,7 @@ impl Arm64Backend {
             i += 2;
         }
         if i < saved.len() {
+            // Cast: i < 10.
             let offset = callee_save_offset + (i as i32) * 8;
             self.buffer.emit(Arm64Instruction::Ldr {
                 rt: saved[i],
@@ -2185,18 +2606,10 @@ impl Arm64Backend {
             });
         }
 
-        // Bug-fix (ARM64 BUG #2): reverse the writeback prologue exactly.
-        //
-        // The caller's FP/LR were saved at [FP-16] (see `emit_prologue`).
-        //   1. SUB SP, FP, #16          — SP = old_SP-16, the address the
-        //      post-index LDP loads from (mirror of the prologue's
-        //      `STP ...,[SP,#-16]!`).
-        //   2. LDP FP, LR, [SP], #16    — restore the caller's FP/LR, then
-        //      SP = old_SP (caller's stack pointer fully restored).
-        self.buffer.emit(Arm64Instruction::SubImm {
+        self.buffer.emit(Arm64Instruction::AddImm {
             rd: Arm64Register::SP,
             rn: Arm64Register::FP,
-            imm: 16,
+            imm: 0,
         });
         self.buffer.emit(Arm64Instruction::LdpPost {
             rt1: Arm64Register::FP,
@@ -2209,13 +2622,10 @@ impl Arm64Backend {
 
     // -- Bytecode compilation -----------------------------------------------
 
-    /// Compile a JVM method to ARM64 instructions.
     /// Compile a JVM bytecode method to ARM64 instructions.
     ///
-    /// `method_info` maps constant pool indices (from invokestatic operands) to the
-    /// number of arguments the target method expects.  When the map does not contain
-    /// an entry for a given CP index the backend assumes a self-recursive call and
-    /// uses `num_params` as the argument count.
+    /// `method_info` maps constant pool indices (from invokestatic operands) to
+    /// the number of arguments the target method expects.
     pub fn compile_method(
         &mut self,
         num_locals: usize,
@@ -2229,24 +2639,11 @@ impl Arm64Backend {
     /// Like [`compile_method`] but accepts an explicit method-info map for invoke
     /// resolution.
     ///
-    /// Runs [`Arm64Backend::compile_pass`] **twice**. The walk binds a label at
-    /// bytecode pc `p` only if `p` is already known to be a branch target when
-    /// the walk reaches it, and targets are discovered lazily, as each branch
-    /// is decoded. For a forward branch that is fine — the branch is decoded
-    /// before its target is reached. For a BACKWARD branch (i.e. every loop
-    /// back-edge) it is not: the target pc was walked past before the label
-    /// existed, so the label was created and never bound, and the encoder's
-    /// patch loop left the placeholder — a displacement-0 branch, which on
-    /// AArch64 is a branch to itself. Every loop this backend "compiled" was
-    /// therefore an infinite self-branch.
-    ///
-    /// The first pass exists purely to discover the complete set of branch
-    /// target PCs; its output is discarded. The second pass re-walks the same
-    /// bytecode with that set in hand and binds a label at each target as it
-    /// passes, so back-edges resolve. Reusing the real walk for discovery
-    /// (rather than a separate scanner) means the two can never disagree about
-    /// instruction boundaries — this module has no bytecode length table to
-    /// keep in sync.
+    /// Runs [`Arm64Backend::compile_pass`] **twice**. Branch targets are
+    /// discovered as each branch is decoded, which is too late for a BACKWARD
+    /// branch: its target was walked past before the label existed. Pass 1
+    /// discovers every target (and every target's operand-stack shape, and
+    /// every loop header); pass 2 re-walks with them in hand.
     pub fn compile_method_with_info(
         &mut self,
         num_locals: usize,
@@ -2255,16 +2652,11 @@ impl Arm64Backend {
         bytecode: &[u8],
         method_info: HashMap<u16, usize>,
     ) -> Arm64CompileResult {
-        // Discovered by pass 1 and read by pass 2, so `compile_pass` must NOT
-        // clear it (it clears `pc_labels`, which is why the back-edge set has
-        // to live outside that reset). Cleared HERE instead, per compile: a
-        // reused backend would otherwise carry another method's loop headers
-        // and emit polls at unrelated PCs.
+        // Discovered by pass 1 and read by pass 2, so `compile_pass` must not
+        // clear them; cleared here, per compile.
         self.back_edge_targets.clear();
+        self.label_states.clear();
 
-        // Pass 1 — discovery. Label ids allocated here are NOT reused: pass 2
-        // resets the buffer (and with it the label-id counter), so it hands
-        // `compile_pass` bytecode PCs and lets it allocate its own ids.
         drop(self.compile_pass(
             num_locals,
             num_params,
@@ -2275,12 +2667,8 @@ impl Arm64Backend {
         ));
         let mut branch_targets: Vec<usize> = self.pc_labels.keys().copied().collect();
         branch_targets.sort_unstable();
-        // `failed` is sticky and intentionally NOT cleared between the two
-        // passes: whatever made pass 1 refuse the method (e.g. an unresolved
-        // invoke) makes pass 2 refuse it identically, and carrying the flag
-        // keeps the two passes' verdicts in lockstep.
+        // `failed` is sticky and intentionally NOT cleared between the passes.
 
-        // Pass 2 — emission, with every back-edge target known up front.
         self.compile_pass(
             num_locals,
             num_params,
@@ -2292,10 +2680,7 @@ impl Arm64Backend {
     }
 
     /// One walk of the bytecode. See [`compile_method_with_info`] for why this
-    /// runs twice and what `branch_targets` carries between the passes: a
-    /// sorted list of every bytecode PC that is the target of some branch,
-    /// used to bind a label at each such PC as the walk passes it (the lazy
-    /// `label_for_pc` discovery below cannot see backward branches in time).
+    /// runs twice and what `branch_targets` carries between the passes.
     fn compile_pass(
         &mut self,
         num_locals: usize,
@@ -2308,28 +2693,23 @@ impl Arm64Backend {
         // Reset state.
         self.buffer = Arm64CodeBuffer::new();
         self.operand_stack.clear();
-        self.operand_stack_oop_marks.clear();
-        self.float_operand_stack.clear();
-        self.scratch_cursor = 0;
-        self.float_scratch_cursor = 0;
+        self.held.clear();
+        self.reachable = true;
         self.pc_labels.clear();
         self.cur_bytecode_pc = 0;
         self.local_regs.clear();
         self.float_local_regs.clear();
-        self.spill_map.clear();
         self.num_params = num_params;
         self.method_info = method_info;
         self.stack_kinds = Self::analyze_stack_kinds(bytecode);
         self.max_stack = max_stack;
         self.pending_local_oop_slots.clear();
+        self.pending_operand_oop_slots.clear();
         self.safepoint_count = 0;
         self.incomplete_oop_maps = 0;
         self.pending_map_incomplete = false;
         // The same "must be oop" local dataflow x64 uses, seeded with this
-        // method's reference parameters. A bit is set only when EVERY path
-        // reaching that pc stored a reference there, which is what a
-        // relocating collector needs: a false positive would have the GC
-        // rewrite a primitive that happens to look like an address.
+        // method's reference parameters.
         let (lo_masks, lo_reached) = crate::x64::compute_local_oop_masks(
             bytecode,
             bytecode.len(),
@@ -2339,116 +2719,64 @@ impl Arm64Backend {
         self.local_oop_masks = lo_masks;
         self.local_oop_reached = lo_reached;
 
-        // Run graph-coloring register allocation for ARM64.
-        let alloc = super::regalloc::allocate_registers_arm64(
+        // The JVM local slot of each incoming argument.
+        let arg_slots: Vec<usize> = match &self.param_jvm_slots {
+            Some(slots) => slots.clone(),
+            None => (0..num_params).collect(),
+        };
+
+        // Graph-coloring register allocation, told where the parameters really
+        // are: its liveness seeds them live-on-entry, and seeding the identity
+        // layout left a parameter after a `long`/`double` dead on entry, free to
+        // share a register with a live one.
+        let alloc = super::regalloc::allocate_registers_arm64_with_param_slots(
             bytecode,
             bytecode.len(),
             num_locals,
             num_params,
+            &arg_slots,
             &[],
         );
 
-        // Build local_regs from GPR assignments (u8 register numbers → Arm64Register).
         for &a in &alloc.assignments {
             self.local_regs.push(a.map(Arm64Register));
         }
-        // Pad if allocator returned fewer entries than num_locals
         while self.local_regs.len() < num_locals {
             self.local_regs.push(None);
         }
 
         // Float/double locals get NO dedicated FP register on this backend.
-        //
-        // Bug-fix (aarch64 parity audit, 2026-08-01 — AAPCS64 violation):
-        // `regalloc::ARM64_LOCAL_FPS` is `D8..D15`, and on AAPCS64 those are
-        // precisely the **callee-saved** FP registers
-        // (the low 64 bits of V8-V15 must be preserved across a call). This
-        // backend's prologue/epilogue save and restore only the callee-saved
-        // GPRs in `alloc.used_callee_saved` — `alloc.used_xmm_regs` is never
-        // consulted and `Arm64FrameLayout` reserves no space for FP saves. So
-        // the previous code, which homed float locals in D8-D15, silently
-        // destroyed the *caller's* D8-D15 on every compiled method that used a
-        // float or double local. The caller is either the interpreter (Rust,
-        // compiled by LLVM, which very much does keep values in D8-D15 across
-        // calls) or another compiled frame; either way it is corruption.
-        //
-        // Two ways to close it: save/restore the used FP registers in the
-        // prologue/epilogue, or stop allocating them. The second is chosen here
-        // — it is the change that cannot itself be wrong, and this backend
-        // compiles nothing whose performance is worth the risk. Float locals now
-        // live in a frame slot (via `FpLdr`/`FpStr`, whose negative-offset
-        // lowering is fixed in `emit_machine_code`) or, when the allocator gave
-        // the slot a GPR, in that GPR via `FmovToFp`/`FmovFromFp`.
-        //
-        // If FP homing is ever wanted back, the prerequisite is an FP
-        // save/restore area in `Arm64FrameLayout::compute` plus prologue and
-        // epilogue emission driven by `alloc.used_xmm_regs` — not a revert of
-        // this loop. Asserted by `float_locals_never_use_callee_saved_fp_regs`.
+        // `regalloc::ARM64_LOCAL_FPS` is D8-D15, which AAPCS64 makes callee-saved,
+        // and this prologue saves only GPRs -- homing a float local there
+        // destroyed the caller's copy (aarch64 parity audit, 2026-08-01). They
+        // live in frame slots. If FP homing is wanted back, the prerequisite is
+        // an FP save area in `Arm64FrameLayout::compute` driven by
+        // `alloc.used_xmm_regs`. Asserted by
+        // `float_locals_never_use_callee_saved_fp_regs`.
         for _ in 0..num_locals {
             self.float_local_regs.push(None);
         }
 
-        // Determine which callee-saved GPR regs we actually use.
         let saved_regs: Vec<Arm64Register> = alloc
             .used_callee_saved
             .iter()
             .map(|&n| Arm64Register(n))
             .collect();
 
-        // Count spills: locals without a register + operand stack space.
-        let gpr_spills = alloc.assignments.iter().filter(|a| a.is_none()).count();
-        let fp_spills = alloc
-            .xmm_assignments
-            .iter()
-            .enumerate()
-            .filter(|(i, a)| a.is_none() && self.local_regs.get(*i).map_or(false, |g| g.is_none()))
-            .count();
-        let _ = fp_spills; // float spills use the same frame slots
-        // One extra spill word per REGISTER-HOMED local, reserved only when
-        // this compilation emits polls.
-        //
-        // A register-homed local has no frame slot at all on this backend --
-        // `spill_index_for` numbers only the locals that got NO register -- so
-        // there is nowhere for a safepoint to put it. The prologue's
-        // callee-save slots cannot be borrowed either: those hold the CALLER's
-        // values and the epilogue restores from them. Hence a dedicated home,
-        // placed after the operand area. See `safepoint_home_for_reg_local`.
+        // Frame words: the frame-homed locals, the operand area, one safepoint
+        // home per register-homed local and the safepoint-id word (the last two
+        // only when this compilation polls). See `safepoint_home_for_reg_local`.
+        let gpr_spills = self.local_spill_count();
         let safepoint_homes = if self.safepoints_enabled {
             saved_regs.len()
         } else {
             0
         };
-        // ...plus ONE more for the safepoint-id slot, on the same condition.
         let sp_id_words = usize::from(self.safepoints_enabled);
         let num_spills = gpr_spills + max_stack + safepoint_homes + sp_id_words;
         let layout = Arm64FrameLayout::compute(num_locals, num_spills, &saved_regs);
-
-        // Refuse frames that could step over the stack guard page.
-        //
-        // Bug-fix (aarch64 parity audit, 2026-08-01 — missing stack bang):
-        // x86-64 probes every page the new frame crosses BEFORE moving RSP
-        // (`x64::Backend::emit_stack_bang_before_frame_alloc`, page size
-        // `x64::reg_encoding::STACK_BANG_PAGE_SIZE == 4096`), which converts
-        // stack exhaustion
-        // into a fault ON the guard page — recoverable, and reported as
-        // `StackOverflowError`. This backend emits no bang at all: its prologue
-        // is a bare `SUB SP, SP, #frame_size`. A frame larger than one guard
-        // page can therefore move SP clean PAST the guard and land in unrelated
-        // mapped memory, at which point the first spill store silently corrupts
-        // whatever is there instead of trapping.
-        //
-        // `frame_size` here is attacker-influenced in the ordinary sense —
-        // `max_locals` and `max_stack` come from the class file and are u16 —
-        // so this is not theoretical: `num_spills = gpr_spills + max_stack`,
-        // giving frames up to ~512 KiB. Until a bang exists, any frame that
-        // could reach beyond the first guard page is refused.
-        const AARCH64_GUARD_PAGE_BYTES: i32 = 4096;
-        if layout.frame_size >= AARCH64_GUARD_PAGE_BYTES {
-            self.failed = true;
-        }
         self.frame = Some(layout);
-        // The sp-id word sits past the locals, the operand area and the
-        // safepoint homes -- the tail `num_spills` was just extended by.
+        // The sp-id word sits past the locals, the operand area and the homes.
         self.sp_id_slot_off = if self.safepoints_enabled {
             let f = self.frame.as_ref().expect("just set");
             let idx = f.num_spills.saturating_sub(1);
@@ -2461,1358 +2789,567 @@ impl Arm64Backend {
 
         self.epilogue_label = self.buffer.new_label();
 
-        // Emit prologue.
         self.emit_prologue();
-
-        // Copy incoming args to local registers.
-        for i in 0..num_params.min(8) {
-            if let Some(local_reg) = self.local_regs.get(i).copied().flatten() {
-                let arg_reg = Arm64CallingConvention::INT_ARG_REGS[i];
-                if arg_reg != local_reg {
-                    self.buffer.emit(Arm64Instruction::Mov {
-                        rd: local_reg,
-                        rm: arg_reg,
-                    });
-                }
-            }
-        }
-
-        // Publish the frame base BEFORE the first poll: the poll stamps an id
-        // into this frame, and an id in a frame the walker cannot locate is
-        // not a root, it is a number.
+        self.emit_argument_homing(&arg_slots);
+        // Publish the frame base BEFORE the first poll stamps an id into it.
         self.emit_frame_record();
-
-        // METHOD-ENTRY SAFEPOINT POLL, emitted HERE rather than at the end of
-        // the prologue: the copy above is what consumes X0-X7, and this poll
-        // emits a CALL that may destroy them. The frame is complete by now (FP
-        // established, callee-saved registers stored), the operand stack is
-        // empty, and every register-homed parameter is in its local register --
-        // which is what lets the poll name the reference ones.
+        // METHOD-ENTRY SAFEPOINT POLL, after the arguments are homed: its call
+        // may destroy X0-X7.
         self.emit_safepoint_poll(true);
 
-        // Walk bytecode.
         let mut pc = 0;
         let mut success = true;
         while pc < bytecode.len() {
-            // Pre-seed this PC's label if the discovery pass saw a branch to
-            // it. Without this, only forward branches (whose target is reached
-            // after the branch is decoded) ever get bound — see
-            // `compile_method_with_info`.
+            // Pre-seed this PC's label if the discovery pass saw a branch to it.
             if branch_targets.binary_search(&pc).is_ok() {
                 let _ = self.label_for_pc_unchecked(pc);
             }
+            self.held.clear();
 
-            // Bind label if any branch targets this PC.
             if let Some(&label) = self.pc_labels.get(&pc) {
+                if self.reachable {
+                    self.arrive_at_target(pc);
+                } else {
+                    self.restore_stack_at(pc);
+                }
                 if !self.buffer.labels.contains_key(&label) {
                     self.buffer.bind_label(label);
                 }
+            } else if !self.reachable {
+                self.restore_stack_at(pc);
             }
-
-            // LOOP-HEADER SAFEPOINT POLL. Emitted after the label is bound, so
-            // a back edge jumps to the label and lands on the poll -- one poll
-            // per header regardless of how many branches target it, which is
-            // why this is here and not at the ~11 branch sites. (A forward
-            // branch to the same label also lands on it; an extra poll is
-            // harmless.) `back_edge_targets` comes from pass 1, so a header is
-            // known before pass 2 reaches it.
-            if self.back_edge_targets.contains(&pc) {
-                self.emit_safepoint_poll(false);
-            }
+            self.reachable = true;
 
             let opcode = bytecode[pc];
             let start_pc = pc;
-            // Publish the instruction boundary before lowering, so every
-            // `label_for_pc` call made by this opcode's arm can tell a forward
-            // branch from a back-edge (see `label_for_pc`).
+            // Published before the loop-header poll (whose id and oop-local mask
+            // are this pc's) and before lowering (so `label_for_pc` can tell a
+            // back-edge from a forward branch).
             self.cur_bytecode_pc = start_pc;
+
+            // LOOP-HEADER SAFEPOINT POLL, after the label so a back edge lands on
+            // it -- one poll per header regardless of how many branches target it.
+            if self.back_edge_targets.contains(&pc) {
+                self.emit_safepoint_poll(false);
+            }
             pc += 1;
 
             match opcode {
-                // iconst_m1 .. iconst_5
-                0x02..=0x08 => {
-                    let value = opcode as i32 - 3;
-                    self.emit_iconst(value);
+                // nop
+                0x00 => self.buffer.emit(Arm64Instruction::Nop),
+                // aconst_null
+                0x01 => {
+                    let dst = self.alloc_reg(false);
+                    self.buffer
+                        .emit(Arm64Instruction::MovImm { rd: dst, imm: 0 });
+                    self.push_reg(OperandKind::Ref, dst);
                 }
+                // iconst_m1 .. iconst_5
+                0x02..=0x08 => self.emit_iconst(i32::from(opcode) - 3),
+                // lconst_0, lconst_1
+                0x09 | 0x0a => self.emit_lconst(i64::from(opcode - 0x09)),
+                // fconst_0 .. fconst_2
+                0x0b..=0x0d => self.emit_fconst(f32::from(opcode - 0x0b)),
+                // dconst_0, dconst_1
+                0x0e | 0x0f => self.emit_dconst(f64::from(opcode - 0x0e)),
                 // bipush
                 0x10 => {
-                    if pc >= bytecode.len() {
+                    let Some(v) = bc_u8(bytecode, pc) else {
                         success = false;
                         break;
-                    }
-                    let val = bytecode[pc] as i8 as i32;
+                    };
                     pc += 1;
-                    self.emit_iconst(val);
+                    // Cast: bipush's operand is a signed byte.
+                    self.emit_iconst(i32::from(v as i8));
                 }
                 // sipush
                 0x11 => {
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let val = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as i32;
-                    pc += 2;
-                    self.emit_iconst(val);
-                }
-                // iload_0 .. iload_3
-                0x1a..=0x1d => self.emit_iload((opcode - 0x1a) as usize),
-                // iload (wide index)
-                0x15 => {
-                    if pc >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let idx = bytecode[pc] as usize;
-                    pc += 1;
-                    self.emit_iload(idx);
-                }
-                // istore_0 .. istore_3
-                0x3b..=0x3e => self.emit_istore((opcode - 0x3b) as usize),
-                // istore (wide index)
-                0x36 => {
-                    if pc >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let idx = bytecode[pc] as usize;
-                    pc += 1;
-                    self.emit_istore(idx);
-                }
-                // iadd
-                0x60 => self.emit_int_add(),
-                // isub
-                0x64 => self.emit_int_sub(),
-                // imul
-                0x68 => self.emit_int_mul(),
-                // idiv — see the `division / remainder` note in the module
-                // header. `emit_int_div`'s zero guard branches to `BRK #1`,
-                // which raises SIGTRAP; nothing in the VM converts that into
-                // an `ArithmeticException`, so a `x / 0` in compiled code
-                // killed the process instead of throwing. Refuse the method
-                // until a real exception path exists.
-                0x6c => {
-                    success = false;
-                    break;
-                }
-                // ineg
-                0x74 => self.emit_int_neg(),
-                // iand
-                0x7e => self.emit_int_and(),
-                // ior
-                0x80 => self.emit_int_or(),
-                // ixor
-                0x82 => self.emit_int_xor(),
-                // ishl
-                0x78 => self.emit_int_shl(),
-                // ishr
-                0x7a => self.emit_int_shr(),
-                // if_icmpeq
-                0x9f => {
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
-                    pc += 2;
-                    let target = (start_pc as isize + offset) as usize;
-                    self.emit_if_icmp(Arm64Condition::Eq, target);
-                }
-                // if_icmpne
-                0xa0 => {
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
-                    pc += 2;
-                    let target = (start_pc as isize + offset) as usize;
-                    self.emit_if_icmp(Arm64Condition::Ne, target);
-                }
-                // if_icmplt
-                0xa1 => {
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
-                    pc += 2;
-                    let target = (start_pc as isize + offset) as usize;
-                    self.emit_if_icmp(Arm64Condition::Lt, target);
-                }
-                // if_icmpge
-                0xa2 => {
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
-                    pc += 2;
-                    let target = (start_pc as isize + offset) as usize;
-                    self.emit_if_icmp(Arm64Condition::Ge, target);
-                }
-                // if_icmpgt
-                0xa3 => {
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
-                    pc += 2;
-                    let target = (start_pc as isize + offset) as usize;
-                    self.emit_if_icmp(Arm64Condition::Gt, target);
-                }
-                // if_icmple
-                0xa4 => {
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
-                    pc += 2;
-                    let target = (start_pc as isize + offset) as usize;
-                    self.emit_if_icmp(Arm64Condition::Le, target);
-                }
-                // goto
-                0xa7 => {
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
-                    pc += 2;
-                    let target = (start_pc as isize + offset) as usize;
-                    let label = self.label_for_pc(target);
-                    self.buffer.emit(Arm64Instruction::B { label });
-                }
-                // ireturn / lreturn
-                0xac | 0xad => self.emit_return_int(),
-                // freturn / dreturn — return FP value in V0
-                0xae | 0xaf => {
-                    let _val = self.pop_float_operand();
-                    // V0 is already the return register; emit Ret
-                    self.buffer.emit(Arm64Instruction::Ret);
-                }
-                // areturn
-                0xb0 => self.emit_return_int(), // object ref is in GP reg
-                // return (void)
-                0xb1 => self.emit_return_void(),
-                // aconst_null
-                0x01 => {
-                    let dst = self.alloc_scratch();
-                    self.buffer
-                        .emit(Arm64Instruction::MovImm { rd: dst, imm: 0 });
-                    self.push_operand(dst);
-                    // T1.1.3 — null is a valid object reference.
-                    self.mark_top_operand_as_oop();
-                }
-                // dup — duplicate top of stack
-                0x59 => {
-                    // JVMS: category-1 only. A `double` on top would live on
-                    // `float_operand_stack`, so duplicating `operand_stack`'s
-                    // top copies an unrelated value.
-                    match self.int_stack_shuffle_entries(start_pc, 1) {
-                        Some(c) if !c[0] => {}
-                        _ => {
-                            success = false;
-                            break;
-                        }
-                    }
-                    // Read the mark BEFORE the pop takes it: a duplicated
-                    // reference is a reference twice over, and pushing two
-                    // unmarked copies would lose both roots.
-                    let was_oop = self
-                        .operand_stack_oop_marks
-                        .last()
-                        .copied()
-                        .unwrap_or(false);
-                    let top = self.pop_operand();
-                    let dup = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::Mov { rd: dup, rm: top });
-                    self.push_operand(top);
-                    if was_oop {
-                        self.mark_top_operand_as_oop();
-                    }
-                    self.push_operand(dup);
-                    if was_oop {
-                        self.mark_top_operand_as_oop();
-                    }
-                }
-                // pop
-                0x57 => {
-                    // JVMS: category-1 only, and it must be on the int stack.
-                    match self.int_stack_shuffle_entries(start_pc, 1) {
-                        Some(c) if !c[0] => {}
-                        _ => {
-                            success = false;
-                            break;
-                        }
-                    }
-                    let _ = self.pop_operand();
-                }
-                // pop2
-                0x58 => {
-                    // FORM 2 is a single category-2 entry here, not two.
-                    let Some(cats) = self.int_stack_shuffle_entries(start_pc, 1) else {
+                    let Some(v) = bc_i16(bytecode, pc) else {
                         success = false;
                         break;
                     };
-                    if cats[0] {
-                        let _ = self.pop_operand();
-                    } else {
-                        match self.int_stack_shuffle_entries(start_pc, 2) {
-                            Some(c) if !c[1] => {}
-                            _ => {
-                                success = false;
-                                break;
-                            }
-                        }
-                        let _ = self.pop_operand();
-                        let _ = self.pop_operand();
-                    }
+                    pc += 2;
+                    self.emit_iconst(i32::from(v));
                 }
-                // swap
-                0x5f => {
-                    // JVMS: both operands category-1.
-                    match self.int_stack_shuffle_entries(start_pc, 2) {
-                        Some(c) if !c[0] && !c[1] => {}
+                // ldc / ldc_w / ldc2_w: this backend is never handed the
+                // constant pool, so it cannot recover the constant. Refuse.
+                0x12..=0x14 => {
+                    self.buffer.emit(Arm64Instruction::Comment(
+                        "ldc family: constant pool not available — bailing to interpreter".into(),
+                    ));
+                    success = false;
+                    break;
+                }
+                // iload lload fload dload aload
+                0x15..=0x19 => {
+                    let Some(idx) = bc_u8(bytecode, pc) else {
+                        success = false;
+                        break;
+                    };
+                    pc += 1;
+                    self.emit_load_local(usize::from(idx), LOCAL_KINDS[usize::from(opcode - 0x15)]);
+                }
+                // iload_0 .. aload_3
+                0x1a..=0x2d => {
+                    let n = opcode - 0x1a;
+                    self.emit_load_local(usize::from(n % 4), LOCAL_KINDS[usize::from(n / 4)]);
+                }
+                // istore lstore fstore dstore astore
+                0x36..=0x3a => {
+                    let Some(idx) = bc_u8(bytecode, pc) else {
+                        success = false;
+                        break;
+                    };
+                    pc += 1;
+                    self.emit_store_local(usize::from(idx), LOCAL_KINDS[usize::from(opcode - 0x36)]);
+                }
+                // istore_0 .. astore_3
+                0x3b..=0x4e => {
+                    let n = opcode - 0x3b;
+                    self.emit_store_local(usize::from(n % 4), LOCAL_KINDS[usize::from(n / 4)]);
+                }
+                // pop: one category-1 value.
+                0x57 => match self.top_categories(1) {
+                    Some(c) if !c[0] => self.drop_top(),
+                    _ => {
+                        success = false;
+                        break;
+                    }
+                },
+                // pop2: one category-2 value, or two category-1 values.
+                0x58 => match self.top_categories(1) {
+                    Some(c) if c[0] => self.drop_top(),
+                    Some(_) => match self.top_categories(2) {
+                        Some(c) if !c[1] => {
+                            self.drop_top();
+                            self.drop_top();
+                        }
                         _ => {
                             success = false;
                             break;
                         }
-                    }
-                    let a = self.pop_operand();
-                    let b = self.pop_operand();
-                    self.push_operand(a);
-                    self.push_operand(b);
-                }
-                // ladd
-                0x61 => self.emit_int_add(), // 64-bit add same instruction on ARM64
-                // lsub
-                0x65 => self.emit_int_sub(),
-                // lmul
-                0x69 => self.emit_int_mul(),
-                // lneg
-                0x75 => self.emit_int_neg(),
-                // land
-                0x7f => self.emit_int_and(),
-                // lor
-                0x81 => self.emit_int_or(),
-                // lxor
-                0x83 => self.emit_int_xor(),
-                // lcmp — compare two longs, produce -1, 0, or 1
-                0x94 => {
-                    let b = self.pop_operand();
-                    let a = self.pop_operand();
-                    let dst = self.alloc_scratch();
-                    // CMP a, b sets flags without overflow risk
-                    self.buffer.emit(Arm64Instruction::Cmp { rn: a, rm: b });
-                    // Default to 0 (equal)
-                    self.buffer
-                        .emit(Arm64Instruction::MovImm { rd: dst, imm: 0 });
-                    let gt_label = self.buffer.new_label();
-                    let end_label = self.buffer.new_label();
-                    // If GT, set 1
-                    self.buffer.emit(Arm64Instruction::BCond {
-                        cond: Arm64Condition::Gt,
-                        label: gt_label,
-                    });
-                    // If EQ, skip (already 0)
-                    self.buffer.emit(Arm64Instruction::BCond {
-                        cond: Arm64Condition::Eq,
-                        label: end_label,
-                    });
-                    // Otherwise LT: set -1
-                    self.buffer
-                        .emit(Arm64Instruction::MovImm { rd: dst, imm: -1 });
-                    self.buffer.emit(Arm64Instruction::B { label: end_label });
-                    self.buffer.bind_label(gt_label);
-                    self.buffer
-                        .emit(Arm64Instruction::MovImm { rd: dst, imm: 1 });
-                    self.buffer.bind_label(end_label);
-                    self.push_operand(dst);
-                }
-                // lload_0..lload_3
-                0x1e..=0x21 => self.emit_iload((opcode - 0x1e) as usize),
-                // lload
-                0x16 => {
-                    if pc >= bytecode.len() {
+                    },
+                    None => {
                         success = false;
                         break;
                     }
-                    let idx = bytecode[pc] as usize;
-                    pc += 1;
-                    self.emit_iload(idx);
-                }
-                // lstore_0..lstore_3
-                0x3f..=0x42 => self.emit_istore((opcode - 0x3f) as usize),
-                // lstore
-                0x37 => {
-                    if pc >= bytecode.len() {
+                },
+                // dup: category-1 top.
+                0x59 => match self.top_categories(1) {
+                    Some(c) if !c[0] => self.emit_dup_group_over(1, 0),
+                    _ => {
                         success = false;
                         break;
                     }
-                    let idx = bytecode[pc] as usize;
-                    pc += 1;
-                    self.emit_istore(idx);
-                }
-                // ifXX (single operand branches)
-                0x99 => {
-                    // ifeq
-                    let val = self.pop_operand();
-                    if pc + 1 >= bytecode.len() {
+                },
+                // dup_x1: both category-1.
+                0x5a => match self.top_categories(2) {
+                    Some(c) if !c[0] && !c[1] => self.emit_dup_group_over(1, 1),
+                    _ => {
                         success = false;
                         break;
                     }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as i32;
-                    pc += 2;
-                    let target = (start_pc as i32 + offset) as usize;
-                    let label = self.label_for_pc(target);
-                    self.buffer.emit(Arm64Instruction::Cbz { rt: val, label });
-                }
-                0x9a => {
-                    // ifne
-                    let val = self.pop_operand();
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as i32;
-                    pc += 2;
-                    let target = (start_pc as i32 + offset) as usize;
-                    let label = self.label_for_pc(target);
-                    self.buffer.emit(Arm64Instruction::Cbnz { rt: val, label });
-                }
-                // iflt (0x9b)
-                0x9b => {
-                    let val = self.pop_operand();
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as i32;
-                    pc += 2;
-                    let target = (start_pc as i32 + offset) as usize;
-                    let label = self.label_for_pc(target);
-                    self.buffer
-                        .emit(Arm64Instruction::CmpImm { rn: val, imm: 0 });
-                    self.buffer.emit(Arm64Instruction::BCond {
-                        cond: Arm64Condition::Lt,
-                        label,
-                    });
-                }
-                // ifge (0x9c)
-                0x9c => {
-                    let val = self.pop_operand();
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as i32;
-                    pc += 2;
-                    let target = (start_pc as i32 + offset) as usize;
-                    let label = self.label_for_pc(target);
-                    self.buffer
-                        .emit(Arm64Instruction::CmpImm { rn: val, imm: 0 });
-                    self.buffer.emit(Arm64Instruction::BCond {
-                        cond: Arm64Condition::Ge,
-                        label,
-                    });
-                }
-                // ifgt (0x9d)
-                0x9d => {
-                    let val = self.pop_operand();
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as i32;
-                    pc += 2;
-                    let target = (start_pc as i32 + offset) as usize;
-                    let label = self.label_for_pc(target);
-                    self.buffer
-                        .emit(Arm64Instruction::CmpImm { rn: val, imm: 0 });
-                    self.buffer.emit(Arm64Instruction::BCond {
-                        cond: Arm64Condition::Gt,
-                        label,
-                    });
-                }
-                // ifle (0x9e)
-                0x9e => {
-                    let val = self.pop_operand();
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as i32;
-                    pc += 2;
-                    let target = (start_pc as i32 + offset) as usize;
-                    let label = self.label_for_pc(target);
-                    self.buffer
-                        .emit(Arm64Instruction::CmpImm { rn: val, imm: 0 });
-                    self.buffer.emit(Arm64Instruction::BCond {
-                        cond: Arm64Condition::Le,
-                        label,
-                    });
-                }
-                // ifnull (0xc6)
-                0xc6 => {
-                    let val = self.pop_operand();
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as i32;
-                    pc += 2;
-                    let target = (start_pc as i32 + offset) as usize;
-                    let label = self.label_for_pc(target);
-                    self.buffer.emit(Arm64Instruction::Cbz { rt: val, label });
-                }
-                // ifnonnull (0xc7)
-                0xc7 => {
-                    let val = self.pop_operand();
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as i32;
-                    pc += 2;
-                    let target = (start_pc as i32 + offset) as usize;
-                    let label = self.label_for_pc(target);
-                    self.buffer.emit(Arm64Instruction::Cbnz { rt: val, label });
-                }
-                // lconst_0, lconst_1
-                0x09 => self.emit_lconst(0),
-                0x0a => self.emit_lconst(1),
-                // invokestatic — resolve argument count from method_info or
-                // fall back to num_params for self-recursive calls.
-                0xb8 => {
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let cp_idx = ((bytecode[pc] as u16) << 8) | bytecode[pc + 1] as u16;
-                    pc += 2;
-                    let num_args = self
-                        .method_info
-                        .get(&cp_idx)
-                        .copied()
-                        .unwrap_or(self.num_params);
-                    self.emit_invoke(num_args);
-                }
-                // fconst_0
-                0x0b => self.emit_fconst(0.0),
-                // fconst_1
-                0x0c => self.emit_fconst(1.0),
-                // fconst_2
-                0x0d => self.emit_fconst(2.0),
-                // dconst_0
-                0x0e => self.emit_fconst(0.0),
-                // dconst_1
-                0x0f => self.emit_fconst(1.0),
-                // ldc (0x12) / ldc_w (0x13) / ldc2_w (0x14)
-                //
-                // Bug-fix (AArch64 STUB, ldc/ldc2_w): these opcodes load a
-                // constant identified by a constant-pool index, but this backend
-                // is never handed the method's constant pool — `Arm64Backend`
-                // carries only `method_info` (cp-index -> invoke arg count), not
-                // the resolved constant values — so there is no way to recover
-                // the int/long/float/double/String/Class constant here. We
-                // therefore BAIL to the interpreter rather than guess.
-                //
-                // CROSS-FILE FOLLOW-UP: to JIT these, plumb the resolved
-                // constant pool (or at least an index -> {i32,i64,f32,f64}
-                // numeric-constant table) into `compile_method_with_info`, then
-                // route numeric ldc/ldc2_w to `emit_iconst`/`emit_lconst`/
-                // `emit_fconst` (the bit-exact emit_fconst added in this pass
-                // handles arbitrary float/double values). String/Class/MethodType
-                // constants still require runtime resolution and must keep
-                // bailing. Until that plumbing exists, bailing is the only
-                // correct option.
-                0x12 | 0x13 => {
-                    // ldc consumes 1 operand byte, ldc_w consumes 2.
-                    let operand_len = if opcode == 0x12 { 1 } else { 2 };
-                    if pc + operand_len > bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    self.buffer.emit(Arm64Instruction::Comment(
-                        "ldc/ldc_w: constant pool not available — bailing to interpreter".into(),
-                    ));
-                    self.buffer.emit(Arm64Instruction::Brk { imm: 0 });
-                    success = false;
-                    break;
-                }
-                0x14 => {
-                    // ldc2_w consumes 2 operand bytes (long/double constant).
-                    if pc + 2 > bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    self.buffer.emit(Arm64Instruction::Comment(
-                        "ldc2_w: constant pool not available — bailing to interpreter".into(),
-                    ));
-                    self.buffer.emit(Arm64Instruction::Brk { imm: 0 });
-                    success = false;
-                    break;
-                }
-                // fload
-                0x17 => {
-                    if pc >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let idx = bytecode[pc] as usize;
-                    pc += 1;
-                    self.emit_fload(idx);
-                }
-                // dload
-                0x18 => {
-                    if pc >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let idx = bytecode[pc] as usize;
-                    pc += 1;
-                    self.emit_fload(idx);
-                }
-                // fload_0..fload_3
-                0x22..=0x25 => self.emit_fload((opcode - 0x22) as usize),
-                // dload_0..dload_3
-                0x26..=0x29 => self.emit_fload((opcode - 0x26) as usize),
-                // fstore
-                0x38 => {
-                    if pc >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let idx = bytecode[pc] as usize;
-                    pc += 1;
-                    self.emit_fstore(idx);
-                }
-                // dstore
-                0x39 => {
-                    if pc >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let idx = bytecode[pc] as usize;
-                    pc += 1;
-                    self.emit_fstore(idx);
-                }
-                // fstore_0..fstore_3
-                0x43..=0x46 => self.emit_fstore((opcode - 0x43) as usize),
-                // dstore_0..dstore_3
-                0x47..=0x4a => self.emit_fstore((opcode - 0x47) as usize),
-                // fadd, dadd
-                0x62 | 0x63 => self.emit_float_add(),
-                // fsub, dsub
-                0x66 | 0x67 => self.emit_float_sub(),
-                // fmul, dmul
-                0x6a | 0x6b => self.emit_float_mul(),
-                // fdiv, ddiv
-                0x6e | 0x6f => self.emit_float_div(),
-                // frem, drem
-                //
-                // Bug-fix (AArch64 STUB, frem/drem silent-wrong-result): the
-                // `emit_float_rem` truncating implementation (`a - trunc(a/b)*b`
-                // via an i64 round-trip with FCVTZS/SCVTF) is only correct while
-                // |a/b| < 2^63. FCVTZS SATURATES to i64::MIN/MAX outside that
-                // range, so the truncated quotient — and therefore the
-                // remainder — is silently WRONG for large operands. Java's
-                // frem/drem (JLS §15.17.3, fmod semantics) is exact across the
-                // whole double range. Rather than emit a path that is wrong for
-                // a real (if rare) input range, bail to the interpreter, which
-                // computes the correct IEEE remainder. AArch64 is the secondary
-                // backend; correctness over feature completeness. (Re-wiring
-                // emit_float_rem would require an exact reduction loop — e.g.
-                // repeated FRINT/scaled subtraction — not the saturating cast.)
-                0x72 | 0x73 => {
-                    self.buffer.emit(Arm64Instruction::Comment(
-                        "frem/drem: no exact lowering — bailing to interpreter".into(),
-                    ));
-                    self.buffer.emit(Arm64Instruction::Brk { imm: 0 });
-                    success = false;
-                    break;
-                }
-                // fneg, dneg
-                0x76 | 0x77 => self.emit_float_neg(),
-                // i2l
-                0x85 => {
-                    // int to long: on 64-bit ARM, sign-extend 32-bit to 64-bit.
-                    // For our backend, ints are already in 64-bit regs, so this is a no-op
-                    // (values are sign-extended at load time).
-                }
-                // i2f (0x86)
-                0x86 => self.emit_i2f(),
-                // i2d (0x87)
-                0x87 => self.emit_i2d(),
-                // l2i (0x88)
-                0x88 => self.emit_l2i(),
-                // l2f (0x89)
-                0x89 => self.emit_i2f(), // same as i2f on 64-bit
-                // l2d (0x8a)
-                0x8a => self.emit_i2d(), // same as i2d on 64-bit
-                // f2i (0x8b)
-                0x8b => self.emit_f2i(),
-                // f2l (0x8c)
-                0x8c => self.emit_f2i(), // same: fcvtzs to 64-bit
-                // f2d (0x8d)
-                0x8d => {
-                    // float to double: in our backend both use double-precision V regs, no-op
-                }
-                // d2i (0x8e)
-                0x8e => self.emit_f2i(),
-                // d2l (0x8f)
-                0x8f => self.emit_f2i(), // same: fcvtzs to 64-bit
-                // d2f (0x90)
-                0x90 => {
-                    // double to float: in our backend both use double-precision V regs, no-op
-                }
-                // i2b (0x91) — int to byte (sign-extend low 8 bits)
-                0x91 => {
-                    let src = self.pop_operand();
-                    let dst = self.alloc_scratch();
-                    // SXTB: sign-extend byte to 64-bit using LSL+ASR pattern
-                    self.buffer
-                        .emit(Arm64Instruction::MovImm { rd: dst, imm: 56 });
-                    let tmp = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::Lsl {
-                        rd: tmp,
-                        rn: src,
-                        rm: dst,
-                    });
-                    self.buffer.emit(Arm64Instruction::Asr {
-                        rd: tmp,
-                        rn: tmp,
-                        rm: dst,
-                    });
-                    self.push_operand(tmp);
-                }
-                // i2c (0x92) — int to char (zero-extend low 16 bits)
-                0x92 => {
-                    let src = self.pop_operand();
-                    let dst = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::MovImm {
-                        rd: dst,
-                        imm: 0xFFFF,
-                    });
-                    let tmp = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::And {
-                        rd: tmp,
-                        rn: src,
-                        rm: dst,
-                    });
-                    self.push_operand(tmp);
-                }
-                // i2s (0x93) — int to short (sign-extend low 16 bits)
-                0x93 => {
-                    let src = self.pop_operand();
-                    let dst = self.alloc_scratch();
-                    self.buffer
-                        .emit(Arm64Instruction::MovImm { rd: dst, imm: 48 });
-                    let tmp = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::Lsl {
-                        rd: tmp,
-                        rn: src,
-                        rm: dst,
-                    });
-                    self.buffer.emit(Arm64Instruction::Asr {
-                        rd: tmp,
-                        rn: tmp,
-                        rm: dst,
-                    });
-                    self.push_operand(tmp);
-                }
-                // fcmpl (0x95), fcmpg (0x96), dcmpl (0x97), dcmpg (0x98)
-                0x95 | 0x97 => self.emit_fcmp(true),  // NaN → -1
-                0x96 | 0x98 => self.emit_fcmp(false), // NaN → 1
-
-                // -- aload / astore (reference load/store, same as iload/istore on 64-bit) --
-                0x19 => {
-                    // aload
-                    if pc >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let idx = bytecode[pc] as usize;
-                    pc += 1;
-                    self.emit_iload(idx);
-                    // T1.1.3 — aload always pushes an object reference.
-                    self.mark_top_operand_as_oop();
-                }
-                0x2a..=0x2d => {
-                    // aload_0..aload_3
-                    self.emit_iload((opcode - 0x2a) as usize);
-                    self.mark_top_operand_as_oop();
-                }
-                0x3a => {
-                    // astore
-                    if pc >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let idx = bytecode[pc] as usize;
-                    pc += 1;
-                    self.emit_istore(idx);
-                }
-                0x4b..=0x4e => self.emit_istore((opcode - 0x4b) as usize), // astore_0..astore_3
-
-                // -- iinc --
-                0x84 => {
-                    if pc + 1 >= bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let idx = bytecode[pc] as usize;
-                    let delta = bytecode[pc + 1] as i8 as i32;
-                    pc += 2;
-                    if let Some(Some(reg)) = self.local_regs.get(idx).copied() {
-                        if delta >= 0 {
-                            self.buffer.emit(Arm64Instruction::AddImm {
-                                rd: reg,
-                                rn: reg,
-                                imm: delta,
-                            });
-                        } else {
-                            self.buffer.emit(Arm64Instruction::SubImm {
-                                rd: reg,
-                                rn: reg,
-                                imm: -delta,
-                            });
-                        }
-                    } else {
-                        // Spilled local: load, add, store back
-                        let frame = self.frame.as_ref().unwrap();
-                        let spill_index = self.spill_index_for(idx);
-                        let offset = frame.spill_offset.saturating_add(
-                            i32::try_from(spill_index)
-                                .unwrap_or(i32::MAX)
-                                .saturating_mul(8),
-                        );
-                        let tmp = self.alloc_scratch();
-                        self.buffer.emit(Arm64Instruction::Ldr {
-                            rt: tmp,
-                            rn: Arm64Register::FP,
-                            offset,
-                        });
-                        if delta >= 0 {
-                            self.buffer.emit(Arm64Instruction::AddImm {
-                                rd: tmp,
-                                rn: tmp,
-                                imm: delta,
-                            });
-                        } else {
-                            self.buffer.emit(Arm64Instruction::SubImm {
-                                rd: tmp,
-                                rn: tmp,
-                                imm: -delta,
-                            });
-                        }
-                        self.buffer.emit(Arm64Instruction::Str {
-                            rt: tmp,
-                            rn: Arm64Register::FP,
-                            offset,
-                        });
-                    }
-                }
-
-                // -- iushr (logical shift right) --
-                0x7c => {
-                    let shift = self.pop_operand();
-                    let val = self.pop_operand();
-                    let dst = self.alloc_scratch();
-                    // Mask to 32 bits first for unsigned shift
-                    let mask = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::MovImm {
-                        rd: mask,
-                        imm: 0xFFFF_FFFF,
-                    });
-                    self.buffer.emit(Arm64Instruction::And {
-                        rd: dst,
-                        rn: val,
-                        rm: mask,
-                    });
-                    self.buffer.emit(Arm64Instruction::Lsr {
-                        rd: dst,
-                        rn: dst,
-                        rm: shift,
-                    });
-                    self.push_operand(dst);
-                }
-
-                // -- lushr (long unsigned shift right) --
-                0x7d => {
-                    let shift = self.pop_operand();
-                    let val = self.pop_operand();
-                    let dst = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::Lsr {
-                        rd: dst,
-                        rn: val,
-                        rm: shift,
-                    });
-                    self.push_operand(dst);
-                }
-
-                // -- lshl --
-                0x79 => {
-                    let shift = self.pop_operand();
-                    let val = self.pop_operand();
-                    let dst = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::Lsl {
-                        rd: dst,
-                        rn: val,
-                        rm: shift,
-                    });
-                    self.push_operand(dst);
-                }
-
-                // -- lshr --
-                0x7b => {
-                    let shift = self.pop_operand();
-                    let val = self.pop_operand();
-                    let dst = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::Asr {
-                        rd: dst,
-                        rn: val,
-                        rm: shift,
-                    });
-                    self.push_operand(dst);
-                }
-
-                // -- ldiv -- (refused; same reason as `idiv` above)
-                0x6d => {
-                    success = false;
-                    break;
-                }
-
-                // -- irem / lrem --
-                //
-                // Both lowered to `a - (a / b) * b` via `SDIV` + `MSUB` with
-                // NO divisor check at all. On AArch64 `SDIV` by zero does not
-                // trap — it yields 0 — so the sequence quietly computed
-                // `a - 0 * b == a`: `x % 0` returned `x` instead of throwing
-                // `ArithmeticException`. A silent wrong answer is worse than
-                // a bail, and there is no exception path on this backend to
-                // route a correct throw through, so refuse the method.
-                // (`Integer.MIN_VALUE % -1` is separately wrong for the same
-                // 64-bit-lowering reason described in the module header.)
-                0x70 | 0x71 => {
-                    success = false;
-                    break;
-                }
-
-                // -- dup_x1 (0x5a) --
-                //
-                // JVMS: both operands category-1. A `float`/`double` in either
-                // position is on the other stack; refuse.
-                0x5a => {
-                    match self.int_stack_shuffle_entries(start_pc, 2) {
-                        Some(c) if !c[0] && !c[1] => {}
-                        _ => {
-                            success = false;
-                            break;
-                        }
-                    }
-                    let val1 = self.pop_operand();
-                    let val2 = self.pop_operand();
-                    let dup = self.alloc_scratch();
-                    self.buffer
-                        .emit(Arm64Instruction::Mov { rd: dup, rm: val1 });
-                    self.push_operand(dup);
-                    self.push_operand(val2);
-                    self.push_operand(val1);
-                }
-
-                // -- dup_x2 (0x5b) --
-                //
-                // FORM 1 is three category-1 entries; FORM 2 is a category-1
-                // top over ONE category-2, i.e. two entries. The old
-                // unconditional three-pop was FORM 1 only.
+                },
+                // dup_x2: FORM 1 is three category-1 values; FORM 2 a category-1
+                // top over one category-2 value.
                 0x5b => {
-                    let Some(cats) = self.int_stack_shuffle_entries(start_pc, 2) else {
+                    let under = match self.top_categories(2) {
+                        Some(c) if !c[0] && c[1] => Some(1),
+                        Some(c) if !c[0] => match self.top_categories(3) {
+                            Some(c3) if !c3[2] => Some(2),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let Some(under) = under else {
                         success = false;
                         break;
                     };
-                    if cats[0] {
-                        success = false; // no dup_x2 form has a category-2 top
-                        break;
-                    }
-                    let below_entries = if cats[1] {
-                        1 // FORM 2 — one category-2 entry under the top
-                    } else {
-                        match self.int_stack_shuffle_entries(start_pc, 3) {
-                            Some(c) if !c[2] => 2, // FORM 1
-                            _ => {
-                                success = false;
-                                break;
-                            }
-                        }
-                    };
-                    let val1 = self.pop_operand();
-                    let mut below = Vec::with_capacity(below_entries);
-                    for _ in 0..below_entries {
-                        below.push(self.pop_operand());
-                    }
-                    let dup = self.alloc_scratch();
-                    self.buffer
-                        .emit(Arm64Instruction::Mov { rd: dup, rm: val1 });
-                    self.push_operand(dup);
-                    for reg in below.into_iter().rev() {
-                        self.push_operand(reg);
-                    }
-                    self.push_operand(val1);
+                    self.emit_dup_group_over(1, under);
                 }
-
-                // -- dup2 (0x5c) --
-                //
-                // FORM 2 is a single category-2 entry, duplicated like `dup`.
-                // The old unconditional two-pop duplicated an unrelated value
-                // sitting under the long — the exact miscompile the x64
-                // backend was fixed for (`dup2_category_safe`'s doc comment).
+                // dup2: FORM 1 two category-1 values; FORM 2 one category-2.
                 0x5c => {
-                    let Some(cats) = self.int_stack_shuffle_entries(start_pc, 1) else {
+                    let group = match self.top_categories(1) {
+                        Some(c) if c[0] => Some(1),
+                        Some(_) => match self.top_categories(2) {
+                            Some(c) if !c[1] => Some(2),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    let Some(group) = group else {
                         success = false;
                         break;
                     };
-                    if cats[0] {
-                        let val = self.pop_operand();
-                        let dup = self.alloc_scratch();
-                        self.buffer.emit(Arm64Instruction::Mov { rd: dup, rm: val });
-                        self.push_operand(val);
-                        self.push_operand(dup);
-                    } else {
-                        match self.int_stack_shuffle_entries(start_pc, 2) {
-                            Some(c) if !c[1] => {}
-                            _ => {
-                                success = false;
-                                break;
-                            }
-                        }
-                        let val1 = self.pop_operand();
-                        let val2 = self.pop_operand();
-                        let dup1 = self.alloc_scratch();
-                        let dup2 = self.alloc_scratch();
-                        self.buffer
-                            .emit(Arm64Instruction::Mov { rd: dup1, rm: val1 });
-                        self.buffer
-                            .emit(Arm64Instruction::Mov { rd: dup2, rm: val2 });
-                        self.push_operand(val2);
-                        self.push_operand(val1);
-                        self.push_operand(dup2);
-                        self.push_operand(dup1);
-                    }
+                    self.emit_dup_group_over(group, 0);
                 }
-
-                // -- dup2_x1 (0x5d) --
-                //
-                // FORM 1 duplicates two category-1 entries over one; FORM 2
-                // duplicates ONE category-2 entry over one. The old
-                // unconditional three-pop was FORM 1 only.
+                // dup2_x1: FORM 1 two category-1 over one; FORM 2 one category-2
+                // over one. The entry underneath is category-1 in both.
                 0x5d => {
-                    let Some(cats) = self.int_stack_shuffle_entries(start_pc, 2) else {
+                    let group = match self.top_categories(2) {
+                        Some(c) if c[0] && !c[1] => Some(1),
+                        Some(c) if !c[0] && !c[1] => match self.top_categories(3) {
+                            Some(c3) if !c3[2] => Some(2),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let Some(group) = group else {
                         success = false;
                         break;
                     };
-                    // JVMS requires the entry under the duplicated group to be
-                    // category-1 in both forms.
-                    let dup_entries = if cats[0] {
-                        if cats[1] {
-                            success = false;
-                            break;
-                        }
-                        1
-                    } else {
-                        match self.int_stack_shuffle_entries(start_pc, 3) {
-                            Some(c) if !c[1] && !c[2] => 2,
-                            _ => {
-                                success = false;
-                                break;
-                            }
-                        }
-                    };
-                    self.emit_dup_group_over(dup_entries, 1);
+                    self.emit_dup_group_over(group, 1);
                 }
-
-                // -- dup2_x2 (0x5e) --
-                //
-                // The four JVMS forms, in this backend's one-entry-per-value
-                // model. The old arm popped four unconditionally, which is
-                // FORM 1 alone; on the other three it took entries belonging to
-                // the caller's stack — the question the x64 page
-                // (`dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend`)
-                // raised and did not answer.
-                //
+                // dup2_x2, in this backend's one-entry-per-value model:
                 //   FORM 4  v1,v2 cat-2   [v2, v1]         -> [v1, v2, v1]
                 //   FORM 2  v1 cat-2      [v3, v2, v1]     -> [v1, v3, v2, v1]
                 //   FORM 3  v3 cat-2      [v3, v2, v1]     -> [v2, v1, v3, v2, v1]
                 //   FORM 1  all cat-1     [v4, v3, v2, v1] -> [v2, v1, v4, v3, v2, v1]
                 0x5e => {
-                    let Some(cats) = self.int_stack_shuffle_entries(start_pc, 2) else {
-                        success = false;
-                        break;
-                    };
-                    let shape = if cats[0] {
-                        if cats[1] {
-                            Some((1usize, 1usize)) // FORM 4
-                        } else {
-                            match self.int_stack_shuffle_entries(start_pc, 3) {
-                                Some(c) if !c[2] => Some((1, 2)), // FORM 2
-                                _ => None,
-                            }
-                        }
-                    } else if cats[1] {
-                        None // no form has a category-2 under a category-1 top
-                    } else {
-                        match self.int_stack_shuffle_entries(start_pc, 3) {
-                            Some(c) if c[2] => Some((2, 1)), // FORM 3
-                            Some(_) => match self.int_stack_shuffle_entries(start_pc, 4) {
-                                Some(c) if !c[3] => Some((2, 2)), // FORM 1
+                    let shape = match self.top_categories(2) {
+                        Some(c) if c[0] && c[1] => Some((1usize, 1usize)),
+                        Some(c) if c[0] => match self.top_categories(3) {
+                            Some(c3) if !c3[2] => Some((1, 2)),
+                            _ => None,
+                        },
+                        Some(c) if !c[1] => match self.top_categories(3) {
+                            Some(c3) if c3[2] => Some((2, 1)),
+                            Some(_) => match self.top_categories(4) {
+                                Some(c4) if !c4[3] => Some((2, 2)),
                                 _ => None,
                             },
                             None => None,
-                        }
+                        },
+                        _ => None,
                     };
-                    let Some((dup_entries, under_entries)) = shape else {
+                    let Some((group, under)) = shape else {
                         success = false;
                         break;
                     };
-                    self.emit_dup_group_over(dup_entries, under_entries);
+                    self.emit_dup_group_over(group, under);
                 }
-
-                // -- tableswitch (0xaa) --
-                //
-                // HIGH security fix: same `checked_tableswitch_count` audit
-                // as the x64 path — reject adversarial overflow / oversize
-                // tables. Bail out by setting `success = false` so the
-                // ARM64 backend falls back to the interpreter.
-                0xaa => {
-                    let index = self.pop_operand();
-                    // Align to 4-byte boundary
-                    while pc % 4 != 0 {
-                        pc += 1;
-                    }
-                    if pc + 12 > bytecode.len() {
-                        success = false;
-                        break;
-                    }
-                    let default_off = i32::from_be_bytes([
-                        bytecode[pc],
-                        bytecode[pc + 1],
-                        bytecode[pc + 2],
-                        bytecode[pc + 3],
-                    ]);
-                    let low = i32::from_be_bytes([
-                        bytecode[pc + 4],
-                        bytecode[pc + 5],
-                        bytecode[pc + 6],
-                        bytecode[pc + 7],
-                    ]);
-                    let high = i32::from_be_bytes([
-                        bytecode[pc + 8],
-                        bytecode[pc + 9],
-                        bytecode[pc + 10],
-                        bytecode[pc + 11],
-                    ]);
-                    pc += 12;
-                    let count = match super::x64::checked_tableswitch_count(low, high) {
-                        Some(n) => n,
-                        None => {
+                // swap: both category-1.
+                0x5f => match self.top_categories(2) {
+                    Some(c) if !c[0] && !c[1] => {
+                        let (Some(v1), Some(v2)) = (self.pop_entry(), self.pop_entry()) else {
                             success = false;
                             break;
-                        }
+                        };
+                        self.push_like(v1.1, v1.0);
+                        self.push_like(v2.1, v2.0);
+                    }
+                    _ => {
+                        success = false;
+                        break;
+                    }
+                },
+                // iadd ladd fadd dadd
+                0x60 => self.emit_binary_int(OperandKind::I32, |rd, rn, rm| {
+                    Arm64Instruction::AddW { rd, rn, rm }
+                }),
+                0x61 => self.emit_binary_int(OperandKind::I64, |rd, rn, rm| {
+                    Arm64Instruction::Add { rd, rn, rm }
+                }),
+                0x62 | 0x63 => self.emit_binary_fp(
+                    if opcode == 0x62 { OperandKind::F32 } else { OperandKind::F64 },
+                    |vd, vn, vm| Arm64Instruction::FaddSingle { vd, vn, vm },
+                    |vd, vn, vm| Arm64Instruction::FaddDouble { vd, vn, vm },
+                ),
+                // isub lsub fsub dsub
+                0x64 => self.emit_binary_int(OperandKind::I32, |rd, rn, rm| {
+                    Arm64Instruction::SubW { rd, rn, rm }
+                }),
+                0x65 => self.emit_binary_int(OperandKind::I64, |rd, rn, rm| {
+                    Arm64Instruction::Sub { rd, rn, rm }
+                }),
+                0x66 | 0x67 => self.emit_binary_fp(
+                    if opcode == 0x66 { OperandKind::F32 } else { OperandKind::F64 },
+                    |vd, vn, vm| Arm64Instruction::FsubSingle { vd, vn, vm },
+                    |vd, vn, vm| Arm64Instruction::FsubDouble { vd, vn, vm },
+                ),
+                // imul lmul fmul dmul
+                0x68 => self.emit_binary_int(OperandKind::I32, |rd, rn, rm| {
+                    Arm64Instruction::MulW { rd, rn, rm }
+                }),
+                0x69 => self.emit_binary_int(OperandKind::I64, |rd, rn, rm| {
+                    Arm64Instruction::Mul { rd, rn, rm }
+                }),
+                0x6a | 0x6b => self.emit_binary_fp(
+                    if opcode == 0x6a { OperandKind::F32 } else { OperandKind::F64 },
+                    |vd, vn, vm| Arm64Instruction::FmulSingle { vd, vn, vm },
+                    |vd, vn, vm| Arm64Instruction::FmulDouble { vd, vn, vm },
+                ),
+                // idiv / ldiv / irem / lrem -- refused. There is no exception
+                // path on this backend: the old divide-by-zero guard was `BRK #1`
+                // (SIGTRAP, which nothing converts), and AArch64 `SDIV` by zero
+                // yields 0, so `x % 0` silently returned `x`.
+                0x6c | 0x6d | 0x70 | 0x71 => {
+                    success = false;
+                    break;
+                }
+                // fdiv ddiv
+                0x6e | 0x6f => self.emit_binary_fp(
+                    if opcode == 0x6e { OperandKind::F32 } else { OperandKind::F64 },
+                    |vd, vn, vm| Arm64Instruction::FdivSingle { vd, vn, vm },
+                    |vd, vn, vm| Arm64Instruction::FdivDouble { vd, vn, vm },
+                ),
+                // frem / drem -- refused: there is no exact lowering (the
+                // truncating FCVTZS round-trip saturates for |a/b| >= 2^63, and
+                // Java's remainder is exact across the whole range).
+                0x72 | 0x73 => {
+                    self.buffer.emit(Arm64Instruction::Comment(
+                        "frem/drem: no exact lowering — bailing to interpreter".into(),
+                    ));
+                    success = false;
+                    break;
+                }
+                // ineg lneg fneg dneg
+                0x74 => {
+                    let src = self.pop_kind(OperandKind::I32);
+                    let dst = self.alloc_reg(false);
+                    self.buffer
+                        .emit(Arm64Instruction::NegW { rd: dst, rn: src });
+                    self.emit_sxtw(dst);
+                    self.push_reg(OperandKind::I32, dst);
+                }
+                0x75 => {
+                    let src = self.pop_kind(OperandKind::I64);
+                    let dst = self.alloc_reg(false);
+                    self.buffer
+                        .emit(Arm64Instruction::Neg { rd: dst, rn: src });
+                    self.push_reg(OperandKind::I64, dst);
+                }
+                0x76 => self.emit_float_neg(OperandKind::F32),
+                0x77 => self.emit_float_neg(OperandKind::F64),
+                // ishl lshl ishr lshr iushr lushr. The W-form variable shifts take
+                // the amount MOD 32 and the X forms MOD 64, which is exactly the
+                // JVMS `& 0x1f` / `& 0x3f`.
+                0x78 => self.emit_shift(OperandKind::I32, |rd, rn, rm| {
+                    Arm64Instruction::LslW { rd, rn, rm }
+                }),
+                0x79 => self.emit_shift(OperandKind::I64, |rd, rn, rm| {
+                    Arm64Instruction::Lsl { rd, rn, rm }
+                }),
+                0x7a => self.emit_shift(OperandKind::I32, |rd, rn, rm| {
+                    Arm64Instruction::AsrW { rd, rn, rm }
+                }),
+                0x7b => self.emit_shift(OperandKind::I64, |rd, rn, rm| {
+                    Arm64Instruction::Asr { rd, rn, rm }
+                }),
+                0x7c => self.emit_shift(OperandKind::I32, |rd, rn, rm| {
+                    Arm64Instruction::LsrW { rd, rn, rm }
+                }),
+                0x7d => self.emit_shift(OperandKind::I64, |rd, rn, rm| {
+                    Arm64Instruction::Lsr { rd, rn, rm }
+                }),
+                // iand land ior lor ixor lxor
+                0x7e => self.emit_binary_int(OperandKind::I32, |rd, rn, rm| {
+                    Arm64Instruction::AndW { rd, rn, rm }
+                }),
+                0x7f => self.emit_binary_int(OperandKind::I64, |rd, rn, rm| {
+                    Arm64Instruction::And { rd, rn, rm }
+                }),
+                0x80 => self.emit_binary_int(OperandKind::I32, |rd, rn, rm| {
+                    Arm64Instruction::OrrW { rd, rn, rm }
+                }),
+                0x81 => self.emit_binary_int(OperandKind::I64, |rd, rn, rm| {
+                    Arm64Instruction::Orr { rd, rn, rm }
+                }),
+                0x82 => self.emit_binary_int(OperandKind::I32, |rd, rn, rm| {
+                    Arm64Instruction::EorW { rd, rn, rm }
+                }),
+                0x83 => self.emit_binary_int(OperandKind::I64, |rd, rn, rm| {
+                    Arm64Instruction::Eor { rd, rn, rm }
+                }),
+                // iinc
+                0x84 => {
+                    let (Some(idx), Some(delta)) = (bc_u8(bytecode, pc), bc_u8(bytecode, pc + 1))
+                    else {
+                        success = false;
+                        break;
                     };
-
-                    // Range check: if index < low || index > high → default
-                    let default_target = (start_pc as i32 + default_off) as usize;
-                    let default_label = self.label_for_pc(default_target);
-
-                    if low != 0 {
-                        let adj = self.alloc_scratch();
-                        self.buffer.emit(Arm64Instruction::SubImm {
-                            rd: adj,
-                            rn: index,
-                            imm: low,
-                        });
-                        // adj holds the 0-based index
-                        let bound = self.alloc_scratch();
-                        self.buffer.emit(Arm64Instruction::MovImm {
-                            rd: bound,
-                            imm: count as i64,
-                        });
-                        self.buffer
-                            .emit(Arm64Instruction::Cmp { rn: adj, rm: bound });
-                        self.buffer.emit(Arm64Instruction::BCond {
-                            cond: Arm64Condition::Cs,
-                            label: default_label,
-                        });
+                    pc += 2;
+                    // Cast: iinc's constant is a signed byte.
+                    self.emit_iinc(usize::from(idx), i32::from(delta as i8));
+                }
+                // i2l l2i i2f i2d l2f l2d f2i f2l f2d d2i d2l d2f i2b i2c i2s
+                0x85..=0x93 => self.emit_conversion(opcode),
+                // lcmp
+                0x94 => self.emit_lcmp(),
+                // fcmpl fcmpg dcmpl dcmpg
+                0x95 => self.emit_fcmp(OperandKind::F32, false),
+                0x96 => self.emit_fcmp(OperandKind::F32, true),
+                0x97 => self.emit_fcmp(OperandKind::F64, false),
+                0x98 => self.emit_fcmp(OperandKind::F64, true),
+                // ifeq ifne iflt ifge ifgt ifle
+                0x99..=0x9e => {
+                    let Some(off) = bc_i16(bytecode, pc) else {
+                        success = false;
+                        break;
+                    };
+                    pc += 2;
+                    let cond = IF_CONDS[usize::from(opcode - 0x99)];
+                    self.emit_if_zero(cond, branch_target(start_pc, i32::from(off)));
+                }
+                // if_icmpeq .. if_icmple
+                0x9f..=0xa4 => {
+                    let Some(off) = bc_i16(bytecode, pc) else {
+                        success = false;
+                        break;
+                    };
+                    pc += 2;
+                    let cond = IF_CONDS[usize::from(opcode - 0x9f)];
+                    self.emit_if_icmp(cond, branch_target(start_pc, i32::from(off)));
+                }
+                // if_acmpeq if_acmpne
+                0xa5 | 0xa6 => {
+                    let Some(off) = bc_i16(bytecode, pc) else {
+                        success = false;
+                        break;
+                    };
+                    pc += 2;
+                    let cond = if opcode == 0xa5 {
+                        Arm64Condition::Eq
                     } else {
-                        let bound = self.alloc_scratch();
-                        self.buffer.emit(Arm64Instruction::MovImm {
-                            rd: bound,
-                            imm: count as i64,
-                        });
-                        self.buffer.emit(Arm64Instruction::Cmp {
-                            rn: index,
-                            rm: bound,
-                        });
-                        self.buffer.emit(Arm64Instruction::BCond {
-                            cond: Arm64Condition::Cs,
-                            label: default_label,
-                        });
-                    }
-
-                    // Emit linear chain of compares+branches for each case
-                    for i in 0..count {
-                        if pc + 4 > bytecode.len() {
-                            success = false;
-                            break;
-                        }
-                        let off = i32::from_be_bytes([
-                            bytecode[pc],
-                            bytecode[pc + 1],
-                            bytecode[pc + 2],
-                            bytecode[pc + 3],
-                        ]);
-                        pc += 4;
-                        let target = (start_pc as i32 + off) as usize;
-                        let case_label = self.label_for_pc(target);
-                        let case_val = self.alloc_scratch();
-                        self.buffer.emit(Arm64Instruction::MovImm {
-                            rd: case_val,
-                            imm: (low + i as i32) as i64,
-                        });
-                        self.buffer.emit(Arm64Instruction::Cmp {
-                            rn: index,
-                            rm: case_val,
-                        });
-                        self.buffer.emit(Arm64Instruction::BCond {
-                            cond: Arm64Condition::Eq,
-                            label: case_label,
-                        });
-                    }
-                    // Fall through to default
-                    self.buffer.emit(Arm64Instruction::B {
-                        label: default_label,
-                    });
+                        Arm64Condition::Ne
+                    };
+                    self.emit_if_acmp(cond, branch_target(start_pc, i32::from(off)));
                 }
-
-                // -- lookupswitch (0xab) --
-                //
-                // HIGH security fix: validate `npairs` via
-                // `checked_lookupswitch_npairs` (reject negative / oversize).
-                0xab => {
-                    let key = self.pop_operand();
+                // goto
+                0xa7 => {
+                    let Some(off) = bc_i16(bytecode, pc) else {
+                        success = false;
+                        break;
+                    };
+                    pc += 2;
+                    let label = self.prepare_branch(branch_target(start_pc, i32::from(off)));
+                    self.buffer.emit(Arm64Instruction::B { label });
+                    self.reachable = false;
+                }
+                // tableswitch. The `checked_tableswitch_count` audit rejects
+                // adversarial overflow / oversize tables, as on x64.
+                0xaa => {
+                    let key = self.pop_kind(OperandKind::I32);
                     while pc % 4 != 0 {
                         pc += 1;
                     }
-                    if pc + 8 > bytecode.len() {
+                    let (Some(default_off), Some(low), Some(high)) =
+                        (bc_i32(bytecode, pc), bc_i32(bytecode, pc + 4), bc_i32(bytecode, pc + 8))
+                    else {
+                        success = false;
+                        break;
+                    };
+                    pc += 12;
+                    let Some(count) = super::x64::checked_tableswitch_count(low, high) else {
+                        success = false;
+                        break;
+                    };
+                    let default = self.prepare_branch(branch_target(start_pc, default_off));
+                    let mut targets = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let Some(off) = bc_i32(bytecode, pc) else {
+                            break;
+                        };
+                        pc += 4;
+                        targets.push(self.prepare_branch(branch_target(start_pc, off)));
+                    }
+                    if targets.len() != count {
                         success = false;
                         break;
                     }
-                    let default_off = i32::from_be_bytes([
-                        bytecode[pc],
-                        bytecode[pc + 1],
-                        bytecode[pc + 2],
-                        bytecode[pc + 3],
-                    ]);
-                    let npairs_raw = i32::from_be_bytes([
-                        bytecode[pc + 4],
-                        bytecode[pc + 5],
-                        bytecode[pc + 6],
-                        bytecode[pc + 7],
-                    ]);
-                    let npairs = match super::x64::checked_lookupswitch_npairs(npairs_raw) {
-                        Some(n) => n,
-                        None => {
-                            success = false;
-                            break;
-                        }
+                    self.buffer.emit(Arm64Instruction::TableSwitch {
+                        key,
+                        low,
+                        default,
+                        targets,
+                    });
+                    self.reachable = false;
+                }
+                // lookupswitch, with `checked_lookupswitch_npairs` validation.
+                0xab => {
+                    let key = self.pop_kind(OperandKind::I32);
+                    while pc % 4 != 0 {
+                        pc += 1;
+                    }
+                    let (Some(default_off), Some(npairs_raw)) =
+                        (bc_i32(bytecode, pc), bc_i32(bytecode, pc + 4))
+                    else {
+                        success = false;
+                        break;
                     };
                     pc += 8;
-
-                    let default_target = (start_pc as i32 + default_off) as usize;
-                    let default_label = self.label_for_pc(default_target);
-
+                    let Some(npairs) = super::x64::checked_lookupswitch_npairs(npairs_raw) else {
+                        success = false;
+                        break;
+                    };
+                    let default = self.prepare_branch(branch_target(start_pc, default_off));
+                    let mut pairs = Vec::with_capacity(npairs);
                     for _ in 0..npairs {
-                        if pc + 8 > bytecode.len() {
-                            success = false;
+                        let (Some(value), Some(off)) = (bc_i32(bytecode, pc), bc_i32(bytecode, pc + 4))
+                        else {
                             break;
-                        }
-                        let match_val = i32::from_be_bytes([
-                            bytecode[pc],
-                            bytecode[pc + 1],
-                            bytecode[pc + 2],
-                            bytecode[pc + 3],
-                        ]);
-                        let off = i32::from_be_bytes([
-                            bytecode[pc + 4],
-                            bytecode[pc + 5],
-                            bytecode[pc + 6],
-                            bytecode[pc + 7],
-                        ]);
+                        };
                         pc += 8;
-                        let target = (start_pc as i32 + off) as usize;
-                        let case_label = self.label_for_pc(target);
-                        let cmp_val = self.alloc_scratch();
-                        self.buffer.emit(Arm64Instruction::MovImm {
-                            rd: cmp_val,
-                            imm: match_val as i64,
-                        });
-                        self.buffer.emit(Arm64Instruction::Cmp {
-                            rn: key,
-                            rm: cmp_val,
-                        });
-                        self.buffer.emit(Arm64Instruction::BCond {
-                            cond: Arm64Condition::Eq,
-                            label: case_label,
-                        });
+                        pairs.push((value, self.prepare_branch(branch_target(start_pc, off))));
                     }
-                    self.buffer.emit(Arm64Instruction::B {
-                        label: default_label,
+                    if pairs.len() != npairs {
+                        success = false;
+                        break;
+                    }
+                    self.buffer.emit(Arm64Instruction::LookupSwitch {
+                        key,
+                        pairs,
+                        default,
                     });
+                    self.reachable = false;
                 }
-
-                // -- if_acmpeq (0xa5), if_acmpne (0xa6) --
-                0xa5 => {
-                    if pc + 1 >= bytecode.len() {
+                // ireturn lreturn freturn dreturn areturn
+                0xac..=0xb0 => {
+                    const RETURN_KINDS: [OperandKind; 5] = LOCAL_KINDS;
+                    self.emit_return_value(RETURN_KINDS[usize::from(opcode - 0xac)]);
+                }
+                // return
+                0xb1 => {
+                    self.buffer.emit(Arm64Instruction::B {
+                        label: self.epilogue_label,
+                    });
+                    self.reachable = false;
+                }
+                // invokestatic -- always refused; see `emit_invoke`.
+                0xb8 => {
+                    let Some(cp_idx) = bc_i16(bytecode, pc) else {
                         success = false;
                         break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
+                    };
                     pc += 2;
-                    let target = (start_pc as isize + offset) as usize;
-                    self.emit_if_icmp(Arm64Condition::Eq, target);
+                    // Cast: the constant-pool index is an unsigned u2.
+                    let num_args = self
+                        .method_info
+                        .get(&(cp_idx as u16))
+                        .copied()
+                        .unwrap_or(self.num_params);
+                    self.emit_invoke(num_args);
                 }
-                0xa6 => {
-                    if pc + 1 >= bytecode.len() {
+                // ifnull ifnonnull
+                0xc6 | 0xc7 => {
+                    let Some(off) = bc_i16(bytecode, pc) else {
                         success = false;
                         break;
-                    }
-                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
+                    };
                     pc += 2;
-                    let target = (start_pc as isize + offset) as usize;
-                    self.emit_if_icmp(Arm64Condition::Ne, target);
+                    self.emit_if_null(opcode == 0xc7, branch_target(start_pc, i32::from(off)));
                 }
-
-                // -- nop (0x00) --
-                0x00 => {
-                    self.buffer.emit(Arm64Instruction::Nop);
-                }
-
                 _ => {
-                    // Unsupported opcode: mark failure AND emit trap instruction
-                    // so execution does not silently fall through.
                     self.buffer.emit(Arm64Instruction::Comment(format!(
                         "unsupported opcode 0x{:02x} at pc={}",
                         opcode, start_pc
                     )));
-                    self.buffer.emit(Arm64Instruction::Brk { imm: 0 });
                     success = false;
+                    break;
                 }
             }
         }
 
-        // Emit epilogue.
         self.emit_epilogue();
 
         let frame = match self.frame.take() {
@@ -3845,417 +3382,417 @@ impl Arm64Backend {
             sp_id_slot_off: self.sp_id_slot_off,
             safepoint_count: self.safepoint_count,
             incomplete_oop_maps: self.incomplete_oop_maps,
-            // T1.1.3 — transfer the collected per-PC oop maps out of
-            // the backend. When empty, the walker falls back to the
-            // conservative stack scan for AArch64 frames, matching
-            // the x64 behavior.
             pending_oop_maps: std::mem::take(&mut self.pending_oop_maps),
         }
     }
 
-    // -- Arithmetic helpers -------------------------------------------------
+    // -- Arithmetic ----------------------------------------------------------
 
-    pub fn emit_int_add(&mut self) {
-        let rhs = self.pop_operand();
-        let lhs = self.pop_operand();
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Add {
-            rd: dst,
-            rn: lhs,
-            rm: rhs,
-        });
-        self.push_operand(dst);
+    /// A two-operand integer operation on `kind` operands. For `I32` the
+    /// instruction is a W form, whose result is the JVMS 32-bit wrapped value,
+    /// and the result is sign-extended back to the canonical form.
+    fn emit_binary_int(
+        &mut self,
+        kind: OperandKind,
+        make: fn(Arm64Register, Arm64Register, Arm64Register) -> Arm64Instruction,
+    ) {
+        let rhs = self.pop_kind(kind);
+        let lhs = self.pop_kind(kind);
+        let dst = self.alloc_reg(false);
+        self.buffer.emit(make(dst, lhs, rhs));
+        if kind == OperandKind::I32 {
+            self.emit_sxtw(dst);
+        }
+        self.push_reg(kind, dst);
     }
 
-    pub fn emit_int_sub(&mut self) {
-        let rhs = self.pop_operand();
-        let lhs = self.pop_operand();
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Sub {
-            rd: dst,
-            rn: lhs,
-            rm: rhs,
-        });
-        self.push_operand(dst);
+    /// A shift of a `kind` value by an `int` amount.
+    fn emit_shift(
+        &mut self,
+        kind: OperandKind,
+        make: fn(Arm64Register, Arm64Register, Arm64Register) -> Arm64Instruction,
+    ) {
+        let amount = self.pop_kind(OperandKind::I32);
+        let value = self.pop_kind(kind);
+        let dst = self.alloc_reg(false);
+        self.buffer.emit(make(dst, value, amount));
+        if kind == OperandKind::I32 {
+            self.emit_sxtw(dst);
+        }
+        self.push_reg(kind, dst);
     }
 
-    pub fn emit_int_mul(&mut self) {
-        let rhs = self.pop_operand();
-        let lhs = self.pop_operand();
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Mul {
-            rd: dst,
-            rn: lhs,
-            rm: rhs,
-        });
-        self.push_operand(dst);
+    /// A two-operand FP operation, in the S form for `float` and the D form
+    /// for `double`. `float` used to be computed as `double` end to end, which
+    /// gets rounding, overflow and the bits handed back to the VM all wrong.
+    fn emit_binary_fp(
+        &mut self,
+        kind: OperandKind,
+        single: fn(Arm64Register, Arm64Register, Arm64Register) -> Arm64Instruction,
+        double: fn(Arm64Register, Arm64Register, Arm64Register) -> Arm64Instruction,
+    ) {
+        let rhs = self.pop_kind(kind);
+        let lhs = self.pop_kind(kind);
+        let dst = self.alloc_reg(true);
+        let inst = if kind == OperandKind::F32 {
+            single(dst, lhs, rhs)
+        } else {
+            double(dst, lhs, rhs)
+        };
+        self.buffer.emit(inst);
+        self.push_reg(kind, dst);
     }
 
-    /// NOT WIRED — no opcode arm calls this. `idiv`/`ldiv` (`0x6c`/`0x6d`)
-    /// refuse the method instead, because the divide-by-zero path below is
-    /// `BRK #1` (SIGTRAP → process death), not an `ArithmeticException`
-    /// throw. Retained as the shape a correct lowering should take once this
-    /// backend has an exception path: replace the `Brk` with a branch to a
-    /// stub that calls the VM's throw helper. Exercised by
-    /// `backend_int_div_emits_sdiv` only.
-    pub fn emit_int_div(&mut self) {
-        let rhs = self.pop_operand();
-        let lhs = self.pop_operand();
-        let dst = self.alloc_scratch();
-        // Guard: if divisor is zero, trap — NOT an ArithmeticException; see
-        // the doc comment above for why this helper is currently unwired.
-        // CBZ rhs, trap_label; SDIV; B continue; trap: BRK
-        let trap_label = self.buffer.new_label();
-        let continue_label = self.buffer.new_label();
-        self.buffer.emit(Arm64Instruction::Cbz {
-            rt: rhs,
-            label: trap_label,
-        });
-        self.buffer.emit(Arm64Instruction::SDiv {
-            rd: dst,
-            rn: lhs,
-            rm: rhs,
-        });
-        self.buffer.emit(Arm64Instruction::B {
-            label: continue_label,
-        });
-        self.buffer.bind_label(trap_label);
-        self.buffer.emit(Arm64Instruction::Brk { imm: 1 }); // ArithmeticException
-        self.buffer.bind_label(continue_label);
-        self.push_operand(dst);
+    /// `fneg` / `dneg`: FNEG, which flips the sign bit. The old `0.0 - x`
+    /// turned `-(+0.0)` into `+0.0` rather than `-0.0`.
+    fn emit_float_neg(&mut self, kind: OperandKind) {
+        let src = self.pop_kind(kind);
+        let dst = self.alloc_reg(true);
+        let inst = if kind == OperandKind::F32 {
+            Arm64Instruction::FnegSingle { vd: dst, vn: src }
+        } else {
+            Arm64Instruction::FnegDouble { vd: dst, vn: src }
+        };
+        self.buffer.emit(inst);
+        self.push_reg(kind, dst);
     }
 
-    pub fn emit_int_neg(&mut self) {
-        let src = self.pop_operand();
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Neg { rd: dst, rn: src });
-        self.push_operand(dst);
+    /// `iinc`: a W-form add, re-sign-extended, on the local's home.
+    fn emit_iinc(&mut self, index: usize, delta: i32) {
+        let Some(home) = self.local_regs.get(index).copied() else {
+            self.failed = true;
+            return;
+        };
+        let add = |rd: Arm64Register| {
+            if delta >= 0 {
+                Arm64Instruction::AddImmW {
+                    rd,
+                    rn: rd,
+                    imm: delta,
+                }
+            } else {
+                Arm64Instruction::SubImmW {
+                    rd,
+                    rn: rd,
+                    imm: -delta,
+                }
+            }
+        };
+        match home {
+            Some(reg) => {
+                self.buffer.emit(add(reg));
+                self.emit_sxtw(reg);
+            }
+            None => {
+                let Some(offset) = self.local_slot_offset(index) else {
+                    self.failed = true;
+                    return;
+                };
+                let tmp = self.alloc_reg(false);
+                self.buffer.emit(Arm64Instruction::Ldr {
+                    rt: tmp,
+                    rn: Arm64Register::FP,
+                    offset,
+                });
+                self.buffer.emit(add(tmp));
+                self.emit_sxtw(tmp);
+                self.buffer.emit(Arm64Instruction::Str {
+                    rt: tmp,
+                    rn: Arm64Register::FP,
+                    offset,
+                });
+            }
+        }
     }
 
-    fn emit_int_and(&mut self) {
-        let rhs = self.pop_operand();
-        let lhs = self.pop_operand();
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::And {
-            rd: dst,
-            rn: lhs,
-            rm: rhs,
-        });
-        self.push_operand(dst);
+    /// The numeric conversions `i2l` (0x85) through `i2s` (0x93).
+    ///
+    /// Width discipline, given that an `int` is held sign-extended:
+    /// * `i2l` is a relabelling -- the register already holds the `long`.
+    /// * `l2i` is `SXTW`, keeping the low 32 bits as a signed value. It used to
+    ///   `AND` with `0xFFFFFFFF`, i.e. zero-extend, so `(int) -1L` read back as
+    ///   4294967295 anywhere the upper half was observed.
+    /// * `f2i`/`d2i` are `FCVTZS W` then `SXTW`: the W form saturates at the
+    ///   32-bit bounds, as the JVMS requires. The X form they used saturated at
+    ///   the 64-bit bounds, so `(int) 1e10` was not `Integer.MAX_VALUE`.
+    /// * `i2f`/`i2d` read the W register; `l2f`/`l2d` read the X register.
+    fn emit_conversion(&mut self, opcode: u8) {
+        use OperandKind::{F32, F64, I32, I64};
+        match opcode {
+            // i2l
+            0x85 => {
+                let Some(top) = self.operand_stack.last_mut() else {
+                    self.failed = true;
+                    return;
+                };
+                if top.kind != I32 {
+                    self.failed = true;
+                    return;
+                }
+                top.kind = I64;
+            }
+            0x86 => self.emit_convert(I32, F32, false, |d, s| Arm64Instruction::ScvtfSingle {
+                vd: d,
+                rn: s,
+            }),
+            0x87 => self.emit_convert(I32, F64, false, |d, s| Arm64Instruction::ScvtfDoubleW {
+                vd: d,
+                rn: s,
+            }),
+            0x88 => self.emit_convert(I64, I32, false, |d, s| Arm64Instruction::Sxtw {
+                rd: d,
+                rn: s,
+            }),
+            0x89 => self.emit_convert(I64, F32, false, |d, s| Arm64Instruction::ScvtfSingleX {
+                vd: d,
+                rn: s,
+            }),
+            0x8a => self.emit_convert(I64, F64, false, |d, s| Arm64Instruction::ScvtfDouble {
+                vd: d,
+                rn: s,
+            }),
+            0x8b => self.emit_convert(F32, I32, true, |d, s| Arm64Instruction::FcvtzsSingle {
+                rd: d,
+                vn: s,
+            }),
+            0x8c => self.emit_convert(F32, I64, false, |d, s| Arm64Instruction::FcvtzsSingleX {
+                rd: d,
+                vn: s,
+            }),
+            0x8d => self.emit_convert(F32, F64, false, |d, s| {
+                Arm64Instruction::FcvtSingleToDouble { vd: d, vn: s }
+            }),
+            0x8e => self.emit_convert(F64, I32, true, |d, s| Arm64Instruction::FcvtzsIntW {
+                rd: d,
+                vn: s,
+            }),
+            0x8f => self.emit_convert(F64, I64, false, |d, s| Arm64Instruction::FcvtzsInt {
+                rd: d,
+                vn: s,
+            }),
+            0x90 => self.emit_convert(F64, F32, false, |d, s| {
+                Arm64Instruction::FcvtDoubleToSingle { vd: d, vn: s }
+            }),
+            // i2b, i2c (zero-extend 16 bits), i2s
+            0x91 => self.emit_convert(I32, I32, false, |d, s| Arm64Instruction::Sxtb {
+                rd: d,
+                rn: s,
+            }),
+            0x92 => self.emit_convert(I32, I32, false, |d, s| Arm64Instruction::AndImm {
+                rd: d,
+                rn: s,
+                imm: 0xFFFF,
+            }),
+            0x93 => self.emit_convert(I32, I32, false, |d, s| Arm64Instruction::Sxth {
+                rd: d,
+                rn: s,
+            }),
+            _ => self.failed = true,
+        }
     }
 
-    fn emit_int_or(&mut self) {
-        let rhs = self.pop_operand();
-        let lhs = self.pop_operand();
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Orr {
-            rd: dst,
-            rn: lhs,
-            rm: rhs,
-        });
-        self.push_operand(dst);
-    }
-
-    fn emit_int_xor(&mut self) {
-        let rhs = self.pop_operand();
-        let lhs = self.pop_operand();
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Eor {
-            rd: dst,
-            rn: lhs,
-            rm: rhs,
-        });
-        self.push_operand(dst);
-    }
-
-    fn emit_int_shl(&mut self) {
-        let rhs = self.pop_operand();
-        let lhs = self.pop_operand();
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Lsl {
-            rd: dst,
-            rn: lhs,
-            rm: rhs,
-        });
-        self.push_operand(dst);
-    }
-
-    fn emit_int_shr(&mut self) {
-        let rhs = self.pop_operand();
-        let lhs = self.pop_operand();
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Asr {
-            rd: dst,
-            rn: lhs,
-            rm: rhs,
-        });
-        self.push_operand(dst);
+    /// Pop a `from`, emit `make(dst, src)` into a fresh register of the `to`
+    /// class, sign-extend when `sxtw`, and push a `to`.
+    fn emit_convert(
+        &mut self,
+        from: OperandKind,
+        to: OperandKind,
+        sxtw: bool,
+        make: fn(Arm64Register, Arm64Register) -> Arm64Instruction,
+    ) {
+        let src = self.pop_kind(from);
+        let dst = self.alloc_reg(to.is_fp());
+        self.buffer.emit(make(dst, src));
+        if sxtw {
+            self.emit_sxtw(dst);
+        }
+        self.push_reg(to, dst);
     }
 
     // -- Compare / Branch ---------------------------------------------------
 
+    /// `lcmp`: `CMP; CSET ne; CNEG lt` -- 1, 0 or -1 with no branch.
+    fn emit_lcmp(&mut self) {
+        let rhs = self.pop_kind(OperandKind::I64);
+        let lhs = self.pop_kind(OperandKind::I64);
+        let dst = self.alloc_reg(false);
+        self.buffer
+            .emit(Arm64Instruction::Cmp { rn: lhs, rm: rhs });
+        self.buffer.emit(Arm64Instruction::Cset {
+            rd: dst,
+            cond: Arm64Condition::Ne,
+        });
+        self.buffer.emit(Arm64Instruction::Cneg {
+            rd: dst,
+            rn: dst,
+            cond: Arm64Condition::Lt,
+        });
+        self.push_reg(OperandKind::I32, dst);
+    }
+
+    /// `fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`: `FCMP; CSET ne; CNEG <c>`.
+    ///
+    /// After `FCMP`: equal is `Z=1 C=1`, less `N=1`, greater `C=1`, and
+    /// unordered `C=1 V=1`. `CSET ne` gives 1 for everything but equal; the
+    /// negation then decides where NaN lands:
+    ///
+    /// * `*cmpg` (NaN -> +1) negates on `MI` (`N=1`), which only "less" sets.
+    /// * `*cmpl` (NaN -> -1) negates on `LT` (`N!=V`), which "less" and
+    ///   "unordered" both satisfy.
+    ///
+    /// The branchy version it replaces took `B.LT` for `*cmpg`, which is TRUE
+    /// on unordered, so NaN produced -1 where the JVMS requires +1.
+    fn emit_fcmp(&mut self, kind: OperandKind, nan_is_greater: bool) {
+        let rhs = self.pop_kind(kind);
+        let lhs = self.pop_kind(kind);
+        let dst = self.alloc_reg(false);
+        let cmp = if kind == OperandKind::F32 {
+            Arm64Instruction::FcmpSingle { vn: lhs, vm: rhs }
+        } else {
+            Arm64Instruction::FcmpDouble { vn: lhs, vm: rhs }
+        };
+        self.buffer.emit(cmp);
+        self.buffer.emit(Arm64Instruction::Cset {
+            rd: dst,
+            cond: Arm64Condition::Ne,
+        });
+        self.buffer.emit(Arm64Instruction::Cneg {
+            rd: dst,
+            rn: dst,
+            cond: if nan_is_greater {
+                Arm64Condition::Mi
+            } else {
+                Arm64Condition::Lt
+            },
+        });
+        self.push_reg(OperandKind::I32, dst);
+    }
+
+    /// `if_icmp<cond>`: a W-form compare.
     pub fn emit_if_icmp(&mut self, cond: Arm64Condition, target_pc: usize) {
-        let rhs = self.pop_operand();
-        let lhs = self.pop_operand();
-        self.buffer.emit(Arm64Instruction::Cmp { rn: lhs, rm: rhs });
-        let label = self.label_for_pc(target_pc);
+        let rhs = self.pop_kind(OperandKind::I32);
+        let lhs = self.pop_kind(OperandKind::I32);
+        let label = self.prepare_branch(target_pc);
+        self.buffer
+            .emit(Arm64Instruction::CmpW { rn: lhs, rm: rhs });
         self.buffer.emit(Arm64Instruction::BCond { cond, label });
+    }
+
+    /// `if_acmp<cond>`: references are full 64-bit words.
+    fn emit_if_acmp(&mut self, cond: Arm64Condition, target_pc: usize) {
+        let rhs = self.pop_kind(OperandKind::Ref);
+        let lhs = self.pop_kind(OperandKind::Ref);
+        let label = self.prepare_branch(target_pc);
+        self.buffer
+            .emit(Arm64Instruction::Cmp { rn: lhs, rm: rhs });
+        self.buffer.emit(Arm64Instruction::BCond { cond, label });
+    }
+
+    /// `if<cond>` against zero, on the W register.
+    fn emit_if_zero(&mut self, cond: Arm64Condition, target_pc: usize) {
+        let val = self.pop_kind(OperandKind::I32);
+        let label = self.prepare_branch(target_pc);
+        match cond {
+            Arm64Condition::Eq => self
+                .buffer
+                .emit(Arm64Instruction::CbzW { rt: val, label }),
+            Arm64Condition::Ne => self
+                .buffer
+                .emit(Arm64Instruction::CbnzW { rt: val, label }),
+            _ => {
+                self.buffer
+                    .emit(Arm64Instruction::CmpImmW { rn: val, imm: 0 });
+                self.buffer.emit(Arm64Instruction::BCond { cond, label });
+            }
+        }
+    }
+
+    /// `ifnull` / `ifnonnull`.
+    fn emit_if_null(&mut self, nonnull: bool, target_pc: usize) {
+        let val = self.pop_kind(OperandKind::Ref);
+        let label = self.prepare_branch(target_pc);
+        if nonnull {
+            self.buffer.emit(Arm64Instruction::Cbnz { rt: val, label });
+        } else {
+            self.buffer.emit(Arm64Instruction::Cbz { rt: val, label });
+        }
     }
 
     // -- Load / Store locals ------------------------------------------------
 
-    pub fn emit_iload(&mut self, index: usize) {
-        if let Some(Some(reg)) = self.local_regs.get(index).copied() {
-            // Local lives in a callee-saved register: just push it.
-            let dst = self.alloc_scratch();
-            self.buffer.emit(Arm64Instruction::Mov { rd: dst, rm: reg });
-            self.push_operand(dst);
-        } else {
-            // Spilled local: load from stack.
-            let frame = self.frame.as_ref().unwrap();
-            let spill_index = self.spill_index_for(index);
-            let offset = frame.spill_offset.saturating_add(
-                i32::try_from(spill_index)
-                    .unwrap_or(i32::MAX)
-                    .saturating_mul(8),
-            );
-            let dst = self.alloc_scratch();
-            self.buffer.emit(Arm64Instruction::Ldr {
-                rt: dst,
-                rn: Arm64Register::FP,
-                offset,
-            });
-            self.push_operand(dst);
-        }
+    /// FP-relative offset of frame-homed local `index`'s word.
+    fn local_slot_offset(&self, index: usize) -> Option<i32> {
+        let frame = self.frame.as_ref()?;
+        let scaled = i32::try_from(self.spill_index_for(index))
+            .ok()?
+            .checked_mul(8)?;
+        frame.spill_offset.checked_add(scaled)
     }
 
-    pub fn emit_istore(&mut self, index: usize) {
-        let src = self.pop_operand();
-        if let Some(Some(reg)) = self.local_regs.get(index) {
-            self.buffer
-                .emit(Arm64Instruction::Mov { rd: *reg, rm: src });
-        } else {
-            let frame = self.frame.as_ref().unwrap();
-            let spill_index = self.spill_index_for(index);
-            let offset = frame.spill_offset.saturating_add(
-                i32::try_from(spill_index)
-                    .unwrap_or(i32::MAX)
-                    .saturating_mul(8),
-            );
-            self.buffer.emit(Arm64Instruction::Str {
-                rt: src,
-                rn: Arm64Register::FP,
-                offset,
-            });
-        }
-    }
-
-    // -- Constants ----------------------------------------------------------
-
-    pub fn emit_iconst(&mut self, value: i32) {
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::MovImm {
-            rd: dst,
-            imm: i64::from(value),
-        });
-        self.push_operand(dst);
-    }
-
-    pub fn emit_lconst(&mut self, value: i64) {
-        let dst = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::MovImm {
-            rd: dst,
-            imm: value,
-        });
-        self.push_operand(dst);
-    }
-
-    /// Load a 64-bit constant using the literal pool (LDR literal with inline data).
-    ///
-    /// Emits the pattern:  LDR Xt, pool_entry; B skip; .quad value; skip:
-    /// This avoids the need for a post-code literal pool by placing the constant
-    /// inline and branching over it.
-    pub fn emit_ldr_literal(&mut self, rd: Arm64Register, value: u64) {
-        let pool_label = self.buffer.new_label();
-        let skip_label = self.buffer.new_label();
-        self.buffer.emit(Arm64Instruction::LdrLiteral {
-            rt: rd,
-            label: pool_label,
-        });
-        self.buffer.emit(Arm64Instruction::B { label: skip_label });
-        self.buffer.emit(Arm64Instruction::ConstantPoolEntry {
-            label: pool_label,
-            value,
-        });
-        self.buffer.bind_label(skip_label);
-    }
-
-    // -- Invoke -------------------------------------------------------------
-
-    pub fn emit_invoke(&mut self, num_args: usize) {
-        // Move arguments from operand stack into X0..X7.
-        // Pop in reverse so that the first arg ends up in X0.
-        let mut arg_regs = Vec::new();
-        for _ in 0..num_args {
-            arg_regs.push(self.pop_operand());
-        }
-        arg_regs.reverse();
-
-        for (i, &src) in arg_regs.iter().enumerate() {
-            if let Some(dst) = Arm64CallingConvention::int_arg_reg(i) {
-                if src != dst {
-                    self.buffer.emit(Arm64Instruction::Mov { rd: dst, rm: src });
-                }
+    /// Push a copy of local `index`, read as a `kind`.
+    fn emit_load_local(&mut self, index: usize, kind: OperandKind) {
+        let Some(home) = self.local_regs.get(index).copied() else {
+            self.failed = true;
+            return;
+        };
+        let dst = self.alloc_reg(kind.is_fp());
+        match home {
+            Some(reg) => {
+                let inst = match kind {
+                    OperandKind::F32 => Arm64Instruction::FmovToFpSingle { vd: dst, rn: reg },
+                    OperandKind::F64 => Arm64Instruction::FmovToFp { vd: dst, rn: reg },
+                    _ => Arm64Instruction::Mov { rd: dst, rm: reg },
+                };
+                self.buffer.emit(inst);
+            }
+            None => {
+                let Some(offset) = self.local_slot_offset(index) else {
+                    self.failed = true;
+                    return;
+                };
+                self.emit_load_kind(dst, kind, offset);
             }
         }
-
-        // Bug-fix (ARM64 BUG #3, infinite self-call): the previous code created
-        // a fresh `call_label`, emitted `Bl { label: call_label }`, and never
-        // bound it. The branch-patch loop in `emit_machine_code` leaves an
-        // unbound label as a "branch to self" (`BL .`), which at runtime is an
-        // infinite self-call / stack overflow. There is no resolved target
-        // address available at emit time here, so the only safe action is to
-        // bail to the interpreter for this method (AArch64 is the secondary
-        // backend; correctness and a safe fallback take priority over feature
-        // completeness). We set `self.failed`, which forces
-        // `Arm64CompileResult.success = false`, and emit a `Brk` trap so that
-        // any code path which mistakenly ignores `failed` still traps loudly
-        // rather than executing a broken self-call.
-        //
-        // (If a concrete call target ever becomes available at emit time, the
-        // correct lowering is `mov_imm64 IP0, <target>; BLR IP0` — the
-        // range-unlimited indirect form — followed by capturing the X0 result.
-        // Until then we must NOT emit any call.)
-        self.failed = true;
-        self.buffer.emit(Arm64Instruction::Comment(format!(
-            "ARM64 BUG #3: unresolved invoke ({} args) — bailing to interpreter",
-            num_args
-        )));
-        self.buffer.emit(Arm64Instruction::Brk { imm: 0 });
-
-        // Keep the operand stack shape consistent for the remainder of the
-        // (now-doomed) compilation pass: a call leaves one result value on the
-        // stack. We push a scratch placeholder so later pops do not underflow
-        // and mask the real failure cause. The emitted code is discarded
-        // because `success` is false.
-        let dst = self.alloc_scratch();
-        self.push_operand(dst);
+        self.push_reg(kind, dst);
     }
 
-    // -- Float/Double helpers ------------------------------------------------
-
-    /// Load a float/double constant onto the float operand stack.
-    ///
-    /// Bug-fix (AArch64 MEDIUM, emit_fconst miscompile): the previous body
-    /// materialized `value as i64` into a GP register and ran `ScvtfDouble`
-    /// (signed-integer → double CONVERSION). That is only correct for INTEGRAL
-    /// constants — e.g. `fconst_2` (2.0). For any non-integral value the
-    /// truncating `as i64` followed by integer→float conversion produced the
-    /// wrong number (2.5 → 2.0, 0.1 → 0.0, π → 3.0, etc.). This backend treats
-    /// every FP register as a 64-bit double (`Dn`), so the correct lowering is
-    /// a BIT-EXACT move: materialize the IEEE-754 double bit pattern into a GPR
-    /// with `mov_imm64`, then `FMOV Dd, Xn` (`FmovToFp`) which copies the raw
-    /// 64 bits with no numeric conversion. This reproduces every double exactly,
-    /// integral or not.
-    pub fn emit_fconst(&mut self, value: f64) {
-        let dst = self.alloc_float_scratch();
-        let tmp = self.alloc_scratch();
-        // Reinterpret the f64 as its raw 64-bit pattern. `to_bits() as i64`
-        // round-trips losslessly through `MovImm`'s `imm as u64` lowering, so
-        // the GPR ends up holding the exact IEEE-754 encoding.
-        let bits = value.to_bits() as i64;
-        self.buffer
-            .emit(Arm64Instruction::MovImm { rd: tmp, imm: bits });
-        // FMOV Dd, Xn — bit-exact GPR → FP move (NOT a numeric conversion).
-        self.buffer
-            .emit(Arm64Instruction::FmovToFp { vd: dst, rn: tmp });
-        self.push_float_operand(dst);
-    }
-
-    /// Load a float/double local variable onto the float operand stack.
-    /// Locals are stored in GP registers; we convert to FP via ScvtfDouble
-    /// or load from spill slot.
-    pub fn emit_fload(&mut self, index: usize) {
-        let dst = self.alloc_float_scratch();
-        // Check if this float local has a dedicated FP register (from graph-coloring).
-        if let Some(Some(fp_reg)) = self.float_local_regs.get(index).copied() {
-            self.buffer.emit(Arm64Instruction::FmovFp {
-                vd: dst,
-                vn: fp_reg,
-            });
-        } else if let Some(Some(gp_reg)) = self.local_regs.get(index).copied() {
-            // Float local stored in a GP register: bit-pattern transfer to FP.
-            self.buffer.emit(Arm64Instruction::FmovToFp {
-                vd: dst,
-                rn: gp_reg,
-            });
-        } else {
-            // Spilled local: load from stack directly into FP register.
-            let frame = self.frame.as_ref().unwrap();
-            let spill_index = self.spill_index_for(index);
-            let offset = frame.spill_offset.saturating_add(
-                i32::try_from(spill_index)
-                    .unwrap_or(i32::MAX)
-                    .saturating_mul(8),
-            );
-            self.buffer.emit(Arm64Instruction::FpLdr {
-                vt: dst,
-                rn: Arm64Register::FP,
-                offset,
-                is_double: true,
-            });
-        }
-        self.push_float_operand(dst);
-    }
-
-    /// Store the top of the float operand stack to a local variable.
-    pub fn emit_fstore(&mut self, index: usize) {
-        let src = self.pop_float_operand();
-        // Check if this float local has a dedicated FP register.
-        if let Some(Some(fp_reg)) = self.float_local_regs.get(index).copied() {
-            self.buffer.emit(Arm64Instruction::FmovFp {
-                vd: fp_reg,
-                vn: src,
-            });
-        } else if let Some(Some(gp_reg)) = self.local_regs.get(index) {
-            // Float local stored in a GP register: bit-pattern transfer from FP.
-            self.buffer.emit(Arm64Instruction::FmovFromFp {
-                rd: *gp_reg,
-                vn: src,
-            });
-        } else {
-            // Spilled: store FP register directly to stack.
-            let frame = self.frame.as_ref().unwrap();
-            let spill_index = self.spill_index_for(index);
-            let offset = frame.spill_offset.saturating_add(
-                i32::try_from(spill_index)
-                    .unwrap_or(i32::MAX)
-                    .saturating_mul(8),
-            );
-            self.buffer.emit(Arm64Instruction::FpStr {
-                vt: src,
-                rn: Arm64Register::FP,
-                offset,
-                is_double: true,
-            });
+    /// Pop a `kind` and store it to local `index`.
+    fn emit_store_local(&mut self, index: usize, kind: OperandKind) {
+        let src = self.pop_kind(kind);
+        let Some(home) = self.local_regs.get(index).copied() else {
+            self.failed = true;
+            return;
+        };
+        match home {
+            Some(reg) => {
+                let inst = match kind {
+                    OperandKind::F32 => Arm64Instruction::FmovFromFpSingle { rd: reg, vn: src },
+                    OperandKind::F64 => Arm64Instruction::FmovFromFp { rd: reg, vn: src },
+                    _ => Arm64Instruction::Mov { rd: reg, rm: src },
+                };
+                self.buffer.emit(inst);
+            }
+            None => {
+                let Some(offset) = self.local_slot_offset(index) else {
+                    self.failed = true;
+                    return;
+                };
+                self.emit_store_kind(src, kind, offset);
+            }
         }
     }
 
-    /// Compute the spill slot index for a local that doesn't have a register.
     /// How many spill slots the FRAME-HOMED LOCALS occupy -- equivalently, the
-    /// first spill index the operand stack may use.
-    ///
-    /// `spill_index_for` numbers those locals `0..local_spill_count()`, and
-    /// `num_spills` is computed as `gpr_spills + max_stack`, so the operand
-    /// area is exactly `[local_spill_count(), num_spills)`. Both spillers must
-    /// take their base from HERE or the two areas overlap -- see
-    /// `operand_spill_slots_do_not_alias_frame_homed_locals`.
+    /// first spill index the operand area uses. Both the operand area and the
+    /// safepoint homes take their base from here, or they overlap the locals
+    /// (see `operand_spill_slots_do_not_alias_frame_homed_locals`).
     fn local_spill_count(&self) -> usize {
         self.spill_index_for(self.local_regs.len())
     }
 
+    /// The spill index of a local that has no register: how many locals before
+    /// it also have none.
     fn spill_index_for(&self, local_index: usize) -> usize {
-        // Count how many locals before this one also lack a register (GPR and FP).
         let mut spill_idx = 0;
         for i in 0..local_index {
             let has_gpr = self.local_regs.get(i).map_or(false, |r| r.is_some());
@@ -4267,800 +3804,103 @@ impl Arm64Backend {
         spill_idx
     }
 
-    /// Float/double add: pop two, emit FaddDouble, push result.
-    pub fn emit_float_add(&mut self) {
-        let rhs = self.pop_float_operand();
-        let lhs = self.pop_float_operand();
-        let dst = self.alloc_float_scratch();
-        self.buffer.emit(Arm64Instruction::FaddDouble {
-            vd: dst,
-            vn: lhs,
-            vm: rhs,
-        });
-        self.push_float_operand(dst);
-    }
+    // -- Constants ----------------------------------------------------------
 
-    /// Float/double sub: pop two, emit FsubDouble, push result.
-    pub fn emit_float_sub(&mut self) {
-        let rhs = self.pop_float_operand();
-        let lhs = self.pop_float_operand();
-        let dst = self.alloc_float_scratch();
-        self.buffer.emit(Arm64Instruction::FsubDouble {
-            vd: dst,
-            vn: lhs,
-            vm: rhs,
-        });
-        self.push_float_operand(dst);
-    }
-
-    /// Float/double mul: pop two, emit FmulDouble, push result.
-    pub fn emit_float_mul(&mut self) {
-        let rhs = self.pop_float_operand();
-        let lhs = self.pop_float_operand();
-        let dst = self.alloc_float_scratch();
-        self.buffer.emit(Arm64Instruction::FmulDouble {
-            vd: dst,
-            vn: lhs,
-            vm: rhs,
-        });
-        self.push_float_operand(dst);
-    }
-
-    /// Float/double div: pop two, emit FdivDouble, push result.
-    pub fn emit_float_div(&mut self) {
-        let rhs = self.pop_float_operand();
-        let lhs = self.pop_float_operand();
-        let dst = self.alloc_float_scratch();
-        self.buffer.emit(Arm64Instruction::FdivDouble {
-            vd: dst,
-            vn: lhs,
-            vm: rhs,
-        });
-        self.push_float_operand(dst);
-    }
-
-    /// Float/double remainder: a - trunc(a/b)*b via FDIV + FCVTZS/SCVTF + FMUL + FSUB.
-    ///
-    /// UNWIRED / reference only. This is INEXACT: the FCVTZS round-trip used to
-    /// truncate the quotient saturates to i64::MIN/MAX once |a/b| >= 2^63, so
-    /// the remainder is wrong for large operands. The `frem`/`drem` dispatch
-    /// now bails to the interpreter instead of calling this (see the 0x72/0x73
-    /// arm). Kept as a starting point should an exact ARM64 reduction loop be
-    /// implemented later; `#[allow(dead_code)]` because nothing wires it now.
-    #[allow(dead_code)]
-    pub fn emit_float_rem(&mut self) {
-        let rhs = self.pop_float_operand();
-        let lhs = self.pop_float_operand();
-        let quotient = self.alloc_float_scratch();
-        // quotient = lhs / rhs
-        self.buffer.emit(Arm64Instruction::FdivDouble {
-            vd: quotient,
-            vn: lhs,
-            vm: rhs,
-        });
-        // Convert to integer and back to truncate: fcvtzs + scvtf
-        let tmp_int = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::FcvtzsInt {
-            rd: tmp_int,
-            vn: quotient,
-        });
-        let trunc = self.alloc_float_scratch();
-        self.buffer.emit(Arm64Instruction::ScvtfDouble {
-            vd: trunc,
-            rn: tmp_int,
-        });
-        // product = trunc * rhs
-        let product = self.alloc_float_scratch();
-        self.buffer.emit(Arm64Instruction::FmulDouble {
-            vd: product,
-            vn: trunc,
-            vm: rhs,
-        });
-        // result = lhs - product
-        let dst = self.alloc_float_scratch();
-        self.buffer.emit(Arm64Instruction::FsubDouble {
-            vd: dst,
-            vn: lhs,
-            vm: product,
-        });
-        self.push_float_operand(dst);
-    }
-
-    /// Float/double negate: FSUB from zero.
-    pub fn emit_float_neg(&mut self) {
-        let src = self.pop_float_operand();
-        // Load zero into a V register
-        let tmp = self.alloc_scratch();
-        self.buffer
-            .emit(Arm64Instruction::MovImm { rd: tmp, imm: 0 });
-        let zero = self.alloc_float_scratch();
-        self.buffer
-            .emit(Arm64Instruction::ScvtfDouble { vd: zero, rn: tmp });
-        let dst = self.alloc_float_scratch();
-        self.buffer.emit(Arm64Instruction::FsubDouble {
-            vd: dst,
-            vn: zero,
-            vm: src,
-        });
-        self.push_float_operand(dst);
-    }
-
-    /// i2f / i2d: pop int from GP stack, convert to float, push onto float stack.
-    pub fn emit_i2f(&mut self) {
-        let src = self.pop_operand();
-        let dst = self.alloc_float_scratch();
-        self.buffer
-            .emit(Arm64Instruction::ScvtfDouble { vd: dst, rn: src });
-        self.push_float_operand(dst);
-    }
-
-    /// i2d: same as i2f in our backend (both use double-precision).
-    pub fn emit_i2d(&mut self) {
-        self.emit_i2f();
-    }
-
-    /// f2i / d2i: pop float from float stack, convert to int, push onto GP stack.
-    pub fn emit_f2i(&mut self) {
-        let src = self.pop_float_operand();
-        let dst = self.alloc_scratch();
-        self.buffer
-            .emit(Arm64Instruction::FcvtzsInt { rd: dst, vn: src });
-        self.push_operand(dst);
-    }
-
-    /// l2i: truncate long to int (mask lower 32 bits).
-    pub fn emit_l2i(&mut self) {
-        let src = self.pop_operand();
-        let dst = self.alloc_scratch();
-        let mask = self.alloc_scratch();
+    /// An `int` constant, sign-extended -- already the canonical form.
+    pub fn emit_iconst(&mut self, value: i32) {
+        let dst = self.alloc_reg(false);
         self.buffer.emit(Arm64Instruction::MovImm {
-            rd: mask,
-            imm: 0xFFFF_FFFFi64,
-        });
-        self.buffer.emit(Arm64Instruction::And {
             rd: dst,
-            rn: src,
-            rm: mask,
+            imm: i64::from(value),
         });
-        self.push_operand(dst);
+        self.push_reg(OperandKind::I32, dst);
     }
 
-    /// Float compare: pop two floats, emit FcmpDouble + conditional set.
-    /// `nan_minus`: if true, NaN produces -1 (fcmpl/dcmpl); if false, NaN produces 1 (fcmpg/dcmpg).
-    pub fn emit_fcmp(&mut self, nan_minus: bool) {
-        let rhs = self.pop_float_operand();
-        let lhs = self.pop_float_operand();
+    pub fn emit_lconst(&mut self, value: i64) {
+        let dst = self.alloc_reg(false);
         self.buffer
-            .emit(Arm64Instruction::FcmpDouble { vn: lhs, vm: rhs });
-        // After FCMP, use conditional logic to produce -1, 0, or 1 on the int stack.
-        // GT → 1, EQ → 0, LT → -1, unordered (NaN) → nan_minus ? -1 : 1
-        let dst = self.alloc_scratch();
-        // Start with 0
-        self.buffer
-            .emit(Arm64Instruction::MovImm { rd: dst, imm: 0 });
-        // If GT, set to 1
-        let gt_label = self.buffer.new_label();
-        let end_label = self.buffer.new_label();
-        let lt_label = self.buffer.new_label();
-        let unord_label = self.buffer.new_label();
+            .emit(Arm64Instruction::MovImm { rd: dst, imm: value });
+        self.push_reg(OperandKind::I64, dst);
+    }
 
-        // B.VS unordered (overflow flag set when NaN)
-        self.buffer
-            .emit(Arm64Instruction::Comment("fcmp result dispatch".into()));
-        // For simplicity, use a series of conditional branches:
-        // After FCMP: EQ means equal, GT means greater, LT(MI) means less, VS means unordered
-        self.buffer.emit(Arm64Instruction::BCond {
-            cond: Arm64Condition::Eq,
-            label: end_label,
+    /// A `float` constant, bit-exact: its IEEE-754 single pattern into a GPR,
+    /// then `FMOV Sd, Wn` (a bit move, not a conversion). It used to load the
+    /// DOUBLE pattern, so every `float` was a `double` in disguise.
+    pub fn emit_fconst(&mut self, value: f32) {
+        let tmp = self.alloc_reg(false);
+        let dst = self.alloc_reg(true);
+        self.buffer.emit(Arm64Instruction::MovImm {
+            rd: tmp,
+            imm: i64::from(value.to_bits()),
         });
-        self.buffer.emit(Arm64Instruction::BCond {
-            cond: Arm64Condition::Gt,
-            label: gt_label,
-        });
-        // If we get here, it's LT or unordered
-        if nan_minus {
-            // Both LT and NaN produce -1
-            self.buffer
-                .emit(Arm64Instruction::MovImm { rd: dst, imm: -1 });
-            self.buffer.emit(Arm64Instruction::B { label: end_label });
-        } else {
-            // LT produces -1, NaN produces 1 — check VS for NaN
-            self.buffer.emit(Arm64Instruction::BCond {
-                cond: Arm64Condition::Lt,
-                label: lt_label,
-            });
-            // Unordered: NaN → 1
-            self.buffer
-                .emit(Arm64Instruction::MovImm { rd: dst, imm: 1 });
-            self.buffer.emit(Arm64Instruction::B { label: end_label });
-            self.buffer.bind_label(lt_label);
-            self.buffer
-                .emit(Arm64Instruction::MovImm { rd: dst, imm: -1 });
-            self.buffer.emit(Arm64Instruction::B { label: end_label });
-        }
-        self.buffer.bind_label(gt_label);
         self.buffer
-            .emit(Arm64Instruction::MovImm { rd: dst, imm: 1 });
-        self.buffer.bind_label(end_label);
-        // Bind unused labels to avoid issues
-        if nan_minus {
-            self.buffer.bind_label(lt_label);
-            self.buffer.bind_label(unord_label);
-        } else {
-            self.buffer.bind_label(unord_label);
-        }
-        self.push_operand(dst);
+            .emit(Arm64Instruction::FmovToFpSingle { vd: dst, rn: tmp });
+        self.push_reg(OperandKind::F32, dst);
+    }
+
+    /// A `double` constant, bit-exact via `FMOV Dd, Xn`.
+    pub fn emit_dconst(&mut self, value: f64) {
+        let tmp = self.alloc_reg(false);
+        let dst = self.alloc_reg(true);
+        // Cast: reinterpret the f64 as its raw 64-bit pattern.
+        self.buffer.emit(Arm64Instruction::MovImm {
+            rd: tmp,
+            imm: value.to_bits() as i64,
+        });
+        self.buffer
+            .emit(Arm64Instruction::FmovToFp { vd: dst, rn: tmp });
+        self.push_reg(OperandKind::F64, dst);
+    }
+
+    // -- Invoke -------------------------------------------------------------
+
+    /// Refuse the method: there is no call-target resolution on this backend.
+    ///
+    /// Emitting `BL` to an unbound label was an infinite self-call (ARM64 BUG
+    /// #3). If a concrete target ever becomes available, the lowering is
+    /// `mov_imm64 IP0, <target>; BLR IP0` with the arguments marshalled and
+    /// the operand stack spilled around the call, as the safepoint poll does.
+    pub fn emit_invoke(&mut self, num_args: usize) {
+        self.failed = true;
+        self.buffer.emit(Arm64Instruction::Comment(format!(
+            "unresolved invoke ({} args) — bailing to interpreter",
+            num_args
+        )));
     }
 
     // -- Return -------------------------------------------------------------
 
-    pub fn emit_return_int(&mut self) {
-        let src = self.pop_operand();
-        if src != Arm64Register::X0 {
-            self.buffer.emit(Arm64Instruction::Mov {
+    /// `ireturn`/`lreturn`/`areturn`/`freturn`/`dreturn`.
+    ///
+    /// The VM calls compiled code as `extern "C" fn(i64, ..) -> i64` and reads
+    /// EVERY result out of X0, decoding a `float` as `f32::from_bits(x0 as
+    /// u32)` and a `double` as `f64::from_bits(x0)`. So an FP result is moved
+    /// into X0 with a bit-exact `FMOV` (`FMOV W0, Sn` for a `float`), not left
+    /// in V0. `freturn`/`dreturn` used to pop and DISCARD the value and emit a
+    /// bare `RET`, skipping the epilogue: the caller's callee-saved registers
+    /// were never restored, SP and FP were left pointing into this frame, and
+    /// the "result" was whatever X0 held.
+    fn emit_return_value(&mut self, kind: OperandKind) {
+        let src = self.pop_kind(kind);
+        let inst = match kind {
+            OperandKind::F32 => Arm64Instruction::FmovFromFpSingle {
+                rd: Arm64Register::X0,
+                vn: src,
+            },
+            OperandKind::F64 => Arm64Instruction::FmovFromFp {
+                rd: Arm64Register::X0,
+                vn: src,
+            },
+            _ => Arm64Instruction::Mov {
                 rd: Arm64Register::X0,
                 rm: src,
-            });
-        }
+            },
+        };
+        self.buffer.emit(inst);
         self.buffer.emit(Arm64Instruction::B {
             label: self.epilogue_label,
         });
-    }
-
-    pub fn emit_return_void(&mut self) {
-        self.buffer.emit(Arm64Instruction::B {
-            label: self.epilogue_label,
-        });
-    }
-
-    // -----------------------------------------------------------------------
-    // NEON vectorization helpers
-    // -----------------------------------------------------------------------
-
-    /// Emit a NEON-vectorized int-array sum loop.
-    ///
-    /// TEST-ONLY / NOT WIRED: this helper is exercised by unit tests only and
-    /// is NOT reachable from the bytecode-compile dispatch in `compile_method`
-    /// (no opcode handler calls it; there is no NEON auto-vectorization pass).
-    /// It is retained as a worked reference for a future vectorizer. Before
-    /// wiring it into codegen, derive the array base/length operands from a real
-    /// induction-variable analysis (mirroring the x64 BCE path) rather than
-    /// passing pre-chosen registers, and re-validate the horizontal-reduce
-    /// stack spill (now red-zone-safe — see the SubImm/AddImm SP framing below).
-    ///
-    /// Generates code equivalent to:
-    /// ```ignore
-    /// int sum = 0;
-    /// // vectorized portion: process 4 elements at a time using NEON
-    /// int32x4_t vacc = {0, 0, 0, 0};
-    /// for (int i = 0; i < (len & ~3); i += 4) {
-    ///     vacc = vadd(vacc, vld1q_s32(&arr[i]));
-    /// }
-    /// sum = vacc[0] + vacc[1] + vacc[2] + vacc[3];
-    /// // scalar tail
-    /// for (int i = len & ~3; i < len; i++) {
-    ///     sum += arr[i];
-    /// }
-    /// ```
-    ///
-    /// Arguments:
-    /// - `arr_reg`: GP register holding the base pointer to the int array data
-    /// - `len_reg`: GP register holding the array length
-    /// - `result_reg`: GP register where the final sum will be stored
-    pub fn emit_neon_array_sum(
-        &mut self,
-        arr_reg: Arm64Register,
-        len_reg: Arm64Register,
-        result_reg: Arm64Register,
-    ) {
-        let vacc = Arm64Register::V0; // accumulator vector
-        let vdata = Arm64Register::V1; // loaded data vector
-        let idx = self.alloc_scratch(); // loop counter
-        let vec_len = self.alloc_scratch(); // len & ~3 (vectorized portion)
-        let ptr = self.alloc_scratch(); // running pointer into array
-
-        let vec_loop = self.buffer.new_label();
-        let vec_done = self.buffer.new_label();
-        let scalar_loop = self.buffer.new_label();
-        let scalar_done = self.buffer.new_label();
-
-        // Initialize accumulator vector to zero
-        self.buffer.emit(Arm64Instruction::MovImm {
-            rd: result_reg,
-            imm: 0,
-        });
-        // Zero the vector accumulator (EOR Vd, Vd, Vd)
-        self.buffer.emit(Arm64Instruction::Eor {
-            rd: Arm64Register(vacc.0 - 32),
-            rn: Arm64Register(vacc.0 - 32),
-            rm: Arm64Register(vacc.0 - 32),
-        });
-
-        // vec_len = len & ~3 (round down to multiple of 4)
-        let mask = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::MovImm {
-            rd: mask,
-            imm: !3i64,
-        });
-        self.buffer.emit(Arm64Instruction::And {
-            rd: vec_len,
-            rn: len_reg,
-            rm: mask,
-        });
-
-        // ptr = arr_reg (starting pointer)
-        self.buffer.emit(Arm64Instruction::Mov {
-            rd: ptr,
-            rm: arr_reg,
-        });
-        // idx = 0
-        self.buffer
-            .emit(Arm64Instruction::MovImm { rd: idx, imm: 0 });
-
-        // Skip vector loop if less than 4 elements
-        self.buffer.emit(Arm64Instruction::Cmp {
-            rn: vec_len,
-            rm: Arm64Register::XZR,
-        });
-        self.buffer.emit(Arm64Instruction::BCond {
-            cond: Arm64Condition::Eq,
-            label: vec_done,
-        });
-
-        // Vector loop
-        self.buffer.bind_label(vec_loop);
-        // Load 4 ints (16 bytes) from [ptr] into vdata
-        self.buffer
-            .emit(Arm64Instruction::NeonLd1_4s { vt: vdata, rn: ptr });
-        // vacc += vdata
-        self.buffer.emit(Arm64Instruction::NeonAdd4s {
-            vd: vacc,
-            vn: vacc,
-            vm: vdata,
-        });
-        // ptr += 16
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: ptr,
-            rn: ptr,
-            imm: 16,
-        });
-        // idx += 4
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: idx,
-            rn: idx,
-            imm: 4,
-        });
-        // if idx < vec_len → loop
-        self.buffer.emit(Arm64Instruction::Cmp {
-            rn: idx,
-            rm: vec_len,
-        });
-        self.buffer.emit(Arm64Instruction::BCond {
-            cond: Arm64Condition::Lt,
-            label: vec_loop,
-        });
-
-        self.buffer.bind_label(vec_done);
-
-        // Horizontal reduce: sum the 4 lanes of vacc into result_reg.
-        // We use ADDV to sum all lanes, but since we don't have ADDV encoded,
-        // extract each lane via GP and add them.
-        // We store vacc to a stack scratch area, then load the 4 ints.
-        //
-        // Bug-fix (AArch64 NEON SP-store): AArch64 has NO red zone — storing
-        // below SP without first lowering SP can be clobbered by an interrupt
-        // or signal handler that reuses the stack. Reserve 16 bytes (one Q-reg)
-        // by lowering SP, spill the vector, read it back, then restore SP. SP
-        // must stay 16-byte aligned per AAPCS64; 16 is already aligned.
-        self.buffer.emit(Arm64Instruction::SubImm {
-            rd: Arm64Register::SP,
-            rn: Arm64Register::SP,
-            imm: 16,
-        });
-        // STR the vector to the reserved [SP] slot.
-        self.buffer.emit(Arm64Instruction::NeonSt1_4s {
-            vt: vacc,
-            rn: Arm64Register::SP,
-        });
-        // Load the 4 elements (as two 64-bit halves) and add them.
-        let t0 = self.alloc_scratch();
-        let t1 = self.alloc_scratch();
-        // Load first 2 as a pair, then next 2
-        self.buffer.emit(Arm64Instruction::Ldr {
-            rt: t0,
-            rn: Arm64Register::SP,
-            offset: 0,
-        });
-        self.buffer.emit(Arm64Instruction::Ldr {
-            rt: t1,
-            rn: Arm64Register::SP,
-            offset: 8,
-        });
-        // Release the reserved stack scratch now that the vector is back in GPRs.
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: Arm64Register::SP,
-            rn: Arm64Register::SP,
-            imm: 16,
-        });
-        // Each 64-bit load holds 2x 32-bit ints. Split them:
-        // Actually, for simplicity, use 32-bit loads. But our LDR is 64-bit.
-        // Alternative: just use the 64-bit values and mask.
-        // Let's use a simpler approach: store to [SP], load 4x 32-bit words via offset.
-        // But we only have 64-bit LDR. Let's just add the two 64-bit halves and mask.
-        // Actually, the cleanest approach: just add as 64-bit pairs.
-        // t0 = arr[0] | (arr[1] << 32), t1 = arr[2] | (arr[3] << 32)
-        // Extract low/high 32-bit from each:
-        let lo0 = self.alloc_scratch();
-        let hi0 = self.alloc_scratch();
-        let lo1 = self.alloc_scratch();
-        // Extract low 32 bits
-        let mask32 = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::MovImm {
-            rd: mask32,
-            imm: 0xFFFF_FFFF,
-        });
-        self.buffer.emit(Arm64Instruction::And {
-            rd: lo0,
-            rn: t0,
-            rm: mask32,
-        });
-        // Extract high 32 bits
-        let shift32 = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::MovImm {
-            rd: shift32,
-            imm: 32,
-        });
-        self.buffer.emit(Arm64Instruction::Lsr {
-            rd: hi0,
-            rn: t0,
-            rm: shift32,
-        });
-        self.buffer.emit(Arm64Instruction::And {
-            rd: lo1,
-            rn: t1,
-            rm: mask32,
-        });
-        let hi1 = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Lsr {
-            rd: hi1,
-            rn: t1,
-            rm: shift32,
-        });
-        // Sum all 4 lanes
-        self.buffer.emit(Arm64Instruction::Add {
-            rd: result_reg,
-            rn: lo0,
-            rm: hi0,
-        });
-        self.buffer.emit(Arm64Instruction::Add {
-            rd: result_reg,
-            rn: result_reg,
-            rm: lo1,
-        });
-        self.buffer.emit(Arm64Instruction::Add {
-            rd: result_reg,
-            rn: result_reg,
-            rm: hi1,
-        });
-
-        // Scalar tail: process remaining elements (idx..len)
-        self.buffer.emit(Arm64Instruction::Cmp {
-            rn: idx,
-            rm: len_reg,
-        });
-        self.buffer.emit(Arm64Instruction::BCond {
-            cond: Arm64Condition::Ge,
-            label: scalar_done,
-        });
-
-        self.buffer.bind_label(scalar_loop);
-        // Load arr[idx] (4-byte int at ptr)
-        let elem = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Ldr {
-            rt: elem,
-            rn: ptr,
-            offset: 0,
-        });
-        // Mask to 32 bits (array element is i32 but LDR loads 64 bits)
-        self.buffer.emit(Arm64Instruction::And {
-            rd: elem,
-            rn: elem,
-            rm: mask32,
-        });
-        self.buffer.emit(Arm64Instruction::Add {
-            rd: result_reg,
-            rn: result_reg,
-            rm: elem,
-        });
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: ptr,
-            rn: ptr,
-            imm: 4,
-        });
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: idx,
-            rn: idx,
-            imm: 1,
-        });
-        self.buffer.emit(Arm64Instruction::Cmp {
-            rn: idx,
-            rm: len_reg,
-        });
-        self.buffer.emit(Arm64Instruction::BCond {
-            cond: Arm64Condition::Lt,
-            label: scalar_loop,
-        });
-
-        self.buffer.bind_label(scalar_done);
-    }
-
-    /// Emit a NEON-vectorized dot product of two int arrays.
-    ///
-    /// Computes: sum(a[i] * b[i]) for i in 0..len
-    ///
-    /// TEST-ONLY / NOT WIRED: exercised by unit tests only; not reachable from
-    /// the bytecode-compile dispatch (see the note on `emit_neon_array_sum`).
-    /// Its horizontal-reduce stack spill is now red-zone-safe (SubImm/AddImm SP
-    /// framing). Re-validate operand provenance before wiring into codegen.
-    pub fn emit_neon_dot_product(
-        &mut self,
-        arr_a_reg: Arm64Register,
-        arr_b_reg: Arm64Register,
-        len_reg: Arm64Register,
-        result_reg: Arm64Register,
-    ) {
-        let vacc = Arm64Register::V0;
-        let va = Arm64Register::V1;
-        let vb = Arm64Register::V2;
-        let vtmp = Arm64Register::V3;
-        let idx = self.alloc_scratch();
-        let vec_len = self.alloc_scratch();
-        let ptr_a = self.alloc_scratch();
-        let ptr_b = self.alloc_scratch();
-
-        let vec_loop = self.buffer.new_label();
-        let vec_done = self.buffer.new_label();
-        let scalar_loop = self.buffer.new_label();
-        let scalar_done = self.buffer.new_label();
-
-        // Zero result and accumulator
-        self.buffer.emit(Arm64Instruction::MovImm {
-            rd: result_reg,
-            imm: 0,
-        });
-        self.buffer.emit(Arm64Instruction::Eor {
-            rd: Arm64Register(vacc.0 - 32),
-            rn: Arm64Register(vacc.0 - 32),
-            rm: Arm64Register(vacc.0 - 32),
-        });
-
-        // vec_len = len & ~3
-        let mask = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::MovImm {
-            rd: mask,
-            imm: !3i64,
-        });
-        self.buffer.emit(Arm64Instruction::And {
-            rd: vec_len,
-            rn: len_reg,
-            rm: mask,
-        });
-
-        self.buffer.emit(Arm64Instruction::Mov {
-            rd: ptr_a,
-            rm: arr_a_reg,
-        });
-        self.buffer.emit(Arm64Instruction::Mov {
-            rd: ptr_b,
-            rm: arr_b_reg,
-        });
-        self.buffer
-            .emit(Arm64Instruction::MovImm { rd: idx, imm: 0 });
-
-        self.buffer.emit(Arm64Instruction::Cmp {
-            rn: vec_len,
-            rm: Arm64Register::XZR,
-        });
-        self.buffer.emit(Arm64Instruction::BCond {
-            cond: Arm64Condition::Eq,
-            label: vec_done,
-        });
-
-        self.buffer.bind_label(vec_loop);
-        self.buffer
-            .emit(Arm64Instruction::NeonLd1_4s { vt: va, rn: ptr_a });
-        self.buffer
-            .emit(Arm64Instruction::NeonLd1_4s { vt: vb, rn: ptr_b });
-        // vtmp = va * vb (element-wise)
-        self.buffer.emit(Arm64Instruction::NeonMul4s {
-            vd: vtmp,
-            vn: va,
-            vm: vb,
-        });
-        // vacc += vtmp
-        self.buffer.emit(Arm64Instruction::NeonAdd4s {
-            vd: vacc,
-            vn: vacc,
-            vm: vtmp,
-        });
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: ptr_a,
-            rn: ptr_a,
-            imm: 16,
-        });
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: ptr_b,
-            rn: ptr_b,
-            imm: 16,
-        });
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: idx,
-            rn: idx,
-            imm: 4,
-        });
-        self.buffer.emit(Arm64Instruction::Cmp {
-            rn: idx,
-            rm: vec_len,
-        });
-        self.buffer.emit(Arm64Instruction::BCond {
-            cond: Arm64Condition::Lt,
-            label: vec_loop,
-        });
-
-        self.buffer.bind_label(vec_done);
-
-        // Horizontal reduce vacc.
-        //
-        // Bug-fix (AArch64 NEON SP-store): reserve 16 bytes by lowering SP
-        // before spilling the accumulator vector (AArch64 has no red zone — a
-        // store below SP can be clobbered by an interrupt/signal). Restore SP
-        // after reading the value back. 16 is 16-byte aligned per AAPCS64.
-        self.buffer.emit(Arm64Instruction::SubImm {
-            rd: Arm64Register::SP,
-            rn: Arm64Register::SP,
-            imm: 16,
-        });
-        self.buffer.emit(Arm64Instruction::NeonSt1_4s {
-            vt: vacc,
-            rn: Arm64Register::SP,
-        });
-        let t0 = self.alloc_scratch();
-        let t1 = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Ldr {
-            rt: t0,
-            rn: Arm64Register::SP,
-            offset: 0,
-        });
-        self.buffer.emit(Arm64Instruction::Ldr {
-            rt: t1,
-            rn: Arm64Register::SP,
-            offset: 8,
-        });
-        // Release the reserved stack scratch.
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: Arm64Register::SP,
-            rn: Arm64Register::SP,
-            imm: 16,
-        });
-        let mask32 = self.alloc_scratch();
-        let shift32 = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::MovImm {
-            rd: mask32,
-            imm: 0xFFFF_FFFF,
-        });
-        self.buffer.emit(Arm64Instruction::MovImm {
-            rd: shift32,
-            imm: 32,
-        });
-        let lo0 = self.alloc_scratch();
-        let hi0 = self.alloc_scratch();
-        let lo1 = self.alloc_scratch();
-        let hi1 = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::And {
-            rd: lo0,
-            rn: t0,
-            rm: mask32,
-        });
-        self.buffer.emit(Arm64Instruction::Lsr {
-            rd: hi0,
-            rn: t0,
-            rm: shift32,
-        });
-        self.buffer.emit(Arm64Instruction::And {
-            rd: lo1,
-            rn: t1,
-            rm: mask32,
-        });
-        self.buffer.emit(Arm64Instruction::Lsr {
-            rd: hi1,
-            rn: t1,
-            rm: shift32,
-        });
-        self.buffer.emit(Arm64Instruction::Add {
-            rd: result_reg,
-            rn: lo0,
-            rm: hi0,
-        });
-        self.buffer.emit(Arm64Instruction::Add {
-            rd: result_reg,
-            rn: result_reg,
-            rm: lo1,
-        });
-        self.buffer.emit(Arm64Instruction::Add {
-            rd: result_reg,
-            rn: result_reg,
-            rm: hi1,
-        });
-
-        // Scalar tail
-        self.buffer.emit(Arm64Instruction::Cmp {
-            rn: idx,
-            rm: len_reg,
-        });
-        self.buffer.emit(Arm64Instruction::BCond {
-            cond: Arm64Condition::Ge,
-            label: scalar_done,
-        });
-
-        self.buffer.bind_label(scalar_loop);
-        let ea = self.alloc_scratch();
-        let eb = self.alloc_scratch();
-        let prod = self.alloc_scratch();
-        self.buffer.emit(Arm64Instruction::Ldr {
-            rt: ea,
-            rn: ptr_a,
-            offset: 0,
-        });
-        self.buffer.emit(Arm64Instruction::Ldr {
-            rt: eb,
-            rn: ptr_b,
-            offset: 0,
-        });
-        self.buffer.emit(Arm64Instruction::And {
-            rd: ea,
-            rn: ea,
-            rm: mask32,
-        });
-        self.buffer.emit(Arm64Instruction::And {
-            rd: eb,
-            rn: eb,
-            rm: mask32,
-        });
-        self.buffer.emit(Arm64Instruction::Mul {
-            rd: prod,
-            rn: ea,
-            rm: eb,
-        });
-        self.buffer.emit(Arm64Instruction::Add {
-            rd: result_reg,
-            rn: result_reg,
-            rm: prod,
-        });
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: ptr_a,
-            rn: ptr_a,
-            imm: 4,
-        });
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: ptr_b,
-            rn: ptr_b,
-            imm: 4,
-        });
-        self.buffer.emit(Arm64Instruction::AddImm {
-            rd: idx,
-            rn: idx,
-            imm: 1,
-        });
-        self.buffer.emit(Arm64Instruction::Cmp {
-            rn: idx,
-            rm: len_reg,
-        });
-        self.buffer.emit(Arm64Instruction::BCond {
-            cond: Arm64Condition::Lt,
-            label: scalar_loop,
-        });
-
-        self.buffer.bind_label(scalar_done);
+        self.reachable = false;
     }
 }
 
@@ -5140,6 +3980,10 @@ fn to_cond(c: &Arm64Condition) -> crate::aarch64::Cond {
         Arm64Condition::Ls => crate::aarch64::Cond::LS,
         Arm64Condition::Cs => crate::aarch64::Cond::HS,
         Arm64Condition::Cc => crate::aarch64::Cond::LO,
+        Arm64Condition::Mi => crate::aarch64::Cond::MI,
+        Arm64Condition::Pl => crate::aarch64::Cond::PL,
+        Arm64Condition::Vs => crate::aarch64::Cond::VS,
+        Arm64Condition::Vc => crate::aarch64::Cond::VC,
         Arm64Condition::Al => crate::aarch64::Cond::AL,
     }
 }
@@ -5161,8 +4005,17 @@ fn emit_addr_into_ip0(
     // IP0 = (i64)offset  (mov_imm64 picks MOVN for negative values, giving a
     // correct two's-complement 64-bit value).
     emitter.mov_imm64(crate::aarch64::Reg::X16, offset as i64 as u64);
-    // IP0 = base + IP0
-    emitter.add(crate::aarch64::Reg::X16, base, crate::aarch64::Reg::X16);
+    // IP0 = base + IP0, in the EXTENDED-register form. The shifted-register
+    // ADD reads register 31 as XZR, so with an SP base it computed `0 + offset`
+    // and the access went to an absolute address. The extended form reads 31
+    // as SP and is otherwise the same instruction.
+    emitter.add_ext(
+        crate::aarch64::Reg::X16,
+        base,
+        crate::aarch64::Reg::X16,
+        crate::aarch64::Extend::UXTX,
+        0,
+    );
 }
 
 /// Lower an ADD/SUB-immediate (`rd = rn ± imm`) safely.
@@ -5187,12 +4040,14 @@ fn emit_addr_into_ip0(
 /// AAPCS64 intra-procedure-call scratch and is never a regalloc output, so the
 /// register-form fallback never clobbers a live value.
 ///
-/// Returns `false` when no sound encoding exists (the SP case below), in which
-/// case the caller must abandon the method. Previously this path emitted
-/// `BRK #0` and reported success: the compile "succeeded", the body was
-/// published, and the SP adjustment it was supposed to perform simply never
-/// happened — the first thread to reach it died with SIGTRAP, which nothing in
-/// the VM converts into anything. A trap is not a lowering; refuse instead.
+/// The register fallback uses the EXTENDED-register form, so it is sound with
+/// SP as `rd` or `rn` too. It used to be the shifted-register form, where 31
+/// is XZR, so an SP adjustment wider than 12 bits had no lowering at all -- it
+/// first emitted `BRK #0` while reporting success, later refused the method,
+/// and either way a frame of 4096 bytes or more could not be allocated.
+///
+/// Returns `false` only when the fallback would clobber its own operand (`rn`
+/// is IP0), in which case the caller must abandon the method.
 #[must_use]
 fn emit_addsub_imm_safe(
     emitter: &mut crate::aarch64::Aarch64Emitter,
@@ -5224,29 +4079,107 @@ fn emit_addsub_imm_safe(
             emitter.add_imm(rd, rn, hi, true);
         }
         true
-    } else if rd.enc() == 31 || rn.enc() == 31 {
-        // SP edge case. Encoding 31 means SP in the ADD/SUB *immediate* form but
-        // XZR in the shifted-*register* form, so we cannot fall back to the
-        // register path with SP as an operand without changing the semantics
-        // (and no extended-register `ADD/SUB (extended)` encoder exists here).
-        // This only arises for an SP adjustment whose magnitude exceeds 0xFFF
-        // and is not 4 KiB-aligned — i.e. a frame larger than 4095 bytes that
-        // isn't page-step-aligned. Refuse the method instead of emitting a
-        // silently-wrong SP update (or, as before, a BRK that reports success
-        // and then kills the process on first execution). If this ever needs to
-        // succeed, plumb an extended-register ADD/SUB into aarch64.rs.
+    } else if rn.enc() == 16 {
+        // The fallback materializes into IP0, which would destroy an operand
+        // that is itself IP0 before it is read. No lowering emits that shape.
         false
     } else {
         // Out of immediate range: materialize into IP0 (X16) and use the
-        // register form. Never silently truncate. (rd/rn are guaranteed not to
-        // be SP here, so the shifted-register encoding is correct.)
+        // extended-register form, which reads 31 as SP on both sides. Never
+        // silently truncate.
         emitter.mov_imm64(crate::aarch64::Reg::X16, mag);
         if effective_sub {
-            emitter.sub(rd, rn, crate::aarch64::Reg::X16);
+            emitter.sub_ext(
+                rd,
+                rn,
+                crate::aarch64::Reg::X16,
+                crate::aarch64::Extend::UXTX,
+                0,
+            );
         } else {
-            emitter.add(rd, rn, crate::aarch64::Reg::X16);
+            emitter.add_ext(
+                rd,
+                rn,
+                crate::aarch64::Reg::X16,
+                crate::aarch64::Extend::UXTX,
+                0,
+            );
         }
         true
+    }
+}
+
+/// Lower `rd = rn +/- imm` on W registers (`AddImmW`/`SubImmW`).
+///
+/// A 32-bit result depends only on the addend mod 2^32, so a wide immediate is
+/// materialized as its low 32 bits. `false` when that would clobber `rn`.
+#[must_use]
+fn emit_addsub_imm_w(
+    emitter: &mut crate::aarch64::Aarch64Emitter,
+    rd: crate::aarch64::Reg,
+    rn: crate::aarch64::Reg,
+    imm: i32,
+    is_sub: bool,
+) -> bool {
+    let signed = if is_sub {
+        -i64::from(imm)
+    } else {
+        i64::from(imm)
+    };
+    let mag = signed.unsigned_abs();
+    if mag <= 0xFFF {
+        // Cast: bounds-checked immediately above.
+        if signed < 0 {
+            emitter.sub_imm_w(rd, rn, mag as u16, false);
+        } else {
+            emitter.add_imm_w(rd, rn, mag as u16, false);
+        }
+        true
+    } else if rn.enc() == 16 {
+        false
+    } else {
+        // Cast: the low 32 bits of the two's-complement addend.
+        emitter.mov_imm64(crate::aarch64::Reg::X16, u64::from(signed as u32));
+        emitter.add_w(rd, rn, crate::aarch64::Reg::X16);
+        true
+    }
+}
+
+/// `rd = rn - value` on W registers, through IP0 when `value` is wide.
+fn emit_w_sub_const(
+    emitter: &mut crate::aarch64::Aarch64Emitter,
+    rd: crate::aarch64::Reg,
+    rn: crate::aarch64::Reg,
+    value: i32,
+) {
+    let v = i64::from(value);
+    if (0..=0xFFF).contains(&v) {
+        // Cast: range-checked.
+        emitter.sub_imm_w(rd, rn, v as u16, false);
+    } else if (-0xFFF..0).contains(&v) {
+        // Cast: range-checked.
+        emitter.add_imm_w(rd, rn, (-v) as u16, false);
+    } else {
+        // Cast: the constant's 32-bit pattern.
+        emitter.mov_imm64(crate::aarch64::Reg::X16, u64::from(value as u32));
+        emitter.sub_w(rd, rn, crate::aarch64::Reg::X16);
+    }
+}
+
+/// Set the flags for `Wrn - value`: `CMP #imm`, `CMN #-imm`, or a compare
+/// against IP0. Never a scratch register, so it cannot collide with `rn`.
+fn emit_w_cmp_const(emitter: &mut crate::aarch64::Aarch64Emitter, rn: crate::aarch64::Reg, value: i32) {
+    let v = i64::from(value);
+    if (0..=0xFFF).contains(&v) {
+        // Cast: range-checked.
+        emitter.cmp_imm_w(rn, v as u16);
+    } else if (-0xFFF..0).contains(&v) {
+        // Cast: range-checked.
+        emitter.cmn_imm_w(rn, (-v) as u16);
+    } else {
+        // Cast: the constant's 32-bit pattern.
+        emitter.mov_imm64(crate::aarch64::Reg::X16, u64::from(value as u32));
+        emitter.cmp_w(rn, crate::aarch64::Reg::X16);
     }
 }
 
@@ -5291,6 +4224,8 @@ fn emit_machine_code_inner(result: &Arm64CompileResult) -> Option<(Vec<u8>, Vec<
     let mut branch_patches: Vec<(usize, u32, bool)> = Vec::new();
     // (code_offset, label_id) for LDR literal instructions needing pool offset patching
     let mut literal_patches: Vec<(usize, u32)> = Vec::new();
+    // (entry_offset, table_base, label_id) for jump-table words
+    let mut table_patches: Vec<(usize, usize, u32)> = Vec::new();
 
     // One entry per pseudo-op, recorded BEFORE it is encoded, so
     // `pseudo_offsets[i]` is where instruction `i` begins.
@@ -5694,6 +4629,115 @@ fn emit_machine_code_inner(result: &Arm64CompileResult) -> Option<(Vec<u8>, Vec<
                 emitter.mul_v4s(fp(*vd), fp(*vn), fp(*vm));
             }
 
+            // -- 32-bit (W) integer forms --
+            Arm64Instruction::AddW { rd, rn, rm } => emitter.add_w(r(*rd), r(*rn), r(*rm)),
+            Arm64Instruction::SubW { rd, rn, rm } => emitter.sub_w(r(*rd), r(*rn), r(*rm)),
+            Arm64Instruction::MulW { rd, rn, rm } => emitter.mul_w(r(*rd), r(*rn), r(*rm)),
+            Arm64Instruction::AndW { rd, rn, rm } => emitter.and_w(r(*rd), r(*rn), r(*rm)),
+            Arm64Instruction::OrrW { rd, rn, rm } => emitter.orr_w(r(*rd), r(*rn), r(*rm)),
+            Arm64Instruction::EorW { rd, rn, rm } => emitter.eor_w(r(*rd), r(*rn), r(*rm)),
+            Arm64Instruction::LslW { rd, rn, rm } => emitter.lsl_w(r(*rd), r(*rn), r(*rm)),
+            Arm64Instruction::LsrW { rd, rn, rm } => emitter.lsr_w(r(*rd), r(*rn), r(*rm)),
+            Arm64Instruction::AsrW { rd, rn, rm } => emitter.asr_w(r(*rd), r(*rn), r(*rm)),
+            Arm64Instruction::NegW { rd, rn } => emitter.neg_w(r(*rd), r(*rn)),
+            Arm64Instruction::AddImmW { rd, rn, imm } => {
+                if !emit_addsub_imm_w(&mut emitter, r(*rd), r(*rn), *imm, false) {
+                    return None;
+                }
+            }
+            Arm64Instruction::SubImmW { rd, rn, imm } => {
+                if !emit_addsub_imm_w(&mut emitter, r(*rd), r(*rn), *imm, true) {
+                    return None;
+                }
+            }
+            Arm64Instruction::CmpW { rn, rm } => emitter.cmp_w(r(*rn), r(*rm)),
+            Arm64Instruction::CmpImmW { rn, imm } => emit_w_cmp_const(&mut emitter, r(*rn), *imm),
+            Arm64Instruction::CbzW { rt, label } => {
+                let pos = emitter.cbz_w(r(*rt), 0);
+                branch_patches.push((pos, *label, true));
+            }
+            Arm64Instruction::CbnzW { rt, label } => {
+                let pos = emitter.cbnz_w(r(*rt), 0);
+                branch_patches.push((pos, *label, true));
+            }
+            Arm64Instruction::Sxtw { rd, rn } => emitter.sxtw(r(*rd), r(*rn)),
+            Arm64Instruction::Sxth { rd, rn } => emitter.sxth(r(*rd), r(*rn)),
+            Arm64Instruction::Sxtb { rd, rn } => emitter.sxtb(r(*rd), r(*rn)),
+            Arm64Instruction::AndImm { rd, rn, imm } => {
+                if !emitter.and_imm(r(*rd), r(*rn), *imm) {
+                    if rn.0 == 16 {
+                        return None;
+                    }
+                    emitter.mov_imm64(crate::aarch64::Reg::X16, *imm);
+                    emitter.and(r(*rd), r(*rn), crate::aarch64::Reg::X16);
+                }
+            }
+            Arm64Instruction::Cset { rd, cond } => emitter.cset(r(*rd), to_cond(cond)),
+            Arm64Instruction::Cneg { rd, rn, cond } => {
+                emitter.cneg(r(*rd), r(*rn), to_cond(cond));
+            }
+
+            // -- FP width forms --
+            Arm64Instruction::FmovToFpSingle { vd, rn } => emitter.fmov_s_from_w(fp(*vd), r(*rn)),
+            Arm64Instruction::FmovFromFpSingle { rd, vn } => emitter.fmov_w_from_s(r(*rd), fp(*vn)),
+            Arm64Instruction::FmovFpSingle { vd, vn } => emitter.fmov_s(fp(*vd), fp(*vn)),
+            Arm64Instruction::ScvtfDoubleW { vd, rn } => emitter.scvtf_d_w(fp(*vd), r(*rn)),
+            Arm64Instruction::ScvtfSingleX { vd, rn } => emitter.scvtf_s_x(fp(*vd), r(*rn)),
+            Arm64Instruction::FcvtzsIntW { rd, vn } => emitter.fcvtzs_w_d(r(*rd), fp(*vn)),
+            Arm64Instruction::FcvtzsSingleX { rd, vn } => emitter.fcvtzs_x_s(r(*rd), fp(*vn)),
+
+            // -- Switches --
+            Arm64Instruction::TableSwitch {
+                key,
+                low,
+                default,
+                targets,
+            } => {
+                use crate::aarch64::{Cond, Reg};
+                let Some(max_index) = targets
+                    .len()
+                    .checked_sub(1)
+                    .and_then(|m| u32::try_from(m).ok())
+                else {
+                    return None;
+                };
+                // X17 = key - low, wrapping at 32 bits, so a key below `low`
+                // becomes a huge index and fails the unsigned check below.
+                emit_w_sub_const(&mut emitter, Reg::X17, r(*key), *low);
+                if max_index <= 0xFFF {
+                    // Cast: range-checked.
+                    emitter.cmp_imm_w(Reg::X17, max_index as u16);
+                } else {
+                    emitter.mov_imm64(Reg::X16, u64::from(max_index));
+                    emitter.cmp_w(Reg::X17, Reg::X16);
+                }
+                let to_default = emitter.b_cond(Cond::HI, 0);
+                branch_patches.push((to_default, *default, true));
+                let adr = emitter.adr(Reg::X16, 0);
+                emitter.ldrsw_reg_uxtw_scaled(Reg::X17, Reg::X16, Reg::X17);
+                emitter.add(Reg::X16, Reg::X16, Reg::X17);
+                emitter.br(Reg::X16);
+                let table = emitter.offset();
+                emitter.patch_adr(adr, table);
+                for &label in targets {
+                    let entry = emitter.emit_u32_data(0);
+                    table_patches.push((entry, table, label));
+                }
+            }
+            Arm64Instruction::LookupSwitch {
+                key,
+                pairs,
+                default,
+            } => {
+                for &(value, label) in pairs {
+                    emit_w_cmp_const(&mut emitter, r(*key), value);
+                    let pos = emitter.b_cond(crate::aarch64::Cond::EQ, 0);
+                    branch_patches.push((pos, label, true));
+                }
+                let pos = emitter.b(0);
+                branch_patches.push((pos, *default, false));
+            }
+
             // -- System --
             Arm64Instruction::Nop => {
                 emitter.nop();
@@ -5741,6 +4785,20 @@ fn emit_machine_code_inner(result: &Arm64CompileResult) -> Option<(Vec<u8>, Vec<
         emitter.patch_ldr_literal(offset, target);
     }
 
+    // Patch jump-table words: each is the signed distance from the table base
+    // to its case, which the dispatch adds to the base it loaded with `ADR`.
+    for &(entry, base, label) in &table_patches {
+        let target = match label_offsets.get(&label) {
+            Some(&t) => t,
+            None => return None,
+        };
+        let Ok(delta) = i32::try_from(target as i64 - base as i64) else {
+            return None;
+        };
+        // Cast: the two's-complement word `LDRSW` sign-extends back.
+        emitter.patch_u32(entry, delta as u32);
+    }
+
     // Sticky encoding-overflow check — see this function's doc comment. Must
     // come AFTER the patch loops: `patch_branch`/`patch_bcond`/
     // `patch_ldr_literal` are themselves able to trip the flag, and in a
@@ -5773,29 +4831,26 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
 /// and refute a coverage claim on pure noise. An oracle that cries wolf is
 /// worse than one that is off.
 ///
-/// AArch64's geometry is the mirror of x86-64's: the saved FP/LR pair sits at
-/// `[FP-16]`, the callee-saved GPRs immediately below it, and the spill area
-/// BELOW those. `callee_saved_shallow` says so, so the verifier uses the range
-/// exclusion instead of x86-64's "everything at or beyond `callee_saved_lo`"
-/// half-line -- which here would have swallowed the entire spill area, the one
-/// region the oop maps actually describe.
+/// The saved FP/LR pair is the frame record AT FP (`[FP]`, `[FP+8]`), outside
+/// the `[FP - size, FP)` band altogether -- where x86-64 keeps its saved RBP and
+/// return address. Below FP come the callee-saved GPRs, and the spill area
+/// BELOW those, which is the mirror of x86-64's order. `callee_saved_shallow`
+/// says so, so the verifier uses the range exclusion instead of x86-64's
+/// "everything at or beyond `callee_saved_lo`" half-line, which here would
+/// swallow the spill area -- the one region the oop maps describe.
 ///
 /// Offsets are positive, meaning `[FP - off]`, matching the x64 convention the
 /// consumer expects.
 fn arm64_frame_layout(frame: &Arm64FrameLayout) -> crate::FrameLayout {
     let mut out = crate::FrameLayout::default();
-    // Register images: the FP/LR pair at [FP-16]/[FP-8] plus the callee-saved
-    // GPR area right below it, one contiguous span from offset 8.
-    out.callee_saved_lo = 8;
-    out.callee_saved_hi = if frame.saved_regs.is_empty() {
-        // Just the FP/LR pair at [FP-16] and [FP-8].
-        24
-    } else {
-        // `callee_save_offset` is negative and already accounts for the FP/LR
-        // pair, so `-callee_save_offset` is the DEEPEST saved-register offset;
-        // `+8` makes the range half-open over it.
-        (-frame.callee_save_offset) + 8
-    };
+    // Register images: the callee-saved GPRs, `[FP-8]` down to
+    // `[FP-callee_save_bytes]`. With none saved there is no image in the band.
+    if !frame.saved_regs.is_empty() {
+        out.callee_saved_lo = 8;
+        // `-callee_save_offset` is the DEEPEST saved-register offset; `+8`
+        // makes the range half-open over it.
+        out.callee_saved_hi = (-frame.callee_save_offset) + 8;
+    }
     out.callee_saved_shallow = true;
     // The spill area: frame-homed locals, then operand slots, then the
     // safepoint homes and the sp-id word. Every one of those is described by
@@ -5944,205 +4999,6 @@ pub fn emit_machine_code_with_oop_maps(
         });
     }
     Some((code, maps))
-}
-
-// ---------------------------------------------------------------------------
-// Arm64PeepholeOptimizer
-// ---------------------------------------------------------------------------
-
-/// ARM64-specific peephole optimizations applied after instruction selection.
-pub struct Arm64PeepholeOptimizer;
-
-impl Arm64PeepholeOptimizer {
-    /// Apply all peephole optimizations.  Returns the total number of
-    /// transformations applied.
-    pub fn optimize(instructions: &mut Vec<Arm64Instruction>) -> usize {
-        let mut total = 0;
-        total += Self::optimize_cbz(instructions);
-        total += Self::optimize_zero_reg(instructions);
-        total += Self::remove_identity_ops(instructions);
-        total += Self::merge_load_store_pairs(instructions);
-        total += Self::fuse_multiply_add(instructions);
-        total
-    }
-
-    /// CMP Xn, XZR + B.EQ label -> CBZ Xn, label
-    /// CMP Xn, XZR + B.NE label -> CBNZ Xn, label
-    pub fn optimize_cbz(instructions: &mut Vec<Arm64Instruction>) -> usize {
-        let mut count = 0;
-        let mut i = 0;
-        while i + 1 < instructions.len() {
-            let do_opt = match (&instructions[i], &instructions[i + 1]) {
-                (
-                    Arm64Instruction::CmpImm { rn, imm: 0 },
-                    Arm64Instruction::BCond {
-                        cond: Arm64Condition::Eq,
-                        label,
-                    },
-                ) => Some(Arm64Instruction::Cbz {
-                    rt: *rn,
-                    label: *label,
-                }),
-                (
-                    Arm64Instruction::CmpImm { rn, imm: 0 },
-                    Arm64Instruction::BCond {
-                        cond: Arm64Condition::Ne,
-                        label,
-                    },
-                ) => Some(Arm64Instruction::Cbnz {
-                    rt: *rn,
-                    label: *label,
-                }),
-                _ => None,
-            };
-            if let Some(replacement) = do_opt {
-                instructions[i] = replacement;
-                instructions.remove(i + 1);
-                count += 1;
-            } else {
-                i += 1;
-            }
-        }
-        count
-    }
-
-    /// MOV Xn, #0 -> use XZR where possible (replace with Mov from XZR).
-    pub fn optimize_zero_reg(instructions: &mut Vec<Arm64Instruction>) -> usize {
-        let mut count = 0;
-        for inst in instructions.iter_mut() {
-            if let Arm64Instruction::MovImm { rd, imm: 0 } = inst {
-                *inst = Arm64Instruction::Mov {
-                    rd: *rd,
-                    rm: Arm64Register::XZR,
-                };
-                count += 1;
-            }
-        }
-        count
-    }
-
-    /// Remove ADD Xn, Xn, #0 and SUB Xn, Xn, #0 (identity operations).
-    pub fn remove_identity_ops(instructions: &mut Vec<Arm64Instruction>) -> usize {
-        let before = instructions.len();
-        instructions.retain(|inst| {
-            !matches!(
-                inst,
-                Arm64Instruction::AddImm { rd, rn, imm: 0 } if *rd == *rn
-            ) && !matches!(
-                inst,
-                Arm64Instruction::SubImm { rd, rn, imm: 0 } if *rd == *rn
-            )
-        });
-        before - instructions.len()
-    }
-
-    /// Merge consecutive LDR/STR with adjacent offsets into LDP/STP.
-    pub fn merge_load_store_pairs(instructions: &mut Vec<Arm64Instruction>) -> usize {
-        let mut count = 0;
-        let mut i = 0;
-        while i + 1 < instructions.len() {
-            let merged = match (&instructions[i], &instructions[i + 1]) {
-                (
-                    Arm64Instruction::Ldr {
-                        rt: rt1,
-                        rn: rn1,
-                        offset: off1,
-                    },
-                    Arm64Instruction::Ldr {
-                        rt: rt2,
-                        rn: rn2,
-                        offset: off2,
-                    },
-                ) if rn1 == rn2 && *off2 == *off1 + 8 && rt1 != rt2 => {
-                    Some(Arm64Instruction::Ldp {
-                        rt1: *rt1,
-                        rt2: *rt2,
-                        rn: *rn1,
-                        offset: *off1,
-                    })
-                }
-                (
-                    Arm64Instruction::Str {
-                        rt: rt1,
-                        rn: rn1,
-                        offset: off1,
-                    },
-                    Arm64Instruction::Str {
-                        rt: rt2,
-                        rn: rn2,
-                        offset: off2,
-                    },
-                ) if rn1 == rn2 && *off2 == *off1 + 8 => Some(Arm64Instruction::Stp {
-                    rt1: *rt1,
-                    rt2: *rt2,
-                    rn: *rn1,
-                    offset: *off1,
-                }),
-                _ => None,
-            };
-            if let Some(replacement) = merged {
-                instructions[i] = replacement;
-                instructions.remove(i + 1);
-                count += 1;
-            } else {
-                i += 1;
-            }
-        }
-        count
-    }
-
-    /// MUL Xd, Xn, Xm followed by ADD Xa, Xd, Xr -> MADD Xa, Xn, Xm, Xr
-    pub fn fuse_multiply_add(instructions: &mut Vec<Arm64Instruction>) -> usize {
-        let mut count = 0;
-        let mut i = 0;
-        while i + 1 < instructions.len() {
-            let fused = match (&instructions[i], &instructions[i + 1]) {
-                (
-                    Arm64Instruction::Mul {
-                        rd: mul_rd,
-                        rn: mul_rn,
-                        rm: mul_rm,
-                    },
-                    Arm64Instruction::Add {
-                        rd: add_rd,
-                        rn: add_rn,
-                        rm: add_rm,
-                    },
-                ) if mul_rd == add_rn => Some(Arm64Instruction::Madd {
-                    rd: *add_rd,
-                    rn: *mul_rn,
-                    rm: *mul_rm,
-                    ra: *add_rm,
-                }),
-                (
-                    Arm64Instruction::Mul {
-                        rd: mul_rd,
-                        rn: mul_rn,
-                        rm: mul_rm,
-                    },
-                    Arm64Instruction::Add {
-                        rd: add_rd,
-                        rn: add_rn,
-                        rm: add_rm,
-                    },
-                ) if mul_rd == add_rm => Some(Arm64Instruction::Madd {
-                    rd: *add_rd,
-                    rn: *mul_rn,
-                    rm: *mul_rm,
-                    ra: *add_rn,
-                }),
-                _ => None,
-            };
-            if let Some(replacement) = fused {
-                instructions[i] = replacement;
-                instructions.remove(i + 1);
-                count += 1;
-            } else {
-                i += 1;
-            }
-        }
-        count
-    }
 }
 
 // ===========================================================================
@@ -6433,8 +5289,8 @@ mod tests {
         let has_add = result
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::Add { .. }));
-        assert!(has_add, "iadd should emit Add instruction");
+            .any(|inst| matches!(inst, Arm64Instruction::AddW { .. }));
+        assert!(has_add, "iadd should emit the 32-bit AddW");
     }
 
     #[test]
@@ -6443,8 +5299,8 @@ mod tests {
         let has_sub = result
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::Sub { .. }));
-        assert!(has_sub, "isub should emit Sub instruction");
+            .any(|inst| matches!(inst, Arm64Instruction::SubW { .. }));
+        assert!(has_sub, "isub should emit the 32-bit SubW");
     }
 
     #[test]
@@ -6453,8 +5309,8 @@ mod tests {
         let has_mul = result
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::Mul { .. }));
-        assert!(has_mul, "imul should emit Mul instruction");
+            .any(|inst| matches!(inst, Arm64Instruction::MulW { .. }));
+        assert!(has_mul, "imul should emit the 32-bit MulW");
     }
 
     /// `idiv` is REFUSED (see the module header and
@@ -6485,8 +5341,8 @@ mod tests {
         let has_neg = result
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::Neg { .. }));
-        assert!(has_neg, "ineg should emit Neg instruction");
+            .any(|inst| matches!(inst, Arm64Instruction::NegW { .. }));
+        assert!(has_neg, "ineg should emit the 32-bit NegW");
     }
 
     #[test]
@@ -6582,183 +5438,6 @@ mod tests {
         assert!(!bad.success, "unsupported opcode should set success=false");
     }
 
-    // -- Peephole optimizer tests -------------------------------------------
-
-    #[test]
-    fn peephole_cbz_optimization() {
-        let mut instrs = vec![
-            Arm64Instruction::CmpImm {
-                rn: Arm64Register::X9,
-                imm: 0,
-            },
-            Arm64Instruction::BCond {
-                cond: Arm64Condition::Eq,
-                label: 42,
-            },
-        ];
-        let count = Arm64PeepholeOptimizer::optimize_cbz(&mut instrs);
-        assert_eq!(count, 1);
-        assert_eq!(instrs.len(), 1);
-        assert!(
-            matches!(instrs[0], Arm64Instruction::Cbz { rt, label: 42 } if rt == Arm64Register::X9)
-        );
-    }
-
-    #[test]
-    fn peephole_cbnz_optimization() {
-        let mut instrs = vec![
-            Arm64Instruction::CmpImm {
-                rn: Arm64Register::X10,
-                imm: 0,
-            },
-            Arm64Instruction::BCond {
-                cond: Arm64Condition::Ne,
-                label: 7,
-            },
-        ];
-        let count = Arm64PeepholeOptimizer::optimize_cbz(&mut instrs);
-        assert_eq!(count, 1);
-        assert!(
-            matches!(instrs[0], Arm64Instruction::Cbnz { rt, label: 7 } if rt == Arm64Register::X10)
-        );
-    }
-
-    #[test]
-    fn peephole_remove_identity_add_zero() {
-        let mut instrs = vec![
-            Arm64Instruction::AddImm {
-                rd: Arm64Register::X9,
-                rn: Arm64Register::X9,
-                imm: 0,
-            },
-            Arm64Instruction::Nop,
-        ];
-        let count = Arm64PeepholeOptimizer::remove_identity_ops(&mut instrs);
-        assert_eq!(count, 1);
-        assert_eq!(instrs.len(), 1);
-        assert!(matches!(instrs[0], Arm64Instruction::Nop));
-    }
-
-    #[test]
-    fn peephole_keep_non_identity_add() {
-        let mut instrs = vec![Arm64Instruction::AddImm {
-            rd: Arm64Register::X9,
-            rn: Arm64Register::X9,
-            imm: 4,
-        }];
-        let count = Arm64PeepholeOptimizer::remove_identity_ops(&mut instrs);
-        assert_eq!(count, 0);
-        assert_eq!(instrs.len(), 1);
-    }
-
-    #[test]
-    fn peephole_merge_ldr_pair() {
-        let mut instrs = vec![
-            Arm64Instruction::Ldr {
-                rt: Arm64Register::X9,
-                rn: Arm64Register::FP,
-                offset: -16,
-            },
-            Arm64Instruction::Ldr {
-                rt: Arm64Register::X10,
-                rn: Arm64Register::FP,
-                offset: -8,
-            },
-        ];
-        let count = Arm64PeepholeOptimizer::merge_load_store_pairs(&mut instrs);
-        assert_eq!(count, 1);
-        assert_eq!(instrs.len(), 1);
-        assert!(matches!(
-            instrs[0],
-            Arm64Instruction::Ldp { rt1, rt2, rn, offset: -16 }
-                if rt1 == Arm64Register::X9 && rt2 == Arm64Register::X10 && rn == Arm64Register::FP
-        ));
-    }
-
-    #[test]
-    fn peephole_merge_str_pair() {
-        let mut instrs = vec![
-            Arm64Instruction::Str {
-                rt: Arm64Register::X19,
-                rn: Arm64Register::FP,
-                offset: -32,
-            },
-            Arm64Instruction::Str {
-                rt: Arm64Register::X20,
-                rn: Arm64Register::FP,
-                offset: -24,
-            },
-        ];
-        let count = Arm64PeepholeOptimizer::merge_load_store_pairs(&mut instrs);
-        assert_eq!(count, 1);
-        assert!(matches!(instrs[0], Arm64Instruction::Stp { .. }));
-    }
-
-    #[test]
-    fn peephole_fuse_mul_add_to_madd() {
-        let mut instrs = vec![
-            Arm64Instruction::Mul {
-                rd: Arm64Register::X9,
-                rn: Arm64Register::X10,
-                rm: Arm64Register::X11,
-            },
-            Arm64Instruction::Add {
-                rd: Arm64Register::X12,
-                rn: Arm64Register::X9,
-                rm: Arm64Register::X13,
-            },
-        ];
-        let count = Arm64PeepholeOptimizer::fuse_multiply_add(&mut instrs);
-        assert_eq!(count, 1);
-        assert_eq!(instrs.len(), 1);
-        assert!(matches!(
-            instrs[0],
-            Arm64Instruction::Madd { rd, rn, rm, ra }
-                if rd == Arm64Register::X12
-                && rn == Arm64Register::X10
-                && rm == Arm64Register::X11
-                && ra == Arm64Register::X13
-        ));
-    }
-
-    #[test]
-    fn peephole_optimize_returns_total_count() {
-        let mut instrs = vec![
-            Arm64Instruction::AddImm {
-                rd: Arm64Register::X9,
-                rn: Arm64Register::X9,
-                imm: 0,
-            },
-            Arm64Instruction::MovImm {
-                rd: Arm64Register::X10,
-                imm: 0,
-            },
-            Arm64Instruction::Nop,
-        ];
-        let total = Arm64PeepholeOptimizer::optimize(&mut instrs);
-        // identity add removed (1) + zero mov -> xzr (1) = 2
-        assert!(
-            total >= 2,
-            "expected at least 2 optimizations, got {}",
-            total
-        );
-    }
-
-    #[test]
-    fn peephole_zero_reg_optimization() {
-        let mut instrs = vec![Arm64Instruction::MovImm {
-            rd: Arm64Register::X9,
-            imm: 0,
-        }];
-        let count = Arm64PeepholeOptimizer::optimize_zero_reg(&mut instrs);
-        assert_eq!(count, 1);
-        assert!(matches!(
-            instrs[0],
-            Arm64Instruction::Mov { rd, rm }
-                if rd == Arm64Register::X9 && rm == Arm64Register::XZR
-        ));
-    }
-
     #[test]
     fn arm64_stack_alignment_is_16() {
         assert_eq!(Arm64CallingConvention::STACK_ALIGNMENT, 16);
@@ -6775,7 +5454,7 @@ mod tests {
         let has_add = result
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::Add { .. }));
+            .any(|inst| matches!(inst, Arm64Instruction::AddW { .. }));
         assert!(has_add);
     }
 
@@ -6793,61 +5472,68 @@ mod tests {
 
     // -- Float/double operation tests ------------------------------------------
 
+    /// `float` arithmetic lowers to the S forms and `double` to the D forms.
+    ///
+    /// Both used to lower to the D forms: `float` was modelled as `double`
+    /// end to end, so rounding, overflow and the bits handed back to the VM
+    /// were a double's.
     #[test]
-    fn backend_float_add_emits_fadd() {
-        // fconst_1 (0x0c), fconst_1 (0x0c), fadd (0x62), return void (0xb1)
-        let result = make_backend_with_method(0, 0, &[0x0c, 0x0c, 0x62, 0xb1]);
-        assert!(result.success, "float add should succeed");
-        let has_fadd = result
-            .instructions
-            .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::FaddDouble { .. }));
-        assert!(has_fadd, "fadd should emit FaddDouble");
+    fn float_and_double_arithmetic_use_their_own_widths() {
+        fn single(op: u8) -> Arm64CompileResult {
+            make_backend_with_method(0, 0, &[0x0c, 0x0c, op, 0xb1])
+        }
+        fn double(op: u8) -> Arm64CompileResult {
+            make_backend_with_method(0, 0, &[0x0f, 0x0f, op, 0xb1])
+        }
+        fn has(r: &Arm64CompileResult, f: fn(&Arm64Instruction) -> bool) -> bool {
+            r.success && r.instructions.iter().any(|i| f(i))
+        }
+        assert!(has(&single(0x62), |i| matches!(i, Arm64Instruction::FaddSingle { .. })));
+        assert!(has(&single(0x66), |i| matches!(i, Arm64Instruction::FsubSingle { .. })));
+        assert!(has(&single(0x6a), |i| matches!(i, Arm64Instruction::FmulSingle { .. })));
+        assert!(has(&single(0x6e), |i| matches!(i, Arm64Instruction::FdivSingle { .. })));
+        assert!(has(&double(0x63), |i| matches!(i, Arm64Instruction::FaddDouble { .. })));
+        assert!(has(&double(0x67), |i| matches!(i, Arm64Instruction::FsubDouble { .. })));
+        assert!(has(&double(0x6b), |i| matches!(i, Arm64Instruction::FmulDouble { .. })));
+        assert!(has(&double(0x6f), |i| matches!(i, Arm64Instruction::FdivDouble { .. })));
+        assert!(
+            !single(0x62)
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Arm64Instruction::FaddDouble { .. })),
+            "fadd must not use the double form"
+        );
+        // A float operand is not a double: `dadd` of two `fconst`s is refused.
+        assert!(!single(0x63).success, "dadd over floats is ill-typed");
     }
 
+    /// `i2f` converts from the W register into an S register, `i2d` into a D
+    /// register, and `l2f`/`l2d` from the X register.
     #[test]
-    fn backend_float_sub_emits_fsub() {
-        let result = make_backend_with_method(0, 0, &[0x0c, 0x0c, 0x66, 0xb1]);
-        assert!(result.success);
-        let has_fsub = result
+    fn integer_to_fp_conversions_pick_source_and_destination_widths() {
+        fn conv(code: &[u8]) -> Arm64CompileResult {
+            make_backend_with_method(0, 0, code)
+        }
+        let i2f = conv(&[0x04, 0x86, 0xb1]);
+        assert!(i2f.success);
+        assert!(i2f.instructions.iter().any(|i| matches!(i, Arm64Instruction::ScvtfSingle { .. })));
+        let i2d = conv(&[0x04, 0x87, 0xb1]);
+        assert!(i2d.instructions.iter().any(|i| matches!(i, Arm64Instruction::ScvtfDoubleW { .. })));
+        let l2f = conv(&[0x0a, 0x89, 0xb1]);
+        assert!(l2f.instructions.iter().any(|i| matches!(i, Arm64Instruction::ScvtfSingleX { .. })));
+        let l2d = conv(&[0x0a, 0x8a, 0xb1]);
+        assert!(l2d.instructions.iter().any(|i| matches!(i, Arm64Instruction::ScvtfDouble { .. })));
+        // f2d / d2f are real conversions now, not no-ops.
+        let f2d = conv(&[0x0c, 0x8d, 0xb1]);
+        assert!(f2d
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::FsubDouble { .. }));
-        assert!(has_fsub);
-    }
-
-    #[test]
-    fn backend_float_mul_emits_fmul() {
-        let result = make_backend_with_method(0, 0, &[0x0c, 0x0c, 0x6a, 0xb1]);
-        assert!(result.success);
-        let has_fmul = result
+            .any(|i| matches!(i, Arm64Instruction::FcvtSingleToDouble { .. })));
+        let d2f = conv(&[0x0f, 0x90, 0xb1]);
+        assert!(d2f
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::FmulDouble { .. }));
-        assert!(has_fmul);
-    }
-
-    #[test]
-    fn backend_float_div_emits_fdiv() {
-        let result = make_backend_with_method(0, 0, &[0x0c, 0x0c, 0x6e, 0xb1]);
-        assert!(result.success);
-        let has_fdiv = result
-            .instructions
-            .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::FdivDouble { .. }));
-        assert!(has_fdiv);
-    }
-
-    #[test]
-    fn backend_type_conversion_i2f() {
-        // iconst_1 (0x04), i2f (0x86), return void (0xb1)
-        let result = make_backend_with_method(0, 0, &[0x04, 0x86, 0xb1]);
-        assert!(result.success, "i2f conversion should succeed");
-        let has_scvtf = result
-            .instructions
-            .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::ScvtfDouble { .. }));
-        assert!(has_scvtf, "i2f should emit ScvtfDouble");
+            .any(|i| matches!(i, Arm64Instruction::FcvtDoubleToSingle { .. })));
     }
 
     #[test]
@@ -6876,17 +5562,32 @@ mod tests {
         );
     }
 
+    /// `fneg`/`dneg` flip the sign bit with FNEG.
+    ///
+    /// Formerly `backend_float_neg_emits_fsub`, which asserted the bug: the
+    /// lowering computed `0.0 - x`, and `0.0 - 0.0` is `+0.0`, so `-(0.0f)`
+    /// lost its sign.
     #[test]
-    fn backend_float_neg_emits_fsub() {
-        // fconst_1 (0x0c), fneg (0x76), return void (0xb1)
-        let result = make_backend_with_method(0, 0, &[0x0c, 0x76, 0xb1]);
-        assert!(result.success, "float neg should succeed");
-        // fneg uses FsubDouble (zero - value)
-        let has_fsub = result
-            .instructions
-            .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::FsubDouble { .. }));
-        assert!(has_fsub, "fneg should emit FsubDouble");
+    fn fneg_and_dneg_use_fneg_not_a_subtraction_from_zero() {
+        for (code, single) in [(&[0x0c, 0x76, 0xb1][..], true), (&[0x0f, 0x77, 0xb1][..], false)] {
+            let result = make_backend_with_method(0, 0, code);
+            assert!(result.success);
+            let neg = result.instructions.iter().any(|i| {
+                if single {
+                    matches!(i, Arm64Instruction::FnegSingle { .. })
+                } else {
+                    matches!(i, Arm64Instruction::FnegDouble { .. })
+                }
+            });
+            assert!(neg, "negation must be FNEG of the operand's own width");
+            assert!(
+                !result.instructions.iter().any(|i| matches!(
+                    i,
+                    Arm64Instruction::FsubDouble { .. } | Arm64Instruction::FsubSingle { .. }
+                )),
+                "0.0 - x turns -0.0 into +0.0"
+            );
+        }
     }
 
     #[test]
@@ -6911,11 +5612,23 @@ mod tests {
 
     #[test]
     fn backend_fconst_bit_exact_for_non_integral() {
-        // emit_fconst must move the IEEE-754 bit pattern (FMOV Dd, Xn), NOT
-        // perform an integer→float conversion (ScvtfDouble), which would round
-        // 2.5 down to 2.0. Drive emit_fconst directly with a non-integral value.
+        // A constant must move the IEEE-754 bit pattern, NOT perform an
+        // integer→float conversion, which would round 2.5 down to 2.0. And a
+        // `float` constant must be the SINGLE pattern into an S register.
+        let mut single = Arm64Backend::new();
+        single.emit_fconst(2.5);
+        assert!(single.buffer.instructions().iter().any(
+            |i| matches!(i, Arm64Instruction::MovImm { imm, .. } if *imm == i64::from(2.5f32.to_bits()))
+        ));
+        assert!(single
+            .buffer
+            .instructions()
+            .iter()
+            .any(|i| matches!(i, Arm64Instruction::FmovToFpSingle { .. })));
+        assert_eq!(single.operand_stack[0].kind, OperandKind::F32);
+
         let mut backend = Arm64Backend::new();
-        backend.emit_fconst(2.5);
+        backend.emit_dconst(2.5);
         let expected_bits = 2.5f64.to_bits() as i64;
         let has_movimm_bits = backend.buffer.instructions().iter().any(
             |inst| matches!(inst, Arm64Instruction::MovImm { imm, .. } if *imm == expected_bits),
@@ -7017,8 +5730,8 @@ mod tests {
         let has_fcmp = result
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::FcmpDouble { .. }));
-        assert!(has_fcmp, "fcmpl should emit FcmpDouble");
+            .any(|inst| matches!(inst, Arm64Instruction::FcmpSingle { .. }));
+        assert!(has_fcmp, "fcmpl of two floats should emit FcmpSingle");
     }
 
     #[test]
@@ -7343,8 +6056,8 @@ mod tests {
         let has_add = result
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::AddImm { imm: 5, .. }));
-        assert!(has_add, "iinc +5 should emit AddImm with imm=5");
+            .any(|inst| matches!(inst, Arm64Instruction::AddImmW { imm: 5, .. }));
+        assert!(has_add, "iinc +5 should emit the 32-bit AddImmW with imm=5");
     }
 
     #[test]
@@ -7355,8 +6068,8 @@ mod tests {
         let has_sub = result
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::SubImm { imm: 1, .. }));
-        assert!(has_sub, "iinc -1 should emit SubImm with imm=1");
+            .any(|inst| matches!(inst, Arm64Instruction::SubImmW { imm: 1, .. }));
+        assert!(has_sub, "iinc -1 should emit the 32-bit SubImmW with imm=1");
     }
 
     #[test]
@@ -7367,8 +6080,8 @@ mod tests {
         let has_lsr = result
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::Lsr { .. }));
-        assert!(has_lsr, "iushr should emit Lsr");
+            .any(|inst| matches!(inst, Arm64Instruction::LsrW { .. }));
+        assert!(has_lsr, "iushr should emit the 32-bit LsrW, which shifts by the amount mod 32");
     }
 
     /// Constant-operand counterpart of
@@ -7480,8 +6193,10 @@ mod tests {
 
     #[test]
     fn p95_lshl_lushr_compiles() {
-        // lconst_1, lconst_1, lshl, lconst_1, lushr, lreturn
-        let result = make_backend_with_method(0, 0, &[0x0a, 0x0a, 0x79, 0x0a, 0x7d, 0xad]);
+        // lconst_1, iconst_1, lshl, iconst_1, lushr, lreturn. The shift amount
+        // is an `int` (JVMS 6.5 `lshl`); an earlier version of this test shifted
+        // by a `long`, which the typed operand stack now refuses.
+        let result = make_backend_with_method(0, 0, &[0x0a, 0x04, 0x79, 0x04, 0x7d, 0xad]);
         assert!(result.success, "lshl/lushr should compile");
     }
 
@@ -7619,92 +6334,6 @@ mod tests {
     // ===================================================================
     // Phase 95.3 — NEON vectorization tests
     // ===================================================================
-
-    #[test]
-    fn p95_neon_array_sum_emits_vector_instructions() {
-        let mut backend = Arm64Backend::new();
-        backend.buffer = Arm64CodeBuffer::new();
-        // Set up minimal frame
-        backend.frame = Some(Arm64FrameLayout::compute(0, 16, &[]));
-        backend.local_regs = Vec::new();
-        backend.float_local_regs = Vec::new();
-
-        backend.emit_neon_array_sum(
-            Arm64Register::X0, // arr_reg
-            Arm64Register::X1, // len_reg
-            Arm64Register::X2, // result_reg
-        );
-
-        let instrs = backend.buffer.instructions();
-
-        // Should contain NeonLd1_4s (vector load)
-        let has_ld1 = instrs
-            .iter()
-            .any(|i| matches!(i, Arm64Instruction::NeonLd1_4s { .. }));
-        assert!(has_ld1, "NEON array sum should emit NeonLd1_4s");
-
-        // Should contain NeonAdd4s (vector add)
-        let has_add = instrs
-            .iter()
-            .any(|i| matches!(i, Arm64Instruction::NeonAdd4s { .. }));
-        assert!(has_add, "NEON array sum should emit NeonAdd4s");
-
-        // Should contain NeonSt1_4s (for horizontal reduce via store)
-        let has_st1 = instrs
-            .iter()
-            .any(|i| matches!(i, Arm64Instruction::NeonSt1_4s { .. }));
-        assert!(
-            has_st1,
-            "NEON array sum should emit NeonSt1_4s for horizontal reduce"
-        );
-
-        // Should contain scalar tail loop
-        let branch_count = instrs
-            .iter()
-            .filter(|i| matches!(i, Arm64Instruction::BCond { .. }))
-            .count();
-        assert!(
-            branch_count >= 3,
-            "should have vector loop + scalar tail branches, got {branch_count}"
-        );
-    }
-
-    #[test]
-    fn p95_neon_dot_product_emits_mul_and_add() {
-        let mut backend = Arm64Backend::new();
-        backend.buffer = Arm64CodeBuffer::new();
-        backend.frame = Some(Arm64FrameLayout::compute(0, 16, &[]));
-        backend.local_regs = Vec::new();
-        backend.float_local_regs = Vec::new();
-
-        backend.emit_neon_dot_product(
-            Arm64Register::X0, // arr_a
-            Arm64Register::X1, // arr_b
-            Arm64Register::X2, // len
-            Arm64Register::X3, // result
-        );
-
-        let instrs = backend.buffer.instructions();
-
-        // Should contain NeonMul4s (vector multiply)
-        let has_mul = instrs
-            .iter()
-            .any(|i| matches!(i, Arm64Instruction::NeonMul4s { .. }));
-        assert!(has_mul, "NEON dot product should emit NeonMul4s");
-
-        // Should contain NeonAdd4s (vector accumulate)
-        let has_add = instrs
-            .iter()
-            .any(|i| matches!(i, Arm64Instruction::NeonAdd4s { .. }));
-        assert!(has_add, "NEON dot product should emit NeonAdd4s");
-
-        // Should contain two NeonLd1_4s (one for each array)
-        let ld1_count = instrs
-            .iter()
-            .filter(|i| matches!(i, Arm64Instruction::NeonLd1_4s { .. }))
-            .count();
-        assert_eq!(ld1_count, 2, "NEON dot product should load from two arrays");
-    }
 
     // NOTE: the `p95_neon_pattern_detection_*` tests were removed alongside the
     // dead `detect_neon_patterns` / `NeonVectorizablePattern` scanner (2026-06-10
@@ -8272,54 +6901,87 @@ mod tests {
         );
     }
 
-    /// The poll leaves the compile-time spill model exactly as it found it.
+    /// The poll leaves the compile-time operand model exactly as it found it.
     ///
-    /// `spill_map` decides whether `pop_operand` emits a reload. The poll's
-    /// spill sits INSIDE the `CBZ`-skipped block, so on the not-taken path
-    /// (flag clear -- the common case) those stores never execute, and an entry
-    /// left behind would make a later `pop_operand` reload a frame slot nothing
-    /// wrote. Asserting the model is unchanged is how a non-executing host
+    /// Its stores and reloads sit INSIDE the `CBZ`-skipped block, so the model
+    /// must say the same thing on both paths: every operand in the register it
+    /// was in. Asserting the model is unchanged is how a non-executing host
     /// checks that.
     #[test]
-    fn the_poll_restores_the_spill_model() {
+    fn the_poll_restores_the_operand_model() {
         let mut b = poll_backend();
         b.frame = Some(Arm64FrameLayout::compute(0, 8, &[]));
-        b.operand_stack = vec![Arm64Register::X9, Arm64Register::X10];
-        b.operand_stack_oop_marks = vec![true, false];
-        assert!(b.spill_map.is_empty());
+        b.max_stack = 8;
+        b.operand_stack = vec![
+            Operand::in_reg(OperandKind::Ref, Arm64Register::X9),
+            Operand::in_reg(OperandKind::I32, Arm64Register::X10),
+            Operand::in_reg(OperandKind::F64, Arm64Register::V0),
+        ];
+        let before = b.operand_stack.clone();
 
         b.emit_safepoint_poll(false);
 
         assert!(!b.failed, "the poll must not refuse this frame");
-        assert!(
-            b.spill_map.is_empty(),
-            "the poll must remove every spill entry it added; left: {:?}",
-            b.spill_map
-        );
-        // The oop map DID record the reference operand's slot: the spill is
+        assert_eq!(b.operand_stack, before, "the poll must leave the model as it found it");
+        // The oop map DID record the reference operand's slot: the store is
         // what makes it nameable, and the map is taken at the call.
-        assert_eq!(
-            b.pending_oop_maps.len(),
-            1,
-            "the safepoint must record a map naming the live reference"
-        );
+        assert_eq!(b.pending_oop_maps.len(), 1);
         assert_eq!(
             b.pending_oop_maps[0].frame_slot_offsets.len(),
             1,
-            "only the marked (reference) operand belongs in the map"
+            "only the reference operand belongs in the map"
         );
     }
 
-    /// A poll whose spill has no reserved slot refuses the method.
+    /// FLOATING-POINT OPERANDS SURVIVE THE POLL'S CALL.
     ///
-    /// The alternative is a live reference sitting in a caller-saved register
-    /// across a CALL, which is the exact hazard the spill exists for.
+    /// V0-V7 are as caller-saved as X9-X15, and the poll used to store only the
+    /// GPR operand stack: a float or double live across a taken poll was
+    /// whatever the slow path left in its register.
+    #[test]
+    fn the_poll_stores_and_reloads_floating_point_operands() {
+        let mut b = poll_backend();
+        b.frame = Some(Arm64FrameLayout::compute(0, 8, &[]));
+        b.max_stack = 8;
+        b.operand_stack = vec![
+            Operand::in_reg(OperandKind::F32, Arm64Register::V1),
+            Operand::in_reg(OperandKind::F64, Arm64Register::V2),
+        ];
+        b.emit_safepoint_poll(false);
+        assert!(!b.failed);
+
+        let ops = b.buffer.instructions();
+        let blr = ops
+            .iter()
+            .position(|i| matches!(i, Arm64Instruction::Blr { .. }))
+            .expect("the poll calls the slow path");
+        let stored = |vt: Arm64Register, double: bool| {
+            ops[..blr].iter().any(|i| {
+                matches!(i, Arm64Instruction::FpStr { vt: v, rn, is_double, .. }
+                         if *v == vt && *rn == Arm64Register::FP && *is_double == double)
+            })
+        };
+        let reloaded = |vt: Arm64Register, double: bool| {
+            ops[blr..].iter().any(|i| {
+                matches!(i, Arm64Instruction::FpLdr { vt: v, rn, is_double, .. }
+                         if *v == vt && *rn == Arm64Register::FP && *is_double == double)
+            })
+        };
+        assert!(stored(Arm64Register::V1, false), "the float is stored at its own width");
+        assert!(stored(Arm64Register::V2, true), "the double is stored");
+        assert!(reloaded(Arm64Register::V1, false), "the float is reloaded after the call");
+        assert!(reloaded(Arm64Register::V2, true), "the double is reloaded after the call");
+    }
+
+    /// A poll whose store has no reserved slot refuses the method.
+    ///
+    /// The alternative is a live value sitting in a caller-saved register
+    /// across a CALL, which is the exact hazard the store exists for.
     #[test]
     fn a_poll_that_cannot_place_its_spill_refuses() {
         let mut b = poll_backend();
         b.frame = Some(Arm64FrameLayout::compute(0, 0, &[]));
-        b.operand_stack = vec![Arm64Register::X9];
-        b.operand_stack_oop_marks = vec![true];
+        b.operand_stack = vec![Operand::in_reg(OperandKind::Ref, Arm64Register::X9)];
         b.emit_safepoint_poll(false);
         assert!(
             b.failed,
@@ -8895,22 +7557,13 @@ mod tests {
         }));
     }
 
-    /// THE OPERAND OOP MARKS ARE NOT IN LOCKSTEP WITH THE OPERAND STACK.
+    /// An operand's oop mark belongs to the VALUE, not to its stack index.
     ///
-    /// `push_operand` pushes no mark and `pop_operand` pops none, so a mark
-    /// outlives the value it described and is then re-read as belonging to
-    /// whatever value later occupies that index. The "lazy resync" in the map
-    /// writer only pads and truncates to the stack LENGTH -- it cannot know the
-    /// surviving entries describe different values now.
-    ///
-    /// Both directions are unsound once a precise map is trusted:
-    ///
-    ///   * stale TRUE -- a primitive is named as a reference, and a relocating
-    ///     collector rewrites a word that is not a pointer;
-    ///   * stale FALSE -- a reference is not named, and with the conservative
-    ///     scan suppressed that is a use-after-free.
-    ///
-    /// This is why `fully_oop_covered` could not simply be switched on.
+    /// The marks once lived in a vector beside the stack that neither push nor
+    /// pop maintained, so a mark outlived its value and was re-read for the
+    /// next one: a primitive named as a reference (a relocating collector
+    /// rewrites a non-pointer) or a reference lost. The mark is a field of the
+    /// entry now, so it cannot drift; this pins that it does not.
     #[test]
     fn operand_oop_marks_track_the_value_not_the_index() {
         let mut b = poll_backend();
@@ -8918,14 +7571,14 @@ mod tests {
         b.sp_id_slot_off = 64;
 
         // A reference at depth 0...
-        b.push_operand(Arm64Register::X9);
-        b.mark_top_operand_as_oop();
-        assert_eq!(b.operand_stack_oop_marks, vec![true]);
+        b.push_reg(OperandKind::Ref, Arm64Register::X9);
+        assert!(b.operand_stack[0].oop);
 
         // ...consumed...
         let _ = b.pop_operand();
+        b.held.clear();
         // ...and an INT pushed into the same slot.
-        b.push_operand(Arm64Register::X10);
+        b.push_reg(OperandKind::I32, Arm64Register::X10);
 
         b.emit_safepoint_poll(false);
         assert!(!b.failed);
@@ -9066,10 +7719,11 @@ mod tests {
              what stops the verifier's x86-64 half-line from swallowing the \
              whole spill area"
         );
-        // The FP/LR pair is a register image.
-        assert!(layout.is_register_image(8), "saved LR");
-        assert!(layout.is_register_image(16), "saved FP");
-        // ...and so is every saved GPR.
+        // The FP/LR pair is the frame record AT FP, not a word of this frame's
+        // band: nothing at or above FP may be claimed.
+        assert!(!layout.is_register_image(0), "[FP] is the caller's FP, outside the band");
+        assert!(!layout.is_register_image(-8), "[FP+8] is the return address");
+        // Every saved GPR is a register image.
         for (i, _) in result.frame.saved_regs.iter().enumerate() {
             let off = -(result.frame.callee_save_offset + (i as i32) * 8);
             assert!(
@@ -9113,16 +7767,19 @@ mod tests {
     #[test]
     fn a_published_artifact_carries_its_frame_layout() {
         let mut b = poll_backend();
-        let result = b.compile_method(2, 0, 4, &[0xb1]);
+        // aload_0; areturn -- local 0 is live, so it gets a callee-saved home.
+        let result = b.compile_method(1, 1, 4, &[0x2a, 0xb0]);
         assert!(result.success);
+        assert!(!result.frame.saved_regs.is_empty(), "test precondition: a saved GPR");
         let cm = publish_compiled_method(&result).expect("publishes");
         assert!(
             cm.frame_layout.callee_saved_shallow,
             "the artifact must carry the aarch64 geometry"
         );
+        let deepest_save = -result.frame.callee_save_offset;
         assert!(
-            cm.frame_layout.is_register_image(16),
-            "and the saved FP must be excluded from this frame's band"
+            cm.frame_layout.is_register_image(deepest_save),
+            "the caller's saved X19 at [FP-{deepest_save}] must be excluded from this frame's band"
         );
         assert_ne!(
             cm.frame_layout,
@@ -9313,60 +7970,126 @@ mod tests {
         assert_eq!(maps[0].native_pc_offset as usize, code.len());
     }
 
-    /// A frame big enough to step over the stack guard page must bail, because
-    /// this backend emits no stack bang (x86-64 does — `emit_stack_bang_before_frame_alloc`).
+    /// A frame larger than a guard page compiles, and touches every page it
+    /// crosses before SP moves.
+    ///
+    /// Formerly `oversized_frame_bails_no_stack_bang`: with no bang, `SUB SP,
+    /// SP, #frame` could step clean past the guard page, so such frames were
+    /// refused outright.
     #[test]
-    fn oversized_frame_bails_no_stack_bang() {
-        // max_stack = 600 → 600 spill slots → ~4.8 KiB frame, past one guard page.
+    fn a_large_frame_bangs_every_page_before_moving_sp() {
+        // max_stack = 600 -> 600 operand words -> a 4816-byte frame.
         let mut big = Arm64Backend::new();
+        big.set_safepoints_enabled(false);
         let result = big.compile_method(0, 0, 600, &[0xb1]);
+        assert!(result.frame.frame_size >= 4096, "test precondition");
+        assert!(result.success, "a large frame must compile once it is banged");
+
+        let below = result.frame.frame_size - 16;
+        let ops = &result.instructions;
+        let probes: Vec<i32> = ops
+            .iter()
+            .filter_map(|i| match i {
+                Arm64Instruction::SubImm { rd, rn, imm }
+                    if *rd == Arm64Register::X16 && *rn == Arm64Register::SP =>
+                {
+                    Some(*imm)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(Some(probes.clone()), stack_bang_probe_offsets(below));
+        assert_eq!(probes.last().copied(), Some(below), "the exact frame bottom is probed");
+
+        let alloc = ops
+            .iter()
+            .position(|i| {
+                matches!(i, Arm64Instruction::SubImm { rd, rn, .. }
+                         if *rd == Arm64Register::SP && *rn == Arm64Register::SP)
+            })
+            .expect("the frame is allocated");
+        let last_touch = ops
+            .iter()
+            .rposition(|i| {
+                matches!(i, Arm64Instruction::Str { rt, rn, offset: 0 }
+                         if *rt == Arm64Register::XZR && *rn == Arm64Register::X16)
+            })
+            .expect("each probe stores through X16");
+        assert!(last_touch < alloc, "every page is touched BEFORE SP moves");
         assert!(
-            result.frame.frame_size >= 4096,
-            "test precondition: frame must exceed a guard page (got {})",
-            result.frame.frame_size
-        );
-        assert!(
-            !result.success,
-            "a frame larger than the guard page must bail: `SUB SP, SP, #frame` \
-             with no bang can jump clean past the guard"
+            emit_machine_code(&result).is_some(),
+            "the 4800-byte SUB SP needs the extended-register form, which now exists"
         );
 
-        // Negative control: an ordinary small frame still compiles, so the gate
-        // is a size threshold and not a blanket refusal.
+        // A frame under a page cannot skip the guard, and gets no probe.
         let mut small = Arm64Backend::new();
+        small.set_safepoints_enabled(false);
         let ok = small.compile_method(0, 0, 4, &[0xb1]);
-        assert!(ok.frame.frame_size < 4096);
-        assert!(ok.success, "a normal frame must still compile");
+        assert!(ok.success);
+        assert!(!ok.instructions.iter().any(|i| {
+            matches!(i, Arm64Instruction::Str { rt, rn, .. }
+                     if *rt == Arm64Register::XZR && *rn == Arm64Register::X16)
+        }));
     }
 
-    /// The one ADD/SUB-immediate shape with no sound encoding (SP operand,
-    /// magnitude > 0xFFF, not 4 KiB-aligned) must report failure, not emit a
-    /// `BRK` and claim success. A BRK raises SIGTRAP, which nothing in the VM
-    /// converts into anything — the process just dies on first execution.
     #[test]
-    fn addsub_imm_safe_refuses_unencodable_sp_adjustment() {
+    fn stack_bang_probe_offsets_cover_every_page_crossed() {
+        assert_eq!(stack_bang_probe_offsets(0), Some(vec![]));
+        assert_eq!(stack_bang_probe_offsets(4095), Some(vec![]));
+        assert_eq!(stack_bang_probe_offsets(4096), Some(vec![4096]));
+        assert_eq!(stack_bang_probe_offsets(8200), Some(vec![4096, 8192, 8200]));
+        assert_eq!(stack_bang_probe_offsets(-1), None);
+        assert_eq!(
+            stack_bang_probe_offsets(4096 * (MAX_STACK_BANG_PROBES as i32 + 1)),
+            None,
+            "past the probe cap the method is refused"
+        );
+    }
+
+    /// A wide SP adjustment lowers through the extended-register form.
+    ///
+    /// Formerly `addsub_imm_safe_refuses_unencodable_sp_adjustment`: the only
+    /// register fallback was the shifted-register form, where 31 is XZR.
+    #[test]
+    fn addsub_imm_safe_lowers_a_wide_sp_adjustment() {
         use crate::aarch64::{Aarch64Emitter, Reg};
 
         let mut e = Aarch64Emitter::new();
-        assert!(
-            !emit_addsub_imm_safe(&mut e, Reg::SP, Reg::SP, 5000, true),
-            "an unencodable SP adjustment must be refused"
-        );
+        assert!(emit_addsub_imm_safe(&mut e, Reg::SP, Reg::SP, 5000, true));
+        let n = e.code().len();
+        assert_eq!(n, 8, "MOVZ X16, #5000; SUB SP, SP, X16, UXTX");
+        let last = u32::from_le_bytes(e.code()[n - 4..].try_into().unwrap());
+        assert_eq!(last, 0xCB30_63FF, "sub sp, sp, x16 -- SP on both sides");
 
-        // A 4 KiB-aligned SP adjustment of the same magnitude class IS
-        // encodable (shifted-by-12 immediate form) and must still succeed.
         let mut e2 = Aarch64Emitter::new();
-        assert!(
-            emit_addsub_imm_safe(&mut e2, Reg::SP, Reg::SP, 8192, true),
-            "a shifted-12 encodable SP adjustment must still lower"
-        );
-        assert_eq!(e2.code().len(), 4, "and it lowers to a single instruction");
+        assert!(emit_addsub_imm_safe(&mut e2, Reg::SP, Reg::SP, 8192, true));
+        assert_eq!(e2.code().len(), 4, "the shifted-12 immediate is still one word");
+
+        // The one refusal left: an operand that is IP0 itself.
+        let mut e3 = Aarch64Emitter::new();
+        assert!(!emit_addsub_imm_safe(&mut e3, Reg::X9, Reg::X16, 5000, false));
     }
 
-    /// `emit_machine_code` must propagate that refusal instead of publishing a
-    /// body whose SP adjustment silently did not happen.
+    /// A far SP-relative access adds SP, not XZR, to the offset.
     #[test]
-    fn emit_machine_code_bails_on_unencodable_sp_immediate() {
+    fn a_far_sp_relative_access_materializes_an_sp_address() {
+        let result = result_from_instructions(vec![
+            Arm64Instruction::Ldr {
+                rt: Arm64Register::X9,
+                rn: Arm64Register::SP,
+                offset: 100_000,
+            },
+            Arm64Instruction::Ret,
+        ]);
+        let bytes = emit_machine_code(&result).expect("encodes");
+        let n = bytes.len();
+        let add = u32::from_le_bytes(bytes[n - 12..n - 8].try_into().unwrap());
+        assert_eq!(add, 0x8B30_63F0, "add x16, sp, x16 in the extended form");
+    }
+
+    /// `emit_machine_code` encodes a wide SP adjustment instead of refusing.
+    #[test]
+    fn emit_machine_code_encodes_a_wide_sp_immediate() {
         let result = result_from_instructions(vec![
             Arm64Instruction::SubImm {
                 rd: Arm64Register::SP,
@@ -9375,12 +8098,13 @@ mod tests {
             },
             Arm64Instruction::Ret,
         ]);
-        assert!(
-            emit_machine_code(&result).is_none(),
-            "an unencodable SP adjustment must bail the method, not emit a BRK"
+        assert_eq!(
+            emit_machine_code(&result).map(|b| b.len()),
+            Some(12),
+            "MOVZ, SUB (extended), RET"
         );
 
-        // Negative control: the encodable form still produces code.
+        // The shifted-immediate form still produces code too.
         let ok = result_from_instructions(vec![
             Arm64Instruction::SubImm {
                 rd: Arm64Register::SP,
@@ -9478,33 +8202,52 @@ mod tests {
         assert_eq!(backend.operand_stack.len(), 6);
     }
 
-    /// A `double` operand lives on `float_operand_stack`, so a shuffle that
-    /// pops `operand_stack` for it takes an unrelated value. Refuse.
+    /// Floating-point operands shuffle like any other, and the forms the JVMS
+    /// does not define still refuse.
+    ///
+    /// Formerly `a_floating_point_operand_refuses_the_shuffle_rather_than_moving_the_wrong_stack`.
+    /// Floats lived on a second stack the shuffles never touched, so every
+    /// shuffle involving one had to refuse. There is one typed stack now, and
+    /// each shuffle resolves its JVMS form from the entries' categories.
     #[test]
-    fn a_floating_point_operand_refuses_the_shuffle_rather_than_moving_the_wrong_stack() {
-        for (name, code) in [
-            // The int stack has enough entries here that the old arms did NOT
-            // underflow — they duplicated `iconst_1` and left the float where
-            // it was, silently. Without these two cases the rest of this test
-            // passes against the pre-fix backend for the wrong reason (an
-            // accidental underflow), which is no test at all.
-            (
-                "dup of a float over two ints",
-                vec![0x03u8, 0x04, 0x0b, 0x59],
-            ),
-            ("pop of a float over two ints", vec![0x03, 0x04, 0x0b, 0x57]),
-            ("dup of a double", vec![0x0e, 0x59]),
-            ("dup2 of a double", vec![0x0e, 0x5c]),
-            ("dup2_x2 of two doubles", vec![0x0e, 0x0f, 0x5e]),
-            ("dup_x1 with a float below", vec![0x0b, 0x03, 0x5a]),
-            ("swap with a float below", vec![0x0b, 0x03, 0x5f]),
-            ("pop of a float", vec![0x0b, 0x57]),
+    fn floating_point_operands_shuffle_on_the_unified_stack() {
+        for (name, code, depth) in [
+            ("dup of a float over two ints", vec![0x03u8, 0x04, 0x0b, 0x59], 4),
+            ("pop of a float over two ints", vec![0x03, 0x04, 0x0b, 0x57], 2),
+            ("dup2 of a double", vec![0x0e, 0x5c], 2),
+            ("dup2_x2 of two doubles", vec![0x0e, 0x0f, 0x5e], 3),
+            ("dup_x1 with a float below", vec![0x0b, 0x03, 0x5a], 3),
+            ("swap with a float below", vec![0x0b, 0x03, 0x5f], 2),
+            ("pop of a float", vec![0x0b, 0x57], 0),
         ] {
             let mut backend = Arm64Backend::new();
-            assert!(
-                !backend.compile_method(4, 0, 8, &code).success,
-                "{name} must refuse the method, not shuffle the integer stack"
-            );
+            assert!(backend.compile_method(4, 0, 8, &code).success, "{name} must lower");
+            assert_eq!(backend.operand_stack.len(), depth, "{name}");
+        }
+
+        // `swap` really exchanges the values, kinds and all.
+        let mut s = Arm64Backend::new();
+        assert!(s.compile_method(4, 0, 8, &[0x0b, 0x03, 0x5f]).success);
+        let kinds: Vec<OperandKind> = s.operand_stack.iter().map(|o| o.kind).collect();
+        assert_eq!(kinds, vec![OperandKind::I32, OperandKind::F32]);
+
+        // `dup` of a float copies at the float's width.
+        let mut d = Arm64Backend::new();
+        let dup = d.compile_method(4, 0, 8, &[0x0b, 0x59]);
+        assert!(dup
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Arm64Instruction::FmovFpSingle { .. })));
+
+        // Forms the JVMS does not define.
+        for (name, code) in [
+            ("dup of a double", vec![0x0eu8, 0x59]),
+            ("dup_x1 over a long", vec![0x09, 0x03, 0x5a]),
+            ("swap of a double", vec![0x03, 0x0e, 0x5f]),
+            ("pop of a long", vec![0x09, 0x57]),
+        ] {
+            let mut backend = Arm64Backend::new();
+            assert!(!backend.compile_method(4, 0, 8, &code).success, "{name} must refuse");
         }
     }
 
@@ -9543,6 +8286,577 @@ mod tests {
     fn an_untypeable_shuffle_refuses_the_method() {
         let mut backend = Arm64Backend::new();
         assert!(!backend.compile_method(4, 0, 8, &[0x5e]).success);
+    }
+
+    // =====================================================================
+    // 2026-09-12 review fixes. `eval_int_method` runs the integer pseudo-ops a
+    // straight-line method lowers to, so VALUES are checked on a host that
+    // cannot execute AArch64; the other tests pin the emitted shapes.
+    // =====================================================================
+
+    /// Run a compiled method's integer pseudo-ops from its prologue to `RET`
+    /// and answer X0. Panics on any pseudo-op it does not model, so a test
+    /// cannot pass by skipping one.
+    fn eval_int_method(result: &Arm64CompileResult, args: &[i64]) -> i64 {
+        let ops = &result.instructions;
+        let mut reg = [0u64; 64];
+        let mut mem: HashMap<u64, u64> = HashMap::new();
+        reg[31] = 0x7FFF_0000; // SP
+        for (i, a) in args.iter().enumerate() {
+            reg[i] = *a as u64;
+        }
+        let labels: HashMap<u32, usize> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| match op {
+                Arm64Instruction::Label(l) => Some((*l, i)),
+                _ => None,
+            })
+            .collect();
+        let w = |v: u64| v as u32;
+        let at = |base: u64, off: i32| base.wrapping_add(off as i64 as u64);
+        let mut pc = 0usize;
+        for _ in 0..100_000 {
+            let Some(op) = ops.get(pc) else {
+                panic!("fell off the end of the pseudo-op stream");
+            };
+            let mut next = pc + 1;
+            match op {
+                Arm64Instruction::Label(_) | Arm64Instruction::Comment(_) | Arm64Instruction::Nop => {}
+                Arm64Instruction::MovImm { rd, imm } => reg[rd.0 as usize] = *imm as u64,
+                Arm64Instruction::Mov { rd, rm } => reg[rd.0 as usize] = reg[rm.0 as usize],
+                Arm64Instruction::AddImm { rd, rn, imm } => {
+                    reg[rd.0 as usize] = at(reg[rn.0 as usize], *imm)
+                }
+                Arm64Instruction::SubImm { rd, rn, imm } => {
+                    reg[rd.0 as usize] = at(reg[rn.0 as usize], imm.wrapping_neg())
+                }
+                Arm64Instruction::AddW { rd, rn, rm } => {
+                    reg[rd.0 as usize] =
+                        u64::from(w(reg[rn.0 as usize]).wrapping_add(w(reg[rm.0 as usize])))
+                }
+                Arm64Instruction::SubW { rd, rn, rm } => {
+                    reg[rd.0 as usize] =
+                        u64::from(w(reg[rn.0 as usize]).wrapping_sub(w(reg[rm.0 as usize])))
+                }
+                Arm64Instruction::LslW { rd, rn, rm } => {
+                    reg[rd.0 as usize] =
+                        u64::from(w(reg[rn.0 as usize]).wrapping_shl(w(reg[rm.0 as usize])))
+                }
+                Arm64Instruction::AddImmW { rd, rn, imm } => {
+                    reg[rd.0 as usize] = u64::from(w(reg[rn.0 as usize]).wrapping_add(*imm as u32))
+                }
+                Arm64Instruction::SubImmW { rd, rn, imm } => {
+                    reg[rd.0 as usize] = u64::from(w(reg[rn.0 as usize]).wrapping_sub(*imm as u32))
+                }
+                Arm64Instruction::Sxtw { rd, rn } => {
+                    reg[rd.0 as usize] = w(reg[rn.0 as usize]) as i32 as i64 as u64
+                }
+                Arm64Instruction::CbzW { rt, label } => {
+                    if w(reg[rt.0 as usize]) == 0 {
+                        next = labels[label];
+                    }
+                }
+                Arm64Instruction::CbnzW { rt, label } => {
+                    if w(reg[rt.0 as usize]) != 0 {
+                        next = labels[label];
+                    }
+                }
+                Arm64Instruction::Str { rt, rn, offset } => {
+                    // Register 31 as a store's Rt is XZR.
+                    let v = if rt.0 == 31 { 0 } else { reg[rt.0 as usize] };
+                    mem.insert(at(reg[rn.0 as usize], *offset), v);
+                }
+                Arm64Instruction::Ldr { rt, rn, offset } => {
+                    let addr = at(reg[rn.0 as usize], *offset);
+                    reg[rt.0 as usize] = *mem
+                        .get(&addr)
+                        .unwrap_or_else(|| panic!("load of an unwritten word at {addr:#x}"));
+                }
+                Arm64Instruction::StpPre { rt1, rt2, rn, offset } => {
+                    let base = at(reg[rn.0 as usize], *offset);
+                    mem.insert(base, reg[rt1.0 as usize]);
+                    mem.insert(base + 8, reg[rt2.0 as usize]);
+                    reg[rn.0 as usize] = base;
+                }
+                Arm64Instruction::Stp { rt1, rt2, rn, offset } => {
+                    let base = at(reg[rn.0 as usize], *offset);
+                    mem.insert(base, reg[rt1.0 as usize]);
+                    mem.insert(base + 8, reg[rt2.0 as usize]);
+                }
+                Arm64Instruction::Ldp { rt1, rt2, rn, offset } => {
+                    let base = at(reg[rn.0 as usize], *offset);
+                    reg[rt1.0 as usize] = mem[&base];
+                    reg[rt2.0 as usize] = mem[&(base + 8)];
+                }
+                Arm64Instruction::LdpPost { rt1, rt2, rn, offset } => {
+                    let base = reg[rn.0 as usize];
+                    reg[rt1.0 as usize] = mem[&base];
+                    reg[rt2.0 as usize] = mem[&(base + 8)];
+                    reg[rn.0 as usize] = at(base, *offset);
+                }
+                Arm64Instruction::B { label } => next = labels[label],
+                Arm64Instruction::Ret => return reg[0] as i64,
+                other => panic!("eval_int_method does not model {other:?}"),
+            }
+            pc = next;
+        }
+        panic!("100000 steps without a RET");
+    }
+
+    /// Compile a static method with `descriptor`, polls off, and require it to
+    /// succeed.
+    fn compile_with(descriptor: &str, locals: usize, stack: usize, code: &[u8]) -> Arm64CompileResult {
+        let mut b = Arm64Backend::new();
+        b.set_safepoints_enabled(false);
+        b.set_method_descriptor(descriptor, true);
+        let slots = crate::compute_param_jvm_slots(descriptor, true).1;
+        let result = b.compile_method(locals, slots, stack, code);
+        assert!(result.success, "{descriptor} {code:02x?} must compile");
+        result
+    }
+
+    /// THE REPORTED MISCOMPILE. `static int f(int a, int b) { return a -
+    /// (b+1+2+3+4); }` returned -4 for `f(100, 5)`: the round-robin scratch
+    /// allocator wrapped onto a live register, spilled it, recorded the spill
+    /// against the REGISTER, pushed the same register for the new value, and
+    /// popping the new value reloaded the old one.
+    #[test]
+    fn the_expression_that_returned_minus_four_evaluates_to_85() {
+        let code = [
+            0x1a, 0x1b, 0x04, 0x60, 0x05, 0x60, 0x06, 0x60, 0x07, 0x60, 0x64, 0xac,
+        ];
+        let result = compile_with("(II)I", 2, 3, &code);
+        assert_eq!(eval_int_method(&result, &[100, 5]), 85);
+        assert_eq!(eval_int_method(&result, &[0, -15]), 0);
+    }
+
+    /// A stack deeper than the seven scratch registers keeps every operand, in
+    /// order -- checked with a subtraction chain, which is order-sensitive.
+    #[test]
+    fn a_stack_deeper_than_the_scratch_pool_keeps_every_value() {
+        let ten_values = || {
+            let mut code = vec![0x04u8, 0x05, 0x06, 0x07, 0x08]; // iconst_1..5
+            for v in 6..=10u8 {
+                code.extend_from_slice(&[0x10, v]); // bipush
+            }
+            code
+        };
+        let mut sum = ten_values();
+        sum.extend(std::iter::repeat(0x60).take(9));
+        sum.push(0xac);
+        assert_eq!(eval_int_method(&compile_with("()I", 0, 10, &sum), &[]), 55);
+
+        // 1 - (2 - (3 - (4 - (5 - (6 - (7 - (8 - (9 - 10))))))))
+        let mut sub = ten_values();
+        sub.extend(std::iter::repeat(0x64).take(9));
+        sub.push(0xac);
+        assert_eq!(eval_int_method(&compile_with("()I", 0, 10, &sub), &[]), -5);
+    }
+
+    /// A value on the operand stack across a branch reaches the merge from
+    /// both paths: `a == 0 ? 2 : 1`. The model used to follow the walk, so the
+    /// two arms left the value in different registers.
+    #[test]
+    fn a_ternary_value_survives_the_merge() {
+        // iload_0; ifeq 8; iconst_1; goto 9; 8: iconst_2; 9: ireturn
+        let code = [0x1a, 0x99, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x05, 0xac];
+        let result = compile_with("(I)I", 1, 1, &code);
+        assert_eq!(eval_int_method(&result, &[0]), 2);
+        assert_eq!(eval_int_method(&result, &[5]), 1);
+    }
+
+    /// `int` results wrap at 32 bits and stay sign-extended through `i2l`,
+    /// `l2i` sign-extends, `ishl` masks, and `iinc` wraps.
+    #[test]
+    fn int_arithmetic_wraps_and_stays_sign_extended() {
+        let min = i64::from(i32::MIN);
+        let max = i64::from(i32::MAX);
+        let add = compile_with("(II)I", 2, 2, &[0x1a, 0x1b, 0x60, 0xac]);
+        assert_eq!(eval_int_method(&add, &[max, 1]), min);
+        // iload_0; iload_1; iadd; i2l; lreturn
+        let widen = compile_with("(II)J", 2, 2, &[0x1a, 0x1b, 0x60, 0x85, 0xad]);
+        assert_eq!(eval_int_method(&widen, &[max, 1]), min, "i2l of a wrapped int");
+        // lload_0; l2i; ireturn
+        let narrow = compile_with("(J)I", 2, 2, &[0x1e, 0x88, 0xac]);
+        assert_eq!(eval_int_method(&narrow, &[0xFFFF_FFFF]), -1, "(int) 0xFFFFFFFFL");
+        assert_eq!(eval_int_method(&narrow, &[0x1_0000_0005]), 5);
+        // iload_0; iload_1; ishl; ireturn
+        let shl = compile_with("(II)I", 2, 2, &[0x1a, 0x1b, 0x78, 0xac]);
+        assert_eq!(eval_int_method(&shl, &[1, 32]), 1, "the distance is masked to 5 bits");
+        assert_eq!(eval_int_method(&shl, &[1, 31]), min);
+        // iinc 0, 1; iload_0; ireturn
+        let inc = compile_with("(I)I", 1, 1, &[0x84, 0x00, 0x01, 0x1a, 0xac]);
+        assert_eq!(eval_int_method(&inc, &[max]), min);
+    }
+
+    /// Every argument lands in its JVM local, category 2 included.
+    ///
+    /// The prologue moved argument register `i` into local `i`, which is wrong
+    /// for every argument after a `long` or `double`.
+    #[test]
+    fn parameters_after_a_long_are_homed_by_jvm_slot() {
+        // static int f(long a, long b, int c) { return c; } -- iload 4; ireturn
+        let r1 = compile_with("(JJI)I", 5, 1, &[0x15, 0x04, 0xac]);
+        assert_eq!(eval_int_method(&r1, &[11, 22, 33]), 33, "c is argument 2 and local 4");
+        // static long f(int a, long b) { return b; } -- lload_1; lreturn
+        let r2 = compile_with("(IJ)J", 3, 2, &[0x1f, 0xad]);
+        assert_eq!(eval_int_method(&r2, &[7, -9]), -9);
+    }
+
+    /// A frame-homed parameter -- which every `float`/`double` one is -- is
+    /// stored by the prologue and read back from that word. It used to be
+    /// stored nowhere.
+    #[test]
+    fn floating_point_parameters_are_stored_to_their_frame_homes() {
+        // static double f(double a, double b) { return b; }
+        // dload_0; pop2; dload_2; dreturn
+        let result = compile_with("(DD)D", 4, 2, &[0x26, 0x58, 0x28, 0xaf]);
+        let ops = &result.instructions;
+        let home_of = |arg: Arm64Register| {
+            ops.iter().find_map(|i| match i {
+                Arm64Instruction::Str { rt, rn, offset }
+                    if *rt == arg && *rn == Arm64Register::FP =>
+                {
+                    Some(*offset)
+                }
+                _ => None,
+            })
+        };
+        let a = home_of(Arm64Register::X0).expect("argument 0 is stored to its frame home");
+        let b = home_of(Arm64Register::X1).expect("argument 1 is stored to its frame home");
+        assert_ne!(a, b);
+        let loads: Vec<i32> = ops
+            .iter()
+            .filter_map(|i| match i {
+                Arm64Instruction::FpLdr {
+                    rn,
+                    offset,
+                    is_double: true,
+                    ..
+                } if *rn == Arm64Register::FP => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(loads, vec![a, b], "each dload reads the word its argument was stored to");
+    }
+
+    /// `freturn`/`dreturn` move the bits into X0 -- where the VM reads every
+    /// result -- and leave through the shared epilogue. They used to discard
+    /// the value and emit a bare `RET`, skipping the frame teardown.
+    #[test]
+    fn fp_returns_move_the_bits_to_x0_and_take_the_epilogue() {
+        for (code, single) in [(&[0x0cu8, 0xae][..], true), (&[0x0f, 0xaf][..], false)] {
+            let result = make_backend_with_method(0, 0, code);
+            assert!(result.success);
+            let ops = &result.instructions;
+            let mv = ops
+                .iter()
+                .position(|i| {
+                    if single {
+                        matches!(i, Arm64Instruction::FmovFromFpSingle { rd, .. } if *rd == Arm64Register::X0)
+                    } else {
+                        matches!(i, Arm64Instruction::FmovFromFp { rd, .. } if *rd == Arm64Register::X0)
+                    }
+                })
+                .expect("the value is moved into X0");
+            assert!(matches!(ops[mv + 1], Arm64Instruction::B { .. }), "then to the epilogue");
+            let rets = ops
+                .iter()
+                .filter(|i| matches!(i, Arm64Instruction::Ret))
+                .count();
+            assert_eq!(rets, 1, "the only RET is the epilogue's");
+            assert!(matches!(ops.last(), Some(Arm64Instruction::Ret)));
+        }
+    }
+
+    /// `*cmpg` negates on MI and `*cmpl` on LT, and the NZCV truth table after
+    /// `FCMP` says that puts NaN where the JVMS does. `fcmpg` used to take
+    /// `B.LT`, which is TRUE on unordered, so NaN produced -1.
+    #[test]
+    fn fp_compares_put_nan_on_the_jvms_side() {
+        type Nzcv = (bool, bool, bool, bool);
+        const LESS: Nzcv = (true, false, false, false);
+        const EQUAL: Nzcv = (false, true, true, false);
+        const GREATER: Nzcv = (false, false, true, false);
+        const UNORDERED: Nzcv = (false, false, true, true);
+        fn holds(cond: Arm64Condition, (n, z, _c, v): Nzcv) -> bool {
+            match cond {
+                Arm64Condition::Ne => !z,
+                Arm64Condition::Mi => n,
+                Arm64Condition::Lt => n != v,
+                other => panic!("unmodelled condition {other:?}"),
+            }
+        }
+        // CSET ne; CNEG <cond>
+        fn value(cond: Arm64Condition, flags: Nzcv) -> i32 {
+            let v = i32::from(holds(Arm64Condition::Ne, flags));
+            if holds(cond, flags) {
+                -v
+            } else {
+                v
+            }
+        }
+        for (code, nan) in [
+            ([0x0bu8, 0x0c, 0x95, 0xac], -1), // fcmpl
+            ([0x0b, 0x0c, 0x96, 0xac], 1),    // fcmpg
+            ([0x0e, 0x0f, 0x97, 0xac], -1),   // dcmpl
+            ([0x0e, 0x0f, 0x98, 0xac], 1),    // dcmpg
+        ] {
+            let r = make_backend_with_method(0, 0, &code);
+            assert!(r.success);
+            assert!(r.instructions.iter().any(
+                |i| matches!(i, Arm64Instruction::Cset { cond: Arm64Condition::Ne, .. })
+            ));
+            assert!(
+                !r.instructions
+                    .iter()
+                    .any(|i| matches!(i, Arm64Instruction::BCond { .. })),
+                "branch-free"
+            );
+            let cond = r
+                .instructions
+                .iter()
+                .find_map(|i| match i {
+                    Arm64Instruction::Cneg { cond, .. } => Some(*cond),
+                    _ => None,
+                })
+                .expect("CNEG");
+            assert_eq!(value(cond, UNORDERED), nan, "0x{:02x} on NaN", code[2]);
+            assert_eq!(value(cond, LESS), -1);
+            assert_eq!(value(cond, EQUAL), 0);
+            assert_eq!(value(cond, GREATER), 1);
+        }
+    }
+
+    /// `f2i`/`d2i` use the 32-bit saturating `FCVTZS W` and then sign-extend;
+    /// `l2i` sign-extends instead of masking.
+    #[test]
+    fn fp_to_int_conversions_saturate_at_32_bits() {
+        for (code, name) in [(&[0x0cu8, 0x8b, 0xac][..], "f2i"), (&[0x0f, 0x8e, 0xac][..], "d2i")] {
+            let r = make_backend_with_method(0, 0, code);
+            assert!(r.success);
+            let ops = &r.instructions;
+            let at = ops
+                .iter()
+                .position(|i| {
+                    matches!(
+                        i,
+                        Arm64Instruction::FcvtzsSingle { .. } | Arm64Instruction::FcvtzsIntW { .. }
+                    )
+                })
+                .unwrap_or_else(|| panic!("{name} must use FCVTZS W"));
+            let rd = match ops[at] {
+                Arm64Instruction::FcvtzsSingle { rd, .. } | Arm64Instruction::FcvtzsIntW { rd, .. } => rd,
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(ops[at + 1], Arm64Instruction::Sxtw { rd: d, rn: s } if d == rd && s == rd),
+                "{name} then SXTW"
+            );
+            assert!(
+                !ops.iter().any(|i| matches!(
+                    i,
+                    Arm64Instruction::FcvtzsInt { .. } | Arm64Instruction::FcvtzsSingleX { .. }
+                )),
+                "{name} must not saturate at the 64-bit bounds"
+            );
+        }
+        let l2i = make_backend_with_method(0, 0, &[0x0a, 0x88, 0xac]);
+        assert!(l2i
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Arm64Instruction::Sxtw { .. })));
+        assert!(
+            !l2i.instructions.iter().any(|i| matches!(
+                i,
+                Arm64Instruction::And { .. } | Arm64Instruction::AndImm { .. }
+            )),
+            "l2i must not zero-extend"
+        );
+    }
+
+    /// Every 32-bit int op is its W form followed by `SXTW` of its result, and
+    /// int compares and zero tests read the W register.
+    #[test]
+    fn int_ops_lower_to_w_forms_followed_by_sxtw() {
+        for op in [0x60u8, 0x64, 0x68, 0x7e, 0x80, 0x82, 0x78, 0x7a, 0x7c] {
+            let r = make_backend_with_method(2, 2, &[0x1a, 0x1b, op, 0xac]);
+            assert!(r.success, "0x{op:02x}");
+            let ops = &r.instructions;
+            let rd = ops
+                .iter()
+                .find_map(|i| match i {
+                    Arm64Instruction::AddW { rd, .. }
+                    | Arm64Instruction::SubW { rd, .. }
+                    | Arm64Instruction::MulW { rd, .. }
+                    | Arm64Instruction::AndW { rd, .. }
+                    | Arm64Instruction::OrrW { rd, .. }
+                    | Arm64Instruction::EorW { rd, .. }
+                    | Arm64Instruction::LslW { rd, .. }
+                    | Arm64Instruction::AsrW { rd, .. }
+                    | Arm64Instruction::LsrW { rd, .. } => Some(*rd),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("0x{op:02x} has no W form"));
+            assert!(
+                ops.windows(2).any(|pair| matches!(
+                    (&pair[0], &pair[1]),
+                    (_, Arm64Instruction::Sxtw { rd: d, rn: s }) if *d == rd && *s == rd
+                )),
+                "0x{op:02x}: the result is sign-extended"
+            );
+            assert!(
+                !ops.iter().any(|i| matches!(
+                    i,
+                    Arm64Instruction::Add { .. }
+                        | Arm64Instruction::Sub { .. }
+                        | Arm64Instruction::Mul { .. }
+                        | Arm64Instruction::And { .. }
+                        | Arm64Instruction::Orr { .. }
+                        | Arm64Instruction::Eor { .. }
+                        | Arm64Instruction::Lsl { .. }
+                        | Arm64Instruction::Asr { .. }
+                        | Arm64Instruction::Lsr { .. }
+                )),
+                "0x{op:02x} leaves no 64-bit op behind"
+            );
+        }
+        // iload_0; iload_1; if_icmpeq 6; return; 6: return
+        let icmp = make_backend_with_method(2, 2, &[0x1a, 0x1b, 0x9f, 0x00, 0x04, 0xb1, 0xb1]);
+        assert!(icmp
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Arm64Instruction::CmpW { .. })));
+        // iload_0; ifeq 5; return; 5: return
+        let ifeq = make_backend_with_method(1, 1, &[0x1a, 0x99, 0x00, 0x04, 0xb1, 0xb1]);
+        assert!(ifeq
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Arm64Instruction::CbzW { .. })));
+    }
+
+    /// A switch's key is never compared with itself, even with every scratch
+    /// register live, and a dense `tableswitch` is a real jump table.
+    ///
+    /// The old lowering popped the key and then took each case constant from
+    /// the scratch allocator, which could hand back the key's own register:
+    /// `CMP R, R`, always equal.
+    #[test]
+    fn a_switch_never_compares_its_key_with_itself() {
+        // seven live ints (every scratch register), then the key
+        let mut prefix = vec![0x03u8; 7];
+        prefix.push(0x1a);
+        let mut look = prefix.clone();
+        look.extend_from_slice(&[0xab, 0, 0, 0]);
+        for word in [28i32, 2, 1, 28, 2, 28] {
+            look.extend_from_slice(&word.to_be_bytes());
+        }
+        look.push(0xac);
+        let mut table = prefix;
+        table.extend_from_slice(&[0xaa, 0, 0, 0]);
+        for word in [28i32, 0, 2, 28, 28, 28] {
+            table.extend_from_slice(&word.to_be_bytes());
+        }
+        table.push(0xac);
+
+        for (name, code) in [("lookupswitch", look), ("tableswitch", table)] {
+            assert_eq!(code.len(), 37, "{name}: every case targets pc 36");
+            let mut b = Arm64Backend::new();
+            let result = b.compile_method(1, 1, 8, &code);
+            assert!(result.success, "{name} must compile");
+            let bytes = emit_machine_code(&result).unwrap_or_else(|| panic!("{name} must encode"));
+            let words: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            for &word in &words {
+                // CMP (SUBS ZR, Rn, Rm) with no shift, either width.
+                if word & 0x7F20_FC1F == 0x6B00_001F {
+                    assert_ne!(
+                        (word >> 5) & 0x1F,
+                        (word >> 16) & 0x1F,
+                        "{name}: {word:#010x} compares a register with itself"
+                    );
+                }
+            }
+            if name == "tableswitch" {
+                assert!(words.contains(&0xB8B1_5A11), "LDRSW X17, [X16, W17, UXTW #2]");
+                assert!(words.contains(&0xD61F_0200), "BR X16");
+            }
+        }
+    }
+
+    /// The prologue builds the standard AAPCS64 frame record and the epilogue
+    /// tears it down, neither through `MOV` (which reads register 31 as XZR).
+    #[test]
+    fn the_prologue_builds_the_standard_frame_record() {
+        let result = make_backend_with_method(1, 1, &[0x1a, 0xac]);
+        assert!(result.success);
+        let ops = &result.instructions;
+        assert!(matches!(ops[0], Arm64Instruction::StpPre { rt1, rt2, rn, offset: -16 }
+                         if rt1 == Arm64Register::FP && rt2 == Arm64Register::LR && rn == Arm64Register::SP));
+        assert!(
+            matches!(ops[1], Arm64Instruction::AddImm { rd, rn, imm: 0 }
+                     if rd == Arm64Register::FP && rn == Arm64Register::SP),
+            "FP = SP right after the push: [FP] is the caller's FP and [FP+8] the LR"
+        );
+        assert!(!ops.iter().any(|i| matches!(i, Arm64Instruction::Mov { rd, rm }
+                                             if *rd == Arm64Register::FP || *rd == Arm64Register::SP || *rm == Arm64Register::SP)));
+        let ldp = ops
+            .iter()
+            .position(|i| matches!(i, Arm64Instruction::LdpPost { .. }))
+            .expect("epilogue");
+        assert!(matches!(ops[ldp - 1], Arm64Instruction::AddImm { rd, rn, imm: 0 }
+                         if rd == Arm64Register::SP && rn == Arm64Register::FP));
+
+        let bytes = emit_machine_code(&result).expect("encodes");
+        let word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(word(0), 0xA9BF_7BFD, "stp x29, x30, [sp, #-16]!");
+        assert_eq!(word(1), 0x9100_03FD, "mov x29, sp (ADD form)");
+
+        assert_eq!(
+            Arm64FrameLayout::compute(0, 0, &[Arm64Register::X19]).callee_save_offset,
+            -16,
+            "the first callee-save pair sits directly below FP"
+        );
+    }
+
+    /// `estimated_size` is an upper bound, and a label or comment costs nothing.
+    #[test]
+    fn code_buffer_estimated_size_is_an_upper_bound() {
+        // sipush 32767; istore_0; iinc 0, 1; iload_0; ireturn
+        let result = make_backend_with_method(1, 0, &[0x11, 0x7F, 0xFF, 0x3b, 0x84, 0x00, 0x01, 0x1a, 0xac]);
+        assert!(result.success);
+        let mut buf = Arm64CodeBuffer::new();
+        for inst in &result.instructions {
+            buf.emit(inst.clone());
+        }
+        let encoded = emit_machine_code(&result).expect("encodes").len();
+        assert!(buf.estimated_size() >= encoded, "{} < {encoded}", buf.estimated_size());
+
+        let mut labels_only = Arm64CodeBuffer::new();
+        let l = labels_only.new_label();
+        labels_only.bind_label(l);
+        labels_only.emit(Arm64Instruction::Comment("nothing".into()));
+        assert_eq!(labels_only.estimated_size(), 0);
+    }
+
+    /// More float operands than V0-V7 spill by depth, at their own width, and
+    /// the method still compiles. The float allocator used to round-robin with
+    /// no liveness check and no spill.
+    #[test]
+    fn a_float_stack_deeper_than_v0_to_v7_spills_by_depth() {
+        let mut code = vec![0x0cu8; 9]; // nine fconst_1
+        code.extend(std::iter::repeat(0x62).take(8)); // eight fadd
+        code.push(0xae); // freturn
+        let mut b = Arm64Backend::new();
+        let result = b.compile_method(0, 0, 9, &code);
+        assert!(result.success, "nine float operands must not exhaust the pool");
+        assert!(result.instructions.iter().any(|i| matches!(
+            i,
+            Arm64Instruction::FpStr { is_double: false, rn, .. } if *rn == Arm64Register::FP
+        )));
     }
 
 // ---------------------------------------------------------------------------
@@ -9681,58 +8995,24 @@ mod arm64_execution {
         TEST_SP_FLAG.store(0, Ordering::SeqCst);
     }
 
-    /// THE 32-BIT INT OPS ARE LOWERED AS 64-BIT, AND HERE IS THE PROOF.
-    ///
-    /// The module header has said so since the 2026-08-01 parity audit --
-    /// `iadd`/`isub`/`imul`/`ineg`/`ishl`/`ishr`/`iand`/`ior`/`ixor` share the
-    /// emitters of their `l*` counterparts, so JVM 32-bit wrapping never
-    /// happens -- but it was a CLAIM: nothing in this repository could execute
-    /// AArch64 to demonstrate it. This does.
-    ///
-    /// `iadd` of `Integer.MAX_VALUE + 1` must be `Integer.MIN_VALUE`
-    /// (JVMS 6.5 `iadd`: "the result is the 32 low-order bits of the true
-    /// mathematical result... overflow is not detected"). The X-form `ADD`
-    /// returns the mathematical result instead.
-    ///
-    /// This test pins the WRONG answer on purpose. It is the characterization
-    /// of a known miscompile, not an endorsement: when the W-form work lands it
-    /// will fail, and the fix is to flip it to
-    /// `iadd_wraps_at_32_bits_as_the_jvms_requires` below and delete that
-    /// test's `#[ignore]`. Fixing it properly is a backend-wide type-discipline
-    /// change (W-forms threaded through loads, compares, returns and `i2l`),
-    /// which the header asks not to attempt piecemeal.
-    #[test]
-    fn iadd_does_not_wrap_at_32_bits_and_this_is_a_bug() {
-        let _serial = exec_guard();
+    /// Compile `code` as a static method with `descriptor`, polls off.
+    fn compile_static(descriptor: &str, locals: usize, stack: usize, code: &[u8]) -> crate::CompiledMethod {
         let mut b = Arm64Backend::new();
         b.set_safepoints_enabled(false);
-        let result = b.compile_method(2, 2, 4, &IADD);
-        assert!(result.success);
-        let cm = publish_compiled_method(&result).expect("publishes");
-
-        let got = call2(&cm, i64::from(i32::MAX), 1);
-        assert_eq!(
-            got,
-            i64::from(i32::MAX) + 1,
-            "the 64-bit ADD returns the mathematical result"
-        );
-        assert_ne!(
-            got,
-            i64::from(i32::MIN),
-            "...and NOT the wrapped `int` the JVMS requires -- this is the \
-             documented 32-bit lowering gap, now demonstrated rather than \
-             asserted"
-        );
+        b.set_method_descriptor(descriptor, true);
+        let slots = crate::compute_param_jvm_slots(descriptor, true).1;
+        let result = b.compile_method(locals, slots, stack, code);
+        assert!(result.success, "{descriptor} must compile");
+        publish_compiled_method(&result).expect("publishes")
     }
 
-    /// What `iadd` must do once the W-form work lands.
+    /// `iadd` wraps at 32 bits, and the result comes back sign-extended.
     ///
-    /// Kept executable and ignored rather than described in a comment, so the
-    /// fix has a test to turn green instead of one to write.
+    /// Formerly `iadd_does_not_wrap_at_32_bits_and_this_is_a_bug`, which pinned
+    /// the 64-bit answer while the correct assertion sat `#[ignore]`d beside
+    /// it. JVMS 6.5 `iadd`: "the result is the 32 low-order bits of the true
+    /// mathematical result".
     #[test]
-    #[ignore = "32-bit int ops are lowered as 64-bit; see \
-                iadd_does_not_wrap_at_32_bits_and_this_is_a_bug and the module \
-                header's `32-bit int ops` gap"]
     fn iadd_wraps_at_32_bits_as_the_jvms_requires() {
         let _serial = exec_guard();
         let mut b = Arm64Backend::new();
@@ -9743,14 +9023,13 @@ mod arm64_execution {
         assert_eq!(call2(&cm, i64::from(i32::MAX), 1), i64::from(i32::MIN));
     }
 
-    /// The second face: `ishl` does not mask its shift amount to 5 bits.
+    /// `ishl` masks its distance to five bits.
     ///
-    /// JVMS 6.5 `ishl`: the shift distance is "the value of the low 5 bits" of
-    /// the second operand, so `1 << 32` is `1`. A 64-bit `LSL` shifts by 32 and
-    /// yields 4294967296. An independent instruction from `iadd`, so this is a
-    /// second witness rather than the same one twice.
+    /// Formerly `ishl_does_not_mask_the_shift_to_five_bits_and_this_is_a_bug`.
+    /// JVMS 6.5 `ishl`: the distance is "the value of the low 5 bits", so
+    /// `1 << 32` is `1` and `1 << 31` is `Integer.MIN_VALUE`.
     #[test]
-    fn ishl_does_not_mask_the_shift_to_five_bits_and_this_is_a_bug() {
+    fn ishl_masks_the_shift_to_five_bits() {
         let _serial = exec_guard();
         // iload_0; iload_1; ishl; ireturn
         let code = [0x1a, 0x1b, 0x78, 0xac];
@@ -9759,13 +9038,51 @@ mod arm64_execution {
         let result = b.compile_method(2, 2, 4, &code);
         assert!(result.success, "ishl must compile");
         let cm = publish_compiled_method(&result).expect("publishes");
+        assert_eq!(call2(&cm, 1, 32), 1);
+        assert_eq!(call2(&cm, 1, 33), 2);
+        assert_eq!(call2(&cm, 1, 31), i64::from(i32::MIN));
+    }
 
-        let got = call2(&cm, 1, 32);
-        assert_eq!(got, 1i64 << 32, "the 64-bit LSL shifts by the full 32");
-        assert_ne!(
-            got, 1,
-            "...and not by `32 & 31 == 0`, which is what the JVMS specifies"
-        );
+    /// The reported miscompile: `static int f(int a, int b) { return a -
+    /// (b+1+2+3+4); }` returned -4 for `f(100, 5)`, because the scratch
+    /// allocator wrapped onto a live register and popping the new value
+    /// reloaded the old one.
+    #[test]
+    fn the_expression_that_returned_minus_four_returns_85() {
+        let _serial = exec_guard();
+        let code = [
+            0x1a, 0x1b, 0x04, 0x60, 0x05, 0x60, 0x06, 0x60, 0x07, 0x60, 0x64, 0xac,
+        ];
+        let cm = compile_static("(II)I", 2, 3, &code);
+        assert_eq!(call2(&cm, 100, 5), 85);
+    }
+
+    /// `dreturn` hands back the double's bits in X0 through the epilogue, and a
+    /// `double` parameter is homed in its frame slot. Both were broken: the
+    /// return discarded the value with a bare `RET`, and a frame-homed
+    /// parameter was never stored.
+    #[test]
+    fn a_double_parameter_round_trips_through_dreturn() {
+        let _serial = exec_guard();
+        // static double f(double a, double b) { return b; }  -- dload_2; dreturn
+        let cm = compile_static("(DD)D", 4, 2, &[0x28, 0xaf]);
+        let got = call2(&cm, 1.5f64.to_bits() as i64, (-2.25f64).to_bits() as i64);
+        assert_eq!(f64::from_bits(got as u64), -2.25);
+    }
+
+    /// `fcmpg` of NaN is +1 and `fcmpl` of NaN is -1.
+    #[test]
+    fn nan_compares_land_where_the_jvms_puts_them() {
+        let _serial = exec_guard();
+        let nan = i64::from(f32::NAN.to_bits());
+        let one = i64::from(1.0f32.to_bits());
+        // fload_0; fload_1; fcmpg|fcmpl; ireturn
+        let g = compile_static("(FF)I", 2, 2, &[0x22, 0x23, 0x96, 0xac]);
+        let l = compile_static("(FF)I", 2, 2, &[0x22, 0x23, 0x95, 0xac]);
+        assert_eq!(call2(&g, nan, one), 1);
+        assert_eq!(call2(&l, nan, one), -1);
+        assert_eq!(call2(&g, i64::from(0.5f32.to_bits()), one), -1);
+        assert_eq!(call2(&l, one, one), 0);
     }
 }
 
