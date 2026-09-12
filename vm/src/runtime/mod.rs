@@ -17,6 +17,7 @@ pub mod interpreter;
 pub mod invokedynamic;
 pub mod local_liveness;
 pub mod memwatch;
+pub mod native_callee_memo;
 pub mod native_oom;
 pub mod signals;
 pub mod value_stack;
