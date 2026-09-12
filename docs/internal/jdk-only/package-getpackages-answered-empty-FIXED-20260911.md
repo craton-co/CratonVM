@@ -243,3 +243,42 @@ It is filed for lane 4 rather than fixed here: whether the `carrier` rows should
 still force the native, or the assertion should follow the rules, is a question
 about what their retirement intended — and editing another lane's assertion to
 make a gate green is how a gate becomes a rubber stamp.
+
+### 9.1 A second one, found on the next merge: the lock-discipline ratchet
+
+`raw_lock_constructions_do_not_grow` fails in all three `native-builtins` arms:
+**429 raw lock constructions against a baseline of 428.** Also dev's, and scored
+the cheap way, because a SOURCE-SCANNING gate can be run at two revisions with
+ONE binary — it reads the tree, not the build:
+
+```text
+mine (91b611b1e)   429 raw, 182 ordered, 745588 lines (baseline 428)
+dev  (bd2e871b7)   429 raw, 182 ordered, 745361 lines (baseline 428)
+```
+
+Same count on both, with my 227 extra lines adding no lock. The test caps its
+printed site list at 40 so it cannot name the new one, but `git grep` at the two
+dev revisions, compared with line numbers stripped so a shifted site is not a new
+one, puts the +1 in exactly one file:
+
+```text
+native-builtins/src/phases_late/jar_manifest.rs
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+```
+
+added by `ace814806` ("text,jar: one hijacked setter broke every REAL
+BreakIterator, and JarEntry.attr was never written"), lane 1's wave 6. Its own
+failure message says what to do — an `OrderedPlMutex` with a justified level, or a
+review note saying why this lock cannot participate in a cycle — and, in capitals,
+not to raise the baseline. Filed for that lane.
+
+### 9.2 What this change was verified on
+
+The six-target gate set ran on `91b611b1e`, the commit below the docs-only one
+that adds this section: **types 639/0, native-api 429/0**, and the three
+`native-builtins` arms 4285 / 4317 / 4462 passing with the ONE lock-ratchet
+failure above — every test this change adds is in those passing counts. `vm-lib`
+is 2670/1 with §9's FFM failure. The three corpus arms — **41 / 134 / 93, no
+failures** — were taken on `4ef2a1e78`, the previous merge: this change's own
+sources are byte-identical between the two, and the delta is other lanes' code,
+each armed by its own lane.
