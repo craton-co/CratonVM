@@ -76,7 +76,7 @@ above the truth for a week.
 
 ## What "the default registry" means, and how it stopped meaning less
 
-The census runs **all six registration passes `vm/src/vm/vm_init.rs` runs** on
+The census runs **every registration pass `vm/src/vm/vm_init.rs` runs** on
 the real-JDK boot path, in its order, behind its `set_drop_real_layout_synthetic`
 flag — see `register_boot_path` in the test.
 
@@ -109,3 +109,53 @@ rules that run *after* the JdkOnly check (`EnumSet`); and one triple can be
 registered with two different kinds (`ByteBuffer.allocate`). It is enforced
 structurally in `register()` and asserted hermetically in
 `native-api/tests/jdk_only_registry.rs` instead. Do not re-add it here.
+
+## Attribute a delta with `CRATONVM_RATCHET_ROWS=1`, not with the dump
+
+The failure message used to say: diff `dump_synthetic_stubs` at this commit and
+at the last freeze. **That diff can be empty while the number has moved by 30.**
+
+This count is **registrations**. `dump_synthetic_stubs` prints **distinct
+triples**. Plenty of triples are registered more than once —
+`ExceptionInInitializerError.<init>()V` from both `lang_misc.rs` and `lib.rs`,
+`Throwable.initCause` from both `lang_misc.rs` and `reflect_annotations.rs` — so
+when one registration is already a `SyntheticStub` and a retirement re-tags the
+other, the count rises by one and the distinct set does not change at all.
+
+Measured 2026-09-11: lane 2's wave 2 moved this gate **+30 / +46 / +30** across
+the three arms with a **byte-identical** dump. The natural misreading of that
+silence is *"my retirement did nothing"*, and the lane nearly abandoned a correct
+50-row table on it. The VM disagreed — `--jdk-only-report` refusals under
+`java/lang` + `java/math` went **95 → 144**, zero survivors.
+
+So: `CRATONVM_RATCHET_ROWS=1` is the attributing instrument, per-registration and
+keyed by registering file. The dump is a summary, and a weaker one than it looks.
+
+## A motionless count is still not proof for rows outside the configuration
+
+Scope, printed on every run as `stub-ratchet(scope):`. Measured that day on one
+tree, **132 `SyntheticStub` rows the shipped VM dispatches sit outside this
+census** — 54 `native-awt`, 25 `jmx`, 21 `native-collections`, 15
+`jar_manifest`, 12 `native-builtins/lib.rs`, 3 elsewhere.
+
+Fourteen of lane 2's fifty were among them, every one a `java/lang/management/*`
+triple registered by `jmx.rs`. In the no-management configuration those are
+invisible **by construction** — widening the boot-path replay would not recover
+them — which is why that arm moved +30 and the management arm +46. Each
+configuration has its own constant and that is where such rows show.
+
+## Take both sides of any comparison from ONE tree, and watch the target dir
+
+Two ways this went wrong the same day, both producing confident wrong numbers:
+
+* **Cross-tree.** This census on current sources against a
+  `--dump-native-registry` from a binary built weeks earlier showed 452
+  disagreements. Same-tree: 2. A census on one tree against a dump from another
+  measures neither.
+* **A shared `CARGO_TARGET_DIR`.** Building both arms into one target dir, the
+  second build printed `Finished in 0.18s`, compiled nothing, and scored one tree
+  with the other's binary — cargo's freshness is by **mtime**, and a `git merge`
+  writes sources older than artefacts built after it. Assert a non-zero
+  `Compiling` count, copy each binary out, and print both sha256s.
+
+`W7-30-stub-ratchet-boot-path-scope.md` §12 carries the full account.
