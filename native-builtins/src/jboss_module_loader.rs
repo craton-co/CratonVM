@@ -65,6 +65,7 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -930,7 +931,70 @@ fn build_module_object(
     Ok(module)
 }
 
-/// Throw `org.jboss.modules.ModuleNotFoundException` with `name`.
+thread_local! {
+    /// Re-entrancy guard for [`alloc_single_message_exception`]'s constructing
+    /// path.
+    ///
+    /// The funnel's callers are the class loader. Running a constructor from
+    /// inside one can load a class, and a load that fails comes back through
+    /// this same funnel: without the guard that is unbounded recursion on the
+    /// one input (a missing class) the funnel exists to report. The inner mint
+    /// takes the flat path, which allocates and cannot re-enter.
+    static MINTING_EXCEPTION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Build `class_name(message)` by running its `<init>(Ljava/lang/String;)V`.
+///
+/// Returns `None` — caller falls back to the flat allocate-and-stamp path —
+/// when the class has no such constructor (a synthetic stub), when the
+/// constructor throws, or when this is a re-entrant mint.
+///
+/// Both compatibility modes gain the same thing, for different reasons: in
+/// `--jdk-only` the constructor is real `Throwable` bytecode and
+/// `fillInStackTrace()` runs; in `compatible` mode the throwable family's
+/// `<init>` shadow runs and it captures the trace itself. Either way the
+/// object the application catches has been through a constructor.
+fn try_construct_single_message_exception(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    message: &str,
+) -> Option<ObjectRef> {
+    /// Clears the guard on the way out, including on an UNWIND.
+    ///
+    /// The workspace is `panic = "unwind"` and the VM holds 37
+    /// `std::panic::catch_unwind` sites, so a panic raised under the `<init>`
+    /// below can be caught above this frame and the thread carry on. A bare
+    /// `set(false)` after the call is not reached on that path, and the flag
+    /// stays true for the life of the thread — every later mint silently takes
+    /// the flat path and the defect this function exists to fix comes back with
+    /// nothing reporting it. A guard that fails by quietly restoring the old
+    /// behaviour is worse than no guard, because the vector still passes in a
+    /// fresh process.
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            MINTING_EXCEPTION.with(|f| f.set(false));
+        }
+    }
+
+    if MINTING_EXCEPTION.with(|f| f.replace(true)) {
+        return None;
+    }
+    let _clear = ClearOnDrop;
+    let detail = ctx.create_string(message);
+    // The VM's `new_object_initialized` pins the argument values before it can
+    // allocate, so `detail` needs no pin of its own here.
+    let built = ctx.new_object_initialized(
+        class_name,
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    );
+    match built {
+        Ok(Some(Value::Object(Some(obj)))) => Some(obj),
+        _ => None,
+    }
+}
+
 /// Allocate a single-message exception (`alloc_object` layout: field 0 = the
 /// message `String`) and populate it.
 ///
@@ -943,21 +1007,84 @@ fn build_module_object(
 /// wildfly-parallel-boot-stale-objectref-residual.md).
 /// Centralized here instead of repeating the pin/read/unpin dance at each
 /// call site.
+///
+/// # Slot 0 is NOT `detailMessage` on a real JDK layout, and both writes are load-bearing
+///
+/// The `alloc_object` layout in the header above is the SYNTHETIC-STUB one.
+/// Thirty-one of this function's call sites name `java/lang/ClassNotFoundException`,
+/// `NoClassDefFoundError` or `NullPointerException`, and under `--real-jdk` /
+/// `--jdk-only` those are the REAL classes, whose slot 0 is
+/// `Throwable.backtrace` — `detailMessage` is a different slot.
+///
+/// A bare `set_field(exc, 0, msg)` was nevertheless observable as the message,
+/// because `native_throwable_get_message` reads slot 0 back whenever the
+/// receiver's OWN class declares no `detailMessage` (`resolve_field_index` does
+/// not walk to `Throwable`) and the slot happens to hold a `java/lang/String`.
+/// Two wrongs cancelling: the loader wrote the wrong field and the shadow
+/// `getMessage` read the wrong field.
+///
+/// **The first `getMessage` to run as real bytecode found the null.** MEASURED
+/// 2026-09-10 while retiring the throwable family's shadows:
+///
+/// ```text
+///   Class.forName("no.such.Klass") -> e.getMessage()
+///     HotSpot                          no.such.Klass
+///     with Throwable.getMessage retired   null
+/// ```
+///
+/// So both writes stay, and neither is redundant:
+///
+///  * `set_field(exc, 0, ..)` keeps COMPATIBLE mode byte-for-byte identical —
+///    the shadow `getMessage` is still what runs there and it still reads
+///    slot 0;
+///  * [`write_throwable_detail_message`] puts the message where the REAL
+///    `Throwable.getMessage()` bytecode looks. On a real layout it resolves
+///    `Throwable.detailMessage`'s index and writes that; on a synthetic stub
+///    the index does not fit the object and it falls back to slot 0, writing
+///    the same value the line above already wrote.
+///
+/// # Both writes are the FALLBACK, since LT-4
+///
+/// Everything above describes the hand-filled object, which is now what this
+/// funnel produces only when it cannot do better.
+/// [`try_construct_single_message_exception`] runs the class's real
+/// `<init>(Ljava/lang/String;)V` first, and a constructed throwable needs
+/// neither write: its own constructor puts the message where its own
+/// `getMessage` looks, in either mode.
+///
+/// The difference the constructor makes is not the message but everything
+/// ELSE a `Throwable` has. `Class.forName("no.such.Klass")` handed the
+/// application a `ClassNotFoundException` whose `getStackTrace()` was EMPTY —
+/// no logging framework could print where the load was asked for — and whose
+/// `cause` was the unset sentinel, so `initCause` succeeded where HotSpot
+/// refuses it. `regression-suite/src/RLoaderExceptionShape.java` is the
+/// vector; it fails on both modes of the binary that preceded this.
 pub fn alloc_single_message_exception(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     num_fields: usize,
     message: &str,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    // LT-4: run the real `<init>(String)` when it can be run. That is what
+    // gives the throwable a stack trace and the `cause` state its own
+    // constructor sets; the hand-filled object below has neither. Every
+    // fallback reason is a shape this funnel must still survive (a synthetic
+    // class with no such constructor, a re-entrant mint, a constructor that
+    // throws), so the flat path stays exactly as it was.
+    if let Some(constructed) = try_construct_single_message_exception(ctx, class_name, message) {
+        return Ok(constructed);
+    }
     let exc = try_alloc_concurrent_synthetic(ctx, class_name, num_fields)?;
     let exc_pin = ctx.pin_native_root(exc);
     let msg = ctx.create_string(message);
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.unpin_native_roots(exc_pin);
     ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    crate::lang_misc::write_throwable_detail_message(ctx, exc, Value::Object(Some(msg)));
     Ok(exc)
 }
 
+/// Throw `org.jboss.modules.ModuleNotFoundException` with `name`.
 fn throw_module_not_found(
     ctx: &mut dyn NativeContext,
     name: &str,
