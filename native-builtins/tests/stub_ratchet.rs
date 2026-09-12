@@ -2010,31 +2010,43 @@ use cratonvm_types::compat::CompatibilityMode;
 /// binary:
 ///
 /// ```text
-///   arm             stubs before -> after     total before -> after
-///   no-management       2728 -> 2761             13622 -> 13622
-///   management          2755 -> 2788             13990 -> 13990
-///   synthetic-jdk       2728 -> 2761             13657 -> 13657
+///   arm             stubs OFF -> ON           total OFF -> ON
+///   no-management       2728 -> 2761             13622 -> 13622   (branch)
+///   management          2755 -> 2788             13990 -> 13990   (branch)
+///   synthetic-jdk       2728 -> 2761             13657 -> 13657   (branch)
 /// ```
+///
+/// RE-MEASURED on the merge with lane 4 wave 2's +137, because a delta is only
+/// a property of the branch if it survives the tree moving under it:
+///
+/// ```text
+///   arm             stubs OFF -> ON           total
+///   no-management       2865 -> 2898             13622   (constants above)
+///   management          2892 -> 2925             13990
+///   synthetic-jdk       2865 -> 2898             13657
+/// ```
+///
+/// +33 and total FLAT both times.
 ///
 /// +33 in all three, total FLAT in all three — this gate's own first case,
 /// "existing fakes were relabelled (welcome; re-freeze with the list)". The
 /// list is the 33 `@@STUB` lines `dump_synthetic_stubs` gains, with none lost.
 ///
-/// ## The paired run also found these constants' TOTALS stale by 13
+/// ## The paired run found the TOTALS 13 low again — the same recurring drift
 ///
-/// Every `MEASURED_TOTAL_REGISTRATIONS_*` below read 13 LOW against the tree it
-/// was measured on — 13609 vs 13622, 13977 vs 13990, 13644 vs 13657 — and the
-/// before-arm of the pair is what proves that is not this wave's doing, because
-/// it reads the higher number with the table turned off.
+/// Every `MEASURED_TOTAL_REGISTRATIONS_*` read 13 LOW against the tree it was
+/// measured on (13609 vs 13622, 13977 vs 13990, 13644 vs 13657), and the OFF
+/// arm of the pair is what proves that is not this wave's doing: it reads the
+/// higher number with the table turned off.
 ///
-/// Those constants are UNGATED: nothing asserts them, and their only reader is
-/// the stub assertion's failure message, which uses them to classify WHY the
-/// stub count moved. So they drift silently as `dev` gains registrations, and
-/// the first wave to move the stub count then gets told its clean relabel is
-/// "new fakes were registered — the regression this gate exists for". They are
-/// re-frozen to the measured values here. This is the same failure mode the
-/// note on `STRICT_MIN_TOTAL_REGISTRATIONS` describes from the other end: an
-/// ABSOLUTE number that nothing enforces, used as evidence.
+/// **This is not a new finding.** The note on those constants already records
+/// "REFRESHED 2026-08-24 ... both were stale by 13 in BOTH arms", and calls it
+/// "the same equal-in-both-arms drift this doc comment already records twice".
+/// It is now recorded four times, which is the point: an UNGATED constant whose
+/// only reader is the classification message drifts every time `dev` gains a
+/// `Bridge`, and the wave that finally moves the stub count is told its clean
+/// relabel is "new fakes were registered — the regression this gate exists
+/// for". Re-frozen to the measured values here.
 ///
 /// # Lane 4 wave 2, 2026-09-11 — the paired ratchet, both columns PRINTED
 ///
@@ -2077,7 +2089,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// is `13609 - 2865 - 10741 = 3` with the wave armed and `13609 - 2728 -
 /// 10878 = 3` with it un-armed. **Invariant across 137 retirements**, where the
 /// level moved by exactly 137.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2892;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2925;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2335,7 +2347,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2892;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2865;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2898;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2515,7 +2527,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2865;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2865;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2898;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

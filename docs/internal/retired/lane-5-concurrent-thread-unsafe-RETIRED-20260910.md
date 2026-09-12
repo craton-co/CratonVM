@@ -912,7 +912,13 @@ The correction was cheap, so the question got asked properly — every registere
   25  (25.0.4+7)           83 declared, 0 native    349 declared, 68 native
 ```
 
-Two facts fall straight out and neither was on this page.
+`sun.misc.Unsafe` GAINING nine methods between 21 and 25 is not a transcription
+error: 25 removes `ensureClassInitialized` and `shouldBeInitialized` and adds
+eleven private ones for the terminal-deprecation warning itself
+(`beforeMemoryAccess`, `isMemoryAccessWarned`, `singleLineWarning`, three
+lambdas, and the rest). The class is being wrapped in a warning, not emptied.
+
+Two more facts fall straight out and neither was on this page.
 
 **`sun.misc.Unsafe` has NO native methods on any of the three images.** Every
 one of the 83 carries `Code` and delegates to `theInternalUnsafe`, so
@@ -1101,17 +1107,26 @@ Total FLAT and stubs up by exactly the wave — the ratchet's own first case,
 *"existing fakes were relabelled (welcome; re-freeze with the list)"*. The list
 is 33 `@@STUB` lines, added, with none removed.
 
-**And the paired run found a stale constant.** `MEASURED_TOTAL_REGISTRATIONS_*`
-is **ungated** — nothing asserts it; it is read only by the stub test's failure
-message, to classify WHY the stub count moved. Measured here, `dev`'s tree is 13
-registrations above each frozen total (13609 vs 13622, 13977 vs 13990, 13644 vs 13657), from
-work that landed after they were last set. A wave that trusted the constant
-would have read "total UP by 13, stubs up by 33" and classified a clean relabel
-as *"new fakes were registered — the regression this gate exists for"*. The
-totals are re-frozen to the measured values here, and this is the mechanism the
-lane note at `STRICT_MIN_TOTAL_REGISTRATIONS` describes from the other side: an
-absolute constant that nothing enforces drifts silently and is then used as
-evidence.
+**Then `dev` moved and it was measured again.** Lane 4's wave 2 landed +137 on
+the same three constants while this one was in flight, so the pair was retaken
+on the merge: `2865 -> 2898`, `2892 -> 2925`, `2865 -> 2898`, totals unchanged.
++33 and flat both times. A delta is a property of the branch only if it survives
+the tree moving under it, which is why lane 4 re-measured theirs too.
+
+**The paired run also found the TOTALS 13 low — a re-occurrence, not a
+discovery.** `MEASURED_TOTAL_REGISTRATIONS_*` is **ungated**: nothing asserts
+it, and its only reader is the stub test's failure message, which uses it to
+classify WHY the stub count moved. Each read 13 below the tree it was measured
+on (13609 vs 13622, 13977 vs 13990, 13644 vs 13657). The constants' own doc
+comment already records the same drift twice — *"REFRESHED 2026-08-24 ... both
+were stale by 13 in BOTH arms ... the same equal-in-both-arms drift this doc
+comment already records twice"* — so this is the fourth time, with the same
+consequence each time: a wave that trusts the constant reads "total UP by 13,
+stubs up by 33" and classifies a clean relabel as *"new fakes were registered —
+the regression this gate exists for"*. Re-frozen to the measured values. It is
+the `STRICT_MIN_TOTAL_REGISTRATIONS` lesson from the other side, and lane 4
+replaced that constant with `STRICT_UNEXPLAINED_DROP_MAX` the same day for the
+same reason: an absolute number nothing enforces is not evidence.
 
 ## 10. What the next wave should do, in order (as written 2026-09-10; see §9a for what happened)
 
