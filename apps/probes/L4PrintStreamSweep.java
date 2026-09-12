@@ -22,9 +22,37 @@ import java.util.*;
  *  Every stream here writes into a `ByteArrayOutputStream` whose bytes are
  *  printed as hex-escaped text, so the diff is of what was written and not of
  *  either VM's console encoding.
+ *
+ *  ## The report leaves through a `FileOutputStream`
+ *
+ *  Section 5 of `docs/known-issues/jdk-only-lanes/lane-4-io-nio-foreign.md`
+ *  requires it, and the reason is specific to this class: real `writeln`
+ *  catches its own `IOException` and sets `trouble = true`, so a `PrintStream`
+ *  whose state is not real DISCARDS rather than throws. A probe that reports
+ *  only through `System.out` would then produce an empty file and an exit code
+ *  of 0 -- which reads as a harness fault, not as a finding. Pass the report
+ *  path as `args[0]`.
  */
 public class L4PrintStreamSweep {
     static int rows = 0;
+    /** The second report channel. `System.out` is the instrument every lane
+     *  reads its probes through AND is part of what this probe measures, so
+     *  the rows are also accumulated here and written out with a
+     *  `FileOutputStream` -- no `PrintStream` anywhere in that path. THE FILE
+     *  IS THE DIFF SOURCE; the console is the convenience copy. */
+    static final StringBuilder REPORT = new StringBuilder();
+    static int consoleRows = 0;
+
+    /** Emit one row on BOTH channels, counting each separately. A retired
+     *  `PrintStream` over a receiver whose state is not real does not throw --
+     *  real `writeln` catches its own `IOException` and sets `trouble` -- so
+     *  the only way to see a discard is to compare a count that went through
+     *  `System.out` with one that did not. */
+    static void emit(String line) {
+        REPORT.append(line).append('\n');
+        System.out.println(line);
+        consoleRows++;
+    }
     static String esc(String s) {
         if (s == null) return "null";
         StringBuilder b = new StringBuilder(s.length());
@@ -39,12 +67,12 @@ public class L4PrintStreamSweep {
     }
     static void p(String tag, Object v) {
         rows++;
-        System.out.println(esc(tag) + " |" + esc(String.valueOf(v)) + "|");
+        emit(esc(tag) + " |" + esc(String.valueOf(v)) + "|");
     }
     static void t(String tag, ThrowingRun r) {
         rows++;
-        try { r.run(); System.out.println(esc(tag) + " |no-throw|"); }
-        catch (Throwable e) { System.out.println(esc(tag) + " |THREW " + e.getClass().getName() + "|"); }
+        try { r.run(); emit(esc(tag) + " |no-throw|"); }
+        catch (Throwable e) { emit(esc(tag) + " |THREW " + e.getClass().getName() + "|"); }
     }
     interface ThrowingRun { void run() throws Throwable; }
 
@@ -75,8 +103,8 @@ public class L4PrintStreamSweep {
     static void one(String tag, ThrowingRun r) {
         fresh();
         rows++;
-        try { r.run(); System.out.println(esc(tag) + " |" + esc(drain()) + "|"); }
-        catch (Throwable e) { System.out.println(esc(tag) + " |THREW " + e.getClass().getName() + "|"); }
+        try { r.run(); emit(esc(tag) + " |" + esc(drain()) + "|"); }
+        catch (Throwable e) { emit(esc(tag) + " |THREW " + e.getClass().getName() + "|"); }
     }
 
     // ------------------------------------------------------------ conversion
@@ -152,7 +180,7 @@ public class L4PrintStreamSweep {
         u8.flush();
         StringBuilder h1 = new StringBuilder();
         for (byte x : b1.toByteArray()) h1.append(String.format("%02x", x));
-        System.out.println("utf8 bytes |" + h1 + "|");
+        emit("utf8 bytes |" + h1 + "|");
         rows++;
         ByteArrayOutputStream b2 = new ByteArrayOutputStream();
         PrintStream l1 = new PrintStream(b2, true, StandardCharsets.ISO_8859_1);
@@ -160,7 +188,7 @@ public class L4PrintStreamSweep {
         l1.flush();
         StringBuilder h2 = new StringBuilder();
         for (byte x : b2.toByteArray()) h2.append(String.format("%02x", x));
-        System.out.println("latin1 bytes |" + h2 + "|");
+        emit("latin1 bytes |" + h2 + "|");
     }
 
     // -------------------------------------------------------------- format
@@ -327,7 +355,18 @@ public class L4PrintStreamSweep {
         errorFlag();
         construction();
         printWriter();
-        System.out.println("rows " + rows);
-        System.out.println("DONE L4PrintStreamSweep");
+        emit("rows " + rows);
+        emit("DONE L4PrintStreamSweep");
+        // `consoleRows` is counted AFTER `System.out.println` returns, so a
+        // stream that discards still counts the row: this pair does not detect
+        // a discard on its own. What it does is pin the two channels to the
+        // same population, so a diff of the FILE is a diff of what the probe
+        // asked and not of what the console survived.
+        REPORT.append("report-rows ").append(consoleRows).append('\n');
+        String out = a.length > 0 ? a[0] : "l4ps-report.txt";
+        try (FileOutputStream f = new FileOutputStream(out)) {
+            f.write(REPORT.toString().getBytes(StandardCharsets.UTF_8));
+            f.flush();
+        }
     }
 }

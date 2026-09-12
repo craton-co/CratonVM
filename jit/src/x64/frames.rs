@@ -171,6 +171,36 @@ impl Compiler {
             } else {
                 self.reg_spill_base + reg_spill_slots * 8
             },
+            // The GPR half of the `SavedRegisters` region, which
+            // `emit_deopt_stubs` writes as `gpr[r] -> [rbp - (base - r*8)]`
+            // for `r` in `0..16`. `base` is therefore the DEEPEST of the
+            // sixteen offsets and `base - 120` the shallowest; the half-open
+            // range ends one slot past `base`. The XMM half occupies
+            // `[base - 248, base - 128]` and is deliberately left out -- see
+            // `FrameLayout::deopt_gpr_lo`.
+            deopt_gpr_lo: if self.deopt_regs_base != 0 {
+                self.deopt_regs_base - 15 * 8
+            } else {
+                0
+            },
+            deopt_gpr_hi: if self.deopt_regs_base != 0 {
+                self.deopt_regs_base + 8
+            } else {
+                0
+            },
+            // The XMM half of the same region: `xmm[n]` sits at
+            // `[rbp - (base - 128 - n*8)]` for `n` in `0..16`, so it spans
+            // `[base - 248, base - 128]` and ends one slot past that.
+            deopt_xmm_lo: if self.deopt_regs_base != 0 {
+                self.deopt_regs_base - 248
+            } else {
+                0
+            },
+            deopt_xmm_hi: if self.deopt_regs_base != 0 {
+                self.deopt_regs_base - 120
+            } else {
+                0
+            },
             frame_size: self.frame_size,
         }
     }

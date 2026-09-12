@@ -94,7 +94,9 @@ const CRATES: &[&str] = &[
 /// The retirement tables, relative to the workspace root.
 const RETIREMENT_TABLE: &str = "native-api/src/retired_shadow.rs";
 
-/// Frozen 2026-09-12 (59). Sorted.
+/// Frozen 2026-09-12 (60; 59 at the freeze, plus `java/io/PrintStream`
+/// from lane 4 wave 6 the same day -- see the comment on that row).
+/// Sorted.
 ///
 /// `java/net/HttpURLConnection` is NOT here because it is not in the
 /// intersection: the wave that found this species did not stop retiring its
@@ -108,6 +110,31 @@ const BASELINE: &[&str] = &[
     "java/io/File",
     "java/io/FileDescriptor",
     "java/io/FileOutputStream",
+    // Added by lane 4 wave 6 (2026-09-12), which retires 29 triples onto this
+    // class. The narrowing this gate's message asks for, run before landing:
+    //
+    //  * `javap -p -c` on 17, 21 and 25: the ONLY field with a non-zero
+    //    declared initialiser anywhere on the class or its superclasses is
+    //    `FilterOutputStream.closeLock = new Object()`. Every other field is
+    //    written from a constructor PARAMETER (`out`, `autoFlush`, `charOut`,
+    //    `textOut`, `charset`) or initialised to the zero of its type
+    //    (`trouble`, `closing`, `closed`, `formatter`).
+    //  * **No retired method reads it.** `PrintStream.close()` overrides
+    //    `FilterOutputStream.close()` and synchronizes on `this`
+    //    (`aload_0; dup; astore_1; monitorenter`), never on `closeLock`, so
+    //    the field the hazard would turn into a wrong answer is not on any
+    //    retired path.
+    //  * It is written BY NAME at the mint site regardless -- see
+    //    `install_real_stream_fields` in `native-builtins/src/lang_system.rs`
+    //    -- because `System.out.closeLock` read `null` against HotSpot's
+    //    `java.lang.Object` and that was a wrong answer whether or not
+    //    anything read it.
+    //  * The other mint site, `try_alloc_concurrent_synthetic(ctx,
+    //    "java/io/PrintStream", 1)` in `t3_impl.rs`, writes a message into
+    //    slot 0 and returns `Int(2)`; the object itself never reaches Java.
+    //
+    // Precondition met, hazard not. Same disposition as the rest of this list.
+    "java/io/PrintStream",
     "java/lang/Class",
     "java/lang/ClassLoader",
     "java/lang/ClassNotFoundException",

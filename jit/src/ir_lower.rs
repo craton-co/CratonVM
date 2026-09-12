@@ -19351,6 +19351,40 @@ pub(crate) fn lower_inner_with_scopes(
         // No outgoing reserve this backend can name; see
         // `FrameLayout::outgoing_lo`, where 0 means "no claim".
         outgoing_lo: 0,
+        // The GPR half of this backend's `SavedRegisters` region, on the same
+        // convention as the single-pass backend: `gpr[0]` is its LOWEST
+        // address, at `[rbp - deopt_regs_base]`, so `deopt_regs_base` is the
+        // DEEPEST of the sixteen offsets.
+        //
+        // Published for completeness rather than for effect. This backend's
+        // `callee_saved_lo..callee_saved_hi` already spans the whole tail, and
+        // both `region_name`'s ladder and `register_image_remap_admits` test
+        // that FIRST -- so on this tier the block already reports as
+        // `callee-saved-gpr-image` and is already rewritten by
+        // `remap_register_image_words`. The single-pass backend, which names
+        // its regions individually, is where these two ranges decide
+        // anything.
+        deopt_gpr_lo: if lowerer.deopt_regs_base != 0 {
+            lowerer.deopt_regs_base - 15 * 8
+        } else {
+            0
+        },
+        deopt_gpr_hi: if lowerer.deopt_regs_base != 0 {
+            lowerer.deopt_regs_base + 8
+        } else {
+            0
+        },
+        // The XMM half of the same region; see `FrameLayout::deopt_xmm_lo`.
+        deopt_xmm_lo: if lowerer.deopt_regs_base != 0 {
+            lowerer.deopt_regs_base - 248
+        } else {
+            0
+        },
+        deopt_xmm_hi: if lowerer.deopt_regs_base != 0 {
+            lowerer.deopt_regs_base - 120
+        } else {
+            0
+        },
         frame_size,
     };
     if needs_context {
