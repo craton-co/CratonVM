@@ -4879,6 +4879,14 @@ pub struct IrBuilder {
     /// [`Self::set_string_layout`]; see the section above this struct for
     /// which of its fields are read and why publishing once is sound.
     string_layout: Option<crate::StringFieldLayout>,
+    /// `(value, type)` → the lowest-id `Op::Const` node of that value and
+    /// type, for every node below [`Self::const_intern_upto`]. What
+    /// [`Self::iconst`] and [`Self::aconst_null`] dedupe against, in place of
+    /// the arena scan each call used to make. See [`Self::interned_const`] for
+    /// how it stays true of a graph that changes under it.
+    const_intern: HashMap<(i64, IrType), NodeId>,
+    /// How far into `graph.nodes` [`Self::const_intern`] has indexed.
+    const_intern_upto: usize,
 }
 
 thread_local! {
@@ -5095,6 +5103,8 @@ impl IrBuilder {
             instanceof_info: HashMap::new(),
             checkcast_info: HashMap::new(),
             string_layout: published_string_layout(),
+            const_intern: HashMap::new(),
+            const_intern_upto: 0,
         }
     }
 
@@ -6180,12 +6190,66 @@ impl IrBuilder {
         // back for every later `iconst(0)` — an integer comparison operand
         // would then be published as a live oop, and `Op::Cmp` would widen to
         // a 64-bit compare on it.
-        for (i, node) in self.graph.nodes.iter().enumerate() {
-            if node.op == Op::Const(val) && node.ty == IrType::Int {
-                return i as NodeId;
-            }
+        if let Some(id) = self.interned_const(val, IrType::Int) {
+            return id;
         }
         self.graph.add(Op::Const(val), IrType::Int, vec![], None)
+    }
+
+    /// The lowest-id `Op::Const(val)` node typed `ty`, or `None` — the answer
+    /// the arena scan [`Self::iconst`] and [`Self::aconst_null`] used to make
+    /// on every call, from [`Self::const_intern`] instead.
+    ///
+    /// # Why the map cannot go stale
+    ///
+    /// * **New nodes** — including a constant added through `self.graph`
+    ///   directly rather than through a helper — are indexed on the next call:
+    ///   everything from [`Self::const_intern_upto`] to the end of the arena is
+    ///   scanned once, and `or_insert` keeps the LOWEST id per key, which is the
+    ///   one the scan's first match returned.
+    /// * **A killed node** (`Graph::kill` rewrites the op to `Op::Dead`; it is
+    ///   the only op rewrite in this file) fails the re-check on a hit, and the
+    ///   full scan decides instead and repairs the entry. Nothing ever turns a
+    ///   node INTO a constant, so a node below a valid entry that was not a
+    ///   match when indexed is not one now.
+    /// * **A shorter arena** than has been indexed means the arena was replaced
+    ///   or truncated, which the builder does not do today; the index is
+    ///   rebuilt from scratch rather than trusted.
+    fn interned_const(&mut self, val: i64, ty: IrType) -> Option<NodeId> {
+        if self.graph.nodes.len() < self.const_intern_upto {
+            self.const_intern.clear();
+            self.const_intern_upto = 0;
+        }
+        for id in self.const_intern_upto..self.graph.nodes.len() {
+            let node = &self.graph.nodes[id];
+            if let Op::Const(v) = node.op {
+                self.const_intern
+                    .entry((v, node.ty))
+                    .or_insert(id as NodeId);
+            }
+        }
+        self.const_intern_upto = self.graph.nodes.len();
+
+        let id = *self.const_intern.get(&(val, ty))?;
+        if matches!(self.graph.nodes.get(id as usize), Some(n) if n.op == Op::Const(val) && n.ty == ty)
+        {
+            return Some(id);
+        }
+        match self
+            .graph
+            .nodes
+            .iter()
+            .position(|n| n.op == Op::Const(val) && n.ty == ty)
+        {
+            Some(found) => {
+                self.const_intern.insert((val, ty), found as NodeId);
+                Some(found as NodeId)
+            }
+            None => {
+                self.const_intern.remove(&(val, ty));
+                None
+            }
+        }
     }
 
     /// `aconst_null` — the null reference, as a `Ref`-typed `Op::Const(0)`.
@@ -6197,10 +6261,8 @@ impl IrBuilder {
     /// be 64-bit. Deduped separately from the integer constants; see
     /// [`Self::iconst`].
     fn aconst_null(&mut self) -> NodeId {
-        for (i, node) in self.graph.nodes.iter().enumerate() {
-            if node.op == Op::Const(0) && node.ty == IrType::Ref {
-                return i as NodeId;
-            }
+        if let Some(id) = self.interned_const(0, IrType::Ref) {
+            return id;
         }
         self.graph.add(Op::Const(0), IrType::Ref, vec![], None)
     }
@@ -13287,6 +13349,62 @@ mod tests {
         // The fallback is deliberately NOT `Ref`: an unprovable slot must not
         // be handed to the collector as an oop.
         assert_ne!(PHI_TYPE_FALLBACK, IrType::Ref);
+    }
+
+    // ── Constant interning ───────────────────────────────────────────
+
+    /// `iconst` / `aconst_null` hand back one node per `(value, type)`, and
+    /// the index they read gives the answer the arena scan it replaced gave —
+    /// the LOWEST-id live match — through every way the arena changes under
+    /// it during a build.
+    #[test]
+    fn constant_interning_returns_one_node_per_constant() {
+        let mut b = IrBuilder::new(1, 2);
+
+        let five = b.iconst(5);
+        assert_eq!(b.iconst(5), five, "the same constant is one node");
+        assert_eq!(b.graph.nodes[five as usize].op, Op::Const(5));
+        assert_eq!(b.graph.nodes[five as usize].ty, IrType::Int);
+
+        // The type is part of the identity, both ways round.
+        let null = b.aconst_null();
+        let zero = b.iconst(0);
+        assert_ne!(null, zero, "null is not the int zero");
+        assert_eq!(b.aconst_null(), null);
+        assert_eq!(b.iconst(0), zero);
+        let long_five = b.lconst(5);
+        assert_ne!(long_five, five);
+        assert_eq!(b.iconst(5), five, "a long 5 is not an int 5");
+
+        // A constant added behind the helpers' back is found, as the scan
+        // found it — and of two, the lower id wins, as the scan's first match
+        // did.
+        let seven_a = b.graph.add(Op::Const(7), IrType::Int, vec![], None);
+        let seven_b = b.graph.add(Op::Const(7), IrType::Int, vec![], None);
+        assert_eq!(b.iconst(7), seven_a);
+
+        // Killing the interned node: the next call must not return the dead
+        // one. With a live duplicate, the duplicate; with none, a new node.
+        b.graph.kill(seven_a);
+        assert_eq!(b.iconst(7), seven_b, "falls back to the surviving duplicate");
+        assert_eq!(b.iconst(7), seven_b, "and the repaired entry sticks");
+        b.graph.kill(five);
+        let five_again = b.iconst(5);
+        assert_ne!(five_again, five, "a dead node is never handed back");
+        assert_eq!(b.graph.nodes[five_again as usize].op, Op::Const(5));
+        assert_eq!(b.iconst(5), five_again);
+
+        // Every answer agrees with the scan the index replaced.
+        let scan = |g: &Graph, v: i64, ty: IrType| {
+            g.nodes
+                .iter()
+                .position(|n| n.op == Op::Const(v) && n.ty == ty)
+                .map(|i| i as NodeId)
+        };
+        for (v, ty) in [(5, IrType::Int), (0, IrType::Int), (7, IrType::Int), (0, IrType::Ref)] {
+            assert_eq!(b.interned_const(v, ty), scan(&b.graph, v, ty), "({v}, {ty:?})");
+        }
+        assert_eq!(b.interned_const(123, IrType::Int), None);
     }
 
     // ── Option-based id accessors ────────────────────────────────────

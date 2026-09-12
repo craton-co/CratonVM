@@ -944,6 +944,21 @@ struct Lowerer<'a> {
     /// `Op::New` so a deopt snapshot slot holding it lowers to a
     /// `FrameValue::VirtualObject`. `None` ⇒ disabled (byte-identical default).
     sr_map: Option<&'a ScalarReplacementMap>,
+    /// Bytecode indices with a safepoint snapshot in `graph.safepoints`.
+    ///
+    /// This and the next two are indexes over `graph`, gathered once in
+    /// [`Lowerer::new`] — the lowerer holds the graph by shared reference, so
+    /// they cannot go stale. Each replaces a scan that ran once per division
+    /// ([`Lowerer::emit_div_zero_guard`]) or once per snapshot
+    /// ([`Lowerer::deopt_block_for_bci`]), which a method near the node cap
+    /// paid as nodes × divisions.
+    safepoint_bcis: std::collections::HashSet<usize>,
+    /// Bytecode indices an `Op::Guard { bci }` is anchored at.
+    guard_bcis: std::collections::HashSet<usize>,
+    /// Every node a deopt at a bci can fire from, in node-id order: each
+    /// `Op::Guard { bci }` under its `bci`, and each `Op::Div` / `Op::Rem`
+    /// under its `bytecode_pc`.
+    deopt_sites_by_bci: HashMap<usize, Vec<NodeId>>,
     /// Which inlined callee each safepoint snapshot belongs to, and the caller
     /// scopes stacked above it. Consumed by [`Lowerer::caller_chain_for`] to
     /// fill `FrameState::caller`, which was hard-coded `None` before this
@@ -1695,6 +1710,29 @@ impl<'a> Lowerer<'a> {
             branch_hints,
             spliced_ranges,
             sr_map,
+            safepoint_bcis: graph.safepoints.iter().map(|s| s.bci).collect(),
+            guard_bcis: graph
+                .nodes
+                .iter()
+                .filter_map(|n| match n.op {
+                    Op::Guard { bci } => Some(bci),
+                    _ => None,
+                })
+                .collect(),
+            deopt_sites_by_bci: {
+                let mut sites: HashMap<usize, Vec<NodeId>> = HashMap::new();
+                for (id, n) in graph.nodes.iter().enumerate() {
+                    let key = match n.op {
+                        Op::Guard { bci } => Some(bci),
+                        Op::Div | Op::Rem => n.bytecode_pc,
+                        _ => None,
+                    };
+                    if let Some(bci) = key {
+                        sites.entry(bci).or_default().push(id as NodeId);
+                    }
+                }
+                sites
+            },
             inline_scopes,
             inline_frame_sites,
             inline_frame_rows: Vec::new(),
@@ -11559,7 +11597,7 @@ impl<'a> Lowerer<'a> {
     ///   Returns `None`.
     fn emit_div_zero_guard(&mut self, ty: IrType, bytecode_pc: Option<usize>) -> Option<usize> {
         let bci = match bytecode_pc {
-            Some(b) if self.graph.safepoints.iter().any(|s| s.bci == b) => b,
+            Some(b) if self.safepoint_bcis.contains(&b) => b,
             _ => return None,
         };
         // TEST ECX,ECX (int) / TEST RCX,RCX (long): ZF=1 when divisor == 0.
@@ -11568,11 +11606,9 @@ impl<'a> Lowerer<'a> {
         } else {
             self.buf.emit(&[0x48, 0x85, 0xC9]);
         }
-        let anchored = self
-            .graph
-            .nodes
-            .iter()
-            .any(|n| matches!(n.op, Op::Guard { bci: g } if g == bci));
+        // Both questions are answered from sets `Lowerer::new` gathered once;
+        // asking the graph here was a whole-graph scan per division.
+        let anchored = self.guard_bcis.contains(&bci);
         if !anchored {
             self.emit_deopt_if_zero(bci, DeoptReason::DivByZero);
             return None;
@@ -12771,13 +12807,22 @@ impl<'a> Lowerer<'a> {
         // the case that anchoring exists to fix — the scheduler hoisted the
         // division — so consulting both would report "ambiguous" and give up
         // on a program point that is in fact unambiguous.
-        let anchored = self
-            .graph
-            .nodes
-            .iter()
-            .any(|n| matches!(n.op, Op::Guard { bci: gb } if gb == bci));
+        let anchored = self.guard_bcis.contains(&bci);
         let mut found: Option<usize> = None;
-        for (id, n) in self.graph.nodes.iter().enumerate() {
+        // Only the nodes `Lowerer::new` indexed under this bci can answer, so
+        // walk those rather than the whole graph once per snapshot. They are in
+        // node-id order, and the answer does not depend on the order anyway:
+        // every exit is either a single agreed block or `None`.
+        let sites: &[NodeId] = self
+            .deopt_sites_by_bci
+            .get(&bci)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for &site in sites {
+            let id = site as usize;
+            let Some(n) = self.graph.nodes.get(id) else {
+                continue;
+            };
             // The deopt at `bci` fires from an explicit `Op::Guard { bci }`, or
             // — for a graph with no guard at this bci — from the div/rem
             // zero/overflow guard the lowerer emits at the node carrying
