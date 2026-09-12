@@ -23,39 +23,6 @@ use crate::{unsafe_obj, unsafe_offset};
 // Native implementations
 // ---------------------------------------------------------------------------
 
-/// `Unsafe.addressSize0()` — returns the size of a native pointer in bytes.
-/// Derived from the host pointer width instead of a hard-coded 8, so it agrees
-/// with `unsafe_natives_ext::native_unsafe_address_size` and stays correct on a
-/// 32-bit build.
-fn native_unsafe_address_size0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(std::mem::size_of::<usize>() as i32)))
-}
-
-/// `Unsafe.isBigEndian0()` — returns whether the platform is big-endian.
-///
-/// Read from the compile target rather than hard-coded to little-endian.
-/// `ByteBuffer`/`VarHandle` byte-order handling and `ScopedMemoryAccess`'s
-/// unaligned accessors branch on this, so a wrong answer silently byte-swaps
-/// every multi-byte off-heap read on a big-endian host.
-fn native_unsafe_is_big_endian0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(i32::from(cfg!(target_endian = "big")))))
-}
-
-/// `Unsafe.unalignedAccess0()` — returns whether unaligned memory access is
-/// supported. True on x86/x86-64 and on AArch64 (which permits unaligned
-/// accesses to normal memory); conservatively false elsewhere, which only
-/// costs a slower byte-at-a-time path in the JDK callers.
-fn native_unsafe_unaligned_access0(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    let unaligned = cfg!(any(
-        target_arch = "x86",
-        target_arch = "x86_64",
-        target_arch = "aarch64"
-    ));
-    Ok(Some(Value::Int(i32::from(unaligned))))
-}
 
 /// `Unsafe.loadLoadFence()` — ensures that loads before the fence are not
 /// reordered with loads after it. Maps to an acquire fence.
@@ -267,14 +234,13 @@ pub fn register_t12_unsafe_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let class = "jdk/internal/misc/Unsafe";
 
-    registry.register(class, "addressSize0", "()I", native_unsafe_address_size0);
-    registry.register(class, "isBigEndian0", "()Z", native_unsafe_is_big_endian0);
-    registry.register(
-        class,
-        "unalignedAccess0",
-        "()Z",
-        native_unsafe_unaligned_access0,
-    );
+    // `addressSize0` / `isBigEndian0` / `unalignedAccess0` were DELETED here
+    // 2026-09-12: `javap -p jdk.internal.misc.Unsafe` declares none of the
+    // three on 17, 21 or 25. They were the private native primitives behind
+    // `addressSize()` / `isBigEndian()` / `unalignedAccess()` in older JDKs;
+    // modern images answer those from `@Stable` constants instead and the
+    // `*0` methods are gone. Six registrations (each was registered twice)
+    // that no caller on any supported image could name.
     registry.register(class, "loadLoadFence", "()V", native_unsafe_load_load_fence);
     registry.register(
         class,
@@ -487,18 +453,6 @@ mod tests {
         // arrayIndexScale with no class mirror defaults to Int(1).
         let scale = native_unsafe_array_index_scale(&mut ctx, &[dummy_this()]).unwrap();
         assert_eq!(scale, Some(Value::Int(1)));
-
-        // addressSize0 returns Int(8)
-        let addr_sz = native_unsafe_address_size0(&mut ctx, &[dummy_this()]).unwrap();
-        assert_eq!(addr_sz, Some(Value::Int(8)));
-
-        // isBigEndian0 returns Int(0) (false)
-        let big_endian = native_unsafe_is_big_endian0(&mut ctx, &[dummy_this()]).unwrap();
-        assert_eq!(big_endian, Some(Value::Int(0)));
-
-        // unalignedAccess0 returns Int(1) (true)
-        let unaligned = native_unsafe_unaligned_access0(&mut ctx, &[dummy_this()]).unwrap();
-        assert_eq!(unaligned, Some(Value::Int(1)));
     }
 
     // -----------------------------------------------------------------------

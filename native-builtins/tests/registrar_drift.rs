@@ -347,12 +347,34 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// 2026-08-30, counting 230 `register_with_kind(` sites in
 /// `native-builtins/src/lib.rs` alone against 1207 plain ones. This file was
 /// the one that commit did not reach.
-const BASELINE_TOTAL_DRIFT: usize = 1275;
+///
+/// **1275 -> 1273, 2026-09-11.** Two rows left [`DRIFT_TRIPLES`] with the
+/// registrations behind them: `java/lang/ClassLoader.getPackages` (from
+/// `register_classloader_natives`) and `java/lang/Package.getPackages` (the whole
+/// of `register_p59_package`, so that pass left the table -- an empty row list is
+/// refused by `the_baseline_is_well_formed`, and absence means the same
+/// allowance of zero). Both were empty-array overrides for the plural package
+/// methods, deleted so the real JDK bytecode answers; `no_new_mode_drift` and
+/// `the_drift_baseline_has_no_stale_rows` agree with the table at the new
+/// numbers. They are NOT candidates for [`FIXED_NOT_DRIFTING`]: that bucket
+/// requires a surviving registrant, and these triples have none.
+const BASELINE_TOTAL_DRIFT: usize = 1273;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1411;
+///
+/// **1411 -> 1409, 2026-09-11.** Two rows left [`DRIFT_TRIPLES`] with the
+/// registrations behind them: `java/lang/ClassLoader.getPackages` (from
+/// `register_classloader_natives`) and `java/lang/Package.getPackages` (the whole
+/// of `register_p59_package`, so that pass left the table -- an empty row list is
+/// refused by `the_baseline_is_well_formed`, and absence means the same
+/// allowance of zero). Both were empty-array overrides for the plural package
+/// methods, deleted so the real JDK bytecode answers; `no_new_mode_drift` and
+/// `the_drift_baseline_has_no_stale_rows` agree with the table at the new
+/// numbers. They are NOT candidates for [`FIXED_NOT_DRIFTING`]: that bucket
+/// requires a surviving registrant, and these triples have none.
+const BASELINE_TOTAL_PAIRS: usize = 1409;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -1047,7 +1069,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/ClassLoader", "getDefinedPackage", "(Ljava/lang/String;)Ljava/lang/Package;"),
             ("java/lang/ClassLoader", "getDefinedPackages", "()[Ljava/lang/Package;"),
             ("java/lang/ClassLoader", "getName", "()Ljava/lang/String;"),
-            ("java/lang/ClassLoader", "getPackages", "()[Ljava/lang/Package;"),
             ("java/lang/ClassLoader", "getParent", "()Ljava/lang/ClassLoader;"),
             ("java/lang/ClassLoader", "getPlatformClassLoader", "()Ljava/lang/ClassLoader;"),
             ("java/lang/ClassLoader", "getResource", "(Ljava/lang/String;)Ljava/net/URL;"),
@@ -1577,12 +1598,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/module/ModuleDescriptor", "isAutomatic", "()Z"),
             ("java/lang/module/ModuleDescriptor", "isOpen", "()Z"),
             ("java/lang/module/ModuleDescriptor", "name", "()Ljava/lang/String;"),
-        ],
-    ),
-    (
-        "register_p59_package",
-        &[
-            ("java/lang/Package", "getPackages", "()[Ljava/lang/Package;"),
         ],
     ),
     (

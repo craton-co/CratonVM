@@ -337,6 +337,14 @@ And one row that this change deliberately leaves alone:
   own `getDefinedPackage` — so the stub is inert on the path this record cares
   about, and making it truthful is a separate change with its own callers.
 
+> **CLOSED 2026-09-11.** That separate change landed, and the caller this record
+> could not name was the PLURAL: `BootLoader.packages()` is the first term of real
+> `ClassLoader.getPackages()`, so an empty name list made `Package.getPackages()`
+> answer `[]` where HotSpot answers 91 on the same probe. Both natives had to move
+> together -- a populated name list with null locations yields an array of NULLS,
+> because `BootLoader.getDefinedPackage` defines a `Package` only for a non-null
+> location. Record: `package-getpackages-answered-empty-FIXED-20260911.md`.
+
 Finally, one accepted asymmetry inside the fix: `ClassLoaders.bootLoader()
 .getDefinedPackage(pn)` answers non-null on CratonVM from the first call, where
 HotSpot answers `null` until `BootLoader.getDefinedPackage` has lazily defined

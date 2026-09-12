@@ -20055,19 +20055,6 @@ fn alloc_package_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
     }
 }
 
-/// `ClassLoader.getPackages() -> Package[]` — unconditionally empty; see the
-/// note on [`i2_classloader_get_defined_packages`].
-pub(crate) fn i2_classloader_get_packages_empty(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    // Empty, but a `Package[0]` rather than an `Object[0]`. The whole reason
-    // this override exists is that jboss-modules' `ConcurrentClassLoader
-    // .<clinit>` stores the result into a `Package[]` local; handing it an
-    // array whose component type is `Object` swaps one wrong shape for another.
-    let empty = alloc_package_array(ctx, 0);
-    Ok(Some(Value::Object(Some(empty))))
-}
 
 /// The single canonical **unnamed** `java.lang.Module` mirror for this VM.
 ///
@@ -20453,32 +20440,6 @@ pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::Nati
         "getDefinedPackages",
         "()[Ljava/lang/Package;",
         i2_classloader_get_defined_packages,
-    );
-    // `ClassLoader.getPackages()` вЂ” real JDK bytecode is
-    // `return packages().toArray(Package[]::new)`. In our boot the stream
-    // pipeline leaks a `ReferencePipeline$Head` into the caller's local
-    // typed as `Package[]`, NPE-ing on arraylength inside
-    // `org/jboss/modules/ConcurrentClassLoader.<clinit>` (WildFly 39 boot).
-    // Override with an empty array. NOTE: this must stay
-    // `i2_classloader_get_packages_empty`, NOT `getDefinedPackages` — the
-    // latter now reports the packages the loader has actually handed out, and
-    // the WildFly boot path needs this one to stay unconditionally empty.
-    r.register(
-        cl,
-        "getPackages",
-        "()[Ljava/lang/Package;",
-        i2_classloader_get_packages_empty,
-    );
-    // `Package.getPackages()` is static and delegates to
-    // `ClassLoader.getClassLoader(Reflection.getCallerClass()).getPackages()`.
-    // Override here as well so direct callers (the WildFly boot path) get an
-    // empty array even if the static delegation pulls a different ClassLoader
-    // mirror. Static: arg 0 is NOT a receiver, so it must not be read as one.
-    r.register(
-        "java/lang/Package",
-        "getPackages",
-        "()[Ljava/lang/Package;",
-        i2_classloader_get_packages_empty,
     );
     // `Package.equals(Object)` -- real JDK has NO override (inherits identity
     // `Object.equals`), which is correct there because HotSpot INTERNS one
@@ -28145,18 +28106,32 @@ Implementation-Title: opensaml-core-api\r\n\
             .remove(&(0, "com.example.memo".to_string()));
     }
 
+
+    /// `ClassLoader.getPackages()` and the static `Package.getPackages()` must
+    /// stay UNREGISTERED.
+    ///
+    /// Four registrars used to give them an empty `Package[]`, all citing one
+    /// premise -- a stream pipeline leaking a `ReferencePipeline$Head` into the
+    /// caller's `Package[]` local during a WildFly boot -- which stopped
+    /// reproducing. With the slot empty, real JDK bytecode answers from
+    /// `BootLoader.packages()` and the parent chain, and that is the answer
+    /// lane 2 measured at 0 against HotSpot's 91. A re-added override would put
+    /// the 0 back silently, so this asserts the absence rather than a value.
+    /// Record: `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
     #[test]
-    fn i2_classloader_get_packages_stays_empty() {
-        // `ClassLoader.getPackages()` must stay unconditionally empty even
-        // though `getDefinedPackages()` no longer is — jboss-modules'
-        // `ConcurrentClassLoader.<clinit>` depends on it.
-        let mut ctx = mock_ctx();
-        let r = i2_classloader_get_packages_empty(&mut ctx, &[Value::Object(None)])
-            .expect("getPackages must succeed");
-        match r {
-            Some(Value::Object(Some(arr))) => assert_eq!(ctx.array_length(arr), 0),
-            other => panic!("getPackages must return an empty array, was {other:?}"),
-        }
+    fn the_plural_package_methods_are_not_registered_here() {
+        let mut r = cratonvm_native_api::NativeMethodRegistry::new();
+        i2_register_classloader_package_natives(&mut r);
+        let rows = r.dump_registrations();
+        let plural: Vec<String> = rows
+            .iter()
+            .filter(|(_, m, _, _)| *m == "getPackages")
+            .map(|(c, m, d, _)| format!("{c}.{m}{d}"))
+            .collect();
+        assert!(
+            plural.is_empty(),
+            "these registrations put the empty `Package[]` back: {plural:?}"
+        );
     }
 
     #[test]
