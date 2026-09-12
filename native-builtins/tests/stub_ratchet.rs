@@ -3170,61 +3170,44 @@ fn essential_registry_is_populated() {
 // real boot-path registrar, which is the one that has 549 stubs in it.
 // ---------------------------------------------------------------------------
 
-/// Vacuity floor for the *strict* registry, mirroring `MIN_TOTAL_REGISTRATIONS`
-/// in [`essential_registry_is_populated`].
+/// How many MORE registrations strict mode may drop than it has stubs to drop.
 ///
-/// This is a collapse detector, not a measurement. Strict mode is expected to
-/// shed the stub registrations plus whatever aliases hang off them (see
-/// [`strict_registry_drops_only_the_stubs`] for why that fallout is real), so
-/// the floor sits well below the compatibility-mode floor. If the strict
-/// registry ever drops under it, `set_compatibility_mode` is refusing far more
-/// than the stubs, and "zero synthetic stubs" would be true only because the
-/// registry is empty.
+/// Collapse detector for the *strict* registry, replacing an absolute floor.
+/// Strict mode refuses every `SyntheticStub` at the door, so
+/// `compat_total - compat_stubs` is the number of rows it should still hold, and
+/// the only legitimate shortfall is `alias_class` fallout — an alias derived
+/// from a refused stub is never attempted, see
+/// [`strict_registry_drops_only_the_stubs`]. A shortfall larger than that is
+/// strict mode shedding whole registration modules, and then "zero synthetic
+/// stubs" is true only because the registry is empty.
 ///
-/// # 10,500 -> 10,200, 2026-08-10
+/// Measured 2026-09-11, no-management: compatible 13,609 rows carrying 2,728
+/// stubs against a strict 10,878 — that is `13,609 - 2,728 - 3`. The 64 is that
+/// 3 plus room for the alias passes to grow. It does NOT move when a retirement
+/// wave lands, and that is the whole point of the shape.
 ///
-/// Lowered by 300 for a strict registry of 10,449, and the number it is
-/// tracking moved for two independent reasons on the same day: 179
-/// registrations were deleted with `ensure_synthetic_class`, and 248 were
-/// re-tagged `SyntheticStub` because no supported JDK image declares their
-/// receiver class (`native-api/src/no_image_receiver.rs`). Strict mode refuses
-/// the second group by design — that is the re-tag's whole point.
+/// # Why this is derived and not frozen: 2026-09-11
 ///
-/// **Lowering a collapse detector is exactly the move it exists to make
-/// suspicious, so it is justified by the evidence the detector cannot see.**
-/// Against a binary built from `dev` without the re-tag, on the same host and
-/// the same images: the `--jdk-only` corpus is 52 passed / 6 failed on **both**
-/// arms and compatible mode is 35 / 0 on both, and the `CRATONVM_NO_STUBS` drop
-/// list grows by exactly 248 entries with **zero** entries moving the other way.
-/// A registry shedding whole modules does not produce that diff.
+/// `STRICT_MIN_TOTAL_REGISTRATIONS` asserted `strict_total >= N` for a frozen N,
+/// and it was re-justified by hand four times in a month — 10,500 -> 10,200 ->
+/// 10,900 -> 10,600 — because the quantity it guards is *designed* to fall. A
+/// retirement wave re-tags N `Bridge` registrations as `SyntheticStub`;
+/// compatible mode still registers all N, so the compatible total does not move,
+/// but strict mode REFUSES all N, so the strict total falls by exactly N. A
+/// constant lower bound on a monotonically falling number is not a detector with
+/// headroom; it is a re-freeze chore with a deadline, and with three lanes
+/// retiring shadows in the same week the deadline arrives in days.
 ///
-/// The 300 of headroom is deliberate and is not a prediction: it keeps the
-/// detector a detector after the next re-tag of this size. The 2026-08-11
-/// retirement of `java.util.logging`'s 104 shadow rows is one such re-tag and
-/// moved this total by zero: a re-tag changes a registration's KIND, it does
-/// not remove the registration. Record: the retired
-/// `bridge-reclassification-wave` write-up.
+/// The last re-freeze (`bf03c1d38`) said so in its own note — "this floor is in
+/// ABSOLUTE rows while the thing it guards against is a module-sized loss of
+/// hundreds, so every retirement wave of any size walks it down and every wave
+/// has to re-justify it" — and left the shape to lane 0. This is that change,
+/// and it takes the stronger form: not a fraction of the compatible total, but
+/// the exact identity the refusals obey, so the bound needs no headroom for
+/// waves at all and only has to cover aliasing.
 ///
-/// # 10,200 -> 10,900, 2026-08-11
-///
-/// Raised, not lowered, and for a reason that is not a measurement at all: the
-/// census now replays 46 of `vm_init`'s registrars instead of 6, so the strict
-/// registry it observes went 10,439 -> 11,192 (no-management) / 11,495
-/// (management). Nothing about strict mode changed. As with
-/// `MIN_TOTAL_REGISTRATIONS`, the floor takes the SMALLER configuration and
-/// keeps the same ~300 rows of deliberate headroom, so it survives the next
-/// re-tag of that size while still detecting a shed module.
-/// # 10,900 -> 10,600, 2026-09-11
-///
-/// Lowered by 300 for a strict registry of 10,878, and the cause is one wave:
-/// `RETIRED_SHADOW_L5R_TRIPLES`, 67 `sun/misc/Unsafe` triples over 87
-/// registrations. Strict mode refuses a re-tagged row by design — which is the
-/// second reason the 2026-08-10 entry above gives — so a retirement wave lowers
-/// this total by exactly its registration count, and this one did.
-///
-/// **This detector exists to make lowering it suspicious, so here is the
-/// evidence it cannot see.** By SUBSTITUTION on the same tree, emptying that
-/// one table and re-running:
+/// **The evidence that the gap and not the level is the invariant** is that same
+/// commit's substitution, on one tree, emptying one table:
 ///
 /// ```text
 ///   table present   compatible 13609 (2728 stubs) -> strict 10878
@@ -3232,20 +3215,37 @@ fn essential_registry_is_populated() {
 ///   difference                          87 stubs            87 rows
 /// ```
 ///
-/// 10,965 clears the old floor, and the shortfall is 87 — the wave, to the row.
-/// A registry shedding whole modules does not move by exactly the size of one
-/// table and restore itself when that table is emptied. The corpus agrees:
-/// 133/133 on `--jdk-only`, 133/133 on `SUITE=all` and 93/93 on `SUITE=core`,
-/// on a release build of the merged tree.
+/// 87 stubs, 87 rows, with the gap to `compat_total - compat_stubs` unchanged at
+/// 3 on both sides. A registry shedding whole modules does not do that.
 ///
-/// The headroom stays at ~300, per the note above, and the maintenance cost is
-/// worth naming: this floor is in ABSOLUTE rows while the thing it guards
-/// against is a module-sized loss of hundreds, so every retirement wave of any
-/// size walks it down and every wave has to re-justify it. A floor expressed as
-/// a FRACTION of the compatible total would not need touching for a wave of
-/// tens — that is lane 0's call, not this lane's, and it is recorded here
-/// because this is the third entry in a row doing the same arithmetic by hand.
-const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_600;
+/// # The floor's history, kept because it is evidence about the mechanism
+///
+/// * **10,500 -> 10,200, 2026-08-10.** Lowered for a strict registry of 10,449,
+///   moved by two things at once: 179 registrations deleted with
+///   `ensure_synthetic_class`, and 248 re-tagged `SyntheticStub` because no
+///   supported JDK image declares their receiver class
+///   (`native-api/src/no_image_receiver.rs`). Justified against a `dev` binary
+///   without the re-tag, same host and images: `--jdk-only` 52 passed / 6 failed
+///   on both arms, compatible 35 / 0 on both, and the `CRATONVM_NO_STUBS` drop
+///   list grew by exactly 248 entries with zero moving the other way.
+/// * **10,200 -> 10,900, 2026-08-11.** Raised, for a reason that was not a
+///   measurement: the census began replaying 46 of `vm_init`'s registrars
+///   instead of 6, so the strict registry it observes went 10,439 -> 11,192
+///   (no-management) / 11,495 (management). A scope change to the instrument.
+///   The derived bound absorbs that too — both sides of the subtraction are
+///   taken through the same scope.
+/// * **10,900 -> 10,600, 2026-09-11 (`bf03c1d38`).** Lowered for a strict
+///   registry of 10,878, cause named to the row: `RETIRED_SHADOW_L5R_TRIPLES`,
+///   67 `sun/misc/Unsafe` triples over 87 registrations, with the substitution
+///   above as evidence and the corpus at 133/133, 133/133, 93/93.
+/// * That 2026-08-11 note also claimed a re-tag "moved this total by zero",
+///   citing `java.util.logging`'s 104 rows, on the grounds that a re-tag changes
+///   a registration's KIND and does not remove the registration. True of the
+///   COMPATIBLE total, which is what `MIN_TOTAL_REGISTRATIONS` guards; false of
+///   the strict one, where the whole point of the kind is that strict mode drops
+///   it. The sentence was copied between two floors whose subjects differ, and
+///   it is the reason the following month of re-freezes read as surprises.
+const STRICT_UNEXPLAINED_DROP_MAX: usize = 64;
 
 /// Build the default native registry the way `--jdk-only` does: set the
 /// VM-scoped strict policy *first*, then run the same boot sequence
@@ -3402,11 +3402,35 @@ fn strict_registry_has_zero_synthetic_stubs() {
          set_compatibility_mode was applied after registration instead of before it."
     );
 
+    // NOT an absolute floor on `strict_total`: that number is designed to FALL
+    // as the stub backlog is retired, because strict mode refuses every row a
+    // retirement wave re-tags. See [`STRICT_UNEXPLAINED_DROP_MAX`]. Both counts
+    // below come from this same run, so the bound holds no matter how many waves
+    // have landed.
+    //
+    // Order is free here, and worth saying so because the file's other
+    // strict/compatible pair reads as if it were not: `set_compatibility_mode`
+    // is per-REGISTRY, and `census_rows` and `strict_census` each build their
+    // own, so neither can leave a policy behind for the other.
+    let (compat_total, compat_stubs) = {
+        let compat_rows = census_rows();
+        let stubs = compat_rows
+            .iter()
+            .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
+            .count();
+        (compat_rows.len(), stubs)
+    };
+    let expected = compat_total.saturating_sub(compat_stubs);
+
     assert!(
-        strict_total >= STRICT_MIN_TOTAL_REGISTRATIONS,
-        "the strict registry holds only {strict_total} registrations, below the \
-         {STRICT_MIN_TOTAL_REGISTRATIONS} floor. Zero synthetic stubs is then a \
-         statement about an empty registry, not about the stub backlog."
+        strict_total + STRICT_UNEXPLAINED_DROP_MAX >= expected,
+        "the strict registry holds {strict_total} registrations, but refusing every \
+         one of compatible mode's {compat_stubs} stubs out of {compat_total} rows \
+         should leave {expected} — a shortfall of {} beyond the \
+         {STRICT_UNEXPLAINED_DROP_MAX} allowed for `alias_class` fallout. Zero \
+         synthetic stubs is then a statement about an empty registry, not about \
+         the stub backlog.",
+        expected.saturating_sub(strict_total)
     );
 }
 
@@ -3516,11 +3540,13 @@ fn strict_registry_drops_only_the_stubs() {
     // both sides, which duplicate registration and compat-side drops cannot
     // skew in the direction they assert.
 
+    let unexplained = dropped.saturating_sub(compat_stubs);
     assert!(
-        strict_total >= STRICT_MIN_TOTAL_REGISTRATIONS,
-        "the strict registry holds only {strict_total} registrations, below the \
-         {STRICT_MIN_TOTAL_REGISTRATIONS} floor — strict mode is shedding whole \
-         registration modules, not just stubs."
+        unexplained <= STRICT_UNEXPLAINED_DROP_MAX,
+        "strict mode dropped {dropped} registrations, {unexplained} more than the \
+         {compat_stubs} stubs it had to drop and beyond the \
+         {STRICT_UNEXPLAINED_DROP_MAX} allowed for `alias_class` fallout — strict \
+         mode is shedding whole registration modules, not just stubs."
     );
 }
 

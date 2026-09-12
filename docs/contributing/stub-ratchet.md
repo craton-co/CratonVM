@@ -159,3 +159,53 @@ Two ways this went wrong the same day, both producing confident wrong numbers:
   `Compiling` count, copy each binary out, and print both sha256s.
 
 `W7-30-stub-ratchet-boot-path-scope.md` §12 carries the full account.
+
+## The strict-registry bound is derived, because the number it guards is meant to fall
+
+`strict_registry_has_zero_synthetic_stubs` and
+`strict_registry_drops_only_the_stubs` both need to know that "zero synthetic
+stubs" is a statement about a populated registry. Until 2026-09-11 they asked
+that as an absolute floor, `strict_total >= STRICT_MIN_TOTAL_REGISTRATIONS`, and
+that constant was re-justified by hand four times in a month: 10,500 -> 10,200
+-> 10,900 -> 10,600.
+
+It is worth being precise about why, because the same shape will be tempting
+again. Strict mode refuses a `SyntheticStub` **at the door**. So a retirement
+wave that re-tags N `Bridge` registrations does two different things to the two
+totals this file prints:
+
+| | compatible | strict |
+|---|---|---|
+| before the wave | T | T - S |
+| after re-tagging N | T (unchanged — a re-tag changes a KIND) | T - S - N |
+
+The compatible total is what `MIN_TOTAL_REGISTRATIONS` guards and it genuinely
+does not move; the strict total falls by exactly N, every time, by design. An
+absolute lower bound on it is therefore not a detector with headroom — it is a
+re-freeze chore with a deadline, and the deadline is however many retirements
+fit in the headroom. Three lanes retiring shadows in one week spends 300 rows in
+days, which is what happened: `bf03c1d38` lowered it for 87 `sun/misc/Unsafe`
+registrations, and the wave before that had already spent most of the rest.
+
+The bound is now `STRICT_UNEXPLAINED_DROP_MAX`, on the GAP rather than the level:
+
+```text
+compat_total - compat_stubs - strict_total <= STRICT_UNEXPLAINED_DROP_MAX
+```
+
+Both terms come from the same run, so no wave moves it. What is left for the
+constant to cover is only `alias_class` fallout — an alias copied off a refused
+stub is never attempted, so one refusal can remove more than one row — which was
+**3** rows when this landed, against a slack of 64.
+
+Two things this makes easier to get right:
+
+* **A wave no longer has to touch this file at all.** Re-freezing
+  `BASELINE_SYNTHETIC_STUBS` is still a wave's job, because that is the number
+  whose movement is the wave's own claim. The strict bound is not.
+* **When it does go red, it means what it says.** A module that fails to
+  register sheds rows on the strict side without adding stubs on the compatible
+  side, so it moves the gap; a retirement moves both sides together and leaves
+  the gap alone. The failure message prints the shortfall, the stub count and the
+  compatible total, so the first question — "is this a wave or a shed module?" —
+  is answered by the message rather than by a second measurement.

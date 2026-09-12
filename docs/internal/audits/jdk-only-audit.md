@@ -578,9 +578,23 @@ It asserts:
 
 - `synthetic <= BASELINE_SYNTHETIC_STUBS` — currently **157**, with `SLACK = 0`;
 - `total >= MIN_TOTAL_REGISTRATIONS` — **8,000**, a vacuity floor;
-- for the strict registry, `strict_total >= STRICT_MIN_TOTAL_REGISTRATIONS`
-  (**7,500**), so "zero synthetic stubs" cannot be achieved by the registry
-  collapsing.
+- for the strict registry, a bound on the SHORTFALL rather than the level —
+  `compat_total - compat_stubs - strict_total <= STRICT_UNEXPLAINED_DROP_MAX`
+  (**64**, which covers `alias_class` fallout) — so "zero synthetic stubs"
+  cannot be achieved by the registry collapsing.
+
+  That replaced an absolute floor, `STRICT_MIN_TOTAL_REGISTRATIONS`, on
+  2026-09-11. Strict mode refuses a re-tagged stub at the door, so every
+  retirement wave lowers the strict total by its own registration count while
+  the compatible total does not move: four waves had walked the floor down by
+  hand (10,500 -> 10,200 -> 10,900 -> 10,600) and the last two spent their
+  headroom in a week. Both terms of the new bound come from the same run.
+
+> The figures in this list are the ones current when each was last read here,
+> and two of them are long superseded — the stub baseline is in the thousands
+> now, not 157. `native-builtins/tests/stub_ratchet.rs` is the authority;
+> quoting this section as a current measurement is the mistake §4.1 itself
+> warns about two paragraphs down.
 
 `strict_mode_refuses_nothing` is the end-state gate and is deliberately
 `#[ignore]`d until `BASELINE_SYNTHETIC_STUBS` reaches 0.
