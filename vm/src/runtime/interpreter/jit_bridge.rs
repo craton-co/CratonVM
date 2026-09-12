@@ -77,7 +77,7 @@ pub(super) fn dbg_osr_recompile_reason(
     method_descriptor: &str,
     entry_pc: usize,
 ) {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_none() {
+    if !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
         return;
     }
     let why = match cached_osr {
@@ -267,9 +267,7 @@ fn osr_stage_get() -> &'static str {
 /// one binary, both answers.
 fn osr_pc_refresh_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_PC_REFRESH").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_OSR_PC_REFRESH"))
 }
 
 /// One interpreter frame that compiled code is running right now.
@@ -1110,10 +1108,9 @@ pub(super) fn compile_osr_artifact(
                         );
                         if let Some((c_off, c_ref)) = slot {
                             compact_field_info.push((pc, c_off as u32, c_ref));
-                        } else if cratonvm_types::flags::runtime_var_os(
+                        } else if cratonvm_types::flags::runtime_flag_on(
                             "CRATONVM_DBG_COMPACT_INLINE",
                         )
-                        .is_some()
                         {
                             // ENGAGEMENT CENSUS. A `None` here is not a missing
                             // optimisation, it is a *helper call on every access*:
@@ -1613,7 +1610,7 @@ pub(super) fn compile_osr_artifact(
                         } else {
                             cratonvm_jit::JitIntrinsic::FfmSegmentSetAtIndex.as_entry()
                         };
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM").is_some() {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_FFM") {
                             eprintln!(
                                 "[ffm] REGISTERED(bridge) {target_class}.{mn}{desc} @pc={pc} kind={invoke_kind}"
                             );
@@ -2674,7 +2671,7 @@ pub(super) fn compile_osr_artifact(
                 // ~4.6x apart on a call-dense loop — see
                 // `docs/known-issues/netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`.
                 let dbg_bind =
-                    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_BIND").is_some();
+                    cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR_BIND");
                 if let Some((callee_pin, entry, needs_ctx)) = compiled_callee {
                     baked_callee_pins.push(callee_pin);
                     let refuse_dispatch = crate::jit::jit_direct_call_requires_dispatch(
@@ -3484,7 +3481,7 @@ pub(super) fn route_osr_exception_out_of_artifact(
     method_descriptor: &str,
     exc: ObjectRef,
 ) -> OsrExceptionExit {
-    let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some();
+    let trace = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT");
     let precise = match cratonvm_jit::deopt::take_exceptional_frame() {
         Some(rframe)
             if deopt_frame_matches_method(&rframe, class_name, method_name, method_descriptor) =>
@@ -3993,7 +3990,7 @@ pub(super) fn try_osr(
     // it: a future trigger passing some other pc must be refused, not silently
     // entered at a bci the interpreter is not standing on.
     if entry_pc != frame.pc {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR") {
             eprintln!(
                 "[cratonvm-osr] REFUSE {}.{}{} entry_pc={} != frame.pc={} \
                  (OsrEntryState::pc must be the frame's current pc)",
@@ -4002,7 +3999,7 @@ pub(super) fn try_osr(
         }
         return None;
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR") {
         eprintln!(
             "[cratonvm-osr] enter {}.{}{} entry_pc={} num_locals={} locals={:?} tags={:?}",
             &*class_name_arc,
@@ -4203,7 +4200,7 @@ pub(super) fn try_osr(
         {
             let now = cratonvm_gc::gc_quiescence::depth();
             if now > _qd0 + 1
-                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some()
+                && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_CORRUPT_FRAMES")
             {
                 eprintln!(
                     "[quiesce-leak] OSR site leaked: depth before={} after={} (expected {})",
@@ -4261,7 +4258,7 @@ pub(super) fn try_osr(
     // OSR→interpreter handoff without expanding the OSR signature
     // (`Option<Option<Value>>`, no error channel).
     if let Some(exc) = crate::jit::helpers::take_jit_pending_exception(thread) {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR") {
             let cid = shared.mem.heap.class_id_of(exc);
             let cname = shared
                 .classes
@@ -4556,7 +4553,7 @@ pub(super) fn try_osr(
             let exit_site = compiled.classify_osr_exit_site(rframe.bci);
             cratonvm_jit::metrics::record_osr_event(exit_site.metric());
             if matches!(exit_site, cratonvm_jit::osr_exit::OsrExitSite::Unrecorded)
-                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some()
+                && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT")
             {
                 eprintln!(
                     "[cratonvm-deopt] OSR-exit at bci={} which {}.{}{} records neither an \
@@ -4580,7 +4577,7 @@ pub(super) fn try_osr(
                 deopt_frame_matches_method(&rframe, &class_name, &method_name, &method_descriptor);
             if !identity_ok {
                 despeculate_stashed_frame_method(shared, &rframe);
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                     eprintln!(
                         "[cratonvm-deopt] OSR-exit stash identity mismatch (frame={} bci={}) \
                          for {}.{}{} — safe reject",
@@ -4623,7 +4620,7 @@ pub(super) fn try_osr(
                     .is_some()
                 })
             {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                     eprintln!(
                         "[cratonvm-deopt] OSR-exit TRANSFER {}.{}{} entry_pc={} resume_bci={}",
                         &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, rframe.bci
@@ -4655,7 +4652,7 @@ pub(super) fn try_osr(
             // Reaching here after a committed body would mean that invariant
             // broke. Do not add a resume path for it — the fix belongs at
             // admission, where nothing has run yet.
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                 eprintln!(
                     "[cratonvm-deopt] OSR-exit bail rejected (continue interpreting) {}.{}{} entry_pc={}",
                     &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
@@ -4694,7 +4691,7 @@ pub(super) fn try_osr(
         // case above, so the interpreter resumes THIS frame from where it
         // was instead of reinterpreting the `i64::MIN` sentinel as a value.
         if deopt_signaled {
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                 eprintln!(
                     "[cratonvm-deopt] OSR-exit bail rejected (uncommon trap, no frame) {}.{}{} entry_pc={}",
                     &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
@@ -4863,7 +4860,7 @@ pub(super) fn resolve_jit_new_site(
         // escape analysis, so every allocation in it survives. Name the class
         // that could not be resolved: "the method bailed" is not actionable,
         // "Short2 was not found from VolumeShort2's loader" is.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_COMPILES") {
             // Separate the two ways this lookup fails: the holder has no loader
             // id at all, versus the class simply not being visible from that
             // loader. `find_class_by_name` is the context-free probe, so a hit
@@ -5546,7 +5543,7 @@ pub(super) fn resolve_cp_class_for_owner(
 fn jit_loader_blind_cp_resolve() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE")
     })
 }
 
@@ -5629,9 +5626,7 @@ pub(super) fn resolve_jit_elidable_init_loading(
 /// uncached-invocation path. Default-OFF → behaviour byte-for-byte unchanged.
 fn jit_sync_methods_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SYNC_METHODS").is_some()
-    })
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_SYNC_METHODS"))
 }
 
 /// Try to JIT-compile a method and return the upgraded cache target.
@@ -7708,7 +7703,7 @@ fn try_jit_compile_callee_uncontained(
 /// "`hit_entry=0` forever" unfalsifiable. Each now names itself.
 fn callee_probe_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CALLEE_PROBE").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_CALLEE_PROBE"))
 }
 
 fn callee_probe_note(why: &str, class_name: &str, method_name: &str, descriptor: &str) {

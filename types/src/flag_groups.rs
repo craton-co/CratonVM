@@ -1831,12 +1831,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "precise-reg-spill", on_key: None, off_key: Some("CRATONVM_NO_PRECISE_REG_SPILL"), off_word: None, since: "2026-07-11" },
     E { group: Group::JIT, token: "precise-virtual-invokes", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES"), off_word: None, since: "2026-07-31" },
     // Guard-dominated bounds-check elimination (`x64::bce::range_bce_enabled`).
-    // Default-**OFF** and presence-parsed: the gate is `.is_some()`, so
-    // `CRATONVM_JIT_RANGE_BCE=0` *enables* it. `off_word` must therefore stay
-    // `None` — `Some("0")` would make `CRATONVM_JIT=-range-bce` write `"0"` and
-    // switch the pass **on**, and a wrong elision here is an out-of-bounds heap
-    // write. `-bce` (`CRATONVM_JIT_NO_BCE`) still kills every reason including
-    // this one.
+    // Default-**OFF**. The gate was presence-parsed (`.is_some()`) until
+    // 2026-09-12, when `CRATONVM_JIT_RANGE_BCE=0` *enabled* it; it is now a
+    // `runtime_flag_on` read, so `=0` is off. `off_word` still stays `None`:
+    // unsetting the key is off under both readings, and a wrong elision here is
+    // an out-of-bounds heap write, so the token must not depend on which parser
+    // a future edit leaves behind. `-bce` (`CRATONVM_JIT_NO_BCE`) still kills
+    // every reason including this one.
     E { group: Group::JIT, token: "range-bce", on_key: Some("CRATONVM_JIT_RANGE_BCE"), off_key: None, off_word: None, since: "2026-08-01" },
     E { group: Group::JIT, token: "range-scan-legacy", on_key: Some("CRATONVM_JIT_RANGE_SCAN_LEGACY"), off_key: None, off_word: None, since: "2026-06-23" },
     E { group: Group::JIT, token: "reassoc", on_key: Some("CRATONVM_JIT_REASSOC"), off_key: None, off_word: None, since: "2026-06-16" },

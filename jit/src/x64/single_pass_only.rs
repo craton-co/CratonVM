@@ -225,7 +225,7 @@ fn induction_var(code: &[u8], header: usize, back_edge: usize) -> Option<usize> 
 }
 
 fn no_bce() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BCE").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_BCE")
 }
 
 fn matrix_dot_enabled() -> bool {

@@ -2335,7 +2335,7 @@ pub extern "C" fn x64_deopt_entry(
     let frame = reconstruct_frame_from_machine_state(point, regs, rbp);
     if point.reason == DeoptReason::PendingException {
         // Exceptional frames get their own stash — see `LAST_EXCEPTIONAL`.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
             eprintln!(
                 "[cratonvm-deopt] x64 exceptional frame at throw bci={} locals={:?}",
                 point.bci, frame.locals,
@@ -2344,7 +2344,7 @@ pub extern "C" fn x64_deopt_entry(
         LAST_EXCEPTIONAL.with(|c| *c.borrow_mut() = Some(frame));
         return i64::MIN;
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
         // Resume-side trace: confirms the frame-deopt trampoline fired and at
         // which bci/reason (deopt-osr Step 8 OSR-exit shows reason=OsrExit), with
         // the RESOLVED locals/stack so a wrong reconstruction is visible.

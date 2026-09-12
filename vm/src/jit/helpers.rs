@@ -189,7 +189,7 @@ pub mod mic_prof {
 
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some())
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_MIC_PROF"))
     }
 
     /// `CRATONVM_DBG_MIC_TRACE` — the per-call `[DISP_TRACE]` line, separate
@@ -199,9 +199,7 @@ pub mod mic_prof {
     /// hundreds of megabytes of stderr.
     pub fn trace_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_TRACE").is_some()
-        })
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_MIC_TRACE"))
     }
 
     #[inline]
@@ -667,9 +665,7 @@ thread_local! {
 #[cfg(debug_assertions)]
 fn jit_borrow_site_capture_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_BORROW_SITES").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_BORROW_SITES"))
 }
 
 /// Debug-only: snapshot the borrow flag and clear it, so a nested JIT entry
@@ -938,7 +934,7 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         if if crate::runtime::env_cache::hot_lookup_cache() {
             crate::runtime::env_cache::dbg_shadow()
         } else {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some()
+            cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SHADOW")
         } {
             use std::sync::atomic::{AtomicBool, Ordering};
             static ONCE: AtomicBool = AtomicBool::new(false);
@@ -1168,9 +1164,7 @@ pub(crate) fn take_all_jit_signals(thread: &mut JvmThread) -> DrainedJitSignals 
 /// binary rather than a comparison across two builds.
 fn trap_frame_snapshot_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT"))
 }
 
 /// Snapshot the live compiled frames for a JIT-signalled NPE.
@@ -2463,7 +2457,7 @@ struct VirtualDispatchTarget {
 /// the hot dispatch path pays two slice compares + one bool load.
 pub(crate) fn cv_trace_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_TRACE_CLASSVALUE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_TRACE_CLASSVALUE"))
 }
 
 /// Residual-6 diagnosis: does this invoke-info describe the
@@ -2878,7 +2872,7 @@ fn site_alias_detect_enabled() -> bool {
     // spelling silently did nothing here, and `flags::with_thread_overrides`
     // could not arrange the probe in a test. Check 4 of
     // `tools/flag-census/check-surface.sh` names exactly this call site.
-    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SITE_ALIAS").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SITE_ALIAS"))
 }
 
 /// May a callee that declares an exception table be published into the
@@ -2966,7 +2960,7 @@ fn mic_publish_exception_table_callees() -> bool {
 fn mic_rust_entry_cache_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE")
     })
 }
 
@@ -4148,7 +4142,7 @@ unsafe fn jit_service_callee_deopt_body(
             // to a method it did not invoke. Name it here rather than at the
             // sink, where the caller chain is already gone.
             if cratonvm_jit::deopt::has_last_deopt()
-                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some()
+                && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT")
             {
                 if let Some((key, bci)) = cratonvm_jit::deopt::peek_last_deopt_identity() {
                     eprintln!(
@@ -4475,7 +4469,7 @@ unsafe fn try_resume_trapped_callee(
     receiver_class_id: ClassId,
 ) -> Option<i64> {
     let trc = |why: &str, detail: &dyn std::fmt::Display| {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
             eprintln!("[cratonvm-deopt] callee-resume refused ({why}): {detail}");
         }
     };
@@ -4655,7 +4649,7 @@ unsafe fn try_resume_trapped_callee(
         }
     };
 
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
         eprintln!("[cratonvm-deopt] helper precise-resume of trapped callee {key} at bci={bci}");
     }
     if via_lambda_identity {
@@ -5024,9 +5018,7 @@ unsafe fn jit_drive_g1_concurrent_mark(vm: &SharedVm) {
 /// refusals.
 fn g1_jit_mark_driver_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_JIT_MARK_DRIVER").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_G1_JIT_MARK_DRIVER"))
 }
 
 #[inline]
@@ -5472,9 +5464,7 @@ unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i6
 /// 25.
 fn jit_post_tlab_hash_stamp() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_POST_TLAB_HASH_STAMP").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_POST_TLAB_HASH_STAMP"))
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -5672,8 +5662,7 @@ fn dbg_tlabmiss(reason: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some())
-    {
+    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_TLABMISS")) {
         return;
     }
     static COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -5734,7 +5723,7 @@ fn stash_new_class_init_failure(
 fn new_class_init_memo_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO")
     })
 }
 
@@ -7540,9 +7529,7 @@ pub mod ref_load_census {
     #[inline]
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_REF_LOADS").is_some()
-        })
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_REF_LOADS"))
     }
 
     /// Count one reference-slot read at `slot`, one of the `*_ELEMENT` /
@@ -7742,7 +7729,7 @@ pub fn jit_ref_load_routes() -> (Option<u64>, u64) {
 fn zgc_jit_load_barrier_suppressed() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_NO_JIT_LOAD_BARRIER").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_ZGC_NO_JIT_LOAD_BARRIER")
     })
 }
 
@@ -8770,9 +8757,9 @@ pub static GETFIELD_HELPER_CALLS: std::sync::atomic::AtomicU64 =
 fn getfield_census_counting_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_MIC_PROF")
             || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_METHOD_STATS").is_some()
-            || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETFIELD_RECEIVERS").is_some()
+            || cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_GETFIELD_RECEIVERS")
     })
 }
 
@@ -8795,9 +8782,7 @@ fn getfield_census_counting_enabled() -> bool {
 /// below, which is the sibling gate on the same path and was always cached.
 fn compact_inline_dbg() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE"))
 }
 
 /// `CRATONVM_DBG_NULL_FIELD_PROVENANCE=<internal/class/Name>` — when a
@@ -8901,9 +8886,7 @@ fn note_null_field_provenance(vm_ptr: i64, obj_ptr: i64, field_index: usize) {
 
 fn getfield_receiver_census_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETFIELD_RECEIVERS").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_GETFIELD_RECEIVERS"))
 }
 
 /// Snapshot of [`GETFIELD_HELPER_CALLS`] for the shutdown diagnostic.
@@ -10133,7 +10116,7 @@ unsafe fn note_dropped_putfield(obj_ptr: i64, field_index: i64, why: &str, plaus
     } else {
         JIT_PUTFIELD_DROPPED_BAD_RECEIVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     };
-    if n >= 32 || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DROPPED_PUTFIELD").is_none() {
+    if n >= 32 || !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DROPPED_PUTFIELD") {
         return;
     }
     let (class, num_slots) = if plausible {
@@ -11189,9 +11172,7 @@ pub mod gs_prof {
 
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETSTATIC_PROF").is_some()
-        })
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_GETSTATIC_PROF"))
     }
 
     #[inline]
@@ -12767,7 +12748,7 @@ mark_word={mark_word:#x}"
 fn aioobe3_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_AIOOBE3").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_AIOOBE3"))
 }
 
 /// RBC.6 — trace exception routing through `route_implicit_exc_through_callee`
@@ -12777,7 +12758,7 @@ fn aioobe3_dbg() -> bool {
 pub(crate) fn rbc6_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_RBC6"))
 }
 
 /// Direct-throw for `ArithmeticException` ("/ by zero") — the div-by-zero
@@ -13547,9 +13528,7 @@ fn note_site_cached_native_hit() {
 /// `batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
 pub(crate) fn native_site_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none()
-    })
+    *ON.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_NATIVE_SITE_CACHE"))
 }
 
 /// Non-leaf natives dispatched from a resolved call site this run.
@@ -14931,7 +14910,7 @@ fn handle_jit_dispatch_error(
             // `NoClassDefFoundError` reaches Java (see the matching hooks in
             // `runtime::exceptions`). Only the Rust backtrace names the JIT
             // dispatch site that could not resolve the class.
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LINKAGE_BT").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_LINKAGE_BT") {
                 let bt = std::backtrace::Backtrace::force_capture();
                 eprintln!("[DBG_LINKAGE_BT] jit NoClassDefFoundError {class_name}\n{bt}");
             }
@@ -24270,7 +24249,7 @@ impl DeoptimizationController {
         );
         let action = vm.record_deoptimization(&method_key, event, &tiered_key);
 
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
             eprintln!(
                 "[cratonvm-deopt] {} reason={:?} bci={} action={:?}",
                 method_key, reason, bci, action
@@ -24372,7 +24351,7 @@ impl DeoptimizationController {
                     enqueue_time_ms: now_ms,
                     osr_bci: None,
                 });
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
                 eprintln!(
                     "[cratonvm-deopt] eager re-queue (RecompileAndReinterpret) {}",
                     method_key
@@ -24965,7 +24944,7 @@ mod tests {
     #[test]
     fn native_site_cache_default_is_on_and_the_kill_switch_kills() {
         assert!(
-            cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NATIVE_SITE_CACHE").is_none(),
+            !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_NATIVE_SITE_CACHE"),
             "this test asserts the DEFAULT; unset CRATONVM_JIT_NO_NATIVE_SITE_CACHE to run it"
         );
         assert!(
@@ -28295,9 +28274,7 @@ unsafe fn jit_safepoint_slow_path_body() {
     };
     if let Some((thread, _guard)) = jit_thread_mut() {
         let hit = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if hit <= 16
-            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_SAFEPOINTS").is_some()
-        {
+        if hit <= 16 && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_SAFEPOINTS") {
             eprintln!(
                 "[jit-safepoint] cooperative slow-path hit={} thread_id={}",
                 hit, thread.thread_id.0

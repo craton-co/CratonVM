@@ -36,14 +36,14 @@ const MAX_LOCAL_HANDLER_CANDIDATES: usize = 4;
 fn osr_refined_ref_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_REFINED_REF").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_OSR_REFINED_REF")
     })
 }
 
 fn osr_ambiguous_dead_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD")
     })
 }
 
@@ -194,7 +194,7 @@ impl Compiler {
             handler_pcs: &handler_pcs,
         };
         self.stack_kinds = analyze(code, code_len, &inputs);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_STACK_KINDS") {
             eprintln!(
                 "[stack-kinds] {} answered {} of {code_len} pcs (calls={} fields={} statics={})",
                 self.method_key,
@@ -535,7 +535,7 @@ impl Compiler {
                     // you expect at a handler appears here, the liveness at
                     // `bci` is not modelling the exception edge that reaches
                     // it — see `regalloc::handler_live_mask`.
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXCFRAME").is_some() {
+                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_EXCFRAME") {
                         eprintln!(
                             "[excframe] DROP local={i} at bci={bci} live_mask={live_here:#x} \
                              precise={} handler_ranges={} method={}",
@@ -560,8 +560,7 @@ impl Compiler {
                     continue;
                 }
                 if let Some(state) = self.sr_virtual_object_state(new_pc) {
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some()
-                    {
+                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") {
                         eprintln!(
                             "[DBG_SCALAR_DEOPT] x64 emit VirtualObject local={i} new_pc={new_pc} \
                              class_id={} fields={} at bci={bci}",
@@ -710,7 +709,7 @@ impl Compiler {
                 // machine home contradicts it, or a slot liveness should have
                 // dropped before reaching here.
                 if was_unsupported
-                    && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_SLOTS").is_some()
+                    && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_OSR_SLOTS")
                 {
                     eprintln!(
                         "[osr-slot] {} local={i} bci={bci} whole_method_kind={:?} \
@@ -750,7 +749,7 @@ impl Compiler {
         // `Value::Int`, and reading it back with `aload` then behaves as null.
         // That failure is invisible in the DROP lines alone, so print the
         // provenance the snapshot actually chose for every slot.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXCFRAME").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_EXCFRAME") {
             eprintln!(
                 "[excframe] FRAME method={} bci={bci} reason={reason:?} oop_reached={oop_reached} \
                  oop_mask={oop_mask:#x} locals={:?}",
@@ -839,7 +838,7 @@ impl Compiler {
                 unknown || self.stack_oop_marks[i] == analysis_says_ref
             })
         });
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_STACK_KINDS") {
             // Which of the three outcomes happened is the whole diagnosis when
             // a snapshot stays `Unsupported`: no answer at this bci (the
             // analysis poisoned upstream), an answer the emitter's depth or oop
@@ -1059,7 +1058,7 @@ impl Compiler {
         has_info: bool,
         has_args_base: bool,
     ) {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_none() {
+        if !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DEOPT") {
             return;
         }
         eprintln!(
@@ -2098,7 +2097,7 @@ impl Compiler {
             // comment in `x64.rs`). Bailing the compile costs one interpreted
             // method; the alternative cost a corrupted stack.
             if frame_box_ptr.is_some() && self.deopt_regs_base == 0 {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                     eprintln!(
                         "[cratonvm-jitc] compile-bail deopt-stub-without-saved-regs \
                          reason={reason} site_pc={site_pc}"

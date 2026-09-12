@@ -275,7 +275,7 @@ pub fn licm_enabled() -> bool {
 pub fn reassoc_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_REASSOC").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_REASSOC"))
 }
 
 /// `true` (default) when pure, call-free *branchy* integer methods may take the
@@ -287,7 +287,7 @@ pub fn reassoc_enabled() -> bool {
 pub fn ir_branchy_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_NO_IR_BRANCHY").is_none())
+    *FLAG.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_IR_BRANCHY"))
 }
 
 // ── Affine strength reduction (reassociation) ────────────────────────
@@ -1235,7 +1235,7 @@ fn eliminate_redundant_loads(graph: &mut Graph) -> bool {
     if !load_cse_enabled() {
         return false;
     }
-    let dbg = std::env::var("CRATONVM_DBG_LOAD_CSE").is_ok();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_LOAD_CSE");
     // A memory op in a COMPACT layout carries no token, so it is not on the
     // chain and the walk cannot see it. One such `Store` between two loads of
     // the cell it writes would be a write this pass steps straight over. Today
@@ -1961,7 +1961,7 @@ fn loop_writes_memory(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
 /// re-reading `String.value` and `String.coder` per character, and every
 /// other arm is unchanged.
 fn licm_read_hoist_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LICM_READ_HOIST").is_none()
+    !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_LICM_READ_HOIST")
 }
 
 /// Points-to summary of a reference node, used by the LICM alias oracle to
@@ -2155,7 +2155,7 @@ fn licm(graph: &mut Graph) -> bool {
     // Non-vacuity diagnostic (mirrors `CRATONVM_DBG_UNROLL`): count the loads
     // this pass actually hoists, so a live soak can confirm LICM fired rather
     // than silently bailing every loop.
-    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LICM").is_some();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_LICM");
     let mut hoisted = 0usize;
     if dbg {
         eprintln!("[DBG_LICM] {} candidate loop header(s)", headers.len());
@@ -3900,7 +3900,7 @@ fn analyze_counted_loop(
     region: NodeId,
     back_ctrl: NodeId,
 ) -> Result<CountedLoop, NotCounted> {
-    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_UNROLL");
     let n = graph.nodes.len();
     // Induction phi: Phi anchored at `region`, inputs [region, init(Const), next],
     // next = Add(self, Const) or Add(Const, self).
@@ -4824,7 +4824,7 @@ fn partial_unroll_loop(
 }
 
 fn unroll(graph: &mut Graph) -> bool {
-    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_UNROLL");
     // Per-call, in `UnrollCensus` field order. See `publish_unroll_census`.
     let mut census = [0usize; 17];
     // Computed ONCE for the whole graph, before any header is transformed:
@@ -5419,7 +5419,7 @@ fn unroll(graph: &mut Graph) -> bool {
         for &d in &to_clone {
             graph.kill(d);
         }
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_UNROLL") {
             eprintln!(
                 "[DBG_UNROLL] fully unrolled counted loop (region {region}, trip {}, {} cloned nodes/iter)",
                 info.trip,

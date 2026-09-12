@@ -458,7 +458,7 @@ where
 
 #[inline]
 fn dbg() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_XT_JIT_ROOT_SCAN")
 }
 
 /// Opt-in verification that the roster `take_over_pass` is handed really does
@@ -469,7 +469,7 @@ fn dbg() -> bool {
 /// that cost. See `imp::audit_roster_covers_jit_peers`.
 #[inline]
 fn roster_audit_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_ROOT_SCAN_AUDIT").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_XT_ROOT_SCAN_AUDIT")
 }
 
 /// Handles of peer threads that were suspended in JIT code and must be
@@ -1663,9 +1663,7 @@ mod imp {
             // Kill switch, so the reader and the historical direct load are
             // A/B-able inside ONE binary. Setting it restores the pre-fix
             // behaviour exactly — including the SIGSEGV.
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_XT_NO_SAFE_PEER_READ")
-                .is_some()
-            {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_XT_NO_SAFE_PEER_READ") {
                 return false;
             }
             let probe: u64 = 0x5ab0_1234_5678_9abc;

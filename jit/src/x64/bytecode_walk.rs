@@ -123,7 +123,7 @@ pub(super) fn note_field_site(method_key: &str, what: &str, pc: usize, slot: usi
 fn substitute_unresolved_field_sites() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE")
     })
 }
 
@@ -211,7 +211,7 @@ pub fn aastore_barrier_gate_census() -> (u64, u64, u64) {
 fn no_aastore_barrier_gate() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_AASTORE_BARRIER_GATE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_AASTORE_BARRIER_GATE")
     })
 }
 
@@ -226,9 +226,7 @@ fn no_aastore_barrier_gate() -> bool {
 /// count would be measuring the workload rather than the compiler.
 fn dbg_aastore_barrier_gate() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_AASTORE_BARRIER_GATE").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_AASTORE_BARRIER_GATE"))
 }
 
 /// The int constant pushed by the instruction IMMEDIATELY before `pc`, if that
@@ -870,7 +868,7 @@ impl Compiler {
                     let n = super::osr::OSR_EMPTY_STACK_REFUSALS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         + 1;
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                         eprintln!(
                             "[cratonvm-jitc] osr-refuse (operand-stack-live) pc={pc} depth={} #{n}",
                             self.stack.len()
@@ -1492,7 +1490,7 @@ impl Compiler {
             // speculative-BCE guard. Only under CRATONVM_DEOPT_EAGER + DEOPT_REAL ⇒
             // no JMP in production ⇒ byte-identical.
             if self.deopt_eager_bci == Some(pc) {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") {
                     eprintln!("[DBG_SCALAR_DEOPT] x64 eager deopt-EXIT JMP emitted at bci={pc}");
                 }
                 if !self.deopt_box_ptr_by_bci.contains_key(&pc) {
@@ -5481,9 +5479,7 @@ impl Compiler {
                                         && self.helpers.read_bounds_addr != 0))
                         })
                     {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
-                            .is_some()
-                        {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE") {
                             eprintln!(
                                 "[compact-inline] getfield pc={pc} off={c_off} ref={c_is_ref}"
                             );
@@ -5556,8 +5552,7 @@ impl Compiler {
                         // verdict, not a cause, and the three clauses want
                         // completely different fixes.
                         if !receiver_is_trusted_oop
-                            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
-                                .is_some()
+                            && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE")
                         {
                             eprintln!(
                                 "[compact-inline] getfield pc={pc} NOT-trusted-oop                                  have_key={trusted_have_key} marks_exact={trusted_marks_exact}                                  top_is_oop={trusted_top_is_oop} depth={} method={}",
@@ -6189,10 +6184,9 @@ impl Compiler {
                                         && self.helpers.region_bounds_addr != 0
                                 })
                             {
-                                if cratonvm_types::flags::runtime_var_os(
+                                if cratonvm_types::flags::runtime_flag_on(
                                     "CRATONVM_DBG_COMPACT_INLINE",
                                 )
-                                .is_some()
                                 {
                                     eprintln!("[compact-inline] putfield-ref pc={pc} off={c_off}");
                                 }
@@ -9820,9 +9814,7 @@ impl Compiler {
                                     // compile's `_jit_invoke_infos` arena and
                                     // outlives the code being emitted.
                                     let ret_tag = unsafe { (*info).return_type };
-                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM")
-                                        .is_some()
-                                    {
+                                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_FFM") {
                                         eprintln!(
                                             "[ffm] EMITTED pc={pc} kind={kind} is_get={is_get}"
                                         );
@@ -9986,9 +9978,7 @@ impl Compiler {
                                 // compile, which drops the method to the
                                 // interpreter and is always safe.
                                 _ => {
-                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM")
-                                        .is_some()
-                                    {
+                                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_FFM") {
                                         eprintln!(
                                             "[ffm] UNHANDLED pc={pc} info={} kind={:?} helper={}",
                                             info_ptr.is_some(),
@@ -12274,9 +12264,7 @@ impl Compiler {
                             // slot live as a fallback), PIC takes
                             // precedence: it caches a 4-entry superset.
                             let pic_ptr = self.pic_slots_idx.get(&pc).map(|&i| self.pic_slots[i].1);
-                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN")
-                                .is_some()
-                            {
+                            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
                                 eprintln!(
                                     "[JIT_GEN_INVOKE_VS] pc={} op=0x{:02x} info_kind={} mic_present={} pic_present={} {}.{}{}",
                                     pc, op, info_ref.invoke_kind, mic_ptr.is_some(), pic_ptr.is_some(),
@@ -13436,7 +13424,7 @@ impl Compiler {
                     let bridge_entry =
                         crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
                     if bridge_site != 0 && bridge_entry != 0 && ret_type != b'V' {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                             eprintln!("[cratonvm-jitc] indy bridge pc={} args={}", pc, arg_slots);
                         }
                         let pre_pop_spill = self.next_spill_offset;
@@ -13458,9 +13446,7 @@ impl Compiler {
                             let Some(args_end) =
                                 self.checked_spill_range_end(pre_pop_spill, arg_slots)
                             else {
-                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
-                                    .is_some()
-                                {
+                                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                                     eprintln!(
                                         "[cratonvm-jitc] indy bridge spill overflow pc={} base={} args={}",
                                         pc, pre_pop_spill, arg_slots
@@ -13594,7 +13580,7 @@ impl Compiler {
                         .last()
                         .is_some_and(|p| !crate::deopt::frame_state_is_resumable(&p.frame_state));
                     if unresumable_trap {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                             eprintln!(
                                 "[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}"
                             );
@@ -13810,15 +13796,13 @@ impl Compiler {
                         // call stays, and only the bump is inlined.
                         let skip_helper =
                             helper_is_noop && !cratonvm_types::jit_tlab_registration_required();
-                        let can_inline = cratonvm_types::flags::runtime_var_os(
+                        let can_inline = !cratonvm_types::flags::runtime_flag_on(
                             "CRATONVM_JIT_DISABLE_INLINE_NEW",
                         )
-                        .is_none()
                             && (helper_is_noop
-                                || cratonvm_types::flags::runtime_var_os(
+                                || cratonvm_types::flags::runtime_flag_on(
                                     "CRATONVM_JIT_ENABLE_INLINE_NEW",
-                                )
-                                .is_some())
+                                ))
                             && self.helpers.get_current_thread != 0
                             && self.helpers.tlab_post_init != 0
                             && self.helpers.new_object != 0
@@ -14179,10 +14163,9 @@ impl Compiler {
                         }
                         if inline_target.is_none()
                             && prim_array_tag.is_none()
-                            && cratonvm_types::flags::runtime_var_os(
+                            && cratonvm_types::flags::runtime_flag_on(
                                 "CRATONVM_DBG_CHECKCAST_INLINE",
                             )
-                            .is_some()
                         {
                             eprintln!(
                                 "[checkcast-inline] pc={pc} REFUSED target_id={target_class_id:?} have_key={trusted_have_key} marks_exact={trusted_marks_exact} top_is_oop={trusted_top_is_oop} method={}",

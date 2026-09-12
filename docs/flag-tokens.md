@@ -29,6 +29,17 @@ Tokens are comma-separated and whitespace around them is ignored. A token the
 group does not define prints one line on stderr and is otherwise ignored — a
 typo is loud, which it was not before.
 
+**Setting a legacy JIT switch directly.** A grouped token writes `1` into its
+legacy variable. If you export that variable yourself, the JIT's boolean switches
+(`CRATONVM_JIT_*`, `CRATONVM_NO_*`, `CRATONVM_DBG_*` and the other names the JIT
+crate reads as on/off) treat `0`, `false`, `off`, `no` and the empty string as
+**off**. Matching is case-insensitive and ignores surrounding whitespace. Any
+other value is on. Until 2026-09-12 these switches only checked whether the
+variable was set, so `CRATONVM_JIT_RANGE_BCE=0` turned the pass *on*. A few
+JIT-read names that carry a value (a number, a word such as `nostore`), or that
+the collector also reads as a gate, still check only for presence. See
+`jit-presence-only-flag-reads-FIXED.md` for the list.
+
 ## The five scalars
 
 These keep their own name: they are a path, a location or a master switch, not

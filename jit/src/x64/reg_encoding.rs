@@ -109,7 +109,7 @@ pub(super) const MAX_STACK_BANG_PROBES: usize = 512;
 pub(crate) fn jit_stack_bang_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_STACK_BANG").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_STACK_BANG") {
             return false;
         }
         match cratonvm_types::flags::runtime_var("CRATONVM_JIT_STACK_BANG") {

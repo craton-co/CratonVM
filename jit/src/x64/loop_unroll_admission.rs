@@ -734,7 +734,7 @@ fn the_rewriter_is_off_by_default_and_armed_per_thread() {
     // The native unroller has its own kill switch; only claim it is live
     // when that switch is not set, or this positive control would fail for
     // an unrelated reason.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_UNROLL").is_none() {
+    if !cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_UNROLL") {
         assert!(
             native_unroller_enabled(),
             "unarmed, the native byte-copy unroller owns unrolling"

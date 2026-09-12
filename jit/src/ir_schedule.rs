@@ -440,7 +440,7 @@ fn sink_pure_nodes(
             blocks[b].nodes.push(id);
         }
     }
-    if retried && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SINK").is_some() {
+    if retried && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_SINK") {
         eprintln!("[ir-sink] equal-depth placement violated a safepoint; fell back to depth-only");
     }
     (moved, 0)
@@ -1452,7 +1452,7 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
         if moved > 0 {
             crate::ir_evidence::note(crate::ir_evidence::Transform::SunkLate);
         }
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SINK").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_SINK") {
             eprintln!("[ir-sink] moved={moved} reverted_for_safepoints={reverted}");
         }
     }

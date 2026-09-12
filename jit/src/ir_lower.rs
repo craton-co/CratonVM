@@ -3175,7 +3175,7 @@ impl<'a> Lowerer<'a> {
             Err(bailout) => {
                 self.unallocated_slot_use.set(true);
                 self.latch_bailout(bailout);
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IRSLOT").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IRSLOT") {
                     match self.graph.nodes.get(id as usize) {
                         Some(n) => eprintln!(
                             "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
@@ -3326,7 +3326,7 @@ impl<'a> Lowerer<'a> {
         // claim below requires `coverable` AND (published OR nothing to
         // publish).
         let published = self.emit_shadow_push(&slots);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_RELOC").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_RELOC") {
             eprintln!(
                 "[ir-reloc] safepoint id={id} slots={slots:?} coverable={coverable} \
                  published={published} thread_helper={:#x} thread_slot={} savebase={} \
@@ -12102,7 +12102,7 @@ impl<'a> Lowerer<'a> {
                 live_across(id) && !named.contains(&(id as NodeId))
             });
             if unseedable {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN") {
                     for (id, r) in live.range.iter().enumerate() {
                         if self
                             .graph
@@ -12648,7 +12648,7 @@ impl<'a> Lowerer<'a> {
         // exactly the historical `frame_value_for` mapping (byte-identical).
         if let Some(sr) = self.sr_map {
             let deopt_block = self.deopt_block_for_bci(sp.bci);
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") {
                 let matches: Vec<NodeId> = sp
                     .locals
                     .iter()
@@ -12833,7 +12833,7 @@ impl<'a> Lowerer<'a> {
         sr: &ScalarReplacementMap,
         emitted: &mut std::collections::HashSet<NodeId>,
     ) -> FrameValue {
-        let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some();
+        let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT");
         let info = match sr.objects.get(&new_id) {
             Some(i) => i,
             // Unreachable through `resolve_frame_state` (which only calls here
@@ -12975,7 +12975,7 @@ impl<'a> Lowerer<'a> {
             field_values.push(fv);
         }
         emitted.insert(new_id);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") {
             eprintln!(
                 "[DBG_SCALAR_DEOPT] emit VirtualObject (new {new_id}, class_id {}, {} field(s)) at deopt block {db}",
                 info.class_id, info.num_fields
@@ -16131,7 +16131,7 @@ fn isel_shadow_enabled() -> bool {
 
 /// `CRATONVM_DBG=ir-isel` — print one shadow-selection line per compile.
 fn isel_shadow_reporting() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_ISEL").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_ISEL")
 }
 
 /// `CRATONVM_JIT=ir-isel-verify` — build the level-2 machine list and check the
@@ -16797,9 +16797,7 @@ fn ir_residency_pays_here(
 fn ir_residency_loop_weight_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_LS_LOOP_WEIGHT").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_IR_LS_LOOP_WEIGHT"))
 }
 
 /// Copy a loop-live int/long PARAMETER into a callee-saved register at entry —
@@ -16842,15 +16840,13 @@ fn ir_reserve_carried_enabled() -> bool {
 fn ir_param_prologue_copy_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_PARAM_COPY").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_IR_PARAM_COPY"))
 }
 
 fn ir_this_nonnull_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_THIS_NONNULL").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_IR_THIS_NONNULL"))
 }
 
 fn linear_scan_enabled() -> bool {
@@ -17039,7 +17035,7 @@ fn ir_lower_machine_model(
 /// somewhere, for one of four reasons" and could not be acted on. Naming the
 /// conjunct is the difference between a count and a diagnosis.
 fn ls_refuse(reason: &str) -> Option<RegResidency> {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN") {
         eprintln!("[ir-ls] refused: {reason}");
     }
     None
@@ -17714,7 +17710,7 @@ fn plan_register_residency(
     // (`[ir-ls] homes: dropped_values=`) is the outcome, and
     // `Lowerer::census_home_blocks` (`[ir-ls] homes kept:`) is the per-cause
     // breakdown of what is left.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN") {
         eprintln!(
             "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
              scan_promoted={} resident={promoted} (fp={fp_promoted} gp={gp_promoted}) \
@@ -17727,7 +17723,7 @@ fn plan_register_residency(
             alloc.reloads,
         );
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN") {
         eprintln!(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
@@ -17757,7 +17753,7 @@ fn plan_register_residency(
 /// caller's signal to run the method in a lower tier. A compiler refusal must
 /// never terminate the VM.
 fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_BAILOUT").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_BAILOUT") {
         eprintln!("[ir-bailout] {bailout}");
     }
     record_bailout(&bailout);
@@ -17876,7 +17872,7 @@ fn legacy_ir_code_buffer_estimate() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE")
     })
 }
 
@@ -17891,7 +17887,7 @@ fn legacy_ir_code_buffer_estimate() -> bool {
 ///
 /// `[ir-bufsize] nodes=N calls=C wanted=W capacity=C' ratio=… overflow=bool`
 fn report_ir_buffer_size(nodes: usize, call_nodes: usize, wanted: usize, capacity: usize) {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_BUFSIZE").is_none() {
+    if !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_BUFSIZE") {
         return;
     }
     // Integer permille, so the line stays greppable and needs no float
@@ -18443,7 +18439,7 @@ pub(crate) fn lower_inner_with_scopes(
     if let Err(bailout) = check_frame_size(frame_estimate, DEFAULT_MAX_FRAME_BYTES) {
         return refuse(bailout);
     }
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SLOTS").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_SLOTS") {
         eprintln!(
             "[ir-slots] nodes={} blocks={} slots={} peak_live={} frame_bytes={frame_estimate}",
             graph.nodes.len(),
@@ -18786,7 +18782,7 @@ pub(crate) fn lower_inner_with_scopes(
 
     let lowerer_osr_entries = std::mem::take(&mut lowerer.osr_entries);
     if ir_osr_entry_enabled()
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN")
     {
         eprintln!(
             "[ir-ls] osr entries: emitted={} refused={:?}",
@@ -18953,7 +18949,7 @@ pub(crate) fn lower_inner_with_scopes(
     // noticing that the optimizing tier plans no residency there at all, so
     // both arms had been running identical machine code.
     if ls_active
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN")
         && (lowerer.phi_copy_reg_reads > 0
             || lowerer.phi_copy_reg_publishes > 0
             || lowerer.phi_copy_publish_deferred > 0
@@ -18974,7 +18970,7 @@ pub(crate) fn lower_inner_with_scopes(
     }
     if ls_active
         && ir_deopt_regs_enabled()
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN")
     {
         eprintln!(
             "[ir-ls] deopt regs: nameable={} frame_slots_named_by_register={} regs_base={}",
@@ -19019,7 +19015,7 @@ pub(crate) fn lower_inner_with_scopes(
         lowerer.deferred_skips[7],
         lowerer.deferred_mid_foldable,
     );
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LINEAR_SCAN") {
         eprintln!(
             "[ir-ls] carries: planned={} taken={} read={} refused={} \
              stores_dropped={} still_deopt_named={} deferred={}/{} cmp_in_place={}+{} \
@@ -19711,9 +19707,7 @@ fn ir_receiver_guard_cse_enabled() -> bool {
 fn staged_arg_slot_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_STAGED_ARG_SLOT").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_JIT_STAGED_ARG_SLOT"))
 }
 
 fn ir_inline_tlab_enabled() -> bool {
@@ -22245,9 +22239,11 @@ mod tests {",
             return;
         }
 
-        // Still stub-only. Then the gate must be OPT-IN: `runtime_var_os(..)
-        // .is_some()` is off unless the variable is set, whereas a
+        // Still stub-only. Then the gate must be OPT-IN: `runtime_flag_on(..)`
+        // is off unless the variable is set to a truthy value, whereas a
         // `map_or(true, ..)` or a `!matches!(.., Ok("0"))` would be default-on.
+        // (It was a presence-only `.is_some()` read until 2026-09-12, and this
+        // needle matched that; see `jit-presence-only-flag-reads-FIXED.md`.)
         let lib_src = include_str!("lib.rs");
         let body = lib_src
             .split("fn c2_alloc_upgrade_enabled() -> bool {")
@@ -22257,7 +22253,7 @@ mod tests {",
             .next()
             .expect("the function ends");
         assert!(
-            body.contains("is_some()"),
+            body.contains("runtime_flag_on("),
             "`c2_alloc_upgrade_enabled` is no longer opt-in, but the optimizing \
              tier still lowers `Op::New` through `emit_new_object_stub` — every \
              promoted allocation now pays a CALL where the single-pass backend \
@@ -30339,23 +30335,17 @@ mod tests {",
 /// two prologue changes stay independently attributable.
 fn prologue_zero_unset_locals_disabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ZERO_UNSET_LOCALS").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_ZERO_UNSET_LOCALS"))
 }
 
 fn prologue_zero_reserved_tail_disabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ZERO_RESERVED_TAIL").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_ZERO_RESERVED_TAIL"))
 }
 
 fn ic_frame_republish_disabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"))
 }
 
 /// How many optimizing-tier inline-cache call sites were compiled WITH the

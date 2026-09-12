@@ -60,7 +60,7 @@ pub(super) fn inclusive_spec_bce_enabled() -> bool {
 pub(super) fn jit_no_spec_bce() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_SPEC_BCE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_SPEC_BCE"))
 }
 
 /// Speculative bounds check elimination: a deopt guard emitted at the loop header.
@@ -1898,7 +1898,7 @@ pub(super) fn range_bce_enabled() -> bool {
     }
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_RANGE_BCE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_RANGE_BCE"))
 }
 
 /// Largest method this pass will analyse, in bytecode bytes.

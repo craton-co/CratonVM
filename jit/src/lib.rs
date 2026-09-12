@@ -320,9 +320,7 @@ pub fn code_ptr_regions_epoch() -> u64 {
 /// workload is 20%, is not a measurement.
 pub fn code_ptr_memo_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_CODE_PTR_MEMO").is_none()
-    })
+    *ON.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_CODE_PTR_MEMO"))
 }
 
 /// Lock-free snapshot of the region list, for [`validate_code_ptr`].
@@ -1537,9 +1535,7 @@ pub fn published_code_free_audit() -> (usize, usize) {
 fn dbg_jit_code_free_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_CODE_FREE").is_some()
-    })
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_CODE_FREE"))
 }
 
 fn record_code_free(base: usize, len: usize, active_executions: usize, flags: usize) {
@@ -2505,7 +2501,7 @@ fn jit_name_ranges() -> &'static std::sync::Mutex<Vec<(usize, usize, String)>> {
 /// Whether to record JIT method-name ranges (`CRATONVM_DBG_JIT_NAMES`). Cached.
 pub fn jit_names_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_NAMES").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_NAMES"))
 }
 
 /// deopt-osr: master gate for *real* deopt-exit / OSR-exit resume
@@ -2675,7 +2671,7 @@ pub fn take_local_handlers_disarmed() -> bool {
 /// passed `sr_map = None` ⇒ byte-identical to the prior producer.
 pub fn scalar_deopt_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SCALAR_DEOPT").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SCALAR_DEOPT"))
 }
 
 /// deopt-osr: CI/test gate for the eager-deopt differential verifier
@@ -2685,7 +2681,7 @@ pub fn scalar_deopt_enabled() -> bool {
 /// mandatory check before any guard/loop family is flipped onto `deopt_real`.
 pub fn deopt_verify_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DEOPT_VERIFY").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DEOPT_VERIFY"))
 }
 
 /// deopt-osr: the through-JIT BCE-deopt differential trigger (`CRATONVM_DEOPT_EAGER`,
@@ -2701,7 +2697,7 @@ pub fn deopt_verify_enabled() -> bool {
 /// byte-identical production code.
 pub fn deopt_eager_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DEOPT_EAGER").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DEOPT_EAGER"))
 }
 
 /// Phase B (real-frame-deopt x64 backport) e2e trigger: `CRATONVM_DEOPT_EAGER_BCI=<n>`
@@ -2730,7 +2726,7 @@ pub fn deopt_eager_bci_override() -> Option<usize> {
 /// emitted ⇒ byte-identical code (the production path).
 pub fn osr_exit_test_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_OSR_EXIT_TEST").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_OSR_EXIT_TEST"))
 }
 
 /// deopt-osr Step 8 follow-up (P4): `CRATONVM_OSR_EXIT_AFTER=N` (default-OFF,
@@ -6881,7 +6877,7 @@ fn c2_alloc_upgrade_enabled() -> bool {
         // `RJitMapTierDiff` reproduces 4 runs in 10, and with the bump off the
         // old reason applies again unchanged. See `ir_inline_tlab_enabled`
         // for the repro and for what was ruled out.
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_ALLOC_UPGRADE").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_C2_ALLOC_UPGRADE")
     })
 }
 
@@ -10509,7 +10505,7 @@ impl StringBuilderFieldLayout {
         // disagreement that dropped every method containing one to the
         // interpreter the first time this landed. `CRATONVM_NO_JIT_SB_INTRINSICS=1`
         // therefore gives an A/B whose two arms are one binary.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_SB_INTRINSICS").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_JIT_SB_INTRINSICS") {
             return None;
         }
         let legacy = |idx: usize, is_ref: bool| -> i32 {
@@ -12160,7 +12156,7 @@ pub fn nio_byte_element_bind_refused(
     // right. The heap control probe bound at the single-pass door and refused
     // at the IR door in the same process, which is only explicable by reading
     // these.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
         eprintln!(
             "[cratonvm-jitc] nio-byte-bind door={door} pc={pc} write={write} \
              profile={} dominant={dominant:?} served={served}",
@@ -13530,9 +13526,7 @@ pub fn census_direct_helper_sites() -> (u64, u64) {
 /// per-site cost for a switch that cannot change mid-run.
 fn no_long_intrinsics() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LONG_INTRINSICS").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_LONG_INTRINSICS"))
 }
 
 /// Resolve a method invocation to a JIT call-site intrinsic, if one applies.
@@ -13930,7 +13924,7 @@ pub static ATOMIC_INTRINSIC_SITES: std::sync::atomic::AtomicUsize =
 /// site and one line per IR body, so "did this site even get offered an
 /// intrinsic" is answerable in one run.
 fn dbg_intrinsic_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INTRINSIC").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_INTRINSIC")
 }
 
 /// `CRATONVM_JIT_NO_ATOMIC_INTRINSIC=1` — keep every `AtomicInteger` RMW call
@@ -13941,13 +13935,11 @@ fn dbg_intrinsic_enabled() -> bool {
 /// See [`ffm_kind_for_descriptor`].
 fn ffm_intrinsic_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_FFM_INTRINSIC").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_FFM_INTRINSIC"))
 }
 
 fn atomic_intrinsic_disabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ATOMIC_INTRINSIC").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_ATOMIC_INTRINSIC")
 }
 
 pub fn try_resolve_atomic_intrinsic(
@@ -13994,7 +13986,7 @@ pub fn try_resolve_atomic_intrinsic(
     // ===== INTRINSIC REGION END: ATOMIC_INT =====
     let (intrinsic, num_params) = hit?;
     ATOMIC_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ATOMIC_INTRINSIC").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_ATOMIC_INTRINSIC") {
         eprintln!(
             "[atomic-intrinsic] {}.{}{} class_id={} compact_off={} legacy_off={}",
             class,
@@ -14037,7 +14029,7 @@ pub static ATOMIC_LONG_INTRINSIC_SITES: std::sync::atomic::AtomicUsize =
 fn atomic_long_intrinsic_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC").is_some()
+        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC")
     })
 }
 
@@ -14095,7 +14087,7 @@ pub fn try_resolve_atomic_long_intrinsic(
     // ===== INTRINSIC REGION END: ATOMIC_LONG =====
     let (intrinsic, num_params) = hit?;
     ATOMIC_LONG_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ATOMIC_INTRINSIC").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_ATOMIC_INTRINSIC") {
         eprintln!(
             "[atomic-long-intrinsic] {}.{}{} class_id={} compact_off={} legacy_off={}",
             class,
@@ -14194,7 +14186,7 @@ fn box_unbox_intrinsic_disabled() -> bool {
     }
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC") {
             return true;
         }
         // DEFAULT ON AGAIN (2026-09-04). The mitigation this replaced existed
@@ -14315,7 +14307,7 @@ pub(crate) fn box_unbox_intrinsic_shape(
                 return None;
             }
             LONG_LONG_VALUE_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ATOMIC_INTRINSIC").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_ATOMIC_INTRINSIC") {
                 eprintln!(
                     "[box-unbox-intrinsic] java/lang/Long.longValue()J class_id={} compact_off={} legacy_off={}",
                     layout.class_id, layout.value_compact_offset, layout.value_legacy_offset,
@@ -14334,7 +14326,7 @@ pub(crate) fn box_unbox_intrinsic_shape(
                 return None;
             }
             INTEGER_INT_VALUE_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ATOMIC_INTRINSIC").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_ATOMIC_INTRINSIC") {
                 eprintln!(
                     "[box-unbox-intrinsic] java/lang/Integer.intValue()I class_id={} compact_off={} legacy_off={}",
                     layout.class_id, layout.value_compact_offset, layout.value_legacy_offset,
@@ -14624,7 +14616,7 @@ mod atomic_accessor_intrinsic_tests {
         // than the VM's latched configuration, which is the hazard
         // `flag_declaration_guard` exists to name — and reading it raw here is
         // what left `check-surface.sh` red on dev.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC") {
             // Someone is running with the family deliberately off.
             return;
         }
@@ -18334,7 +18326,7 @@ invalidation before this body's publication"
         // throughput can otherwise cost a whole session to attribute (the
         // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
         // stopped being compiled once org/h2/ became JIT-eligible).
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_COMPILED") {
             eprintln!(
                 "CRATONVM_DBG_JIT_COMPILED: put {}.{}{}",
                 key.class_name, key.method_name, key.descriptor
@@ -18454,7 +18446,7 @@ invalidation before this body's publication"
         // throughput can otherwise cost a whole session to attribute (the
         // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
         // stopped being compiled once org/h2/ became JIT-eligible).
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_COMPILED") {
             eprintln!(
                 "CRATONVM_DBG_JIT_COMPILED: osr {}.{}{}",
                 key.class_name, key.method_name, key.descriptor
@@ -20678,7 +20670,7 @@ pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descr
     mark_jit_bail_listed(class_name, method_name, descriptor);
     let site = take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0));
     record_jit_bail_reason(class_name, method_name, descriptor, site);
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
         eprintln!(
             "[cratonvm-jitc] OSR-bail site={} pc={} opcode={:#04x} {class_name}.{method_name}{descriptor}",
             site.0, site.1, site.2,
@@ -21404,7 +21396,7 @@ pub fn note_deferred_new_bail(
         });
         if armed {
             DEFERRED_NEW_ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                 eprintln!(
                     "[cratonvm-jitc] deferred-new ARMED {class_name}.{method_name}{descriptor} ({} unresolved new site(s))",
                     deferred_sites.len(),
@@ -21487,7 +21479,7 @@ pub fn take_deferred_new_retry(
             entry.state = 2;
             DEFERRED_NEW_ARMED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             DEFERRED_NEW_RETIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                 eprintln!(
                     "[cratonvm-jitc] deferred-new RETIRED {class_name}.{method_name}{descriptor} -- {} looks, class never loaded",
                     entry.looks,
@@ -21495,7 +21487,7 @@ pub fn take_deferred_new_retry(
             }
             return false;
         }
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
             eprintln!(
                 "[cratonvm-jitc] deferred-new HELD {class_name}.{method_name}{descriptor} -- deferred class still unloaded; retry kept (look {}/{budget})",
                 entry.looks,
@@ -21506,7 +21498,7 @@ pub fn take_deferred_new_retry(
     }
     entry.state = 1;
     DEFERRED_NEW_ARMED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
         eprintln!("[cratonvm-jitc] deferred-new SPENT {class_name}.{method_name}{descriptor}");
     }
     DEFERRED_NEW_SPENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -21800,7 +21792,7 @@ pub fn devirt_yielded_to_intrinsic_count() -> u64 {
 /// NOT `OnceLock`-cached, matching `string_intrinsic_pin_enabled`: read at
 /// compile time only, never on a runtime hot path.
 fn devirt_intrinsic_yield_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD").is_none()
+    !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD")
 }
 
 /// Would an inline call-site intrinsic take this `invokevirtual` site?
@@ -22003,9 +21995,7 @@ pub fn private_invokevirtual_pinned() -> u64 {
 pub(crate) fn dbg_jit_slot_overlap() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_SLOT_OVERLAP").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_SLOT_OVERLAP"))
 }
 
 fn jit_deny_filter() -> Option<&'static Vec<String>> {
@@ -22702,7 +22692,7 @@ pub fn jit_direct_call_requires_dispatch(
 /// compile time only, never on a runtime hot path, and caching would make it
 /// racy against whichever test thread compiles first.
 pub fn force_c2_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FORCE_C2").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_FORCE_C2")
 }
 
 /// PERF-01: which single-pass-only lowering, if any, applies to this method?
@@ -22827,7 +22817,7 @@ pub fn force_c2_enabled() -> bool {
 /// never on a runtime hot path, and caching would make the flag racy against
 /// whichever thread compiles first.
 fn string_intrinsic_pin_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_STRING_INTRINSIC_PIN").is_none()
+    !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_STRING_INTRINSIC_PIN")
 }
 
 /// A `java/lang/String` field layout that exists ONLY so
@@ -22943,7 +22933,7 @@ const STRING_INTRINSIC_NAME_PROBE: StringFieldLayout = StringFieldLayout {
 /// it: read at compile time only, never on a runtime hot path, and caching
 /// would make the flag racy against whichever thread compiles first.
 fn ir_string_access_expander_handles(class: &str, name: &str, descriptor: &str) -> bool {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IR_STRING_ACCESS_ADMIT").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_IR_STRING_ACCESS_ADMIT") {
         return false;
     }
     match try_resolve_string_intrinsic(class, name, descriptor, Some(STRING_INTRINSIC_NAME_PROBE)) {
@@ -23312,7 +23302,7 @@ pub fn string_intrinsic_pin_door_census_line() -> String {
 /// compile-time only, never a runtime hot path, and caching would make the flag
 /// racy against whichever thread compiles first.
 fn string_pin_fail_closed_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_STRING_PIN_FAIL_CLOSED").is_none()
+    !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_STRING_PIN_FAIL_CLOSED")
 }
 
 /// The pin's decision for the real eligibility conjunction: `true` = keep this
@@ -23416,8 +23406,8 @@ fn single_pass_only_lowering_for(
 /// (`jit-ir-relocation-map-contract.md`): the absence never named
 /// which stage produced it. Each stage now reports under this flag.
 pub fn ir_stage_reporting() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
-        || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC")
+        || cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_COMPILES")
 }
 
 /// `CRATONVM_JIT_IR_OVER_INTRINSIC=1` — let the optimizing tier take a method
@@ -23427,7 +23417,7 @@ pub fn ir_stage_reporting() -> bool {
 /// trade can be re-measured in one binary if the IR tier ever grows an
 /// intrinsic emitter, at which point this whole refusal should go away.
 pub fn ir_over_intrinsic_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_OVER_INTRINSIC").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_IR_OVER_INTRINSIC")
 }
 
 pub fn ir_direct_calls_enabled() -> bool {
@@ -23516,9 +23506,7 @@ pub fn sp_id_slot_init_enabled() -> bool {
 pub fn shadow_end_guard_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NO_END_GUARD").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_NO_END_GUARD"))
 }
 
 /// Number of times a JIT-emitted shadow-stack push hit the `end` guard and
@@ -24325,9 +24313,7 @@ pub fn try_compile_with_invokespecial_resolver(
                 intrinsic_resolver,
             );
             backend_attempted |= retry_backend_attempted;
-            if retried.is_some()
-                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
-            {
+            if retried.is_some() && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                 eprintln!(
                     "[cratonvm-jitc] local-handlers: {}.{}{} refused with handler bodies in the image; compiled without them",
                     cached.class_name, cached.method_name, cached.method_descriptor,
@@ -24481,7 +24467,7 @@ pub fn try_compile_with_invokespecial_resolver(
                 site,
             );
         }
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
             // `reason=` is the point of this line. `backend_attempted` alone
             // says only whether the bail is permanent (see `JIT_BAIL_SITE`),
             // which is not a diagnosis — a resolver that cannot represent an
@@ -24536,9 +24522,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // crashing dup_x1 method (NO_DUP_X1 removes the Groovy SIGSEGV) can be pinned
     // and dumped. Proper opcode walk via scev::bytecode_len so operand bytes that
     // happen to equal 0x5A are not mistaken for the opcode.
-    if result.is_some()
-        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DUPX_METHODS").is_some()
-    {
+    if result.is_some() && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DUPX_METHODS") {
         let code: &[u8] = &cached.code;
         let n = code.len();
         let mut pc = 0usize;
@@ -24664,7 +24648,7 @@ fn local_handler_reads_unsafe_local(
     } else {
         (1u64 << param_slot_count) - 1
     };
-    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6").is_some();
+    let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_RBC6");
     for entry in exception_table {
         let handler_pc = entry.handler_pc as usize;
         let unsafe_found =
@@ -24726,7 +24710,7 @@ fn precise_handler_frames_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES")
     })
 }
 
@@ -24736,9 +24720,7 @@ fn precise_handler_frames_enabled() -> bool {
 fn exc_table_c2_disabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_EXC_TABLE_C2").is_some()
-    })
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_EXC_TABLE_C2"))
 }
 
 /// Whether every potentially throwing bytecode covered by this method's
@@ -24935,16 +24917,14 @@ fn precise_array_access_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_ARRAY_ACCESS").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_PRECISE_ARRAY_ACCESS")
     })
 }
 
 fn precise_indy_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_INDY").is_none()
-    })
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_PRECISE_INDY"))
 }
 
 /// Whether a protected `new` (0xbb) / `athrow` (0xbf) may be treated as
@@ -24995,7 +24975,7 @@ fn precise_alloc_athrow_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW")
     })
 }
 
@@ -25046,7 +25026,7 @@ fn precise_alloc_athrow_enabled() -> bool {
 /// against a separately built branch would confound this with everything else
 /// that landed.
 fn precise_getstatic_checkcast_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST").is_none()
+    !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST")
 }
 
 /// Whether a protected `getfield`/`putfield` may be treated as publishing a
@@ -25074,11 +25054,11 @@ fn precise_getstatic_checkcast_enabled() -> bool {
 pub(crate) fn rbc6_emit_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6_EMIT").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_RBC6_EMIT"))
 }
 
 fn precise_field_ops_enabled() -> bool {
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_FIELD_OPS").is_some() {
+    if cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_PRECISE_FIELD_OPS") {
         return false;
     }
     !x64::inline_getfield_enabled()
@@ -25090,7 +25070,7 @@ fn precise_virtual_invokes_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_PRECISE_VIRTUAL_INVOKES")
     })
 }
 
@@ -25908,7 +25888,7 @@ fn try_compile_inner(
         ($site:expr) => {
             return {
                 crate::note_jit_bail_site($site);
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                     eprintln!(
                         "[cratonvm-jitc] resolver-bail site={} {}.{}{}",
                         $site, cached.class_name, cached.method_name, cached.method_descriptor
@@ -25927,7 +25907,7 @@ fn try_compile_inner(
         ($site:expr, $pc:expr, $op:expr) => {
             return {
                 crate::note_jit_bail_site_at($site, $pc, $op);
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                     eprintln!(
                         "[cratonvm-jitc] resolver-bail site={}(pc={},op=0x{:02x}) {}.{}{}",
                         $site,
@@ -25955,7 +25935,7 @@ fn try_compile_inner(
             return {
                 *backend_attempted = true;
                 crate::note_jit_bail_site($site);
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                     eprintln!(
                         "[cratonvm-jitc] permanent-bail site={} {}.{}{}",
                         $site, cached.class_name, cached.method_name, cached.method_descriptor
@@ -25974,7 +25954,7 @@ fn try_compile_inner(
     let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
         Some(s) => s,
         None => {
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_RBC6") {
                 eprintln!(
                     "[rbc6-dbg] try_compile_inner: jit_scan returned None for {}.{}{}",
                     cached.class_name, cached.method_name, cached.method_descriptor
@@ -26076,7 +26056,7 @@ fn try_compile_inner(
             &cached.method_descriptor,
             cached.is_static,
         );
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_RBC6") {
             eprintln!(
                 "[rbc6-dbg] try_compile_inner: local_handler_reads_unsafe_local={} for {}.{}{}",
                 unsafe_local, cached.class_name, cached.method_name, cached.method_descriptor
@@ -27536,8 +27516,7 @@ fn try_compile_inner(
                         // counts distinct methods.
                         if is_self_recursive
                             && !selfrec_fits
-                            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED")
-                                .is_some()
+                            && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_COMPILED")
                         {
                             eprintln!(
                                 "CRATONVM_DBG_JIT_COMPILED: selfrec-refused {cn}.{mn}{desc} \
@@ -28034,9 +28013,7 @@ fn try_compile_inner(
                                 ir_direct_callee_entries
                                     .push((entry, jit_entry_artifact_id(entry)));
                             }
-                        } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
-                            .is_some()
-                        {
+                        } else if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                             eprintln!(
                                 "[cratonvm-jitc] ir-direct-call MISSED {cn}.{mn}{desc} @pc={pc} ir_direct={ir_direct} static={is_static} special={is_special}"
                             );
@@ -28216,7 +28193,7 @@ fn try_compile_inner(
                         builder.set_unbox_intrinsics(std::mem::take(&mut ir_unbox_intrinsic_sites));
                     }
                     if all_emittable && !info_map.is_empty() {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_CALL").is_some() {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_CALL") {
                             eprintln!(
                                 "[cratonvm-ircall] {}.{}{}: emitting {} invoke(static/special/virtual/interface) Op::Call(s), {} bound as DIRECT calls",
                                 cached.class_name,
@@ -28556,10 +28533,9 @@ fn try_compile_inner(
                 && layout.has_coder
                 && !layout.value_compact_is_narrow
                 && cratonvm_types::compact_ref_fields_enabled()
-                && cratonvm_types::flags::runtime_var_os(
+                && !cratonvm_types::flags::runtime_flag_on(
                     "CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS",
                 )
-                .is_none()
             {
                 // `emit_inline_compact_getfield` computes its address as
                 // `HEADER_SIZE + row.0`; `StringFieldLayout`'s offsets already
@@ -28605,7 +28581,7 @@ fn try_compile_inner(
         // `tiered::MAX_C2_COMPILE_TIME_MS`, which catches whatever slips past.
         let built = match built {
             Some(g) if g.nodes.len() > ir::IR_MAX_GRAPH_NODES => {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_CALL").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_CALL") {
                     eprintln!(
                         "[cratonvm-ircall] {}.{}{}: IR graph {} nodes > IR_MAX_GRAPH_NODES {} — single-pass",
                         cached.class_name,
@@ -28657,7 +28633,7 @@ fn try_compile_inner(
         }
         if built.is_none()
             && !scan.new_ops.is_empty()
-            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_NEW").is_some()
+            && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_NEW")
         {
             eprintln!(
                 "[cratonvm-scalarnew] IR builder bailed (single-pass) for allocation method {}.{}{}",
@@ -28853,9 +28829,7 @@ fn try_compile_inner(
                             // `scalar_replaceable < ir_news` means some `new` escaped and
                             // the method will bail to single-pass via the surviving-New
                             // gate below.
-                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_NEW")
-                                .is_some()
-                            {
+                            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_NEW") {
                                 let ir_news = graph
                                     .nodes
                                     .iter()
@@ -29099,7 +29073,7 @@ fn try_compile_inner(
                     // backend's — which is where a forwarding or elision defect
                     // is visible and a disassembly no longer separates it from a
                     // lowering one.
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_GRAPH").is_some() {
+                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_GRAPH") {
                         eprintln!(
                             "[ir-graph] {}.{}{} — {} node(s), entry={} exit={}",
                             cached.class_name,
@@ -29443,9 +29417,7 @@ fn try_compile_inner(
                         // is what left the IR relocation contract unfalsifiable:
                         // a probe showing `coverage_fallbacks=0` cannot be told
                         // apart from a probe where IR never compiled anything.
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES")
-                            .is_some()
-                        {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_COMPILES") {
                             eprintln!(
                                 "[ir] optimizing backend produced a body for {}.{}{}",
                                 cached.class_name, cached.method_name, cached.method_descriptor
@@ -29461,8 +29433,7 @@ fn try_compile_inner(
                         // took the IR path at runtime (single-pass also compiles
                         // longs, so a live "== HotSpot" probe alone is vacuous).
                         if ir_emit_long
-                            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LONG")
-                                .is_some()
+                            && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_LONG")
                             && method_uses_category2(code, code_len, &cached.method_descriptor)
                         {
                             eprintln!(
@@ -29565,9 +29536,7 @@ fn try_compile_inner(
             if compact_fields {
                 if let Some((c_off, c_ref)) = compact_slot {
                     compact_field_info.push((pc, c_off, c_ref));
-                } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
-                    .is_some()
-                {
+                } else if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE") {
                     // ENGAGEMENT CENSUS — see the OSR twin in
                     // `vm/src/runtime/interpreter/jit_bridge.rs`. A `None` here
                     // costs a `jit_getfield` call on EVERY access to a compact
@@ -29944,7 +29913,7 @@ fn try_compile_inner(
             } else {
                 if yields_to_intrinsic {
                     DEVIRT_YIELDED_TO_INTRINSIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                         eprintln!(
                             "[cratonvm-jitc] devirt YIELDS to intrinsic {class_name}.{method_name}{descriptor} @pc={pc}"
                         );
@@ -30252,8 +30221,7 @@ fn try_compile_inner(
                             // — a site whose body resolved fine can still be
                             // refused here on budget or policy, and a bare
                             // `nested-splice=0` cannot tell the two apart.
-                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
-                            {
+                            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                                 eprintln!(
                                     "[cratonvm-jitc] inline-plan pc={pc} {}.{}{}: {:?} (cost={:?} budget_left={})",
                                     class_name,
@@ -30319,17 +30287,13 @@ fn try_compile_inner(
                                     }
                                     inline_sites.insert(pc, spliced);
                                     planned_inline = true;
-                                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
-                                        .is_some()
-                                    {
+                                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                                         eprintln!(
                                             "[cratonvm-jitc] inline-planned {class_name}.{method_name}{descriptor} @pc={pc}"
                                         );
                                     }
                                 }
-                            } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
-                                .is_some()
-                            {
+                            } else if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                                 eprintln!(
                                     "[cratonvm-jitc] inline-refused {class_name}.{method_name}{descriptor} @pc={pc} reason={}",
                                     plan.refusal().map_or("none", InlineRefusal::category)
@@ -31541,7 +31505,7 @@ fn try_compile_inner(
                     } else {
                         JitIntrinsic::FfmSegmentSetAtIndex.as_entry()
                     };
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FFM").is_some() {
+                    if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_FFM") {
                         eprintln!(
                             "[ffm] REGISTERED {class_name}.{method_name}{descriptor} @pc={pc} kind={invoke_kind}"
                         );
@@ -31754,7 +31718,7 @@ fn try_compile_inner(
                         );
                     }
                     if (by_profile || by_despec)
-                        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+                        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC")
                     {
                         eprintln!(
                             "[cratonvm-jitc] string-intrinsic DECLINED {class_name}.{method_name}{descriptor} @pc={pc} guard_class_id={guard_class_id} by_profile={by_profile} by_despec={by_despec}"
@@ -31827,7 +31791,7 @@ fn try_compile_inner(
                 // (no resolved layout vs. an unmatched name/descriptor) so
                 // "the intrinsic is inert" is answerable in one run.
                 if (class_name == "java/lang/String" || class_name == "java/lang/CharSequence")
-                    && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+                    && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC")
                 {
                     eprintln!(
                         "[cratonvm-jitc] string-intrinsic MISSED {class_name}.{method_name}{descriptor} @pc={pc} layout={} coder={}",
@@ -31836,7 +31800,7 @@ fn try_compile_inner(
                     );
                 }
             } else if (class_name == "java/lang/String" || class_name == "java/lang/CharSequence")
-                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+                && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC")
             {
                 eprintln!(
                     "[cratonvm-jitc] string-intrinsic SKIPPED-GATE {class_name}.{method_name}{descriptor} @pc={pc} recursive={is_recursive_call} kind={invoke_kind}"

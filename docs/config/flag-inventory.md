@@ -72,6 +72,16 @@ Derivation rules, so a regenerated table matches this one:
   literal, outside a whole-line comment. `types/src/flag_groups.rs` is excluded:
   the registry names every variable, and that is a declaration, not a read.
 
+**Boolean values of JIT switches.** A `presence` parser means "set at all is
+on". Since 2026-09-12 that no longer describes the JIT crate's own on/off reads.
+Those go through `cratonvm_types::flags::runtime_flag_on`, which treats unset,
+empty, `0`, `false`, `off` and `no` as **off**. Matching is case-insensitive and
+ignores surrounding whitespace. The Shape and Default columns are unaffected. A
+handful of JIT-read names are still presence-parsed on purpose: they carry a
+value, or the collector reads the same name through `parse::present`. They are
+listed in `jit-presence-only-flag-reads-FIXED.md`. No flag was added, removed or
+renamed by that change.
+
 Three tests keep the inputs honest, and all three are `cargo test -p
 cratonvm-types`:
 
