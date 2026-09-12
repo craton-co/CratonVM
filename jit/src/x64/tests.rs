@@ -10465,35 +10465,35 @@ fn test_compile_invoke_with_args() {
 #[test]
 fn test_bytecode_len_invoke() {
     // Verify bytecode length calculation for invoke opcodes
-    assert_eq!(bytecode_len_at(&[0xb6, 0x00, 0x01], 0), 3); // invokevirtual
-    assert_eq!(bytecode_len_at(&[0xb7, 0x00, 0x01], 0), 3); // invokespecial
-    assert_eq!(bytecode_len_at(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0), 5); // invokeinterface
+    assert_eq!(bytecode_analysis::step(&[0xb6, 0x00, 0x01], 0), 3); // invokevirtual
+    assert_eq!(bytecode_analysis::step(&[0xb7, 0x00, 0x01], 0), 3); // invokespecial
+    assert_eq!(bytecode_analysis::step(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0), 5); // invokeinterface
                                                                         // Defense-in-depth (same class as the missing-`ldc` desync): the other
                                                                         // 5-byte ops. invokedynamic is now accepted by `jit_scan` (see the 0xba
                                                                         // scan/codegen arms); goto_w / jsr_w are still rejected today, but the
                                                                         // length table must stay correct so a future acceptance can't silently
-                                                                        // desync every PC-stepping walk. Must match the regalloc.rs `bc_len`
+                                                                        // desync every PC-stepping walk. Must match the `bytecode_analysis::step`
                                                                         // twin's `bc_len_five_byte_ops`.
-    assert_eq!(bytecode_len_at(&[0xba, 0x00, 0x01, 0x00, 0x00], 0), 5); // invokedynamic
-    assert_eq!(bytecode_len_at(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5); // goto_w
-    assert_eq!(bytecode_len_at(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5); // jsr_w
+    assert_eq!(bytecode_analysis::step(&[0xba, 0x00, 0x01, 0x00, 0x00], 0), 5); // invokedynamic
+    assert_eq!(bytecode_analysis::step(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5); // goto_w
+    assert_eq!(bytecode_analysis::step(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5); // jsr_w
 }
 
 #[test]
 fn test_bytecode_len_wide() {
     // wide (0xc4) prefix — JVMS §6.5. Must stay in lockstep with
-    // regalloc.rs::bc_len's 0xc4 arm.
+    // `bytecode_analysis::step`'s 0xc4 arm.
     // `wide iload <2-byte index>` → 4 bytes (0x15 = iload).
-    assert_eq!(bytecode_len_at(&[0xc4, 0x15, 0x01, 0x00], 0), 4);
+    assert_eq!(bytecode_analysis::step(&[0xc4, 0x15, 0x01, 0x00], 0), 4);
     // `wide istore <2-byte index>` → 4 bytes (0x36 = istore).
-    assert_eq!(bytecode_len_at(&[0xc4, 0x36, 0x01, 0x00], 0), 4);
+    assert_eq!(bytecode_analysis::step(&[0xc4, 0x36, 0x01, 0x00], 0), 4);
     // `wide ret <2-byte index>` → 4 bytes (0xa9 = ret).
-    assert_eq!(bytecode_len_at(&[0xc4, 0xa9, 0x01, 0x00], 0), 4);
+    assert_eq!(bytecode_analysis::step(&[0xc4, 0xa9, 0x01, 0x00], 0), 4);
     // `wide iinc <2-byte index> <2-byte const>` → 6 bytes (0x84 = iinc).
-    assert_eq!(bytecode_len_at(&[0xc4, 0x84, 0x01, 0x00, 0x00, 0x01], 0), 6);
+    assert_eq!(bytecode_analysis::step(&[0xc4, 0x84, 0x01, 0x00, 0x00, 0x01], 0), 6);
     // Truncated prefix (no modified-opcode byte): the `pc + 1 < code.len()`
     // bounds check must not panic and falls to the 4-byte form.
-    assert_eq!(bytecode_len_at(&[0xc4], 0), 4);
+    assert_eq!(bytecode_analysis::step(&[0xc4], 0), 4);
 }
 
 #[test]
@@ -10836,7 +10836,7 @@ fn test_detect_int_array_sum_pattern() {
     assert_eq!(back_edge, 22);
 
     // Find induction variable
-    let back_edge_end = back_edge + bytecode_len_at(&code, back_edge);
+    let back_edge_end = back_edge + bytecode_analysis::step(&code, back_edge);
     let iv = find_induction_variable(&code, header, back_edge_end);
     assert_eq!(iv, Some(4), "Induction variable should be local 4 (i)");
 
@@ -11064,7 +11064,7 @@ fn test_detect_int_array_element_wise_rejects_non_elementwise() {
     let loops = detect_loops(&code, code_len);
     // Either no loop is detected or the pattern doesn't match — both are fine.
     for &(header, back_edge) in &loops {
-        let back_end = back_edge + bytecode_len_at(&code, back_edge);
+        let back_end = back_edge + bytecode_analysis::step(&code, back_edge);
         if let Some(iv) = find_induction_variable(&code, header, back_end) {
             assert!(
                 detect_int_array_element_wise(&code, header, back_edge, iv).is_none(),

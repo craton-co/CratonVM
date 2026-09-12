@@ -775,7 +775,7 @@ impl Compiler {
         while p < dup2_pc {
             prev2 = prev;
             prev = Some(p);
-            let len = bytecode_len_at(code, p);
+            let len = bytecode_analysis::step(code, p);
             if len == 0 {
                 return None;
             }

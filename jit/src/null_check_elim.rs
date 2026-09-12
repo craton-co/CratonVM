@@ -66,6 +66,8 @@
 /// `nonnull_at_pc[i]` is the bitmask of locals known non-null at the
 /// start of the instruction at `pc == i`. PCs that don't start an
 /// instruction have a bitmask of 0 (no info).
+use crate::bytecode_analysis;
+
 #[derive(Default)]
 pub struct NullCheckInfo {
     /// Per-PC non-null bitmask. Index = bytecode PC, value = u64 mask.
@@ -158,14 +160,6 @@ fn opcode_dereferences_receiver(op: u8) -> bool {
     )
 }
 
-/// Length in bytes of a single bytecode instruction starting at `pc`.
-/// Conservative: returns 1 for any opcode we don't recognise (forces
-/// the worklist to advance by 1 — still sound because the missing
-/// transfer just leaves IN unchanged).
-fn op_len(code: &[u8], pc: usize) -> usize {
-    crate::scev::bytecode_len(code, pc, code.len())
-}
-
 /// If the instruction at `pc` is an `aload <local>` form, return the
 /// local index. Recognises `aload_0..3` and `aload <u8>`.
 fn aload_at(code: &[u8], pc: usize) -> Option<usize> {
@@ -245,7 +239,7 @@ fn successors(code: &[u8], pc: usize) -> (Option<usize>, Option<usize>) {
         return (None, None);
     }
     let op = code[pc];
-    let len = op_len(code, pc);
+    let len = bytecode_analysis::step(code, pc);
     let ft = pc + len;
     match op {
         // return forms — no successor
@@ -428,7 +422,7 @@ fn transfer(
     // `new`/`anewarray`/etc followed by `astore N` sets N non-null.
     if produces_nonnull(op) {
         // Find next instruction after this allocation.
-        let next_pc = pc + op_len(code, pc);
+        let next_pc = pc + bytecode_analysis::step(code, pc);
         if next_pc < code.len() {
             if let Some(local) = astore_at(code, next_pc) {
                 if local < 64 {
@@ -666,7 +660,7 @@ pub fn analyze_with_receiver(
         while p < len {
             is_inst_start[p] = true;
             prev_inst_pc[p] = prev;
-            let l = op_len(code, p);
+            let l = bytecode_analysis::step(code, p);
             if l == 0 {
                 break;
             }
@@ -705,7 +699,7 @@ pub fn analyze_with_receiver(
         // The next instruction after one that never falls through (goto,
         // return, athrow, a switch, `ret`) is reached, if at all, some other way.
         if ft.is_none() || code[p] == 0xA9 {
-            mark(Some(p + op_len(code, p)));
+            mark(Some(p + bytecode_analysis::step(code, p)));
         }
     }
 

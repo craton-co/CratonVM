@@ -359,9 +359,9 @@ fn a_transformed_pc_is_never_an_interpreter_bci() {
                      the opcode",
                     x.kind
                 );
-                let out_len = bytecode_len_at(&x.code, pc);
+                let out_len = bytecode_analysis::step(&x.code, pc);
                 assert!(out_len > 0);
-                assert_eq!(out_len, bytecode_len_at(&code, bci));
+                assert_eq!(out_len, bytecode_analysis::step(&code, bci));
                 if bci != pc {
                     saw_divergence = true;
                 }
@@ -396,7 +396,7 @@ fn osr_entry_lands_on_the_steady_state_copy_not_a_peeled_prefix() {
         let mut pc = header;
         while pc < back_edge {
             v.push(pc);
-            pc += bytecode_len_at(&code, pc);
+            pc += bytecode_analysis::step(&code, pc);
         }
         v
     };
@@ -1643,7 +1643,7 @@ fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
     let mut walked: Vec<usize> = Vec::new();
     while bci <= 16 {
         walked.push(bci);
-        bci += bytecode_len_at(&code, bci);
+        bci += bytecode_analysis::step(&code, bci);
     }
     assert_eq!(bci, 19, "the walk must land past the back edge");
     let mut listed: Vec<usize> = ENTERABLE

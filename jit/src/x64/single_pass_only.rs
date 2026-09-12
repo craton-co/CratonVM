@@ -87,7 +87,7 @@ use super::escape_analysis::{
 use super::simd_analysis::{
     detect_int_array_element_wise, detect_int_array_sum, detect_matrix_dot_loop,
 };
-use super::{bytecode_len_at, find_induction_variable, has_avx2};
+use super::{bytecode_analysis, find_induction_variable, has_avx2};
 use rustc_hash::FxHashSet;
 
 /// One class of loop lowering that only the single-pass backend can perform.
@@ -221,7 +221,7 @@ impl SinglePassOnly {
 }
 
 fn induction_var(code: &[u8], header: usize, back_edge: usize) -> Option<usize> {
-    find_induction_variable(code, header, back_edge + bytecode_len_at(code, back_edge))
+    find_induction_variable(code, header, back_edge + bytecode_analysis::step(code, back_edge))
 }
 
 fn no_bce() -> bool {

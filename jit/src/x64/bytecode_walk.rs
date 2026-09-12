@@ -263,7 +263,7 @@ pub(super) fn prev_insn_int_const(code: &[u8], code_len: usize, pc: usize) -> Op
     let mut cur = 0usize;
     let mut prev: Option<usize> = None;
     while cur < pc {
-        let next = cur + crate::scev::bytecode_len(code, cur, code_len);
+        let next = cur + crate::bytecode_analysis::step(code, cur);
         if next > pc {
             // `pc` is not an instruction boundary on this linear decode
             // (a jump target inside a wide/tableswitch pad, say). Decline.
@@ -438,7 +438,7 @@ impl Compiler {
                     }
                     _ => {}
                 }
-                p += bytecode_len_at(code, p);
+                p += bytecode_analysis::step(code, p);
             }
         }
         // (getstatic cache removed — every getstatic calls the helper at
@@ -693,7 +693,7 @@ impl Compiler {
                         recorded_marks.unwrap_or_else(|| vec![false; expected_depth]);
                 } else {
                     self.pc_to_native[pc] = -1;
-                    pc += bytecode_len_at(code, pc);
+                    pc += bytecode_analysis::step(code, pc);
                     continue;
                 }
             }
@@ -1517,10 +1517,10 @@ impl Compiler {
                     self.push_from_rax();
                     // Mark intermediate PCs in the skipped sequence
                     let native_pos = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
-                    let mut skip_pc = pc + bytecode_len_at(code, pc);
+                    let mut skip_pc = pc + bytecode_analysis::step(code, pc);
                     while skip_pc < seq_end {
                         self.pc_to_native[skip_pc] = native_pos;
-                        skip_pc += bytecode_len_at(code, skip_pc);
+                        skip_pc += bytecode_analysis::step(code, skip_pc);
                     }
                     pc = seq_end;
                     continue;
@@ -1554,10 +1554,10 @@ impl Compiler {
                     // the deopt and OSR machinery, and a `-1` hole there is a
                     // different claim than "the same native point".
                     let native_pos = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
-                    let mut skip_pc = pc + bytecode_len_at(code, pc);
+                    let mut skip_pc = pc + bytecode_analysis::step(code, pc);
                     while skip_pc < seq_end {
                         self.pc_to_native[skip_pc] = native_pos;
-                        skip_pc += bytecode_len_at(code, skip_pc);
+                        skip_pc += bytecode_analysis::step(code, skip_pc);
                     }
                     pc = seq_end;
                     continue;
@@ -1583,22 +1583,22 @@ impl Compiler {
                 if let Some((seq_end, result_offset)) = arith_replace {
                     // Safety: no interior PC may be a branch target.
                     let mut interior_safe = true;
-                    let mut q = pc + bytecode_len_at(code, pc);
+                    let mut q = pc + bytecode_analysis::step(code, pc);
                     while q < seq_end {
                         if branch_targets[q] {
                             interior_safe = false;
                             break;
                         }
-                        q += bytecode_len_at(code, q);
+                        q += bytecode_analysis::step(code, q);
                     }
                     if interior_safe {
                         self.emit_load_local(RAX, result_offset);
                         self.push_from_rax();
                         let native_pos = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
-                        let mut skip_pc = pc + bytecode_len_at(code, pc);
+                        let mut skip_pc = pc + bytecode_analysis::step(code, pc);
                         while skip_pc < seq_end {
                             self.pc_to_native[skip_pc] = native_pos;
-                            skip_pc += bytecode_len_at(code, skip_pc);
+                            skip_pc += bytecode_analysis::step(code, skip_pc);
                         }
                         pc = seq_end;
                         continue;

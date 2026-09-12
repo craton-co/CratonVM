@@ -51,6 +51,7 @@
 //! [rbp - (N+1)*8 .. ] = operand stack spill area
 //! ```
 
+pub(crate) use crate::bytecode_analysis;
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo};
 use cratonvm_jit_api::JitRuntimeHelpers;
 // JEP 358 (helpful NPE) inline-codegen path: the canonical operation-kind

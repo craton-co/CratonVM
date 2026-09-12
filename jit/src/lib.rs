@@ -20322,7 +20322,7 @@ fn decode_for_local_liveness(code: &[u8], code_len: usize) -> Option<Vec<IrLiven
     let mut pc = 0usize;
     while pc < code_len {
         let op = byte(pc)?;
-        let len = x64::bytecode_len_at(code, pc);
+        let len = crate::bytecode_analysis::step(code, pc);
         if len == 0 || pc.checked_add(len)? > code_len {
             return None;
         }
@@ -25806,7 +25806,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // DBG (spring-bug-11): list every successfully-compiled method that contains
     // a dup_x1 (0x5A), with the PCs and a small following-byte window, so the
     // crashing dup_x1 method (NO_DUP_X1 removes the Groovy SIGSEGV) can be pinned
-    // and dumped. Proper opcode walk via scev::bytecode_len so operand bytes that
+    // and dumped. Proper opcode walk via bytecode_analysis::step so operand bytes that
     // happen to equal 0x5A are not mistaken for the opcode.
     if result.is_some() && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DUPX_METHODS") {
         let code: &[u8] = &cached.code;
@@ -25817,7 +25817,7 @@ pub fn try_compile_with_invokespecial_resolver(
             if code[pc] == 0x5a {
                 hits.push(pc);
             }
-            let l = crate::scev::bytecode_len(code, pc, n);
+            let l = crate::bytecode_analysis::step(code, pc);
             pc += if l == 0 { 1 } else { l };
         }
         if !hits.is_empty() {
@@ -26538,7 +26538,7 @@ pub fn bytecode_commits_side_effect(code: &[u8], code_len: usize) -> bool {
         if opcode_commits_side_effect(op) {
             return true;
         }
-        let len = x64::bytecode_len_at(code, pc);
+        let len = crate::bytecode_analysis::step(code, pc);
         if len == 0 || pc.saturating_add(len) > code_len {
             return true;
         }
@@ -26573,7 +26573,7 @@ pub fn bytecode_holds_monitor(code: &[u8], code_len: usize) -> bool {
         if matches!(code[pc], 0xc2 | 0xc3) {
             return true;
         }
-        let len = x64::bytecode_len_at(code, pc);
+        let len = crate::bytecode_analysis::step(code, pc);
         if len == 0 || pc.saturating_add(len) > code_len {
             return true;
         }
@@ -26716,7 +26716,7 @@ fn ir_unresumable_protected_trap(
         // or one that runs off the end means the scan lost sync, and the
         // conservative answer to "I can no longer read this code" is to
         // decline the tier rather than guess.
-        let len = x64::bytecode_len_at(code, pc);
+        let len = crate::bytecode_analysis::step(code, pc);
         if len == 0 || pc.saturating_add(len) > code_len {
             return trap.or(Some((pc, op)));
         }
@@ -26869,7 +26869,7 @@ pub fn first_unsupported_precise_frame_site(
         {
             return Some((pc, op));
         }
-        let len = x64::bytecode_len_at(code, pc);
+        let len = crate::bytecode_analysis::step(code, pc);
         if len == 0 || pc.saturating_add(len) > code_len {
             return Some((pc, op));
         }
@@ -33799,7 +33799,7 @@ fn method_uses_category2(code: &[u8], code_len: usize, descriptor: &str) -> bool
         if is_category2_opcode(code[pc]) {
             return true;
         }
-        pc += crate::scev::bytecode_len(code, pc, code_len);
+        pc += crate::bytecode_analysis::step(code, pc);
     }
     false
 }
@@ -34114,7 +34114,7 @@ fn method_uses_double(code: &[u8], code_len: usize, descriptor: &str) -> bool {
         if is_double_opcode(code[pc]) {
             return true;
         }
-        pc += crate::scev::bytecode_len(code, pc, code_len);
+        pc += crate::bytecode_analysis::step(code, pc);
     }
     false
 }
@@ -34171,7 +34171,7 @@ fn fp_in_body(code: &[u8], code_len: usize) -> bool {
         if is_double_opcode(code[pc]) || is_float_opcode(code[pc]) {
             return true;
         }
-        pc += crate::scev::bytecode_len(code, pc, code_len);
+        pc += crate::bytecode_analysis::step(code, pc);
     }
     false
 }

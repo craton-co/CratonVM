@@ -757,7 +757,7 @@ impl Compiler {
             if start == pc - 1 {
                 starts_ok.1 = true;
             }
-            start += bytecode_len_at(code, start).max(1);
+            start += bytecode_analysis::step(code, start).max(1);
         }
         if start != pc || !starts_ok.0 || !starts_ok.1 {
             return None;

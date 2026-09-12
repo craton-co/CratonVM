@@ -162,7 +162,7 @@ pub(super) fn wide_local_high_halves(code: &[u8], code_len: usize) -> Vec<usize>
             0x37 | 0x39 if pc + 1 < code_len => mark(code[pc + 1] as usize, &mut hi),
             _ => {}
         }
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     hi
 }
@@ -256,7 +256,7 @@ pub(super) fn classify_local_kinds(
         if let Some((k, slot)) = local_access_at(code, code_len, pc) {
             vote(&mut kinds, slot, k);
         }
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
 
     // Mark each cat-2 base's high-half slot. A high-half that is independently
@@ -452,7 +452,7 @@ pub(super) fn refine_ambiguous_local_kinds(
                 found = true;
                 break;
             }
-            pc += bytecode_len_at(code, pc);
+            pc += bytecode_analysis::step(code, pc);
         }
         found
     };
@@ -615,7 +615,7 @@ pub(super) fn code_uses_long_float_double(code: &[u8], code_len: usize) -> bool 
         if op == 0xc4 && pc + 1 < code_len && opcode_touches_long_float_double(code[pc + 1]) {
             return true;
         }
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     false
 }
@@ -680,7 +680,7 @@ pub(super) fn find_induction_variable(
                 stored_locals |= 1 << (code[pc] - 0x43);
                 pc += 1;
             }
-            _ => pc += bytecode_len_at(code, pc),
+            _ => pc += bytecode_analysis::step(code, pc),
         }
     }
 
@@ -773,7 +773,7 @@ pub(super) fn analyze_array_access_operands(
                     join_targets.insert(target as usize);
                 }
             }
-            pc += bytecode_len_at(code, pc);
+            pc += bytecode_analysis::step(code, pc);
         }
     }
 
@@ -894,7 +894,7 @@ pub(super) fn analyze_array_access_operands(
             // modelled: stop so no access is reported on a desynchronised stack.
             _ => break,
         }
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
 
     out
@@ -958,7 +958,7 @@ pub(super) fn collect_i16_branch_targets(code: &[u8], code_len: usize) -> Option
             }
             _ => {}
         }
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     Some(targets)
 }
@@ -1048,7 +1048,7 @@ pub(super) fn find_bound_arraylength_provenance(
         }
         prev2 = prev1;
         prev1 = Some(pc);
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
 
     let (store_pc, p1, p2) = match stores.as_slice() {
@@ -1114,7 +1114,7 @@ pub(super) fn find_iv_nonneg_start(code: &[u8], code_len: usize, iv_local: usize
             }
         }
         prev1 = Some(pc);
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
 
     let (store_pc, p1) = match stores.as_slice() {
@@ -1225,7 +1225,7 @@ pub(super) fn branch_edges(code: &[u8], code_len: usize) -> Option<Vec<(usize, u
             }
             _ => {}
         }
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     Some(edges)
 }
@@ -1239,7 +1239,7 @@ fn falls_through_into(code: &[u8], code_len: usize, header: usize) -> bool {
     let mut pc = 0usize;
     while pc < header && pc < code_len {
         prev = Some(pc);
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     if pc != header {
         return true; // desynchronised decode: assume the entry exists
@@ -1262,7 +1262,7 @@ fn range_contains_array_access(code: &[u8], from: usize, to: usize) -> bool {
         if matches!(code[pc], 0x2e..=0x35 | 0x4f..=0x56) {
             return true;
         }
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     false
 }
@@ -1397,7 +1397,7 @@ fn locate_exit_test(
                 }
             }
         }
-        s += bytecode_len_at(code, s);
+        s += bytecode_analysis::step(code, s);
     }
     let (cmp_start, iv, bound) = found?;
     Some(LoopExitTest {
@@ -1420,7 +1420,7 @@ fn recognise_loop(
     header: usize,
     back_edge: usize,
 ) -> Option<RecognisedLoop> {
-    let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
+    let back_edge_end = back_edge + bytecode_analysis::step(code, back_edge);
     if back_edge_end > code_len {
         return None;
     }
@@ -1558,7 +1558,7 @@ impl GuardShape {
 fn innermost_enclosing(code: &[u8], loops: &[(usize, usize)]) -> Vec<Option<usize>> {
     let spans: Vec<(usize, usize)> = loops
         .iter()
-        .map(|&(h, b)| (h, b + bytecode_len_at(code, b)))
+        .map(|&(h, b)| (h, b + bytecode_analysis::step(code, b)))
         .collect();
     (0..loops.len())
         .map(|i| {
@@ -1678,7 +1678,7 @@ fn analyze_counted_loop_bce(
             continue;
         };
         let loop_ = &rl.counted;
-        let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
+        let back_edge_end = back_edge + bytecode_analysis::step(code, back_edge);
 
         // The inclusive comparator is no longer a CORRECTNESS refusal — the
         // proof handles it as `bound_addend() == 0`, a `length >= bound + 1`
@@ -2242,7 +2242,7 @@ fn range_start_tables(code: &[u8], code_len: usize) -> Option<StartTables> {
     while pc < code_len {
         t.is_start[pc] = true;
         t.prev[pc] = prev;
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 {
             return None;
         }

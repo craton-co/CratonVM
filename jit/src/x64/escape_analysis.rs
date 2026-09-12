@@ -284,7 +284,7 @@ pub(super) fn analyze_escapes(
                     }
                 }
                 abs_stack.clear();
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
             // Plain (non-areturn) returns: ireturn/lreturn/freturn/dreturn/
             // return. A method-exit return ENDS the current path — it is NOT a
@@ -303,7 +303,7 @@ pub(super) fn analyze_escapes(
             0xac | 0xad | 0xae | 0xaf | 0xb1 => {
                 escape_all!();
                 abs_stack.clear();
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
             // nop — no stack effect; must NOT disturb tracked provenance.
             0x00 => {
@@ -331,9 +331,9 @@ pub(super) fn analyze_escapes(
             // their own arms above; this range deliberately excludes them.
             0x01..=0x18 | 0x1a..=0x29 | 0xb2 => {
                 abs_stack.push(None);
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
-            // For all other opcodes, use bytecode_len_at for PC advance.
+            // For all other opcodes, use `bytecode_analysis::step` for PC advance.
             //
             // EC-SCALAR-SOUNDNESS (varargs-ctor receiver fix): an opcode this
             // single pass does not model precisely. We cannot know whether it
@@ -362,7 +362,7 @@ pub(super) fn analyze_escapes(
             // scalar-replaced one. Straight-line allocation sites built only
             // from modeled opcodes are unaffected.
             _ => {
-                let len = bytecode_len_at(code, pc);
+                let len = bytecode_analysis::step(code, pc);
                 for slot in abs_stack.iter() {
                     if let Some(p) = slot {
                         escaped.insert(*p);
@@ -383,7 +383,7 @@ pub(super) fn analyze_escapes(
         if code[pc] == 0xbb && !escaped.contains(&pc) {
             non_escaping.insert(pc);
         }
-        pc += bytecode_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     non_escaping
 }
@@ -981,7 +981,7 @@ pub(super) fn plan_scalar_replacement(
                 for prov in local_prov.iter_mut() {
                     *prov = None;
                 }
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
         }
     }
@@ -1277,7 +1277,7 @@ pub(super) fn find_bypassable_loop_headers(
             }
             _ => {}
         }
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 {
             opaque = true;
             break;
@@ -1293,7 +1293,7 @@ pub(super) fn find_bypassable_loop_headers(
     }
 
     for &(header, back_edge) in loops {
-        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        let loop_end = back_edge + bytecode_analysis::step(code, back_edge);
         for &(src, target) in &edges {
             let target_inside = target >= header && target < loop_end;
             let src_inside = src >= header && src < loop_end;
@@ -1378,7 +1378,7 @@ pub(super) fn detect_loops(code: &[u8], code_len: usize) -> Vec<(usize, usize)> 
             // ldc2_w (and the invoke/field/switch ops), so the walk stepped
             // into operand bytes and could fabricate or miss backward branches
             // (the CM-FASTMATH length-table desync family).
-            _ => pc += bytecode_len_at(code, pc),
+            _ => pc += bytecode_analysis::step(code, pc),
         }
     }
     loops
@@ -1943,7 +1943,7 @@ pub(super) fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64
                 pc += if widened == 0x84 { 6 } else { 4 };
             }
             // Other: advance by instruction length
-            _ => pc += bytecode_len_at(code, pc),
+            _ => pc += bytecode_analysis::step(code, pc),
         }
     }
     modified
@@ -2018,7 +2018,7 @@ pub(super) fn find_loop_hoists(
     sorted_loops.sort_by_key(|&(h, b)| std::cmp::Reverse(b.saturating_sub(h)));
 
     for &(header, back_edge) in &sorted_loops {
-        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        let loop_end = back_edge + bytecode_analysis::step(code, back_edge);
         if loop_end > code_len {
             continue;
         }
@@ -2039,7 +2039,7 @@ pub(super) fn find_loop_hoists(
                 element_may_change = true;
                 break;
             }
-            check_pc += bytecode_len_at(code, check_pc);
+            check_pc += bytecode_analysis::step(code, check_pc);
         }
         if element_may_change {
             continue;
@@ -2051,7 +2051,7 @@ pub(super) fn find_loop_hoists(
         while pc < loop_end && pc < code_len {
             if hoisted_pcs.contains(&pc) {
                 // Already hoisted by an outer loop
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
                 continue;
             }
 
@@ -2071,7 +2071,7 @@ pub(super) fn find_loop_hoists(
                 }
                 pc = seq_end;
             } else {
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
         }
     }

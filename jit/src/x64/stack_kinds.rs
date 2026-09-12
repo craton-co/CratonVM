@@ -222,7 +222,7 @@ pub(crate) fn analyze(code: &[u8], code_len: usize, inputs: &StackKindInputs<'_>
         map.at.insert(pc, state.clone());
 
         let op = code[pc];
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 {
             continue;
         }

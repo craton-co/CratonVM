@@ -163,7 +163,7 @@ pub(super) fn find_array_len_hoists(
     let mut claimed_pcs: Vec<usize> = Vec::new();
 
     for &(header, back_edge) in &sorted_loops {
-        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        let loop_end = back_edge + bytecode_analysis::step(code, back_edge);
         if loop_end > code_len || header >= loop_end {
             continue;
         }
@@ -178,7 +178,7 @@ pub(super) fn find_array_len_hoists(
                 unmodelled = true;
                 break;
             }
-            let l = bytecode_len_at(code, scan);
+            let l = bytecode_analysis::step(code, scan);
             if l == 0 {
                 unmodelled = true;
                 break;
@@ -195,12 +195,12 @@ pub(super) fn find_array_len_hoists(
         let mut pc = header;
         while pc < loop_end && pc < code_len {
             if claimed_pcs.contains(&pc) {
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
                 continue;
             }
             let Some((array_local, seq_end)) = match_invariant_arraylength(code, pc, code_len)
             else {
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
                 continue;
             };
             // `find_modified_locals` saturates every local index at bit 63, so
@@ -236,7 +236,7 @@ pub(super) fn find_array_len_hoists(
                 }
                 pc = seq_end;
             } else {
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
         }
     }
@@ -287,7 +287,7 @@ fn straight_line_prefix_of_header(
         if !pure_push {
             return false;
         }
-        let l = bytecode_len_at(code, pc);
+        let l = bytecode_analysis::step(code, pc);
         if l == 0 {
             return false;
         }
@@ -306,7 +306,7 @@ fn branch_target_pcs(code: &[u8], start: usize, end: usize) -> Vec<usize> {
     let mut pc = start;
     while pc < end {
         let op = code[pc];
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 {
             break;
         }
@@ -338,7 +338,7 @@ fn branch_target_pcs(code: &[u8], start: usize, end: usize) -> Vec<usize> {
             }
             // tableswitch / lookupswitch: every target is a branch target, and
             // decoding their variable-length payloads here would duplicate
-            // `bytecode_len_at`. Treat the whole span as entered rather than
+            // `bytecode_analysis::step`. Treat the whole span as entered rather than
             // half-decode them -- a switch in the body is rare and losing the
             // hoist there costs nothing anyone can measure.
             0xaa | 0xab => {
@@ -368,120 +368,6 @@ pub(super) struct FpLoopHoist {
     pub(super) is_double: bool,
 }
 
-/// Get the byte length of a bytecode instruction at `pc`.
-pub(crate) fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
-    match code[pc] {
-        // 2-byte: bipush(0x10), ldc(0x12), iload..aload(0x15..0x19),
-        // istore..astore(0x36..0x3a), ret(0xa9), newarray(0xbc).
-        // `ldc` (0x12) was previously absent and fell through to the `_ => 1`
-        // arm — a 1-byte under-count that misaligned every PC-stepping consumer
-        // (branch-target precompute, DCE, OSR/unroll). When an `ldc` sat
-        // immediately before a branch (e.g. `ldc 65536; if_icmpge exit` — the
-        // standard `for (i; i<CONST; …)` header), the scan skipped the branch,
-        // never marked its exit target, DCE-killed that target, and left the
-        // loop-exit `if_icmpge` unpatched (rel32=0) → the loop overran its bound
-        // (BC SPHINCS-256 Horst.horst_sign AIOOBE).
-        0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
-        // 3-byte: sipush(0x11), ldc_w(0x13), ldc2_w(0x14), iinc(0x84), jsr(0xa8),
-        // the if_* family, field/invoke ops, etc. ldc_w/ldc2_w were also absent.
-        0x11
-        | 0x13
-        | 0x14
-        | 0x84
-        | 0xa8
-        | 0x99..=0xa6
-        | 0xa7
-        | 0xb2
-        | 0xb3
-        | 0xb4
-        | 0xb5
-        | 0xb6
-        | 0xb7
-        | 0xb8
-        | 0xbd
-        | 0xc0
-        | 0xc1
-        | 0xc6
-        | 0xc7 => 3,
-        0xbb => 3, // new
-        0xc5 => 4,
-        // 5-byte instructions. invokeinterface (0xb9: opcode, cp_hi, cp_lo,
-        // count, 0) and invokedynamic (0xba: opcode, cp_hi, cp_lo, 0, 0) are
-        // both reachable in a compiled method today (`jit_scan` accepts
-        // both). The wide-offset branches goto_w (0xc8) / jsr_w (0xc9:
-        // opcode + 4-byte signed offset) are still rejected by `jit_scan`
-        // (catch-all → `None`), so no compiled method contains them — but,
-        // like `wide` (0xc4) below, the length table must stay correct as
-        // defense-in-depth so every PC-stepping consumer (branch-target
-        // precompute, DCE, OSR/unroll, instruction-start map, oop-map dataflow)
-        // stays in lockstep if any is ever accepted. A missing entry
-        // under-counts by 4 bytes and misaligns the walk — the same class of
-        // bug as the previously-absent `ldc`. Keep the regalloc.rs `bc_len`
-        // twin in sync.
-        0xb9 | 0xba | 0xc8 | 0xc9 => 5,
-        // wide (0xc4) — prefix modifies the following opcode to use a 2-byte
-        // local index. JVMS §6.5 wide: `wide <opcode> <indexbyte1> <indexbyte2>`
-        // is 4 bytes for the load/store/ret family, and `wide iinc <index>
-        // <const>` is 6 bytes (extra 2-byte signed constant). The modified
-        // opcode is the byte at `pc + 1`: only `iinc` (0x84) takes the 6-byte
-        // form. NOT latent, whatever this comment used to say: `jit_scan`
-        // accepts the widened load/store and `iinc` forms
-        // (`x64/bytecode_compat.rs`), so compiled methods DO contain `wide` and
-        // every PC-stepping consumer of this table is load-bearing rather than
-        // defensive. Keep the regalloc.rs `bc_len` twin in sync.
-        0xc4 => {
-            if pc + 1 < code.len() && code[pc + 1] == 0x84 {
-                6 // wide iinc
-            } else {
-                4 // wide <load/store/ret>
-            }
-        }
-        // tableswitch — variable length
-        0xaa => {
-            let mut p = pc + 1;
-            while p % 4 != 0 {
-                p += 1;
-            }
-            // Truncated header: a tableswitch placed near the end of `code` may
-            // not carry the full 12-byte default/low/high header. Reading it
-            // would index past `code_len` and panic. Return a length that
-            // consumes the rest of `code` so any walker that uses this helper
-            // terminates without an OOB read; the main compile loop's own
-            // `pc + 12 > code_len` guard then rejects the method.
-            if p + 12 > code.len() {
-                return code.len() - pc;
-            }
-            let low = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
-            let high = i32::from_be_bytes([code[p + 8], code[p + 9], code[p + 10], code[p + 11]]);
-            // Checked `high - low + 1`: raw i32 arithmetic overflows on
-            // attacker-controlled bounds. Such methods are already rejected by
-            // `jit_scan`; if one ever reaches here, fall back to a zero count
-            // (header-only length) rather than overflowing the address math.
-            let count = checked_tableswitch_count(low, high).unwrap_or(0);
-            (p + 12 + count * 4) - pc
-        }
-        // lookupswitch — variable length
-        0xab => {
-            let mut p = pc + 1;
-            while p % 4 != 0 {
-                p += 1;
-            }
-            // Truncated header (see tableswitch above): bail to a remainder
-            // length rather than reading the 8-byte default/npairs header OOB.
-            if p + 8 > code.len() {
-                return code.len() - pc;
-            }
-            // A negative `npairs` (crafted bytecode) cast straight to usize would
-            // become an enormous value and overflow the address math below; clamp
-            // to 0 so the length stays sane (the main loop rejects such methods).
-            let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]])
-                .max(0) as usize; // Widening: always safe
-            (p + 8 + npairs * 8) - pc
-        }
-        _ => 1,
-    }
-}
-
 /// array_receiver_local soundness fix — build a bitmap of valid instruction
 /// START offsets for `code[..code_len]`.
 ///
@@ -490,7 +376,7 @@ pub(crate) fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
 /// a real opcode value, so a naive "previous byte" decode mis-identifies the
 /// instruction. The only reliable way to know whether a given offset is an
 /// instruction boundary is to walk FORWARD from PC 0 stepping by
-/// [`bytecode_len_at`] (the same walk used by [`compute_branch_targets`] and
+/// [`bytecode_analysis::step`] (the same walk used by [`compute_branch_targets`] and
 /// the oop-map dataflow). `starts[k]` is `true` iff `k` is the first byte of
 /// some instruction reached by that linear walk.
 ///
@@ -502,7 +388,7 @@ pub(super) fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
     let mut pc = 0usize;
     while pc < code_len {
         starts[pc] = true;
-        let len = bytecode_len_at(code, pc).max(1); // never advance 0 → no infinite loop
+        let len = bytecode_analysis::step(code, pc).max(1); // never advance 0 → no infinite loop
         pc += len;
     }
     starts
@@ -3403,7 +3289,7 @@ pub(super) fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> 
                     mark(&mut targets, read_off(code, jp));
                     jp += 4;
                 }
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
             // lookupswitch: default + npairs (match, offset) pairs.
             0xAB => {
@@ -3441,10 +3327,10 @@ pub(super) fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> 
                     mark(&mut targets, read_off(code, jp + 4));
                     jp += 8;
                 }
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
             _ => {
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
         }
     }
@@ -3455,10 +3341,10 @@ pub(super) fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> 
 /// instruction at `pc` (normal flow only; exception-handler edges are not
 /// available to the JIT and are handled conservatively by leaving handler-only
 /// PCs `unreached`). Mirrors the branch/switch decoding in
-/// [`compute_branch_targets`] and the per-opcode length in [`bytecode_len_at`].
+/// [`compute_branch_targets`] and the per-opcode length in [`bytecode_analysis::step`].
 pub(super) fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -> Vec<usize> {
     let op = code[pc];
-    let fallthrough = pc + bytecode_len_at(code, pc);
+    let fallthrough = pc + bytecode_analysis::step(code, pc);
     let read_i16 = |at: usize| -> isize {
         if at + 1 < code_len {
             // Cast: signed offset to isize for pointer/index arithmetic
@@ -3940,7 +3826,7 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
                 has_dup2 = true;
                 break;
             }
-            p += bytecode_len_at(code, p);
+            p += bytecode_analysis::step(code, p);
         }
     }
     if !has_dup2 {
@@ -4384,11 +4270,11 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // switches — pop the int key; rest invariant.
             0xaa => {
                 pop!();
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
             0xab => {
                 pop!();
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
 
             // --- field / method ops: the width effect depends on the CP
@@ -4403,7 +4289,7 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // FORM-2 dup2 (e.g. `lload; dup2`, `ladd; dup2`).
             0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xba => {
                 widths.clear();
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
 
             // new / checkcast / instanceof / monitor / nop / iinc / arrays.
@@ -4450,7 +4336,7 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // dup2 defaults to FORM-1 = codegen behavior) without rejecting.
             _ => {
                 widths.clear();
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
         }
     }
@@ -4883,7 +4769,7 @@ pub(super) fn compute_reachable_pcs_with_roots(
         // this map at real instruction boundaries) and the walk stays bounded
         // by `code_len`; such a method is rejected afterwards by
         // `patch_branches`, which finds the target has no native offset.
-        let len = bytecode_len_at(code, pc).max(1);
+        let len = bytecode_analysis::step(code, pc).max(1);
         targets.clear();
         if !branch_targets_at(code, pc, code_len, &mut targets) {
             return None;
@@ -4943,7 +4829,7 @@ pub(super) fn all_backward_edges_are_polled(code: &[u8], code_len: usize) -> boo
         if targets.iter().any(|&t| t <= pc) && !poll_bearing_opcode(code[pc]) {
             return false;
         }
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 {
             return false;
         }
@@ -5028,7 +4914,7 @@ impl MethodCfg {
         while pc < code_len {
             idx_of[pc] = pcs.len();
             pcs.push(pc);
-            let len = bytecode_len_at(code, pc);
+            let len = bytecode_analysis::step(code, pc);
             if len == 0 {
                 return None;
             }
@@ -5057,7 +4943,7 @@ impl MethodCfg {
                 succs[i].push(ti);
             }
             if opcode_falls_through(code[at]) {
-                let nxt = at + bytecode_len_at(code, at);
+                let nxt = at + bytecode_analysis::step(code, at);
                 if nxt < code_len {
                     let ni = idx_of[nxt];
                     if ni == CFG_NONE {
@@ -5872,7 +5758,7 @@ fn encode_preheader_guard(guard: &PreheaderGuard) -> Result<Vec<u8>, LoopXformRe
 /// at the shifted PC instead of assuming a uniform shift.
 ///
 /// Transcribed from the `let mut p = pc + 1; while p % 4 != 0 { p += 1 }`
-/// walks in [`bytecode_len_at`] and [`branch_targets_at`] — keep the three in
+/// walks in [`bytecode_analysis::step`] and [`branch_targets_at`] — keep the three in
 /// step, and note that all three measure from index 0 of the `code` slice,
 /// i.e. the slice must start at the method's first bytecode.
 #[allow(dead_code)]
@@ -6156,7 +6042,7 @@ fn rewrite_loop_copies(
     for &(out_base, from, to, region) in &spans {
         let mut pc = from;
         while pc < to {
-            let len = bytecode_len_at(code, pc);
+            let len = bytecode_analysis::step(code, pc);
             if len == 0 {
                 return Err(R::BadShape);
             }
@@ -6742,7 +6628,7 @@ mod loop_xform_tests {
             if targets.iter().any(|&t| t <= pc) {
                 out.push(pc);
             }
-            pc += bytecode_len_at(code, pc);
+            pc += bytecode_analysis::step(code, pc);
         }
         out
     }
@@ -7489,14 +7375,14 @@ mod loop_xform_tests {
             let mut pc = 0usize;
             while pc < len {
                 assert!(starts[pc], "{name}: {pc} is not an instruction start");
-                let l = bytecode_len_at(&code, pc);
+                let l = bytecode_analysis::step(&code, pc);
                 assert!(l > 0, "{name}: zero-length instruction at {pc}");
                 pc += l;
             }
             assert_eq!(pc, len, "{name}: the walk overran the fixture");
 
             assert!(matches!(code[sw], 0xaa | 0xab), "{name}: no switch at {sw}");
-            assert_eq!(bytecode_len_at(&code, sw), sw_len, "{name}: switch length");
+            assert_eq!(bytecode_analysis::step(&code, sw), sw_len, "{name}: switch length");
             let mut t: Vec<usize> = Vec::new();
             assert!(
                 branch_targets_at(&code, sw, len, &mut t),
@@ -7584,11 +7470,11 @@ mod loop_xform_tests {
                         let bci = x.bci_at(pc).unwrap_or(usize::MAX);
                         assert!(bci < len, "{what}: pc {pc} has no provenance");
                         assert_eq!(x.code[pc], code[bci], "{what}: pc {pc} vs bci {bci}");
-                        let l = bytecode_len_at(&x.code, pc);
+                        let l = bytecode_analysis::step(&x.code, pc);
                         assert!(l > 0, "{what}: zero-length instruction at {pc}");
                         assert_eq!(
                             l,
-                            bytecode_len_at(&code, bci),
+                            bytecode_analysis::step(&code, bci),
                             "{what}: pc {pc} and bci {bci} disagree on length"
                         );
                         for d in 0..l {
@@ -7858,7 +7744,7 @@ mod loop_xform_tests {
                 plan_loop_unroll(&before, blen, 12, 26, k, &[]).expect("switch before the loop"),
             ] {
                 assert_eq!(&x.code[..12], &before[..12], "{:?} k={k}", x.kind);
-                assert_eq!(bytecode_len_at(&x.code, 0), 12, "{:?} k={k}", x.kind);
+                assert_eq!(bytecode_analysis::step(&x.code, 0), 12, "{:?} k={k}", x.kind);
                 let mut t: Vec<usize> = Vec::new();
                 assert!(branch_targets_at(&x.code, 0, x.code_len, &mut t));
                 assert_eq!(
@@ -7886,7 +7772,7 @@ mod loop_xform_tests {
                 let sw = 19 + k * 14;
                 assert_eq!(switch_pad(sw), switch_pad(19), "k={k}");
                 assert_eq!(x.code[sw], 0xab, "k={k}");
-                assert_eq!(bytecode_len_at(&x.code, sw), 9, "k={k}");
+                assert_eq!(bytecode_analysis::step(&x.code, sw), 9, "k={k}");
                 assert_eq!(x.bci_at(sw), Some(19), "k={k}");
                 let mut t: Vec<usize> = Vec::new();
                 assert!(branch_targets_at(&x.code, sw, x.code_len, &mut t));
@@ -8109,7 +7995,7 @@ mod loop_xform_tests {
                     }
                     _ => 1,
                 };
-                pc += bytecode_len_at(&bytes, pc);
+                pc += bytecode_analysis::step(&bytes, pc);
             }
             assert_eq!(
                 pc,
@@ -8306,7 +8192,7 @@ mod loop_xform_tests {
                 // …and so does every other bci in the region: entering a
                 // transformed copy would skip the guard, which is the whole
                 // point of having one.
-                let mut pc = header + bytecode_len_at(&code, header);
+                let mut pc = header + bytecode_analysis::step(&code, header);
                 while pc < back_edge + 3 {
                     let entry = x.osr_entry_pc(pc).expect("bci is in range");
                     assert_eq!(
@@ -8320,7 +8206,7 @@ mod loop_xform_tests {
                         entry >= v.fallback_base,
                         "{kind:?} k={k} bci={pc}: OSR entered a guarded copy"
                     );
-                    pc += bytecode_len_at(&code, pc);
+                    pc += bytecode_analysis::step(&code, pc);
                 }
                 // No OSR entry anywhere in the method resolves into the guard.
                 let (gfrom, gto) = x.guard_span().expect("versioned");

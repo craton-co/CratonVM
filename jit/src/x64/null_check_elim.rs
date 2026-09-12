@@ -174,7 +174,7 @@ pub(super) fn array_receiver(code: &[u8], pc: usize) -> Option<(usize, usize)> {
     }
 
     // Locate the index-push: the unique instruction whose start `s_idx < pc`
-    // satisfies `s_idx + bytecode_len_at(.. , s_idx) == pc`. Scan back over the
+    // satisfies `s_idx + bytecode_analysis::step(.. , s_idx) == pc`. Scan back over the
     // (at most 3) bytes an index push can occupy, accepting only a real start.
     let mut idx_pc: Option<usize> = None;
     for back in 1..=3usize {
@@ -187,7 +187,7 @@ pub(super) fn array_receiver(code: &[u8], pc: usize) -> Option<(usize, usize)> {
         }
         // A real instruction start: it must end exactly at `pc` to be the
         // immediately-preceding instruction (the index push).
-        if cand + bytecode_len_at(code, cand) == pc {
+        if cand + bytecode_analysis::step(code, cand) == pc {
             idx_pc = Some(cand);
         }
         // The nearest real start that ends at `pc` is the predecessor; since we
@@ -225,7 +225,7 @@ pub(super) fn array_receiver(code: &[u8], pc: usize) -> Option<(usize, usize)> {
         if !starts[cand] {
             continue;
         }
-        if cand + bytecode_len_at(code, cand) == idx_pc {
+        if cand + bytecode_analysis::step(code, cand) == idx_pc {
             aload_pc = Some(cand);
         }
         if aload_pc.is_some() {

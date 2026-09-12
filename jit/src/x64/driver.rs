@@ -346,7 +346,7 @@ pub(super) fn gc_inert_selfrec_candidate(
         if !allowed {
             return false;
         }
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 || pc.saturating_add(len) > code_len {
             return false;
         }
@@ -1359,7 +1359,7 @@ pub fn compile_with_param_slots(
             .iter()
             .filter(|(header, _)| !bypassable_headers.contains(header))
             .filter_map(|&(header, back_edge)| {
-                let loop_end = back_edge + bytecode_len_at(code, back_edge);
+                let loop_end = back_edge + bytecode_analysis::step(code, back_edge);
                 let iv = find_induction_variable(code, header, loop_end)?;
                 detect_matrix_dot_loop(code, header, back_edge, iv)
             })
@@ -1383,7 +1383,7 @@ pub fn compile_with_param_slots(
     let simd_loops = if has_avx2() && !no_bce {
         let mut simd = Vec::new();
         for &(header, back_edge) in &loops {
-            let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
+            let back_edge_end = back_edge + bytecode_analysis::step(code, back_edge);
             if let Some(iv) = find_induction_variable(code, header, back_edge_end) {
                 if let Some(info) = detect_int_array_sum(code, header, back_edge, iv) {
                     simd.push(info);
@@ -1413,7 +1413,7 @@ pub fn compile_with_param_slots(
     let simd_element_wise_loops = {
         let mut ewise = Vec::new();
         for &(header, back_edge) in &loops {
-            let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
+            let back_edge_end = back_edge + bytecode_analysis::step(code, back_edge);
             if let Some(iv) = find_induction_variable(code, header, back_edge_end) {
                 if let Some(info) = detect_int_array_element_wise(code, header, back_edge, iv) {
                     ewise.push(info);
@@ -1736,7 +1736,7 @@ pub fn compile_with_param_slots(
     // metadata for them). When one exists, reserve the floor frame slot so
     // each such site can do the two-instruction `CMP RSP, [rbp - floor]`
     // instead of a `self_call_stack_guard` helper CALL per recursion level.
-    // The walk uses `bytecode_len_at`; a desync past a variable-length switch
+    // The walk uses `bytecode_analysis::step`; a desync past a variable-length switch
     // can at worst set the flag spuriously, which only reserves an unused
     // slot + one prologue helper call (never unsound).
     let reserve_stack_floor = needs_heap
@@ -1754,7 +1754,7 @@ pub fn compile_with_param_slots(
                     found = true;
                     break;
                 }
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
             found
         };
@@ -3221,7 +3221,7 @@ pub(super) fn estimate_max_stack(code: &[u8], code_len: usize) -> usize {
         // (incl. switch pad/offset tables) as phantom opcodes; a phantom
         // return zeroed `depth` and could UNDER-estimate the frame's operand
         // stack (the CM-FASTMATH length-table desync family).
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 {
             break;
         }
