@@ -631,6 +631,20 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 &[key, Value::Object(None)],
             );
         }
+        // `Mac.init(null)` is `InvalidKeyException: No installed provider
+        // supports this key: (null)`. This VM read the null as an EMPTY key,
+        // marked the Mac initialised and reported success, so the first
+        // `doFinal` returned a MAC computed under a zero-length key rather
+        // than refusing. Below the SPI branch above on purpose: a third-party
+        // SPI decides for itself.
+        // MEASURED, `L6JcaSweep` row 124.
+        if matches!(args.get(1), None | Some(Value::Object(None))) {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/InvalidKeyException",
+                "No installed provider supports this key: (null)",
+            ));
+        }
         let key_bytes = match args.get(1) {
             Some(Value::Object(Some(k))) => mac_extract_key_bytes(ctx, *k),
             _ => Vec::new(),
