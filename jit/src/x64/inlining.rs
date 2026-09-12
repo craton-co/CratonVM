@@ -2795,6 +2795,15 @@ impl Compiler {
                         op == 0xb0 || self.stack_oop_marks.last().copied().unwrap_or(false);
                     // Pop callee's return value → push onto caller stack
                     self.pop_to_rax();
+                    if op == 0xac {
+                        // JVMS §6.5 `ireturn` narrowing, at the splice's return
+                        // join: the callee's own compiled body would narrow in
+                        // its epilogue, and splicing it must not lose that — an
+                        // inlined `()Z` returning 2 is 0 to its caller. Each
+                        // `ireturn` of a branchy callee comes through here.
+                        let tag = crate::narrowed_int_return_tag(&site.descriptor);
+                        self.emit_narrow_int_return(tag);
+                    }
                     // Reclaim the callee's locals AND its merge region, back to
                     // the depth the CALLER's operand stack reached when this
                     // invoke's arguments were popped. `save_spill` is the

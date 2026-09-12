@@ -311,6 +311,28 @@ impl Compiler {
         self.modrm_reg(reg, reg);
     }
 
+    /// JVMS §6.5 `ireturn`: narrow the value in RAX to the method's declared
+    /// int-category return type, as if by `value & 1` for `boolean` and by
+    /// truncation plus sign/zero extension for `byte`/`char`/`short`.
+    ///
+    /// `tag` is [`crate::narrowed_int_return_tag`]'s answer; `None` emits
+    /// nothing. The results keep this backend's int convention — an `int` is
+    /// sign-extended through all 64 bits of RAX — so `B`/`S` sign-extend to 64
+    /// and `Z`/`C`, which are never negative, zero-extend.
+    pub(super) fn emit_narrow_int_return(&mut self, tag: Option<u8>) {
+        match tag {
+            // AND EAX, 1 (83 /4 ib) — the 32-bit op zero-extends into RAX.
+            Some(b'Z') => self.buf.emit(&[0x83, 0xE0, 0x01]),
+            // MOVSX RAX, AL (REX.W 0F BE /r).
+            Some(b'B') => self.buf.emit(&[0x48, 0x0F, 0xBE, 0xC0]),
+            // MOVZX EAX, AX (0F B7 /r) — zero-extends into RAX.
+            Some(b'C') => self.buf.emit(&[0x0F, 0xB7, 0xC0]),
+            // MOVSX RAX, AX (REX.W 0F BF /r).
+            Some(b'S') => self.buf.emit(&[0x48, 0x0F, 0xBF, 0xC0]),
+            _ => {}
+        }
+    }
+
     // ── CMOV helpers (round-8 perf, round-7 jit #7) ──────────────────
     //
     // CMOVcc r64, r/m64 lets us implement small-value selects (Math.min,

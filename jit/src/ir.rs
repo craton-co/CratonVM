@@ -1601,6 +1601,11 @@ struct SpliceFrame {
     saved_locals: Vec<NodeId>,
     saved_stack: Vec<NodeId>,
     returns_value: bool,
+    /// The callee's JVMS §6.5 `ireturn` narrowing
+    /// ([`crate::narrowed_int_return_tag`] of its `method_key`), applied to the
+    /// value each of its `ireturn`s hands back. `None` for `I` and for a
+    /// fixture with no key.
+    return_narrow: Option<u8>,
     /// This body has more than one reachable `return`, so a `return` is NOT a
     /// splice exit: it is an edge into the continuation built at [`Self::end`].
     /// Decided once, by the pre-scan in [`IrBuilder::build`], from the same
@@ -4810,6 +4815,12 @@ pub struct IrBuilder {
     /// for a build that splices nothing — the default, and the value every
     /// hand-built/test graph keeps.
     spliced_bodies_pure: bool,
+    /// JVMS §6.5 `ireturn` narrowing for THIS method's own return type
+    /// ([`crate::narrowed_int_return_tag`]), set by
+    /// [`Self::set_return_descriptor`]. `None` — narrow nothing — for `I`, for
+    /// every non-int return, and for a hand-built/test builder that never said.
+    /// A spliced callee's `ireturn` uses its own frame's tag instead.
+    return_narrow: Option<u8>,
     pub tdigest_scalar_kernel: bool,
     /// inc 26/35: resolved `ldc2_w` (0x14) constant values (`pc → (bits, is_double)`).
     /// Set by [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to
@@ -5084,6 +5095,7 @@ impl IrBuilder {
             invoke_labels: HashMap::new(),
             method_label: None,
             spliced_bodies_pure: true,
+            return_narrow: None,
             tdigest_scalar_kernel: false,
             ldc2w_info: HashMap::new(),
             wide_field_long: false,
@@ -5102,6 +5114,15 @@ impl IrBuilder {
     /// be called before [`Self::build`]; an `ldc2_w` pc not present bails.
     pub fn set_ldc2w_info(&mut self, info: HashMap<usize, (i64, bool)>) {
         self.ldc2w_info = info;
+    }
+
+    /// JVMS §6.5: narrow this method's `ireturn`s to its declared int-category
+    /// return type (`Z` as if by `& 1`, `B`/`C`/`S` by truncation and
+    /// extension). `descriptor` is the method's own descriptor; a method key
+    /// works too (see [`crate::narrowed_int_return_tag`]). Must be called
+    /// before [`Self::build`]. A builder that never calls it narrows nothing.
+    pub fn set_return_descriptor(&mut self, descriptor: &str) {
+        self.return_narrow = crate::narrowed_int_return_tag(descriptor);
     }
 
     /// COV-03: admit `J` / `F`+`D` instance-field accesses, from the same two
@@ -5779,6 +5800,10 @@ impl IrBuilder {
         let returns_value = site.returns_value;
         let receiver_is_arg0 = site.receiver_is_arg0;
         let arg_local_slots = site.arg_local_slots.clone();
+        // The CALLEE's return type, not the caller's: an inlined `()Z` body
+        // returning 2 must hand its caller 0, exactly as its own compiled
+        // body would have.
+        let return_narrow = crate::narrowed_int_return_tag(&site.method_key);
 
         if self.splice.len() >= MAX_IR_SPLICE_DEPTH {
             return None;
@@ -5891,6 +5916,7 @@ impl IrBuilder {
             saved_locals,
             saved_stack,
             returns_value,
+            return_narrow,
             multi_return,
             exits: Vec::new(),
             exit_bci: pc,
@@ -6169,6 +6195,34 @@ impl IrBuilder {
 
     fn add_data(&mut self, op: Op, ty: IrType, inputs: Vec<NodeId>, pc: usize) -> NodeId {
         self.graph.add(op, ty, inputs, Some(pc))
+    }
+
+    /// JVMS §6.5 `ireturn` narrowing of `val` to `tag`
+    /// ([`crate::narrowed_int_return_tag`]), built from exactly the nodes the
+    /// `iand` (`Z`, `x & 1`), `i2b`, `i2c` and `i2s` arms build — no new op, no
+    /// new lowering, and the fold passes see a shape they already know.
+    fn narrow_int_return(&mut self, val: NodeId, tag: Option<u8>, pc: usize) -> NodeId {
+        match tag {
+            Some(b'Z') => {
+                let one = self.iconst(1);
+                self.add_data(Op::And, IrType::Int, vec![val, one], pc)
+            }
+            Some(b'B') => {
+                let c = self.iconst(24);
+                let shl = self.add_data(Op::Shl, IrType::Int, vec![val, c], pc);
+                self.add_data(Op::Shr, IrType::Int, vec![shl, c], pc)
+            }
+            Some(b'C') => {
+                let mask = self.iconst(0xFFFF);
+                self.add_data(Op::And, IrType::Int, vec![val, mask], pc)
+            }
+            Some(b'S') => {
+                let c = self.iconst(16);
+                let shl = self.add_data(Op::Shl, IrType::Int, vec![val, c], pc);
+                self.add_data(Op::Shr, IrType::Int, vec![shl, c], pc)
+            }
+            _ => val,
+        }
     }
 
     fn iconst(&mut self, val: i64) -> NodeId {
@@ -9154,6 +9208,19 @@ impl IrBuilder {
                 // returns an object was refused at its return.
                 0xac | 0xb0 => {
                     let val = self.pop();
+                    // JVMS §6.5 `ireturn` narrowing for a `Z`/`B`/`C`/`S`
+                    // return — never `areturn`. Inside a splice the tag is the
+                    // spliced callee's own, so it applies at every return edge
+                    // of that body, single- or multi-return alike.
+                    let val = if code[pc] == 0xac {
+                        let tag = match self.splice.last() {
+                            Some(frame) => frame.return_narrow,
+                            None => self.return_narrow,
+                        };
+                        self.narrow_int_return(val, tag, pc)
+                    } else {
+                        val
+                    };
                     // Inside a splice this is not a method exit: it hands the
                     // value back to the caller's operand stack and the walk
                     // resumes after the `invoke`. No `Op::Return`, and `ctrl`

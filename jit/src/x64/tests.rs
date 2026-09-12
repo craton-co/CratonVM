@@ -9163,6 +9163,102 @@ fn instanceof_primitive_array_tag_answers_without_the_helper() {
     assert_eq!(HITS.load(Ordering::SeqCst), 1, "a tag mismatch must call the helper");
 }
 
+/// Compile `code` as the method `method_key` names, through the door that
+/// carries a method key — the legacy `compile` wrapper passes `""`, which
+/// narrows nothing.
+fn keyed_int_method(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    method_key: &str,
+) -> CompiledMethod {
+    let param_jvm_slots: Vec<usize> = (0..num_params).collect();
+    compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
+        code,
+        code_len,
+        num_params,
+        num_params,
+        false,
+        Vec::new(),         // multianewarray_info
+        Vec::new(),         // field_info
+        Vec::new(),         // typecheck_info
+        Vec::new(),         // static_field_info
+        Vec::new(),         // new_info
+        Vec::new(),         // new_deferred_info
+        Vec::new(),         // anewarray_info
+        Vec::new(),         // anewarray_deferred_info
+        Vec::new(),         // invoke_info
+        Vec::new(),         // direct_calls
+        Vec::new(),         // mic_slots
+        Vec::new(),         // pic_slots
+        Vec::new(),         // ldc_info
+        Vec::new(),         // ldc_string_info
+        Vec::new(),         // ldc_class_info
+        Vec::new(),         // ldc2w_info
+        Default::default(), // ldc_fp_pcs
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        HashMap::new(), // inline_guard_variants (PGO-02)
+        None,           // string_layout
+        &param_jvm_slots,
+        num_params,
+        0, // param_oop_mask: int parameters only
+        Vec::new(),
+        method_key,
+        Vec::new(),
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+    )
+    .expect("int method must compile")
+}
+
+/// Finding #84: JVMS §6.5 `ireturn` narrows a `boolean` return as if by
+/// `value & 1` and a `byte`/`char`/`short` return by truncation and extension.
+/// The interpreter bridge always did; a compiled caller reads RAX raw, so the
+/// compiled body must do it too. `B`/`S` results are checked as full `i64`s:
+/// this backend keeps an `int` sign-extended through RAX.
+#[test]
+fn ireturn_narrows_boolean_byte_char_short_returns() {
+    // SAFETY (every call): JIT code compiled from valid bytecode, called with
+    // exactly its declared int arguments.
+    // ()Z: iconst_2; ireturn -> 2 & 1 = 0
+    let z = keyed_int_method(&[0x05, 0xac, 0, 0], 2, 0, "T.z:()Z");
+    assert_eq!(unsafe { z.try_call(&[]) }, Ok(0));
+    // ()B: sipush 200; ireturn -> (byte) 200 = -56
+    let b = keyed_int_method(&[0x11, 0x00, 0xC8, 0xac, 0, 0], 4, 0, "T.b:()B");
+    assert_eq!(unsafe { b.try_call(&[]) }, Ok(-56));
+    // ()C: iconst_m1; ireturn -> (char) -1 = 65535
+    let c = keyed_int_method(&[0x02, 0xac, 0, 0], 2, 0, "T.c:()C");
+    assert_eq!(unsafe { c.try_call(&[]) }, Ok(65535));
+    // (I)S: iload_0; ireturn. A parameter rather than `ldc 70000`, so the value
+    // cannot be folded and the legacy wrapper's lack of an `ldc` table does not
+    // matter. (short) 70000 = 4464, (short) -70000 = -4464.
+    let s = keyed_int_method(&[0x1a, 0xac, 0, 0], 2, 1, "T.s:(I)S");
+    assert_eq!(unsafe { s.try_call(&[70000]) }, Ok(4464));
+    assert_eq!(unsafe { s.try_call(&[-70000]) }, Ok(-4464));
+    // Controls: an `I` return, and a method with no key, are left alone.
+    let i = keyed_int_method(&[0x1a, 0xac, 0, 0], 2, 1, "T.i:(I)I");
+    assert_eq!(unsafe { i.try_call(&[70000]) }, Ok(70000));
+    let unkeyed = keyed_int_method(&[0x05, 0xac, 0, 0], 2, 0, "");
+    assert_eq!(unsafe { unkeyed.try_call(&[]) }, Ok(2));
+}
+
+#[test]
+fn narrowed_int_return_tag_reads_only_the_return_byte() {
+    assert_eq!(crate::narrowed_int_return_tag("()Z"), Some(b'Z'));
+    assert_eq!(crate::narrowed_int_return_tag("T.f:(I)B"), Some(b'B'));
+    assert_eq!(crate::narrowed_int_return_tag("(JJ)C"), Some(b'C'));
+    assert_eq!(crate::narrowed_int_return_tag("a/B.m:()S"), Some(b'S'));
+    assert_eq!(crate::narrowed_int_return_tag("()I"), None);
+    assert_eq!(crate::narrowed_int_return_tag("()V"), None);
+    assert_eq!(crate::narrowed_int_return_tag("()[Z"), None);
+    assert_eq!(crate::narrowed_int_return_tag("()La/Z;"), None);
+    assert_eq!(crate::narrowed_int_return_tag(""), None);
+}
+
 #[cfg(feature = "vm-tests")]
 #[test]
 fn test_bounds_check_iaload_in_bounds() {

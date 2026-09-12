@@ -26591,6 +26591,10 @@ fn try_compile_inner(
         // unconditionally rather than only under the long gate.
         let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
         builder.set_param_types(&ptypes);
+        // JVMS §6.5 `ireturn` narrowing for a `Z`/`B`/`C`/`S` return, the same
+        // four tags the interpreter bridge narrows. A compiled caller reads the
+        // return register raw, so the body has to narrow before it returns.
+        builder.set_return_descriptor(&cached.method_descriptor);
         // COV-03: admit `J` / `F`+`D` INSTANCE FIELD accesses from the same two
         // flags this admission chain evaluates. A wide field is the one way a
         // category-2 or FP value can enter the graph with no category-2/FP
@@ -33064,6 +33068,27 @@ pub fn param_spec_slot_indices(descriptor: &str) -> Vec<usize> {
         slot += width;
     }
     out
+}
+
+/// The int-category return tag that JVMS §6.5 `ireturn` narrows (`Z`, `B`,
+/// `C` or `S`), or `None` when the return needs no narrowing (`I`, or not an
+/// int-category return at all).
+///
+/// Accepts a bare descriptor or a `"Class.method:descriptor"` method key. It
+/// reads only the last two bytes: an int-category return is the single byte
+/// after the closing `)`, while a reference return ends in `;` and a
+/// primitive-array return has `[` before its element byte, so neither can
+/// match. That also keeps it immune to a `)` inside a class name, which a
+/// scan for the first or last `)` is not.
+///
+/// The interpreter bridge narrows the same four tags (`narrow_int_return` in
+/// `jit_bridge.rs`); both compiled tiers now narrow at `ireturn` too, so a
+/// compiled caller never sees a `boolean` of 2.
+pub fn narrowed_int_return_tag(descriptor: &str) -> Option<u8> {
+    match descriptor.as_bytes() {
+        [.., b')', tag @ (b'Z' | b'B' | b'C' | b'S')] => Some(*tag),
+        _ => None,
+    }
 }
 
 /// Parse the return type from a method descriptor. Returns 'I', 'J', 'V', etc.

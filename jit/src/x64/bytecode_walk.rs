@@ -5121,6 +5121,15 @@ impl Compiler {
                 0xac..=0xb0 => {
                     self.flush_scratch_registers();
                     self.pop_to_rax();
+                    if code[pc] == 0xac {
+                        // JVMS §6.5: a `boolean`/`byte`/`char`/`short` return is
+                        // narrowed at `ireturn`. A compiled caller reads RAX
+                        // raw, so without this a `()Z` body returning 2 hands
+                        // it 2. The return type is the method key's; an empty
+                        // key (the legacy test wrapper) narrows nothing.
+                        let tag = crate::narrowed_int_return_tag(&self.method_key);
+                        self.emit_narrow_int_return(tag);
+                    }
                     self.emit_epilogue();
                     self.reset_spills();
                     dead = true;

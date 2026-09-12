@@ -20326,6 +20326,40 @@ mod tests {",
         assert_eq!(HITS.load(Ordering::SeqCst), 1);
     }
 
+    /// Finding #84 on the optimizing tier: JVMS §6.5 `ireturn` narrows a
+    /// `Z`/`B`/`C`/`S` return. The builder inserts the same nodes `i2b`/`i2c`/
+    /// `i2s`/`iand` build, so only the low 32 bits of RAX are this tier's
+    /// `int` and that is what is compared.
+    #[test]
+    fn ireturn_narrows_boolean_byte_char_short_returns() {
+        static FLAG: u8 = 0;
+        extern "C" fn slow_poll() {}
+        let cases: [(&[u8], usize, &str, &[i64], i32); 6] = [
+            (&[0x05, 0xac], 0, "()Z", &[], 0),                  // iconst_2
+            (&[0x11, 0x00, 0xC8, 0xac], 0, "()B", &[], -56),    // sipush 200
+            (&[0x02, 0xac], 0, "()C", &[], 65535),              // iconst_m1
+            (&[0x1a, 0xac], 1, "(I)S", &[70000], 4464),         // iload_0
+            (&[0x1a, 0xac], 1, "(I)S", &[-70000], -4464),       // iload_0
+            (&[0x1a, 0xac], 1, "(I)I", &[70000], 70000),        // control
+        ];
+        for (code, n, desc, args, want) in cases {
+            let mut builder = IrBuilder::new(n, n);
+            builder.set_return_descriptor(desc);
+            let graph = builder.build(code, code.len()).expect("IR build");
+            let schedule = ir_schedule::schedule(&graph);
+            let mut helpers = no_helpers();
+            helpers.safepoint_flag_addr = &FLAG as *const u8 as usize;
+            helpers.safepoint_slow_path = slow_poll as *const () as usize;
+            let compiled = lower(&graph, &schedule, n, n, &helpers)
+                .unwrap_or_else(|| panic!("{desc} must lower"));
+            // SAFETY: the lowered body takes exactly `n` int arguments and
+            // returns an int; the poll flag is a static zero.
+            let got = unsafe { compiled.try_call(args) }.expect("call");
+            // Cast: this tier's `int` result is the low 32 bits of RAX.
+            assert_eq!(got as i32, want, "{desc} with {args:?}");
+        }
+    }
+
     /// An OUTLINED safepoint poll stops exactly when the inline one does, and
     /// the method finishes either way.
     ///
