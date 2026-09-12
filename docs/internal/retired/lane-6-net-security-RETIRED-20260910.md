@@ -591,6 +591,18 @@ control pinned, the row is gone.
 
 ## 8. What this leaves for the next lane
 
+> **Update 2026-09-11: items 2, 4, 7 (in part) and 8 are DONE**, in
+> [`lane-6-net-residuals-20260911.md`](lane-6-net-residuals-20260911.md).
+> `X500Principal` was fixed in the natives rather than by putting a real
+> `X500Name` in `thisX500Name` — the 138 rows this section prices as the value
+> of retiring it are the same 138 rows, and fixing them needed no retirement
+> and so no answer to item 6. `Inet6AddressImpl.lookupAllHostAddr` turned out
+> to be a registration naming a descriptor the JDK 25 image does not declare,
+> and fixing it uncovered a second, larger defect in the literal screen worth
+> 190 differing rows. Item 8's fixture exists and found 21 defects on its first
+> run. Items 1, 3, 5, 6, 9 and 10 stand as written.
+
+
 Every KEEP in this lane except the TLS/JCA question is **one nameable change
 away from being a candidate again**, and this wave found the change and the
 vector that tests it. Ordered by rows unblocked per unit of work.
