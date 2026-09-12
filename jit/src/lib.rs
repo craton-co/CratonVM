@@ -624,8 +624,23 @@ impl ExecutableBuffer {
     }
 
     /// AUDIT: mark this buffer as reachable by generated code.
+    ///
+    /// Also the code-cache install count: a published body is counted once
+    /// here and once more when its mapping is released (`Drop`), so installed
+    /// minus reclaimed is exactly the published code still mapped. See
+    /// [`jit_code_reclamation_stats`].
     #[inline]
     pub fn mark_published(&mut self) {
+        if !self.published {
+            use std::sync::atomic::Ordering::Relaxed;
+            RECLAMATION.installed_bodies.fetch_add(1, Relaxed);
+            RECLAMATION
+                .installed_bytes
+                .fetch_add(self.capacity as u64, Relaxed);
+            RECLAMATION
+                .installed_code_bytes
+                .fetch_add(self.len as u64, Relaxed);
+        }
         self.published = true;
     }
 
@@ -1083,9 +1098,20 @@ fn jit_code_cache_at_capacity() -> bool {
     if cap == usize::MAX {
         return false; // cap disabled
     }
-    let used = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let mut used = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     if used < cap {
         return false;
+    }
+    // Retired bodies waiting in the retirement queue are committed bytes too.
+    // Try to release them before refusing a compile on their account: a queue
+    // that drained only at process-wide quiescence used to pin the cache at its
+    // cap for as long as one thread stayed parked inside compiled code.
+    if jit_retirement_queue_len() != 0 {
+        drain_deferred_jit_owners();
+        used = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        if used < cap {
+            return false;
+        }
     }
     // At/over the cap: warn exactly once, then keep refusing silently.
     if !JIT_CODE_CACHE_CAP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1151,6 +1177,16 @@ impl Drop for ExecutableBuffer {
         if self.published {
             flags |= CODE_FREE_PUBLISHED;
             PUBLISHED_CODE_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The reclaim half of `mark_published`'s install accounting.
+            RECLAMATION
+                .reclaimed_bodies
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            RECLAMATION
+                .reclaimed_bytes
+                .fetch_add(self.capacity as u64, std::sync::atomic::Ordering::Relaxed);
+            RECLAMATION
+                .reclaimed_code_bytes
+                .fetch_add(self.len as u64, std::sync::atomic::Ordering::Relaxed);
             if !authorised {
                 // THE invariant this module exists to keep. A published body's
                 // mapping may only be returned from inside a reclamation the
@@ -16015,11 +16051,167 @@ static JIT_CACHE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// [`cratonvm_types::striped_counter`].
 static ACTIVE_JIT_EXECUTIONS: cratonvm_types::striped_counter::StripedCounter =
     cratonvm_types::striped_counter::StripedCounter::new();
-static DEFERRED_JIT_OWNERS: std::sync::OnceLock<parking_lot::Mutex<Vec<Arc<CompiledMethod>>>> =
+/// One owner handed to the retirement queue.
+struct DeferredOwner {
+    /// Retirement generation stamped AFTER the owner's raw targets were
+    /// unpublished. A thread that returns to JIT depth 0 after this generation
+    /// cannot hold the body on its stack.
+    retired_gen: u64,
+    /// Start of the body's executable buffer: the identity a blocked thread's
+    /// stack summary records.
+    buffer_start: usize,
+    /// Reserved bytes of that buffer, for the queue gauge.
+    bytes: u64,
+    owner: Arc<CompiledMethod>,
+}
+
+static DEFERRED_JIT_OWNERS: std::sync::OnceLock<parking_lot::Mutex<Vec<DeferredOwner>>> =
     std::sync::OnceLock::new();
 
+/// Code-cache install and reclamation accounting, read by
+/// [`jit_code_reclamation_stats`]. Relaxed counters: observability, not a
+/// transaction.
+struct ReclamationCounters {
+    installed_bodies: std::sync::atomic::AtomicU64,
+    installed_bytes: std::sync::atomic::AtomicU64,
+    installed_code_bytes: std::sync::atomic::AtomicU64,
+    withdrawn_bodies: std::sync::atomic::AtomicU64,
+    withdrawn_bytes: std::sync::atomic::AtomicU64,
+    queued_owners: std::sync::atomic::AtomicU64,
+    queued_bytes: std::sync::atomic::AtomicU64,
+    reclaimed_bodies: std::sync::atomic::AtomicU64,
+    reclaimed_bytes: std::sync::atomic::AtomicU64,
+    reclaimed_code_bytes: std::sync::atomic::AtomicU64,
+    drains: std::sync::atomic::AtomicU64,
+    drains_quiescent: std::sync::atomic::AtomicU64,
+    drains_by_thread_evidence: std::sync::atomic::AtomicU64,
+    drains_deferred: std::sync::atomic::AtomicU64,
+}
+
+impl ReclamationCounters {
+    const fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
+        Self {
+            installed_bodies: AtomicU64::new(0),
+            installed_bytes: AtomicU64::new(0),
+            installed_code_bytes: AtomicU64::new(0),
+            withdrawn_bodies: AtomicU64::new(0),
+            withdrawn_bytes: AtomicU64::new(0),
+            queued_owners: AtomicU64::new(0),
+            queued_bytes: AtomicU64::new(0),
+            reclaimed_bodies: AtomicU64::new(0),
+            reclaimed_bytes: AtomicU64::new(0),
+            reclaimed_code_bytes: AtomicU64::new(0),
+            drains: AtomicU64::new(0),
+            drains_quiescent: AtomicU64::new(0),
+            drains_by_thread_evidence: AtomicU64::new(0),
+            drains_deferred: AtomicU64::new(0),
+        }
+    }
+}
+
+static RECLAMATION: ReclamationCounters = ReclamationCounters::new();
+
+/// One thread's part in the quiescence proof code reclamation needs.
+///
+/// The process-wide `ACTIVE_JIT_EXECUTIONS` count can prove "no thread is in
+/// compiled code", and nothing else. A thread that never returns from compiled
+/// code — a pool worker parked in `LinkedBlockingQueue.take()` — keeps it above
+/// zero forever, and before these records existed no retired body was released
+/// until the code-cache cap refused every compile. Per-thread evidence lets the
+/// drain decide body by body instead. See [`drain_deferred_jit_owners`].
+struct JitThreadQuiescence {
+    /// JIT executions this thread holds. Written only by its own thread.
+    depth: std::sync::atomic::AtomicUsize,
+    /// The retirement generation read the last time this thread returned to
+    /// depth 0, read with its depth already 0. Written only by its own thread.
+    quiescent_gen: std::sync::atomic::AtomicU64,
+    /// Nesting of blocked windows ([`jit_thread_blocked_enter`]). Written only
+    /// by its own thread.
+    blocked_nesting: std::sync::atomic::AtomicU32,
+    /// What this thread's stack can return into while it is blocked.
+    blocked: parking_lot::Mutex<BlockedStackSummary>,
+}
+
+#[derive(Default)]
+struct BlockedStackSummary {
+    /// The scan completed, the thread is still inside the blocked window the
+    /// scan was taken at, and it has run no compiled code since. Cleared under
+    /// the lock before the thread can run compiled code again.
+    valid: bool,
+    /// Sorted, deduplicated starts of every executable buffer a word of the
+    /// scanned stack band points into.
+    buffers: Vec<usize>,
+}
+
+/// Every thread that has ever entered compiled code and has not exited.
+static JIT_THREADS: std::sync::OnceLock<parking_lot::Mutex<Vec<Arc<JitThreadQuiescence>>>> =
+    std::sync::OnceLock::new();
+
+fn jit_threads() -> &'static parking_lot::Mutex<Vec<Arc<JitThreadQuiescence>>> {
+    JIT_THREADS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+/// JIT executions entered on a thread whose quiescence record is already gone
+/// (thread teardown). While non-zero the per-thread evidence is incomplete, so
+/// only the process-wide fast path may release bodies.
+static UNTRACKED_JIT_EXECUTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Returns to depth 0 between two drain attempts one thread makes while the
+/// retirement queue is non-empty. Per-thread evidence walks every registered
+/// thread, so it must not ride every return.
+const DRAIN_PUMP_INTERVAL: u32 = 32;
+
+/// The calling thread's entry in [`JIT_THREADS`], removed when the thread exits.
+struct ThreadQuiescenceHandle {
+    record: Arc<JitThreadQuiescence>,
+    drain_countdown: std::cell::Cell<u32>,
+}
+
+impl ThreadQuiescenceHandle {
+    fn register() -> Self {
+        let record = Arc::new(JitThreadQuiescence {
+            depth: std::sync::atomic::AtomicUsize::new(0),
+            quiescent_gen: std::sync::atomic::AtomicU64::new(0),
+            blocked_nesting: std::sync::atomic::AtomicU32::new(0),
+            blocked: parking_lot::Mutex::new(BlockedStackSummary::default()),
+        });
+        jit_threads().lock().push(Arc::clone(&record));
+        THREAD_QUIESCENCE_REGISTERED.with(|registered| registered.set(true));
+        Self {
+            record,
+            drain_countdown: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl Drop for ThreadQuiescenceHandle {
+    fn drop(&mut self) {
+        // Thread exit: its thread function has returned, so no compiled frame
+        // of it remains anywhere.
+        self.record
+            .depth
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.record.blocked.lock().valid = false;
+        jit_threads()
+            .lock()
+            .retain(|thread| !Arc::ptr_eq(thread, &self.record));
+    }
+}
+
+thread_local! {
+    static THREAD_QUIESCENCE: ThreadQuiescenceHandle = ThreadQuiescenceHandle::register();
+    /// Whether this thread ever registered a quiescence record. Lets a blocked
+    /// transition on a thread that never entered compiled code — most parks in
+    /// the process — skip registering one.
+    static THREAD_QUIESCENCE_REGISTERED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Retirement generation: advanced AFTER every withdrawal of a raw target from
-/// a place generated code reads without a lock (an inline-cache way).
+/// a place generated code reads without a lock (an inline-cache way), and for
+/// every owner handed to the retirement queue.
 ///
 /// A withdrawal stamped `g` is graced — its way may be reused for a different
 /// receiver — once `g <= JIT_GRACED_GENERATION`, i.e. once every thread has
@@ -16179,7 +16371,7 @@ slot of {:#x} ({})",
     STALE_IC_SCANNING.with(|f| f.set(false));
 }
 
-fn deferred_jit_owners() -> &'static parking_lot::Mutex<Vec<Arc<CompiledMethod>>> {
+fn deferred_jit_owners() -> &'static parking_lot::Mutex<Vec<DeferredOwner>> {
     DEFERRED_JIT_OWNERS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
@@ -16329,51 +16521,402 @@ fn jit_leak_code_enabled() -> bool {
     })
 }
 
-fn drain_deferred_jit_owners_if_quiescent() {
+/// Code-cache install and reclamation accounting, as one snapshot.
+///
+/// Read one relaxed counter at a time, so a snapshot taken during a
+/// publication or a drain can be off by that event. Installs and reclaims are
+/// both counted on the executable buffer of a PUBLISHED body
+/// (`ExecutableBuffer::mark_published` and its `Drop`), so
+/// `installed - reclaimed` is exactly the published code still mapped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitCodeReclamationStats {
+    /// Bodies published into a dispatch surface.
+    pub installed_bodies: u64,
+    /// Reserved bytes of those bodies.
+    pub installed_bytes: u64,
+    /// Emitted machine-code bytes of those bodies.
+    pub installed_code_bytes: u64,
+    /// Bodies withdrawn from a `JitCache`: superseded, invalidated or flushed.
+    pub withdrawn_bodies: u64,
+    /// Reserved bytes of those bodies.
+    pub withdrawn_bytes: u64,
+    /// Owners waiting in the retirement queue now (gauge). One body can be
+    /// queued by more than one holder.
+    pub queued_owners: u64,
+    /// Reserved bytes of the queued owners' bodies (gauge).
+    pub queued_bytes: u64,
+    /// Published bodies whose mapping was released.
+    pub reclaimed_bodies: u64,
+    /// Reserved bytes released.
+    pub reclaimed_bytes: u64,
+    /// Machine-code bytes released.
+    pub reclaimed_code_bytes: u64,
+    /// Drain attempts on a non-empty queue.
+    pub drains: u64,
+    /// Drains that found every thread outside compiled code.
+    pub drains_quiescent: u64,
+    /// Drains that released bodies on per-thread evidence while some thread
+    /// was still inside compiled code — typically parked there.
+    pub drains_by_thread_evidence: u64,
+    /// Drains that released nothing.
+    pub drains_deferred: u64,
+}
+
+/// Snapshot the code-cache install and reclamation accounting.
+pub fn jit_code_reclamation_stats() -> JitCodeReclamationStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &RECLAMATION;
+    JitCodeReclamationStats {
+        installed_bodies: c.installed_bodies.load(Relaxed),
+        installed_bytes: c.installed_bytes.load(Relaxed),
+        installed_code_bytes: c.installed_code_bytes.load(Relaxed),
+        withdrawn_bodies: c.withdrawn_bodies.load(Relaxed),
+        withdrawn_bytes: c.withdrawn_bytes.load(Relaxed),
+        queued_owners: c.queued_owners.load(Relaxed),
+        queued_bytes: c.queued_bytes.load(Relaxed),
+        reclaimed_bodies: c.reclaimed_bodies.load(Relaxed),
+        reclaimed_bytes: c.reclaimed_bytes.load(Relaxed),
+        reclaimed_code_bytes: c.reclaimed_code_bytes.load(Relaxed),
+        drains: c.drains.load(Relaxed),
+        drains_quiescent: c.drains_quiescent.load(Relaxed),
+        drains_by_thread_evidence: c.drains_by_thread_evidence.load(Relaxed),
+        drains_deferred: c.drains_deferred.load(Relaxed),
+    }
+}
+
+/// Owners waiting in the retirement queue. One relaxed load.
+#[inline]
+pub fn jit_retirement_queue_len() -> usize {
+    RECLAMATION
+        .queued_owners
+        .load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+/// Release every retired body no thread can still execute or return into, and
+/// report the accounting afterwards.
+pub fn reclaim_retired_jit_code() -> JitCodeReclamationStats {
+    drain_deferred_jit_owners();
+    jit_code_reclamation_stats()
+}
+
+/// Why a queued body may be released while some thread is still inside
+/// compiled code. Collected with the retirement queue lock held, so every
+/// reading in it postdates the unpublication of every queued body.
+struct ThreadQuiescenceEvidence {
+    /// Every thread inside compiled code and not blocked has returned to JIT
+    /// depth 0 after this retirement generation was reached.
+    min_running_gen: u64,
+    /// For each thread blocked inside compiled code: the generation it last
+    /// returned to depth 0 at, and the sorted executable-buffer starts its
+    /// stack can return into.
+    blocked: Vec<(u64, Vec<usize>)>,
+}
+
+impl ThreadQuiescenceEvidence {
+    /// Whether no thread can still be executing, or return into, `body`.
+    ///
+    /// A running thread is safe once it has been at depth 0 after the body's
+    /// retirement stamp. A blocked thread is safe on the same condition, or
+    /// when no word on its stack points into the body: it cannot run compiled
+    /// code without first leaving the blocked window, and when it does it can
+    /// only return through the addresses its stack holds or enter through a
+    /// dispatch surface — and the body was unpublished from every surface
+    /// before it was queued.
+    fn permits(&self, body: &DeferredOwner) -> bool {
+        body.retired_gen <= self.min_running_gen
+            && self.blocked.iter().all(|(quiescent_gen, buffers)| {
+                body.retired_gen <= *quiescent_gen
+                    || buffers.binary_search(&body.buffer_start).is_err()
+            })
+    }
+}
+
+/// Per-thread quiescence evidence, or `None` when some JIT execution runs on a
+/// thread whose record is gone and so cannot be vouched for.
+///
+/// Lock order: the retirement queue (held by the caller), then [`JIT_THREADS`],
+/// then one thread's summary at a time.
+fn collect_thread_quiescence_evidence() -> Option<ThreadQuiescenceEvidence> {
+    use std::sync::atomic::Ordering;
+    if UNTRACKED_JIT_EXECUTIONS.load(Ordering::Acquire) != 0 {
+        return None;
+    }
+    let threads: Vec<Arc<JitThreadQuiescence>> = jit_threads().lock().clone();
+    let mut evidence = ThreadQuiescenceEvidence {
+        min_running_gen: u64::MAX,
+        blocked: Vec::new(),
+    };
+    for thread in &threads {
+        // Depth 0 now: outside compiled code at an instant after every queued
+        // unpublication, so this thread holds none of the queued bodies.
+        if thread.depth.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        let quiescent_gen = thread.quiescent_gen.load(Ordering::Acquire);
+        {
+            // Holding this lock while `valid` reads true proves the thread is
+            // still blocked: it clears `valid` under this lock before it can
+            // run compiled code again.
+            let summary = thread.blocked.lock();
+            if summary.valid {
+                evidence
+                    .blocked
+                    .push((quiescent_gen, summary.buffers.clone()));
+                continue;
+            }
+        }
+        evidence.min_running_gen = evidence.min_running_gen.min(quiescent_gen);
+    }
+    Some(evidence)
+}
+
+/// Republish the queue gauges. Caller holds the queue lock.
+fn publish_queue_gauges(queue: &[DeferredOwner]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    RECLAMATION
+        .queued_owners
+        .store(queue.len() as u64, Relaxed);
+    RECLAMATION
+        .queued_bytes
+        .store(queue.iter().map(|body| body.bytes).sum(), Relaxed);
+}
+
+/// Release every queued owner no thread can still execute or return into.
+///
+/// Two proofs, tried in order. The process-wide one: every thread was outside
+/// compiled code at some instant after the queue lock was taken, which frees
+/// everything. The per-thread one, used while some thread is still in compiled
+/// code: see [`ThreadQuiescenceEvidence::permits`]. It is what lets a thread
+/// parked inside compiled code stop holding every retired body in the process.
+fn drain_deferred_jit_owners() {
+    use std::sync::atomic::Ordering;
     if jit_leak_code_enabled() {
         return;
     }
-    // Take the lock BEFORE reading the quiescence counter, and hold it across
-    // both.
-    //
-    // Reading `is_zero()` first is a use-after-free of executable memory: this
-    // thread can observe zero at t0, be descheduled while another thread enters
-    // JIT at t1 and a third unpublishes-and-queues a body at t2 > t1, then
-    // resume and free that body on the strength of a t0 witness that predates
-    // its unpublication. Queueing also takes this lock, so holding it across
-    // the read guarantees the witness postdates every queued body's
-    // unpublication.
-    let mut queue = deferred_jit_owners().lock();
-    let observed = JIT_RETIRE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-    if !ACTIVE_JIT_EXECUTIONS.is_zero() {
+    let released: Vec<DeferredOwner> = {
+        // Take the lock BEFORE any quiescence observation, and hold it across
+        // them. Observing first is a use-after-free of executable memory: this
+        // thread can observe quiescence at t0, be descheduled while another
+        // thread enters JIT at t1 and a third unpublishes-and-queues a body at
+        // t2 > t1, then resume and free that body on the strength of a t0
+        // witness that predates its unpublication. Queueing also takes this
+        // lock, so holding it guarantees every witness postdates every queued
+        // body's unpublication.
+        let mut queue = deferred_jit_owners().lock();
+        if queue.is_empty() {
+            return;
+        }
+        RECLAMATION.drains.fetch_add(1, Ordering::Relaxed);
+        let observed = JIT_RETIRE_GENERATION.load(Ordering::Acquire);
+        let released = if ACTIVE_JIT_EXECUTIONS.is_zero() {
+            note_graced_generation(observed);
+            RECLAMATION.drains_quiescent.fetch_add(1, Ordering::Relaxed);
+            std::mem::take(&mut *queue)
+        } else if let Some(evidence) = collect_thread_quiescence_evidence() {
+            // A blocked thread cannot be between an inline-cache compare and
+            // its entry load, so only running threads bound the grace of a
+            // retired way.
+            note_graced_generation(observed.min(evidence.min_running_gen));
+            let (released, kept): (Vec<DeferredOwner>, Vec<DeferredOwner>) =
+                std::mem::take(&mut *queue)
+                    .into_iter()
+                    .partition(|body| evidence.permits(body));
+            *queue = kept;
+            if !released.is_empty() {
+                RECLAMATION
+                    .drains_by_thread_evidence
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            released
+        } else {
+            Vec::new()
+        };
+        if released.is_empty() {
+            RECLAMATION.drains_deferred.fetch_add(1, Ordering::Relaxed);
+        }
+        publish_queue_gauges(&queue);
+        released
+    };
+    if released.is_empty() {
         return;
     }
-    note_graced_generation(observed);
-    let retired = std::mem::take(&mut *queue);
-    drop(queue);
+    // Outside the queue lock: dropping the last owner is where the executable
+    // mapping goes back to the OS.
     let _authorised = AuthorisedReclaim::enter();
-    drop(retired);
+    drop(released);
 }
 
 fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
+    use std::sync::atomic::Ordering;
     let Some(owner) = owner else {
         return;
     };
-    if jit_leak_code_enabled() {
-        deferred_jit_owners().lock().push(owner);
-        return;
-    }
-    let observed = JIT_RETIRE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-    if ACTIVE_JIT_EXECUTIONS.is_zero() {
+    let leak = jit_leak_code_enabled();
+    let observed = JIT_RETIRE_GENERATION.load(Ordering::Acquire);
+    if !leak && ACTIVE_JIT_EXECUTIONS.is_zero() {
+        // The caller has already unpublished this owner's raw targets, so a walk
+        // that finds every thread outside compiled code proves none can reach
+        // them.
         note_graced_generation(observed);
         let _authorised = AuthorisedReclaim::enter();
         drop(owner);
         return;
     }
-    deferred_jit_owners().lock().push(owner);
+    let body = DeferredOwner {
+        // Stamped after the caller's unpublication: a thread that returns to
+        // depth 0 after this point cannot hold the body on its stack.
+        retired_gen: bump_retire_generation(),
+        buffer_start: owner.entry as usize,
+        bytes: owner._buffer.capacity() as u64,
+        owner,
+    };
+    {
+        let mut queue = deferred_jit_owners().lock();
+        queue.push(body);
+        publish_queue_gauges(&queue);
+    }
     // Close the race where the final execution leaves between the first load
-    // and queue publication.
-    drain_deferred_jit_owners_if_quiescent();
+    // and queue publication, and let per-thread evidence release it at once
+    // when the only threads still in compiled code are parked elsewhere.
+    drain_deferred_jit_owners();
+}
+
+/// A body leaving a [`JitCache`] — superseded, invalidated or flushed. Counted
+/// as a withdrawal, then handed to the retirement queue like any other owner.
+fn retire_withdrawn_body(body: Option<Arc<CompiledMethod>>) {
+    if let Some(cm) = &body {
+        use std::sync::atomic::Ordering::Relaxed;
+        RECLAMATION.withdrawn_bodies.fetch_add(1, Relaxed);
+        RECLAMATION
+            .withdrawn_bytes
+            .fetch_add(cm._buffer.capacity() as u64, Relaxed);
+    }
+    defer_jit_owner(body);
+}
+
+/// Record the start of every executable buffer a word of `[lo, hi)` points
+/// into, sorted and deduplicated, into `out`.
+///
+/// Conservative: a stale word counts, which only retains more. Returns `false`
+/// for a band too large to scan, which leaves the summary unusable — the thread
+/// then counts as running, the fail-safe direction.
+///
+/// # Safety
+///
+/// Every byte of `[lo, hi)` must be readable.
+unsafe fn collect_code_buffers_in_band(lo: usize, hi: usize, out: &mut Vec<usize>) -> bool {
+    const MAX_BAND_BYTES: usize = 1 << 20;
+    let lo = (lo + 7) & !7usize;
+    if hi <= lo {
+        return true;
+    }
+    if hi - lo > MAX_BAND_BYTES {
+        return false;
+    }
+    // Every `ExecutableBuffer` is in this snapshot from `new` to `Drop`, so a
+    // body a frame on this stack can return into is always in it.
+    let regions = jit_code_region_snapshot().load();
+    let (Some(&(envelope_lo, _)), Some(&(_, envelope_hi))) = (regions.first(), regions.last())
+    else {
+        return true;
+    };
+    let mut addr = lo;
+    while addr + 8 <= hi {
+        // SAFETY: the caller guarantees the band is readable; `addr` is 8-byte
+        // aligned and `addr + 8 <= hi`.
+        let word = unsafe { (addr as *const usize).read() };
+        // Regions are sorted and disjoint, so their envelope rejects almost
+        // every word with two compares before the binary search.
+        if word >= envelope_lo && word < envelope_hi {
+            if let Some((start, _)) = region_containing_in(&regions, word) {
+                out.push(start);
+            }
+        }
+        addr += 8;
+    }
+    out.sort_unstable();
+    out.dedup();
+    true
+}
+
+/// Record, at a transition into a blocked state, which executable buffers the
+/// calling thread's stack can return into while it stays blocked.
+///
+/// A thread parked inside compiled code holds its JIT execution for as long as
+/// it is parked. While blocked it can only return through the addresses on its
+/// stack; it cannot run compiled code without first calling
+/// [`jit_thread_blocked_leave`] or re-entering through [`jit_execution_enter`],
+/// and both withdraw this summary before anything runs. So a retired body none
+/// of those addresses point into is unreachable from this thread, and the drain
+/// may release it without waiting for the thread to wake.
+///
+/// `[stack_lo, stack_hi)` must cover every frame between the caller and the
+/// thread's outermost compiled entry. Nested windows keep the outermost
+/// window's summary. A thread holding no JIT execution records nothing — its
+/// depth of 0 already vouches for it.
+///
+/// # Safety
+///
+/// Every byte of `[stack_lo, stack_hi)` must be readable for the duration of
+/// the call. Callers pass a band of the calling thread's own stack.
+pub unsafe fn jit_thread_blocked_enter(stack_lo: usize, stack_hi: usize) {
+    use std::sync::atomic::Ordering;
+    if !THREAD_QUIESCENCE_REGISTERED.with(std::cell::Cell::get) {
+        return;
+    }
+    let _ = THREAD_QUIESCENCE.try_with(|handle| {
+        let record = &handle.record;
+        let nesting = record.blocked_nesting.load(Ordering::Relaxed);
+        record
+            .blocked_nesting
+            .store(nesting.saturating_add(1), Ordering::Release);
+        if nesting != 0 || record.depth.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        // Scan without the summary lock held, into the summary's own buffer.
+        let mut buffers = std::mem::take(&mut record.blocked.lock().buffers);
+        buffers.clear();
+        // SAFETY: the caller guarantees the band is readable.
+        let complete = unsafe { collect_code_buffers_in_band(stack_lo, stack_hi, &mut buffers) };
+        let mut summary = record.blocked.lock();
+        summary.buffers = buffers;
+        summary.valid = complete;
+    });
+}
+
+/// End the blocked window [`jit_thread_blocked_enter`] opened.
+pub fn jit_thread_blocked_leave() {
+    use std::sync::atomic::Ordering;
+    if !THREAD_QUIESCENCE_REGISTERED.with(std::cell::Cell::get) {
+        return;
+    }
+    let _ = THREAD_QUIESCENCE.try_with(|handle| {
+        let record = &handle.record;
+        let nesting = record.blocked_nesting.load(Ordering::Relaxed);
+        if nesting == 0 {
+            return;
+        }
+        record.blocked_nesting.store(nesting - 1, Ordering::Release);
+        if nesting == 1 {
+            // Under the summary lock: a drain that read the summary as valid
+            // held this lock, so it read it while this thread was still
+            // blocked.
+            record.blocked.lock().valid = false;
+        }
+    });
+}
+
+/// Whether a [`JitExecutionToken`] was counted in its thread's quiescence
+/// record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionTracking {
+    /// A placeholder no `enter` produced.
+    Unset,
+    /// Counted in the thread's [`JitThreadQuiescence::depth`].
+    Tracked,
+    /// The thread's record was already gone; counted in
+    /// [`UNTRACKED_JIT_EXECUTIONS`].
+    Untracked,
 }
 
 /// What one [`jit_execution_enter`] recorded, for the matching
@@ -16382,36 +16925,115 @@ fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
 /// Carries the striped counter's stripe so the decrement lands where the
 /// increment did even when the leave runs during thread teardown, after the
 /// thread's stripe thread-local is gone (see
-/// [`cratonvm_types::striped_counter::StripeToken`]).
+/// [`cratonvm_types::striped_counter::StripeToken`]), and which per-thread
+/// count the entry went into.
 #[derive(Clone, Copy, Debug)]
 pub struct JitExecutionToken {
     stripe: cratonvm_types::striped_counter::StripeToken,
+    tracking: ExecutionTracking,
 }
 
 impl JitExecutionToken {
     /// A token no `enter` produced; leaving with it changes no count.
     pub const UNSET: JitExecutionToken = JitExecutionToken {
         stripe: cratonvm_types::striped_counter::StripeToken::UNSET,
+        tracking: ExecutionTracking::Unset,
     };
 }
 
-/// Enter/leave the process-wide executable-code quiescence epoch. VM JIT entry
-/// guards call these at the same boundaries as their precise frame chain, and
-/// keep the returned token beside the entry it describes.
+/// Enter/leave the executable-code quiescence epoch. VM JIT entry guards call
+/// these at the same boundaries as their precise frame chain, and keep the
+/// returned token beside the entry it describes.
+///
+/// Each call updates both the process-wide count (the drain's fast path) and
+/// this thread's own depth, which is what lets a drain release a body while
+/// some other thread stays inside compiled code.
 #[must_use = "the token must be passed to the matching jit_execution_leave"]
 pub fn jit_execution_enter() -> JitExecutionToken {
+    use std::sync::atomic::Ordering;
+    let tracked = THREAD_QUIESCENCE
+        .try_with(|handle| {
+            let record = &handle.record;
+            let depth = record.depth.load(Ordering::Relaxed);
+            record.depth.store(depth + 1, Ordering::Release);
+            if record.blocked_nesting.load(Ordering::Relaxed) != 0 {
+                // Compiled code is about to run inside a blocked window — a
+                // native method calling back into Java. Frames it pushes can
+                // reach bodies published after the window's stack scan, so the
+                // summary stops vouching for this thread before any of that
+                // code runs.
+                record.blocked.lock().valid = false;
+            }
+        })
+        .is_ok();
+    let tracking = if tracked {
+        ExecutionTracking::Tracked
+    } else {
+        UNTRACKED_JIT_EXECUTIONS.fetch_add(1, Ordering::AcqRel);
+        ExecutionTracking::Untracked
+    };
     JitExecutionToken {
         stripe: ACTIVE_JIT_EXECUTIONS.inc_token(),
+        tracking,
     }
 }
 
 pub fn jit_execution_leave(token: JitExecutionToken) {
+    use std::sync::atomic::Ordering;
     ACTIVE_JIT_EXECUTIONS.dec_token(token.stripe);
-    // The retirement drain only needs to run when this was the last activation
-    // anywhere. `is_zero` short-circuits on the first live stripe, so the
-    // common "some other thread is still in JIT" case costs one load.
-    if ACTIVE_JIT_EXECUTIONS.is_zero() {
-        drain_deferred_jit_owners_if_quiescent();
+    let mut pump = false;
+    match token.tracking {
+        ExecutionTracking::Unset => return,
+        ExecutionTracking::Untracked => {
+            let _ = UNTRACKED_JIT_EXECUTIONS.fetch_update(
+                Ordering::Release,
+                Ordering::Acquire,
+                |n| Some(n.saturating_sub(1)),
+            );
+        }
+        ExecutionTracking::Tracked => {
+            let _ = THREAD_QUIESCENCE.try_with(|handle| {
+                let record = &handle.record;
+                let depth = record.depth.load(Ordering::Relaxed).saturating_sub(1);
+                record.depth.store(depth, Ordering::Release);
+                if depth != 0 {
+                    return;
+                }
+                // Read with this thread's depth already 0: every retirement
+                // stamped at or below it predates an instant at which this
+                // thread held no compiled frame.
+                record.quiescent_gen.store(
+                    JIT_RETIRE_GENERATION.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                if RECLAMATION.queued_owners.load(Ordering::Relaxed) != 0 {
+                    let left = handle.drain_countdown.get();
+                    if left == 0 {
+                        handle.drain_countdown.set(DRAIN_PUMP_INTERVAL);
+                        pump = true;
+                    } else {
+                        handle.drain_countdown.set(left - 1);
+                    }
+                }
+            });
+        }
+    }
+    if RECLAMATION.queued_owners.load(Ordering::Relaxed) != 0 {
+        // The process-wide proof is one short-circuiting walk and can free
+        // everything; per-thread evidence walks the registry, so it rides only
+        // this thread's pump.
+        if pump || ACTIVE_JIT_EXECUTIONS.is_zero() {
+            drain_deferred_jit_owners();
+        }
+    } else if JIT_RETIRE_GENERATION.load(Ordering::Relaxed)
+        > JIT_GRACED_GENERATION.load(Ordering::Relaxed)
+    {
+        // Nothing queued, but a retired inline-cache way may be waiting out its
+        // grace period.
+        let observed = JIT_RETIRE_GENERATION.load(Ordering::Acquire);
+        if ACTIVE_JIT_EXECUTIONS.is_zero() {
+            note_graced_generation(observed);
+        }
     }
 }
 
@@ -17069,7 +17691,7 @@ publication"
         // inline caches use: `defer_jit_owner` drops immediately when no JIT
         // execution is in flight (the common case, so no retention change) and
         // otherwise holds the `Arc` until `ACTIVE_JIT_EXECUTIONS` reaches zero.
-        defer_jit_owner(superseded.map(|(_, cm)| cm));
+        retire_withdrawn_body(superseded.map(|(_, cm)| cm));
         // T2.2 — bump on EVERY publication, not just replacements. A first-time
         // insertion is exactly the event the interpreter's negative
         // "no compiled body for this method" memo
@@ -17152,7 +17774,7 @@ publication"
         shard.osr_methods.store(Arc::new(next));
         // Same reasoning as `put` — an OSR body is, if anything, more likely to
         // be mid-execution when it is replaced.
-        defer_jit_owner(superseded.map(|(_, cm)| cm));
+        retire_withdrawn_body(superseded.map(|(_, cm)| cm));
         // T2.2 — unconditional, for the same reason as `put` above.
         JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -17365,7 +17987,7 @@ publication"
                 removed += old_len - next.len();
                 shard.methods.store(Arc::new(next));
                 for cm in evicted {
-                    defer_jit_owner(Some(cm));
+                    retire_withdrawn_body(Some(cm));
                 }
             }
 
@@ -17382,7 +18004,7 @@ publication"
                 removed += old_len - next.len();
                 shard.osr_methods.store(Arc::new(next));
                 for cm in evicted {
-                    defer_jit_owner(Some(cm));
+                    retire_withdrawn_body(Some(cm));
                 }
             }
         }
@@ -17445,7 +18067,7 @@ publication"
             shard.methods.store(Arc::new(FxHashMap::default()));
             shard.osr_methods.store(Arc::new(FxHashMap::default()));
             for cm in evicted {
-                defer_jit_owner(Some(cm));
+                retire_withdrawn_body(Some(cm));
             }
         }
         if count != 0 {
@@ -38896,6 +39518,80 @@ mod tests {
         assert!(
             eventually_drained(|| lookup_jit_code_range(entry).is_none()),
             "the quiescent transition must drain deferred code owners"
+        );
+    }
+
+    /// A thread parked inside compiled code — a pool worker blocked in
+    /// `LinkedBlockingQueue.take()` — used to hold `ACTIVE_JIT_EXECUTIONS` up
+    /// for as long as it stayed parked, so nothing retired after it parked was
+    /// ever released and the code cache filled to its cap. While blocked, the
+    /// thread can only return into what its stack names: a retired body it
+    /// does not name must be reclaimed without waiting for it to wake, and one
+    /// it does name must be kept until it leaves.
+    #[test]
+    fn a_thread_parked_in_compiled_code_holds_only_what_its_stack_names() {
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("ParkedInJitClass");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(4723);
+        let publish = |name: &str| {
+            let method: Arc<str> = Arc::from(name);
+            let mut buf = ExecutableBuffer::new(64).expect("alloc body");
+            buf.emit(&[0xC3]);
+            cache.put(
+                class.clone(),
+                method.clone(),
+                desc.clone(),
+                cid,
+                CompiledMethod::new(buf),
+            );
+            let cm = cache
+                .get(&class, &method, &desc, cid)
+                .expect("published");
+            let entry = cm.entry_ptr() as usize;
+            (method, Arc::downgrade(&cm), entry)
+        };
+        let (unrelated_method, unrelated, _) = publish("unrelated");
+        let (held_method, held, held_entry) = publish("held");
+
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::thread::spawn(move || {
+            let execution = jit_execution_enter();
+            // This thread's stack band while parked: a return address into
+            // `held`, and nothing that points into `unrelated`.
+            let band: [usize; 8] = [0, 0x10, held_entry + 4, 0, 0, 0, 0, 0];
+            let lo = band.as_ptr() as usize;
+            let hi = lo + std::mem::size_of_val(&band);
+            // SAFETY: `band` is a live local array on this thread's stack for
+            // the whole blocked window.
+            unsafe { jit_thread_blocked_enter(lo, hi) };
+            parked_tx.send(()).expect("the test waits for the park");
+            wake_rx.recv().expect("the test wakes the thread");
+            jit_thread_blocked_leave();
+            std::hint::black_box(&band);
+            jit_execution_leave(execution);
+        });
+        parked_rx.recv().expect("the thread parks");
+
+        cache.remove(&class, &unrelated_method, &desc, cid);
+        cache.remove(&class, &held_method, &desc, cid);
+        assert!(
+            eventually_drained(|| unrelated.strong_count() == 0),
+            "a retired body no parked thread can return into must be reclaimed \
+             while that thread is still parked inside compiled code"
+        );
+        assert_ne!(
+            held.strong_count(),
+            0,
+            "a retired body the parked thread's stack names must be kept"
+        );
+
+        wake_tx.send(()).expect("the parked thread is waiting");
+        parked.join().expect("the parked thread finishes");
+        assert!(
+            eventually_drained(|| held.strong_count() == 0),
+            "and released once the thread has left compiled code"
         );
     }
 

@@ -1173,17 +1173,11 @@ pub fn pop_jit_entry() -> Option<usize> {
             "jit::conservative_roots::pop_jit_entry",
         );
         cratonvm_gc::gc_quiescence::leave();
+        // P1 code-cache retirement: `jit_execution_leave` is also the
+        // retirement queue's wake-up. It records this thread's return to depth
+        // 0 and drains when that can release something, so this hot path owes
+        // the queue nothing more.
         cratonvm_jit::jit_execution_leave(entry.exec_token);
-        // P1 code-cache retirement: leaving a compiled frame is one of the two
-        // moments `GLOBAL_JIT_DEPTH` can reach zero, and therefore one of the
-        // two moments an unpublished body can become reclaimable. The sweep
-        // asks the quiescence question itself (with the retirement queue lock
-        // held — see `code_cache_lifecycle`'s §1.2); all this site owes it is
-        // the wake-up. The gate is one relaxed load, and with nothing queued —
-        // the overwhelmingly common case — that is the whole cost.
-        if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
-            crate::jit::code_cache_lifecycle::sweep_if_quiescent();
-        }
         note_jit_residue(entry.entry_sp);
         Some(entry.entry_sp)
     } else {
@@ -1303,12 +1297,12 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
             pruned,
             scanner_sp,
         );
-        // P1 code-cache retirement: the self-heal is the OTHER way
-        // `GLOBAL_JIT_DEPTH` reaches zero. Without this wake-up a leaked
-        // `JitEntryGuard` would wedge the retirement queue exactly as it used
-        // to wedge the moving collector — and because retention is the
-        // fail-safe, that would show up as unbounded code-cache growth rather
-        // than as a crash. See `code_cache_lifecycle`'s §1.3.
+        // P1 code-cache retirement: a leaked `JitEntryGuard` is exactly what
+        // wedges the retirement queue, and each leave above pumps the drain only
+        // on its thread's schedule. Ask once, explicitly, now that the wedge is
+        // gone — retention is the fail-safe, so a missed wake-up would show up
+        // as code-cache growth rather than as a crash. See
+        // `code_cache_lifecycle`'s §1.3.
         if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
             crate::jit::code_cache_lifecycle::sweep_if_quiescent();
         }
@@ -5326,6 +5320,52 @@ pub fn any_thread_in_jit() -> bool {
 #[inline]
 pub fn current_thread_jit_depth() -> usize {
     JIT_ENTRY_CHAIN.with(|c| c.borrow().len())
+}
+
+/// Code reclamation: publish, at a transition into a blocked state, which
+/// compiled bodies this thread's stack can return into while it stays blocked.
+///
+/// A thread parked inside compiled code (a pool worker in
+/// `LinkedBlockingQueue.take()`) holds a JIT execution for as long as it is
+/// parked, so the process-wide quiescence count never reaches zero. Every return
+/// address into compiled code on this thread lies between the current frame and
+/// the outermost JIT entry's captured SP, so that band is what
+/// `cratonvm_jit::jit_thread_blocked_enter` scans. See
+/// `docs/jit/code-cache-lifetime.md`.
+///
+/// `#[inline(never)]` so the stack probe lives in this frame, which stays live
+/// for the whole scan. Called by every `GcBarrier` blocked-state entry; paired
+/// with [`note_blocking_transition_leave`].
+#[inline(never)]
+pub(crate) fn note_blocking_transition_enter() {
+    let lo = current_stack_pointer();
+    // A thread holding no JIT entry passes an empty band: nothing to scan, but
+    // the window still nests, so the matching leave stays balanced.
+    let hi = outermost_jit_entry_sp().unwrap_or(lo).max(lo);
+    // SAFETY: `[lo, hi)` is this thread's own stack between this live frame and
+    // the outermost live compiled entry's SP, all of it mapped for the call.
+    unsafe { cratonvm_jit::jit_thread_blocked_enter(lo, hi) };
+}
+
+/// End the blocked window [`note_blocking_transition_enter`] opened.
+#[inline]
+pub(crate) fn note_blocking_transition_leave() {
+    cratonvm_jit::jit_thread_blocked_leave();
+}
+
+/// Highest `entry_sp` on this thread's JIT entry chain — the outermost compiled
+/// entry — or `None` with no entry. `try_with`/`try_borrow` because a blocking
+/// transition can run during thread teardown and must never panic.
+fn outermost_jit_entry_sp() -> Option<usize> {
+    JIT_ENTRY_CHAIN
+        .try_with(|chain| {
+            chain
+                .try_borrow()
+                .ok()
+                .and_then(|entries| entries.iter().map(|e| e.entry_sp).max())
+        })
+        .ok()
+        .flatten()
 }
 
 /// The active compiled frames of the CURRENT thread, outermost first, as
