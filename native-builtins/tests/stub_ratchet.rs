@@ -1997,7 +1997,35 @@ use cratonvm_types::compat::CompatibilityMode;
 /// time. Three independent derivations of one delta is what makes it a property
 /// of this branch rather than of a tree, which is the claim a re-freeze makes.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2755;
+/// # Lane 4 wave 2, 2026-09-11 — the paired ratchet, both columns PRINTED
+///
+/// `+137` in all three configurations and the total unchanged in all three:
+/// case **(b)** in the taxonomy the panic message above sets out — existing
+/// registrations relabelled `Bridge` -> `SyntheticStub` so `--jdk-only` drops
+/// them and the JDK's own bytecode runs. The rows are
+/// `RETIRED_SHADOW_L4_FFM_TRIPLES`, 137 triples over the nine
+/// `jdk/internal/foreign/layout/ValueLayouts$Of*Impl` carriers.
+///
+/// ```text
+///   arm             OFF             ON              delta
+///   (default)   2728 / 13609    2865 / 13609        +137 / 0
+///   management  2755 / 13977    2892 / 13977        +137 / 0
+///   synthetic   2728 / 13644    2865 / 13644        +137 / 0
+/// ```
+///
+/// **The OFF column was PRINTED, not inferred from a `<=` pass**, and it
+/// reproduces every constant this wave found in this file — all three stub
+/// baselines AND all three totals — so there is no inherited drift to
+/// disentangle from the delta. It was taken with
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW=jdk/internal/foreign/layout/`, so one
+/// binary answered both halves and nothing about the comparison depends on two
+/// checkouts being otherwise identical, which is what that switch exists for.
+///
+/// Measured on the MERGE with `origin/dev` at `e240573a8`, not on the branch
+/// before it: the three baselines moved twice while this wave was in flight
+/// (2609 -> 2728 and 2620 -> 2755), and the `+137` is identical each time only
+/// because it was re-measured each time rather than subtracted.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2892;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2255,7 +2283,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2755;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2728;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2865;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2435,7 +2463,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2728;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2728;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2865;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -3176,6 +3204,38 @@ fn essential_registry_is_populated() {
 /// moved this total by zero: a re-tag changes a registration's KIND, it does
 /// not remove the registration. Record: the retired
 /// `bridge-reclassification-wave` write-up.
+///
+/// ## That last sentence is true of COMPATIBLE mode only
+///
+/// 2026-09-11, lane 4 wave 2. A re-tag leaves the registration alone in
+/// compatible mode, and that is what was measured. Under `JdkOnly` it does not:
+/// `register_inner` REFUSES a `SyntheticStub`, so **every retired triple is one
+/// row fewer in the strict registry.** This floor therefore tracks a quantity
+/// the retirement campaign is deliberately driving DOWN, one wave at a time,
+/// and the reading above -- "a re-tag moves this total by zero" -- is why nine
+/// lanes have been surprised by it one at a time instead of expecting it.
+///
+/// This wave did not need the number moved, and deliberately did not move it:
+/// 137 rows take the strict registry from 10,878 to **10,741**, which clears
+/// the 10,600 above. Both columns, one binary, OFF taken with
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW=jdk/internal/foreign/layout/`:
+///
+/// ```text
+///            compatible   stubs   strict    dropped   refusals
+///   OFF        13609       2728    10878      2731      2749
+///   ON         13609       2865    10741      2868      2886
+///   delta          0       +137     -137      +137      +137
+/// ```
+///
+/// Exactly the table's row count in every column that moves and zero in the one
+/// that must not, beside a `--jdk-only` corpus at 133 passed / 0 failed on both
+/// binaries. That is the shape of evidence a collapse detector cannot see and
+/// the shape the 2026-08-10 entry above asks for.
+///
+/// **What is left is 141 rows of headroom where the design wants ~300, so the
+/// next wave crosses this floor.** When it does: re-measure BOTH columns as
+/// above, check the delta equals the table's row count in every column, and
+/// lower it on that -- never on the number alone, and never from one column.
 ///
 /// # 10,200 -> 10,900, 2026-08-11
 ///

@@ -452,14 +452,20 @@ adding them would be a re-freeze wearing an amendment's clothes.
 
 ```text
   arm             OFF             ON              delta
-  (default)   2609 / 13610    2746 / 13610        +137 / 0
-  management  2620 / 13978    2757 / 13978        +137 / 0
-  synthetic   2609 / 13645    2746 / 13645        +137 / 0
+  (default)   2728 / 13609    2865 / 13609        +137 / 0
+  management  2755 / 13977    2892 / 13977        +137 / 0
+  synthetic   2728 / 13644    2865 / 13644        +137 / 0
 ```
 
-OFF reproduces the three frozen constants exactly and the totals do not move in
-either half: case (b) in the ratchet's own taxonomy, existing registrations
-relabelled rather than new fakes registered.
+OFF reproduces every constant in the file -- all three stub baselines and all
+three totals -- and the totals do not move in either half: case (b) in the
+ratchet's own taxonomy, existing registrations relabelled rather than new fakes
+registered.
+
+**Re-measured on the merge with `origin/dev` at `e240573a8`, not carried over
+from the branch.** The three baselines moved under this wave twice while it was
+in flight (2609 -> 2728 and 2620 -> 2755) and the `+137` is identical each time
+only because it was measured each time rather than subtracted.
 
 **A collapse detector whose doc said a retirement could not move it.**
 `STRICT_MIN_TOTAL_REGISTRATIONS` in `native-builtins/tests/stub_ratchet.rs` went
@@ -474,19 +480,27 @@ deliberately driving down. Eight waves had taken it from 11,192 to 10,998 — 98
 above the floor, not the 300 the comment believes it left — and 137 more crossed
 it.
 
-Lowered 10,900 -> 10,500, with the evidence a collapse detector cannot see:
+On the branch, before the merge, this wave crossed it: 10,998 -> 10,861 against
+a floor of 10,900. **On the merge it does not, and the number is deliberately
+left alone.** A sibling lane hit the same wall the same day and lowered the
+floor 10,900 -> 10,600 for its own wave, and 137 rows now read:
 
 ```text
              compatible   stubs   strict   dropped   refusals
-   OFF         13610       2609   10998     2612      2630
-   ON          13610       2746   10861     2749      2767
+   OFF         13609       2728   10878     2731      2749
+   ON          13609       2865   10741     2868      2886
    delta           0       +137   -137      +137      +137
 ```
 
 Exactly the table's row count in every column that moves, zero in the one that
-must not, and a corpus that does not move at all. **Every lane after this one
-should expect to cross that floor too**, and the thing that makes lowering it
-safe is the paired OFF/ON measurement, never the number.
+must not, and a corpus that does not move at all. 10,741 clears 10,600, so what
+this wave leaves behind is the CORRECTION rather than a second relaxation of the
+same gate in one day.
+
+**What is left is 141 rows of headroom where the design wants ~300, so the next
+wave crosses this floor.** Every lane after this one should expect to, and the
+thing that makes lowering it safe is the paired OFF/ON measurement above --
+never the number alone, and never a re-freeze taken from one column.
 
 ### 9.10 The residual, in the terms §9.5 uses
 
