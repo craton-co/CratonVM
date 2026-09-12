@@ -1845,11 +1845,15 @@ Two registrations remain in `--jdk-only`, and neither is a retirement:
                                   because it is this VM's own. Retiring it is
                                   not meaningful; §9f is what it needs
                                   watching for instead.
-  getUnsafe()Lsun/misc/Unsafe;    the native is CORRECT (SecurityException off
-                                  the boot path, measured against HotSpot on
-                                  both 21 and 25). The divergence is the
-                                  missing core-reflection member filter, which
-                                  is cross-cutting and has its own page.
+  getUnsafe()Lsun/misc/Unsafe;    the native is correct -- it raises
+                                  SecurityException off the boot path, which is
+                                  what the JDK's own method does. What differs
+                                  is that reflection can REACH it here: all
+                                  three images hide it behind the
+                                  core-reflection member filter and this VM has
+                                  no such filter, so `getMethod` finds it where
+                                  HotSpot answers NoSuchMethodException (9d.5).
+                                  Cross-cutting, and it has its own page.
 ```
 
 §9d.4 took the last two retirable rows. 67 + 13 + 2 = 82 of that class's
