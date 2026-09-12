@@ -1691,6 +1691,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-partial-unroll", on_key: Some("CRATONVM_JIT_IR_PARTIAL_UNROLL"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-partial-unroll-factor", on_key: Some("CRATONVM_JIT_IR_PARTIAL_UNROLL_FACTOR"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "ir-sink-equal-depth", on_key: Some("CRATONVM_JIT_IR_SINK_EQUAL_DEPTH"), off_key: None, off_word: None, since: "2026-09-12" },
+    E { group: Group::JIT, token: "ir-residency-crossblock", on_key: Some("CRATONVM_JIT_IR_RESIDENCY_CROSSBLOCK"), off_key: None, off_word: None, since: "2026-09-12" },
     E { group: Group::JIT, token: "c2-accept", on_key: Some("CRATONVM_C2_ACCEPT"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "c2-accept-memo", on_key: Some("CRATONVM_C2_ACCEPT_MEMO"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-unresolved-class-trap", on_key: Some("CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP"), off_key: None, off_word: None, since: "2026-09-06" },
