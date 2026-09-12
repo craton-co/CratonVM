@@ -724,3 +724,48 @@ fn the_gate_measures_a_populated_registry() {
         registry.len()
     );
 }
+
+/// `java/util/jar/JarFile.<init>` has TWO producers, and which one wins is a
+/// fact lane 1 §10 item 5 depends on.
+///
+/// The count-based ratchets above tolerate 1,201 shadowed rows, so a duplicate
+/// is invisible individually — and this one is load-bearing. `JarFile`'s
+/// constructors are registered by
+/// `native-io/src/zip_real_jar.rs::register_jar_natives` (which mirrors the
+/// whole surface onto `java/util/zip/ZipFile` as well) and again by
+/// `native-builtins/src/phases_late/jar_manifest.rs::register_p59_jar`. The
+/// two build DIFFERENT objects, and `register` is last-write-wins, so a reader
+/// pricing a `JarFile` retirement from the wrong source file prices the wrong
+/// native. This lane has already paid for that species once, on the
+/// `ZoneInfoFile` duplicate whose note in `native-builtins/src/lib.rs` ends
+/// "the later call always wins silently".
+///
+/// This test does not judge which producer SHOULD win — it pins that a
+/// duplicate exists and prints both `file:line`s, so the next reader starts
+/// from the measurement instead of a grep. If the duplicate is ever resolved,
+/// the assert fires and the resolution gets recorded here.
+#[test]
+fn the_jarfile_constructor_has_two_producers_and_this_says_which_wins() {
+    let census = shadowed();
+    let ctors: Vec<&ShadowedRegistration> = census
+        .iter()
+        .filter(|r| r.triple().starts_with("java/util/jar/JarFile.<init>"))
+        .collect();
+    assert!(
+        !ctors.is_empty(),
+        "`java/util/jar/JarFile.<init>` reports no shadowed registration, so \
+         either the second producer is gone — in which case delete this test \
+         and record in lane 1 §10 item 5 which one survived — or the replay no \
+         longer reaches one of the two registrars, which would make the \
+         ratchets above vacuous for the whole `java/util/jar/` family."
+    );
+    let rendered: Vec<String> = ctors.iter().map(|r| render(r)).collect();
+    // Printed unconditionally: the value of this test is the two locations,
+    // and a passing test that hides them is the "reports and does not block"
+    // shape this file's own `UNSEEDED_GRACE_ENDS_UNIX` note argues against.
+    println!(
+        "java/util/jar/JarFile.<init> — {} shadowed registration(s):\n{}",
+        ctors.len(),
+        rendered.join("\n")
+    );
+}

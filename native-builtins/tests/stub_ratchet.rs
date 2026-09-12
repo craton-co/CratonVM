@@ -1432,6 +1432,144 @@ use cratonvm_types::compat::CompatibilityMode;
 /// removes the slack, and it is why this wave's delta reads +251 against the
 /// tree and +237/+248/+251 against the constants.
 ///
+/// # Re-frozen 2026-09-11 (the FOURTH merge): 2668 -> 2755, +87 for the fifth time
+///
+/// ```text
+///   dev alone   2641 / 2668 / 2641
+///   union       2728 / 2755 / 2728   totals 13609 / 13977 / 13644
+///   this branch  +87 /  +87 /  +87   totals -3
+/// ```
+///
+/// Five measurements, four dev merges, 241 commits, and the delta has not
+/// moved once. It is `RETIRED_SHADOW_L5R_TRIPLES` (67 `sun/misc/Unsafe`
+/// triples over 87 registrations) plus four deleted
+/// `AbstractExecutorService` registrations and one added
+/// `ForkJoinPool.execute(ForkJoinTask)V`. Nothing else in this branch touches
+/// either number.
+///
+/// # Re-frozen 2026-09-11 (the THIRD merge): 2622 -> 2709, +87 for the fourth time
+///
+/// Measured on the union again rather than carried forward:
+///
+/// ```text
+///   dev alone            2611 / 2622 / 2611
+///   union                2698 / 2709 / 2698   totals 13609 / 13977 / 13644
+///   this branch           +87 /  +87 /  +87   totals -3 (as isolated by the
+///                                             substitution on the block below)
+/// ```
+///
+/// Four measurements across three dev merges and 229 commits, and the delta
+/// has been +87 stubs and -3 total every time. A number that survives that
+/// much churn underneath it is measuring the change rather than the tree.
+///
+/// # Re-frozen 2026-09-11 (the SECOND merge): 2620 -> 2707, isolated by substitution
+///
+/// Dev moved 91 more commits between this branch's verification and its push,
+/// and re-froze DOWNWARD in the process (an unretire switch landed). Neither
+/// branch's number describes the union, and this time the delta was not taken
+/// by subtracting constants — it was measured by SUBSTITUTION, reverting this
+/// branch's three source changes on the merged tree and re-running:
+///
+/// ```text
+///   union, this branch's changes present   2696 / 2707   totals 13607 / 13975
+///   union, the same three reverted to dev  2609 / 2620   totals 13610 / 13978
+///   this branch                             +87 / +87            -3 /    -3
+/// ```
+///
+/// **+87 and -3 for the third time**, unchanged by two dev merges and 214
+/// commits landing underneath. That reproducibility is the evidence the count
+/// tracks this branch's table and registrations rather than the tree it sits in.
+///
+/// The 2609 / 2620 row is EXACTLY dev's frozen constants, so dev's stub
+/// baselines were right for dev's tree.
+///
+/// **Its TOTALS were not, and the totals here drop 13 of dev's.** Dev froze
+/// 13623 / 13991 / 13658 where its own tree measures 13610 / 13978 / 13645 —
+/// stale by 13, in the ungated constant this file's own doc warns can only ever
+/// be worth its last refresh. The values below are the measured union
+/// (13607 / 13975 / 13642), which is dev's true number plus this branch's -3.
+/// Nothing is absorbed: the -3 is attributed above and the 13 is named here as
+/// dev's drift rather than folded in silently.
+///
+/// # Re-frozen 2026-09-11 (the MERGE): 2558 -> 2645, and both deltas reproduce
+///
+/// Two accounts sit above this constant because two branches re-froze it on
+/// the same day for different waves, and the merge of them is neither number.
+/// Measured on the union, all three arms:
+///
+/// ```text
+///   tree                     no-mgmt    mgmt   syn-jdk    total (no-mgmt)
+///   dev alone                   2547    2558      2547              13610
+///   union (this merge)          2634    2645      2634              13607
+///   delta                        +87     +87       +87                 -3
+/// ```
+///
+/// **Both of this branch's deltas reproduce exactly on top of dev's new
+/// baseline**, which is the whole reason the values were left unset in the
+/// merge commit rather than added up:
+///
+///   * **+87 stubs** — `RETIRED_SHADOW_L5R_TRIPLES`, 67 `sun/misc/Unsafe`
+///     triples across 87 registrations. The same +87 this branch measured
+///     against the pre-merge tree, unchanged by dev's wave landing underneath
+///     it, which is what "case one" predicts and what a collision would not.
+///   * **-3 total** — the four deleted `AbstractExecutorService` registrations
+///     and the one added `ForkJoinPool.execute(ForkJoinTask)V`. Also unchanged.
+///
+/// Dev's own +189 (2369 -> 2558, on its side of the merge) is accounted for on
+/// its own block above this one. Nothing here absorbs it: the two waves touch
+/// disjoint tables, and `no_triple_is_claimed_by_two_tables` is the gate that
+/// says so rather than the arithmetic.
+///
+/// # Re-frozen 2026-09-11 (second time today): 2339 -> 2426, +87 stubs and -3 total
+///
+/// The lane-5 RESIDUAL wave. Both numbers moved and they moved in OPPOSITE
+/// directions, which is two of the three cases on
+/// [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`] happening in one commit range.
+/// Measured on the merged tree, all three arms:
+///
+/// ```text
+///   arm             before    after     stubs    total before -> after
+///   no-management     2328     2415      +87        13610 -> 13607   (-3)
+///   management        2339     2426      +87        13978 -> 13975   (-3)
+///   synthetic-jdk     2328     2415      +87        13645 -> 13642   (-3)
+/// ```
+///
+/// The +87 arrived in TWO SITTINGS on the same day and the split is worth
+/// keeping, because it is the clearest demonstration this file has that the
+/// stub count tracks a TABLE rather than a guess: 58 rows when the workload
+/// reached 48 triples, then 29 more when widening the workload reached 19
+/// more. Each sitting's row count was derived independently in the kind-map
+/// freeze and agreed both times.
+///
+/// **The +87 is case ONE** — existing registrations relabelled `Bridge` ->
+/// `SyntheticStub`. It is `RETIRED_SHADOW_L5R_TRIPLES`: 67 `sun/misc/Unsafe`
+/// triples, twenty of them registered at more than one ordinal, and the re-tag
+/// flips every ordinal. 67 -> 87 is the same arithmetic as this morning's
+/// 98 -> 101, and it reproduces the count in the kind-map freeze
+/// (`scripts/baselines/jdk-only-kind-map-25-linux.tsv`) which was derived by a
+/// different route.
+///
+/// **The -3 is case THREE** — registrations DELETED — and it is a different set
+/// of rows entirely:
+///
+/// ```text
+///   -4   java/util/concurrent/AbstractExecutorService {submit x3, invokeAny}
+///        deleted: registered on an abstract class no dispatch door resolves
+///        to, invocations:0 on every probe run and all 132 corpus reports
+///   +1   java/util/concurrent/ForkJoinPool.execute(ForkJoinTask)V
+///        added: `is_forkjoin_native_override` had listed it with nothing
+///        registered behind it, so the interpreter was forcing a native that
+///        did not exist
+///   ---
+///   -3   net, in all three arms
+/// ```
+///
+/// Case three is the one direction in which re-freezing RECORDS work rather
+/// than absorbing it, as the classification note says, and this is the first
+/// time both directions have appeared together. They are separable because
+/// each has its own arithmetic: the stub delta matches a table, the total delta
+/// matches a registration count, and neither explains the other.
+///
 /// **Re-frozen 2026-09-10 by lane L0, +56 in all three configurations.**
 /// 1883 -> 1939 (no-management), 1894 -> 1950 (management), 1883 -> 1939
 /// (synthetic-jdk). All three numbers were PASTED from this gate's own
@@ -1737,6 +1875,56 @@ use cratonvm_types::compat::CompatibilityMode;
 /// admission and not their kind.
 ///
 /// # Re-frozen 2026-09-11 on the L6 merge: 2609 / 2620 / 2609
+/// # Re-frozen 2026-09-11 for jdk-only lane 2 wave 2, 2558 -> 2604
+///
+/// Lane 2 retired 50 triples under `java/lang` and `java/math`. Every number
+/// below was RUN on this tree against a binary built from `origin/dev`
+/// (`6d16472f5`), which sits exactly on its own baseline in all three arms --
+/// so the whole delta is this branch's:
+///
+/// ```text
+///   arm              dev    this branch   delta   total registrations
+///   no-management   2547       2577        +30    13610 -> 13610
+///   management      2558       2604        +46    13978 -> 13978
+///   synthetic-jdk   2547       2577        +30    13645 -> 13645
+/// ```
+///
+/// **Case (b), and the second column says so:** the total did not move by one
+/// row in any arm. 30 added registrations in the boot arm, **0 removed**, every
+/// one a lane-2 triple, taken with `CRATONVM_RATCHET_ROWS=1` on both binaries
+/// and `comm`-diffed. The management arm's extra 16 are the
+/// `java/lang/management/*` rows -- 14 distinct triples, two of them registered
+/// twice -- which the other two arms do not compile.
+///
+/// **30 registrations, 0 new distinct triples.** `dump_synthetic_stubs` is
+/// byte-identical between the two binaries, and that is not a contradiction:
+/// these triples are registered more than once (`ExceptionInInitializerError.
+/// <init>()V` from both `lang_misc.rs` and `lib.rs`, `Throwable.initCause` from
+/// both `lang_misc.rs` and `reflect_annotations.rs`), one registration was
+/// already a `SyntheticStub`, and the table re-tags the other. The DISTINCT set
+/// therefore cannot see this retirement while this ratchet can. Anyone
+/// attributing a delta with the dump alone will read a real retirement as a
+/// no-op -- it nearly cost lane 2 its own table.
+///
+/// The VM agrees, which is the third instrument: `--jdk-only-report` refusals
+/// under those two prefixes go 95 -> 144 with **zero survivors**.
+///
+/// **Beware a shared `CARGO_TARGET_DIR`.** Both arms were first measured into
+/// one target dir and cargo reported `Finished in 0.18s`, compiled nothing and
+/// scored this tree with dev's binary -- freshness is by mtime, and a
+/// `git merge` writes files OLDER than artefacts built after it. The numbers
+/// above come from builds asserted by a non-zero `Compiling` count, with each
+/// binary copied out and its sha256 printed and differing.
+///
+/// # Re-frozen 2026-09-11 by lane L6: +17, measured on three merge bases
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count -- case (b) in the failure
+/// message above: a fake labelled honestly so `--jdk-only` drops it and the
+/// JDK's own bytecode runs.
+///
+/// The substitution experiment, with the control pinned to the merge's own
+/// SECOND PARENT rather than to the moving `origin/dev` ref:
 ///
 /// ```text
 /// dev (lane 6's +17)                     2564 / 2575 / 2564
@@ -1755,42 +1943,61 @@ use cratonvm_types::compat::CompatibilityMode;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-/// # Lane 4 wave 2, 2026-09-11 — the paired ratchet, both columns PRINTED
 ///
-/// `+137` in all three configurations, and the total unchanged in all three:
-/// case **(b)** in the taxonomy the panic message above sets out — existing
-/// registrations relabelled `Bridge` -> `SyntheticStub` so `--jdk-only` drops
-/// them and the JDK's own bytecode runs. The rows are
-/// `RETIRED_SHADOW_L4_FFM_TRIPLES`, 137 triples over the nine
-/// `jdk/internal/foreign/layout/ValueLayouts$Of*Impl` carriers.
+/// **Re-frozen again 2026-09-11 on the lane 1 wave 5 merge: 2620 -> 2622.**
+/// `+2`, and the account the assertion demands is two rows —
+/// `sun/util/calendar/ZoneInfoFile.getZoneInfo` and `getZoneInfo0`, the whole
+/// of `RETIRED_SHADOW_L1_ZI_TRIPLES`. The table's own length and this ratchet
+/// are two instruments reporting one number.
+///
+/// RE-MEASURED on the merged tree rather than carried across it. This branch
+/// had measured `2560` against dev's earlier `2558`; dev then re-froze to
+/// `2620` for lanes L0/L3/L6 while this wave was in its corpus runs, and
+/// `2620 + 2` was NOT assumed — each arm was run again and this is its printed
+/// line. That is the treadmill the note above names: on a branch this busy the
+/// constant is re-measured per merge, never added up.
+///
+/// **+17 for 15 triples is not an error.** The unit of this count is a
+/// REGISTRATION, not a triple, and two of the fifteen are registered twice:
+/// the same `(class, name, descriptor)` reaches `register` from two sites and
+/// each registration is re-tagged separately. The `--jdk-only-report` census
+/// for the same prefixes reports **15 distinct triples refused, 0 with a
+/// survivor** -- the same population counted the other way.
+/// **Re-measured 2026-09-11 after lane L6's +17 landed, and the delta is the
+/// same +30/+46/+30.** The table above was taken over dev `6d16472f5`; L6 then
+/// re-froze these constants to 2564/2575/2564 and this branch re-merged. The
+/// numbers were RE-RUN on the merged tree rather than added to L6's, because
+/// arithmetic is how this file's header records a constant sitting six above
+/// the truth for a week:
 ///
 /// ```text
-///   arm             OFF             ON              delta
-///   (default)   2609 / 13610    2746 / 13610        +137 / 0
-///   management  2620 / 13978    2757 / 13978        +137 / 0
-///   synthetic   2609 / 13645    2746 / 13645        +137 / 0
+///   arm             control f98c8a7ec   trial    delta
+///   no-management       2564 GREEN       2594     +30
+///   management          2575 GREEN       2621     +46
+///   synthetic-jdk       2564 GREEN       2594     +30
 /// ```
 ///
-/// **The OFF column was PRINTED, not inferred from a `<=` pass**, and it
-/// reproduces the three constants this wave found here (2620 / 2609 / 2609)
-/// exactly. It was taken with `CRATONVM_UNRETIRE_NATIVE_SHADOW=jdk/internal/
-/// foreign/layout/`, so one binary answered both halves and nothing about the
-/// comparison depends on two checkouts being otherwise identical — which is
-/// what that switch was built for.
+/// Control green on its own baseline in all three arms is the load-bearing
+/// half: it says the whole delta is this branch's and none of it is drift being
+/// absorbed. Six binaries, six distinct sha256s, every build asserted by a
+/// non-zero `Compiling` count.
 ///
-/// **The `MEASURED_TOTAL_REGISTRATIONS_*` move is NOT this wave's.** All three
-/// were 13 above the measurement in BOTH columns, so the drift is inherited and
-/// is recorded here rather than absorbed silently: 13991 -> 13978,
-/// 13623 -> 13610, 13658 -> 13645. A wave that changed them would have shown a
-/// total moving between its OWN two columns, and none of these does.
+/// **Third measurement of the same delta, 2026-09-11.** dev re-froze twice more
+/// while this branch was being verified (L6's +17, then lane 1's provider wave),
+/// so the arms were re-run against each new tip rather than incremented:
 ///
-/// The same 13 appears one section up, read the other way round: that note
-/// measured 13623 / 13991 / 13658 against dev's 13610 / 13978 and concluded dev
-/// was 13 stale, so the constants were raised. This tree, forked from `dev` at
-/// `aba314446`, measures the lower three again. Whichever direction it went, it
-/// is the same 13 registrations and it belongs to neither wave -- the two notes
-/// now bracket it, which is more than either could say alone.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2757;
+/// ```text
+///   control          no-mgmt   mgmt    syn-jdk      trial gives
+///   6d16472f5  GREEN    2547    2558     2547      2577 / 2604 / 2577
+///   f98c8a7ec  GREEN    2564    2575     2564      2594 / 2621 / 2594
+///   8f09c89b9  GREEN    2611    2622     2611      2641 / 2668 / 2641
+/// ```
+///
+/// +30 / +46 / +30 every time, with the control green on its own baseline every
+/// time. Three independent derivations of one delta is what makes it a property
+/// of this branch rather than of a tree, which is the claim a re-freeze makes.
+///
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2755;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1997,6 +2204,19 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2757;
 /// on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]. +163, all of it lane 4 wave 1:
 /// the arm-OFF measurement lands on 2384 exactly.
 /// # Re-frozen 2026-09-11 on the L6 merge: 2609 / 2620 / 2609
+/// **Re-frozen 2026-09-11, 2547 -> 2577** for jdk-only lane 2 wave 2, in the
+/// same commit as the other two, each arm RUN rather than derived from its
+/// sibling. The account is on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+///
+/// # Re-frozen 2026-09-11 by lane L6: +17, measured on three merge bases
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count -- case (b) in the failure
+/// message above: a fake labelled honestly so `--jdk-only` drops it and the
+/// JDK's own bytecode runs.
+///
+/// The substitution experiment, with the control pinned to the merge's own
+/// SECOND PARENT rather than to the moving `origin/dev` ref:
 ///
 /// ```text
 /// dev (lane 6's +17)                     2564 / 2575 / 2564
@@ -2015,7 +2235,27 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2757;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2746;
+///
+/// **Re-frozen again 2026-09-11 on the lane 1 wave 5 merge: 2609 -> 2611.**
+/// `+2`, and the account the assertion demands is two rows —
+/// `sun/util/calendar/ZoneInfoFile.getZoneInfo` and `getZoneInfo0`, the whole
+/// of `RETIRED_SHADOW_L1_ZI_TRIPLES`. The table's own length and this ratchet
+/// are two instruments reporting one number.
+///
+/// RE-MEASURED on the merged tree rather than carried across it. This branch
+/// had measured `2549` against dev's earlier `2547`; dev then re-froze to
+/// `2609` for lanes L0/L3/L6 while this wave was in its corpus runs, and
+/// `2609 + 2` was NOT assumed — each arm was run again and this is its printed
+/// line. That is the treadmill the note above names: on a branch this busy the
+/// constant is re-measured per merge, never added up.
+///
+/// **+17 for 15 triples is not an error.** The unit of this count is a
+/// REGISTRATION, not a triple, and two of the fifteen are registered twice:
+/// the same `(class, name, descriptor)` reaches `register` from two sites and
+/// each registration is re-tagged separately. The `--jdk-only-report` census
+/// for the same prefixes reports **15 distinct triples refused, 0 with a
+/// survivor** -- the same population counted the other way.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2728;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2144,6 +2384,19 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2746;
 /// each time and not a rule. The account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 /// # Re-frozen 2026-09-11 on the L6 merge: 2609 / 2620 / 2609
+/// **Re-frozen 2026-09-11, 2547 -> 2577** for jdk-only lane 2 wave 2, in the
+/// same commit as the other two, each arm RUN rather than derived from its
+/// sibling. The account is on [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+///
+/// # Re-frozen 2026-09-11 by lane L6: +17, measured on three merge bases
+///
+/// `RETIRED_SHADOW_L6_TRIPLES` retires 15 triples, and re-tagging a `Bridge`
+/// to `SyntheticStub` is what raises this count -- case (b) in the failure
+/// message above: a fake labelled honestly so `--jdk-only` drops it and the
+/// JDK's own bytecode runs.
+///
+/// The substitution experiment, with the control pinned to the merge's own
+/// SECOND PARENT rather than to the moving `origin/dev` ref:
 ///
 /// ```text
 /// dev (lane 6's +17)                     2564 / 2575 / 2564
@@ -2162,7 +2415,27 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2746;
 /// side: on a branch this busy the constant is re-measured per merge, never
 /// added up. Totals stay 13623 / 13991 / 13658, so lane 6's 17 are
 /// relabellings too.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2746;
+///
+/// **Re-frozen again 2026-09-11 on the lane 1 wave 5 merge: 2609 -> 2611.**
+/// `+2`, and the account the assertion demands is two rows —
+/// `sun/util/calendar/ZoneInfoFile.getZoneInfo` and `getZoneInfo0`, the whole
+/// of `RETIRED_SHADOW_L1_ZI_TRIPLES`. The table's own length and this ratchet
+/// are two instruments reporting one number.
+///
+/// RE-MEASURED on the merged tree rather than carried across it. This branch
+/// had measured `2549` against dev's earlier `2547`; dev then re-froze to
+/// `2609` for lanes L0/L3/L6 while this wave was in its corpus runs, and
+/// `2609 + 2` was NOT assumed — each arm was run again and this is its printed
+/// line. That is the treadmill the note above names: on a branch this busy the
+/// constant is re-measured per merge, never added up.
+///
+/// **+17 for 15 triples is not an error.** The unit of this count is a
+/// REGISTRATION, not a triple, and two of the fifteen are registered twice:
+/// the same `(class, name, descriptor)` reaches `register` from two sites and
+/// each registration is re-tagged separately. The `--jdk-only-report` census
+/// for the same prefixes reports **15 distinct triples refused, 0 with a
+/// survivor** -- the same population counted the other way.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2728;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2222,7 +2495,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2746;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13978;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13977;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2235,7 +2508,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13978;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13610;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13609;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2261,7 +2534,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13610;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13645;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13644;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
@@ -2904,47 +3177,6 @@ fn essential_registry_is_populated() {
 /// not remove the registration. Record: the retired
 /// `bridge-reclassification-wave` write-up.
 ///
-/// ## That last paragraph is WRONG about strict mode, and was wrong when written
-///
-/// A re-tag leaves the registration alone in COMPATIBLE mode, and that is what
-/// was measured. Under `JdkOnly` it does not: `register_inner` REFUSES a
-/// `SyntheticStub`, so every retired triple is one row fewer in the strict
-/// registry. This total is therefore a quantity the retirement campaign is
-/// deliberately driving DOWN, one wave at a time, and eight waves had taken it
-/// from 11,192 to 10,998 -- 98 above this floor, not the 300 the paragraph
-/// above believes it left. Lane 4 wave 2's 137 rows are simply the wave that
-/// crossed it.
-///
-/// # 10,900 -> 10,500, 2026-09-11
-///
-/// Lowered for a strict registry of 10,861, and **lowering a collapse detector
-/// is exactly the move it exists to make suspicious**, so here is the evidence
-/// it cannot see. Both columns measured on ONE binary, the OFF column taken
-/// with `CRATONVM_UNRETIRE_NATIVE_SHADOW=jdk/internal/foreign/layout/`:
-///
-/// ```text
-///            compatible   stubs   strict    dropped   refusals
-///   OFF        13610       2609    10998      2612      2630
-///   ON         13610       2746    10861      2749      2767
-///   delta          0       +137     -137      +137      +137
-/// ```
-///
-/// Exactly the table's row count in every column that moves, and zero in the
-/// one that must not. A registry shedding whole modules does not produce that
-/// diff, and neither does one with aliasing fallout -- the drop and the stub
-/// count move together to the row. Beside it: the `--jdk-only` corpus is
-/// **133 passed / 0 failed on both binaries**, `SUITE=all` 133/0 and
-/// `SUITE=core` 93/0 on the wave binary, and the kind map moves exactly 101
-/// rows, all of them inside the table.
-///
-/// The 361 of headroom left here is the same kind of deliberate as the 300 was,
-/// with one thing now said out loud that was not before: **this floor will be
-/// crossed again, by design.** The campaign's denominator is 5,549 bucket-A/B
-/// rows and about a fifth of them are retired, so a fixed floor is the wrong
-/// shape for what it is tracking. What makes lowering it safe is the paired
-/// OFF/ON measurement above plus a corpus that does not move -- never the
-/// number itself, and never a re-freeze taken from one column.
-///
 /// # 10,200 -> 10,900, 2026-08-11
 ///
 /// Raised, not lowered, and for a reason that is not a measurement at all: the
@@ -2954,7 +3186,38 @@ fn essential_registry_is_populated() {
 /// `MIN_TOTAL_REGISTRATIONS`, the floor takes the SMALLER configuration and
 /// keeps the same ~300 rows of deliberate headroom, so it survives the next
 /// re-tag of that size while still detecting a shed module.
-const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_500;
+/// # 10,900 -> 10,600, 2026-09-11
+///
+/// Lowered by 300 for a strict registry of 10,878, and the cause is one wave:
+/// `RETIRED_SHADOW_L5R_TRIPLES`, 67 `sun/misc/Unsafe` triples over 87
+/// registrations. Strict mode refuses a re-tagged row by design — which is the
+/// second reason the 2026-08-10 entry above gives — so a retirement wave lowers
+/// this total by exactly its registration count, and this one did.
+///
+/// **This detector exists to make lowering it suspicious, so here is the
+/// evidence it cannot see.** By SUBSTITUTION on the same tree, emptying that
+/// one table and re-running:
+///
+/// ```text
+///   table present   compatible 13609 (2728 stubs) -> strict 10878
+///   table emptied   compatible 13609 (2641 stubs) -> strict 10965
+///   difference                          87 stubs            87 rows
+/// ```
+///
+/// 10,965 clears the old floor, and the shortfall is 87 — the wave, to the row.
+/// A registry shedding whole modules does not move by exactly the size of one
+/// table and restore itself when that table is emptied. The corpus agrees:
+/// 133/133 on `--jdk-only`, 133/133 on `SUITE=all` and 93/93 on `SUITE=core`,
+/// on a release build of the merged tree.
+///
+/// The headroom stays at ~300, per the note above, and the maintenance cost is
+/// worth naming: this floor is in ABSOLUTE rows while the thing it guards
+/// against is a module-sized loss of hundreds, so every retirement wave of any
+/// size walks it down and every wave has to re-justify it. A floor expressed as
+/// a FRACTION of the compatible total would not need touching for a wave of
+/// tens — that is lane 0's call, not this lane's, and it is recorded here
+/// because this is the third entry in a row doing the same arithmetic by hand.
+const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_600;
 
 /// Build the default native registry the way `--jdk-only` does: set the
 /// VM-scoped strict policy *first*, then run the same boot sequence

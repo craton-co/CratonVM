@@ -253,6 +253,39 @@
 #
 #   The measurement is in
 #   docs/internal/retired/lane-5-concurrent-thread-unsafe-RETIRED-20260910.md.
+#
+# amended: 2026-09-11, lane 5 residuals. FOUR rows REMOVED, not edited:
+#   java/util/concurrent/AbstractExecutorService {submit x3, invokeAny}.
+#   Those registrations were DELETED from native-builtins (they sat on an
+#   abstract class no dispatch door ever resolves to; L5ExecutorSweep reads
+#   invocations:0 even with a purpose-built direct subclass). A freeze row for
+#   a registration that no longer exists is worse than a stale one -- it is a
+#   row nothing can ever re-measure -- so the rows go with the code. This is
+#   the first amendment here that REMOVES rather than edits; the count of
+#   bridge rows for that class is now zero, and the class is absent entirely.
+#
+# amended: 2026-09-11, lane 5 residual wave. 87 rows edited by hand for 67
+#   triples: bridge -> synthetic-stub, kind_stated 0 -> 1. Twenty of the 67 are
+#   registered at more than one ordinal and the retag flips every one, which is
+#   where 67 becomes 87 -- the same arithmetic as the 98 -> 101 above, measured
+#   the same way.
+#
+#   TWO SITTINGS. The first took 58 rows for the 48 triples the original
+#   workload reached; widening apps/probes/L5SunMiscUnsafe.java to the volatile
+#   twins, the long atomics and the bulk-memory trio reached 19 more and added
+#   29 rows. Both sittings are the same rule and the same run shape, so they are
+#   one amendment rather than two.
+#
+#   All 48 are sun/misc/Unsafe and all 48 were DISPATCHED under
+#   CRATONVM_ENFORCE_NATIVE_SHADOW=sun/misc/Unsafe by
+#   apps/probes/L5SunMiscUnsafe.java, each with outcome=bytecode-won in the
+#   --jdk-only-report -- so the value here is not derived from the retag rule
+#   alone, it is derived from a run in which the JDK's own bytecode served
+#   every one of these triples and the probe stayed byte-identical.
+#
+#   sun/misc/Unsafe.{getUnsafe, ensureClassInitialized, shouldBeInitialized}
+#   are deliberately NOT edited. JDK 25 does not declare them, so nothing can
+#   dispatch them and they are deletions rather than retirements.
 # amended: 2026-09-11, lane L0 wave 2. TWENTY-ONE rows edited by hand for
 #   NINETEEN triples, not re-measured: bridge -> synthetic-stub.
 #
@@ -7633,10 +7666,6 @@ java/util/Vector	setElementAt	(Ljava/lang/Object;I)V	0	bridge	0	1
 java/util/Vector	size	()I	0	bridge	0	1
 java/util/Vector	toArray	()[Ljava/lang/Object;	0	bridge	0	1
 java/util/Vector	toString	()Ljava/lang/String;	0	bridge	0	1
-java/util/concurrent/AbstractExecutorService	invokeAny	(Ljava/util/Collection;)Ljava/lang/Object;	0	bridge	0	1
-java/util/concurrent/AbstractExecutorService	submit	(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;	0	bridge	0	1
-java/util/concurrent/AbstractExecutorService	submit	(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;	0	bridge	0	1
-java/util/concurrent/AbstractExecutorService	submit	(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;	0	bridge	0	1
 java/util/concurrent/BrokenBarrierException	<init>	()V	0	bridge	0	1
 java/util/concurrent/BrokenBarrierException	<init>	()V	1	bridge	0	1
 java/util/concurrent/BrokenBarrierException	<init>	(Ljava/lang/String;)V	0	bridge	0	1
@@ -11155,113 +11184,113 @@ sun/misc/URLClassPath	getURLs	()[Ljava/net/URL;	0	synthetic-stub	1	1
 sun/misc/URLClassPath	getURLs	(Z)[Ljava/net/URL;	0	synthetic-stub	1	1
 sun/misc/Unsafe	<clinit>	()V	0	bridge	0	1
 sun/misc/Unsafe	acquireFence	()V	0	bridge	0	1
-sun/misc/Unsafe	addressSize	()I	0	bridge	0	1
-sun/misc/Unsafe	allocateInstance	(Ljava/lang/Class;)Ljava/lang/Object;	0	bridge	0	1
-sun/misc/Unsafe	allocateMemory	(J)J	0	bridge	0	1
-sun/misc/Unsafe	allocateMemory	(J)J	1	bridge	0	1
-sun/misc/Unsafe	allocateMemory	(J)J	2	bridge	0	1
-sun/misc/Unsafe	allocateMemory	(J)J	3	bridge	0	1
-sun/misc/Unsafe	allocateMemory	(J)J	4	bridge	0	1
-sun/misc/Unsafe	arrayBaseOffset	(Ljava/lang/Class;)I	0	bridge	0	1
-sun/misc/Unsafe	arrayIndexScale	(Ljava/lang/Class;)I	0	bridge	0	1
+sun/misc/Unsafe	addressSize	()I	0	synthetic-stub	1	1
+sun/misc/Unsafe	allocateInstance	(Ljava/lang/Class;)Ljava/lang/Object;	0	synthetic-stub	1	1
+sun/misc/Unsafe	allocateMemory	(J)J	0	synthetic-stub	1	1
+sun/misc/Unsafe	allocateMemory	(J)J	1	synthetic-stub	1	1
+sun/misc/Unsafe	allocateMemory	(J)J	2	synthetic-stub	1	1
+sun/misc/Unsafe	allocateMemory	(J)J	3	synthetic-stub	1	1
+sun/misc/Unsafe	allocateMemory	(J)J	4	synthetic-stub	1	1
+sun/misc/Unsafe	arrayBaseOffset	(Ljava/lang/Class;)I	0	synthetic-stub	1	1
+sun/misc/Unsafe	arrayIndexScale	(Ljava/lang/Class;)I	0	synthetic-stub	1	1
 sun/misc/Unsafe	compareAndExchangeObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
-sun/misc/Unsafe	compareAndSwapInt	(Ljava/lang/Object;JII)Z	0	bridge	0	1
-sun/misc/Unsafe	compareAndSwapLong	(Ljava/lang/Object;JJJ)Z	0	bridge	0	1
-sun/misc/Unsafe	compareAndSwapObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	bridge	0	1
-sun/misc/Unsafe	copyMemory	(Ljava/lang/Object;JLjava/lang/Object;JJ)V	0	bridge	0	1
-sun/misc/Unsafe	copyMemory	(Ljava/lang/Object;JLjava/lang/Object;JJ)V	1	bridge	0	1
-sun/misc/Unsafe	copyMemory	(Ljava/lang/Object;JLjava/lang/Object;JJ)V	2	bridge	0	1
-sun/misc/Unsafe	copyMemory	(Ljava/lang/Object;JLjava/lang/Object;JJ)V	3	bridge	0	1
+sun/misc/Unsafe	compareAndSwapInt	(Ljava/lang/Object;JII)Z	0	synthetic-stub	1	1
+sun/misc/Unsafe	compareAndSwapLong	(Ljava/lang/Object;JJJ)Z	0	synthetic-stub	1	1
+sun/misc/Unsafe	compareAndSwapObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z	0	synthetic-stub	1	1
+sun/misc/Unsafe	copyMemory	(Ljava/lang/Object;JLjava/lang/Object;JJ)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	copyMemory	(Ljava/lang/Object;JLjava/lang/Object;JJ)V	1	synthetic-stub	1	1
+sun/misc/Unsafe	copyMemory	(Ljava/lang/Object;JLjava/lang/Object;JJ)V	2	synthetic-stub	1	1
+sun/misc/Unsafe	copyMemory	(Ljava/lang/Object;JLjava/lang/Object;JJ)V	3	synthetic-stub	1	1
 sun/misc/Unsafe	defineClass	(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;	0	bridge	0	1
 sun/misc/Unsafe	defineClass	(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;	1	bridge	0	1
 sun/misc/Unsafe	ensureClassInitialized	(Ljava/lang/Class;)V	0	bridge	0	1
-sun/misc/Unsafe	freeMemory	(J)V	0	bridge	0	1
-sun/misc/Unsafe	freeMemory	(J)V	1	bridge	0	1
-sun/misc/Unsafe	freeMemory	(J)V	2	bridge	0	1
-sun/misc/Unsafe	freeMemory	(J)V	3	bridge	0	1
-sun/misc/Unsafe	freeMemory	(J)V	4	bridge	0	1
-sun/misc/Unsafe	freeMemory	(J)V	5	bridge	0	1
-sun/misc/Unsafe	fullFence	()V	0	bridge	0	1
+sun/misc/Unsafe	freeMemory	(J)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	freeMemory	(J)V	1	synthetic-stub	1	1
+sun/misc/Unsafe	freeMemory	(J)V	2	synthetic-stub	1	1
+sun/misc/Unsafe	freeMemory	(J)V	3	synthetic-stub	1	1
+sun/misc/Unsafe	freeMemory	(J)V	4	synthetic-stub	1	1
+sun/misc/Unsafe	freeMemory	(J)V	5	synthetic-stub	1	1
+sun/misc/Unsafe	fullFence	()V	0	synthetic-stub	1	1
 sun/misc/Unsafe	getAddress	(J)J	0	bridge	0	1
-sun/misc/Unsafe	getAndAddInt	(Ljava/lang/Object;JI)I	0	bridge	0	1
-sun/misc/Unsafe	getAndAddLong	(Ljava/lang/Object;JJ)J	0	bridge	0	1
-sun/misc/Unsafe	getAndSetInt	(Ljava/lang/Object;JI)I	0	bridge	0	1
-sun/misc/Unsafe	getAndSetLong	(Ljava/lang/Object;JJ)J	0	bridge	0	1
-sun/misc/Unsafe	getAndSetObject	(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
-sun/misc/Unsafe	getBoolean	(Ljava/lang/Object;J)Z	0	bridge	0	1
-sun/misc/Unsafe	getBooleanVolatile	(Ljava/lang/Object;J)Z	0	bridge	0	1
-sun/misc/Unsafe	getByte	(J)B	0	bridge	0	1
-sun/misc/Unsafe	getByte	(Ljava/lang/Object;J)B	0	bridge	0	1
-sun/misc/Unsafe	getByteVolatile	(Ljava/lang/Object;J)B	0	bridge	0	1
+sun/misc/Unsafe	getAndAddInt	(Ljava/lang/Object;JI)I	0	synthetic-stub	1	1
+sun/misc/Unsafe	getAndAddLong	(Ljava/lang/Object;JJ)J	0	synthetic-stub	1	1
+sun/misc/Unsafe	getAndSetInt	(Ljava/lang/Object;JI)I	0	synthetic-stub	1	1
+sun/misc/Unsafe	getAndSetLong	(Ljava/lang/Object;JJ)J	0	synthetic-stub	1	1
+sun/misc/Unsafe	getAndSetObject	(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;	0	synthetic-stub	1	1
+sun/misc/Unsafe	getBoolean	(Ljava/lang/Object;J)Z	0	synthetic-stub	1	1
+sun/misc/Unsafe	getBooleanVolatile	(Ljava/lang/Object;J)Z	0	synthetic-stub	1	1
+sun/misc/Unsafe	getByte	(J)B	0	synthetic-stub	1	1
+sun/misc/Unsafe	getByte	(Ljava/lang/Object;J)B	0	synthetic-stub	1	1
+sun/misc/Unsafe	getByteVolatile	(Ljava/lang/Object;J)B	0	synthetic-stub	1	1
 sun/misc/Unsafe	getChar	(J)C	0	bridge	0	1
-sun/misc/Unsafe	getChar	(Ljava/lang/Object;J)C	0	bridge	0	1
-sun/misc/Unsafe	getCharVolatile	(Ljava/lang/Object;J)C	0	bridge	0	1
+sun/misc/Unsafe	getChar	(Ljava/lang/Object;J)C	0	synthetic-stub	1	1
+sun/misc/Unsafe	getCharVolatile	(Ljava/lang/Object;J)C	0	synthetic-stub	1	1
 sun/misc/Unsafe	getDouble	(J)D	0	bridge	0	1
-sun/misc/Unsafe	getDouble	(Ljava/lang/Object;J)D	0	bridge	0	1
-sun/misc/Unsafe	getDoubleVolatile	(Ljava/lang/Object;J)D	0	bridge	0	1
+sun/misc/Unsafe	getDouble	(Ljava/lang/Object;J)D	0	synthetic-stub	1	1
+sun/misc/Unsafe	getDoubleVolatile	(Ljava/lang/Object;J)D	0	synthetic-stub	1	1
 sun/misc/Unsafe	getFloat	(J)F	0	bridge	0	1
-sun/misc/Unsafe	getFloat	(Ljava/lang/Object;J)F	0	bridge	0	1
-sun/misc/Unsafe	getFloatVolatile	(Ljava/lang/Object;J)F	0	bridge	0	1
+sun/misc/Unsafe	getFloat	(Ljava/lang/Object;J)F	0	synthetic-stub	1	1
+sun/misc/Unsafe	getFloatVolatile	(Ljava/lang/Object;J)F	0	synthetic-stub	1	1
 sun/misc/Unsafe	getInt	(J)I	0	bridge	0	1
-sun/misc/Unsafe	getInt	(Ljava/lang/Object;J)I	0	bridge	0	1
-sun/misc/Unsafe	getIntVolatile	(Ljava/lang/Object;J)I	0	bridge	0	1
-sun/misc/Unsafe	getLoadAverage	([DI)I	0	bridge	0	1
-sun/misc/Unsafe	getLong	(J)J	0	bridge	0	1
-sun/misc/Unsafe	getLong	(Ljava/lang/Object;J)J	0	bridge	0	1
-sun/misc/Unsafe	getLongVolatile	(Ljava/lang/Object;J)J	0	bridge	0	1
-sun/misc/Unsafe	getObject	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	0	1
-sun/misc/Unsafe	getObjectVolatile	(Ljava/lang/Object;J)Ljava/lang/Object;	0	bridge	0	1
+sun/misc/Unsafe	getInt	(Ljava/lang/Object;J)I	0	synthetic-stub	1	1
+sun/misc/Unsafe	getIntVolatile	(Ljava/lang/Object;J)I	0	synthetic-stub	1	1
+sun/misc/Unsafe	getLoadAverage	([DI)I	0	synthetic-stub	1	1
+sun/misc/Unsafe	getLong	(J)J	0	synthetic-stub	1	1
+sun/misc/Unsafe	getLong	(Ljava/lang/Object;J)J	0	synthetic-stub	1	1
+sun/misc/Unsafe	getLongVolatile	(Ljava/lang/Object;J)J	0	synthetic-stub	1	1
+sun/misc/Unsafe	getObject	(Ljava/lang/Object;J)Ljava/lang/Object;	0	synthetic-stub	1	1
+sun/misc/Unsafe	getObjectVolatile	(Ljava/lang/Object;J)Ljava/lang/Object;	0	synthetic-stub	1	1
 sun/misc/Unsafe	getShort	(J)S	0	bridge	0	1
-sun/misc/Unsafe	getShort	(Ljava/lang/Object;J)S	0	bridge	0	1
-sun/misc/Unsafe	getShortVolatile	(Ljava/lang/Object;J)S	0	bridge	0	1
+sun/misc/Unsafe	getShort	(Ljava/lang/Object;J)S	0	synthetic-stub	1	1
+sun/misc/Unsafe	getShortVolatile	(Ljava/lang/Object;J)S	0	synthetic-stub	1	1
 sun/misc/Unsafe	getUnsafe	()Lsun/misc/Unsafe;	0	bridge	0	1
-sun/misc/Unsafe	loadFence	()V	0	bridge	0	1
-sun/misc/Unsafe	objectFieldOffset	(Ljava/lang/reflect/Field;)J	0	bridge	0	1
-sun/misc/Unsafe	pageSize	()I	0	bridge	0	1
-sun/misc/Unsafe	park	(ZJ)V	0	bridge	0	1
+sun/misc/Unsafe	loadFence	()V	0	synthetic-stub	1	1
+sun/misc/Unsafe	objectFieldOffset	(Ljava/lang/reflect/Field;)J	0	synthetic-stub	1	1
+sun/misc/Unsafe	pageSize	()I	0	synthetic-stub	1	1
+sun/misc/Unsafe	park	(ZJ)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putAddress	(JJ)V	0	bridge	0	1
-sun/misc/Unsafe	putBoolean	(Ljava/lang/Object;JZ)V	0	bridge	0	1
-sun/misc/Unsafe	putBooleanVolatile	(Ljava/lang/Object;JZ)V	0	bridge	0	1
+sun/misc/Unsafe	putBoolean	(Ljava/lang/Object;JZ)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putBooleanVolatile	(Ljava/lang/Object;JZ)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putByte	(JB)V	0	bridge	0	1
-sun/misc/Unsafe	putByte	(Ljava/lang/Object;JB)V	0	bridge	0	1
-sun/misc/Unsafe	putByteVolatile	(Ljava/lang/Object;JB)V	0	bridge	0	1
+sun/misc/Unsafe	putByte	(Ljava/lang/Object;JB)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putByteVolatile	(Ljava/lang/Object;JB)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putChar	(JC)V	0	bridge	0	1
-sun/misc/Unsafe	putChar	(Ljava/lang/Object;JC)V	0	bridge	0	1
-sun/misc/Unsafe	putCharVolatile	(Ljava/lang/Object;JC)V	0	bridge	0	1
+sun/misc/Unsafe	putChar	(Ljava/lang/Object;JC)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putCharVolatile	(Ljava/lang/Object;JC)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putDouble	(JD)V	0	bridge	0	1
-sun/misc/Unsafe	putDouble	(Ljava/lang/Object;JD)V	0	bridge	0	1
-sun/misc/Unsafe	putDoubleVolatile	(Ljava/lang/Object;JD)V	0	bridge	0	1
+sun/misc/Unsafe	putDouble	(Ljava/lang/Object;JD)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putDoubleVolatile	(Ljava/lang/Object;JD)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putFloat	(JF)V	0	bridge	0	1
-sun/misc/Unsafe	putFloat	(Ljava/lang/Object;JF)V	0	bridge	0	1
-sun/misc/Unsafe	putFloatVolatile	(Ljava/lang/Object;JF)V	0	bridge	0	1
+sun/misc/Unsafe	putFloat	(Ljava/lang/Object;JF)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putFloatVolatile	(Ljava/lang/Object;JF)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putInt	(JI)V	0	bridge	0	1
-sun/misc/Unsafe	putInt	(Ljava/lang/Object;JI)V	0	bridge	0	1
-sun/misc/Unsafe	putIntVolatile	(Ljava/lang/Object;JI)V	0	bridge	0	1
-sun/misc/Unsafe	putLong	(JJ)V	0	bridge	0	1
-sun/misc/Unsafe	putLong	(Ljava/lang/Object;JJ)V	0	bridge	0	1
-sun/misc/Unsafe	putLongVolatile	(Ljava/lang/Object;JJ)V	0	bridge	0	1
-sun/misc/Unsafe	putObject	(Ljava/lang/Object;JLjava/lang/Object;)V	0	bridge	0	1
-sun/misc/Unsafe	putObjectVolatile	(Ljava/lang/Object;JLjava/lang/Object;)V	0	bridge	0	1
+sun/misc/Unsafe	putInt	(Ljava/lang/Object;JI)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putIntVolatile	(Ljava/lang/Object;JI)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putLong	(JJ)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putLong	(Ljava/lang/Object;JJ)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putLongVolatile	(Ljava/lang/Object;JJ)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putObject	(Ljava/lang/Object;JLjava/lang/Object;)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putObjectVolatile	(Ljava/lang/Object;JLjava/lang/Object;)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	putShort	(JS)V	0	bridge	0	1
-sun/misc/Unsafe	putShort	(Ljava/lang/Object;JS)V	0	bridge	0	1
-sun/misc/Unsafe	putShortVolatile	(Ljava/lang/Object;JS)V	0	bridge	0	1
-sun/misc/Unsafe	reallocateMemory	(JJ)J	0	bridge	0	1
-sun/misc/Unsafe	reallocateMemory	(JJ)J	1	bridge	0	1
-sun/misc/Unsafe	reallocateMemory	(JJ)J	2	bridge	0	1
-sun/misc/Unsafe	reallocateMemory	(JJ)J	3	bridge	0	1
+sun/misc/Unsafe	putShort	(Ljava/lang/Object;JS)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	putShortVolatile	(Ljava/lang/Object;JS)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	reallocateMemory	(JJ)J	0	synthetic-stub	1	1
+sun/misc/Unsafe	reallocateMemory	(JJ)J	1	synthetic-stub	1	1
+sun/misc/Unsafe	reallocateMemory	(JJ)J	2	synthetic-stub	1	1
+sun/misc/Unsafe	reallocateMemory	(JJ)J	3	synthetic-stub	1	1
 sun/misc/Unsafe	releaseFence	()V	0	bridge	0	1
-sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	0	bridge	0	1
-sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	1	bridge	0	1
-sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	2	bridge	0	1
-sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	3	bridge	0	1
-sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	4	bridge	0	1
+sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	1	synthetic-stub	1	1
+sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	2	synthetic-stub	1	1
+sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	3	synthetic-stub	1	1
+sun/misc/Unsafe	setMemory	(Ljava/lang/Object;JJB)V	4	synthetic-stub	1	1
 sun/misc/Unsafe	shouldBeInitialized	(Ljava/lang/Class;)Z	0	bridge	0	1
-sun/misc/Unsafe	staticFieldBase	(Ljava/lang/reflect/Field;)Ljava/lang/Object;	0	bridge	0	1
-sun/misc/Unsafe	staticFieldBase	(Ljava/lang/reflect/Field;)Ljava/lang/Object;	1	bridge	0	1
-sun/misc/Unsafe	staticFieldOffset	(Ljava/lang/reflect/Field;)J	0	bridge	0	1
-sun/misc/Unsafe	storeFence	()V	0	bridge	0	1
-sun/misc/Unsafe	throwException	(Ljava/lang/Throwable;)V	0	bridge	0	1
-sun/misc/Unsafe	unpark	(Ljava/lang/Object;)V	0	bridge	0	1
+sun/misc/Unsafe	staticFieldBase	(Ljava/lang/reflect/Field;)Ljava/lang/Object;	0	synthetic-stub	1	1
+sun/misc/Unsafe	staticFieldBase	(Ljava/lang/reflect/Field;)Ljava/lang/Object;	1	synthetic-stub	1	1
+sun/misc/Unsafe	staticFieldOffset	(Ljava/lang/reflect/Field;)J	0	synthetic-stub	1	1
+sun/misc/Unsafe	storeFence	()V	0	synthetic-stub	1	1
+sun/misc/Unsafe	throwException	(Ljava/lang/Throwable;)V	0	synthetic-stub	1	1
+sun/misc/Unsafe	unpark	(Ljava/lang/Object;)V	0	synthetic-stub	1	1
 sun/misc/Unsafe	weakCompareAndExchangeObject	(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	0	bridge	0	1
 sun/net/PortConfig	getLower0	()I	0	bridge	1	1
 sun/net/PortConfig	getUpper0	()I	0	bridge	1	1
