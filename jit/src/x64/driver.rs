@@ -1415,21 +1415,14 @@ pub fn compile_with_param_slots(
         Vec::new()
     };
 
-    // SIMD FP: detect vectorizable double-array-sum loops (requires AVX2)
-    let simd_fp_loops = if has_avx2() {
-        let mut simd = Vec::new();
-        for &(header, back_edge) in &loops {
-            let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
-            if let Some(iv) = find_induction_variable(code, header, back_edge_end) {
-                if let Some(info) = detect_fp_array_sum(code, header, back_edge, iv) {
-                    simd.push(info);
-                }
-            }
-        }
-        simd
-    } else {
-        Vec::new()
-    };
+    // No vectorised floating-point reduction. There used to be one for
+    // `s += a[i]` over a `double[]`: four lane accumulators seeded with +0.0
+    // and combined as (l0+l2)+(l1+l3). Java FP addition is strict IEEE and not
+    // associative, so that reordering changed results ({1e16, 1, -1e16, 1}
+    // summed to 2.0 instead of 1.0) and turned an all -0.0 sum into +0.0.
+    // `vector_gate::admit_vectorization` refuses reductions under
+    // `FpRelaxation::Strict` for exactly this reason; the retired detector
+    // never consulted it. A future FP reduction goes through that gate.
 
     // T5.2.15 — Int-array element-wise SIMD detection.
     //
@@ -1998,10 +1991,6 @@ pub fn compile_with_param_slots(
         .into_iter()
         .filter(|s| simd_covered(s.header_pc, s.array_local, s.bound_local, s.iv_local))
         .collect();
-    let simd_fp_loops: Vec<SimdFpArraySum> = simd_fp_loops
-        .into_iter()
-        .filter(|s| simd_covered(s.header_pc, s.array_local, s.bound_local, s.iv_local))
-        .collect();
     let simd_element_wise_loops: Vec<SimdArrayElementWise> = simd_element_wise_loops
         .into_iter()
         .filter(|e| {
@@ -2013,10 +2002,6 @@ pub fn compile_with_param_slots(
     // A SIMD batch pre-header is emitted under the same placement contract as
     // the LICM hoists, so a bypassable header must not carry one either.
     let simd_loops: Vec<SimdIntArraySum> = simd_loops
-        .into_iter()
-        .filter(|s| !bypassable_headers.contains(&s.header_pc))
-        .collect();
-    let simd_fp_loops: Vec<SimdFpArraySum> = simd_fp_loops
         .into_iter()
         .filter(|s| !bypassable_headers.contains(&s.header_pc))
         .collect();
@@ -2146,7 +2131,6 @@ pub fn compile_with_param_slots(
     compiler.ldc_fp_pcs = ldc_fp_pcs;
     compiler.fp_hoist_info = fp_hoist_info;
     compiler.fp_strength_reduction_pcs = fp_strength_reduction_pcs;
-    compiler.simd_fp_loops = simd_fp_loops;
     // Phase B (real-frame-deopt x64 backport): build the per-field type map for
     // scalar-replaced objects by joining the per-access-site `field_info`
     // (`(pc, field_index, type_tag)`) with the plan's `field_ops` (`pc → new_pc`).

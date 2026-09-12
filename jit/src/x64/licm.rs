@@ -364,28 +364,6 @@ pub(super) struct FpLoopHoist {
     pub(super) is_double: bool,
 }
 
-/// Information about a vectorizable double-array sum reduction loop.
-/// Pattern: for (i = start; i < bound; i++) sum += arr[i]
-/// where arr is a double[] and sum is a double local.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(super) struct SimdFpArraySum {
-    /// Bytecode PC of the loop header.
-    pub(super) header_pc: usize,
-    /// Bytecode PC of the back-edge instruction.
-    pub(super) back_edge_pc: usize,
-    /// Local index of the induction variable (i).
-    pub(super) iv_local: usize,
-    /// Local index of the accumulator (sum).
-    pub(super) acc_local: usize,
-    /// Local index of the array reference.
-    pub(super) array_local: usize,
-    /// Local index of the loop bound.
-    pub(super) bound_local: usize,
-    /// Operation: 0x58=ADD (sum), 0x59=MUL (dot product partial).
-    pub(super) sse_op: u8,
-}
-
 /// Get the byte length of a bytecode instruction at `pc`.
 pub(crate) fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
     match code[pc] {

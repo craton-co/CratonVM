@@ -84,8 +84,7 @@ use super::escape_analysis::{
     detect_byte_sieve_loop, detect_loops, find_bypassable_loop_headers,
 };
 use super::simd_analysis::{
-    detect_fp_array_sum, detect_int_array_element_wise, detect_int_array_sum,
-    detect_matrix_dot_loop,
+    detect_int_array_element_wise, detect_int_array_sum, detect_matrix_dot_loop,
 };
 use super::{bytecode_len_at, find_induction_variable, has_avx2};
 use rustc_hash::FxHashSet;
@@ -105,8 +104,6 @@ pub(crate) enum SinglePassOnly {
     ByteSieve,
     /// SuperWord reduction over an `int[]` (AVX2).
     SimdIntArraySum,
-    /// SuperWord reduction over a `double[]`/`float[]` (AVX2).
-    SimdFpArraySum,
     /// Element-wise `out[i] = a[i] OP b[i]` vectorisation (AVX2 at emission).
     SimdArrayElementWise,
     /// The matrix dot-product loop nest.
@@ -121,7 +118,6 @@ impl SinglePassOnly {
         SinglePassOnly::BulkSetByteStride,
         SinglePassOnly::ByteSieve,
         SinglePassOnly::SimdIntArraySum,
-        SinglePassOnly::SimdFpArraySum,
         SinglePassOnly::SimdArrayElementWise,
         SinglePassOnly::MatrixDot,
     ];
@@ -135,9 +131,8 @@ impl SinglePassOnly {
             SinglePassOnly::BulkSetByteStride => 1,
             SinglePassOnly::ByteSieve => 2,
             SinglePassOnly::SimdIntArraySum => 3,
-            SinglePassOnly::SimdFpArraySum => 4,
-            SinglePassOnly::SimdArrayElementWise => 5,
-            SinglePassOnly::MatrixDot => 6,
+            SinglePassOnly::SimdArrayElementWise => 4,
+            SinglePassOnly::MatrixDot => 5,
         }
     }
 
@@ -148,7 +143,6 @@ impl SinglePassOnly {
             SinglePassOnly::BulkSetByteStride => "a bulk byte-array stride store",
             SinglePassOnly::ByteSieve => "the byte-array sieve loop nest",
             SinglePassOnly::SimdIntArraySum => "a vectorised int[] reduction",
-            SinglePassOnly::SimdFpArraySum => "a vectorised floating-point reduction",
             SinglePassOnly::SimdArrayElementWise => "a vectorised element-wise array loop",
             SinglePassOnly::MatrixDot => "the matrix dot-product loop nest",
         }
@@ -168,9 +162,7 @@ impl SinglePassOnly {
             // driver so downstream passes can see it, but emission checks
             // `has_avx2()`. The veto follows EMISSION, not detection: a
             // method nobody will vectorise must not lose its IR body.
-            SinglePassOnly::SimdIntArraySum
-            | SinglePassOnly::SimdFpArraySum
-            | SinglePassOnly::SimdArrayElementWise => has_avx2(),
+            SinglePassOnly::SimdIntArraySum | SinglePassOnly::SimdArrayElementWise => has_avx2(),
             SinglePassOnly::MatrixDot => matrix_dot_enabled(),
         }
     }
@@ -208,12 +200,6 @@ impl SinglePassOnly {
                                 .is_some()
                     })
             }
-            SinglePassOnly::SimdFpArraySum => loops.iter().any(|&(h, b)| {
-                live(&h)
-                    && induction_var(code, h, b)
-                        .and_then(|iv| detect_fp_array_sum(code, h, b, iv))
-                        .is_some()
-            }),
             SinglePassOnly::SimdArrayElementWise => loops.iter().any(|&(h, b)| {
                 live(&h)
                     && induction_var(code, h, b)

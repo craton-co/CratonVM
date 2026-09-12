@@ -998,8 +998,6 @@ struct Compiler {
     fp_hoist_info: Vec<FpLoopHoist>,
     /// FP LICM: frame offsets for hoisted FP values (one per FpLoopHoist entry).
     _fp_hoist_offsets: Vec<i32>,
-    /// SIMD: vectorizable double-array sum loops detected during analysis.
-    simd_fp_loops: Vec<SimdFpArraySum>,
     /// FP strength reduction: set of bytecode PCs where dmul-by-2.0 is replaced with dadd-self.
     fp_strength_reduction_pcs: FxHashSet<usize>,
     /// Scalar replacement: non-escaping NEW PCs → frame-local field storage.
@@ -2970,7 +2968,6 @@ impl Compiler {
             scratch_xmm_in_use: 0,
             fp_hoist_info: Vec::new(),
             _fp_hoist_offsets: Vec::new(),
-            simd_fp_loops: Vec::new(),
             fp_strength_reduction_pcs: FxHashSet::default(),
             scalar_replaced: FxHashMap::default(),
             scalar_field_ops: FxHashMap::default(),

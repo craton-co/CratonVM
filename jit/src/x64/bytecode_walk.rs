@@ -1319,63 +1319,6 @@ impl Compiler {
                 }
             }
 
-            // === SIMD FP: Emit vectorized preheader for double-array-sum loops ===
-            {
-                let simd_fp_match = self
-                    .simd_fp_loops
-                    .iter()
-                    .find(|s| s.header_pc == pc)
-                    .map(|s| (s.iv_local, s.acc_local, s.array_local, s.bound_local));
-
-                if let Some((iv_local, acc_local, array_local, bound_local)) = simd_fp_match {
-                    let acc_offset = self.local_offset(acc_local);
-
-                    // Sync accumulator XMM/register → frame slot
-                    if let Some(xmm) = self.xmm_for_local(acc_local) {
-                        self.emit_movq_mem_rbp_from_xmm(acc_offset, xmm);
-                    } else if let Some(acc_reg) = self.reg_for_local(acc_local) {
-                        self.emit_store_local(acc_offset, acc_reg);
-                    }
-
-                    // Load array reference into RCX
-                    if let Some(reg) = self.reg_for_local(array_local) {
-                        self.emit_mov_reg_reg(RCX, reg);
-                    } else {
-                        self.emit_load_local(RCX, self.local_offset(array_local));
-                    }
-                    // Load induction variable into R10D
-                    if let Some(reg) = self.reg_for_local(iv_local) {
-                        self.emit_mov_reg_reg(R10, reg);
-                    } else {
-                        self.emit_load_local(R10, self.local_offset(iv_local));
-                    }
-                    // Load bound into R11D
-                    if let Some(reg) = self.reg_for_local(bound_local) {
-                        self.emit_mov_reg_reg(R11, reg);
-                    } else {
-                        self.emit_load_local(R11, self.local_offset(bound_local));
-                    }
-
-                    // Emit SIMD FP array sum
-                    self.emit_simd_fp_array_sum(acc_offset);
-
-                    // Sync accumulator frame slot → XMM/register
-                    if let Some(xmm) = self.xmm_for_local(acc_local) {
-                        self.emit_load_local(RAX, acc_offset);
-                        self.emit_movq_xmm_from_rax(xmm);
-                    } else if let Some(acc_reg) = self.reg_for_local(acc_local) {
-                        self.emit_load_local(acc_reg, acc_offset);
-                    }
-
-                    // Update induction variable from R10D
-                    if let Some(reg) = self.reg_for_local(iv_local) {
-                        self.emit_mov_reg_reg(reg, R10);
-                    } else {
-                        self.emit_store_local(self.local_offset(iv_local), R10);
-                    }
-                }
-            }
-
             // === T17.Β.3 — Loop unswitch pre-header evaluation ===========
             //
             // The detector has already proved that `invariant_local`
