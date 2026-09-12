@@ -19,20 +19,20 @@ use super::*;
 /// regression bisection while the arms are fresh.
 pub(super) fn dupx_codegen_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUPX").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_DUPX"))
 }
 
 /// DBG bisection (spring-bug-11): disable ONLY the dup_x1 (0x5A) codegen arm,
 /// to tell whether the Groovy SIGSEGV is in dup_x1 vs dup_x2 vs a co-located op.
 pub(super) fn dup_x1_codegen_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUP_X1").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_DUP_X1"))
 }
 
 /// DBG bisection (spring-bug-11): disable ONLY the dup_x2 (0x5B) codegen arm.
 pub(super) fn dup_x2_codegen_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUP_X2").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_DUP_X2"))
 }
 
 /// Disable ONLY the dup2_x2 (0x5E) codegen arm, restoring the historical
@@ -42,8 +42,7 @@ pub(super) fn dup_x2_codegen_disabled() -> bool {
 /// `dup-x2`.
 pub(super) fn dup2_x2_codegen_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE
-        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUP2_X2").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_DUP2_X2"))
 }
 
 /// Kill-switch for the IR tier's trusted-oop receiver shortcut on a PRIMITIVE
@@ -57,7 +56,7 @@ pub(super) fn dup2_x2_codegen_disabled() -> bool {
 pub fn trusted_oop_receiver_getfield_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD").is_none()
+        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD")
     })
 }
 
@@ -66,8 +65,7 @@ pub fn trusted_oop_receiver_getfield_enabled() -> bool {
 /// methods carry the opcode; this says what happened inside each one.
 pub(super) fn dupx_trace() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE
-        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DUPX_TRACE").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_DUPX_TRACE"))
 }
 
 /// DBG bisection (spring-bug-11): immediately `canonicalize_stack()` after a
@@ -78,9 +76,7 @@ pub(super) fn dupx_trace() -> bool {
 /// op is to blame.
 pub(super) fn dupx_eager_canon() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_DUPX_EAGER_CANON").is_some()
-    })
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_DUPX_EAGER_CANON"))
 }
 
 /// Parse a comma-separated env var into a substring list, `None` when unset or
@@ -189,8 +185,7 @@ pub(super) fn sp_inline_mega_enabled() -> bool {
 /// method names. One line per emitted site, at compile time — not per call.
 pub(super) fn sp_ic_site_trace() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE
-        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SP_IC_SITES").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SP_IC_SITES"))
 }
 
 pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitScanResult> {
@@ -475,7 +470,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                     // narrow form either, so refuse the method rather than
                     // widen the set this walk claims to model.
                     _ => {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                             eprintln!("[cratonvm-jitc] scan-bail wide op=0x{wop:02x} pc={pc}");
                         }
                         return None;
@@ -869,7 +864,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // Anything else: not JIT-compatible
             _ => {
-                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                     eprintln!("[cratonvm-jitc] scan-bail op=0x{:02x} pc={}", op, pc);
                 }
                 return None;

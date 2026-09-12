@@ -266,14 +266,12 @@ pub mod parse {
     /// `!(empty | "0" | "false" | "off" | "no")`, case-insensitive, trimmed.
     ///
     /// Used by `native_io::env_flag_enabled` for the confinement and strict
-    /// defence-in-depth deployment profiles.
+    /// defence-in-depth deployment profiles. The value rule is shared with
+    /// [`super::runtime_flag_on`], so the two cannot drift apart.
     #[inline]
     pub fn truthy_word(src: &dyn FlagSource, name: &str) -> bool {
         match utf8(src, name) {
-            Some(v) => {
-                let v = v.trim().to_ascii_lowercase();
-                !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
-            }
+            Some(v) => super::word_is_on(&v),
             None => false,
         }
     }
@@ -3738,6 +3736,33 @@ pub fn runtime_var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
     std::env::var_os(key)
 }
 
+/// The value rule behind [`parse::truthy_word`] and [`runtime_flag_on`]: off
+/// iff the value, trimmed and ASCII-lowercased, is empty, `0`, `false`, `off`
+/// or `no`. Everything else — `1`, `true`, `yes`, `anything` — is on.
+#[inline]
+fn word_is_on(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+}
+
+/// A boolean switch read through [`runtime_var_os`]: `false` when the variable
+/// is unset, otherwise the [`parse::truthy_word`] rule applied to its value
+/// (lossily decoded, so a non-UTF-8 value is on rather than silently off).
+///
+/// This is what a presence-only `runtime_var_os(NAME).is_some()` gate should
+/// have been. Under presence semantics `NAME=0`, `NAME=false`, `NAME=off` and
+/// `NAME=` all turned the switch ON — see
+/// `jit-presence-only-flag-reads-FIXED.md`. It keeps every property of
+/// [`runtime_var_os`]: the latched snapshot for declared names, per-thread
+/// test overrides for undeclared ones, and the read census.
+#[inline]
+pub fn runtime_flag_on<K: AsRef<OsStr>>(key: K) -> bool {
+    match runtime_var_os(key) {
+        Some(value) => word_is_on(&value.to_string_lossy()),
+        None => false,
+    }
+}
+
 /// Per-flag-name read census — see the call in [`runtime_var_os`].
 ///
 /// `CRATONVM_DBG_FLAGREADS=1` prints the top offenders every 200k reads. A flag
@@ -3835,6 +3860,51 @@ mod tests {
             Some(OsString::from("enabled"))
         );
         assert_eq!(f.legacy_var_os("CRATONVM_DBG_AIOOBE"), None);
+    }
+
+    /// `runtime_flag_on` is a boolean, not a presence test: the off words are
+    /// off, and it agrees with `parse::truthy_word` on every one of them.
+    #[test]
+    fn runtime_flag_on_reads_the_off_words_as_off() {
+        // Undeclared, so the per-thread override path serves it without any
+        // write to `environ`.
+        const NAME: &str = "cratonvm_undeclared_runtime_flag_on_probe";
+        assert!(
+            std::env::var_os(NAME).is_none(),
+            "fixture name must not exist in the real environment"
+        );
+        assert!(!runtime_flag_on(NAME), "unset must read as off");
+        with_thread_overrides(&[(NAME, None)], || {
+            assert!(
+                !runtime_flag_on(NAME),
+                "an override to None must read as off"
+            );
+        });
+
+        for (value, want) in [
+            ("", false),
+            ("0", false),
+            ("false", false),
+            ("OFF", false),
+            (" no ", false),
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("anything", true),
+        ] {
+            with_thread_overrides(&[(NAME, Some(value))], || {
+                assert_eq!(
+                    runtime_flag_on(NAME),
+                    want,
+                    "runtime_flag_on with {NAME}={value:?}"
+                );
+            });
+            assert_eq!(
+                parse::truthy_word(&src(&[(NAME, value)]), NAME),
+                want,
+                "parse::truthy_word with {NAME}={value:?} must agree"
+            );
+        }
     }
 
     /// An UNDECLARED name is overridable, so a test never has to write to

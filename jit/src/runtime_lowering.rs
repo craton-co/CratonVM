@@ -365,7 +365,7 @@ pub(crate) fn emit_inline_tlab_new_ir(
         None
     };
     if let Some(why) = declined {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
             eprintln!("[cratonvm-jitc] ir inline-TLAB bump DECLINED: {why}");
         }
         note_inline_tlab_decline(why);

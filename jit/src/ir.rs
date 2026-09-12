@@ -4627,7 +4627,7 @@ fn ir_string_intrinsics_enabled() -> bool {
 /// `BigDecimal` run.
 fn string_intrinsic_reporting() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_STRING").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_STRING"))
 }
 
 /// Builds an IR `Graph` from JVM bytecode by abstract-interpreting
@@ -11407,8 +11407,8 @@ fn report_phi_type_fallback(why: &str) {
 }
 
 fn ir_bail_reporting() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
-        || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some()
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC")
+        || cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_IR_COMPILES")
 }
 
 /// Check if a method (from its JitScanResult) is suitable for IR compilation.

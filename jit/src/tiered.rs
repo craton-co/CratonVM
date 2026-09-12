@@ -1197,7 +1197,7 @@ impl CompilerCore {
         if stale.is_empty() {
             return;
         }
-        let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TIER_ENQUEUE").is_some();
+        let trace = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_TIER_ENQUEUE");
         {
             let mut methods = self.methods.lock();
             for request in stale {
@@ -1364,7 +1364,7 @@ impl CompilerCore {
     /// one-shot memo (`cratonvm_jit::take_deferred_new_retry`), so a method can
     /// reach here at most once per process.
     pub(crate) fn request_deferred_new_retry(&self, key: &MethodKey) {
-        let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some();
+        let dbg = cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC");
         macro_rules! refuse {
             ($why:expr) => {{
                 if dbg {
@@ -3294,7 +3294,7 @@ impl TieredCompilationManager {
             osr_bci: None,
         };
 
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TIER_ENQUEUE").is_some() {
+        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_TIER_ENQUEUE") {
             eprintln!(
                 "[cratonvm-tier] enqueue {}.{}{} tier={:?} invocations={} elapsed_ms={}",
                 state.method_key.class_name,

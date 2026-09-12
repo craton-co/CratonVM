@@ -1543,7 +1543,7 @@ impl Compiler {
         );
         // Compact object: set GC_FLAG_COMPACT (bit 2) in the gc_flags byte.
         if let Some(body) = compact_body {
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE") {
                 eprintln!(
                     "[compact-inline] new class_id={class_id_raw} body={body} total={total_size}"
                 );

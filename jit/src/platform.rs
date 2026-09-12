@@ -833,7 +833,7 @@ mod near_globals {
     /// than left for the reader to subtract: a buffer inside the window is
     /// what makes `rip_disp32` hand out the short form.
     fn report(outcome: &str, anchor: usize, buf: usize, size: usize, attempt: usize) {
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CODE_NEAR_GLOBALS").is_none() {
+        if !cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_CODE_NEAR_GLOBALS") {
             return;
         }
         let (in_reach_n, fell_back_n, retired) = stats();
