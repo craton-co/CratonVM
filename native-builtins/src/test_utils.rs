@@ -750,6 +750,12 @@ pub(crate) struct MockNativeContext {
     ptr_to_index: UnsafeCell<HashMap<usize, usize>>,
     /// class_id -> class_name mapping
     class_names: HashMap<u32, String>,
+    /// Opt-in backing for `list_loaded_class_ids`, which defaults to "nothing
+    /// is loaded" so a test that does not ask for it is unaffected. Populated
+    /// only by `declare_loaded_class`.
+    loaded_class_ids: Vec<u32>,
+    /// Opt-in backing for `module_for_package`, which defaults to `None`.
+    module_by_package: HashMap<String, String>,
     /// class_name -> class_id mapping
     name_to_id: HashMap<String, u32>,
     /// Synthetic lambda class id -> defining host internal name. Tests use
@@ -992,6 +998,8 @@ impl MockNativeContext {
             heap: UnsafeCell::new(Vec::new()),
             ptr_to_index: UnsafeCell::new(HashMap::new()),
             class_names: HashMap::new(),
+            loaded_class_ids: Vec::new(),
+            module_by_package: HashMap::new(),
             name_to_id: HashMap::new(),
             lambda_proxy_hosts_override: UnsafeCell::new(HashMap::new()),
             next_class_id: seed.next_class_id,
@@ -1400,6 +1408,29 @@ impl MockNativeContext {
         ClassId::new(id)
     }
 
+    /// Declare a class that `list_loaded_class_ids` will also report.
+    ///
+    /// `declare_second_copy` above names an id WITHOUT adding it to that list,
+    /// deliberately; this is the version for code that walks the loaded set --
+    /// `boot_loader::native_get_system_package_names` is the caller it was added
+    /// for. The list stays empty unless a test calls this.
+    #[allow(dead_code)]
+    pub(crate) fn declare_loaded_class(&mut self, internal_name: &str) -> ClassId {
+        let id = self.next_class_id;
+        self.next_class_id += 1;
+        self.class_names.insert(id, internal_name.to_string());
+        self.loaded_class_ids.push(id);
+        ClassId::new(id)
+    }
+
+    /// Say which module owns a package, in the slash form
+    /// `NativeContext::module_for_package` takes.
+    #[allow(dead_code)]
+    pub(crate) fn declare_module_package(&mut self, package_slash: &str, module: &str) {
+        self.module_by_package
+            .insert(package_slash.to_string(), module.to_string());
+    }
+
     /// WP0.2: set the direct super-class of `class_id`.
     #[allow(dead_code)]
     pub(crate) fn set_superclass(&self, class_id: ClassId, super_id: ClassId) {
@@ -1552,6 +1583,14 @@ impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
 
     fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
         self.class_names.get(&class_id.as_u32()).cloned()
+    }
+
+    fn list_loaded_class_ids(&self) -> Vec<ClassId> {
+        self.loaded_class_ids.iter().copied().map(ClassId::new).collect()
+    }
+
+    fn module_for_package(&self, pkg: &str) -> Option<String> {
+        self.module_by_package.get(pkg).cloned()
     }
 
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {

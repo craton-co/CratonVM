@@ -312,6 +312,7 @@ prescribes `TIMEOUT=600` for.
 - [`completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`](completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md)
 - [`completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`](completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md)
   — the successor. CLOSED 2026-09-02: all three of its residuals discharged,
-  composition 1.19x. What is still open from this line is
-  [`../../known-issues/perf/composition-native-callback-and-the-promotion-question-20260902.md`](../../known-issues/perf/composition-native-callback-and-the-promotion-question-20260902.md).
-- [`../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`](../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md)
+  composition 1.19x. Its own successor closed on 2026-09-11:
+  [`composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`](composition-native-callback-and-the-promotion-question-CLOSED-20260911.md).
+  Nothing on this line is open.
+- [`interpreted-invoke-cost-350ns-RETIRED-20260911.md`](interpreted-invoke-cost-350ns-RETIRED-20260911.md)

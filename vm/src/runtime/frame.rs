@@ -1675,7 +1675,7 @@ impl Frame {
     /// on the interpreted-invoke probe put `memcpy` under `Vec::pop<Frame>`
     /// and `pop_and_recycle_frame_with_reason` at 6.97% of the invoke arm,
     /// inside a frame-lifecycle group that was ~24.7% of it — see
-    /// `known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`.
+    /// `docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md`.
     /// Nothing on that path needed the frame moved anywhere; it needed four
     /// `Vec` headers out of it.
     ///

@@ -2223,6 +2223,12 @@ unsafe fn bail_to_interpreter(
     // body. Same hazard as the dispatch slow path — see
     // `try_lambda_proxy_sam_dispatch`, which declines everything that is not a
     // proxy's SAM, so the routing below is unchanged for every other call.
+    crate::vm::dbg_dispatch_tally(
+        "jit_bail_to_interpreter",
+        info.class_name,
+        info.method_name,
+        info.descriptor,
+    );
     if let Some(result) = try_lambda_proxy_sam_dispatch(vm, thread, info, args) {
         return match result {
             Ok(Some(Value::Int(v))) => v as i64,
@@ -13524,11 +13530,47 @@ fn resolve_native_site(
     // `classify_native` is a pure function of `(class, method)` and is the FIRST
     // thing the dispatch-site gate consults: when it answers `None`, that gate
     // returns `Ok(())` in every mode without touching the policy or the audit
-    // log. So refusing the sensitive triples here is exactly equivalent, and no
-    // leaf native is one — the classified set is process spawn, library load,
-    // `Unsafe`, Panama, file and socket I/O, none of which could satisfy the
-    // leaf contract in the first place.
-    if cratonvm_native_api::capability::classify_native(&lookup_class, info.method_name).is_some() {
+    // log.
+    //
+    // THE REFUSAL BELOW WAS RIGHT WHEN IT WAS WRITTEN AND ITS REASON EXPIRED.
+    //
+    // It closed with "no leaf native is one — the classified set is process
+    // spawn, library load, `Unsafe`, Panama, file and socket I/O, none of which
+    // could satisfy the leaf contract in the first place". True while the cache
+    // was leaf-only. 836631dcc widened it to EVERY registered native, and
+    // `jdk/internal/misc/Unsafe` is `CapabilityKind::RawMemory`, so from that
+    // commit the sentence stopped describing the code and the refusal became a
+    // blanket exclusion of the hottest native on any CAS-driven workload.
+    //
+    // Measured on `HibfixComposeProbe2`, 40 000 chains,
+    // `CRATONVM_DBG=dispatch-tally`: **99 428 of the 100 805 calls reaching
+    // `invoke_or_native` are `Unsafe.compareAndSetInt` arriving from
+    // `jit_invoke_virtual_mic`'s tail** — 2.49 per composition chain, each one
+    // the full ~27-gate cascade and the three-string registry hash this cache
+    // exists to remove. The site refusal census reported it as three refused
+    // SITES, which is a number that cannot be read as a per-call cost, which is
+    // why it sat there. See
+    // `docs/internal/performance/composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`.
+    //
+    // The gate is not skipped: it is MOVED to the dispatch side, which is where
+    // the funnel runs it too (`invoke_or_native`'s "CAPABILITY GATE, dispatch
+    // site 1 of 3" — deliberately at the last point before the native runs, not
+    // at resolution). The entry carries one `bool`, so every unclassified
+    // native — the overwhelming majority — pays a not-taken branch, and a
+    // classified one pays exactly what it pays through the funnel.
+    //
+    // `CRATONVM_JIT_SITE_CACHE_CAPABILITY=0` restores the refusal, so the
+    // change can be priced and, if a capability question is ever raised
+    // against it, switched off without a rebuild.
+    // The KIND, not a bool, and derived from `lookup_class` — the receiver's
+    // runtime class, which is what this site actually dispatches on. Carrying
+    // the answer forward is the point: re-deriving it at dispatch would have to
+    // use `info.class_name`, the constant-pool owner, and an unclassified owner
+    // with a classified receiver (`InputStream` declared, `FileInputStream`
+    // received) would silently lose the gate.
+    let capability_kind =
+        cratonvm_native_api::capability::classify_native(&lookup_class, info.method_name);
+    if capability_kind.is_some() && !site_cache_capability_gate_enabled() {
         return site_refusal::note(3);
     }
     // The triple may be registered on the receiver's class OR inherited from a
@@ -13667,6 +13709,7 @@ fn resolve_native_site(
         callback,
         native_id,
         receiver_class_id: guard,
+        capability_kind,
         poly: poly_descriptor.is_some(),
         // Decoded HERE, on the one cold path that builds an entry, so the
         // dispatch never parses this descriptor again. See
@@ -14008,8 +14051,39 @@ struct NativeSiteCache {
     /// every other entry uses — would hand a boxed `Integer` back into an
     /// `int` return slot.
     poly: bool,
+    /// `capability::classify_native`'s answer for this site's RECEIVER class,
+    /// resolved once with the rest of the entry.
+    ///
+    /// `Some` means the dispatch must run
+    /// `vm_exec::check_native_dispatch_capability_for_slot` before calling the
+    /// callback — the same gate, at the same point in the call, as
+    /// `invoke_or_native`'s "dispatch site 1 of 3". `None` for every native
+    /// that is not process spawn, library load, `Unsafe`, Panama, or
+    /// file/socket I/O, which is nearly all of them; those pay one
+    /// predicted-not-taken branch.
+    ///
+    /// It is the KIND and not a flag because the dispatch must not re-derive
+    /// it: only this resolution saw the receiver's runtime class. See the long
+    /// note at the classification site in `resolve_native_site` for why this is
+    /// carried at all and no longer a refusal.
+    capability_kind: Option<cratonvm_native_api::CapabilityKind>,
     /// This site's descriptor, decoded once — see [`NativeSiteDescriptor`].
     desc: NativeSiteDescriptor,
+}
+
+/// `CRATONVM_JIT_SITE_CACHE_CAPABILITY` — default-ON, `=0` restores the
+/// blanket refusal of capability-classified triples in `resolve_native_site`.
+///
+/// One binary, two arms, so "serve `Unsafe` from the site cache and run the
+/// gate on dispatch" can be priced against "refuse the site and pay
+/// `invoke_or_native` for every call" without a rebuild — and switched off
+/// on the spot if a capability question is ever raised against it.
+fn site_cache_capability_gate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_SITE_CACHE_CAPABILITY")
+            .map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
+    })
 }
 
 /// A call site's descriptor, decoded once and carried on the cache entry the
@@ -15900,6 +15974,12 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // `invoke_or_native` then applies the VM's interface/abstract retarget.
             let dispatch_class =
                 virtual_dispatch_target_for_receiver(vm, receiver_ref, info).class_name;
+            crate::vm::dbg_dispatch_tally(
+                "jit_dispatch_virtual_tail",
+                &dispatch_class,
+                info.method_name,
+                info.descriptor,
+            );
             let virt_result = crate::vm::invoke_or_native(
                 vm,
                 thread,
@@ -16104,14 +16184,22 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         info.descriptor,
                         &values,
                     ),
-                    None => crate::vm::invoke_or_native(
-                        vm,
-                        thread,
-                        info.class_name,
-                        info.method_name,
-                        info.descriptor,
-                        &values,
-                    ),
+                    None => {
+                        crate::vm::dbg_dispatch_tally(
+                            "jit_dispatch_static_tail",
+                            info.class_name,
+                            info.method_name,
+                            info.descriptor,
+                        );
+                        crate::vm::invoke_or_native(
+                            vm,
+                            thread,
+                            info.class_name,
+                            info.method_name,
+                            info.descriptor,
+                            &values,
+                        )
+                    }
                 };
                 match r {
                     Ok(v) => v,
@@ -16272,14 +16360,17 @@ unsafe fn try_jit_static_bytecode_callee(
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
-    let frame = crate::runtime::frame::Frame::new_pooled_cached(
+    // In-place install, not a by-value build: `execute_prebuilt_frame` pushes
+    // through `push_frame_and_fire_entry`, which harvests and trims the
+    // retired slot, so this helper used to undo frame-slot reuse for the
+    // interpreter frames beneath it once per call. See
+    // `install_and_run_cached_frame`.
+    Some(crate::runtime::interpreter::install_and_run_cached_frame(
+        vm,
+        thread,
         cached,
         values,
-        &mut thread.locals_pool,
-        &mut thread.stacks_pool,
-    );
-    Some(crate::runtime::interpreter::execute_prebuilt_frame(
-        vm, thread, frame,
+        Some("jit-static-bc"),
     ))
 }
 
@@ -16468,14 +16559,17 @@ unsafe fn try_jit_virtual_bytecode_callee(
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
-    let frame = crate::runtime::frame::Frame::new_pooled_cached(
+    // In-place install, not a by-value build: `execute_prebuilt_frame` pushes
+    // through `push_frame_and_fire_entry`, which harvests and trims the
+    // retired slot, so this helper used to undo frame-slot reuse for the
+    // interpreter frames beneath it once per call. See
+    // `install_and_run_cached_frame`.
+    Some(crate::runtime::interpreter::install_and_run_cached_frame(
+        vm,
+        thread,
         cached,
         values,
-        &mut thread.locals_pool,
-        &mut thread.stacks_pool,
-    );
-    Some(crate::runtime::interpreter::execute_prebuilt_frame(
-        vm, thread, frame,
+        Some("jit-virtual-bc"),
     ))
 }
 
@@ -16649,14 +16743,17 @@ unsafe fn try_jit_special_bytecode_callee(
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
-    let frame = crate::runtime::frame::Frame::new_pooled_cached(
+    // In-place install, not a by-value build: `execute_prebuilt_frame` pushes
+    // through `push_frame_and_fire_entry`, which harvests and trims the
+    // retired slot, so this helper used to undo frame-slot reuse for the
+    // interpreter frames beneath it once per call. See
+    // `install_and_run_cached_frame`.
+    Some(crate::runtime::interpreter::install_and_run_cached_frame(
+        vm,
+        thread,
         cached,
         values,
-        &mut thread.locals_pool,
-        &mut thread.stacks_pool,
-    );
-    Some(crate::runtime::interpreter::execute_prebuilt_frame(
-        vm, thread, frame,
+        Some("jit-special-bc"),
     ))
 }
 
@@ -16844,6 +16941,24 @@ unsafe fn try_jit_site_cached_native_dispatch(
         }
     }
 
+    // CAPABILITY GATE. Same gate, same point in the call, as
+    // `invoke_or_native`'s "dispatch site 1 of 3": the last place before the
+    // native actually runs, because a capability is only exercised by a native
+    // that executes. Reached only by the classified triples — process spawn,
+    // library load, `Unsafe`, Panama, file and socket I/O — and skipped by a
+    // not-taken branch for everything else.
+    //
+    // A refusal returns `None` rather than propagating the error: this is a
+    // fast path whose contract is "served, or not served here", and the funnel
+    // it declines to raises the identical error from the identical gate. That
+    // costs a refused call one extra traversal and keeps the fast path unable
+    // to invent a failure the slow path would not have produced.
+    if let Some(kind) = entry.capability_kind {
+        if crate::vm::check_native_dispatch_capability_for_slot(vm, kind, entry.native_id).is_err()
+        {
+            return site_refusal::note_and_decline(3);
+        }
+    }
     // The old `let (thread, _guard) = jit_thread_mut()?;` stood here. Same
     // position, same early-out, but the reference is the caller's.
     let thread = thread?;
@@ -23011,6 +23126,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         }
         let invoke_res = {
             let _g = mic_prof::CycGuard::new(&mic_prof::CYC_INVOKE);
+            crate::vm::dbg_dispatch_tally(
+                "jit_mic_tail",
+                &class_name,
+                info.method_name,
+                info.descriptor,
+            );
             crate::vm::invoke_or_native(
                 vm,
                 thread,
@@ -23234,6 +23355,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
 
     let invoke_res = {
         let _g = mic_prof::CycGuard::new(&mic_prof::CYC_INVOKE);
+        crate::vm::dbg_dispatch_tally(
+            "jit_mic_tail",
+            &class_name,
+            info.method_name,
+            info.descriptor,
+        );
         crate::vm::invoke_or_native(
             vm,
             thread,
@@ -27633,6 +27760,9 @@ mod jit_native_dispatch_profile {
                         callback: cb,
                         native_id: None,
                         receiver_class_id: Some(0),
+                        // The rungs below price an UNCLASSIFIED native, which
+                        // is what the cache overwhelmingly serves.
+                        capability_kind: None,
                         desc: NativeSiteDescriptor::decode(GET_INFO.descriptor),
                         // These rungs price the ORDINARY native dispatch. A
                         // signature-polymorphic entry takes a different tail

@@ -442,7 +442,7 @@ pub struct CachedBytecodeMethod {
     /// `intercept_force_registered_native_cached` at 1.67% and
     /// `real_http_url_connection_native` at **1.50%** of the interpreted-invoke
     /// arm, with a `memcpy` arm underneath (`str::eq` bottoms out in `memcmp`).
-    /// See `known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`.
+    /// See `docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md`.
     ///
     /// The *argument*- and *receiver*-dependent halves of those arms are NOT
     /// memoized and must not be: a null second argument, an Objenesis-shaped

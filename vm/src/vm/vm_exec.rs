@@ -1610,6 +1610,49 @@ fn reset_permissive_dispatch_memo() {
     PERMISSIVE_DISPATCH_MEMO.with(|memo| memo.set((0, 0, 0)));
 }
 
+/// [`check_native_dispatch_capability`] for a caller that already knows the
+/// classification and the slot, and has no strings to spend on re-deriving
+/// either.
+///
+/// The JIT's per-call-site native cache
+/// (`jit::helpers::try_jit_site_cached_native_dispatch`) is that caller. It
+/// resolved the site once, against the RECEIVER's runtime class — which is not
+/// necessarily `JitInvokeInfo::class_name`, the constant-pool owner — and it
+/// holds the `NativeMethodId`. Re-entering through the string form would
+/// re-classify from the CP owner, and `java/io/InputStream` (unclassified) with
+/// a `java/io/FileInputStream` receiver (`FileRead`) is exactly the shape where
+/// that silently drops the gate. So the kind travels on the cache entry and the
+/// decision is made from it, never re-derived.
+///
+/// Otherwise identical to the string form, arm for arm: the permissive-mode
+/// thread memo first, then the slot's own precomputed classification, then the
+/// `classify_native` answer as the fallback for a slot that carries none.
+pub(crate) fn check_native_dispatch_capability_for_slot(
+    shared: &SharedVm,
+    kind: cratonvm_native_api::CapabilityKind,
+    native_id: Option<cratonvm_native_api::NativeMethodId>,
+) -> Result<(), MethodCallFailed> {
+    let registry = &shared.natives.native_methods;
+    let Some(caps) = registry.capabilities() else {
+        return Ok(());
+    };
+    if caps.mode() == cratonvm_native_api::CapabilityMode::Permissive
+        && permissive_dispatch_already_recorded(shared.vm_identity, caps, kind)
+    {
+        return Ok(());
+    }
+    if let Some(id) = native_id {
+        if registry.capability_of_id(id).is_some() {
+            return registry.check_dispatch_capability(id).map_err(Into::into);
+        }
+    }
+    caps.check(cratonvm_native_api::Capability::of(
+        kind,
+        cratonvm_native_api::Scope::Any,
+    ))
+    .map_err(Into::into)
+}
+
 /// The ~35-native half of [`check_native_dispatch_capability`]. Out of line so
 /// the hot path is two predicted-not-taken branches and nothing else.
 #[cold]
@@ -11834,6 +11877,64 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
             // -- see the GC-safety comment above this block's `if`.
             receiver = self.thread.native_pin_roots[sam_compat_pin_base];
             self.thread.native_pin_roots.truncate(sam_compat_pin_base);
+
+            // THE RESOLVED-HANDLE FAST PATH for a native->Java callback.
+            //
+            // Everything from here to `invoke_or_native` resolves the callee
+            // BY NAME, on every call: a class-manager read plus a `String`
+            // allocation for the receiver's class name, a `find_with_kind`
+            // triple hash against ~3 100 native slots, the cold
+            // descriptor-quirk rewrite on the miss, two more class-manager
+            // reads inside `invoke_or_native`, and then the whole by-name
+            // resolution again in `invoke_on_class_shared_inner`. This is
+            // ~2 500 stubs' calling convention, and
+            // `completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
+            // §3 measured removing it at ONE call site at 1.154x of a whole
+            // benchmark.
+            //
+            // A hit means this exact (VM, receiver class, method, descriptor)
+            // last reached the ordinary bytecode tail at the bottom of
+            // `invoke_on_class_shared_inner`, on this declaring class, and
+            // nothing that could change that has happened since — see
+            // `native_callee_memo`'s invalidation table. The replay is
+            // `interpreter::execute` on that class, which is exactly what the
+            // tail does and exactly what `invoke_virtual_bytecode_only` (the
+            // hand-written form of this fix) does.
+            //
+            // Three things are refused before the probe. An ARRAY receiver
+            // stores its COMPONENT class id in the header, so its id would
+            // redeem a plain receiver's entry and run the component's
+            // override (the `KC26 array.clone()` bug, restated below). A
+            // REDEFINED process has an agent's woven bytecode competing with
+            // registered natives, and that verdict is per-class state no
+            // epoch here tracks. A lambda-proxy id cannot appear: those come
+            // from the reserved `LAMBDA_PROXY_ID_BASE` range and `ClassId`s
+            // are never reused, so an id that was an ordinary class when the
+            // memo was filled is still one.
+            let memo_eligible = crate::runtime::env_cache::native_callback_memo()
+                && self.shared.mem.heap.kind_of(receiver) != cratonvm_types::ObjectKind::Array
+                && !crate::classloading::any_class_redefined();
+            if memo_eligible {
+                if let Some(declaring) = crate::runtime::native_callee_memo::lookup(
+                    self.shared,
+                    receiver_class_id,
+                    method_name,
+                    descriptor,
+                ) {
+                    let mut full_args = Vec::with_capacity(1 + args.len());
+                    full_args.push(Value::Object(Some(receiver)));
+                    full_args.extend_from_slice(args);
+                    return crate::runtime::interpreter::execute(
+                        self.shared,
+                        self.thread,
+                        declaring,
+                        method_name,
+                        descriptor,
+                        &full_args,
+                    );
+                }
+            }
+
             // Not a lambda proxy SAM call вЂ” normal virtual dispatch.
             // If the receiver IS a lambda proxy but calling a non-SAM method
             // (e.g. andThen), dispatch on the functional interface class.
@@ -12066,7 +12167,30 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                     method_name, class_name, resolved_from_receiver, receiver_class_id, global_id, needs_exact_class_dispatch
                 );
             }
-            if needs_exact_class_dispatch {
+            // Arm the memo's witness across the dispatch. It is NOT a
+            // prediction: the fill below happens only if the dispatch
+            // actually arrives at `invoke_on_class_shared_inner`'s ordinary
+            // bytecode tail, which every special arm returns before reaching.
+            // Both routes below end at that same tail with the same declaring
+            // class, so both are memoisable.
+            //
+            // `arms_poly_call_site` is the one thing the tail cannot see: a
+            // signature-polymorphic `invoke`/`invokeExact` needs
+            // `invoke_or_native` to publish the CALL-SITE descriptor before
+            // dispatching, and the fast path does not call it. Refused here
+            // rather than at the tail because this is where the class name
+            // that predicate reads is in hand.
+            let memo_save = (memo_eligible
+                && resolved_from_receiver
+                && !arms_poly_call_site(&class_name, method_name))
+            .then(|| {
+                crate::runtime::native_callee_memo::arm(
+                    receiver_class_id,
+                    method_name,
+                    descriptor,
+                )
+            });
+            let result = if needs_exact_class_dispatch {
                 invoke_on_class_shared(
                     self.shared,
                     self.thread,
@@ -12077,7 +12201,19 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                 )
             } else {
                 self.invoke_or_native(&class_name, method_name, descriptor, &full_args)
+            };
+            if let Some(save) = memo_save {
+                if let Some(declaring) = crate::runtime::native_callee_memo::disarm(save) {
+                    crate::runtime::native_callee_memo::fill(
+                        self.shared,
+                        receiver_class_id,
+                        method_name,
+                        descriptor,
+                        declaring,
+                    );
+                }
             }
+            result
         }
     }
 
@@ -19889,6 +20025,12 @@ pub fn dbg_dispatch_tally(site: &str, class_name: &str, method_name: &str, descr
     dispatch_tally::record(site, class_name, method_name, descriptor);
 }
 
+/// Print the `CRATONVM_DBG=dispatch-tally` rows at exit. Called from
+/// `interp_census::report_at_exit`; prints nothing when the tally is unarmed.
+pub fn dump_dispatch_tally_at_exit() {
+    dispatch_tally::dump_at_exit();
+}
+
 mod dispatch_tally {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -19910,18 +20052,35 @@ mod dispatch_tally {
         if !enabled() {
             return;
         }
-        static TOTAL: AtomicU64 = AtomicU64::new(0);
         {
             let mut guard = counts().lock().unwrap_or_else(|p| p.into_inner());
             *guard
                 .entry(format!("{site} {class_name}.{method_name}{descriptor}"))
                 .or_insert(0) += 1;
         }
-        let n = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let n = TOTAL_SO_FAR.fetch_add(1, Ordering::Relaxed) + 1;
         if n % (1 << 20) == 0 {
             dump(n);
         }
     }
+
+    /// Print the tally at exit, from `interp_census::report_at_exit`.
+    ///
+    /// `record` only dumped every 2^20 rows, so a workload that generates
+    /// fewer than a million dispatches -- `HibfixComposeProbe2` at 40 000
+    /// chains generates ~100 000 -- armed the instrument and printed nothing.
+    /// An instrument that cannot report at the size its own page measures is
+    /// an instrument armed where nobody reads it.
+    pub(super) fn dump_at_exit() {
+        if !enabled() {
+            return;
+        }
+        dump(TOTAL_SO_FAR.load(Ordering::Relaxed));
+    }
+
+    /// Every row recorded so far, for [`dump_at_exit`]. `record`'s own
+    /// periodic dump reads the same counter.
+    pub(super) static TOTAL_SO_FAR: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn dump(total: u64) {
         let guard = counts().lock().unwrap_or_else(|p| p.into_inner());
@@ -21120,6 +21279,14 @@ impl<'a> NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+        // The NATIVE->JAVA CALLBACK door, labelled separately in
+        // `CRATONVM_DBG=dispatch-tally`. Without the label every door's calls
+        // arrive under one `invoke_or_native` heading keyed by CALLEE, so the
+        // question `composition-native-callback-and-the-promotion-question-20260902.md`
+        // item 1 actually asks -- how much of the general resolver's traffic
+        // is a native calling back into Java -- cannot be read off it. On
+        // `HibfixComposeProbe2` the answer is 1.3 % of it.
+        dbg_dispatch_tally("native_callback", class_name, method_name, descriptor);
         invoke_or_native(
             self.shared,
             self.thread,
@@ -27748,37 +27915,43 @@ fn invoke_on_class_shared_inner(
                                     | "copyMemory"
                                     | "copyMemoryInternal"
                             ))
-                        // BREAKITER: `java.text.BreakIterator.getWordInstance` /
-                        // `getLineInstance` / `getSentenceInstance` / `getCharacterInstance`
-                        // are concrete static factories whose JDK 25 bytecode walks
-                        // `LocaleProviderAdapter.forJRE().getBreakIteratorProvider()`,
-                        // then `BreakIteratorProviderImpl.getBreakInstance(...)` which
-                        // reads `LocaleResources.getBreakIteratorInfo("BreakIteratorClasses")`.
-                        // That cache lookup returns null in our partial locale-data
-                        // bootstrap (jdk.localedata's class-based resource bundles are
-                        // not surfaced through our jimage path), producing
-                        //   "Cannot load from null array"
-                        // at `BreakIteratorProviderImpl.getBreakInstance pc=21`.
-                        // Tripwire: JUnit Platform's `--help` formatter uses
-                        // `BreakIterator.getLineInstance(Locale.US)` for text wrapping
-                        // and aborts on the NPE under `CRATONVM_DISABLE_JIT=1`.
+                        // BREAKITER, REMOVED 2026-09-11 (lane 1 wave 6). The four
+                        // static factories were pinned here from 2026-07 because the
+                        // real chain died at
+                        // `BreakIteratorProviderImpl.getBreakInstance pc=21` with
+                        // "Cannot load from null array" -- `LocaleResources
+                        // .getBreakIteratorInfo("BreakIteratorClasses")` answered null.
+                        // Tripwire: JUnit Platform's `--help` formatter wraps text with
+                        // `BreakIterator.getLineInstance(Locale.US)`.
                         //
-                        // Fix: pin our native overrides (registered in
-                        // `phases_late.rs::register_p66_break_iterator`) ahead of the
-                        // JDK bytecode. The natives return a synthetic
-                        // `java/text/BreakIterator` whose instance methods
-                        // (`setText`/`first`/`next`/`previous`/`last`) are abstract on
-                        // the real class — those route via the `method.is_abstract()`
-                        // branch automatically, so only the static factories need an
-                        // allow-list entry here.
-                        || (class_name == "java/text/BreakIterator"
-                            && matches!(
-                                method_name,
-                                "getWordInstance"
-                                | "getLineInstance"
-                                | "getSentenceInstance"
-                                | "getCharacterInstance"
-                            ))
+                        // Both halves of that are now fixed and MEASURED, by
+                        // `apps/probes/L1BreakIterRealProbe`, whose `P.*` rows reach
+                        // `BreakIteratorProviderImpl` WITHOUT these factories and so
+                        // could be measured while the pin was still here:
+                        //
+                        //   wave 5  the two `LocaleResources` readers answer from the
+                        //           image (`non_cldr_packages`), so the bundle and the
+                        //           `*BreakIteratorData` blob are found and
+                        //           `new sun.text.RuleBasedBreakIterator(name, bytes)`
+                        //           validates the rule data.
+                        //   wave 6  `setText(String)` and `preceding(int)` -- the only
+                        //           two of the seventeen registrations CONCRETE on the
+                        //           abstract class, and therefore the only two a real
+                        //           subclass receiver could not escape -- step aside
+                        //           for a receiver this VM did not fabricate. Before
+                        //           that, every real BreakIterator in the VM had its
+                        //           text written into slot 0 of an object whose slot 0
+                        //           is `charCategoryTable`, and the walks answered
+                        //           `[0]`.
+                        //
+                        // With the pin gone the factories run their own bytecode and
+                        // answer `sun.text.RuleBasedBreakIterator`,
+                        // `sun.text.DictionaryBasedBreakIterator` (th) and
+                        // `GraphemeBreakIterator` like HotSpot, offset for offset on
+                        // every walk the probe takes. The synthetic natives stay
+                        // registered for synthetic-JDK mode, where there is no bytecode
+                        // to prefer, and are retired under `--jdk-only`
+                        // (`RETIRED_SHADOW_L1_BI_TRIPLES`).
                         // BUG-15: `LocaleResources.getDateTimePattern(int,int,
                         // Calendar)` returns null in our partial locale-data
                         // bootstrap (jdk.localedata class-based bundles not
@@ -27805,11 +27978,17 @@ fn invoke_on_class_shared_inner(
                         // readers `BreakIteratorProviderImpl.getBreakInstance`
                         // needs, answered from the image's own
                         // `BreakIteratorInfo` bundle class and
-                        // `*BreakIteratorData` binary rather than null. This is
-                        // the gate the BREAKITER arm above is waiting on: once
-                        // the real chain builds a `sun.text.RuleBasedBreakIterator`,
-                        // `java/text/BreakIterator`'s 17 registrations can be
-                        // retired instead of pinned (lane 1 §10 item 5).
+                        // `*BreakIteratorData` binary rather than null.
+                        //
+                        // This arm is what the pin above was waiting on, and
+                        // as of wave 6 that pin is GONE: the real chain builds
+                        // a `sun.text.RuleBasedBreakIterator` and walks it
+                        // like HotSpot, and `java/text/BreakIterator`'s 17
+                        // registrations are retired rather than pinned. These
+                        // two entries are therefore load-bearing for the whole
+                        // family now, not a step towards it -- remove them and
+                        // `getBreakInstance` is back to "Cannot load from null
+                        // array" with nothing pinned behind it.
                         || (class_name == "sun/util/locale/provider/LocaleResources"
                             && matches!(
                                 method_name,
@@ -30250,6 +30429,26 @@ fn invoke_on_class_shared_inner(
         if let Some(callback) = override_cb {
             safe_native_call(shared, thread, callback, args)
         } else {
+            // THE ORDINARY TAIL, and the one site the native->Java callback
+            // memo is allowed to learn from.
+            //
+            // Reaching here means every override, proxy, retarget and
+            // policy arm above declined — so a memo filled from this point
+            // cannot be smuggling past one of them, including arms added
+            // after this line was written. See
+            // `crate::runtime::native_callee_memo`'s "Why a witness, and not
+            // a classifier".
+            //
+            // `!is_native && !is_synchronized` is the tail's own pair of
+            // facts about the callee, and the second is load-bearing: a
+            // synchronized callee's monitor is held by the `_sync_guard`
+            // below, which the memo's fast path does not build.
+            crate::runtime::native_callee_memo::note_plain_bytecode_tail(
+                declaring_class_id,
+                method_name,
+                descriptor,
+                !is_native && !is_synchronized,
+            );
             // Execute bytecode via interpreter
             crate::runtime::interpreter::execute(
                 shared,
@@ -33688,6 +33887,87 @@ mod tests {
         reset_permissive_dispatch_memo();
         assert!(gate(&shared, SENSITIVE).is_ok());
         assert_eq!(caps.audit_report().total_checks(), 2);
+    }
+
+    /// The JIT site cache's gate, arm for arm against the string form.
+    ///
+    /// It exists because the site cache stopped refusing capability-classified
+    /// triples on 2026-09-11 — see `resolve_native_site`'s note and
+    /// `performance/composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`
+    /// #1. A fast path that serves `Unsafe` is only allowed to exist if its
+    /// gate answers what the funnel's would, so this asserts exactly that in
+    /// all three modes, with no `NativeMethodId` in hand (the fallback arm) and
+    /// with the classification carried rather than re-derived.
+    #[test]
+    fn the_slot_keyed_gate_answers_what_the_string_gate_answers() {
+        use cratonvm_native_api::CapabilityKind;
+
+        // Permissive: allowed, and recorded exactly once per kind per thread.
+        let (shared, caps) = vm_in_mode(CapabilityMode::Permissive);
+        assert!(
+            check_native_dispatch_capability_for_slot(
+                &shared,
+                CapabilityKind::ProcessSpawn,
+                None
+            )
+            .is_ok()
+        );
+        assert_eq!(caps.audit_report().total_checks(), 1);
+        for _ in 0..8 {
+            assert!(check_native_dispatch_capability_for_slot(
+                &shared,
+                CapabilityKind::ProcessSpawn,
+                None
+            )
+            .is_ok());
+        }
+        assert_eq!(
+            caps.audit_report().total_checks(),
+            1,
+            "the permissive memo must suppress the audit write for the slot              form exactly as it does for the string form"
+        );
+        drop(shared);
+
+        // Audit: allowed, and every use tallied as ungranted.
+        let (shared, caps) = vm_in_mode(CapabilityMode::Audit);
+        assert!(
+            check_native_dispatch_capability_for_slot(&shared, CapabilityKind::RawMemory, None)
+                .is_ok()
+        );
+        assert_eq!(caps.audit_report().total_ungranted(), 1);
+        drop(shared);
+
+        // Enforce: refused, every time, with the same SecurityException the
+        // funnel raises — this is the arm that makes the fast path safe.
+        let (shared, _caps) = vm_in_mode(CapabilityMode::Enforce);
+        let denied =
+            check_native_dispatch_capability_for_slot(&shared, CapabilityKind::RawMemory, None)
+                .expect_err("RawMemory is not granted");
+        let text = denied.to_string();
+        assert!(text.contains("SecurityException"), "{text}");
+        assert!(text.contains("raw-memory"), "{text}");
+        for _ in 0..8 {
+            assert!(check_native_dispatch_capability_for_slot(
+                &shared,
+                CapabilityKind::RawMemory,
+                None
+            )
+            .is_err());
+        }
+        drop(shared);
+
+        // And with no policy installed at all the gate is a no-op, which is
+        // what keeps an embedder that never called `set_capabilities` paying
+        // nothing.
+        let shared = SharedVm::new(VmConfig::default());
+        if shared.natives.native_methods.capabilities().is_none() {
+            assert!(check_native_dispatch_capability_for_slot(
+                &shared,
+                CapabilityKind::RawMemory,
+                None
+            )
+            .is_ok());
+        }
     }
 
     /// `Audit` is the mode a deployment runs its suite in before flipping:

@@ -3253,6 +3253,29 @@ pub(super) fn coerce_arg(
 // Getting from a call site's SAM descriptor to the implementation method,
 // and making the arguments fit: `interpreter/lambda.rs`.
 
+/// How a cached-native dispatch learns its return tag.
+///
+/// The tag decides one thing — whether the native's result is pushed onto the
+/// caller's operand stack — and it is needed only when the native actually
+/// returned a value, which is why [`RetTag::Scan`] stays lazy.
+#[derive(Clone, Copy)]
+pub(super) enum RetTag<'a> {
+    /// Read off the call site's cached `DescriptorFacts`; nothing to compute.
+    Known(u8),
+    /// Scan `descriptor` for the byte after `')'`, as this path always did.
+    Scan(&'a str),
+}
+
+impl RetTag<'_> {
+    #[inline]
+    fn resolve(self) -> u8 {
+        match self {
+            RetTag::Known(tag) => tag,
+            RetTag::Scan(descriptor) => crate::jit::return_type(descriptor),
+        }
+    }
+}
+
 /// [`invoke_cached_native_callback`] for the two inline-cache `Native` arms,
 /// which hold the resolved [`NativeMethodId`] and can therefore ask whether the
 /// slot claims **leaf** — see
@@ -3277,25 +3300,21 @@ pub(super) fn invoke_cached_native_callback_leaf_aware(
     callback: cratonvm_native_api::NativeCallback,
     native_id: cratonvm_native_api::NativeMethodId,
     args: &[Value],
-    method_descriptor: &str,
+    ret: RetTag<'_>,
 ) -> Result<(), MethodCallFailed> {
     if !shared.natives.native_methods.is_leaf_id(native_id) {
-        return invoke_cached_native_callback(
-            shared,
-            thread,
-            frame_idx,
-            callback,
-            args,
-            method_descriptor,
+        return invoke_cached_native_callback_impl(
+            shared, thread, frame_idx, callback, args, ret, false,
         );
     }
+    super::site_cache::site_stats::bump(super::site_cache::site_stats::NATFACTS_LEAF);
     // The native ring is deliberately not entered. It exists so a watchdog can
     // name the native a hung thread is inside; a leaf cannot block, so it can
     // never be the answer to that question, and `record_enter`/`record_exit`
     // are two of the calls this path exists to remove.
     let result = crate::vm::safe_native_call_leaf(shared, thread, callback, args)?;
     if let Some(value) = result {
-        let ret = crate::jit::return_type(method_descriptor);
+        let ret = ret.resolve();
         if ret != b'V' {
             let value = coerce_value_for_return(value, ret);
             push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
@@ -3312,7 +3331,7 @@ pub(super) fn invoke_cached_native_callback_impl(
     frame_idx: usize,
     callback: cratonvm_native_api::NativeCallback,
     args: &[Value],
-    method_descriptor: &str,
+    ret: RetTag<'_>,
     objects_prevalidated: bool,
 ) -> Result<(), MethodCallFailed> {
     // Widening: small integer index -> usize (non-negative, fits in pointer width)
@@ -3325,7 +3344,7 @@ pub(super) fn invoke_cached_native_callback_impl(
     cratonvm_native_api::native_ring::record_exit(_ring_idx);
     let result = result?;
     if let Some(value) = result {
-        let ret = crate::jit::return_type(method_descriptor);
+        let ret = ret.resolve();
         // A void method must not leave anything on the caller's operand stack,
         // even if its native happens to return `Some(_)` (many natives return
         // the receiver / a status for convenience). The slow path
@@ -3362,7 +3381,7 @@ pub(super) fn invoke_cached_native_callback(
         frame_idx,
         callback,
         args,
-        method_descriptor,
+        RetTag::Scan(method_descriptor),
         false,
     )
 }
@@ -3382,7 +3401,7 @@ pub(super) fn invoke_cached_native_callback_prevalidated(
         frame_idx,
         callback,
         args,
-        method_descriptor,
+        RetTag::Scan(method_descriptor),
         true,
     )
 }
@@ -5343,7 +5362,47 @@ mod param_tags_tests {
                 crate::jit::return_type(d),
                 "DescriptorFacts::ret_tag disagrees with jit::return_type for {d:?}"
             );
+            // The claim the cached-native arms rest on, stated directly:
+            // when the tag array is complete, reading `param_tags[i]` is the
+            // same byte `pop_coerced_invoke_args_*` would have obtained by
+            // scanning the descriptor it re-resolved. `native_site_facts_usable`
+            // admits exactly this shape.
+            if !facts.param_tags_overflow {
+                for i in 0..facts.param_tag_len as usize {
+                    assert_eq!(
+                        facts.param_tags[i],
+                        scanned.get(d, i),
+                        "cached-native facts tag {i} disagrees with the scan for {d:?}"
+                    );
+                }
+            }
         }
+    }
+
+    /// `native_site_facts_usable` must refuse exactly the two shapes the tag
+    /// array cannot describe, and admit everything else.
+    ///
+    /// It is the whole guard between the facts-driven argument pop and the
+    /// general helper, and both of its refusals are silent-wrong-answer shapes
+    /// rather than crashes: an overflowing descriptor has no tags past the
+    /// eighth parameter, and a `num_params` that disagrees with the tokenised
+    /// count means the entry and the descriptor describe different methods.
+    #[test]
+    fn cached_native_facts_are_refused_for_the_shapes_they_cannot_describe() {
+        use crate::runtime::interpreter::native_site_facts_usable;
+        let ok = cratonvm_jit_api::DescriptorFacts::of("(IJLjava/lang/String;)V");
+        assert!(native_site_facts_usable(&ok, 3, false));
+        assert!(native_site_facts_usable(&ok, 3, true));
+        // A count that disagrees with the tokenised one.
+        assert!(!native_site_facts_usable(&ok, 2, false));
+        assert!(!native_site_facts_usable(&ok, 4, false));
+        // More parameters than the inline tag array holds.
+        let over = cratonvm_jit_api::DescriptorFacts::of("(IIIIIIIII)V");
+        assert!(over.param_tags_overflow);
+        assert!(!native_site_facts_usable(&over, 9, false));
+        // Zero parameters is the commonest cached-native shape of all.
+        let none = cratonvm_jit_api::DescriptorFacts::of("()I");
+        assert!(native_site_facts_usable(&none, 0, true));
     }
 
     /// Slot 0 of a non-static call is the receiver and must answer `b'L'`

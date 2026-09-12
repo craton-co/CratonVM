@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-548 tokens.
+550 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -610,11 +610,13 @@ export inherited from a parent shell.
 | `interp-frames` | `CRATONVM_DBG_INTERP_FRAMES` |
 | `tierup-decline` | `CRATONVM_DBG_TIERUP_DECLINE` |
 | `direct-binds` | `CRATONVM_DBG_DIRECT_BINDS` |
+| `callback-memo` | `CRATONVM_DBG_CALLBACK_MEMO` |
+| `promote-refuse` | `CRATONVM_DBG_PROMOTE_REFUSE` |
 | `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
 
 ## `CRATONVM_JIT`
 
-446 tokens.
+450 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -946,6 +948,7 @@ export inherited from a parent shell.
 | `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
 | `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
 | `door-sync` | `CRATONVM_JIT_NO_DOOR_SYNC` |
+| `cached-native-facts` | `CRATONVM_JIT_NO_CACHED_NATIVE_FACTS` |
 | `frame-emplace` | `CRATONVM_JIT_NO_FRAME_EMPLACE` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
@@ -1061,8 +1064,11 @@ export inherited from a parent shell.
 | `hot-lookup-cache` | `CRATONVM_JIT_HOT_LOOKUP_CACHE` |
 | `virtual-nominate-always` | `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS` |
 | `virtual-promote-java-util` | `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` |
+| `virtual-promote-handler-callee` | `CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE` |
 | `native-cf-postcomplete-skip` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` |
 | `native-cf-postcomplete-direct` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` |
+| `native-callback-memo` | `CRATONVM_NATIVE_CALLBACK_MEMO` |
+| `site-cache-capability` | `CRATONVM_JIT_SITE_CACHE_CAPABILITY` |
 | `ffm-verdict-ways` | `CRATONVM_FFM_VERDICT_WAYS` |
 
 ## `CRATONVM_GC`

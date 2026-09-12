@@ -1935,6 +1935,11 @@ pub const INVENTORY: &[E] = &[
     // drives `StringBuffer` one character at a time. See
     // `invoke_fast::door_sync_enabled`.
     E { group: Group::JIT, token: "door-sync", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_SYNC"), off_word: None, since: "2026-09-08" },
+    // 2026-09-11. Off restores the per-call `resolve_method_ref` that every
+    // cached-native invoke used to pay for two facts that are constants of
+    // the call site: each parameter's descriptor tag and the return tag.
+    // See `CachedInvokeTarget::Native::facts`.
+    E { group: Group::JIT, token: "cached-native-facts", on_key: None, off_key: Some("CRATONVM_JIT_NO_CACHED_NATIVE_FACTS"), off_word: None, since: "2026-09-11" },
     // `frame-emplace` — off builds the frame on the Rust stack and moves it
     // into the slot instead of constructing it there.
     E { group: Group::JIT, token: "frame-emplace", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_EMPLACE"), off_word: None, since: "2026-09-03" },
@@ -2251,8 +2256,26 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "hot-lookup-cache", on_key: Some("CRATONVM_JIT_HOT_LOOKUP_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "virtual-nominate-always", on_key: Some("CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "virtual-promote-java-util", on_key: Some("CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL"), off_key: None, off_word: None, since: "2026-09-02" },
+    // 2026-09-11. The fourth of four routes to a direct compiled entry, and
+    // the only one still refusing on the callee's exception table alone. See
+    // `env_cache::jit_virtual_promote_handler_callee`.
+    E { group: Group::JIT, token: "virtual-promote-handler-callee", on_key: Some("CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE"), off_key: None, off_word: None, since: "2026-09-11" },
     E { group: Group::JIT, token: "native-cf-postcomplete-skip", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "native-cf-postcomplete-direct", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // --- composition residuals, part two: 2026-09-11 -------------------------
+    // `composition-native-callback-and-the-promotion-question-20260902.md`.
+    // Item 1's mechanism and its engagement census; item 2's second census,
+    // the one that names why a NOMINATED site still refuses to promote.
+    E { group: Group::JIT, token: "native-callback-memo", on_key: Some("CRATONVM_NATIVE_CALLBACK_MEMO"), off_key: None, off_word: Some("0"), since: "2026-09-11" },
+    E { group: Group::DBG, token: "callback-memo", on_key: Some("CRATONVM_DBG_CALLBACK_MEMO"), off_key: None, off_word: None, since: "2026-09-11" },
+    E { group: Group::DBG, token: "promote-refuse", on_key: Some("CRATONVM_DBG_PROMOTE_REFUSE"), off_key: None, off_word: None, since: "2026-09-11" },
+    // The JIT per-call-site native cache used to refuse every
+    // capability-classified triple outright, which since 836631dcc (leaf-only
+    // -> every registered native) has meant refusing `jdk/internal/misc/Unsafe`
+    // -- 99 428 of the 100 805 general-resolver calls on the composition probe.
+    // The gate now runs on the dispatch side instead, where the funnel runs it;
+    // `=0` restores the refusal.
+    E { group: Group::JIT, token: "site-cache-capability", on_key: Some("CRATONVM_JIT_SITE_CACHE_CAPABILITY"), off_key: None, off_word: Some("0"), since: "2026-09-11" },
     // `CRATONVM_JIT_IR_COLD_ARG_STAGE` was declared here too, as a courtesy,
     // and dev declared it concurrently -- both rows merged with no conflict,
     // which is the append-anywhere hazard. Dev's row is kept; this note is the

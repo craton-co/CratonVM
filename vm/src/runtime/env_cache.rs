@@ -1294,8 +1294,17 @@ pub fn hot_lookup_cache() -> bool {
 /// `receiver_is_java_util` exclusion has always barred. The exception-table
 /// half of `promotion_barred` is NOT relaxed by this: that one is a
 /// correctness hazard (a handler-bearing callee entered by a direct compiled
-/// call has no interpreter boundary at which its own handler can be resumed),
-/// where the prefix is a performance policy.
+/// call has no interpreter boundary at which its own handler can be resumed).
+///
+/// **The prefix is not merely a performance policy, and the 2026-09-02 page
+/// that said so was wrong.** cb563d707 added it because "this cached virtual
+/// route can publish a stale receiver-specific entry and **then spin**" on the
+/// Spring generic-conversion graph. A spin is not a slowdown. The 30 % lock-loop
+/// regression that later justified keeping it does NOT reproduce (2026-09-11:
+/// 1.02x favourable, ranges overlapping, on the same probe and as a one-binary
+/// A/B), so what keeps this default-OFF is the stale-entry hazard alone — see
+/// `performance/composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`
+/// item 2 for what would have to be shown to flip it.
 ///
 /// It exists because the policy has never been priced on its own.
 /// `aqs-thread-handoff-latency-RETIRED-20260805.md` item 3 measured
@@ -1313,6 +1322,57 @@ pub fn jit_virtual_promote_java_util() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
         match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => false,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE` — default-OFF, `=1` opts in.
+///
+/// Admits a callee that DECLARES A LOCAL EXCEPTION TABLE to the cached-virtual
+/// PROMOTION, i.e. lets `execute_invokevirtual_cached` enter its compiled body
+/// through `execute_jit_call_decoded`.
+///
+/// # Why this is a switch and not simply a deletion
+///
+/// The bar was added by `7952e8370` (2026-07-30) on the reasoning that a
+/// direct compiled entry "has no interpreter boundary at which the callee's
+/// own exception table can be resumed". That commit's own message records
+/// what the bar is worth:
+///
+/// > NOT proven, and recorded as such in the docs: the original stranding
+/// > could not be reproduced, so the new gate is correct by construction
+/// > rather than demonstrated against the symptom — a deliberately un-gated
+/// > control binary also matches HotSpot on the routing probe.
+///
+/// And the premise has since stopped holding. `execute_jit_call_decoded`
+/// drains `sig.exception`, `sig.npe`, `sig.aioobe` and `sig.arithmetic`
+/// through `route_jit_signal_exception(.., cached, ..)` — with `cached` the
+/// CALLEE — which prefers a precise exceptional frame published by the callee's
+/// own deopt stub, falls back to the callee's stamped athrow bci, and enters
+/// the callee's handler through `route_jit_exception_through_method`. That is
+/// the RBC.6 machinery (`docs/feature-designs/jit-local-exception-handlers.md`),
+/// and `handler_resume_needs_precise_locals` is its refusal: a handler that
+/// reads a local the fallback cannot supply propagates rather than entering
+/// with zeroed locals.
+///
+/// This gate is the fourth of four routes, and the only one still refusing on
+/// the callee's table alone. The inline machine-code MIC/PIC cascade
+/// (`mic_callee_has_exception_table`) keeps its refusal for a different reason
+/// and is NOT relaxed by this: it `CALL`s the raw entry pointer from compiled
+/// code and has no Rust frame at which to route anything.
+///
+/// The oracle is `probes/CalleeHandlerRoutingProbe.java`: a handler-bearing
+/// instance callee driven past the tier-up threshold on its non-throwing path
+/// and only THEN given its implicit exception — the promotion-then-throw
+/// ordering. It must print the same nine lines on HotSpot and on both settings
+/// of this switch.
+#[inline]
+pub fn jit_virtual_promote_handler_callee() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_PROMOTE_HANDLER_CALLEE") {
             Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
             Err(_) => false,
         }
@@ -2052,6 +2112,16 @@ cached_is_set!(no_frame_slot_reuse, "CRATONVM_JIT_NO_FRAME_SLOT_REUSE");
 /// and every call under `CRATONVM_JIT_NO_FRAME_SLOT_REUSE`. Token:
 /// `CRATONVM_JIT=-frame-emplace`.
 cached_is_set!(no_frame_emplace, "CRATONVM_JIT_NO_FRAME_EMPLACE");
+
+/// `CRATONVM_JIT_NO_CACHED_NATIVE_FACTS` -- make every cached-native invoke
+/// recover its call site's descriptor with `resolve_method_ref` again (a
+/// resolution-cache `RwLock` read, a hash probe and three `Arc<str>`
+/// clone/drop pairs), then scan the string it returns for the parameter tags
+/// and once more for the return tag, and materialise the arguments through two
+/// heap `Vec`s. On, the inline-cache entry answers all of that from the
+/// `DescriptorFacts` it was filled with. Token:
+/// `CRATONVM_JIT=-cached-native-facts`.
+cached_is_set!(no_cached_native_facts, "CRATONVM_JIT_NO_CACHED_NATIVE_FACTS");
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --
@@ -2977,5 +3047,33 @@ pub fn jit_gate_pass_memo() -> bool {
     slot_bool(&CACHE, || {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_GATE_PASS_MEMO")
             .map_or(true, |v| v != "0" && v != "false")
+    })
+}
+
+/// `CRATONVM_NATIVE_CALLBACK_MEMO` — default-ON, `=0` opts out.
+///
+/// The resolved-handle form of a native->Java callback: see
+/// `crate::runtime::native_callee_memo`. With it off, every
+/// `NativeContext::invoke_virtual` resolves its callee by NAME on every call —
+/// a class-manager read and a `String` allocation for the receiver's class
+/// name, a `find_with_kind` triple hash against the native slot table, the
+/// cold descriptor-quirk rewrite on a miss, and then a second by-name
+/// resolution inside `invoke_on_class_shared_inner`.
+///
+/// It exists as a switch rather than as an unconditional change so the
+/// mechanism can be priced in ONE binary, which is how
+/// `completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
+/// priced the six levers before it — two of which turned out to be worth
+/// nothing and are recorded as refuted rather than removed.
+///
+/// Cached because it is read on the VM's hottest native->Java path.
+#[inline]
+pub fn native_callback_memo() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_CALLBACK_MEMO") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     })
 }

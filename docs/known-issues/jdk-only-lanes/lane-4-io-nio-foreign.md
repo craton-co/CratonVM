@@ -310,8 +310,9 @@ because the dial could not read a clean floor until they were:
   deliberately not in the table; §5 requires its own wave and its own commit.
   Read §9.2 and §9.3 before trusting that screen — and screen it against the
   corpus, where `System.out` actually lives.
-* **479 rows no probe in this tree reaches.** `ValueLayouts$Of*Impl` is the
-  cheapest half.
+* **479 rows no probe in this tree reaches**, minus the 146 wave 2 moved out of
+  that bucket in one pass -- see §9.7, which is what "the cheapest half" was
+  worth.
 * **The five backed-out families (51).** All five are blocked on the same thing:
   a fabricated carrier whose real fields this VM never writes. §9.4 is what
   fixing one looks like, and it is the unlock — not retrying the retirement.
@@ -324,5 +325,378 @@ because the dial could not read a clean floor until they were:
   *and* `mirror_class_registrations` together, plus every
   `class_name == "java/nio/file/Path"` test in `vm/` and `native-collections`.
 * **`sun/nio/ch/` (308).** Package verdict upheld, not beaten.
-* **`jdk/internal/foreign`.** Untouched; its prefix is not admitted, because
-  nothing under it reached the candidate set.
+* **`jdk/internal/foreign`.** Wave 2 took the value layouts (§9.7). What is
+  left under it is the group layouts (35) on one named carrier defect, and the
+  segment/arena/session half (70) on a decision that is on record and says they
+  must not be retired at all.
+
+---
+
+### Wave 2 -- 2026-09-11, 137 rows over the nine `ValueLayouts$Of*Impl` carriers
+
+`RETIRED_SHADOW_L4_FFM_TRIPLES`, under a new NARROW prefix
+`jdk/internal/foreign/layout/`. The wave is 137 of 146 candidate rows; the
+table's doc comment carries the arithmetic and the carve-out.
+
+**One probe emptied the bucket.** `apps/probes/L4FfmLayoutSweep.java`, 359 rows,
+reaches **all 146** registrations over the nine classes -- the census taken from
+its own run reports `invocations > 0` with the schema-5 `invocations_complete`
+bit set on every one of them. §9.1 put 479 rows in "no probe in this tree
+invokes it" and said over half were this shape; that was a statement about the
+instrument, and one afternoon of probe-writing was the whole cost of disproving
+it.
+
+### 9.7 The carrier was the blocker again, and the dial could not see it
+
+Armed on the wave's scope, the probe went from **100 differing lines to 358**.
+That is not a verdict on the retirement -- it is the second instance of the
+finding §9.4 recorded for `java.io.File`, one family over:
+
+```text
+  bool.toString    THREW NPE: Cannot invoke "Class.descriptorString()" because "this.carrier" is null
+  bool.name        null                              (HotSpot: Optional.empty)
+  bool.varHandle   THREW NPE: Cannot invoke "Optional.isPresent()" because "this.name" is null
+```
+
+`jdk.internal.foreign.layout.AbstractLayout` declares `name` as an
+`Optional<String>` and this VM wrote a bare `String` reference into it;
+`ValueLayouts$AbstractValueLayout` declares `carrier`, a `Class`, and nothing
+wrote it at all -- while the native `carrier()` derived its answer from the
+class NAME, so the METHOD was right and the FIELD behind it was null. Fixed in
+the commit before the table, at every mint and clone site in
+`native-builtins/src/phases_late/foreign_ffm.rs`, through one reader and one
+writer that know the convention. **Two defects that were live in both modes
+went with it**, neither of them reachable by a retirement:
+
+| | before | after |
+|---|---|---|
+| `JAVA_INT.withName("k").equals(...)` | `NullPointerException` | `true` |
+| `JAVA_INT.withOrder(BIG_ENDIAN).toString()` | `i4` | `I4` |
+| `withName` on a struct/sequence | `Optional[Optional[s]]`, 0 members | the name, the members |
+| probe rows differing, `--jdk-only` | 50 | **25** |
+
+The second row is this lane's own failure mode in the one method a caller reads
+to find out what it is holding: the case of the letter IS the byte order, and
+`order()` beside it answered correctly the whole time.
+
+### 9.8 The wave is a wash on the probe, and that is the result
+
+One binary against itself, dial scoped to exactly the wave
+(`CRATONVM_ENFORCE_NATIVE_SHADOW=jdk/internal/foreign/layout/ValueLayouts$`):
+
+```text
+  unarmed --jdk-only          25 rows differ
+  armed on this wave          25 rows differ
+```
+
+The same count, a different 25. Nineteen rows the native answered wrongly become
+right, because the real bodies throw the JDK's own text
+(`Invalid alignment: 3`, `Bad layout path: ...`) and render its own string
+(`a8:i4`). Nineteen become wrong, and **every one of them is `varHandle`** --
+the real `AbstractValueLayout.varHandle()` reaches
+`Utils.makeSegmentViewVarHandle` and ends in `NoClassDefFoundError:
+java/lang/invoke/BoundMethodHandle`. So `varHandle` is carved out, the table is
+137 rows rather than 146, and the arm is the floor minus nineteen: **six rows,
+none of them on a class in the table.**
+
+Read that as the lane's own §9.2 warning applied in the other direction: an
+armed arm that goes RED is not a verdict either. The first armed run of this
+scope read 358 and the answer was a carrier defect; the second read 25 and the
+answer was one method.
+
+### 9.9 Acceptance
+
+Every number below is on `vm-l4ffm-w2` against `vm-l4ffm-ctl`, the binary built
+from the exact commit this branch forks from (`aba314446`), so the two differ by
+this wave and the carrier fix and nothing else. **No timing claim anywhere:**
+`RMapGcStress` read 146 s then 334 s on one binary, and this lane does not make
+that mistake twice.
+
+```text
+  corpus, CRATONVM_ARGS=--jdk-only   control  133 passed, 0 failed
+                                     wave     133 passed, 0 failed
+  corpus, SUITE=all                  wave     133 passed, 0 failed
+  corpus, SUITE=core                 wave      93 passed, 0 failed
+  vectors differing between the two --jdk-only arms:  none
+```
+
+**Re-taken on the MERGE**, not carried over: `origin/dev` moved 49 commits
+under this wave, two of them other lanes' retirement tables. The merged binary
+(`0b491dce8`) reproduces the branch numbers to the line -- `L4FfmLayoutSweep`
+12 differing lines in `--jdk-only` and 48 in compatible, `FfmSegmentSweep` 40,
+the other two probes 0 -- and the `--jdk-only` corpus is 133 passed / 0 failed
+on it as well. The kind-map amendment and the probe A/B above were taken on the
+pre-merge binary and are unchanged by it; the stub ratchet was RE-MEASURED,
+because its three baselines moved twice while this wave was in flight.
+
+**137 refusals, 0 survivors**, and the control says why it mattered. Same probe,
+`--jdk-only --explain-jdk-only --jdk-only-report`:
+
+| | control | wave |
+|---|---|---|
+| report entries over these 137 triples | 256 | 137 |
+| outcome | 137 `native-won`, 119 `bytecode-won` | all `synthetic-native-registered` |
+| survivors | 0 | **0** |
+
+Every one of the 137 was a native winning over real bytecode that was there all
+along, and none has a survivor to fall through to.
+
+**Kind map.** 101 rows amended by hand in
+`scripts/baselines/jdk-only-kind-map-25-linux.tsv`, `bridge 0 1` ->
+`synthetic-stub 1 1`, filtered by the control census: a row was edited only
+where the wave's census disagrees with the baseline AND the control's still
+agrees with it AND the triple is in the table. Zero rows outside the table.
+`--update-baseline` was refused, because it would have blessed the 804 rows the
+gate fires on for `dev`'s own binary. After the amendment both binaries report
+the same two numbers -- **804 changed kind, 39 lost `kind_stated`** -- which is
+where the gate stood before this wave.
+
+The table has 137 rows and only 101 appear in that file: `byteSize`,
+`byteAlignment`, `byteOffset` and `toString` on the nine classes have no row in
+the baseline at all, in EITHER arm, so they are absent rather than changed and
+adding them would be a re-freeze wearing an amendment's clothes.
+
+**Stub ratchet**, both columns printed, OFF taken from
+`CRATONVM_UNRETIRE_NATIVE_SHADOW` so one binary answers both halves:
+
+```text
+  arm             OFF             ON              delta
+  (default)   2728 / 13609    2865 / 13609        +137 / 0
+  management  2755 / 13977    2892 / 13977        +137 / 0
+  synthetic   2728 / 13644    2865 / 13644        +137 / 0
+```
+
+OFF reproduces every constant in the file -- all three stub baselines and all
+three totals -- and the totals do not move in either half: case (b) in the
+ratchet's own taxonomy, existing registrations relabelled rather than new fakes
+registered.
+
+**Re-measured on the merge with `origin/dev` at `e240573a8`, not carried over
+from the branch.** The three baselines moved under this wave twice while it was
+in flight (2609 -> 2728 and 2620 -> 2755) and the `+137` is identical each time
+only because it was measured each time rather than subtracted.
+
+**A collapse detector whose doc said a retirement could not move it.**
+`STRICT_MIN_TOTAL_REGISTRATIONS` in `native-builtins/tests/stub_ratchet.rs` went
+red on this wave, and it is the one gate here that genuinely moved because of
+it. Its comment says of the 2026-08-11 logging retirement that it *"moved this
+total by zero: a re-tag changes a registration's KIND, it does not remove the
+registration"*. That is true in COMPATIBLE mode, which is what was measured, and
+false in the mode this whole campaign is about: under `JdkOnly`,
+`register_inner` REFUSES a `SyntheticStub`, so **every retired triple is one row
+fewer in the strict registry.** The floor tracks a number nine lanes are
+deliberately driving down. Eight waves had taken it from 11,192 to 10,998 — 98
+above the floor, not the 300 the comment believes it left — and 137 more crossed
+it.
+
+On the branch, before the merge, this wave crossed it: 10,998 -> 10,861 against
+a floor of 10,900. **On the merge it does not, and the number is deliberately
+left alone.** A sibling lane hit the same wall the same day and lowered the
+floor 10,900 -> 10,600 for its own wave, and 137 rows now read:
+
+```text
+             compatible   stubs   strict   dropped   refusals
+   OFF         13609       2728   10878     2731      2749
+   ON          13609       2865   10741     2868      2886
+   delta           0       +137   -137      +137      +137
+```
+
+Exactly the table's row count in every column that moves, zero in the one that
+must not, and a corpus that does not move at all.
+
+**And then the gate stopped being a level.** While this wave was landing, the
+stub-ratchet lane replaced `STRICT_MIN_TOTAL_REGISTRATIONS` with
+`STRICT_UNEXPLAINED_DROP_MAX` -- *"bound the strict registry's SHORTFALL, not
+its level: the number it guarded is designed to fall"* -- which is the same
+conclusion from the other end, and a better instrument than the correction this
+wave was going to leave behind. This wave is its confirmation:
+
+```text
+  shortfall = compatible - stubs - strict
+  OFF   13609 - 2728 - 10878 = 3
+  ON    13609 - 2865 - 10741 = 3
+```
+
+**Invariant across 137 retirements**, where the level moved by exactly 137.
+A campaign-wide quantity wants a gate on what should NOT change, not on what
+every lane is paid to reduce.
+
+### 9.10 The residual, in the terms §9.5 uses
+
+**Compatible mode keeps a second copy of the mint that this fix does not
+reach.** `make_prepared_value_layout` in `vm/src/vm/vm_util.rs` seeds
+`ValueLayout.JAVA_INT` and its fifteen siblings before `<clinit>`; it resolves
+`byteSize`, `byteAlignment` and `name` by name and writes **three of the five**
+real fields, leaving `carrier` and `order` null. `--jdk-only` drops that preseed
+entirely and runs the real `<clinit>`, which is why the strict arm is at 25 rows
+and the compatible one at 34. It does not touch this wave:
+`NativeKind::allowed_in(Compatible)` is `true` for every kind, so a retired
+triple still dispatches its native in compatible mode.
+
+**The group layouts (35) are one carrier defect, not thirteen.**
+`AbstractGroupLayout.elements` is declared `java.util.List<MemoryLayout>` and
+this VM stores a java ARRAY there. Armed, `memberLayouts()` answers 0 where the
+oracle answers 2, `byteOffset(groupElement("c"))` cannot resolve a member that
+is plainly there, and every group `toString` dies in `NoSuchMethodError: 'int
+java.lang.foreign.MemoryLayout.size()'`. Same shape as the defect this wave
+fixed, same treatment -- a real `List`, written at the mint -- and it is the
+cheapest next wave in the lane for the same reason this one was. **Taken as
+wave 3 the following day; see below.**
+
+**The segment, arena and session carriers (70) are not a wave.**
+`docs/known-issues/jdk-only/the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md`
+decides that `cratonvm/internal/foreign/MemorySegmentImpl` is the VM's own
+allocation shape and is laid out deliberately unlike
+`AbstractMemorySegmentImpl`, whose `length`/`readOnly`/`scope` would alias the
+carrier's `ptr`/`size`/`arena`. Retiring one runs a real body over those three
+slots. Nothing to screen while that decision stands.
+
+That decision's own §3 asked for three things from "the layout half", and the
+first two are now done by a route it did not anticipate: the layout carriers are
+minted on their REAL JDK classes rather than on a
+`cratonvm/internal/foreign/LayoutImpl`, so `getClass().isInterface()` is false
+for both of its check rows and `FfmSegmentSweep`'s other 23 are unchanged at 40
+lines over 20 name pairs.
+
+---
+
+### Wave 3 -- 2026-09-12, 28 rows over the four GROUP carriers
+
+`RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES`: `StructLayoutImpl`, `UnionLayoutImpl`,
+`SequenceLayoutImpl`, `PaddingLayoutImpl`, under the prefix wave 2 admitted. No
+new prefix, because the prefix was never the decision.
+
+### 9.11 The carrier was the blocker for the third wave running
+
+`jdk.internal.foreign.layout.AbstractGroupLayout` declares
+`List<MemoryLayout> elements` and this VM stored a bare ARRAY in it; `kind` and
+`minByteAlignment`, the other two fields it declares, were never written at all.
+`memberLayouts()` is `return elements;` -- one `getfield` -- so the first real
+body to touch a group got an array where the JDK's own code calls `List` methods:
+
+```text
+  struct.memberLayouts().size()     0        HotSpot: 2
+  struct.byteOffset(groupElement)   cannot resolve a member plainly there
+  struct.toString()                 NoSuchMethodError: MemoryLayout.size()
+  struct.equals(struct)             NullPointerException
+```
+
+Third instance of one shape in three waves -- `java.io.File`'s `prefixLength`
+(§9.4), `AbstractLayout`'s `Optional<String> name` (§9.7), now `elements` -- and
+the same fix each time: **one reader, one writer, routed through every site that
+mints or walks the carrier.** The pattern is worth naming, because the lane has
+now paid for it three times: *a carrier minted on its REAL class must hold what
+that class DECLARES, in the declared TYPE, at every field the real bodies read.*
+Resolving the slot by name gets the index right and says nothing about the type.
+
+Three decisions the measurement made rather than taste:
+
+* **The member COUNT travels beside the array.** An `ArrayList` has capacity
+  past its size, so reading `array_length` off `elementData` invents trailing
+  null members -- a group that grows silently, which is §4's failure mode.
+* **The reader asks `object_is_array`, not a field name.** A reference array's
+  header class id is its COMPONENT's, so the payload cannot be asked its own
+  name, and `AbstractGroupLayout` itself declares `elements` -- a name probe can
+  answer yes for entirely the wrong reason.
+* **The list is UNMODIFIABLE.** HotSpot throws `UnsupportedOperationException`
+  from `memberLayouts().add(...)`, and since the accessor returns the field
+  itself, an `ArrayList` hands a caller a mutable view of a layout's members.
+  The writer mints `ImmutableCollections$ListN`, whose `size()` IS
+  `elements.length` -- no second count to disagree with.
+
+### 9.12 The two modes disagreeing is what found the last defect
+
+```text
+  structLayout(..).withName("st").memberLayouts().size()
+    --jdk-only   2        compatible   0
+```
+
+`resolve_field_index` resolves a class GLOBALLY BY NAME and answers `None` for
+one not yet loaded -- which under compatible mode `ImmutableCollections$ListN`
+is not, because nothing has called `List.of` by then. The mint fell back to the
+mutable shape, and `AbstractGroupLayout`'s constructor then `List.copyOf`'d it
+into a `List12` on the next `withName`: a shape with `e0`/`e1` and **no backing
+array at all**, which the reader cannot decode, so the group reported zero
+members. Loading the class first fixes both modes.
+
+**An A/B that runs only one mode would not have seen it**, and the lane page has
+said to run both since wave 1 without saying why. This is why.
+
+### 9.13 Acceptance
+
+`apps/probes/L4FfmLayoutSweep.java`, now 390 rows, oracle stable over three
+captures. Control is `vm-l4ffm-w3ctl`, built from `origin/dev` at `52113652d` in
+a separate checkout so the wave tree was never disturbed.
+
+```text
+  L4FfmLayoutSweep, --jdk-only        rows differing
+    control (origin/dev)                  13
+    carrier fix, group table un-retired    3
+    carrier fix + the table                2
+```
+
+The un-retired arm is the SAME BINARY with
+`CRATONVM_UNRETIRE_NATIVE_SHADOW` naming the four classes; its arm report prints
+`7 + 7 + 8 + 6 = 28 table row(s)`, which is the receipt that it armed this table
+and not its neighbour. The retirement fixes one row -- `byteOffset` on a padding
+layout, which now throws the JDK's own message -- and breaks none.
+
+The two rows left are neither this wave's nor a group's, and both are
+`varHandle`, carved out of this wave as of wave 2: `ADDRESS.varHandle().varType()`
+answers `long` where the oracle says `MemorySegment`, and a union's `varHandle`
+**accepts a misaligned access HotSpot refuses**. That second one is a MISSING
+REFUSAL, which is §4's failure mode again, and it is now the only one of its kind
+left in the FFM layout surface.
+
+**28 refusals, 0 survivors.** On the control all 28 report `native-won`: a
+native winning over real bytecode that was there the whole time.
+
+The corpus does not move:
+
+```text
+  CRATONVM_ARGS=--jdk-only   control  133 passed, 0 failed
+                             wave     133 passed, 0 failed
+  SUITE=all                  wave     133 passed, 0 failed
+  SUITE=core                 wave      93 passed, 0 failed
+```
+
+and the two `--jdk-only` arms differ on **no vector at all**, compared row by
+row rather than by their totals.
+
+**Stub ratchet, both columns printed, +32 against a 28-row table.** The unit
+here is one REGISTRATION and the table's unit is one triple: `byteSize` and
+`byteAlignment` on `StructLayoutImpl` and `UnionLayoutImpl` are each registered
+twice, from two neighbouring loops in `foreign_ffm.rs`, so one shadows the other
+and both are re-tagged. Same distinction wave 2's `51 table row(s)` against 71
+moving registrations made.
+
+```text
+  arm             OFF             ON              delta
+  (default)   2884 / 13617    2916 / 13617        +32 / 0
+  management  2911 / 13985    2943 / 13985        +32 / 0
+  synthetic   2884 / 13652    2916 / 13652        +32 / 0
+```
+
+Re-measured on the merge with `origin/dev`, not carried over: the three stub
+baselines moved under this wave while it was in flight (2865 -> 2884,
+2892 -> 2911), so the `+32` is identical each time only because it was measured
+each time rather than added.
+
+The OFF column names the four CLASSES, not the prefix: the prefix would have
+un-retired wave 2's 137 value-layout rows as well, and **an OFF column that
+undoes a neighbour's wave is not this wave's before-number.** That distinction
+cost nothing to make and would have read as a 24-row improvement wrongly
+credited here.
+
+**Kind map: no amendment, and that is checkable.** Both binaries report the same
+852 flips, and all 28 of this table's triples have ZERO rows in
+`scripts/baselines/jdk-only-kind-map-25-linux.tsv` — the file carries wave 2's
+101 `ValueLayouts` rows and none at all for the four group classes. So the gate
+is red for `dev`'s own reasons, exactly as red as before, and this wave is not
+among them.
+
+Compatible mode is 28 rows against strict's 2, and every one of the 26 is
+downstream of the preseed §9.10 names: comparing two structs compares their
+MEMBERS, and the members are the preseeded `ValueLayout` constants whose
+`carrier` `make_prepared_value_layout` never writes. Strict drops that preseed
+and runs the real `<clinit>`, which is the whole of the gap.

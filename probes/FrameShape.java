@@ -21,7 +21,7 @@
 //
 // Interleaves its arms in both directions on alternating rounds and reports
 // min-of-N, like every other probe on
-// docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
+// docs/internal/performance/interpreted-invoke-cost-350ns-RETIRED-20260911.md.
 public class FrameShape {
 
     // max_locals ~= 2, max_stack ~= 2

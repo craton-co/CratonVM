@@ -680,8 +680,9 @@ and **discard any arm whose control did not fail**.
    `juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md` (internal), whose successor
    `completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
    (internal) closed on 2026-09-02 with composition **1.19x** faster and all
-   three of its residuals discharged. What is still open from that line is
-   [`../perf/composition-native-callback-and-the-promotion-question-20260902.md`](../perf/composition-native-callback-and-the-promotion-question-20260902.md).
+   three of its residuals discharged. Its successor closed on 2026-09-11
+   (`internal/performance/composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`),
+   so nothing on that line is open.
 2. **Test the variance hypothesis of §5.9 directly.** It predicts that
    anything reducing JIT timing variance reduces the failure, while anything
    reducing mean speed does not. `CRATONVM_BG_COMPILE=0` (synchronous
