@@ -86,7 +86,7 @@ the review are the gate that does that.
 | 40 | IR long Cmp uses a 32-bit CMP | FIXED 58bb7cfec |
 | 41 | Every synchronized-block method refused after full emission | FIXED 58bb7cfec |
 | 42 | A lowering refusal publishes an accepted verdict | FIXED 45c07691e |
-| 43 | Bottom-tested loops refuse the IR build | OPEN `ir-builder-refuses-rotated-loops-20260912.md` |
+| 43 | Bottom-tested loops refuse the IR build | PARTIAL 58ede83bd (caller code builds; a rotated loop in a spliced callee body still refuses); `ir-builder-refuses-rotated-loops-20260912.md` |
 | 44 | `ir_compatible` admits opcodes the builder refuses | FIXED f5329cdd5, 9b8cbce45 |
 | 45 | `ir_evidence` entries leak on an IR bail | FIXED add815189 |
 | 46 | IR frame states carry no monitor stack | OPEN `ir-frame-states-carry-no-monitor-stack-20260912.md` |
