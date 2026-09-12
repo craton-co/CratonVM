@@ -10169,6 +10169,10 @@ impl Compiler {
                                     }
                                     self.buf.emit(&[0x48, 0x63, 0xC1]); // MOVSXD RAX, ECX
                                     self.push_from_rax();
+                                    // Counted HERE, where the site is emitted,
+                                    // not in the matcher (review #80).
+                                    crate::ATOMIC_INTRINSIC_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                     for p in bail {
                                         self.deopt_stubs.push((p, pc, 6));
@@ -10253,6 +10257,8 @@ impl Compiler {
                                 self.buf.emit(&[0x0F, 0x94, 0xC0]); // SETZ AL
                                 self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
                                 self.push_from_rax();
+                                crate::ATOMIC_INTRINSIC_SITES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                 for p in bail {
                                     self.deopt_stubs.push((p, pc, 6));
@@ -10408,6 +10414,10 @@ impl Compiler {
                                     }
                                     self.buf.emit(&[0x48, 0x89, 0xC8]); // MOV RAX, RCX
                                     self.push_from_rax();
+                                    // Counted at emission, not in the matcher
+                                    // (review #80).
+                                    crate::ATOMIC_LONG_INTRINSIC_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                     for p in bail {
                                         self.deopt_stubs.push((p, pc, 6));
@@ -10492,6 +10502,8 @@ impl Compiler {
                                 self.buf.emit(&[0x0F, 0x94, 0xC0]); // SETZ AL
                                 self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
                                 self.push_from_rax();
+                                crate::ATOMIC_LONG_INTRINSIC_SITES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                                 for p in bail {
                                     self.deopt_stubs.push((p, pc, 6));
@@ -10601,6 +10613,15 @@ impl Compiler {
                                         self.buf.emit(&[0x48, 0x63, 0xC1]);
                                     }
                                     self.push_from_rax();
+                                    // Counted at emission, not in the matcher
+                                    // (review #80).
+                                    if is_long {
+                                        crate::LONG_LONG_VALUE_INTRINSIC_SITES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        crate::INTEGER_INT_VALUE_INTRINSIC_SITES
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
 
                                     for p in bail {
                                         self.deopt_stubs.push((p, pc, 6));
