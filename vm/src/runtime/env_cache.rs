@@ -1294,8 +1294,17 @@ pub fn hot_lookup_cache() -> bool {
 /// `receiver_is_java_util` exclusion has always barred. The exception-table
 /// half of `promotion_barred` is NOT relaxed by this: that one is a
 /// correctness hazard (a handler-bearing callee entered by a direct compiled
-/// call has no interpreter boundary at which its own handler can be resumed),
-/// where the prefix is a performance policy.
+/// call has no interpreter boundary at which its own handler can be resumed).
+///
+/// **The prefix is not merely a performance policy, and the 2026-09-02 page
+/// that said so was wrong.** cb563d707 added it because "this cached virtual
+/// route can publish a stale receiver-specific entry and **then spin**" on the
+/// Spring generic-conversion graph. A spin is not a slowdown. The 30 % lock-loop
+/// regression that later justified keeping it does NOT reproduce (2026-09-11:
+/// 1.02x favourable, ranges overlapping, on the same probe and as a one-binary
+/// A/B), so what keeps this default-OFF is the stale-entry hazard alone — see
+/// `performance/composition-native-callback-and-the-promotion-question-CLOSED-20260911.md`
+/// item 2 for what would have to be shown to flip it.
 ///
 /// It exists because the policy has never been priced on its own.
 /// `aqs-thread-handoff-latency-RETIRED-20260805.md` item 3 measured
@@ -2977,5 +2986,33 @@ pub fn jit_gate_pass_memo() -> bool {
     slot_bool(&CACHE, || {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_GATE_PASS_MEMO")
             .map_or(true, |v| v != "0" && v != "false")
+    })
+}
+
+/// `CRATONVM_NATIVE_CALLBACK_MEMO` — default-ON, `=0` opts out.
+///
+/// The resolved-handle form of a native->Java callback: see
+/// `crate::runtime::native_callee_memo`. With it off, every
+/// `NativeContext::invoke_virtual` resolves its callee by NAME on every call —
+/// a class-manager read and a `String` allocation for the receiver's class
+/// name, a `find_with_kind` triple hash against the native slot table, the
+/// cold descriptor-quirk rewrite on a miss, and then a second by-name
+/// resolution inside `invoke_on_class_shared_inner`.
+///
+/// It exists as a switch rather than as an unconditional change so the
+/// mechanism can be priced in ONE binary, which is how
+/// `completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
+/// priced the six levers before it — two of which turned out to be worth
+/// nothing and are recorded as refuted rather than removed.
+///
+/// Cached because it is read on the VM's hottest native->Java path.
+#[inline]
+pub fn native_callback_memo() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_CALLBACK_MEMO") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
     })
 }
