@@ -1326,7 +1326,10 @@ too.
   per triple                      outcome = bytecode-won on both
   the workload                    d(base, armed) = 0 over 57 rows
   precondition 3, on the 21 run   declared, !acc_native, has_code on both
-  vs HotSpot 21                   d(hs, base) = d(hs, armed) = 1
+  vs HotSpot 21                   ONE row differs, base and armed alike,
+                                  and it is `getUnsafe` -- the member
+                                  filter, which is not this wave's and
+                                  which 9d.5 measures on all three images
 ```
 
 Note where yielding lands. The `sun.misc` bytecode delegates to
@@ -1342,19 +1345,36 @@ its own remedy and then sat unread for a day. The three supported images are
 all on this host; running against one of the other two is a flag, not a
 project.
 
-### 9d.5 A second image confirms the member-filter defect, on a different row
+### 9d.5 The member-filter defect, now measured on all three images
 
-The one row that differs from HotSpot 21 is `getUnsafe`, and it differs in a
-new way: HotSpot 21 answers `EX:NoSuchMethodException` where CratonVM answers
-`EX:SecurityException`. `javap -p` declares `public static sun.misc.Unsafe
-getUnsafe()` on 21, so the method is there and the JDK's core-reflection member
-filter is hiding it — the same defect §9b's exclusion note records from the 25
-run, now confirmed on an image where it takes a *different* shape (25 lets
-`getMethod` through and throws from the call; 21 hides the method outright).
+The one row that differs from HotSpot 21 is `getUnsafe`, and the 21 run made it
+cheap to ask the same question of every image at once. `javap -p` declares
+`public static sun.misc.Unsafe getUnsafe()` on 17, 21 AND 25, and:
+
+```text
+  HotSpot 17.0.20.1     getUnsafe -> EX:NoSuchMethodException
+  HotSpot 21.0.12       getUnsafe -> EX:NoSuchMethodException
+  HotSpot 25.0.4        getUnsafe -> EX:NoSuchMethodException
+  CratonVM on 21        getUnsafe -> EX:SecurityException
+  CratonVM on 25        getUnsafe -> EX:SecurityException
+```
+
+The method is declared on every image and `getMethod` finds it on none of them,
+because the JDK's core-reflection member filter hides it. CratonVM implements no
+such filter, so it finds the method on every image and the call then throws the
+`SecurityException` the native correctly raises off the boot path.
+
+**A first draft of this section said the divergence took a DIFFERENT shape on 21
+than on 25** — that 25 let `getMethod` through and only 21 hid the method. That
+was wrong, and it was wrong for the reason this page keeps re-learning: it read
+a CratonVM-on-25 transcript against a HotSpot-on-21 transcript and took the
+difference between them for a difference between images. Running the three
+oracles side by side took one command and says the opposite — the behaviour is
+identical on all three, which makes the divergence simpler rather than subtler.
 
 Still not this lane's, still open:
 `docs/known-issues/jdk-only/core-reflection-has-no-member-filter-20260911.md`.
-What the second image adds is that the divergence is not one row's quirk.
+What the other two images add is that it is not one image's quirk.
 
 ### 9d.6 The two-binary arm threw out two rows every earlier instrument passed
 
