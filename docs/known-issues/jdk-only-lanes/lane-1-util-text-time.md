@@ -56,10 +56,10 @@ would invent a number neither took. What they retire, exactly:
 
 ### Wave 6 — the acceptance, and the first tree taken in BOTH modes
 
-Control `cratonvm-l1w6-base-20260911` is `origin/dev` at `8f09c89b9`
-untouched. Three trial binaries off it, because three of this wave's changes
-answer different questions and a single binary could not have told them
-apart:
+**THE ATTRIBUTION LADDER came first, and it is why this wave needed five
+binaries rather than two.** Each change answers a different question, and one
+trial binary could not have told them apart. Control
+`cratonvm-l1w6-base-20260911` is `origin/dev` at `8f09c89b9` untouched:
 
 ```text
   t1  setText/preceding step aside for real receivers; JarEntry.attr
@@ -67,7 +67,22 @@ apart:
   t3  t2 + LocaleNames routed to the image's CLDR bundle classes
 ```
 
-**161 probes, both modes, per probe:**
+```text
+  L1BreakIterRealProbe    base 28  ->  t1 16  ->  t2 0
+  L1LocaleProviderWorkload base 8  ->  t2  4  ->  t3 0
+  L1JarTextSweep          base 22  ->  t1 20
+```
+
+**t3 also cost one probe, and that is the whole reason for a fourth
+binary.** `CurrencyNameProbe` went 0 -> 4: routing `LocaleNames` to the real
+class bundles for EVERY caller answered a `ResourceBundle.getBundle` that
+HotSpot refuses with `MissingResourceException`. The `checkcast` that needs
+the real bundle is in `LocaleData`, which is not application code, so the
+routing is now gated on `caller_is_app` — and the probe that caught it is in
+nobody's locale family. **A whole-tree differential is what makes a narrow
+fix safe to keep.**
+
+**161 probes, both modes, per probe, on the PRE-MERGE pair:**
 
 ```text
   --jdk-only    base vs t2     0 worse   4 better

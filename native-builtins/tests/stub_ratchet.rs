@@ -1997,7 +1997,21 @@ use cratonvm_types::compat::CompatibilityMode;
 /// time. Three independent derivations of one delta is what makes it a property
 /// of this branch rather than of a tree, which is the claim a re-freeze makes.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2755;
+/// **Re-frozen 2026-09-11 (lane 1 wave 6): 2755 -> 2774.** `+19`, and the account
+/// is nineteen rows in two tables: `RETIRED_SHADOW_L1_BI_TRIPLES`, all
+/// seventeen of `java/text/BreakIterator` (retired WHOLE because the class is
+/// abstract -- every instance the JDK hands back is a real subclass answering
+/// its own bytecode), plus `RETIRED_SHADOW_L1_LP_TRIPLES`, one registration
+/// each on `sun/util/resources/LocaleData` and `JRELocaleProviderAdapter`.
+///
+/// MEASURED TWICE, ACROSS A MERGE, AND NEVER ADDED. Before dev moved this
+/// branch printed 2630/2641/2630 against dev's 2611/2622/2611; dev then
+/// re-froze twice more for other lanes (to 2728/2755/2728) and this branch
+/// re-merged. The arms were RE-RUN rather than incremented, and printed
+/// 2747/2774/2747 -- the same +19 over a control 117 higher. Two independent
+/// derivations of one delta is what makes it a property of this branch rather
+/// than of a tree.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2774;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2255,7 +2269,21 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2755;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2728;
+/// **Re-frozen 2026-09-11 (lane 1 wave 6): 2728 -> 2747.** `+19`, and the account
+/// is nineteen rows in two tables: `RETIRED_SHADOW_L1_BI_TRIPLES`, all
+/// seventeen of `java/text/BreakIterator` (retired WHOLE because the class is
+/// abstract -- every instance the JDK hands back is a real subclass answering
+/// its own bytecode), plus `RETIRED_SHADOW_L1_LP_TRIPLES`, one registration
+/// each on `sun/util/resources/LocaleData` and `JRELocaleProviderAdapter`.
+///
+/// MEASURED TWICE, ACROSS A MERGE, AND NEVER ADDED. Before dev moved this
+/// branch printed 2630/2641/2630 against dev's 2611/2622/2611; dev then
+/// re-froze twice more for other lanes (to 2728/2755/2728) and this branch
+/// re-merged. The arms were RE-RUN rather than incremented, and printed
+/// 2747/2774/2747 -- the same +19 over a control 117 higher. Two independent
+/// derivations of one delta is what makes it a property of this branch rather
+/// than of a tree.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2747;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2435,7 +2463,21 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2728;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2728;
+/// **Re-frozen 2026-09-11 (lane 1 wave 6): 2728 -> 2747.** `+19`, and the account
+/// is nineteen rows in two tables: `RETIRED_SHADOW_L1_BI_TRIPLES`, all
+/// seventeen of `java/text/BreakIterator` (retired WHOLE because the class is
+/// abstract -- every instance the JDK hands back is a real subclass answering
+/// its own bytecode), plus `RETIRED_SHADOW_L1_LP_TRIPLES`, one registration
+/// each on `sun/util/resources/LocaleData` and `JRELocaleProviderAdapter`.
+///
+/// MEASURED TWICE, ACROSS A MERGE, AND NEVER ADDED. Before dev moved this
+/// branch printed 2630/2641/2630 against dev's 2611/2622/2611; dev then
+/// re-froze twice more for other lanes (to 2728/2755/2728) and this branch
+/// re-merged. The arms were RE-RUN rather than incremented, and printed
+/// 2747/2774/2747 -- the same +19 over a control 117 higher. Two independent
+/// derivations of one delta is what makes it a property of this branch rather
+/// than of a tree.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2747;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
