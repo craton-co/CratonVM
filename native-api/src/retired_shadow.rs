@@ -1304,6 +1304,14 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     // `the_zone_info_file_prefix_retires_only_the_two_measured_rows` is the
     // guard.
     "sun/util/calendar/ZoneInfoFile",
+    // 2026-09-11, L1 wave 6. Two more NARROW spellings, for the same reason
+    // the line above is narrow: the locale-provider tree's other half is
+    // MEASURED not retirable (`LocaleResources` +12 on 254 engagements,
+    // `CalendarDataUtility` +12 on 108 -- see
+    // `RETIRED_SHADOW_L1_LP_TRIPLES`), and a `sun/util/` prefix would put
+    // both one binary search from a future table.
+    "sun/util/locale/provider/JRELocaleProviderAdapter",
+    "sun/util/resources/LocaleData",
     // 2026-09-11, lane L3 adds NO prefix of its own, and that is the merge
     // resolution rather than an omission. This branch carried
     // `java/lang/invoke/` and `java/lang/reflect/` for
@@ -3328,6 +3336,13 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// `intValueExact`, `isProbablePrime`, `longValueExact`, `not`, `shiftLeft`,
 /// `shiftRight`, `testBit`, `toByteArray` — and they are 0-diff over the whole
 /// 13253-row sweep with the JIT on.
+///
+/// # `java/lang/Package.getPackages()` left this table on 2026-09-11
+///
+/// Not un-retired: the four empty-array registrations behind it were DELETED,
+/// so there is no longer a shadow for strict mode to refuse. A retirement row
+/// for a triple nothing registers is rot that reads like a measurement. Record:
+/// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Character", "isJavaLetter", "(C)Z"),
     ("java/lang/Character", "isJavaLetterOrDigit", "(C)Z"),
@@ -3361,7 +3376,6 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/Object", "wait", "()V"),
     ("java/lang/Object", "wait", "(J)V"),
     ("java/lang/Package", "equals", "(Ljava/lang/Object;)Z"),
-    ("java/lang/Package", "getPackages", "()[Ljava/lang/Package;"),
     ("java/lang/Package", "hashCode", "()I"),
     ("java/lang/StringUTF16", "getChars", "([BII[CI)V"),
     (
@@ -4452,6 +4466,44 @@ static RETIRED_SHADOW_L1_JT_TRIPLES: &[(&str, &str, &str)] = &[
 /// under four of the lane's remaining items, and it is §10's, not this table's.
 /// Admitting `sun/util/` as a prefix would put all of it one binary search from
 /// a future table for no gain today, so the prefix names this class alone.
+///
+/// ## ADDENDUM, wave 6 (2026-09-11): the six vacuous rows are vacuous no more
+///
+/// A `reached == 0` row is a request for a workload, and wave 6 wrote one:
+/// `apps/probes/L1LocaleProviderWorkload`, 147 rows driving every public API
+/// whose real-JDK implementation goes through these classes. Armed one class
+/// per process against the wave-6 control binary, the six rows above now
+/// read:
+///
+/// ```text
+///   java/util/Date                                     +0   reached=14
+///   sun/util/locale/provider/CalendarDataUtility      +12   reached=108
+///   sun/util/locale/provider/JRELocaleProviderAdapter   +0   reached=8
+///   sun/util/locale/provider/LocaleResources          +12   reached=254
+///   sun/util/resources/Bundles                          +0   reached=0
+///   sun/util/resources/LocaleData                       +0   reached=21
+/// ```
+///
+/// and four neighbours the same run priced for the first time:
+///
+/// ```text
+///   sun/util/calendar/          +0   reached=411   (ZoneInfoFile already out)
+///   java/util/TimeZone          +0   reached=196
+///   java/util/Currency         +38   reached=75
+///   java/util/Locale            +6   reached=16156
+/// ```
+///
+/// So the paragraph above is HALF wrong and the half matters:
+/// `LocaleResources` and `CalendarDataUtility` are genuinely blocked (+12
+/// each, on 108 and 254 engagements), and `Currency` and `Locale` are worse
+/// still. But `Date`, `JRELocaleProviderAdapter`, `LocaleData`, `TimeZone` and
+/// the rest of `sun/util/calendar/` are CANDIDATES with engagement behind
+/// them, and the sentence that called all five one blocker was reasoning from
+/// an empty set. `sun/util/resources/Bundles` is the one row still at
+/// `reached=0`, and it stays a non-answer.
+///
+/// A candidate is still not a verdict -- that is this table's own standing
+/// warning, and none of these four has had a trial binary yet.
 static RETIRED_SHADOW_L1_ZI_TRIPLES: &[(&str, &str, &str)] = &[
     (
         "sun/util/calendar/ZoneInfoFile",
@@ -4462,6 +4514,160 @@ static RETIRED_SHADOW_L1_ZI_TRIPLES: &[(&str, &str, &str)] = &[
         "sun/util/calendar/ZoneInfoFile",
         "getZoneInfo0",
         "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
+    ),
+];
+
+/// Lane 1 wave 6, 2026-09-11: `java/text/BreakIterator`, all seventeen.
+///
+/// The family the lane page held for two waves as "one throw, and it is the
+/// locale provider's". It was, and this is the other end of that thread.
+///
+/// # Why seventeen and not a subset
+///
+/// Because the blocker was never per-method. `java.text.BreakIterator` is
+/// ABSTRACT: everything the JDK hands back is a `sun.text.RuleBasedBreakIterator`,
+/// a `sun.text.DictionaryBasedBreakIterator` or a
+/// `BreakIteratorProviderImpl$GraphemeBreakIterator`, and once the real chain
+/// builds one, every one of the seventeen is answered by that object's own
+/// bytecode. Retiring half would leave the fabricated carrier reachable from
+/// the other half's factories.
+///
+/// # The three things that had to be true, each measured on its own binary
+///
+/// ```text
+///   wave 5   LocaleResources.getBreakIteratorInfo / getBreakIteratorResources
+///            answer from the image. `non_cldr_packages`: the family is not
+///            one CLDR re-generated, and the blanket `cldr` mapping made
+///            every candidate miss.
+///   wave 6   setText(String) and preceding(int) -- the only two of the
+///            seventeen that are CONCRETE on the abstract class -- step aside
+///            for a receiver this VM did not fabricate. Until they did, the
+///            chain built the RIGHT object and then wrote the text into slot 0
+///            of an object whose slot 0 is `charCategoryTable`.
+///   wave 6   the BREAKITER pin in `vm/src/vm/vm_exec.rs` is removed, so the
+///            four static factories run their own bytecode.
+/// ```
+///
+/// `apps/probes/L1BreakIterRealProbe` is the instrument, and it was built to
+/// be measurable BEFORE any of this landed: its `P.*` rows reach
+/// `BreakIteratorProviderImpl` directly, which the pin never covered. On the
+/// control binary the chain already answered `sun.text.RuleBasedBreakIterator`
+/// and every walk over it was `[0]`. On the wave-6 binary:
+///
+/// ```text
+///   control  28 rows differ from HotSpot   (13 of them P.*, 15 F.*)
+///   setText   16 rows differ               (0 P.*, all 16 the pinned F.*)
+///   pin off    0 rows differ
+/// ```
+///
+/// # What is NOT retired, and why the tempting row is absent
+///
+/// `java/text/BreakIterator` is the whole table. The natives stay registered
+/// for synthetic-JDK mode, where there is no bytecode to prefer and the
+/// fabricated carrier is the only BreakIterator there is -- retirement is
+/// `--jdk-only`'s refusal and does not touch that mode.
+///
+/// The two `LocaleResources` readers wave 5 added are NOT retirable and must
+/// not be swept in by a later widening of a prefix: they are the floor this
+/// family now stands on, force-listed at both dispatch doors, and the family
+/// returns to "Cannot load from null array" without them.
+/// Lane 1 wave 6, 2026-09-11: the two locale-provider rows the vacuity
+/// workload turned from non-answers into candidates, one method each.
+///
+/// Both were `reached == 0` in wave 5's bisection -- `+0` computed over an
+/// empty set. `apps/probes/L1LocaleProviderWorkload` gave them a workload and
+/// they came back with engagement and no divergence:
+///
+/// ```text
+///   sun/util/resources/LocaleData.getBundle              +0   reached=21
+///   .../JRELocaleProviderAdapter.getLocaleServiceProvider +0   reached=8
+/// ```
+///
+/// Each class carries exactly ONE registration in the whole tree (grep for
+/// the class name: one hit each, in `locale_resources.rs` and
+/// `locale_bootstrap.rs`), so "retire the class" and "retire the method" are
+/// the same act here and no half-retirement is possible.
+///
+/// THE TWO SIBLINGS THAT ARE NOT HERE ARE THE POINT. The same run measured
+/// `LocaleResources` at +12 over 254 engagements and `CalendarDataUtility` at
+/// +12 over 108, and the paragraph in `RETIRED_SHADOW_L1_ZI_TRIPLES` that
+/// called all five "one blocker" was reasoning from `reached == 0`. Four of
+/// them are candidates; two are measured blockers. Neither fact was visible
+/// before there was a workload.
+///
+/// `sun/util/resources/Bundles` remains at `reached=0` even under the new
+/// workload and is deliberately absent: a row nothing reaches is a row
+/// nothing has measured.
+static RETIRED_SHADOW_L1_LP_TRIPLES: &[(&str, &str, &str)] = &[
+    (
+        "sun/util/locale/provider/JRELocaleProviderAdapter",
+        "getLocaleServiceProvider",
+        "(Ljava/lang/Class;)Ljava/util/spi/LocaleServiceProvider;",
+    ),
+    (
+        "sun/util/resources/LocaleData",
+        "getBundle",
+        "(Ljava/lang/String;Ljava/util/Locale;)Ljava/util/ResourceBundle;",
+    ),
+];
+
+static RETIRED_SHADOW_L1_BI_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/text/BreakIterator", "current", "()I"),
+    ("java/text/BreakIterator", "first", "()I"),
+    ("java/text/BreakIterator", "following", "(I)I"),
+    (
+        "java/text/BreakIterator",
+        "getCharacterInstance",
+        "()Ljava/text/BreakIterator;",
+    ),
+    (
+        "java/text/BreakIterator",
+        "getCharacterInstance",
+        "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
+    ),
+    (
+        "java/text/BreakIterator",
+        "getLineInstance",
+        "()Ljava/text/BreakIterator;",
+    ),
+    (
+        "java/text/BreakIterator",
+        "getLineInstance",
+        "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
+    ),
+    (
+        "java/text/BreakIterator",
+        "getSentenceInstance",
+        "()Ljava/text/BreakIterator;",
+    ),
+    (
+        "java/text/BreakIterator",
+        "getSentenceInstance",
+        "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
+    ),
+    (
+        "java/text/BreakIterator",
+        "getText",
+        "()Ljava/text/CharacterIterator;",
+    ),
+    (
+        "java/text/BreakIterator",
+        "getWordInstance",
+        "()Ljava/text/BreakIterator;",
+    ),
+    (
+        "java/text/BreakIterator",
+        "getWordInstance",
+        "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
+    ),
+    ("java/text/BreakIterator", "last", "()I"),
+    ("java/text/BreakIterator", "next", "()I"),
+    ("java/text/BreakIterator", "preceding", "(I)I"),
+    ("java/text/BreakIterator", "previous", "()I"),
+    (
+        "java/text/BreakIterator",
+        "setText",
+        "(Ljava/lang/String;)V",
     ),
 ];
 
@@ -5705,6 +5911,223 @@ static RETIRED_SHADOW_L4_FFM_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 4 wave 3, 2026-09-12: the four GROUP carriers.
+///
+/// `StructLayoutImpl`, `UnionLayoutImpl`, `SequenceLayoutImpl` and
+/// `PaddingLayoutImpl` — the half of `jdk/internal/foreign/layout/` wave 2 held
+/// back, under the prefix wave 2 admitted. 28 rows of 31: `varHandle` is carved
+/// out on all three classes that register it, for the reason wave 2 carved it
+/// out on the nine value layouts.
+///
+/// # The carrier was the blocker, and it was ONE defect for all four classes
+///
+/// `jdk.internal.foreign.layout.AbstractGroupLayout` declares
+/// `List<MemoryLayout> elements` and this VM stored a bare ARRAY in it; `kind`
+/// and `minByteAlignment` were never written at all. `memberLayouts()` is
+/// `return elements;` — one `getfield` — so the first real body to touch a
+/// group got an array where the JDK's own code calls `List` methods:
+///
+/// ```text
+///   struct.memberLayouts().size()      0          (oracle 2)
+///   struct.byteOffset(groupElement)    cannot resolve a member plainly there
+///   struct.toString()                  NoSuchMethodError: MemoryLayout.size()
+/// ```
+///
+/// Fixed in the commit before this table, through one reader and one writer:
+/// `p67_group_members` decodes whichever shape the field holds and returns the
+/// COUNT beside the array (an `ArrayList` has capacity past its size, and
+/// reading `array_length` would invent trailing members); `p67_group_set_members`
+/// writes the list; `p67_group_set_kind` writes `kind` from the enum's own
+/// statics, so there is one `STRUCT` object in the VM and `==` on it answers
+/// what the JDK expects.
+///
+/// **The list is UNMODIFIABLE and that is measured, not tidy.** HotSpot answers
+/// `UnsupportedOperationException` to `memberLayouts().add(...)`; since the
+/// retired accessor returns the field itself, an `ArrayList` here would hand
+/// out a mutable view of a layout's members.
+///
+/// # The funnel
+///
+/// 31 distinct triples over the four classes, every one of them reached by
+/// `apps/probes/L4FfmLayoutSweep.java` — six were cold on the first pass
+/// (`PaddingLayoutImpl.byteAlignment`, the three `withName` covariant bridges
+/// at the `MemoryLayout` static type, and `UnionLayoutImpl`'s `byteOffset` and
+/// `varHandle`) and the probe was extended until none was. A row no probe
+/// invokes is a row the funnel must not take.
+///
+/// # What the retirement does
+///
+/// One binary against itself, the group table un-retired with
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW` naming the four classes -- which prints
+/// `7 + 7 + 8 + 6 = 28 table row(s)` and is the arm's own receipt that it armed
+/// this table and not its neighbour:
+///
+/// ```text
+///   control (origin/dev)                    13 rows differ
+///   carrier fix, group table un-retired      3
+///   carrier fix + this table                 2
+/// ```
+///
+/// **The retirement fixes one row and breaks none.** `byteOffset` on a padding
+/// layout throws the JDK's own `Bad layout path: attempting to select a group
+/// element from a non-group layout: x4` where the native answered its own
+/// wording. Eleven of the control's thirteen were the carrier, which is the
+/// commit before this one; the two left over are neither this wave's nor a
+/// group's, and both are in `varHandle`:
+///
+///  * `ADDRESS.varHandle().varType()` answers `long` where the oracle says
+///    `MemorySegment`;
+///  * a union's `varHandle` ACCEPTS a misaligned access HotSpot refuses -- a
+///    missing refusal, which is the silent-wrong-answer shape this lane owns,
+///    in the one method carved out of both FFM waves.
+///
+/// **28 refusals, 0 survivors**, and on the control all 28 were `native-won`:
+/// a native winning over real bytecode that was there the whole time.
+///
+/// Measured on **linux/x86_64 against JDK 25**.
+static RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES: &[(&str, &str, &str)] = &[
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "elementCount",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "elementLayout",
+        "()Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "memberLayouts",
+        "()Ljava/util/List;",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "memberLayouts",
+        "()Ljava/util/List;",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+];
+
 /// The 2026-09-11 lane-L6 wave: `java/net/HttpURLConnection` and
 /// `ProxySelector.getDefault` -- 15 rows of a lane of 966, after the corpus
 /// refused 109 that the probe tree had cleared.
@@ -6163,9 +6586,20 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // more. See `RETIRED_SHADOW_L1_ZI_TRIPLES` for why two rows and not forty,
     // and why the table is written but not yet accepted.
     RETIRED_SHADOW_L1_ZI_TRIPLES,
+    // 2026-09-11, L1 wave 6: `java/text/BreakIterator`, all seventeen, with
+    // the BREAKITER pin in `vm_exec.rs` removed in the same commit. Neither
+    // half is correct alone -- retire without lifting the pin and the pin
+    // still serves the factories; lift without retiring and the census still
+    // counts seventeen shadows over a family that no longer uses them.
+    RETIRED_SHADOW_L1_BI_TRIPLES,
+    RETIRED_SHADOW_L1_LP_TRIPLES,
     // Lane 4 wave 2, added WITH the table rather than after a gate caught it --
     // which is the whole point of the loop this const now feeds.
     RETIRED_SHADOW_L4_FFM_TRIPLES,
+    // Lane 4 wave 3, the group half of the same prefix. No new prefix:
+    // `jdk/internal/foreign/layout/` was admitted by wave 2 and its note
+    // there says what this line is the other half of.
+    RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -6220,38 +6654,61 @@ mod tests {
         }
     }
 
-    /// The group layouts sit under the same prefix and are NOT retired.
+    /// Wave 3's group half, and its carve-out.
     ///
-    /// `jdk/internal/foreign/layout/` admits four more carriers to the binary
-    /// search -- `StructLayoutImpl`, `UnionLayoutImpl`, `SequenceLayoutImpl`,
-    /// `PaddingLayoutImpl` -- and the prefix is not the decision. They are held
-    /// back on a measured carrier defect (`AbstractGroupLayout.elements` is a
-    /// `java.util.List` and this VM stores an array there), and a prefix that
-    /// admits them is exactly how a later wave would retire them by accident.
+    /// This test read the other way round until 2026-09-12 -- it asserted the
+    /// four group carriers were NOT retired, because wave 2 held them back on
+    /// a measured carrier defect. Wave 3 fixed the carrier
+    /// (`AbstractGroupLayout.elements` is a `java.util.List` and this VM stored
+    /// an array in it) and took them, so the assertion is inverted rather than
+    /// deleted: the thing worth guarding is still the same, which is that the
+    /// PREFIX is not the decision.
     #[test]
-    fn the_ffm_group_layouts_are_admitted_by_the_prefix_and_not_retired() {
+    fn the_ffm_group_wave_is_four_carriers_without_varhandle() {
+        let mut classes = std::collections::BTreeSet::new();
+        for (c, m, d) in RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in the lane 4 group table and the predicate cannot see it"
+            );
+            assert!(
+                c.starts_with("jdk/internal/foreign/layout/") && !c.contains("ValueLayouts"),
+                "{c} is not one of the four group carriers this wave measured"
+            );
+            assert_ne!(
+                *m, "varHandle",
+                "{c}.{m}{d} is carved out of this wave on purpose -- the real                  `AbstractLayout.varHandle` reaches `Utils.makeSegmentViewVarHandle`                  and ends in `NoClassDefFoundError: java/lang/invoke/BoundMethodHandle`,                  exactly as it does for the nine value layouts"
+            );
+            classes.insert(*c);
+        }
+        assert_eq!(RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES.len(), 28);
+        assert_eq!(classes.len(), 4, "{classes:?}");
+        for c in &classes {
+            assert!(
+                !triple_is_retired_shadow(
+                    c,
+                    "varHandle",
+                    "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;"
+                ),
+                "{c}.varHandle(PathElement...) must stay a live Bridge"
+            );
+        }
+    }
+
+    /// The segment, arena and session carriers are NOT retired, and not because
+    /// nobody has screened them.
+    ///
+    /// `the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md` decides
+    /// that `cratonvm/internal/foreign/MemorySegmentImpl` is the VM's own
+    /// allocation shape, laid out DELIBERATELY unlike
+    /// `AbstractMemorySegmentImpl`, whose `length`/`readOnly`/`scope` would
+    /// alias the carrier's `ptr`/`size`/`arena`. Retiring one of these runs a
+    /// real body over those three slots. That is not a wave awaiting a
+    /// measurement; it is a wave that must not be run while the decision
+    /// stands, which is why it is asserted here rather than left to a reader.
+    #[test]
+    fn the_ffm_allocation_shape_carriers_are_never_retired() {
         for (c, m, d) in [
-            (
-                "jdk/internal/foreign/layout/StructLayoutImpl",
-                "memberLayouts",
-                "()Ljava/util/List;",
-            ),
-            (
-                "jdk/internal/foreign/layout/UnionLayoutImpl",
-                "memberLayouts",
-                "()Ljava/util/List;",
-            ),
-            (
-                "jdk/internal/foreign/layout/SequenceLayoutImpl",
-                "elementCount",
-                "()J",
-            ),
-            (
-                "jdk/internal/foreign/layout/PaddingLayoutImpl",
-                "toString",
-                "()Ljava/lang/String;",
-            ),
-            // And the half a decision on record keeps out of every wave.
             ("jdk/internal/foreign/ArenaImpl", "close", "()V"),
             ("jdk/internal/foreign/MemorySessionImpl", "close", "()V"),
             (
@@ -6259,10 +6716,15 @@ mod tests {
                 "byteSize",
                 "()J",
             ),
+            (
+                "jdk/internal/foreign/NativeMemorySegmentImpl",
+                "address",
+                "()J",
+            ),
         ] {
             assert!(
                 !triple_is_retired_shadow(c, m, d),
-                "{c}.{m}{d} is retired and this wave did not measure it"
+                "{c}.{m}{d} is retired, and the FFM carrier decision says it must not be"
             );
         }
     }
@@ -6410,18 +6872,33 @@ mod tests {
             2,
             "wave 5 is `getZoneInfo` and `getZoneInfo0`. A third row needs its              own trial binary, not this table."
         );
+        // WAVE 6 NARROWED THIS LIST, and the narrowing is the whole point of
+        // the guard rather than an erosion of it. Four of the six were
+        // released by a MEASUREMENT, not by an argument:
+        // `apps/probes/L1LocaleProviderWorkload` gave them the workload their
+        // `reached == 0` was asking for, and `JRELocaleProviderAdapter` (+0,
+        // reached=8) and `LocaleData` (+0, reached=21) are retired in
+        // `RETIRED_SHADOW_L1_LP_TRIPLES` on that reading plus a trial binary.
+        //
+        // `java/util/Date` (+0, reached=14) and the rest of
+        // `sun/util/calendar/` (+0, reached=411) are candidates with
+        // engagement and no table yet -- they stay here, because a candidate
+        // is not a verdict.
+        //
+        // The two that stay for a STRONGER reason than vacuity are
+        // `LocaleResources` and `CalendarDataUtility`: they measured +12 each,
+        // on 254 and 108 engagements. Those are not unmeasured rows any more;
+        // they are measured NO.
         for c in [
             "java/util/Date",
             "sun/util/locale/provider/CalendarDataUtility",
-            "sun/util/locale/provider/JRELocaleProviderAdapter",
             "sun/util/locale/provider/LocaleResources",
             "sun/util/resources/Bundles",
-            "sun/util/resources/LocaleData",
         ] {
             for t in RETIRED_SHADOW_TABLES.iter() {
                 assert!(
                     !t.iter().any(|(tc, _, _)| *tc == c),
-                    "{c} read `+0` with `reached == 0` on the 2026-09-11 sweep,                      which is a VACUOUS green and not a measurement. It cannot                      be retired on that row."
+                    "{c} is retired, and wave 6 measured it either VACUOUS                      (`reached == 0`, so its `+0` is arithmetic on an empty                      set) or WORSE ARMED (+12). Neither is a licence to                      retire; a candidate needs its own trial binary."
                 );
             }
         }
@@ -6445,12 +6922,14 @@ mod tests {
     /// better failure — it is a behaviour change a probe can see — but it is
     /// still worth a test that names the table rather than counting.
     #[test]
-    fn lane_ones_four_tables_are_all_in_the_tables_const() {
+    fn lane_ones_six_tables_are_all_in_the_tables_const() {
         for (t, name) in [
             (RETIRED_SHADOW_L1_TRIPLES, "RETIRED_SHADOW_L1_TRIPLES"),
             (RETIRED_SHADOW_L1_HM_TRIPLES, "RETIRED_SHADOW_L1_HM_TRIPLES"),
             (RETIRED_SHADOW_L1_JT_TRIPLES, "RETIRED_SHADOW_L1_JT_TRIPLES"),
             (RETIRED_SHADOW_L1_ZI_TRIPLES, "RETIRED_SHADOW_L1_ZI_TRIPLES"),
+            (RETIRED_SHADOW_L1_BI_TRIPLES, "RETIRED_SHADOW_L1_BI_TRIPLES"),
+            (RETIRED_SHADOW_L1_LP_TRIPLES, "RETIRED_SHADOW_L1_LP_TRIPLES"),
         ] {
             // Compared BY VALUE, not by pointer. `RETIRED_SHADOW_TABLES` is a
             // `const`, so each use site materialises its own array and
@@ -6463,6 +6942,95 @@ mod tests {
                 RETIRED_SHADOW_TABLES.iter().any(|listed| *listed == t),
                 "{name} is consulted by `triple_is_retired_shadow` but is not in                  `RETIRED_SHADOW_TABLES`, so it is never asked whether it                  disarms a real-JDK keep arm."
             );
+        }
+    }
+
+    #[test]
+    fn every_locale_provider_entry_is_reachable_through_the_predicate() {
+        for (c, m, d) in RETIRED_SHADOW_L1_LP_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 1 wave 6's locale-provider table and                  the predicate cannot see it -- the narrow prefix for that                  class is missing."
+            );
+        }
+    }
+
+    /// The two MEASURED blockers must not drift into a table by prefix.
+    ///
+    /// `LocaleResources` and `CalendarDataUtility` read +12 each on the
+    /// wave-6 workload, with 254 and 108 door engagements behind the number.
+    /// They are the reason this lane spells its `sun/util/` prefixes one
+    /// class at a time.
+    #[test]
+    fn the_two_measured_locale_blockers_are_not_retired() {
+        for c in [
+            "sun/util/locale/provider/LocaleResources",
+            "sun/util/locale/provider/CalendarDataUtility",
+        ] {
+            assert!(
+                !RETIRED_SHADOW_PREFIXES
+                    .iter()
+                    .any(|p| c.starts_with(p) && *p != c),
+                "{c} is admitted by a retired-shadow prefix. It measured +12                  in wave 6 with engagement behind it; admitting the package                  puts a measured blocker one binary search from a future                  table."
+            );
+        }
+    }
+
+    #[test]
+    fn every_break_iterator_entry_is_reachable_through_the_predicate() {
+        for (c, m, d) in RETIRED_SHADOW_L1_BI_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 1 wave 6's table and the predicate                  cannot see it, so the entry is inert and silent."
+            );
+        }
+    }
+
+    /// The family is retired WHOLE, and the count is the guard on that.
+    ///
+    /// `java.text.BreakIterator` is abstract: every instance the JDK hands
+    /// back is a real subclass whose own bytecode answers all seventeen. A
+    /// subset would leave the fabricated carrier reachable from whichever
+    /// factory was left behind, which is the half-retirement the lane page
+    /// warns about for the HashMap views.
+    #[test]
+    fn the_break_iterator_family_is_retired_whole() {
+        assert_eq!(
+            RETIRED_SHADOW_L1_BI_TRIPLES.len(),
+            17,
+            "`register_p66_break_iterator` registers seventeen triples on              `java/text/BreakIterator`. A table with a different length is              either a half-retirement or a registrar that changed without              this table."
+        );
+        for (c, _, _) in RETIRED_SHADOW_L1_BI_TRIPLES {
+            assert_eq!(
+                *c, "java/text/BreakIterator",
+                "this table is one class; a `sun/text/*` row belongs to                  whoever measures that class, not to this one."
+            );
+        }
+    }
+
+    /// The two `LocaleResources` readers are the family's FLOOR, not part of
+    /// it, and nothing may retire them by widening a prefix.
+    ///
+    /// With the BREAKITER pin gone there is no fallback behind them: retire
+    /// `getBreakIteratorInfo` or `getBreakIteratorResources` and every
+    /// BreakIterator factory is back to "Cannot load from null array" at
+    /// `BreakIteratorProviderImpl.getBreakInstance pc=21`.
+    #[test]
+    fn the_two_locale_resources_readers_are_not_retired_by_anything() {
+        for m in ["getBreakIteratorInfo", "getBreakIteratorResources"] {
+            for d in [
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                "(Ljava/lang/String;)[B",
+            ] {
+                assert!(
+                    !triple_is_retired_shadow(
+                        "sun/util/locale/provider/LocaleResources",
+                        m,
+                        d
+                    ),
+                    "sun/util/locale/provider/LocaleResources.{m}{d} is                      retired. It is the floor `java/text/BreakIterator`'s                      retirement stands on -- see                      `RETIRED_SHADOW_L1_BI_TRIPLES`."
+                );
+            }
         }
     }
 
@@ -6488,7 +7056,7 @@ mod tests {
     /// result. Adding any of the three back means re-running the bisection,
     /// not editing this list.
     #[test]
-    fn wave_four_is_six_classes_and_refuses_jarfile_breakiterator_dateformat() {
+    fn wave_four_is_six_classes_and_refuses_jarfile_and_dateformat() {
         for (c, _, _) in RETIRED_SHADOW_L1_JT_TRIPLES {
             assert!(
                 matches!(
@@ -6514,11 +7082,28 @@ mod tests {
                 "getJarEntry",
                 "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
             ),
-            ("java/text/BreakIterator", "next", "()I"),
+            // `java/text/BreakIterator` was HERE until wave 6 and is not any
+            // more. Wave 4 was right that the family carried its whole
+            // regression in one class; wave 6 fixed the cause (the provider
+            // chain, then the two CONCRETE registrations that hijacked real
+            // receivers) and retired all seventeen with a probe that matches
+            // HotSpot on every row. What remains of the guard is the pair
+            // below: the two `LocaleResources` readers the family now stands
+            // on, which must never be retired by anything.
             (
                 "java/text/DateFormat",
                 "getInstance",
                 "()Ljava/text/DateFormat;",
+            ),
+            (
+                "sun/util/locale/provider/LocaleResources",
+                "getBreakIteratorInfo",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+            ),
+            (
+                "sun/util/locale/provider/LocaleResources",
+                "getBreakIteratorResources",
+                "(Ljava/lang/String;)[B",
             ),
             // `java/text/ParseException` was IN wave 4's table and came out
             // on its own measurement. Armed alone on
@@ -6546,9 +7131,7 @@ mod tests {
         ] {
             assert!(
                 !triple_is_retired_shadow(c, m, d),
-                "{c}.{m}{d} is retired. `JarFile` and `BreakIterator` each \
-                 carry their family's whole regression and `DateFormat`'s arm \
-                 was vacuous — none of the three has a measurement behind it."
+                "{c}.{m}{d} is retired. `JarFile` carries its family's whole \n                 regression, `DateFormat`'s arm was vacuous, and the two \n                 `LocaleResources` readers are the floor BreakIterator's own \n                 retirement stands on."
             );
         }
     }
@@ -8870,27 +9453,39 @@ Ljava/nio/channels/FileChannel;"
                 "getManifest",
                 "()Ljava/util/jar/Manifest;",
             ),
-            (
-                "java/text/BreakIterator",
-                "getWordInstance",
-                "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
-            ),
-            // 2026-09-11, L1 wave 4: `java/text/Normalizer` came OFF this
-            // list and `java/text/BreakIterator` took its place, on the same
-            // bisection. `java/text/` armed whole is +16 on `L1TailSweep`
-            // and `BreakIterator` armed alone is the same +16;
-            // `ParseException` and `Normalizer` are +0 with the dial
-            // engaged (reached 1 and 10), and `DateFormat` is +0 with
-            // `reached == 0`, which is §7's trap and stays out.
+            // 2026-09-11, L1 wave 4 put `java/text/BreakIterator` on this
+            // list (`getWordInstance(Locale)` and `next()`), on the same
+            // bisection that took `java/text/Normalizer` off it:
+            // `java/text/` armed whole is +16 on `L1TailSweep` and
+            // `BreakIterator` armed alone is the same +16.
+            //
+            // WAVE 6 TOOK BOTH ROWS OFF, and not by re-reading the dial.
+            // The +16 was real and its CAUSE is now fixed: the family threw
+            // `AbstractMethodError` because yielding sent real bytecode to a
+            // provider chain that answered null, and then -- once wave 5
+            // fixed that -- to a correct `sun.text.RuleBasedBreakIterator`
+            // whose text had been written into slot 0 of an object whose
+            // slot 0 is `charCategoryTable`. With `setText(String)` and
+            // `preceding(int)` stepping aside for real receivers and the
+            // BREAKITER pin gone, `L1BreakIterRealProbe` matches HotSpot on
+            // all 30 rows and the family is retired WHOLE in
+            // `RETIRED_SHADOW_L1_BI_TRIPLES`.
+            //
+            // A held row is held until the blocker is fixed, not forever;
+            // this is what taking one off is supposed to look like -- a
+            // named cause, a probe that measured it, and a trial binary.
+            //
+            // `java/text/DateFormat` is still out, and still for §7's
+            // reason: +0 with `reached == 0`.
             //
             // Retiring `Normalizer` is what §9 said it could not do: with
             // `java/text/` held, the null-argument contract had to live in
             // `normalizer_reject_nulls` inside the native. It can now be the
             // image's own body again, in `--jdk-only`.
             (
-                "java/text/BreakIterator",
-                "next",
-                "()I",
+                "java/text/DateFormat",
+                "getDateInstance",
+                "(I)Ljava/text/DateFormat;",
             ),
             // NOT a vacuous green — this one was clean over 51 probes with
             // the dial armed and turned red only on the trial binary, because

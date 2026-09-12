@@ -1997,48 +1997,28 @@ use cratonvm_types::compat::CompatibilityMode;
 /// time. Three independent derivations of one delta is what makes it a property
 /// of this branch rather than of a tree, which is the claim a re-freeze makes.
 ///
-/// # Lane 4 wave 2, 2026-09-11 — the paired ratchet, both columns PRINTED
+/// # 2943 -> 2942, 2026-09-12 — one triple LEFT the stub population
 ///
-/// `+137` in all three configurations and the total unchanged in all three:
-/// case **(b)** in the taxonomy the panic message above sets out — existing
-/// registrations relabelled `Bridge` -> `SyntheticStub` so `--jdk-only` drops
-/// them and the JDK's own bytecode runs. The rows are
-/// `RETIRED_SHADOW_L4_FFM_TRIPLES`, 137 triples over the nine
-/// `jdk/internal/foreign/layout/ValueLayouts$Of*Impl` carriers.
+/// `java/lang/Package.getPackages()[Ljava/lang/Package;` is no longer registered
+/// at all: the four empty-array overrides for the plural package methods were
+/// deleted, so the real JDK bytecode answers them. It was a retired shadow, so it
+/// counted here; the sibling triple deleted with it,
+/// `java/lang/ClassLoader.getPackages`, was a `Bridge` and did not.
 ///
-/// ```text
-///   arm             OFF             ON              delta
-///   (default)   2728 / 13609    2865 / 13609        +137 / 0
-///   management  2755 / 13977    2892 / 13977        +137 / 0
-///   synthetic   2728 / 13644    2865 / 13644        +137 / 0
-/// ```
+/// A DECREASE is re-frozen in the same change, because this ratchet asserts `<=`:
+/// a baseline left above the tree silently re-admits that many new stubs.
 ///
-/// **The OFF column was PRINTED, not inferred from a `<=` pass**, and it
-/// reproduces every constant this wave found in this file — all three stub
-/// baselines AND all three totals — so there is no inherited drift to
-/// disentangle from the delta. It was taken with
-/// `CRATONVM_UNRETIRE_NATIVE_SHADOW=jdk/internal/foreign/layout/`, so one
-/// binary answered both halves and nothing about the comparison depends on two
-/// checkouts being otherwise identical, which is what that switch exists for.
-///
-/// Measured on the MERGE with `origin/dev`, not on the branch before it: the
-/// three baselines moved twice while this wave was in flight (2609 -> 2728 and
-/// 2620 -> 2755), and the `+137` is identical each time only because it was
-/// re-measured each time rather than subtracted.
-///
-/// ## The strict registry, and the gate that used to guard it by LEVEL
-///
-/// This wave crossed `STRICT_MIN_TOTAL_REGISTRATIONS` on its own branch —
-/// 10,998 -> 10,861 against a floor of 10,900 — because under `JdkOnly`
-/// `register_inner` REFUSES a `SyntheticStub`, so a retired triple is one row
-/// FEWER in the strict registry and that floor was guarding a number the
-/// campaign is deliberately driving down. `STRICT_UNEXPLAINED_DROP_MAX`
-/// replaced it on `dev` the same day, bounding the SHORTFALL instead, and this
-/// wave is the confirmation that the new shape is the right one: the shortfall
-/// is `13609 - 2865 - 10741 = 3` with the wave armed and `13609 - 2728 -
-/// 10878 = 3` with it un-armed. **Invariant across 137 retirements**, where the
-/// level moved by exactly 137.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2892;
+/// RE-MEASURED ON EACH MERGE, never carried across one. This branch measured
+/// `2728 -> 2727`, then `2865 -> 2864` after lane 4 wave 2, then this line after
+/// lane 4 wave 3 and lane 1 wave 6 — three waves re-froze these constants while
+/// this one row was in flight, and the delta is the same 1 every time BECAUSE it
+/// was re-measured rather than subtracted. It was also checked at ROW granularity:
+/// `CRATONVM_RATCHET_ROWS=1` on both trees, one target dir with a touch between
+/// them, sorted and `comm`-ed, gives exactly ONE row on `dev` and not here --
+/// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
+/// -- and none the other way. Record:
+/// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2942;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2296,7 +2276,28 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2892;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2865;
+/// # 2916 -> 2915, 2026-09-12 — one triple LEFT the stub population
+///
+/// `java/lang/Package.getPackages()[Ljava/lang/Package;` is no longer registered
+/// at all: the four empty-array overrides for the plural package methods were
+/// deleted, so the real JDK bytecode answers them. It was a retired shadow, so it
+/// counted here; the sibling triple deleted with it,
+/// `java/lang/ClassLoader.getPackages`, was a `Bridge` and did not.
+///
+/// A DECREASE is re-frozen in the same change, because this ratchet asserts `<=`:
+/// a baseline left above the tree silently re-admits that many new stubs.
+///
+/// RE-MEASURED ON EACH MERGE, never carried across one. This branch measured
+/// `2728 -> 2727`, then `2865 -> 2864` after lane 4 wave 2, then this line after
+/// lane 4 wave 3 and lane 1 wave 6 — three waves re-froze these constants while
+/// this one row was in flight, and the delta is the same 1 every time BECAUSE it
+/// was re-measured rather than subtracted. It was also checked at ROW granularity:
+/// `CRATONVM_RATCHET_ROWS=1` on both trees, one target dir with a touch between
+/// them, sorted and `comm`-ed, gives exactly ONE row on `dev` and not here --
+/// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
+/// -- and none the other way. Record:
+/// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2915;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2476,7 +2477,28 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2865;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2865;
+/// # 2916 -> 2915, 2026-09-12 — one triple LEFT the stub population
+///
+/// `java/lang/Package.getPackages()[Ljava/lang/Package;` is no longer registered
+/// at all: the four empty-array overrides for the plural package methods were
+/// deleted, so the real JDK bytecode answers them. It was a retired shadow, so it
+/// counted here; the sibling triple deleted with it,
+/// `java/lang/ClassLoader.getPackages`, was a `Bridge` and did not.
+///
+/// A DECREASE is re-frozen in the same change, because this ratchet asserts `<=`:
+/// a baseline left above the tree silently re-admits that many new stubs.
+///
+/// RE-MEASURED ON EACH MERGE, never carried across one. This branch measured
+/// `2728 -> 2727`, then `2865 -> 2864` after lane 4 wave 2, then this line after
+/// lane 4 wave 3 and lane 1 wave 6 — three waves re-froze these constants while
+/// this one row was in flight, and the delta is the same 1 every time BECAUSE it
+/// was re-measured rather than subtracted. It was also checked at ROW granularity:
+/// `CRATONVM_RATCHET_ROWS=1` on both trees, one target dir with a touch between
+/// them, sorted and `comm`-ed, gives exactly ONE row on `dev` and not here --
+/// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
+/// -- and none the other way. Record:
+/// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2915;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2536,7 +2558,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2865;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13977;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13985;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2549,7 +2571,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13977;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13609;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13617;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2575,7 +2597,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13609;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13644;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13652;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

@@ -1784,11 +1784,8 @@ pub(crate) fn p67_layout_named_member(
     layout: ObjectRef,
     target_name: &str,
 ) -> Option<ObjectRef> {
-    let members = match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
-        Value::Object(Some(arr)) => arr,
-        _ => return None,
-    };
-    for i in 0..ctx.array_length(members) {
+    let (members, member_count) = p67_group_members(ctx, layout)?;
+    for i in 0..member_count {
         let member = match ctx.get_array_element(members, i) {
             Value::Object(Some(member)) => member,
             _ => continue,
@@ -1983,14 +1980,14 @@ pub(crate) fn p67_layout_render(ctx: &dyn NativeContext, layout: ObjectRef) -> S
         } else {
             ""
         };
-        let parts = match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
-            Value::Object(Some(arr)) => (0..ctx.array_length(arr))
+        let parts = match p67_group_members(ctx, layout) {
+            Some((arr, count)) => (0..count)
                 .map(|i| match ctx.get_array_element(arr, i) {
                     Value::Object(Some(m)) => p67_layout_render(ctx, m),
                     _ => String::new(),
                 })
                 .collect::<Vec<_>>(),
-            _ => Vec::new(),
+            None => Vec::new(),
         };
         format!("[{}]", parts.join(sep))
     } else {
@@ -2121,12 +2118,239 @@ pub(crate) fn p67_classify_path_element(
     P67PathElement::Unsupported(class_name)
 }
 
-/// The member layouts of a group layout (slot 2), if it has any.
-fn p67_group_members(ctx: &dyn NativeContext, layout: ObjectRef) -> Option<ObjectRef> {
-    match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
-        Value::Object(Some(arr)) if ctx.array_length(arr) > 0 => Some(arr),
-        _ => None,
+/// The member layouts of a group layout, as `(array, count)`.
+///
+/// **The field does not hold the same thing on both carriers.** A real
+/// `jdk.internal.foreign.layout.AbstractGroupLayout` declares
+/// `List<MemoryLayout> elements`; the carriers this file fabricates keep a bare
+/// array in the payload slot. Every reader in this file wants the array, so the
+/// unwrap lives here -- one place -- and [`p67_group_set_members`] is its
+/// inverse.
+///
+/// **The COUNT comes back beside the array** because an `ArrayList` has
+/// capacity past its size: reading `array_length` off its `elementData` would
+/// invent trailing null members and a group would grow silently, which is the
+/// quiet-wrong-answer shape this lane owns.
+///
+/// The list is recognised by its `elementData` field rather than by a class
+/// name -- the same by-name rule every carrier note in this file gives, and the
+/// only one available anyway: a reference array's header class id is its
+/// COMPONENT's, so the payload cannot be asked for its own name. No layout
+/// class declares `elementData`.
+pub(crate) fn p67_group_members(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+) -> Option<(ObjectRef, usize)> {
+    let payload = match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    // ASK WHETHER IT IS AN ARRAY; do not infer it from a field name. A
+    // reference array's header class id is its COMPONENT's, and
+    // `AbstractGroupLayout` itself declares `elements` -- so a name probe
+    // against an array of layouts can answer yes for the wrong reason.
+    if ctx.object_is_array(payload) {
+        let n = ctx.array_length(payload);
+        return (n > 0).then_some((payload, n));
     }
+    let payload_class = ctx.class_id_of_object(payload);
+    // `ArrayList`: `elementData` has capacity past `size`, so the SIZE decides.
+    if let Some(data) = ctx.resolve_field_index_by_class_id(payload_class, "elementData") {
+        let size = ctx
+            .resolve_field_index_by_class_id(payload_class, "size")
+            .and_then(|i| ctx.get_field(payload, i).as_int())
+            .unwrap_or(0)
+            .max(0) as usize;
+        let arr = match ctx.get_field(payload, data) {
+            Value::Object(Some(arr)) => arr,
+            _ => return None,
+        };
+        let n = std::cmp::min(size, ctx.array_length(arr));
+        return (n > 0).then_some((arr, n));
+    }
+    // `ImmutableCollections$ListN` keeps the array in `elements` and IS its
+    // length -- `size()` returns `elements.length`, so there is no separate
+    // count to read.
+    //
+    // NOT DECODED: `List12`, the one- and two-element shape, which holds `e0`
+    // and `e1` and has no backing array at all. Nothing in this tree gives a
+    // layout one -- every group minted here carries a `ListN`, and
+    // `AbstractGroupLayout`'s `List.copyOf` returns an immutable list
+    // unchanged -- and if that ever stops being true the symptom is a group
+    // reporting ZERO members, which `struct.withName.members` in
+    // `apps/probes/L4FfmLayoutSweep.java` is the row that catches.
+    if let Some(data) = ctx.resolve_field_index_by_class_id(payload_class, "elements") {
+        if let Value::Object(Some(arr)) = ctx.get_field(payload, data) {
+            let n = ctx.array_length(arr);
+            return (n > 0).then_some((arr, n));
+        }
+    }
+    None
+}
+
+/// An UNMODIFIABLE `List` over `arr[..len]`, built by NAME.
+///
+/// **Unmodifiable, and that is measured rather than tidy.**
+/// `AbstractGroupLayout.memberLayouts()` is `return elements;` -- one
+/// `getfield` -- so whatever this builds is what a caller gets, and HotSpot
+/// answers `UnsupportedOperationException` to `memberLayouts().add(...)`. An
+/// `ArrayList` here would hand out a mutable view of a layout's members, and a
+/// `MemoryLayout` is specified immutable.
+///
+/// `java.util.ImmutableCollections$ListN` is the shape `List.of(...)` mints:
+/// `size()` is `elements.length`, so the array must be EXACTLY the member count
+/// and there is no separate size field to disagree with it. `len` is asserted
+/// against the array rather than trusted, because a list whose backing array is
+/// longer than its count is precisely the silent-extra-member defect
+/// [`p67_group_members`] returns a count to avoid.
+fn p67_new_member_list(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    len: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    const LIST_N: &str = "java/util/ImmutableCollections$ListN";
+    let arr = if ctx.array_length(arr) == len {
+        arr
+    } else {
+        // Copy down to the exact length. Nothing in this file produces a
+        // longer array today; the branch exists so that if something does, the
+        // list reports the members it has rather than the slots it was given.
+        let pin = ctx.pin_native_root(arr);
+        let exact = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+        let arr = ctx.read_native_pin(pin, arr);
+        for i in 0..len {
+            let v = ctx.get_array_element(arr, i);
+            ctx.set_array_element(exact, i, v);
+        }
+        ctx.unpin_native_roots(pin);
+        exact
+    };
+    let pin = ctx.pin_native_root(arr);
+    // LOAD IT FIRST. `resolve_field_index` resolves the class GLOBALLY by name
+    // and answers `None` for one that is not loaded yet -- which under
+    // COMPATIBLE mode it is not, because nothing has called `List.of` by then.
+    // Without this the fallback below fires, the group carries a MUTABLE list,
+    // and `AbstractGroupLayout`'s constructor then `List.copyOf`s it into a
+    // `List12` on the next `withName` -- a shape with `e0`/`e1` and no backing
+    // array, which `p67_group_members` cannot decode, so the group reports
+    // ZERO members. Measured exactly that way on 2026-09-12: strict 2, compat
+    // 0, on `structLayout(..).withName("st").memberLayouts().size()`.
+    let list_class = ctx.ensure_class_initialized(LIST_N).ok();
+    let elements_slot = list_class
+        .and_then(|cid| ctx.resolve_field_index_by_class_id(cid, "elements"))
+        .or_else(|| ctx.resolve_field_index(LIST_N, "elements"));
+    let allow_nulls_slot = list_class
+        .and_then(|cid| ctx.resolve_field_index_by_class_id(cid, "allowNulls"))
+        .or_else(|| ctx.resolve_field_index(LIST_N, "allowNulls"));
+    let Some(elements_slot) = elements_slot else {
+        // No such class in this image: fall back to the mutable shape rather
+        // than to nothing, which is what this returned before 2026-09-12.
+        let data_slot = ctx
+            .resolve_field_index("java/util/ArrayList", "elementData")
+            .unwrap_or(0);
+        let size_slot = ctx
+            .resolve_field_index("java/util/ArrayList", "size")
+            .unwrap_or(1);
+        let n_fields = std::cmp::max(data_slot, size_slot) + 1;
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields)?;
+        let arr = ctx.read_native_pin(pin, arr);
+        ctx.unpin_native_roots(pin);
+        ctx.set_field(list, data_slot, Value::Object(Some(arr)));
+        ctx.set_field(list, size_slot, Value::Int(len as i32));
+        return Ok(list);
+    };
+    let n_fields = std::cmp::max(elements_slot, allow_nulls_slot.unwrap_or(0)) + 1;
+    let list = try_alloc_concurrent_synthetic(ctx, LIST_N, n_fields)?;
+    let arr = ctx.read_native_pin(pin, arr);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(list, elements_slot, Value::Object(Some(arr)));
+    // EXPLICITLY false rather than merely unwritten: an untouched slot reads
+    // back through the R-niche rule as `Int(0)`, which is the same `false` --
+    // but the rest of this file writes its flags and the one place that did not
+    // is the 2026-08-10 endian defect.
+    if let Some(slot) = allow_nulls_slot {
+        ctx.set_field(list, slot, Value::Int(0));
+    }
+    Ok(list)
+}
+
+/// Write the member layouts in the convention THIS carrier's class declares,
+/// and return the layout -- which the real arm can MOVE, because it allocates.
+///
+/// A real `AbstractGroupLayout.elements` is a `List<MemoryLayout>` and its own
+/// `toString`, `equals`, `hashCode` and `memberLayouts` all call `List` methods
+/// on it straight away, so a bare array there is not merely unread: it is a
+/// `NoSuchMethodError` out of the first real body to touch the group. Same
+/// shape as `AbstractLayout.name` holding a `String` where the JDK declares an
+/// `Optional`, one class up the hierarchy.
+pub(crate) fn p67_group_set_members(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    members: ObjectRef,
+    len: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let slots = p67_layout_slots(ctx, layout);
+    if ctx.object_num_fields(layout) <= slots.payload {
+        return Ok(layout);
+    }
+    if !slots.real {
+        ctx.set_field(layout, slots.payload, Value::Object(Some(members)));
+        return Ok(layout);
+    }
+    let pin = ctx.pin_native_root(layout);
+    let list = p67_new_member_list(ctx, members, len)?;
+    let layout = ctx.read_native_pin(pin, layout);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(layout, slots.payload, Value::Object(Some(list)));
+    Ok(layout)
+}
+
+/// Write `kind` and `minByteAlignment`, the two fields a real
+/// `AbstractGroupLayout` declares that no carrier here ever wrote.
+///
+/// `kind` is an `AbstractGroupLayout$Kind` and the real `toString` reads
+/// `kind.delimTag` to pick `[a|b]` over `[ab]`, while `equals` compares it --
+/// so a null there is a `NullPointerException` on the first real body, and a
+/// WRONG one is a union that prints like a struct. The constant is taken from
+/// the enum's own statics rather than fabricated, so there is exactly one
+/// `STRUCT` object in the VM and `==` on it answers what the JDK's own code
+/// expects.
+pub(crate) fn p67_group_set_kind(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    is_union: bool,
+    min_byte_alignment: i64,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(layout);
+    if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, "minByteAlignment") {
+        if ctx.object_num_fields(layout) > slot {
+            ctx.set_field(layout, slot, Value::Long(min_byte_alignment));
+        }
+    }
+    let Some(kind_slot) = ctx.resolve_field_index_by_class_id(class_id, "kind") else {
+        return Ok(layout);
+    };
+    if ctx.object_num_fields(layout) <= kind_slot {
+        return Ok(layout);
+    }
+    let pin = ctx.pin_native_root(layout);
+    let kind = (|| {
+        let cid = ctx
+            .ensure_class_initialized("jdk/internal/foreign/layout/AbstractGroupLayout$Kind")
+            .ok()?;
+        let name = if is_union { "UNION" } else { "STRUCT" };
+        let idx = ctx.static_field_index_by_name(cid, name)?;
+        match ctx.get_static_field(cid, idx) {
+            Value::Object(Some(obj)) => Some(obj),
+            _ => None,
+        }
+    })();
+    let layout = ctx.read_native_pin(pin, layout);
+    ctx.unpin_native_roots(pin);
+    if let Some(kind) = kind {
+        ctx.set_field(layout, kind_slot, Value::Object(Some(kind)));
+    }
+    Ok(layout)
 }
 
 /// Offset of a group member, computed with the SAME alignment rule
@@ -2140,7 +2364,7 @@ fn p67_group_member_offset(
     group: ObjectRef,
     mut select: impl FnMut(usize, Option<&str>) -> bool,
 ) -> Option<(i64, ObjectRef)> {
-    let members = p67_group_members(ctx, group)?;
+    let (members, member_count) = p67_group_members(ctx, group)?;
 
     // A UNION PUTS EVERY MEMBER AT OFFSET 0 (F16, 2026-08-13). This loop used
     // to accumulate for any group, which was invisible while `unionLayout`
@@ -2158,7 +2382,7 @@ fn p67_group_member_offset(
         .is_some_and(|n| n.contains("UnionLayout"));
 
     let mut offset = 0_i64;
-    for i in 0..ctx.array_length(members) {
+    for i in 0..member_count {
         let member = match ctx.get_array_element(members, i) {
             Value::Object(Some(m)) => m,
             _ => continue,
@@ -4166,13 +4390,22 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 max_align = max_align.max(member_align);
             }
             let members_pin = ctx.pin_native_root(members);
-            let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/StructLayoutImpl", 4)?;
+            let obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "jdk/internal/foreign/layout/StructLayoutImpl",
+                4,
+            )?;
             let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             let members = ctx.read_native_pin(members_pin, members);
+            let member_count = ctx.array_length(members);
             ctx.set_field(obj, slots.byte_size, Value::Long(size));
             ctx.set_field(obj, slots.byte_alignment, Value::Long(max_align));
-            ctx.set_field(obj, slots.payload, Value::Object(Some(members)));
             ctx.unpin_native_roots(members_pin);
+            // The three below each ALLOCATE and so can move `obj`; each hands
+            // back the current reference and none may be reordered above a
+            // plain `set_field` that would then use a stale one.
+            let obj = p67_group_set_members(ctx, obj, members, member_count)?;
+            let obj = p67_group_set_kind(ctx, obj, false, max_align)?;
             let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -4373,13 +4606,22 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // it. Minting one through `p67_layout_object` answers the right
             // byteSize and then loses every member.
             let members_pin = ctx.pin_native_root(members);
-            let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/UnionLayoutImpl", 4)?;
+            let obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "jdk/internal/foreign/layout/UnionLayoutImpl",
+                4,
+            )?;
             let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             let members = ctx.read_native_pin(members_pin, members);
+            let member_count = ctx.array_length(members);
             ctx.set_field(obj, slots.byte_size, Value::Long(size));
             ctx.set_field(obj, slots.byte_alignment, Value::Long(max_align));
-            ctx.set_field(obj, slots.payload, Value::Object(Some(members)));
             ctx.unpin_native_roots(members_pin);
+            // The three below each ALLOCATE and so can move `obj`; each hands
+            // back the current reference and none may be reordered above a
+            // plain `set_field` that would then use a stale one.
+            let obj = p67_group_set_members(ctx, obj, members, member_count)?;
+            let obj = p67_group_set_kind(ctx, obj, true, max_align)?;
             let obj = p67_layout_set_name(ctx, obj, Value::Object(None))?;
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -4741,30 +4983,20 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             "memberLayouts",
             "()Ljava/util/List;",
             |ctx, args| {
-                let members =
-                    match obj_arg(args, 0).ok().and_then(|this| {
-                        match ctx.get_field(this, p67_layout_slots(ctx, this).payload) {
-                            Value::Object(Some(arr)) => Some(arr),
-                            _ => None,
-                        }
-                    }) {
-                        Some(arr) => arr,
-                        None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
-                    };
-                let len = ctx.array_length(members);
-                let members_pin = ctx.pin_native_root(members);
-                let data_slot = ctx
-                    .resolve_field_index("java/util/ArrayList", "elementData")
-                    .unwrap_or(0);
-                let size_slot = ctx
-                    .resolve_field_index("java/util/ArrayList", "size")
-                    .unwrap_or(1);
-                let n_fields = std::cmp::max(data_slot, size_slot) + 1;
-                let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields)?;
-                let members = ctx.read_native_pin(members_pin, members);
-                ctx.set_field(list, data_slot, Value::Object(Some(members)));
-                ctx.set_field(list, size_slot, Value::Int(len as i32));
-                ctx.unpin_native_roots(members_pin);
+                // Through the shared reader, which knows both conventions: a
+                // real carrier's `elements` IS a `List` already and wrapping it
+                // in a second one answered a list of one list.
+                let (members, len) = match obj_arg(args, 0)
+                    .ok()
+                    .and_then(|this| p67_group_members(ctx, this))
+                {
+                    Some(pair) => pair,
+                    None => (
+                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+                        0,
+                    ),
+                };
+                let list = p67_new_member_list(ctx, members, len)?;
                 Ok(Some(Value::Object(Some(list))))
             },
         );
