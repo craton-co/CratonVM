@@ -2016,17 +2016,25 @@ use cratonvm_types::compat::CompatibilityMode;
 ///   synthetic-jdk       2728 -> 2761             13657 -> 13657   (branch)
 /// ```
 ///
-/// RE-MEASURED on the merge with lane 4 wave 2's +137, because a delta is only
-/// a property of the branch if it survives the tree moving under it:
+/// RE-MEASURED on every merge that moved these constants, because a delta is
+/// only a property of the branch if it survives the tree moving under it. Lane
+/// 4 wave 2 (+137), lane 6's net residuals and lane 1 wave 6 (+19) all landed
+/// while this wave was in its acceptance runs:
 ///
 /// ```text
-///   arm             stubs OFF -> ON           total
-///   no-management       2865 -> 2898             13622   (constants above)
-///   management          2892 -> 2925             13990
-///   synthetic-jdk       2865 -> 2898             13657
+///   control       no-mgmt   mgmt    syn-jdk      this wave gives
+///   e240573a8       2728    2755      2728       2761 / 2788 / 2761
+///   +L4 w2          2865    2892      2865       2898 / 2925 / 2898
+///   da7cc2da6       2884    2911      2884       2917 / 2944 / 2917
 /// ```
 ///
-/// +33 and total FLAT both times.
+/// **+33 every time, over controls 189 rows apart**, and the total flat beside
+/// each one. Three independent derivations, none of them arithmetic — the same
+/// standard lane 1 wave 6 states three lines above.
+///
+/// The totals below move with the controls (13622 -> 13630, 13990 -> 13998,
+/// 13657 -> 13665): that +8 is lane 1 wave 6's non-stub registrations, not this
+/// wave's, and the OFF arm is what says so.
 ///
 /// +33 in all three, total FLAT in all three — this gate's own first case,
 /// "existing fakes were relabelled (welcome; re-freeze with the list)". The
@@ -2110,7 +2118,7 @@ use cratonvm_types::compat::CompatibilityMode;
 ///
 /// +19 every time, over controls 254 rows apart. That is what makes the
 /// delta a property of this branch rather than of a tree.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2911;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2944;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2389,7 +2397,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2911;
 ///
 /// +19 every time, over controls 254 rows apart. That is what makes the
 /// delta a property of this branch rather than of a tree.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2884;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2917;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2590,7 +2598,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2884;
 ///
 /// +19 every time, over controls 254 rows apart. That is what makes the
 /// delta a property of this branch rather than of a tree.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2884;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2917;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2650,7 +2658,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2884;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13990;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13998;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2663,7 +2671,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13990;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13622;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13630;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -2689,7 +2697,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13622;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13657;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13665;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
