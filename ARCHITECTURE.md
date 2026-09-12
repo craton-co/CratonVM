@@ -99,7 +99,7 @@ find <the 22 member dirs> -name '*.rs' -type f \
   | xargs -0 cat | wc -l
 ```
 
-which reports roughly 2,205,000 lines (2,142,548 on 2026-09-09) across 971
+which reports roughly 2,205,000 lines (2,204,853 on 2026-09-12) across 971
 files. Re-measure before quoting it: this figure and the table below stood
 at 1,350,000 for long enough to be wrong by 49%, because nothing regenerates
 them. If you change this paragraph, change the table too — they are derived
