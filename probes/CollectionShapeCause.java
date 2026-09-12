@@ -96,6 +96,12 @@ public class CollectionShapeCause {
         filled("ConcurrentHashMap+4", n, ConcurrentHashMap::new, CollectionShapeCause::putFour);
         filled("CopyOnWriteArrayList+4", n, CopyOnWriteArrayList::new,
                 CollectionShapeCause::addFour);
+        // Its EMPTY row is two tables up; this is the half that says whether a
+        // backing-object change moved the cost or removed it. A
+        // `CopyOnWriteArraySet` retains one `CopyOnWriteArrayList` on HotSpot,
+        // and retained a `LinkedHashMap` on this VM until 2026-09-12.
+        filled("CopyOnWriteArraySet+4", n, CopyOnWriteArraySet::new,
+                CollectionShapeCause::addFour);
         filled("ConcurrentLinkedQueue+4", n, ConcurrentLinkedQueue::new,
                 CollectionShapeCause::addFour);
         System.out.println();
