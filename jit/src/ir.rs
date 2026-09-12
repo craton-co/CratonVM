@@ -1627,6 +1627,16 @@ struct SpliceFrame {
     /// nodes to the enclosing `invoke`. See [`IrInlineSite`] on the two
     /// meanings of `bytecode_pc`.
     exit_bci: usize,
+    /// `[start, end)` ranges, in combined-buffer pcs, in which the walk visits
+    /// a body with a rotated loop (see [`BlockWalk`]). Empty for a body walked
+    /// in pc order. A walked body's `return`s are exit edges, as for
+    /// [`Self::multi_return`], because reverse post-order need not visit the
+    /// trailing `return` last; the body closes when its ranges run out.
+    ranges: Vec<(usize, usize)>,
+    /// Index into [`Self::ranges`] of the next range to visit.
+    next_range: usize,
+    /// End of the range being walked. Unused when `ranges` is empty.
+    range_end: usize,
 }
 
 /// Hard cap on inline-scope chain length.
@@ -4750,6 +4760,10 @@ pub struct IrBuilder {
     /// [`Self::begin_splice`]. Empty unless `CRATONVM_JIT_IR_SPLICE_MULTI_RETURN=1`
     /// — and without it the scanner has admitted no such body either.
     splice_multi_return: HashSet<usize>,
+    /// `IrInlineSite::base` → the block-walk ranges, rebased to combined-buffer
+    /// pcs, of every admitted body with a rotated loop. Filled by the pre-scan
+    /// in [`Self::build`] and read by [`Self::begin_splice`].
+    splice_block_walks: HashMap<usize, Vec<(usize, usize)>>,
     /// Diagnostic-only: how many splices this build performed, for the
     /// `[ir] spliced` line. Never read by lowering.
     splices_done: usize,
@@ -5100,6 +5114,7 @@ impl IrBuilder {
             inline_sites: HashMap::new(),
             splice: Vec::new(),
             splice_multi_return: HashSet::new(),
+            splice_block_walks: HashMap::new(),
             splices_done: 0,
             splice_local: HashSet::new(),
             splice_tainted: HashSet::new(),
@@ -5927,6 +5942,9 @@ impl IrBuilder {
         let saved_locals = std::mem::replace(&mut self.locals, callee_locals);
         let saved_stack = std::mem::take(&mut self.stack);
         let multi_return = self.splice_multi_return.contains(&base);
+        let ranges = self.splice_block_walks.get(&base).cloned().unwrap_or_default();
+        // `BlockWalk::reverse_postorder` puts the body's pc 0 (`base`) first.
+        let range_end = ranges.first().map_or(end, |&(_, e)| e);
         self.splice.push(SpliceFrame {
             return_pc: pc + instr_len,
             end,
@@ -5934,9 +5952,12 @@ impl IrBuilder {
             saved_stack,
             returns_value,
             return_narrow,
-            multi_return,
+            multi_return: multi_return || !ranges.is_empty(),
             exits: Vec::new(),
             exit_bci: pc,
+            ranges,
+            next_range: 1,
+            range_end,
         });
         self.splices_done += 1;
         // A callee body in the graph is the transform that makes every other
@@ -7093,11 +7114,31 @@ impl IrBuilder {
                         self.ensure_merge(base + target);
                     }
                 }
-                for &header in body_verified.loop_headers() {
-                    let header = header as usize;
-                    if body_reachable.contains(&header) {
-                        self.loop_headers.insert(base + header);
-                    }
+                let body_headers: HashSet<usize> = body_verified
+                    .loop_headers()
+                    .iter()
+                    .map(|&h| h as usize)
+                    .filter(|h| body_reachable.contains(h))
+                    .collect();
+                // A body with a rotated loop gets its own block walk, for the
+                // same reason the caller does: walked in pc order, its loop
+                // body has no forward entry when the walk reaches it, the
+                // safety net fires, and the CALLER's whole build is refused.
+                // Its loop headers are then the walk's (the test blocks).
+                if has_rotated_loop_header(&body_verified, &body_reachable, &body_headers, body_len)
+                {
+                    let Some(walk) =
+                        BlockWalk::reverse_postorder(&body_verified, &body_reachable, body_len)
+                    else {
+                        return ir_build_bail(line!(), base);
+                    };
+                    self.loop_headers.extend(walk.headers.iter().map(|&h| base + h));
+                    self.splice_block_walks.insert(
+                        base,
+                        walk.ranges.iter().map(|&(s, e)| (base + s, base + e)).collect(),
+                    );
+                } else {
+                    self.loop_headers.extend(body_headers.iter().map(|&h| base + h));
                 }
 
                 // A body with several `return`s: the walk must NOT leave the
@@ -7213,6 +7254,51 @@ impl IrBuilder {
             // own end never executed a return, which means the resolver admitted
             // a shape the walk does not agree with — refuse rather than walk
             // into whatever `lib.rs` appended next.
+            // A spliced body with a rotated loop is walked range by range, the
+            // same as the caller's block walk above. At a range's end a live
+            // fall-through is a merge predecessor. When the ranges run out,
+            // every `return` has recorded its exit edge, so the body closes the
+            // way a multi-return body does.
+            if let Some(frame) = self.splice.last() {
+                if !frame.ranges.is_empty() && pc >= frame.range_end {
+                    let (range_end, end) = (frame.range_end, frame.end);
+                    if pc != range_end {
+                        return ir_build_bail(line!(), pc);
+                    }
+                    if self.ctrl_opt().is_some() {
+                        // Live control at the body's end never executed a
+                        // `return`; anywhere else it must enter a merge.
+                        if pc >= end || !self.merges.contains_key(&pc) {
+                            return ir_build_bail(line!(), pc);
+                        }
+                        self.add_merge_predecessor(pc);
+                    }
+                    let Some(frame) = self.splice.last_mut() else {
+                        return ir_build_bail(line!(), pc);
+                    };
+                    if let Some((start, next_end)) = frame.ranges.get(frame.next_range).copied() {
+                        frame.next_range += 1;
+                        frame.range_end = next_end;
+                        // As at a caller range jump: the next range starts at a
+                        // merge whose activation restores the callee's frame.
+                        self.ctrl = NO_NODE;
+                        self.locals.fill(NO_NODE);
+                        self.stack.clear();
+                        pc = start;
+                        continue;
+                    }
+                    if frame.exits.is_empty() {
+                        return ir_build_bail(line!(), pc);
+                    }
+                    match self.finish_multi_return_splice() {
+                        Some(next) => {
+                            pc = next;
+                            continue;
+                        }
+                        None => return ir_build_bail(line!(), pc),
+                    }
+                }
+            }
             if let Some(frame) = self.splice.last() {
                 if pc >= frame.end {
                     // A multi-return body ENDS here rather than falling off:
@@ -12262,6 +12348,54 @@ mod tests {
                 && n.input_opt(0) == Some(merge)
                 && n.inputs.len() == 3),
             "pc {header}: a loop-carried phi with its back-edge input patched in"
+        );
+    }
+
+    /// `static int f(int n) { return sumTo(n) + 1; }`, with `sumTo` the ECJ
+    /// loop of [`ROTATED_FOR`] spliced in at the `invokestatic` (pc 1).
+    /// Returns `(combined, caller_len, sites, base)`.
+    fn rotated_callee_splice_fixture() -> (Vec<u8>, usize, HashMap<usize, IrInlineSite>, usize) {
+        let caller = [
+            0x1a, // 0: iload_0
+            0xb8, 0x00, 0x01, // 1: invokestatic #1  sumTo(I)I
+            0x04, 0x60, // 4: iconst_1; 5: iadd
+            0xac, // 6: ireturn
+        ];
+        let mut combined = caller.to_vec();
+        let base = combined.len();
+        combined.extend_from_slice(&ROTATED_FOR[..21]);
+        combined.extend_from_slice(&[0, 0]);
+        let mut sites = HashMap::new();
+        sites.insert(
+            1,
+            IrInlineSite {
+                base,
+                code_len: 21,
+                num_args: 1,
+                max_locals: 3,
+                arg_local_slots: vec![0],
+                returns_value: true,
+                receiver_is_arg0: false,
+                method_key: "P.sumTo:(I)I".to_string(),
+                class_id: 0,
+            },
+        );
+        (combined, caller.len(), sites, base)
+    }
+
+    #[test]
+    fn a_spliced_callee_with_a_rotated_loop_builds_instead_of_refusing_the_caller() {
+        let (combined, caller_len, sites, base) = rotated_callee_splice_fixture();
+        let mut builder = IrBuilder::new(1, 1);
+        builder.set_inline_sites(sites);
+        let graph = builder
+            .build(&combined, caller_len)
+            .expect("a callee body with a rotated loop must splice, not refuse the caller");
+        // The callee's test block (its pc 14) heads the loop, in combined pcs.
+        assert_loop_header(&graph, base + 14);
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::Call { .. })),
+            "the spliced call must be gone, not emitted alongside the body",
         );
     }
 
