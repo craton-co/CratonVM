@@ -10764,8 +10764,30 @@ pub static NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
 pub static NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Sites bound to the two `ByteBuffer` single-byte helpers.
+/// Sites bound to the two `ByteBuffer` single-byte helpers at the SINGLE-PASS
+/// door.
 pub static NIO_BYTE_ELEMENT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The same, at the OSR door — `jit_bridge.rs`'s own callee-binding loop,
+/// which is neither of the other two and is the one that compiles a hot LOOP
+/// body. Its own comment calls it "the door that mattered", and the heap
+/// control probe proved the point in the other direction: with the gate on the
+/// other two doors only, this one still bound the site and the helper declined
+/// 1 595 000 of 1 595 000 calls.
+pub static NIO_BYTE_ELEMENT_SITES_OSR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn nio_byte_element_sites_osr() -> u64 {
+    NIO_BYTE_ELEMENT_SITES_OSR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The same, at the OPTIMIZING (IR) door — counted apart from the single-pass
+/// tally for the reason `census_direct_helper_sites` states about its own pair:
+/// a bind at one door says nothing about the other, and this family's whole
+/// history is a single-pass bind reading as landed while the tier the hot loop
+/// actually runs in had no route to it at all.
+pub static NIO_BYTE_ELEMENT_SITES_IR: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Calls the thin helpers actually SERVED, and calls they DECLINED to the
@@ -10802,9 +10824,220 @@ pub fn nio_byte_element_sites() -> u64 {
     NIO_BYTE_ELEMENT_SITES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The same count for the optimizing door. Reported beside the single-pass one
+/// so `single-pass/IR` reads as a pair.
+pub fn nio_byte_element_sites_ir() -> u64 {
+    NIO_BYTE_ELEMENT_SITES_IR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_nio_bytebuffer_byte_direct_fns(put: usize, get: usize) {
     NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN.store(put, std::sync::atomic::Ordering::Relaxed);
     NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN.store(get, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `java/nio/Buffer.session()Ljdk/internal/foreign/MemorySessionImpl;` thin
+/// direct-call helper. `0` = not wired.
+///
+/// # The census that named it
+///
+/// `--dump-native-registry` over `probes/OnlyHeapGetInt.java` — 200 000
+/// `HeapByteBuffer.getInt(int)` calls and nothing else — divides exactly:
+///
+/// ```text
+/// 200000  java/nio/HeapByteBuffer.session()Ljdk/internal/foreign/MemorySessionImpl;  [bridge]
+/// 200000  jdk/internal/misc/ScopedMemoryAccess.getIntUnaligned(...)I                 [synthetic-stub]
+/// ```
+///
+/// One `session()` crossing per multi-byte accessor, and its registered body
+/// is `Ok(Some(Value::Object(None)))` — a constant null. That is the same
+/// shape as `Reference.reachabilityFence`, whose own doc says of an equally
+/// empty body that *"paying ~160 ns of generic native funnel for that is pure
+/// loss"*, and which was given a thin helper for exactly this reason.
+pub static BUFFER_SESSION_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_buffer_session_direct_fn(addr: usize) {
+    BUFFER_SESSION_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `fn(class_id: u32) -> bool` — "has the `session()` shim actually run for a
+/// receiver of this class?"
+///
+/// Published by `build_helpers` from `cratonvm_native_builtins::
+/// buffer_session::class_is_served`, because this crate depends on neither
+/// `native-builtins` nor `native-io` and must not.
+pub static BUFFER_SESSION_SERVED_CLASS_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_buffer_session_served_class_fn(addr: usize) {
+    BUFFER_SESSION_SERVED_CLASS_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Would the `session()` shim answer for a receiver of `class_id`?
+pub fn buffer_session_class_is_served(class_id: u32) -> bool {
+    let raw = BUFFER_SESSION_SERVED_CLASS_FN.load(std::sync::atomic::Ordering::Relaxed);
+    if raw == 0 || class_id == 0 {
+        return false;
+    }
+    // SAFETY: the cell holds a pointer published by `build_helpers` from a
+    // `fn(u32) -> bool` item with process lifetime, and is written only there.
+    let f: fn(u32) -> bool = unsafe { std::mem::transmute(raw) };
+    f(class_id)
+}
+
+/// `CRATONVM_JIT_BUFFER_SESSION_DIRECT=0` — send every `Buffer.session()` site
+/// back through the generic native funnel. Default ON.
+pub fn buffer_session_direct_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_BUFFER_SESSION_DIRECT")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Sites bound to the `session()` helper, per door, and the calls it served
+/// against the calls it declined. Read together: a bind count without a served
+/// count cannot tell "installed" from "installed and answering nothing", which
+/// is the failure this whole family has hit twice.
+pub static BUFFER_SESSION_SITES_SP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BUFFER_SESSION_SITES_IR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BUFFER_SESSION_SITES_OSR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BUFFER_SESSION_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BUFFER_SESSION_DECLINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(sp, ir, osr, served, declined)` for the `session()` helper.
+pub fn buffer_session_census() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        BUFFER_SESSION_SITES_SP.load(Relaxed),
+        BUFFER_SESSION_SITES_IR.load(Relaxed),
+        BUFFER_SESSION_SITES_OSR.load(Relaxed),
+        BUFFER_SESSION_SERVED.load(Relaxed),
+        BUFFER_SESSION_DECLINED.load(Relaxed),
+    )
+}
+
+/// Is this call site `java.nio.Buffer.session()`?
+///
+/// Matched on `(name, descriptor)` rather than on the receiver class, and that
+/// is deliberate. `session()` is `final` on `java/nio/Buffer`, so there is
+/// exactly one implementation and every buffer class names it at a call site
+/// through its OWN class (`HeapByteBuffer.getInt` emits
+/// `invokevirtual HeapByteBuffer.session`). A class-name list here would have
+/// to repeat the registration's eleven names and would inherit their known
+/// omissions; the receiver check that actually matters is made at run time by
+/// the helper, against the classes the shim really served.
+pub fn is_buffer_session_site(name: &str, descriptor: &str) -> bool {
+    name == "session" && descriptor == "()Ljdk/internal/foreign/MemorySessionImpl;"
+}
+
+/// `fn(class_id: u32, write: bool) -> bool` — "has the `ByteBuffer` element
+/// funnel actually served a receiver of this class with the modelled layout?"
+///
+/// This crate cannot call `cratonvm_native_io::direct_buffer::elem_fastpath::
+/// class_is_served` directly (it does not depend on `native-io`, and must not:
+/// the JIT sits below the native layer), so the VM publishes the predicate as a
+/// pointer in `build_helpers`, exactly as it publishes the helper entries above.
+/// `0` = not wired, which every caller must read as "cannot prove served".
+pub static NIO_BYTE_ELEMENT_SERVED_CLASS_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_nio_byte_element_served_class_fn(addr: usize) {
+    NIO_BYTE_ELEMENT_SERVED_CLASS_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Would the thin `ByteBuffer` element helper SERVE a receiver of `class_id`?
+///
+/// Answers `false` whenever it cannot prove `true` — an unwired predicate, a
+/// class id of 0, a class the funnel has not served. Every caller uses it to
+/// decide whether to bind a fast path, so the conservative answer costs a
+/// missed bind and never a wrong one.
+pub fn nio_byte_element_class_is_served(class_id: u32, write: bool) -> bool {
+    let raw = NIO_BYTE_ELEMENT_SERVED_CLASS_FN.load(std::sync::atomic::Ordering::Relaxed);
+    if raw == 0 || class_id == 0 {
+        return false;
+    }
+    // SAFETY: the cell holds a pointer published by `build_helpers` from a
+    // `fn(u32, bool) -> bool` item with process lifetime, and is only ever
+    // written there.
+    let f: fn(u32, bool) -> bool = unsafe { std::mem::transmute(raw) };
+    f(class_id, write)
+}
+
+/// Sites where a `ByteBuffer` element bind was refused because the site's own
+/// profile says its receiver is one the helper cannot serve.
+pub static NIO_BYTE_ELEMENT_SITES_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn nio_byte_element_sites_refused() -> u64 {
+    NIO_BYTE_ELEMENT_SITES_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Should this `ByteBuffer.get(int)` / `put(int,byte)` site be bound to the
+/// thin element helper at all?
+///
+/// # The question this exists to ask
+///
+/// The helper reads a DIRECT buffer's off-heap `address`; for a
+/// `HeapByteBuffer` receiver it declines, and a declined call is strictly
+/// worse than no bind — it pays the helper crossing, the decline, and then the
+/// generic funnel, where an unbound site would have taken the inline cache
+/// straight to the compiled `HeapByteBuffer.get`. Measured on
+/// `probes/HeapBufferShapeControlProbe.java`, a heap-only site: 190 ns bound
+/// against 20 ns unbound, with the helper census reading
+/// `served=0 declined=1195000` — a bind that was pure loss on every call.
+///
+/// # Why it refuses only on POSITIVE evidence
+///
+/// `None` — no profile, or no receiver holding 80% of the site — binds, which
+/// is the behaviour every door had before this gate existed. The gate is here
+/// to remove a bind that is provably a loss, not to require proof before
+/// making one: `class_is_served` is a table the FUNNEL fills in, so it is
+/// empty until the interpreter has run the site, and a "prove it first" rule
+/// would refuse every bind on a method compiled early and never revisit it.
+///
+/// Both inputs are observed rather than assumed. `dominant_receiver` is the
+/// same profile the IR planner seeds its MIC from, and `class_is_served` is
+/// the same table the helper's own prologue consults before it agrees to
+/// answer — so planner and helper cannot disagree about who gets served.
+pub fn nio_byte_element_bind_refused(
+    profile: Option<&profile::MethodProfile>,
+    pc: usize,
+    write: bool,
+    door: &str,
+) -> bool {
+    let dominant = profile
+        .and_then(|prof| prof.receivers.get(&pc))
+        .and_then(|counts| profile::dominant_receiver(counts, 80));
+    let served = dominant.is_some_and(|d| nio_byte_element_class_is_served(d, write));
+    // `CRATONVM_DBG_JITC=1` — the three inputs of this decision, per door.
+    // Added because the counters alone cannot tell "no profile yet" from
+    // "profiled and served": both read as a bind, and only one of them is
+    // right. The heap control probe bound at the single-pass door and refused
+    // at the IR door in the same process, which is only explicable by reading
+    // these.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] nio-byte-bind door={door} pc={pc} write={write} \
+             profile={} dominant={dominant:?} served={served}",
+            profile.is_some()
+        );
+    }
+    if dominant.is_none() || served {
+        return false;
+    }
+    NIO_BYTE_ELEMENT_SITES_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// `MessageDigest.update(byte)` thin direct-call bind.
@@ -24185,29 +24418,36 @@ fn try_compile_inner(
                             || (cn == "java/lang/foreign/MemorySegment"
                                 && matches!(mn.as_str(), "getAtIndex" | "setAtIndex")
                                 && ffm_kind_for_descriptor(&desc).is_some())
-                            // The single-BYTE `ByteBuffer` element accessors
-                            // and `MessageDigest.update(byte)`. Bound by their
-                            // own arm in the single-pass scan, for the same
-                            // reason the FFM row above is: they carry a
-                            // dispatch info for the decline edge, so
-                            // `try_resolve_intrinsic` does not name them and
-                            // this predicate has to.
+                            // `MessageDigest.update(byte)`. Bound by its own arm
+                            // in the single-pass scan, for the same reason the
+                            // FFM row above is: it carries a dispatch info for
+                            // the decline edge, so `try_resolve_intrinsic` does
+                            // not name it and this predicate has to.
                             //
-                            // Found the same way, by the same instrument. With
-                            // the bind wired at two doors and the splice
-                            // refusing to swallow the site, `BufProbe` still
-                            // reported `ByteBuffer.byteElement=2` bound sites
-                            // against `served=1636` calls and 5 239 468 funnel
-                            // invocations in the native census: 1 636 is what a
-                            // single-pass compile serves BEFORE
-                            // `PooledDirectByteBuf._setByte` tiers up, and the
-                            // IR tier it tiers up to lowers the site to a plain
-                            // dispatch. A count that small next to a bound-site
-                            // count is the signature of this exact routing.
-                            || (nio_byte_direct_helpers_enabled()
-                                && cn == "java/nio/ByteBuffer"
-                                && ((mn == "put" && desc == "(IB)Ljava/nio/ByteBuffer;")
-                                    || (mn == "get" && desc == "(I)B")))
+                            // THE SINGLE-BYTE `ByteBuffer` ACCESSORS USED TO BE
+                            // ON THIS ROW TOO, AND ARE NOT ANY MORE. They were
+                            // added here because the IR tier had no route to
+                            // their helper, so a site that tiered up lost the
+                            // fast path — the reasoning is preserved in the
+                            // bind's own comment. It now HAS that route (see
+                            // `NIO_BYTE_ELEMENT_SITES_IR`, the only thin-helper
+                            // bind in the IR planner outside the
+                            // `is_static || is_special` gate), so keeping the
+                            // row would refuse the method the optimizing tier
+                            // to protect a fast path that no longer needs
+                            // protecting.
+                            //
+                            // What the row cost, measured on
+                            // `probes/NioBufferCostProbe.java`: a heap
+                            // `ByteBuffer.get(int)` ran at 574 ns because the
+                            // helper serves DIRECT receivers only, so every
+                            // heap call paid the helper crossing, then its
+                            // decline, then the generic funnel — while the
+                            // enclosing method was held out of the optimizing
+                            // tier to buy that. This is the widest term in the
+                            // NIO gap: the refusal is method-level, so ONE
+                            // `buf.get(i)` anywhere in an HTTP codec method
+                            // costs that whole method C2.
                             || (md_update_direct_helper_enabled()
                                 && cn == "java/security/MessageDigest"
                                 && mn == "update"
@@ -24682,6 +24922,126 @@ fn try_compile_inner(
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
+                            }
+                        }
+                        // `ByteBuffer.get(int)` / `put(int,byte)` at the
+                        // OPTIMIZING door — the only bind in this function that
+                        // is deliberately OUTSIDE the `is_static || is_special`
+                        // gate above.
+                        //
+                        // Every other thin helper here is statically bound, so
+                        // the gate is free. `java/nio/ByteBuffer` is abstract
+                        // with several concrete subclasses, so its sites are
+                        // genuinely virtual and can never be pinned by
+                        // `invokevirtual_site_final_owner` the way the `final`
+                        // wrapper classes are. The gate is therefore not a
+                        // soundness condition for THIS family — it is a
+                        // statement about which sites the other helpers can
+                        // reach — and the two things that would make a virtual
+                        // bind unsound are both already handled:
+                        //
+                        //  * the callee is not known from the site. It does not
+                        //    have to be: the helper's own prologue
+                        //    (`dbb_direct_elem_addr`) probes the receiver and
+                        //    DECLINES to `jit_invoke_dispatch` for anything it
+                        //    is not certain of, which is exactly the contract
+                        //    the single-pass door already relies on (it binds
+                        //    the same helper with `guard_class_id: 0`).
+                        //  * the receiver must reach the helper in the right
+                        //    register. `lower_data_node`'s direct-call arm
+                        //    already computes `has_receiver` from
+                        //    `invoke_kind` and admits `0 | 1 | 2`, so
+                        //    `emit_direct_cross_call` marshals a virtual site's
+                        //    receiver correctly with no change here.
+                        //
+                        // WHY IT HAD TO BE ADDED. Without it this family was in
+                        // the `is_intrinsic_site` refusal list a few hundred
+                        // lines up, which cost the WHOLE enclosing method the
+                        // optimizing tier for the sake of a single-pass-only
+                        // bind. Measured on `probes/NioBufferCostProbe.java`,
+                        // heap `ByteBuffer.get(int)`: 574 ns with the refusal,
+                        // 53 ns with the bind disabled entirely (method reaches
+                        // the IR tier, site becomes an ordinary MIC dispatch) —
+                        // but disabling the bind cost the DIRECT receiver
+                        // 118 ns -> 393 ns, because a direct buffer's own
+                        // `get` bottoms out in a registered native. Binding
+                        // here keeps both: the method is optimized AND the
+                        // direct fast path survives.
+                        //
+                        // AND ONLY WHERE IT CAN WIN. The helper serves DIRECT
+                        // receivers; for a `HeapByteBuffer` it declines, and
+                        // the site then pays the helper crossing, the decline,
+                        // and the generic funnel — 574 ns against the 53 ns the
+                        // ordinary MIC path costs, because the MIC reaches the
+                        // COMPILED `HeapByteBuffer.get`, which is four
+                        // bytecodes over a `byte[]`. So the bind is gated on the
+                        // site's own profiled receiver being a class the funnel
+                        // has actually served with the modelled layout. A site
+                        // with no profile, no dominant receiver, or a heap
+                        // receiver refuses the bind and keeps the MIC — which is
+                        // the better path for it, not a fallback.
+                        //
+                        // Both facts are observed rather than assumed:
+                        // `dominant_receiver` is the same profile the MIC seeds
+                        // itself from a few lines below, and `class_is_served`
+                        // is the same table the helper's own prologue consults
+                        // before it agrees to answer.
+                        // `Buffer.session()` at this door too, and outside the
+                        // `is_static || is_special` gate for the same reason
+                        // the `byteElement` bind below is: the site is a
+                        // genuine `invokevirtual`, the lowerer already
+                        // marshals a receiver for `invoke_kind` `0 | 1 | 2`,
+                        // and the helper screens the receiver itself.
+                        if direct_target.is_none()
+                            && ir_direct
+                            && buffer_session_direct_enabled()
+                            && (is_virtual || is_special)
+                            && is_buffer_session_site(&mn, &desc)
+                        {
+                            let entry =
+                                BUFFER_SESSION_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                            if entry != 0 {
+                                direct_target = Some((entry, true));
+                                direct_target_is_thin_helper = true;
+                                BUFFER_SESSION_SITES_IR
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        if direct_target.is_none()
+                            && ir_direct
+                            && nio_byte_direct_helpers_enabled()
+                            && is_virtual
+                            && cn == "java/nio/ByteBuffer"
+                            && ((mn == "put" && desc == "(IB)Ljava/nio/ByteBuffer;")
+                                || (mn == "get" && desc == "(I)B"))
+                            && !nio_byte_element_bind_refused(profile, pc, mn == "put", "ir")
+                        {
+                            let is_put = mn == "put";
+                            // `direct_native_helper_for_impl`, not
+                            // `direct_native_helper`: the registered row whose
+                            // `NativeKind` decides the JDK-only policy question
+                            // lives on the IMPLEMENTING class, not on the
+                            // abstract `java/nio/ByteBuffer` the site names.
+                            // Same argument, and the same call, as the
+                            // single-pass door.
+                            let entry = direct_native_helper_for_impl(
+                                if is_put {
+                                    &NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN
+                                } else {
+                                    &NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN
+                                },
+                                jdk_only,
+                                intrinsic_resolver,
+                                cn.as_str(),
+                                "java/nio/DirectByteBuffer",
+                                &mn,
+                                &desc,
+                            );
+                            if entry != 0 {
+                                direct_target = Some((entry, true));
+                                direct_target_is_thin_helper = true;
+                                NIO_BYTE_ELEMENT_SITES_IR
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                         // A GPU kernel keeps its dispatch helper.
@@ -27800,12 +28160,54 @@ fn try_compile_inner(
                 // path serves only a class the FUNNEL has already served
                 // with the modelled layout, which is a fact this compile
                 // cannot know.
+                //
+                // The receiver test lives in the helper, but the QUESTION OF
+                // WHETHER TO BIND AT ALL is asked here, from this site's own
+                // profile — see `nio_byte_element_bind_refused`. A site whose
+                // receiver the helper cannot serve is better off unbound: the
+                // inline cache takes it straight to the compiled
+                // `HeapByteBuffer.get`, where a bind buys a crossing, a decline
+                // and the funnel. This door needs the gate more than the
+                // optimizing one does, not less: `osr_entered_optimizing=0` on
+                // the heap probe says the hot loop runs in a SINGLE-PASS OSR
+                // body, so a gate only at the other door leaves the measured
+                // 190-vs-20 ns case exactly as it was.
+                // `Buffer.session()` — the other half of the crossing census
+                // that named the `byteElement` pair. See
+                // `BUFFER_SESSION_DIRECT_FN`: one crossing per multi-byte heap
+                // accessor, for a constant null. Matched on `(name,
+                // descriptor)` because the method is `final` on
+                // `java/nio/Buffer` and every site names it through the
+                // caller's own class; the receiver screen that matters is the
+                // helper's, at run time.
+                if direct_jit_callee_calls_enabled
+                    && buffer_session_direct_enabled()
+                    && invoke_kind == 0
+                    && is_buffer_session_site(&method_name, &descriptor)
+                {
+                    let entry = BUFFER_SESSION_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    if entry != 0 {
+                        BUFFER_SESSION_SITES_SP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                return_type: b'L',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
                 if direct_jit_callee_calls_enabled
                     && nio_byte_direct_helpers_enabled()
                     && invoke_kind == 0
                     && class_name == "java/nio/ByteBuffer"
                     && ((method_name == "put" && descriptor == "(IB)Ljava/nio/ByteBuffer;")
                         || (method_name == "get" && descriptor == "(I)B"))
+                    && !nio_byte_element_bind_refused(profile, pc, method_name == "put", "single-pass")
                 {
                     let is_put = method_name == "put";
                     let entry = direct_native_helper_for_impl(

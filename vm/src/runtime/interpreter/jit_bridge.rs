@@ -1718,11 +1718,37 @@ pub(super) fn compile_osr_artifact(
                     // door — and it is not a hole: each helper asks
                     // `jit_direct_helper_refused` on its own fast path and
                     // declines to the generic dispatcher, which is policy-checked.
+                    //
+                    // GATED, like the other two doors, and this is the door
+                    // where the gate does the work — for the same reason the
+                    // paragraph above gives about the bind itself. The helper
+                    // serves DIRECT receivers; on a `HeapByteBuffer` it
+                    // declines, and a declined call is worse than no bind at
+                    // all, because an unbound site takes the inline cache
+                    // straight to the compiled `HeapByteBuffer.get` (a bounds
+                    // check and an array load). Measured on the two
+                    // monomorphic control probes, one binary, bind on/off:
+                    // heap 237 ns bound against 18-22 unbound, direct 52 ns
+                    // bound against 132-138 unbound. Neither blanket answer is
+                    // right, so the question is asked per site.
+                    //
+                    // `osr_receiver_profile` is the same profile this door
+                    // already screens its guarded `String` intrinsics against,
+                    // two hundred lines up — and the reason that fetch exists
+                    // is the reason this gate does: a door with no profile
+                    // emits a decision the interpreter's own observations
+                    // contradict.
                     if invoke_kind == 0
                         && cratonvm_jit::nio_byte_direct_helpers_enabled()
                         && target_class == "java/nio/ByteBuffer"
                         && ((mn == "put" && desc == "(IB)Ljava/nio/ByteBuffer;")
                             || (mn == "get" && desc == "(I)B"))
+                        && !cratonvm_jit::nio_byte_element_bind_refused(
+                            osr_receiver_profile.as_ref(),
+                            pc,
+                            mn == "put",
+                            "osr",
+                        )
                     {
                         let is_put = mn == "put";
                         let entry = if is_put {
@@ -1730,7 +1756,7 @@ pub(super) fn compile_osr_artifact(
                         } else {
                             crate::jit::helpers::jit_dbb_get_byte_direct as *const () as usize
                         };
-                        cratonvm_jit::NIO_BYTE_ELEMENT_SITES
+                        cratonvm_jit::NIO_BYTE_ELEMENT_SITES_OSR
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         direct_calls2.push((
                             pc,
@@ -1739,6 +1765,42 @@ pub(super) fn compile_osr_artifact(
                                 needs_context: true,
                                 num_params: if is_put { 2 } else { 1 },
                                 return_type: if is_put { b'L' } else { b'I' },
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    // `Buffer.session()` — a constant null behind a ~160 ns
+                    // funnel, one crossing per multi-byte heap accessor. Bound
+                    // at this door for the reason the block above is: a hot
+                    // loop body is compiled HERE, and this is where a
+                    // `ByteBuffer.getInt` loop's `session()` site lives.
+                    //
+                    // No receiver screen at compile time, and none is
+                    // possible: `session()` is `final` on `java/nio/Buffer`, so
+                    // a site names it through whatever buffer class the caller
+                    // is, and whether the null-returning SHIM (rather than the
+                    // real `getfield segment` bytecode) owns that receiver is a
+                    // per-receiver runtime fact. The helper makes that check
+                    // itself, against the classes the shim has actually served,
+                    // and declines to the generic dispatcher otherwise.
+                    if invoke_kind == 0
+                        && cratonvm_jit::buffer_session_direct_enabled()
+                        && cratonvm_jit::is_buffer_session_site(mn, desc)
+                    {
+                        cratonvm_jit::BUFFER_SESSION_SITES_OSR
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry: crate::jit::helpers::jit_buffer_session_direct as *const ()
+                                    as usize,
+                                needs_context: true,
+                                num_params: 0,
+                                // A `MemorySessionImpl` reference: the
+                                // return-value ladder must oop-mark it, and the
+                                // decline edge can return a real one.
+                                return_type: b'L',
                                 guard_class_id: 0,
                             },
                         ));

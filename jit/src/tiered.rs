@@ -1596,12 +1596,24 @@ pub fn dump_method_stats_to_stderr() {
     let (long_value_of_sites, long_long_value_sites) = crate::long_box_direct_helper_sites();
     let (vh_read_sp, vh_read_osr) = crate::varhandle_read_direct_helper_sites();
     let nio_byte_sites = crate::nio_byte_element_sites();
+    let nio_byte_sites_ir = crate::nio_byte_element_sites_ir();
+    let nio_byte_sites_osr = crate::nio_byte_element_sites_osr();
+    let nio_byte_refused = crate::nio_byte_element_sites_refused();
+    let (bs_sp, bs_ir, bs_osr, bs_served, bs_declined) = crate::buffer_session_census();
     let md_update_sites = crate::md_update_byte_sites();
     eprintln!(
         "[cratonvm] JIT thin direct-helper binds: Preconditions.checkIndex={check_index_sites} \
          Reference.reachabilityFence={fence_sites} Long.valueOf={long_value_of_sites} \
          Long.longValue={long_long_value_sites} VarHandle.read={vh_read_sp}/{vh_read_osr} \
-         ByteBuffer.byteElement={nio_byte_sites} MessageDigest.update={md_update_sites}",
+         ByteBuffer.byteElement=sp:{nio_byte_sites}/ir:{nio_byte_sites_ir}/osr:{nio_byte_sites_osr}          (profile-refused={nio_byte_refused}) MessageDigest.update={md_update_sites}",
+    );
+    // `Buffer.session()`: bound sites per door, and the calls the fast path
+    // actually answered against the ones it sent back to the funnel. Printed
+    // together because a bind count alone cannot distinguish "installed" from
+    // "installed and declining everything" -- the exact failure the
+    // `ByteBuffer.byteElement` line above was added for after it happened.
+    eprintln!(
+        "[cratonvm] JIT Buffer.session direct: sites sp:{bs_sp}/ir:{bs_ir}/osr:{bs_osr}          served={bs_served} declined={bs_declined}",
     );
     // Non-virtual `invokevirtual` reclassification, by RULE. Printed together
     // because they are the same transformation with two different soundness
