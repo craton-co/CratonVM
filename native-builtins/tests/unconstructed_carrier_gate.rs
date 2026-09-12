@@ -61,7 +61,7 @@
 //! narrowing is recorded in
 //! `docs/internal/retired/lane-6-carrier-hazard-census-20260912.md`, which is
 //! also where the confirmed instances are listed. This file is the tripwire for
-//! a FIFTY-FOURTH, not a verdict on the fifty-three.
+//! a SIXTIETH, not a verdict on the fifty-nine.
 //!
 //! **A new row is not automatically a bug.** It is a request to run the
 //! narrowing in that record before landing.
@@ -94,7 +94,7 @@ const CRATES: &[&str] = &[
 /// The retirement tables, relative to the workspace root.
 const RETIREMENT_TABLE: &str = "native-api/src/retired_shadow.rs";
 
-/// Frozen 2026-09-12. Sorted.
+/// Frozen 2026-09-12 (59). Sorted.
 ///
 /// `java/net/HttpURLConnection` is NOT here because it is not in the
 /// intersection: the wave that found this species did not stop retiring its
@@ -103,8 +103,11 @@ const RETIREMENT_TABLE: &str = "native-api/src/retired_shadow.rs";
 /// audited — the audit lives in the record, and the two tests below only ask
 /// whether the population has moved.
 const BASELINE: &[&str] = &[
+    "java/io/ByteArrayInputStream",
     "java/io/ByteArrayOutputStream",
     "java/io/File",
+    "java/io/FileDescriptor",
+    "java/io/FileOutputStream",
     "java/lang/Class",
     "java/lang/ClassLoader",
     "java/lang/ClassNotFoundException",
@@ -127,6 +130,8 @@ const BASELINE: &[&str] = &[
     "java/net/URL",
     "java/nio/ByteBuffer",
     "java/nio/CharBuffer",
+    "java/nio/channels/FileChannel",
+    "java/nio/file/attribute/FileTime",
     "java/text/BreakIterator",
     "java/time/Duration",
     "java/time/ZoneId",
@@ -142,6 +147,7 @@ const BASELINE: &[&str] = &[
     "java/util/Optional",
     "java/util/OptionalLong",
     "java/util/Properties",
+    "java/util/TreeMap",
     "java/util/concurrent/CompletableFuture",
     "java/util/concurrent/ConcurrentHashMap",
     "java/util/concurrent/ThreadPoolExecutor",
@@ -282,7 +288,7 @@ fn minted_classes() -> (BTreeSet<String>, usize) {
 ///
 /// Only `("class", "name", "descriptor"),` tuples count. A class NAMED in the
 /// file's prose is not a retirement, and counting prose is how the first pass
-/// of this census reported sixty-six where the tables say fifty-three.
+/// of this census reported sixty-six where the tables say fifty-nine.
 fn retired_carriers() -> BTreeSet<String> {
     let path = workspace().join(RETIREMENT_TABLE);
     let src = std::fs::read_to_string(&path)
