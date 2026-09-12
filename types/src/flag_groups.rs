@@ -1185,6 +1185,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "c1-vector-veto", on_key: Some("CRATONVM_JIT_C1_VECTOR_VETO"), off_key: None, off_word: Some("0"), since: "2026-08-04" },
     E { group: Group::JIT, token: "census-direct-helpers", on_key: Some("CRATONVM_JIT_CENSUS_DIRECT_HELPERS"), off_key: None, off_word: Some("0"), since: "2026-08-17" },
     E { group: Group::JIT, token: "nio-byte-direct-helpers", on_key: Some("CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS"), off_key: None, off_word: Some("0"), since: "2026-08-28" },
+    E { group: Group::JIT, token: "buffer-session-direct", on_key: Some("CRATONVM_JIT_BUFFER_SESSION_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-12" },
     E { group: Group::JIT, token: "md-update-direct-helper", on_key: Some("CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER"), off_key: None, off_word: Some("0"), since: "2026-08-28" },
     E { group: Group::JIT, token: "cached-entry-owner-reuse", on_key: Some("CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE"), off_key: None, off_word: Some("0"), since: "2026-08-17" },
     E { group: Group::JIT, token: "c2-first-call", on_key: Some("CRATONVM_JIT_C2_FIRST_CALL"), off_key: None, off_word: None, since: "2026-06-21" },

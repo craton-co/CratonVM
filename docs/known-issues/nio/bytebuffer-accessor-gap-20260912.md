@@ -372,7 +372,9 @@ The population is **learned from the funnel, never guessed from a name list** â€
 the same discipline `native-io`'s `elem_fastpath` uses, and for the same
 reason.
 
-`CRATONVM_JIT_BUFFER_SESSION_DIRECT=0` restores the funnel, which is what the
+`CRATONVM_JIT_BUFFER_SESSION_DIRECT=0` (declared in `flag_groups.rs` as the
+JIT token `buffer-session-direct`, so `CRATONVM_JIT=buffer-session-direct` also
+reaches it) restores the funnel, which is what the
 self-diff gate below uses to prove the two arms agree.
 
 ### What it is worth
