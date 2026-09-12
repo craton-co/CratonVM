@@ -6812,11 +6812,10 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// is **13253 rows, 0 diffs**, every ordered pair of a boundary corpus through
 /// every binary operation.
 ///
-/// ## Nine of the 24 are HELD BACK, and each half has its own cause
+/// ## All 24 are retired. Nine were held, and the RULE that held them expired
 ///
-/// With all 24 retired, the probe-tree A/B on two binaries — control
-/// `db988f6a76365f1f` without this table, trial `06307f0eca53c714` with it, same
-/// tree otherwise — reads:
+/// Wave 1 retired ten and held fourteen. With all 24 retired the probe-tree A/B
+/// on two binaries had read:
 ///
 /// ```text
 ///   BigIntegerSweep   control (no table, JIT on)    0 differing lines
@@ -6825,18 +6824,19 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// ```
 ///
 /// A positive delta is the one result that is a reason not to retire, so the
-/// nine are held per-TRIPLE — the same instrument the `java/util/logging` wave
-/// used for `Logger.log`'s eighth overload — and each is named:
+/// nine were held per-TRIPLE and the hold was generalised to a rule. Both halves
+/// are now closed, and for different reasons: one was a real defect, the other a
+/// contract that had never been checked against the oracle.
 ///
-/// **`add`, `subtract`, `multiply` — a SURVIVOR.** All three are registered
-/// twice. `phases_late.rs` owns the slot as a `Bridge`; `math_bignum.rs`
-/// registered an `Intrinsic` first and owns no slot, so it is *dead in
-/// compatible mode and never dispatched*. Refusing the `Bridge` under
-/// `--jdk-only` does not reach bytecode — it wakes the dead loser, which
+/// **`add`, `subtract`, `multiply` -- a SURVIVOR, and a real defect.** All three
+/// were registered twice. `phases_late.rs` owns the slot as a `Bridge`;
+/// `math_bignum.rs` registered an `Intrinsic` first which owned no slot and was
+/// *dead in compatible mode in all three feature arms*. Refusing the `Bridge`
+/// under `--jdk-only` did not reach bytecode -- it woke the dead loser, which
 /// returns **null** for a null argument where the real body throws:
 ///
 /// ```text
-///   --jdk-only-report, BigIntegerSweep run:
+///   --jdk-only-report, BigIntegerSweep run, before the fix:
 ///     27 synthetic-native-registered refusals on the retired classes
 ///      3 of them carrying a survivor
 ///        add       survivor=intrinsic@native-builtins/src/math_bignum.rs:1404
@@ -6844,45 +6844,40 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 ///        multiply  survivor=intrinsic@native-builtins/src/math_bignum.rs:1416
 /// ```
 ///
-/// This is the `refused is not retired` check earning its place: the probe rows
-/// moved, so the wave *looked* measurable, and the retirement was inert.
-/// Retiring these three means removing the dead `math_bignum.rs` registrations
-/// first, which changes nothing in compatible mode because they own no slot.
+/// Fixed 2026-09-12 by deleting the three dead registrations, which changes
+/// nothing in compatible mode because they own no slot there. The same shape had
+/// shipped in the `java/util/logging` wave a month earlier and was fixed in the
+/// same change. `stub_ratchet.rs`'s `no_retired_triple_survives_the_strict_boot`
+/// is the gate that makes it impossible to ship a third time: one line of set
+/// arithmetic over the strict boot's registry, asking which of its surviving rows
+/// these tables claim.
 ///
-/// **`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT DROPPED the
-/// message; blocker cleared 2026-09-11.** These do reach bytecode, and
-/// interpreted they are HotSpot-exact. Once the real body was JIT-compiled the
-/// `NullPointerException` arrived with no message at all. It was not a
-/// `BigInteger` fact — `probes/L2JitNpeProbe.java` asks six null-deref shapes
-/// cold and hot with no JDK class involved and every one of them lost its
-/// message when hot. Fixed and retired as
-/// `docs/internal/fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`,
-/// pinned by `vm/tests/jit_npe_message_hot_equals_cold.rs`.
+/// **The other eleven -- the rule's premise was false.** Interpreted they were
+/// HotSpot-exact; once the real body was JIT-compiled the `NullPointerException`
+/// arrived with no message. The VM-side defect was real and was fixed by
+/// `0d013f359`. The *rule* built on top of it was not: asked of the oracle at the
+/// same heat, HotSpot drops the message too.
 ///
-/// They are STILL HELD, and not by this reason: the rule below is structural —
-/// every reference-argument row — and lifting it needs the `BigIntegerSweep`
-/// measurement with the JIT on that put it there, which is lane 2's to take.
+/// ```text
+///   probes/L2BigIntNpe14.java -- 15 null-argument rows, cold then 200k warm
+///     HotSpot 25.0.4+7, default flags         9 of 15 hot rows answer a bare
+///                                             `null`, and WHICH nine differs
+///                                             between runs of the same class file
+///     HotSpot -XX:-OmitStackTraceInFastThrow  0 of 15; hot == cold, all helpful
+/// ```
 ///
-/// ## ...and the held set is every REFERENCE-argument row, not a list of six
+/// `OmitStackTraceInFastThrow` is on by default and lets C2 throw a preallocated
+/// exception carrying neither message nor stack trace. So "hot equals cold" was
+/// never the JDK contract, and the run-to-run instability that made the hold
+/// structural rather than empirical is the ORACLE's instability, reproduced. The
+/// stable contract is the interpreted message -- identical under both oracle
+/// configurations -- and this VM matches it on all 30 rows in both modes, never
+/// taking the fast-throw latitude. Record:
+/// `docs/internal/jdk-only/lane-2-biginteger-held-rows-and-inert-retirements-FIXED-20260912.md`.
 ///
-/// The six above are what regressed on the 24-triple binary. On the 13-triple
-/// one, `remainder` and friends were correct and `modInverse` and `modPow`
-/// regressed instead — the same defect surfacing on different rows, because
-/// which bodies the JIT has compiled by the time the probe's null section runs
-/// is not fixed between runs. Reading one run's diff and holding exactly the
-/// rows in it would be freezing a coin flip.
-///
-/// So the hold is structural rather than empirical: **a row is exposed if its
-/// real body can dereference a null reference ARGUMENT**, and wave 1 retires
-/// only signatures that take none. That is the twelve rows of `divide`,
-/// `modInverse`, `modPow`, `add`, `subtract`, `multiply`, `remainder`, `mod`,
-/// `gcd`, `and`, `or`, `xor` held for the JIT reason or the survivor reason,
-/// plus the two `byte[]` constructors, which the sweep never asks with null and
-/// so cannot vouch for either way.
-///
-/// What remains is ten value-shaped rows — `bitCount`, `bitLength`,
+/// The ten value-shaped rows of wave 1 -- `bitCount`, `bitLength`,
 /// `intValueExact`, `isProbablePrime`, `longValueExact`, `not`, `shiftLeft`,
-/// `shiftRight`, `testBit`, `toByteArray` — and they are 0-diff over the whole
+/// `shiftRight`, `testBit`, `toByteArray` -- remain 0-diff over the whole
 /// 13253-row sweep with the JIT on.
 ///
 /// **Seven rows removed on the 2026-09-11 catch-up merge with lane T**:
@@ -6987,12 +6982,64 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/management/MemoryUsage", "getInit", "()J"),
     ("java/lang/management/MemoryUsage", "getMax", "()J"),
     ("java/lang/management/MemoryUsage", "getUsed", "()J"),
+    ("java/math/BigInteger", "<init>", "(I[B)V"),
+    ("java/math/BigInteger", "<init>", "([B)V"),
+    (
+        "java/math/BigInteger",
+        "add",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "and",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "bitCount", "()I"),
     ("java/math/BigInteger", "bitLength", "()I"),
+    (
+        "java/math/BigInteger",
+        "divide",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "gcd",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "intValueExact", "()I"),
     ("java/math/BigInteger", "isProbablePrime", "(I)Z"),
     ("java/math/BigInteger", "longValueExact", "()J"),
+    (
+        "java/math/BigInteger",
+        "mod",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "modInverse",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "modPow",
+        "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "multiply",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "not", "()Ljava/math/BigInteger;"),
+    (
+        "java/math/BigInteger",
+        "or",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "remainder",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     (
         "java/math/BigInteger",
         "shiftLeft",
@@ -7003,8 +7050,18 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
         "shiftRight",
         "(I)Ljava/math/BigInteger;",
     ),
+    (
+        "java/math/BigInteger",
+        "subtract",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "testBit", "(I)Z"),
     ("java/math/BigInteger", "toByteArray", "()[B"),
+    (
+        "java/math/BigInteger",
+        "xor",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
 ];
 
 /// Lane L1 wave 1, 2026-09-10: the six `java/util` families whose state is
@@ -11417,82 +11474,59 @@ mod tests {
                  adding a third."
             );
         }
-        // The nine BigInteger triples held back, and WHY each is held. A
-        // re-add has to move the blocker first, and the blocker is not in this
-        // file: `add`/`subtract`/`multiply` need the dead `math_bignum.rs`
-        // registrations gone, the other six need the JIT to stop dropping the
-        // helpful-NPE message. Both are measured; see this table's doc comment.
-        for m in ["add", "subtract", "multiply"] {
-            assert!(
-                !triple_is_retired_shadow(
-                    "java/math/BigInteger",
-                    m,
-                    "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
-                ),
-                "BigInteger.{m} was retired, but an older math_bignum.rs \
-                 Intrinsic still owns the slot after the refusal — the \
-                 retirement is INERT and the survivor returns null for a null \
-                 argument where the real body throws."
-            );
-        }
-        for m in [
-            "remainder",
-            "mod",
-            "gcd",
-            "and",
-            "or",
-            "xor",
-            "divide",
-            "modInverse",
-        ] {
-            assert!(
-                !triple_is_retired_shadow(
-                    "java/math/BigInteger",
-                    m,
-                    "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
-                ),
-                "BigInteger.{m} was retired. It reaches bytecode correctly \
-                 INTERPRETED, and loses its NullPointerException message once \
-                 the body is JIT-compiled."
-            );
-        }
-        for (m, d) in [
-            (
-                "modPow",
-                "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-            ),
-            ("<init>", "([B)V"),
-            ("<init>", "(I[B)V"),
-        ] {
-            assert!(
-                !triple_is_retired_shadow("java/math/BigInteger", m, d),
-                "BigInteger.{m}{d} was retired. Wave 1's rule is structural: a \
-                 row whose real body can dereference a null reference ARGUMENT \
-                 is exposed to the JIT's dropped NullPointerException message, \
-                 and which rows show it varies run to run."
-            );
-        }
-
-        // Wave 1's rule, asserted over the TABLE rather than over a list of
-        // names, so a row added later has to satisfy it too. Only the parameter
-        // list is examined: `toByteArray()[B` returns an array and takes
-        // nothing, and reading the whole descriptor would reject it.
-        for (c, m, d) in RETIRED_SHADOW_L2_TRIPLES {
-            if *c != "java/math/BigInteger" {
-                continue;
-            }
-            let params = d
-                .split_once('(')
-                .and_then(|(_, rest)| rest.split_once(')'))
-                .map(|(p, _)| p)
-                .unwrap_or("");
-            assert!(
-                !params.contains('L') && !params.contains('['),
-                "{c}.{m}{d} takes a reference parameter. Until the JIT carries \
-                 the helpful-NPE message into compiled code, such a row \
-                 regresses the message it used to get from the native."
-            );
-        }
+        // **Wave 3, 2026-09-12: the fourteen held rows moved, and the RULE
+        // that held them was retired with them.**
+        //
+        // Wave 1 held every row whose real body can dereference a null
+        // reference ARGUMENT, because retiring such a row traded the native's
+        // constant `NullPointerException` message for a compiled body that
+        // arrived with no message at all -- and which rows showed it varied
+        // between runs, so the hold was made structural rather than copied out
+        // of one diff. `0d013f359` fixed the compiled-code message. Re-measuring
+        // did not confirm the rule; it refuted its PREMISE.
+        //
+        // `probes/L2BigIntNpe14.java` asks all fourteen rows with a null
+        // argument, cold and then after 200k warm iterations of the SAME method,
+        // on the oracle:
+        //
+        // ```text
+        //   HotSpot 25.0.4+7, default flags     9 of 15 hot rows answer a BARE
+        //                                       `null`, and WHICH nine differs
+        //                                       between runs (3 runs: subtract
+        //                                       dropped/dropped/helpful,
+        //                                       remainder dropped/helpful/
+        //                                       helpful, modPow flipped too)
+        //   HotSpot -XX:-OmitStackTraceInFastThrow
+        //                                       0 of 15 -- hot == cold, every
+        //                                       message helpful
+        // ```
+        //
+        // Losing the helpful message in compiled code is what HotSpot ITSELF
+        // does by default: `OmitStackTraceInFastThrow` lets C2 throw a
+        // preallocated exception carrying neither message nor stack trace, and
+        // the run-to-run variance wave 1 measured on this VM is the same
+        // variance the oracle shows. So "hot equals cold" was never the JDK
+        // contract, and a retired row answering a bare `null` when hot is
+        // HotSpot-FAITHFUL rather than regressed. The stable contract is the
+        // interpreted message, which is identical under both oracle
+        // configurations, and this VM reproduces it on all fourteen.
+        //
+        // What replaces the rule is the POPULATION. Lane 2 measured 24
+        // `BigInteger` triples; all 24 are retired. A 25th needs its own
+        // per-class corpus screen and probe-tree A/B, which is what this count
+        // is here to demand.
+        let bigint_rows = RETIRED_SHADOW_L2_TRIPLES
+            .iter()
+            .filter(|(c, _, _)| *c == "java/math/BigInteger")
+            .count();
+        assert_eq!(
+            bigint_rows, 24,
+            "lane 2 measured 24 `java/math/BigInteger` triples -- ten in wave 1, \
+             fourteen in wave 3 -- and this table holds {bigint_rows}. A row \
+             outside that set has been through neither the per-class corpus \
+             screen nor the probe-tree A/B; take both before changing this \
+             number."
+        );
 
         // The ten rows the image says are not shadows. Six are `<init>` on an
         // INTERFACE, which declares no constructor at all; the rest are a

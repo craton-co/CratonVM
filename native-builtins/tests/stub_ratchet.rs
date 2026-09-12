@@ -2241,7 +2241,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// above): the total not moving at all is the cleanest of the four readings
 /// -- every added SyntheticStub row is an existing Bridge relabelled, zero new
 /// registrations, exactly what a table landing on a fresh `dev` predicts.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3876;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3873;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2612,7 +2612,31 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3876;
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 /// # 2948 → 3832, 2026-09-12 — see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]'s
 /// account of this same merge; `+884` here too, total unchanged 13606 -> 13606.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3849;
+// 2026-09-12, lane 2 wave 3: +14 in every arm. The fourteen `java/math/BigInteger`
+// triples lane 2 held back joined `RETIRED_SHADOW_L2_TRIPLES`, and a table entry
+// re-tags the triple's `Bridge` to `SyntheticStub` in COMPATIBLE mode too --
+// `register` applies the retag before `register_inner`, and only `--jdk-only`
+// goes on to refuse it. So this count rising by exactly the number of rows added
+// is what an accepted wave looks like here; it is not a regression.
+//
+// TAKEN, not computed -- three times, because dev moved twice underneath this
+// branch and each merge conflicted on all three literals:
+//
+//   pre-merge tree            2915/2942/2915 -> measured 2929/2956/2929
+//   after 25 dev commits      dev 2948/2975/2948 -> measured 2962/2989/2962
+//   after 16 more (a +884
+//     wave from another lane) dev 3832/3859/3832 -> measured 3846/3873/3846
+//
+// Every conflict was resolved to DEV's literal and the gate re-run, never dev's
+// value plus 14: arithmetic over two baselines cannot see a row that moved in both
+// directions, which is the whole reason this lane re-measures on every merge. That
+// the measured delta came out +14 all three times -- across a wave that moved the
+// baselines by 884 -- is the CROSS-CHECK, not the derivation.
+//
+// The same +14 shows independently in the `--jdk-only-report`: 3036 refusals
+// against the control's 3022, and `java/math/BigInteger` going from 10 refused
+// triples to 24.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3846;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2852,7 +2876,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3849;
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 /// # 2948 → 3832, 2026-09-12 — see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]'s
 /// account of this same merge; `+884` here too, total unchanged 13641 -> 13641.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3849;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3846;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -3798,6 +3822,62 @@ fn strict_rows() -> Vec<(String, String, String, NativeKind)> {
         .into_iter()
         .map(|(c, m, d, k)| (c.to_string(), m.to_string(), d.to_string(), k))
         .collect()
+}
+
+/// **A retirement is INERT when a second native sits underneath the bridge it
+/// refuses**, and until this test existed nothing could see it.
+///
+/// `register()` re-tags a retired triple's `Bridge` to `SyntheticStub` and
+/// `--jdk-only` then refuses it. A refusal is not a removal: it declines to
+/// insert THAT registration and leaves whatever is already in the slot. So a
+/// triple registered twice -- an older `Intrinsic` first, the honest bridge
+/// second -- keeps dispatching to the older body after the refusal, and the real
+/// JDK bytecode the table exists to reach never runs. The row is in the table,
+/// the census reports zero surviving stubs, the wave measures as accepted, and
+/// nothing changed.
+///
+/// Two waves shipped that way and each was found by hand, months apart:
+///
+/// ```text
+///   java/util/logging  5 triples  an Intrinsic in phases_early.rs   2026-08-11
+///   java/math/BigInteger  3       an Intrinsic in math_bignum.rs    2026-09-10
+/// ```
+///
+/// The instrument is one line of set arithmetic and it needed no new data: the
+/// strict boot's own registry, asked which of its surviving rows the retirement
+/// tables claim. Both waves above are exactly what it prints on the commit
+/// before this one.
+///
+/// Note what this does NOT need: a running VM, a probe, or a refusal report. The
+/// 2026-08-11 wave was diagnosed from a 2029-refusal `--jdk-only-report` and the
+/// 2026-09-10 one from a probe whose rows moved for the wrong reason; both are
+/// answered here by `cargo test`.
+#[test]
+fn no_retired_triple_survives_the_strict_boot() {
+    let mut inert: Vec<String> = strict_rows()
+        .into_iter()
+        .filter(|(c, m, d, _)| {
+            cratonvm_native_api::retired_shadow::triple_is_retired_shadow(c, m, d)
+        })
+        .map(|(c, m, d, k)| format!("  {c}.{m}{d} still dispatches as {k:?}"))
+        .collect();
+    inert.sort();
+    inert.dedup();
+    assert!(
+        inert.is_empty(),
+        "{} retired triple(s) are INERT: a native survives the refusal and the \
+         real JDK bytecode never runs, so the retirement changed nothing.\n{}\n\
+         Fix the REGISTRATION, not this test. Each of these is a second \
+         registration of a triple whose honest bridge is refused; find it with \
+         `NativeMethodRegistry::census()`, which lists every registration with \
+         its site and kind (the last row for a triple owns the slot, every \
+         earlier one is dead code in compatible mode). If the survivor is dead \
+         in compatible mode -- proven by running that census in all three \
+         feature arms -- delete it. If it OWNS the slot in compatible mode, \
+         re-tag it `Bridge` instead so the refusal reaches it.",
+        inert.len(),
+        inert.join("\n")
+    );
 }
 
 /// **A fake must not outlive `--jdk-only` because a SECOND file called it a
