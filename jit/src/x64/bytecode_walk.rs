@@ -3607,7 +3607,15 @@ impl Compiler {
 
                 // dmul — with strength reduction: dmul by 2.0 → dadd self
                 0x6b => {
-                    if self.fp_strength_reduction_pcs.contains(&pc) {
+                    // A `dmul` that is itself a branch target merges operand
+                    // stacks from more than one predecessor, so the constant
+                    // 2.0 the analysis saw textually before it is only one of
+                    // the possible right operands (`x * (c ? y : 2.0)` puts
+                    // `L: ldc2_w 2.0` directly before `M: dmul`). Only the
+                    // fall-through-only shape may be strength-reduced.
+                    if self.fp_strength_reduction_pcs.contains(&pc)
+                        && !branch_targets.get(pc).copied().unwrap_or(true)
+                    {
                         // Pattern: <value>, ldc2_w 2.0, dmul
                         // Stack: [value, 2.0] → pop 2.0, emit ADDSD value, value
                         let _two = self.pop_stack(); // discard the 2.0 constant
@@ -4013,6 +4021,10 @@ impl Compiler {
 
                 // f2i — float to int (truncate toward zero, NaN→0, overflow→MAX/MIN)
                 0x8b => {
+                    // The MOVD below writes XMM0: move any pending XMM0 value
+                    // deeper on the stack out first, as every other conversion
+                    // arm does, or it is silently replaced by this operand.
+                    self.flush_xmm0_slots();
                     self.pop_to_rax();
                     // MOVD XMM0, EAX: 66 0F 6E C0
                     self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC0]);
@@ -4028,6 +4040,7 @@ impl Compiler {
 
                 // f2l — float to long (truncate toward zero, NaN→0, overflow→MAX/MIN)
                 0x8c => {
+                    self.flush_xmm0_slots(); // the MOVD below writes XMM0; see f2i
                     self.pop_to_rax();
                     // MOVD XMM0, EAX: 66 0F 6E C0
                     self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC0]);
@@ -4052,6 +4065,7 @@ impl Compiler {
 
                 // d2i — double to int (truncate toward zero, NaN→0, overflow→MAX/MIN)
                 0x8e => {
+                    self.flush_xmm0_slots(); // the MOVQ below writes XMM0; see f2i
                     self.pop_to_rax();
                     // MOVQ XMM0, RAX: 66 48 0F 6E C0
                     self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
@@ -4067,6 +4081,7 @@ impl Compiler {
 
                 // d2l — double to long (truncate toward zero, NaN→0, overflow→MAX/MIN)
                 0x8f => {
+                    self.flush_xmm0_slots(); // the MOVQ below writes XMM0; see f2i
                     self.pop_to_rax();
                     // MOVQ XMM0, RAX: 66 48 0F 6E C0
                     self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
@@ -4262,7 +4277,7 @@ impl Compiler {
                     // the if_icmp, the fall-through iload, the goto,
                     // and the taken-side iload all at once; on hit
                     // we resume at the merge PC L2.
-                    if let Some(new_pc) = self.try_cmov_minmax_peephole(code, pc, op, val1, val2) {
+                    if let Some(new_pc) = self.try_cmov_minmax_peephole(code, code_len, &branch_targets, pc, op, val1, val2) {
                         // Map the original if_icmp PC to the start of
                         // the CMOV sequence so downstream branch
                         // resolution keeps working.

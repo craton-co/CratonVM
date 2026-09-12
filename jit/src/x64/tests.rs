@@ -12008,8 +12008,10 @@ fn test_m5_lambda_with_captured_object() {
 #[test]
 fn p87_scratch_xmm_constants() {
     // Verify scratch XMM register constants are defined correctly
+    #[cfg(target_os = "windows")]
+    assert_eq!(SCRATCH_XMMS, [2, 3, 4, 5]);
+    #[cfg(not(target_os = "windows"))]
     assert_eq!(SCRATCH_XMMS, [2, 3, 4, 5, 6, 7]);
-    assert_eq!(SCRATCH_XMMS.len(), 6);
 }
 
 #[test]
@@ -18235,4 +18237,252 @@ fn no_age_floor_can_separate_an_old_gen_receiver_from_a_young_one() {
     // The mask answers both correctly.
     assert_ne!(old_new & cratonvm_types::GC_FLAG_OLD_GEN, 0);
     assert_eq!(young_old & cratonvm_types::GC_FLAG_OLD_GEN, 0);
+}
+
+// -----------------------------------------------------------------------
+// JIT review 2026-09-12 — regressions for the single-pass codegen findings
+// -----------------------------------------------------------------------
+
+/// `compile` with every table empty — the shape all the fixtures below need.
+macro_rules! review_compile {
+    ($code:expr, $len:expr, $params:expr, $locals:expr, $heap:expr) => {
+        compile(
+            &$code,
+            $len,
+            $params,
+            $locals,
+            $heap,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+    };
+}
+
+/// `(double) i + (T) x` — the `i2d` result is still pending in XMM0 when the
+/// narrowing conversion loads its own operand. Each of f2i / f2l / d2i / d2l
+/// used to write XMM0 without moving that pending value out, so the method
+/// returned roughly `(T) x` instead of the sum.
+#[test]
+fn review_fp_to_int_conversions_keep_a_pending_xmm0_operand() {
+    // (load x, conversion, widen result back to double)
+    let cases: [(u8, u8, u8, &str); 4] = [
+        (0x23, 0x8b, 0x87, "f2i"), // fload_1 f2i i2d
+        (0x23, 0x8c, 0x8a, "f2l"), // fload_1 f2l l2d
+        (0x27, 0x8e, 0x87, "d2i"), // dload_1 d2i i2d
+        (0x27, 0x8f, 0x8a, "d2l"), // dload_1 d2l l2d
+    ];
+    for (load, conv, widen, name) in cases {
+        // iload_0 i2d <load> <conv> <widen> dadd dreturn
+        let code: Vec<u8> = vec![0x1a, 0x87, load, conv, widen, 0x63, 0xaf, 0, 0];
+        let compiled = review_compile!(code, 7, 2, 2, false)
+            .unwrap_or_else(|| panic!("{name} fixture should compile"));
+        let x_bits = if load == 0x23 {
+            3.75f32.to_bits() as i64 // Cast: JIT ABI convention
+        } else {
+            3.75f64.to_bits() as i64 // Cast: JIT ABI convention
+        };
+        // SAFETY: calling machine code compiled from the verified-shape fixture above.
+        let result = unsafe { compiled.try_call(&[5, x_bits]).expect("test JIT call") };
+        assert_eq!(
+            f64::from_bits(result as u64), // Cast: JIT ABI convention
+            8.0,
+            "{name}: (double) 5 + ({name}) 3.75 must be 8.0"
+        );
+    }
+}
+
+/// `static int f(int ok, int a, int b) { return (ok != 0 && a < b) ? a : b; }`
+/// javac makes the taken-side `iload_2` the target of the short-circuit
+/// `ifeq` as well. The CMOV min/max fusion swallowed that PC, so `ok == 0`
+/// jumped past the merged result and returned a stale slot.
+#[test]
+fn review_cmov_minmax_declines_a_span_entered_by_another_branch() {
+    let code: Vec<u8> = vec![
+        0x1a, //              0: iload_0
+        0x99, 0x00, 0x0c, //  1: ifeq -> 13
+        0x1b, //              4: iload_1
+        0x1c, //              5: iload_2
+        0xa2, 0x00, 0x07, //  6: if_icmpge -> 13
+        0x1b, //              9: iload_1
+        0xa7, 0x00, 0x04, // 10: goto -> 14
+        0x1c, //             13: iload_2
+        0xac, //             14: ireturn
+        0x00, 0x00,
+    ];
+    let compiled = review_compile!(code, 15, 3, 3, false).expect("short-circuit ternary compiles");
+    for (ok, a, b) in [(0i64, 1i64, 5i64), (0, 9, 5), (1, 1, 5), (1, 9, 5), (0, -7, 3), (1, -7, 3)] {
+        let expected = if ok != 0 && a < b { a } else { b };
+        // SAFETY: calling machine code compiled from the fixture above.
+        let result = unsafe { compiled.try_call(&[ok, a, b]).expect("test JIT call") };
+        assert_eq!(result as i32, expected as i32, "ok={ok} a={a} b={b}"); // Cast: int return
+    }
+}
+
+/// `long s = 0; for (int i = 3; i < n; i++) s = a[i] + s; return s;`
+/// entered with `i > n`. The vectorised pre-header computed the chunk count
+/// as an unsigned `(n - i) >> 3`, i.e. ~2^29 chunks past the array.
+#[test]
+fn review_simd_int_sum_entered_past_its_bound_runs_zero_iterations() {
+    let code: Vec<u8> = vec![
+        0x09, //              0: lconst_0
+        0x41, //              1: lstore_2
+        0x06, //              2: iconst_3
+        0x36, 0x04, //        3: istore 4
+        0x15, 0x04, //        5: iload 4   (loop header)
+        0x1b, //              7: iload_1
+        0xa2, 0x00, 0x11, //  8: if_icmpge -> 25
+        0x2a, //             11: aload_0
+        0x15, 0x04, //       12: iload 4
+        0x2e, //             14: iaload
+        0x85, //             15: i2l
+        0x20, //             16: lload_2
+        0x61, //             17: ladd
+        0x41, //             18: lstore_2
+        0x84, 0x04, 0x01, // 19: iinc 4, 1
+        0xa7, 0xff, 0xef, // 22: goto -> 5
+        0x20, //             25: lload_2
+        0xad, //             26: lreturn
+        0x00, 0x00,
+    ];
+    let compiled = review_compile!(code, 27, 2, 5, false).expect("int-sum loop compiles");
+
+    let run = |len: usize, n: i64| -> i64 {
+        let mut words = vec![0u64; (HEADER_SIZE + 4 * len + 7) / 8 + 1];
+        let array_ptr = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` holds the VM array header plus `len` ints.
+        unsafe {
+            (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(len as i32); // Cast: test length
+            for i in 0..len {
+                (array_ptr.add(ARRAY_DATA_OFFSET + 4 * i) as *mut i32).write_unaligned(i as i32 + 1); // Cast: test value
+            }
+        }
+        // SAFETY: the compiled method receives a correctly laid out int[].
+        unsafe { compiled.try_call(&[array_ptr as i64, n]).expect("test JIT call") } // Cast: pointer as JIT arg
+    };
+    assert_eq!(run(1, 1), 0, "i = 3 > n = 1 must run zero iterations");
+    assert_eq!(run(2, 0), 0, "i = 3 > n = 0 must run zero iterations");
+    // Control: a normal entry still sums a[3..16] = 4 + 5 + ... + 16.
+    assert_eq!(run(16, 16), (4..=16).sum::<i64>());
+}
+
+/// Win64 makes XMM6-XMM15 non-volatile. No scratch XMM may be one of them:
+/// neither the prologue nor any stub saves the scratch pool.
+#[test]
+fn review_scratch_xmm_pool_is_volatile_under_the_host_abi() {
+    let callee_saved: &[u8] = if cfg!(target_os = "windows") { &[6, 7, 8, 9, 10, 11, 12, 13, 14, 15] } else { &[] };
+    for xmm in SCRATCH_XMMS {
+        assert!(!callee_saved.contains(&xmm), "scratch XMM{xmm} is callee-saved on this ABI");
+    }
+}
+
+/// `double s = 0; for (int i = 0; i < 3; i++) s += x * (c != 0 ? y : 2.0);`
+/// javac lays the `ldc2_w 2.0` directly before the `dmul`, which is also the
+/// merge point of the `goto` from the `y` arm. The in-loop strength reduction
+/// replaced the dmul with `x + x` regardless of which arm reached it.
+#[test]
+fn review_dmul_by_two_strength_reduction_skips_a_merge_point() {
+    let code: Vec<u8> = vec![
+        0x0e, //              0: dconst_0
+        0x4a, //              1: dstore_3
+        0x03, //              2: iconst_0
+        0x36, 0x05, //        3: istore 5
+        0x15, 0x05, //        5: iload 5   (loop header)
+        0x06, //              7: iconst_3
+        0xa2, 0x00, 0x1b, //  8: if_icmpge -> 35
+        0x29, //             11: dload_3
+        0x1a, //             12: iload_0
+        0x87, //             13: i2d
+        0x1c, //             14: iload_2
+        0x99, 0x00, 0x08, // 15: ifeq -> 23
+        0x1b, //             18: iload_1
+        0x87, //             19: i2d
+        0xa7, 0x00, 0x06, // 20: goto -> 26
+        0x14, 0x00, 0x01, // 23: ldc2_w #1 (2.0)
+        0x6b, //             26: dmul      (merge point)
+        0x63, //             27: dadd
+        0x4a, //             28: dstore_3
+        0x84, 0x05, 0x01, // 29: iinc 5, 1
+        0xa7, 0xff, 0xe5, // 32: goto -> 5
+        0x29, //             35: dload_3
+        0xaf, //             36: dreturn
+        0x00, 0x00,
+    ];
+    let compiled = compile(
+        &code,
+        37,
+        3,
+        6,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(23, 2.0f64.to_bits() as i64)], // Cast: JIT ABI convention
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None,
+    )
+    .expect("ternary-multiply loop compiles");
+    for (c, expected) in [(1i64, 105.0f64), (0, 30.0)] {
+        // SAFETY: calling machine code compiled from the fixture above.
+        let result = unsafe { compiled.try_call(&[5, 7, c]).expect("test JIT call") };
+        assert_eq!(f64::from_bits(result as u64), expected, "c={c}"); // Cast: JIT ABI convention
+    }
+}
+
+/// `long s = 0; for (int i = 0; i < n; i++) s = a[i] + s;` over values whose
+/// sum passes 2^32. The vectorised pre-header summed 32-bit lanes and then
+/// sign-extended the wrapped total into the long accumulator.
+#[test]
+fn review_simd_int_sum_into_a_long_does_not_wrap_at_32_bits() {
+    let code: Vec<u8> = vec![
+        0x09, 0x41, 0x03, 0x36, 0x04, // lconst_0 lstore_2 iconst_0 istore 4
+        0x15, 0x04, 0x1b, 0xa2, 0x00, 0x11, // iload 4; iload_1; if_icmpge -> 25
+        0x2a, 0x15, 0x04, 0x2e, 0x85, 0x20, 0x61, 0x41, // a[i] i2l lload_2 ladd lstore_2
+        0x84, 0x04, 0x01, 0xa7, 0xff, 0xef, // iinc 4,1; goto -> 5
+        0x20, 0xad, 0x00, 0x00, // lload_2 lreturn
+    ];
+    let compiled = review_compile!(code, 27, 2, 5, false).expect("int-sum loop compiles");
+    for (len, value) in [(8usize, i32::MAX), (19, i32::MAX), (16, i32::MIN), (24, -7)] {
+        let mut words = vec![0u64; (HEADER_SIZE + 4 * len + 7) / 8 + 1];
+        let array_ptr = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` holds the VM array header plus `len` ints.
+        unsafe {
+            (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(len as i32); // Cast: test length
+            for i in 0..len {
+                (array_ptr.add(ARRAY_DATA_OFFSET + 4 * i) as *mut i32).write_unaligned(value);
+            }
+        }
+        // SAFETY: the compiled method receives a correctly laid out int[].
+        let result = unsafe {
+            compiled.try_call(&[array_ptr as i64, len as i64]).expect("test JIT call") // Cast: JIT args
+        };
+        assert_eq!(result, value as i64 * len as i64, "len={len} value={value}"); // Cast: expected long sum
+    }
 }

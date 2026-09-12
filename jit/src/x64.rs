@@ -393,6 +393,17 @@ pub const LOCAL_XMMS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 /// When a FP binop produces a result in XMM0, it can be promoted to a scratch XMM
 /// to free XMM0 for the next operation, avoiding the XMM0→frame spill/reload cycle.
 /// These are caller-saved and must be flushed before calls and backward branches.
+///
+/// "Caller-saved" is an ABI fact, not a choice: Win64 makes XMM6-XMM15
+/// non-volatile, and neither the prologue nor the epilogue saves a scratch
+/// register (only `alloc_used_xmms`, drawn from `LOCAL_XMMS`, is saved). A
+/// sixth pending FP value promoted into XMM6/XMM7 therefore returned to the
+/// Rust caller with its non-volatile state destroyed. The pool is the
+/// volatile subset on Windows; exhaustion falls back to a frame spill in
+/// `flush_xmm0_slots`, so the smaller pool costs a store, never correctness.
+#[cfg(target_os = "windows")]
+const SCRATCH_XMMS: [u8; 4] = [2, 3, 4, 5];
+#[cfg(not(target_os = "windows"))]
 const SCRATCH_XMMS: [u8; 6] = [2, 3, 4, 5, 6, 7];
 
 #[cfg(not(target_os = "windows"))]

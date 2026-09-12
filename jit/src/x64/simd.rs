@@ -37,6 +37,13 @@ impl Compiler {
         // 0x44, 0x89: MOV EAX, R11D;  SUB EAX, R10D; SHR EAX, 3
         self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
         self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
+        // Entered with i >= n the difference is zero or negative, and an
+        // unsigned SHR of a negative difference is ~2^29 chunks — every one
+        // of them past the array. Clamp to zero on the SIGNED flags of the
+        // SUB (JGE honours OF, so a wrapped `n - i` still reads as n < i),
+        // leaving the scalar loop's own `i < n` test to run zero iterations.
+        self.buf.emit(&[0x7D, 0x02]); // JGE +2
+        self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX
         self.buf.emit(&[0xC1, 0xE8, 0x03]); // SHR EAX, 3
         self.buf.emit(&[0x41, 0x89, 0xC0]); // MOV R8D, EAX — chunk count
         self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
@@ -59,9 +66,31 @@ impl Compiler {
         self.buf.emit(&[0x48, 0x05]); // ADD RAX, imm32
         self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
 
+        // The lanes are 64-bit. The detector admits the `long` accumulator
+        // shape (`s = a[i] + s` after `i2l`), and 32-bit lanes plus a 32-bit
+        // horizontal sum wrapped at 2^32 before the result was sign-extended
+        // into the long: eight `Integer.MAX_VALUE` elements summed to -8.
+        // Each 8-int chunk is widened as two 4-int halves (VPMOVSXDQ reads a
+        // 128-bit memory operand), so every lane holds a sign-extended int and
+        // the accumulator cannot wrap before 2^31 chunks. The low 32 bits of
+        // the 64-bit total are exactly the wrapped `int` sum, so the int
+        // accumulator arm below needs no separate path.
         let simd_loop_start = self.buf.pos();
-        // VPADDD YMM0, YMM0, [RAX]
-        self.emit_vpaddd_ymm_mem(0, 0, RAX, 0);
+        for half_disp in [0i32, 16] {
+            // VPMOVSXDQ YMM1, [RAX + half_disp]   VEX.256.66.0F38.WIG 25 /r
+            self.emit_vex3(true, true, true, 0x02, false, 0, true, 1);
+            self.buf.emit_byte(0x25);
+            if half_disp == 0 {
+                self.buf.emit_byte(0x08); // mod=00 reg=YMM1 rm=RAX
+            } else {
+                self.buf.emit_byte(0x48); // mod=01 reg=YMM1 rm=RAX
+                self.buf.emit_byte(half_disp as u8); // Cast: disp8 16, in range
+            }
+            // VPADDQ YMM0, YMM0, YMM1             VEX.256.66.0F.WIG D4 /r
+            self.emit_vex2(true, 0, true, 1);
+            self.buf.emit_byte(0xD4);
+            self.buf.emit_byte(0xC1); // mod=11 reg=YMM0 rm=YMM1
+        }
         // ADD RAX, 32  (advance by 8 ints × 4 bytes)
         self.buf.emit(&[0x48, 0x83, 0xC0, 0x20]);
         // DEC R8D
@@ -72,17 +101,28 @@ impl Compiler {
         self.buf.emit_byte(0x85);
         self.buf.emit(&rel.to_le_bytes());
 
-        // --- Horizontal reduction: YMM0 → EAX ---
-        self.emit_horizontal_sum_ymm0_to_eax();
+        // --- Horizontal reduction: four qword lanes of YMM0 → RAX ---
+        // VEXTRACTI128 XMM1, YMM0, 1           VEX.256.66.0F3A.W0 39 /r ib
+        self.emit_vex3(true, true, true, 0x03, false, 0, true, 1);
+        self.buf.emit(&[0x39, 0xC1, 0x01]); // mod=11 reg=YMM0 rm=XMM1, imm8=1
+        // VPADDQ XMM0, XMM0, XMM1              VEX.128.66.0F.WIG D4 /r
+        self.emit_vex2(true, 0, false, 1);
+        self.buf.emit(&[0xD4, 0xC1]);
+        // VPSHUFD XMM1, XMM0, 0x4E — high qword into the low lane
+        self.emit_vex2(true, 0, false, 1);
+        self.buf.emit(&[0x70, 0xC8, 0x4E]); // mod=11 reg=XMM1 rm=XMM0
+        // VPADDQ XMM0, XMM0, XMM1
+        self.emit_vex2(true, 0, false, 1);
+        self.buf.emit(&[0xD4, 0xC1]);
+        // VMOVQ RAX, XMM0                      VEX.128.66.0F.W1 7E /r
+        self.emit_vex3(true, true, true, 0x01, true, 0, false, 1);
+        self.buf.emit(&[0x7E, 0xC0]);
 
         // VZEROUPPER
         self.emit_vzeroupper();
 
         // Add SIMD result to accumulator
         if acc_is_long {
-            // MOVSXD RAX, EAX
-            self.rex_w();
-            self.buf.emit(&[0x63, 0xC0]);
             // ADD [RBP + acc_offset], RAX (64-bit add to long local)
             self.rex_w();
             self.buf.emit_byte(0x01); // ADD r/m64, r64
@@ -121,6 +161,11 @@ impl Compiler {
         // Recompute: EAX = (R11D - R10D) >> 3 << 3; R10D += EAX
         self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
         self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
+        // The same signed clamp as the chunk count: for i > n, `(n - i) & ~7`
+        // is a NEGATIVE multiple of 8, which would restart the scalar tail
+        // below i and read a[i - 8k] — before the array.
+        self.buf.emit(&[0x7D, 0x02]); // JGE +2
+        self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX
         self.buf.emit(&[0x83, 0xE0, 0xF8]); // AND EAX, ~7 (round down to multiple of 8)
         self.buf.emit(&[0x41, 0x01, 0xC2]); // ADD R10D, EAX
 
@@ -414,6 +459,9 @@ impl Compiler {
         // chunk_count = (n - i) / 4 (4 doubles per YMM register)
         self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
         self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
+        // Signed clamp for an i >= n entry; see `emit_simd_int_array_sum`.
+        self.buf.emit(&[0x7D, 0x02]); // JGE +2
+        self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX
         self.buf.emit(&[0xC1, 0xE8, 0x02]); // SHR EAX, 2 (divide by 4)
         self.buf.emit(&[0x41, 0x89, 0xC0]); // MOV R8D, EAX — chunk count
         self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
@@ -498,6 +546,9 @@ impl Compiler {
         // Update induction variable: i += chunks_processed * 4
         self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
         self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
+        // Signed clamp for i > n; see the recompute in `emit_simd_int_array_sum`.
+        self.buf.emit(&[0x7D, 0x02]); // JGE +2
+        self.buf.emit(&[0x31, 0xC0]); // XOR EAX, EAX
         self.buf.emit(&[0x83, 0xE0, 0xFC]); // AND EAX, ~3 (round down to multiple of 4)
         self.buf.emit(&[0x41, 0x01, 0xC2]); // ADD R10D, EAX
 
@@ -656,6 +707,9 @@ impl Compiler {
         // `i*4 + chunk_count + H` and the first VMOVDQU faults.
         self.buf.emit(&[0x45, 0x89, 0xD8]); // MOV R8D, R11D
         self.buf.emit(&[0x45, 0x29, 0xD0]); // SUB R8D, R10D
+        // Signed clamp for an i >= n entry; see `emit_simd_int_array_sum`.
+        self.buf.emit(&[0x7D, 0x03]); // JGE +3
+        self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D, R8D
         self.buf.emit(&[0x41, 0xC1, 0xE8, 0x03]); // SHR R8D, 3
         self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
                                             // JZ to scalar remainder (patch later)
@@ -750,6 +804,9 @@ impl Compiler {
         // scalar remainder below dereferences.
         self.buf.emit(&[0x45, 0x89, 0xD8]); // MOV R8D, R11D
         self.buf.emit(&[0x45, 0x29, 0xD0]); // SUB R8D, R10D
+        // Signed clamp for i > n; see the recompute in `emit_simd_int_array_sum`.
+        self.buf.emit(&[0x7D, 0x03]); // JGE +3
+        self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D, R8D
         self.buf.emit(&[0x41, 0x83, 0xE0, 0xF8]); // AND R8D, ~7
         self.buf.emit(&[0x45, 0x01, 0xC2]); // ADD R10D, R8D
 

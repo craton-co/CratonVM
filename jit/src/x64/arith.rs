@@ -631,6 +631,8 @@ impl Compiler {
     pub(super) fn try_cmov_minmax_peephole(
         &mut self,
         code: &[u8],
+        code_len: usize,
+        branch_targets: &[bool],
         pc: usize,
         op: u8,
         val1: StackSlot,
@@ -707,6 +709,44 @@ impl Compiler {
         let mut inner = [a_local, b_local];
         inner.sort_unstable();
         if pair != inner {
+            return None;
+        }
+
+        // ---- Merge-point safety. ---------------------------------------
+        //
+        // The fusion consumes `pc..=l2_pc` and maps every PC in that span to
+        // the native offset AFTER the merged result is pushed. That is only
+        // sound when the span is entered through this `if_icmp` alone.
+        // javac's short-circuit conditions break it routinely:
+        // `(ok && a < b) ? a : b` makes the taken-side `iload` the target of
+        // the `ifeq` as well, and `(ok || a < b) ? b : a` does the same to the
+        // fall-through `iload`. A foreign edge into the span would skip the
+        // CMOV's result store and read a stale slot at L2.
+        //
+        // The operand loads must also be the instructions that produced
+        // `val1`/`val2`: `pc-2`/`pc-1` have to be instruction starts (a
+        // `sipush 0x1a1b` operand reads as two `iload`s) and must not be
+        // reachable from elsewhere, and neither may `pc` itself.
+        let is_target = |p: usize| branch_targets.get(p).copied().unwrap_or(true);
+        if is_target(pc - 1) || is_target(pc) || is_target(a_pc) || is_target(goto_pc) {
+            return None;
+        }
+        let edges = super::bce::branch_edges(code, code_len)?;
+        if edges.iter().any(|&(from, to)| to == b_pc && from != pc) {
+            return None;
+        }
+        let mut start = 0usize;
+        let mut starts_ok = (false, false);
+        while start < pc && start < code_len {
+            if start == pc - 2 {
+                starts_ok.0 = true;
+            }
+            if start == pc - 1 {
+                starts_ok.1 = true;
+            }
+            start += bytecode_len_at(code, start).max(1);
+        }
+        if start != pc || !starts_ok.0 || !starts_ok.1 {
             return None;
         }
 

@@ -1457,7 +1457,7 @@ fn negate_exit_cmp(cmp: ExitCmp) -> ExitCmp {
 /// `lookupswitch`, `jsr`/`ret`, `goto_w`/`jsr_w`). Sibling of
 /// `collect_i16_branch_targets`, which keeps only the targets; the entry-edge
 /// question below needs to know where an edge came *from*.
-fn branch_edges(code: &[u8], code_len: usize) -> Option<Vec<(usize, usize)>> {
+pub(super) fn branch_edges(code: &[u8], code_len: usize) -> Option<Vec<(usize, usize)>> {
     let mut edges = Vec::new();
     let code_len = code_len.min(code.len());
     let mut pc = 0usize;
