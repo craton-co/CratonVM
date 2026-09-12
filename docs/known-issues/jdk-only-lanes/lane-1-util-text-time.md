@@ -82,6 +82,110 @@ routing is now gated on `caller_is_app` — and the probe that caught it is in
 nobody's locale family. **A whole-tree differential is what makes a narrow
 fix safe to keep.**
 
+**THE ACCEPTANCE IS THE POST-MERGE PAIR.** dev moved 24 commits during this
+wave -- including two of the three files it touches and two re-freezes of the
+stub ratchet -- so the pre-merge control stopped being a control. Both
+binaries were rebuilt from one worktree, sequentially, and their sha256s
+differ:
+
+```text
+  control  cratonvm-l1w6-base2-20260912   origin/dev d9fe011ff   0c64eb0825fb056c
+  trial    cratonvm-l1w6-t4-20260912      this merge 8e2c4b229   a3f625e012f512b5
+```
+
+166 probes (dev's merge brought five more), fresh oracle, `--jdk-only`:
+
+```text
+  0 worse   3 better
+    L1BreakIterRealProbe      28 -> 0
+    L1LocaleProviderWorkload   8 -> 0
+    L1JarTextSweep            20 -> 18
+  base differing 44   trial differing 42
+```
+
+`VtHandoffProbe` did not move on this pair at all, and `CurrencyNameProbe` is
+back to 0 -- the two probes the pre-merge runs had flagged, one as noise and
+one as a real regression now gated.
+
+And the same pair in DEFAULT mode, all 166:
+
+```text
+  0 worse   2 better
+    L1BreakIterRealProbe      28 -> 16
+    L1JarTextSweep            38 -> 36
+  base differing 51   trial differing 51
+```
+
+`28 -> 16` and not `28 -> 0` is the whole point of running this arm: the
+sixteen that remain are exactly the `F.*` rows, so **the pin removal and the
+retirement change nothing in default mode** — a retired triple is re-tagged
+`SyntheticStub`, and a `SyntheticStub` still dispatches where there is no
+`--jdk-only` refusal. What default mode gets from this wave is the two
+repairs that were never mode-gated: the real provider chain (`P.*`) and
+`JarEntry.attr`.
+
+CORPUS, both binaries, interleaved:
+
+```text
+                              control      trial
+  jdk-only-strict-probes      FAIL         FAIL      <- both, and see below
+  regression-suite SUITE=all  133 / 133    133 / 133
+  regression-suite SUITE=core  93 /  93     93 /  93
+```
+
+The suite runs in DEFAULT mode unless `CRATONVM_ARGS` names `--jdk-only`, so
+those 226 vectors are this wave's second default-mode instrument and they
+agree with the tree.
+
+The pre-merge numbers below are kept because they are the ATTRIBUTION, not
+the acceptance: they are how each change was separated from the others.
+
+**THE STRICT ARM FAILS ON BOTH BINARIES, AND WAVE 5's DIAGNOSIS OF WHY IS NOW
+QUOTED RATHER THAN ASSERTED.** `jdk-only-strict-probes` is `RESULT: FAIL` on
+the control and on the trial, and every divergent line in both is the same
+shape:
+
+```text
+  +2026-09-12T02:02:55.079422Z  WARN cas_diag: T19_H6_CAS_DIAG cas_long FAIL #0
+     class=java/util/concurrent/ConcurrentHashMap slot=4
+     current=Long(3) expected=Long(4) new=Long(3)
+```
+
+A WARN carrying a wall clock, compared against a frozen baseline as if it
+were program output. It cannot match, and it appears only when a CAS
+contends — so WHICH probes carry it varies with host load (control 11 lines
+over 3 probes, trial 12 over 4, on a box at load 27). That arm cannot be
+green under contention whatever any lane does. It is a harness defect and it
+is nobody's lane; this page has now recorded it twice.
+
+
+GATES, on the merged tree:
+
+```text
+  native-api --lib                                   427 passed, 0 failed
+  native-collections --lib                           147 passed, 0 failed
+  native-builtins --test duplicate_registration_gate   8 passed, 0 failed
+  native-builtins --lib, the wave's own six tests      6 passed, 0 failed
+  native-builtins --test stub_ratchet, three arms    green after the re-freeze
+  rustfmt hunks inside this branch's added lines       0 of 39
+```
+
+RATCHET, re-measured on the merged tree and never carried across it:
+
+```text
+  BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT   2728 -> 2747
+  BASELINE_SYNTHETIC_STUBS_MANAGEMENT      2755 -> 2774
+  BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK   2728 -> 2747
+```
+
+`+19` on every arm, and the account is nineteen rows in two tables: all
+seventeen of `java/text/BreakIterator`, plus `LocaleData.getBundle` and
+`JRELocaleProviderAdapter.getLocaleServiceProvider`. Measured TWICE across
+the merge — before it, this branch printed 2630/2641/2630 against dev's
+2611/2622/2611; dev then re-froze twice more for other lanes and the arms
+were RE-RUN rather than incremented, giving the same `+19` over a control
+117 rows higher.
+
 **161 probes, both modes, per probe, on the PRE-MERGE pair:**
 
 ```text
