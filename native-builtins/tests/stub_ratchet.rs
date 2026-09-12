@@ -2348,7 +2348,16 @@ use cratonvm_types::compat::CompatibilityMode;
 /// REGISTRATIONS_*` are carried to the measured figures rather than left
 /// stale, which this file has already been caught doing twice -- once by 99
 /// and once by 13, and a stale total misclassifies the NEXT wave's failure.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4039;
+///
+/// # 2026-09-12, L1 wave 8 -- +156, third sitting -- control 4012/4039/4012, trial 4168/4195/4168
+///
+/// `dev` moved again between wave 8's re-measurement and its landing, and a
+/// sibling lane re-froze these three constants a second time. Resolved the
+/// same way, and for the same reason: keep BOTH notes and RE-MEASURE, because
+/// two deltas added together is arithmetic, not a measurement. The wave's own
+/// delta has been +156 -- exactly its table's row count -- in every arm of
+/// every sitting, with the totals unmoved.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4195;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2790,7 +2799,16 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4039;
 /// totals as `13586 / 13954 / 13621`, and left the three constants at the
 /// values from before it landed. The paired arm above measures the same three
 /// numbers with this wave's rows switched off, which is what says so.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 4012;
+///
+/// # 2026-09-12, L1 wave 8 -- +156, third sitting
+///
+/// `dev` moved again between wave 8's re-measurement and its landing, and a
+/// sibling lane re-froze these three constants a second time. Resolved the
+/// same way, and for the same reason: keep BOTH notes and RE-MEASURE, because
+/// two deltas added together is arithmetic, not a measurement. The wave's own
+/// delta has been +156 -- exactly its table's row count -- in every arm of
+/// every sitting, with the totals unmoved.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 4168;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -3101,7 +3119,16 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 4012;
 /// totals as `13586 / 13954 / 13621`, and left the three constants at the
 /// values from before it landed. The paired arm above measures the same three
 /// numbers with this wave's rows switched off, which is what says so.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 4012;
+///
+/// # 2026-09-12, L1 wave 8 -- +156, third sitting
+///
+/// `dev` moved again between wave 8's re-measurement and its landing, and a
+/// sibling lane re-froze these three constants a second time. Resolved the
+/// same way, and for the same reason: keep BOTH notes and RE-MEASURE, because
+/// two deltas added together is arithmetic, not a measurement. The wave's own
+/// delta has been +156 -- exactly its table's row count -- in every arm of
+/// every sitting, with the totals unmoved.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 4168;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
