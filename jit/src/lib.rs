@@ -39041,24 +39041,19 @@ mod tests {
         );
     }
 
-    /// The memoized invocation-counter key must stay bit-identical to the two
-    /// open-coded 31-multiplier loops it replaced in the interpreter -- the key
-    /// indexes `ProfileStore`'s per-method warmup counters, so a different value
-    /// would silently reset every method's tier-up progress.
+    /// The memoized invocation-counter key must be exactly the canonical
+    /// `invoc_key_parts` key every other door computes -- the key indexes
+    /// `ProfileStore`'s per-method warmup counters, so a door with a different
+    /// value would count a method's warmup in a counter nobody else reads.
     #[test]
     fn memoized_invoc_key_matches_the_open_coded_hash() {
         let cid = cratonvm_types::ClassId::new(7);
         let cached = probe_test_method("pkg/Hash", "someMethod", "(Ljava/lang/String;I)Z", cid);
-        let expected = {
-            let mut h = 0u32;
-            for &b in cached.method_name.as_bytes() {
-                h = h.wrapping_mul(31).wrapping_add(b as u32);
-            }
-            for &b in cached.method_descriptor.as_bytes() {
-                h = h.wrapping_mul(31).wrapping_add(b as u32);
-            }
-            ((cid.as_u32() as u64) << 32) | (h as u64)
-        };
+        let expected = cratonvm_jit_api::invoc_key_parts(
+            cid.as_u32(),
+            &cached.method_name,
+            &cached.method_descriptor,
+        );
         assert_eq!(cached.invoc_key(), expected);
         // Memoized: stable across calls.
         assert_eq!(cached.invoc_key(), expected);

@@ -2354,17 +2354,14 @@ pub fn execute(
                     // permanently-uncompiled. Opt-out (`CRATONVM_BG_COMPILE=0`) falls
                     // through to the historical eager/inline paths below.
                     if crate::runtime::env_cache::bg_compile() {
-                        let invoc_key = {
-                            let mut h = 0u32;
-                            for &b in method_name.as_bytes() {
-                                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: u8 → u32
-                            }
-                            for &b in method_descriptor.as_bytes() {
-                                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: u8 → u32
-                            }
-                            // Widening: u32 → u64 (value preserved)
-                            ((class_id.as_u32() as u64) << 32) | (h as u64)
-                        };
+                        // The canonical key, shared with every other door that
+                        // counts this method. This used to be an open-coded
+                        // 32-bit `31 * h` hash, under which overloads merged.
+                        let invoc_key = cratonvm_jit_api::invoc_key_parts(
+                            class_id.as_u32(),
+                            method_name,
+                            method_descriptor,
+                        );
                         let n = shared.jit.profile_store.increment_invocation(invoc_key);
                         let threshold = crate::runtime::env_cache::jit_invocation_threshold();
                         // The stride every dispatch door uses. This door had
@@ -2411,19 +2408,12 @@ pub fn execute(
                     // IR-incompatible bodies), then re-fetch the cached body. The
                     // single-pass block below is unreached while the flag is set.
                     if c2_first_call_enabled() {
-                        let invoc_key = {
-                            let mut h = 0u32;
-                            for &b in method_name.as_bytes() {
-                                // Widening: smaller value -> u32 (value fits)
-                                h = h.wrapping_mul(31).wrapping_add(b as u32);
-                            }
-                            for &b in method_descriptor.as_bytes() {
-                                // Widening: smaller value -> u32 (value fits)
-                                h = h.wrapping_mul(31).wrapping_add(b as u32);
-                            }
-                            // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
-                            ((class_id.as_u32() as u64) << 32) | (h as u64)
-                        };
+                        // The canonical key; see the background-compile twin above.
+                        let invoc_key = cratonvm_jit_api::invoc_key_parts(
+                            class_id.as_u32(),
+                            method_name,
+                            method_descriptor,
+                        );
                         let n = shared.jit.profile_store.increment_invocation(invoc_key);
                         if n < crate::runtime::env_cache::jit_invocation_threshold() {
                             c2_not_hot = true; // defer, do NOT seal (counter must keep running)

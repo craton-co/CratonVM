@@ -999,7 +999,7 @@ const INVOCATION_SHARDS: usize = 64;
 /// `parking_lot::Mutex`, so every Java method call in the VM serialised on a
 /// single lock (plus a hash probe) purely to bump a counter.
 struct InvocationShard {
-    counts: parking_lot::RwLock<FxHashMap<u64, AtomicU32>>,
+    counts: parking_lot::RwLock<FxHashMap<u128, AtomicU32>>,
 }
 
 impl InvocationShard {
@@ -1012,12 +1012,30 @@ impl InvocationShard {
 
 /// Shard index for a packed invocation key.
 ///
-/// The packed key is `(class_id << 32) | method_name_descriptor_hash`, so the
-/// low 32 bits are the well-distributed part; the high bits would cluster
-/// every method of one class into one shard.
+/// The packed key is `(class_id << 64) | fingerprint(name, descriptor)` (see
+/// `cratonvm_jit_api::invoc_key_parts`), so the low 64 bits are the
+/// well-distributed part; the high bits would cluster every method of one
+/// class into one shard.
 #[inline]
-fn invocation_shard_for(packed_key: u64) -> usize {
-    (packed_key as u32 as usize) & (INVOCATION_SHARDS - 1)
+fn invocation_shard_for(packed_key: u128) -> usize {
+    (packed_key as u64 as usize) & (INVOCATION_SHARDS - 1)
+}
+
+/// Add `n` to an invocation counter cell, pinning at `u32::MAX`.
+///
+/// A compare-and-swap loop, not `fetch_add` followed by `saturating_add` on the
+/// value it returned: that pair pinned the RETURNED value but let the cell
+/// itself wrap, so a batched door's 16-call credit or a long loop's work credit
+/// could carry a hot method's counter back through zero -- and a method below
+/// the threshold again is a method that stops being offered to the JIT.
+#[inline]
+fn saturating_add_cell(cell: &AtomicU32, n: u32) -> u32 {
+    match cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+        (c != u32::MAX).then(|| c.saturating_add(n))
+    }) {
+        Ok(previous) => previous.saturating_add(n),
+        Err(saturated) => saturated,
+    }
 }
 
 /// Increment an invocation counter cell, preserving the exact
@@ -1175,14 +1193,14 @@ impl ProfileStore {
 
     /// Reclaim every profile and warmup counter owned by an unloaded class.
     pub fn invalidate_class(&self, class_id: u32) {
-        // Sharded by the *low* 32 bits (see `invocation_shard_for`), so a
+        // Sharded by the *low* 64 bits (see `invocation_shard_for`), so a
         // class's methods are spread across every shard — all of them must be
         // swept. Cold path (class unloading), so the full walk is fine.
         for shard in &self.invocation_counts {
             shard
                 .counts
                 .write()
-                .retain(|packed, _| (*packed >> 32) as u32 != class_id);
+                .retain(|packed, _| (*packed >> 64) as u32 != class_id);
         }
         for shard in &self.shards {
             let mut methods = shard.methods.write();
@@ -1213,12 +1231,12 @@ impl ProfileStore {
     }
 
     /// Increment the invocation counter for a method identified by the packed key
-    /// `(class_id << 32) | method_hash`. Returns the new count.
+    /// `(class_id << 64) | fingerprint(name, descriptor)`. Returns the new count.
     ///
     /// Called from the interpreter's cached bytecode dispatch to gate JIT compilation
     /// behind a warmup threshold instead of compiling on the second invocation.
     #[inline]
-    pub fn increment_invocation(&self, packed_key: u64) -> u32 {
+    pub fn increment_invocation(&self, packed_key: u128) -> u32 {
         let shard = &self.invocation_counts[invocation_shard_for(packed_key)];
         // Fast path (every call after a method's first): shared read-lock, one
         // relaxed atomic RMW on the cell. Unrelated threads and unrelated
@@ -1247,21 +1265,17 @@ impl ProfileStore {
     /// `fetch_add`) and folds the count in here every few calls, so this
     /// store still sees every call for the census while the per-call path no
     /// longer takes a shard lock and a hash lookup.
-    pub fn add_invocations(&self, packed_key: u64, n: u32) -> u32 {
+    pub fn add_invocations(&self, packed_key: u128, n: u32) -> u32 {
         let shard = &self.invocation_counts[invocation_shard_for(packed_key)];
         {
             let read = shard.counts.read();
             if let Some(cell) = read.get(&packed_key) {
-                let prev = cell.fetch_add(n, Ordering::Relaxed);
-                return prev.saturating_add(n);
+                return saturating_add_cell(cell, n);
             }
         }
         let mut write = shard.counts.write();
         match write.get(&packed_key) {
-            Some(cell) => {
-                let prev = cell.fetch_add(n, Ordering::Relaxed);
-                prev.saturating_add(n)
-            }
+            Some(cell) => saturating_add_cell(cell, n),
             None => {
                 write.insert(packed_key, AtomicU32::new(n));
                 n
@@ -1286,7 +1300,7 @@ impl ProfileStore {
     /// long-running loop cannot instantly saturate the counter and drag in
     /// every method that merely happens to contain one.
     #[inline]
-    pub fn add_loop_work(&self, packed_key: u64, iterations: u32) -> u32 {
+    pub fn add_loop_work(&self, packed_key: u128, iterations: u32) -> u32 {
         let credit = iterations / LOOP_WORK_PER_INVOCATION;
         if credit == 0 {
             return 0;
@@ -1295,16 +1309,12 @@ impl ProfileStore {
         {
             let read = shard.counts.read();
             if let Some(cell) = read.get(&packed_key) {
-                return cell
-                    .fetch_add(credit, std::sync::atomic::Ordering::Relaxed)
-                    .saturating_add(credit);
+                return saturating_add_cell(cell, credit);
             }
         }
         let mut write = shard.counts.write();
         match write.get(&packed_key) {
-            Some(cell) => cell
-                .fetch_add(credit, std::sync::atomic::Ordering::Relaxed)
-                .saturating_add(credit),
+            Some(cell) => saturating_add_cell(cell, credit),
             None => {
                 write.insert(packed_key, AtomicU32::new(credit));
                 credit
@@ -1716,7 +1726,7 @@ impl ProfileStore {
     }
 
     /// Snapshot all invocation counts: returns (packed_key, count) pairs.
-    pub fn snapshot_invocation_counts(&self) -> Vec<(u64, u32)> {
+    pub fn snapshot_invocation_counts(&self) -> Vec<(u128, u32)> {
         // Not a single atomic snapshot across shards — it never was: the
         // pre-sharding version held one lock, but callers (diagnostics /
         // tiered-manager reporting) already tolerated counters advancing
@@ -2012,10 +2022,10 @@ mod tests {
         const PER_THREAD: u32 = 2_000;
         let store = Arc::new(ProfileStore::new());
         // Two keys that differ ONLY in the high (class_id) half: they must
-        // share a shard, since `invocation_shard_for` masks the low 32 bits.
+        // share a shard, since `invocation_shard_for` masks the low 64 bits.
         // This is the case most likely to expose a lost update.
-        let key_a = 0x0000_0001_DEAD_BEEFu64;
-        let key_b = 0x0000_0002_DEAD_BEEFu64;
+        let key_a: u128 = (1u128 << 64) | 0xDEAD_BEEF;
+        let key_b: u128 = (2u128 << 64) | 0xDEAD_BEEF;
         assert_eq!(
             invocation_shard_for(key_a),
             invocation_shard_for(key_b),
@@ -2065,7 +2075,7 @@ mod tests {
     #[test]
     fn invocation_counter_saturates_instead_of_wrapping() {
         let store = ProfileStore::new();
-        let key = 0x0BAD_C0DEu64;
+        let key: u128 = 0x0BAD_C0DE;
         // Seed the cell directly at MAX-1 rather than calling increment 4
         // billion times.
         {
@@ -2082,8 +2092,51 @@ mod tests {
         }
     }
 
+    /// The batched doors must pin the CELL, not only the value they return:
+    /// `fetch_add` let the cell wrap while the returned value saturated, so
+    /// the next read restarted a hot method's warmup from almost zero.
+    #[test]
+    fn batched_invocation_credit_saturates_the_cell() {
+        let store = ProfileStore::new();
+        let key: u128 = (3u128 << 64) | 0x00C0_FFEE;
+        {
+            let shard = &store.invocation_counts[invocation_shard_for(key)];
+            shard
+                .counts
+                .write()
+                .insert(key, AtomicU32::new(u32::MAX - 3));
+        }
+        assert_eq!(store.add_invocations(key, 16), u32::MAX);
+        assert_eq!(
+            store.add_invocations(key, 16),
+            u32::MAX,
+            "the cell itself stayed pinned instead of wrapping"
+        );
+        assert_eq!(store.add_loop_work(key, u32::MAX), u32::MAX);
+        assert_eq!(store.increment_invocation(key), u32::MAX);
+    }
+
+    /// Overloads must not share a counter. The old key folded name and
+    /// descriptor into 32 bits with `31 * h`, where short strings collide by
+    /// construction (`"Aa"` and `"BB"` hash alike).
+    #[test]
+    fn invocation_keys_separate_overloads_and_keep_the_class_id() {
+        let a = cratonvm_jit_api::invoc_key_parts(7, "m", "(IJ)V");
+        let b = cratonvm_jit_api::invoc_key_parts(7, "m", "(JI)V");
+        let c = cratonvm_jit_api::invoc_key_parts(7, "mI", "(J)V");
+        let d = cratonvm_jit_api::invoc_key_parts(7, "Aa", "()V");
+        let e = cratonvm_jit_api::invoc_key_parts(7, "BB", "()V");
+        assert_ne!(a, b);
+        assert_ne!(a, c, "the name/descriptor boundary is part of the fingerprint");
+        assert_ne!(d, e);
+        assert_eq!((a >> 64) as u32, 7, "the class id stays in the high half");
+        let store = ProfileStore::new();
+        store.increment_invocation(a);
+        assert_eq!(store.increment_invocation(b), 1, "an overload starts its own count");
+    }
+
     /// `invalidate_class` must sweep *every* shard: because the shard index
-    /// comes from the low 32 bits, one class's methods are spread across all
+    /// comes from the low 64 bits, one class's methods are spread across all
     /// of them. A single-shard sweep would leak counters for an unloaded
     /// class and let a recycled `class_id` inherit stale warmup state.
     #[test]
@@ -2091,12 +2144,12 @@ mod tests {
         let store = ProfileStore::new();
         // 256 methods of class 7 — with 64 shards this reliably populates
         // many distinct shards.
-        for m in 0..256u64 {
-            store.increment_invocation((7u64 << 32) | m);
+        for m in 0..256u128 {
+            store.increment_invocation((7u128 << 64) | m);
         }
         // A second class that must survive the sweep.
-        for m in 0..256u64 {
-            store.increment_invocation((9u64 << 32) | m);
+        for m in 0..256u128 {
+            store.increment_invocation((9u128 << 64) | m);
         }
         assert_eq!(store.snapshot_invocation_counts().len(), 512);
 
@@ -2105,7 +2158,7 @@ mod tests {
         let remaining = store.snapshot_invocation_counts();
         assert_eq!(remaining.len(), 256, "class 7 counters should all be gone");
         assert!(
-            remaining.iter().all(|(k, _)| (*k >> 32) as u32 == 9),
+            remaining.iter().all(|(k, _)| (*k >> 64) as u32 == 9),
             "only class 9 counters should remain"
         );
     }
@@ -2257,7 +2310,7 @@ mod tests {
             for i in 0..300u32 {
                 let key = make_key(i);
                 store.record_branch(&key, (i as usize) * 4, i % 2 == 0);
-                store.increment_invocation((i as u64) << 32);
+                store.increment_invocation((i as u128) << 64);
             }
             // Snapshot should show all 300 methods.
             let snap = store.snapshot_all();
