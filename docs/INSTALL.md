@@ -34,7 +34,7 @@ cratonvm --help
 
 ## Building from Source
 
-Requires **Rust 1.80+** and optionally **JDK 17+** (for compiling test Java classes).
+Requires **Rust 1.88+** and optionally **JDK 17+** (for compiling test Java classes).
 
 ```bash
 git clone https://github.com/craton-co/cratonvm.git

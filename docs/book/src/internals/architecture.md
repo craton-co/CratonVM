@@ -37,7 +37,7 @@ lints.)
 | `cratonvm-difftest` | `difftest/` | Differential-testing harness against a reference JDK |
 
 It is roughly **1.35 million lines of Rust**. The project
-builds on Rust **1.80+**
+builds on Rust **1.88+**
 (edition 2021).
 
 ## Dependency flow

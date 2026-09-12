@@ -18057,6 +18057,65 @@ struct EaScalarPlan {
     elide_alloc: bool,
 }
 
+/// Whether forwarding `value` from an array store straight to a load of
+/// element kind `load_kind` gives the load the value it would have read.
+///
+/// Wide element kinds (int, long, float, double, reference) store the value
+/// whole, so any value fits. A narrow kind truncates on store and re-extends on
+/// load, so the value must already be in range: a constant in range, the
+/// builder's own `i2b`/`i2s` (`(x << k) >> k`) or `i2c` (`x & 0xFFFF`) shape, or
+/// a load of the same narrow kind. A `boolean[]` (newarray atype 4) stores
+/// `value & 1`, so only 0/1 constants and compare results fit it.
+fn narrow_array_value_fits(
+    graph: &ir::Graph,
+    value: ir::NodeId,
+    load_kind: ir::MemKind,
+    array_atype: Option<u8>,
+) -> bool {
+    use ir::{MemKind, Op};
+    let Some(node) = graph.node_opt(value) else {
+        return false;
+    };
+    let const_of = |id: ir::NodeId| match graph.node_opt(id).map(|n| &n.op) {
+        Some(Op::Const(c)) => Some(*c),
+        _ => None,
+    };
+    if array_atype == Some(4) {
+        return match &node.op {
+            Op::Const(c) => matches!(*c, 0 | 1),
+            Op::Cmp(_) => true,
+            _ => false,
+        };
+    }
+    let (lo, hi, shift) = match load_kind {
+        MemKind::Byte => (i64::from(i8::MIN), i64::from(i8::MAX), Some(24)),
+        MemKind::Short => (i64::from(i16::MIN), i64::from(i16::MAX), Some(16)),
+        MemKind::Char => (0, i64::from(u16::MAX), None),
+        _ => return true,
+    };
+    match &node.op {
+        Op::Const(c) => (lo..=hi).contains(c),
+        Op::ArrayLoad(mk) => *mk == load_kind,
+        // `(x << k) >> k`: sign-extend the low 32 - k bits.
+        Op::Shr => shift.is_some_and(|k| {
+            node.inputs.len() >= 2
+                && const_of(node.inputs[1]) == Some(k)
+                && graph.node_opt(node.inputs[0]).is_some_and(|shl| {
+                    matches!(shl.op, Op::Shl)
+                        && shl.inputs.len() >= 2
+                        && const_of(shl.inputs[1]) == Some(k)
+                })
+        }),
+        // `x & 0xFFFF`.
+        Op::And => {
+            load_kind == MemKind::Char
+                && node.inputs.len() >= 2
+                && (const_of(node.inputs[1]) == Some(0xFFFF) || const_of(node.inputs[0]) == Some(0xFFFF))
+        }
+        _ => false,
+    }
+}
+
 /// Decide what may be done to one scalar-replacement candidate. Pure: it never
 /// mutates `ir_graph`. `None` refuses the object entirely (it stays allocated,
 /// its stores stay, its loads stay).
@@ -18195,6 +18254,24 @@ fn plan_scalar_replacement(
             // must never be guessed at, so fail closed rather than assume.
             escape_analysis::LoadResolution::Unknown => return None,
         };
+        // A narrow array slot stores a TRUNCATED value: `bastore` keeps the low
+        // byte (and `& 1` for a `boolean[]`), `castore`/`sastore` the low 16
+        // bits, and the matching load re-extends. Forwarding the stored node to
+        // the load skips both halves, so `sipush 300; bastore; ...; baload`
+        // read back 300 instead of 44. javac always narrows first (`i2b`,
+        // `i2c`, `i2s`), but other compilers need not; refuse unless the value
+        // provably already fits the slot.
+        if is_array {
+            if let Some(v) = value {
+                let load_kind = match &ir_graph.node_opt(l)?.op {
+                    ir::Op::ArrayLoad(mk) => *mk,
+                    _ => return None,
+                };
+                if !narrow_array_value_fits(ir_graph, v, load_kind, info.array_element_type) {
+                    return None;
+                }
+            }
+        }
         load_plans.push((l, value));
     }
     for &(l, _) in &load_plans {
@@ -26990,6 +27067,19 @@ fn try_compile_inner(
                     })
                     .unwrap_or_default();
 
+                // Latched BEFORE escape analysis, because lock elision deletes
+                // the evidence. `lower_inner` refuses precise deopt resume for a
+                // graph that still holds a `MonitorEnter`/`MonitorExit` (frame
+                // states carry no monitor stack), but elision marks the monitors
+                // `Op::Dead` first, so the check saw none: a guard deopt inside
+                // `synchronized (new Object()) { ... }` resumed precisely with no
+                // lock held and the interpreter's `monitorexit` threw
+                // IllegalMonitorStateException. See the use below.
+                let had_monitors = graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, ir::Op::MonitorEnter | ir::Op::MonitorExit));
+
                 // --- Escape analysis (Phase 41 + G46 wiring) ---
                 // Convert IR graph to escape analysis graph, run analysis,
                 // and apply scalar replacement / lock elision to the IR graph.
@@ -27405,6 +27495,12 @@ fn try_compile_inner(
                         other => other,
                     };
                     if let Some(mut compiled) = lowered {
+                        // A method that had monitors before lock elision may not
+                        // resume precisely, whatever the post-elision graph
+                        // shows; see `had_monitors`.
+                        if had_monitors {
+                            compiled.can_deopt_resume = false;
+                        }
                         // cov-06 residual: a surviving `Op::New` or
                         // `Op::NewArray` allocation call can fail (OOM, or a
                         // negative length for an array) and stash a pending
@@ -42531,5 +42627,67 @@ mod deferred_new_retry_gate_tests {
                 );
             },
         );
+    }
+}
+
+/// Regressions from the 2026-09-12 JIT review: array scalar replacement may
+/// forward a stored value to a narrow load only when the value already fits.
+#[cfg(test)]
+mod narrow_array_forwarding_tests {
+    use super::narrow_array_value_fits;
+    use crate::ir::{Graph, IrType, MemKind, NodeId, Op};
+
+    fn graph() -> Graph {
+        Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: 0,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+            receiver_param: None,
+        }
+    }
+
+    fn konst(g: &mut Graph, v: i64) -> NodeId {
+        g.add(Op::Const(v), IrType::Int, vec![], None)
+    }
+
+    #[test]
+    fn a_constant_must_be_in_the_slot_range() {
+        let mut g = graph();
+        let c300 = konst(&mut g, 300);
+        let c44 = konst(&mut g, 44);
+        let c_neg = konst(&mut g, -1);
+        assert!(!narrow_array_value_fits(&g, c300, MemKind::Byte, Some(8)), "300 does not fit a byte");
+        assert!(narrow_array_value_fits(&g, c44, MemKind::Byte, Some(8)));
+        assert!(!narrow_array_value_fits(&g, c_neg, MemKind::Char, Some(5)), "char is unsigned");
+        assert!(narrow_array_value_fits(&g, c300, MemKind::Short, Some(9)));
+        // Wide element kinds store the whole value.
+        assert!(narrow_array_value_fits(&g, c300, MemKind::Int, Some(10)));
+    }
+
+    #[test]
+    fn the_builders_own_narrowing_shapes_fit() {
+        let mut g = graph();
+        let x = g.add(Op::Param(0), IrType::Int, vec![], None);
+        let k24 = konst(&mut g, 24);
+        let shl = g.add(Op::Shl, IrType::Int, vec![x, k24], None);
+        let i2b = g.add(Op::Shr, IrType::Int, vec![shl, k24], None);
+        assert!(narrow_array_value_fits(&g, i2b, MemKind::Byte, Some(8)));
+        assert!(!narrow_array_value_fits(&g, i2b, MemKind::Char, Some(5)));
+        let mask = konst(&mut g, 0xFFFF);
+        let i2c = g.add(Op::And, IrType::Int, vec![x, mask], None);
+        assert!(narrow_array_value_fits(&g, i2c, MemKind::Char, Some(5)));
+        // An unnarrowed parameter fits no narrow slot.
+        assert!(!narrow_array_value_fits(&g, x, MemKind::Short, Some(9)));
+    }
+
+    #[test]
+    fn a_boolean_slot_takes_only_zero_or_one() {
+        let mut g = graph();
+        let one = konst(&mut g, 1);
+        let two = konst(&mut g, 2);
+        assert!(narrow_array_value_fits(&g, one, MemKind::Byte, Some(4)));
+        assert!(!narrow_array_value_fits(&g, two, MemKind::Byte, Some(4)), "boolean[] stores value & 1");
     }
 }

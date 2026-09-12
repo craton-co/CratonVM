@@ -4,7 +4,7 @@
 # MSRV — clippy uses this to avoid suggesting features unavailable on older toolchains.
 # Bumped 1.77 -> 1.80: the codebase already uses std APIs stabilised in 1.80
 # (so 1.77 never actually built), which clippy's incompatible_msrv lint flagged.
-msrv = "1.80"
+msrv = "1.88"
 
 # Allow slightly complex types in the JIT and GC crates
 type-complexity-threshold = 300

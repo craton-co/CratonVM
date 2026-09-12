@@ -7,7 +7,7 @@ installation see [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Prerequisites
 
-- **Rust 1.80+** — install via [rustup.rs](https://rustup.rs).
+- **Rust 1.88+** — install via [rustup.rs](https://rustup.rs).
 - **JDK 17+** *(optional)* — only needed to compile the Java test classes and
   to boot against a real `java.base`. CratonVM runs standalone (synthetic JDK)
   without one.
