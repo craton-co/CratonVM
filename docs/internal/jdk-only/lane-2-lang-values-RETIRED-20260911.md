@@ -103,7 +103,7 @@ Fixed, tests re-keyed to the JDK contract with new cases pinned to measured
 HotSpot rows. `RJdkSecurity` passes with `BigInteger` retired: the 2026-08-19
 screen result was this defect all along.
 
-### Fourteen `BigInteger` rows are held, and the held set is a RULE
+### Fourteen `BigInteger` rows were held on a RULE, and the rule expired
 
 ```text
   BigIntegerSweep   control (no table, JIT on)    0 differing lines
@@ -118,28 +118,28 @@ and `math_bignum.rs` registered an `Intrinsic` first which owns no slot and is
 reach bytecode — it wakes the dead loser, which returns **null** for a null
 argument where the real body throws. 3 of 27 refusals carried a survivor. The
 probe rows moved, so the wave *looked* measurable and retired nothing.
+**FIXED 2026-09-12** by deleting the three dead registrations.
 
 **The rest — the JIT dropped the helpful NPE message. BLOCKER CLEARED
-2026-09-11, and the rows still do not move.** Interpreted they were
-HotSpot-exact; once the body was JIT-compiled the `NullPointerException` arrived
-with no message at all. Fixed by `0d013f359` and retired as
+2026-09-11, and the RULE built on it was refuted 2026-09-12.** Interpreted they
+were HotSpot-exact; once the body was JIT-compiled the `NullPointerException`
+arrived with no message at all. Fixed by `0d013f359` and retired as
 [`../fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`](../fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md),
 pinned by `vm/tests/jit_npe_message_hot_equals_cold.rs`.
 
-Clearing the blocker is not the same as retiring the rows, and the JIT lane said
-so in this page before it moved: **the hold is STRUCTURAL** — every
-reference-argument row, not the six that happened to regress — so lifting it owes
-the same `BigIntegerSweep` measurement with the JIT on that put it there. This
-lane did not re-take it, so the 14 rows stay held and the tally in §5 stands.
+This lane then made the hold STRUCTURAL — every reference-argument row, not the
+six that happened to regress — because which rows showed the defect varied
+between runs. That generalisation was the right shape and the wrong contract.
+Asked of the oracle at the same heat, HotSpot 25.0.4+7 drops the message on **9
+of 15** hot rows under default flags and on **0 of 15** with
+`-XX:-OmitStackTraceInFastThrow`, and which nine changes between runs of the
+same class file. `OmitStackTraceInFastThrow` lets C2 throw a preallocated
+exception with neither message nor stack trace, so the variance this lane
+measured is the oracle's own.
 
-**Which rows show it moves between runs**, so the hold is structural rather than
-copied out of one diff: six rows regressed on the 24-triple binary, and
-`modInverse`/`modPow` regressed instead on the 13-triple one — the same defect on
-different rows, because which bodies the JIT has compiled by the time the probe's
-null section runs is not fixed. **A row is exposed if its real body can
-dereference a null reference ARGUMENT**, so wave 1 retires only signatures that
-take none, and the guard asserts that over the TABLE rather than over a list of
-names.
+**All 14 rows retired 2026-09-12**, 0 differing from HotSpot on both arms of a
+two-binary A/B, +14 refusals and 0 survivors in the report. Record:
+[`lane-2-biginteger-held-rows-and-inert-retirements-FIXED-20260912.md`](lane-2-biginteger-held-rows-and-inert-retirements-FIXED-20260912.md).
 
 ## 3. Wave 2 — 37 rows, and a defect the shadows were hiding
 
@@ -201,7 +201,7 @@ corpus, against a 40/40 baseline taken on the same binary.
 | `java/lang/SecurityManager` | 13 | **40/0** | the exec/Panama security model |
 | `StackWalker` + `StackFrameInfo` + `StackTraceElement` | 23 | 38/2 `RJdkReflect` `RJdkLogging` | frame-walk state |
 | `java/lang/Runtime` + `Shutdown` | 11 | 39/1 `RJdkJni` | native library loading |
-| `java/math/BigInteger`, held per-triple | 14 | — | survivor / JIT NPE (§2) |
+| ~~`java/math/BigInteger`, held per-triple~~ **RETIRED 2026-09-12** | 14 | **41/0** | none — the rule's premise was false (§2) |
 
 **Four of those arms are corpus-clean and three are blocked anyway.** That is the
 most important line on this page. `java/lang/ref/` is the campaign's own worked
@@ -273,18 +273,21 @@ where retiring is a defect.
 
 ## 6. What this lane hands on
 
-- ~~**The JIT drops JEP 358's helpful NPE message** in compiled code.~~ FIXED
-  2026-09-11 by `0d013f359` (`probes/L2JitNpeProbe.java`, now six shapes, and
-  `vm/tests/jit_npe_message_hot_equals_cold.rs`). The 14 `BigInteger` rows it
-  blocked are still held: the rule is "no reference parameter", which was
-  derived from rows MOVING between runs, and nobody has re-measured with the
-  defect gone. That re-measurement is the whole of what is left here.
-- **Five `java/util/logging` triples are INERT.** The full refusal report on the
-  final binary reads 2029 refusals, 7 rows / 5 distinct triples with a survivor,
-  all `java/util/logging`, none in lane 2 — an older `phases_early.rs` intrinsic
-  still owns the slot after the 2026-08-11 retirement refuses the bridge, so the
-  real bytecode never runs. Same shape as this lane's `BigInteger` survivor, in
-  an already-landed wave.
+- ~~**The JIT drops JEP 358's helpful NPE message** in compiled code, and the 14
+  `BigInteger` rows it blocked are still held.~~ The VM defect was FIXED
+  2026-09-11 by `0d013f359`. The re-measurement was taken 2026-09-12 and
+  **refuted the rule's premise**: HotSpot drops the message in compiled code too,
+  on 9 of 15 rows under default flags, non-deterministically. All 14 rows are
+  retired. Record:
+  [`lane-2-biginteger-held-rows-and-inert-retirements-FIXED-20260912.md`](lane-2-biginteger-held-rows-and-inert-retirements-FIXED-20260912.md).
+- ~~**Five `java/util/logging` triples are INERT.**~~ FIXED 2026-09-12 with this
+  lane's own `BigInteger` survivor, because they are one defect: an older
+  `phases_early.rs` `Intrinsic` still owned the slot after the 2026-08-11
+  retirement refused the bridge, so the real bytecode never ran. All five
+  registrations were dead in compatible mode in all three feature arms and were
+  deleted. The report on the fixed binary reads **0 survivors** where it read 7
+  rows / 5 triples. What was missing was an instrument, not a diagnosis:
+  `no_retired_triple_survives_the_strict_boot` now asks on every commit.
 - ~~**`Package.getPackages()` returns empty**, on the control and after the
   retirement alike — so it is neither caused nor fixed here. 2 probe rows.~~
   **FIXED 2026-09-11**, and the reason the retirement could not move it is worth
@@ -296,10 +299,21 @@ where retiring is a defect.
   `BootLoader` natives. 0 -> 35 on both arms against HotSpot's 91, and the triple
   has LEFT `RETIRED_SHADOW_L2_TRIPLES` because nothing registers it any more.
   Record: `package-getpackages-answered-empty-FIXED-20260911.md`.
-- **`the_drift_baseline_has_no_stale_rows` is red on `origin/dev`**, from lane
-  0's `Class.getModule` `Intrinsic` re-tag. Attributed and recorded in
-  `bug-two-drift-gates-are-red-on-pristine-dev-from-a-class-parameterised-registrar-20260822.md`.
-- **Lane 0's L2 row** should read 390/57/279.
+- ~~**`the_drift_baseline_has_no_stale_rows` is red on `origin/dev`**, from lane
+  0's `Class.getModule` `Intrinsic` re-tag.~~ **GREEN as of 93ca8d5c3.** Measured
+  2026-09-12 while retiring the `BigInteger` rows: `registrar_drift` is 7 passed /
+  0 failed in all three feature arms, and that file holds exactly seven `#[test]`
+  functions, of which this is one — so the pass is this row's and not a filtered
+  run's. Nothing in this lane fixed it; it is recorded here because a handoff that
+  names a red owes the reader the fact that the red is gone.
+  `bug-two-drift-gates-are-red-on-pristine-dev-from-a-class-parameterised-registrar-20260822.md`
+  keeps the history.
+
+  Worth keeping for the method: the whole of `native-builtins`' gate set read
+  "one red, and it is dev's" for months while `cargo test --tests` stopped at
+  `lock_discipline_ratchet` and never compiled `registrar_drift` at all. This row
+  could have been green for weeks without anyone being able to tell.
+- ~~**Lane 0's L2 row** should read 390/57/279.~~ It does, as of the retirement commit — `lane-0-integration-and-gates.md` line 67. The three numbers are a POPULATION (390 shadows over 57 classes, 279 sites) and so do not move when rows retire.
 
 ## 7. Acceptance
 

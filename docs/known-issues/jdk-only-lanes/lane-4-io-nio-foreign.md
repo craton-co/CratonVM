@@ -167,7 +167,7 @@ single-dump census and undercounts a class whose rows only one workload reaches.
 | blocked: lane T owns `concrete_receiver.rs:185` | 49 |
 | blocked: `java/nio/file/Files`, armed 4, above the floor | 39 |
 | deferred: `java/io/PrintStream`, its own wave (§5) | 30 |
-| **backed out by a build** (five families, §9.2) | **51** |
+| **backed out by a build** (four families, §9.2; CharBuffer's 17 taken as wave 4) | **34** |
 | blocked: `Path` carrier is stamped with the interface | 11 |
 | reviewed `Intrinsic` | 10 |
 | **total** | **1 254** |
@@ -198,7 +198,9 @@ the real bodies take their window from `position()`/`limit()`, which this VM's
 carrier does not keep where the real accessors read them).
 
 `java/nio/ByteBuffer`'s 34 rows — same accessors, same probe — moved nothing.
-CharBuffer is a carrier defect, not a buffer-wide one.
+CharBuffer is a carrier defect, not a buffer-wide one. **Taken as wave 4 on
+2026-09-12, and the diagnosis in that last sentence was wrong: the carrier is
+fine and has been since 2026-08-06. See below.**
 
 **Use the dial to BOUND a wave. Never to certify one.**
 
@@ -322,9 +324,15 @@ because the dial could not read a clean floor until they were:
 * **479 rows no probe in this tree reaches**, minus the 146 wave 2 moved out of
   that bucket in one pass -- see §9.7, which is what "the cheapest half" was
   worth.
-* **The five backed-out families (51).** All five are blocked on the same thing:
-  a fabricated carrier whose real fields this VM never writes. §9.4 is what
-  fixing one looks like, and it is the unlock — not retrying the retirement.
+* **The four backed-out families that are left (34).** This said FIVE, and
+  said all five were the same thing — a fabricated carrier whose real fields
+  this VM never writes. Wave 4 took `java/nio/CharBuffer` (17) and found that
+  claim false for it: the carrier was repaired on 2026-08-06 and the row that
+  actually broke was a METHOD CONTRACT, `toString(int, int)`, held to two
+  different index conventions by two natives that only ever talked to each
+  other. §9.15 is what that looks like and §9.4 is what a carrier defect looks
+  like; **read a family's own measurement before assuming which of the two it
+  is.**
 * **`java/nio/file/Path` (11) and, behind it, `FileSystemProvider`.** One defect
   and a measured order: the Path carrier is stamped with the INTERFACE, so
   `toString()` lands on `Object.toString()` and no `instanceof UnixPath` in the
@@ -709,3 +717,123 @@ downstream of the preseed §9.10 names: comparing two structs compares their
 MEMBERS, and the members are the preseeded `ValueLayout` constants whose
 `carrier` `make_prepared_value_layout` never writes. Strict drops that preseed
 and runs the real `<clinit>`, which is the whole of the gap.
+
+---
+
+### Wave 4 -- 2026-09-12, 17 rows over `java/nio/CharBuffer`
+
+`RETIRED_SHADOW_L4_CHARBUFFER_TRIPLES`. No new prefix: `java/nio/` was admitted
+by wave 1, which retires this class's 34-row `java/nio/ByteBuffer` twin under
+it. The prefix was never the decision.
+
+### 9.14 The family §9.2 backed out, and what re-measuring it found
+
+§9.2 lost this family on wave 1's first build: armed, `subSequence(1, 3)`
+answered `cd` where the oracle says `bc`, and the lane page wrote that down as a
+carrier whose `position`/`limit` the real accessors could not read. **The
+carrier is fine.** `native-builtins/src/phases_late/charset_buffers.rs` mints
+`java/nio/HeapCharBuffer` -- the real CONCRETE class -- at every producer, and
+has since `4ba4f312b` (2026-08-06, *"CharBuffer.wrap stamped the abstract class,
+so subSequence checked nothing"*), five weeks before §9.2 was written.
+
+So the first thing wave 4 measured was the family as it stands, against
+`apps/probes/L4CharBufferSweep.java` and HotSpot 25 on linux/x86_64:
+
+```text
+  L4CharBufferSweep, 261 rows                       rows differing
+    control (origin/dev bdb02d94e), --jdk-only            0
+    control, compatible                                   0
+    control, --jdk-only, dial armed on the family         0
+```
+
+Three arms clean, the dial reporting `reached=1913 yielded=1913 leaked=0`. On
+that evidence the wave is a pure §1.4 shadow removal: seventeen natives in
+front of real bodies that answer identically.
+
+**It is not, and the dial is why.** §9.2's own rule -- *use the dial to BOUND a
+wave, never to certify one* -- earns its keep here in the direction that is
+hardest to see: the dial's decline is conditional, `subSequence` and
+`toString(int, int)` are ABSTRACT on `java/nio/CharBuffer` and so can never be
+declined, and those two are exactly where the defect lives. A table has no such
+fallback. Retired, the same probe moves **twelve rows**.
+
+### 9.15 `toString(int, int)` had two conventions, and owned both ends of each
+
+The twelve are one defect, bisected to one row in one pass with
+`CRATONVM_UNRETIRE_NATIVE_SHADOW` -- seventeen runs, sixteen of them still at
+12 diffs and `toString()Ljava/lang/String;` alone at 0.
+
+The JDK's `CharBuffer.toString()` is one line, `toString(position(), limit())`,
+and every real `toString(int, int)` under it takes ABSOLUTE buffer indices:
+`HeapCharBuffer` is `new String(hb, start + offset, end - start)`,
+`StringCharBuffer` is `str.subSequence(start + offset, end + offset)`. This VM
+had TWO conventions for that one method, picked by the receiver's class name:
+absolute for a `StringCharBuffer`, and **relative to the position** for
+everything else -- with its own `toString()` passing `0, limit - position` to
+the second one to compensate.
+
+```text
+  b = allocate(6); put("abcdef"); clear(); position(2); limit(5)
+
+    HotSpot                b.toString()  ->  toString(2, 5)  ->  "cde"
+    retired, pre-fix       b.toString()  ->  toString(2, 5)  ->  hb[2+2 .. 2+5]  ->  "ef"
+```
+
+Twelve rows, every one of them off by exactly `position`: `subSequence`
+followed by `toString`, a windowed `toString`, the reflective route, a
+read-only window, a `slice`'s window, a `wrap(char[], int, int)`'s window, and a
+lone surrogate whose window moved off it.
+
+**This is the lane's oldest lesson arriving in a new shape.** Three waves have
+now paid for *a carrier minted on its real class must hold what that class
+declares, in the declared type*. The general form is about agreement, not about
+fields: **a native that owns both ends of a convention agrees with itself
+whatever the convention is, and only real bytecode is a second opinion.** Here
+the convention was an argument's meaning rather than a field's type, and the
+retirement is what put a real body on one end of it.
+
+The receiver-class split went with the fix. It was added in August so that the
+reflective route -- which resolves `toString()` against the DECLARING class --
+and a bytecode `invokevirtual` would agree on a `StringCharBuffer`; with one
+convention there is nothing left for them to disagree about. `ts.wrapSR
+.reflective` and `ts.heap.reflective` are the two probe rows that hold both
+routes to it.
+
+### 9.16 Acceptance
+
+`apps/probes/L4CharBufferSweep.java`, 261 rows, oracle stable over three
+captures. Four arms, three binaries, all built from this worktree:
+
+```text
+  L4CharBufferSweep, --jdk-only, 261 rows            rows differing
+    A  control (origin/dev bdb02d94e)                      0
+    B  the table, WITHOUT the fix                         12
+    C  the fix + the table                                 0
+    D  the fix, table un-retired (SAME binary as C)        0
+```
+
+Arm D is C with `CRATONVM_UNRETIRE_NATIVE_SHADOW=java/nio/CharBuffer`, whose arm
+report prints `17 table row(s)` -- the receipt that it armed this table and not
+a neighbour under the same prefix. Compatible mode is 0 on the control and 0 on
+the wave, which is what a mode-blind re-tag should do: `SyntheticStub` is
+allowed in compatible mode, so the native still wins there and nothing moves.
+
+**The funnel: 17 of 17, none cold.** Every row is invoked by the probe under
+`--nojit CRATONVM_DISABLE_INTRINSICS=1`, which is what makes the census's
+`invocations_complete: true` mean what it says. `session()` and `checkSession()`
+are package-private `java.nio.Buffer` internals no probe can call by name; they
+are reached 5 and 149 times as callees, which is how the JDK reaches them too.
+
+`hasArray()Z` was the one row the funnel nearly lost, and for a reason worth
+recording: called through a lambda it answered correctly with `invocations: 0`
+-- the answer came from somewhere the registry never saw -- and called plainly
+off a local the same triple reads 5. The probe now asks in both shapes
+(`direct()`), because a funnel that cannot show a row was invoked must not take
+that row.
+
+**Eighteen rows clear the §1.4 bucket test and seventeen are in the table.**
+`charAt(I)C` is the eighteenth and is carved out by the re-tag's own condition:
+`NativeMethodRegistry::register` re-tags a retired triple only when the
+effective category is `Bridge`, and `charAt` is registered as an `intrinsic`. A
+row for it would be inert by construction, which is a different reason from the
+FFM waves' `varHandle` carve-out and is asserted separately.

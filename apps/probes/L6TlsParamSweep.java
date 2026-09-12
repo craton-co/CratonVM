@@ -45,6 +45,13 @@ public class L6TlsParamSweep {
         }
     }
 
+    static String[] sortedArr(String[] a) {
+        if (a == null) return new String[0];
+        String[] c = a.clone();
+        Arrays.sort(c);
+        return c;
+    }
+
     static String sorted(String[] a) {
         if (a == null) return "null";
         String[] c = a.clone();
@@ -448,6 +455,44 @@ public class L6TlsParamSweep {
         tv("SSLKeyException is SSLException", () -> new SSLKeyException("m") instanceof SSLException);
         tv("SSLProtocolException is SSLException", () -> new SSLProtocolException("m") instanceof SSLException);
         tv("SSLException is IOException", () -> new SSLException("m") instanceof java.io.IOException);
+
+        // ---- the lists, asked of the VM about ITSELF
+        //
+        // Appended at the END so every row number above keeps its identity.
+        //
+        // The suite and protocol lists above cannot match HotSpot's — this
+        // VM's TLS is rustls and supports a different set, which the lane's
+        // retirement record calls out as not a defect to fix by lying about
+        // the list. But "the list is different" and "the VM gives two
+        // different answers to the same question" are not the same claim, and
+        // only the second is measurable without settling the first. Every row
+        // here is `true` on HotSpot BY CONSTRUCTION — it asks one JSSE
+        // whether it agrees with itself — so a `false` is this VM's own
+        // internal contradiction and nothing to do with which suites rustls
+        // implements.
+        tv("agree: SSLContext supported == SSLSocketFactory supported", () ->
+            Arrays.equals(
+                sortedArr(SSLContext.getDefault().getSupportedSSLParameters().getCipherSuites()),
+                sortedArr(((SSLSocketFactory) SSLSocketFactory.getDefault()).getSupportedCipherSuites())));
+        tv("agree: SSLSocketFactory default == SSLServerSocketFactory default", () ->
+            Arrays.equals(
+                sortedArr(((SSLSocketFactory) SSLSocketFactory.getDefault()).getDefaultCipherSuites()),
+                sortedArr(((SSLServerSocketFactory) SSLServerSocketFactory.getDefault()).getDefaultCipherSuites())));
+        tv("agree: SSLEngine enabled == SSLEngine supported", () -> {
+            SSLContext c = SSLContext.getInstance("TLS");
+            c.init(null, null, null);
+            SSLEngine e = c.createSSLEngine();
+            return Arrays.equals(sortedArr(e.getEnabledCipherSuites()),
+                                 sortedArr(e.getSupportedCipherSuites()));
+        });
+        tv("agree: SSLSocket supported protocols == SSLEngine supported protocols", () -> {
+            SSLContext c = SSLContext.getInstance("TLS");
+            c.init(null, null, null);
+            SSLSocket s = (SSLSocket) ((SSLSocketFactory) SSLSocketFactory.getDefault()).createSocket();
+            String[] a = sortedArr(s.getSupportedProtocols());
+            s.close();
+            return Arrays.equals(a, sortedArr(c.createSSLEngine().getSupportedProtocols()));
+        });
 
         System.out.println("rows " + rows);
         System.out.println("DONE L6TlsParamSweep");

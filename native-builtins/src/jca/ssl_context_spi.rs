@@ -797,3 +797,82 @@ mod registrar_tests {
         );
     }
 }
+
+/// The `SSLContext`s this crate's `getInstance` minted and nobody has
+/// `init`ed, by identity hash.
+///
+/// **Not a field.** The obvious place is slot 1, which both live
+/// `getInstance` registrations already write `Int(0)` into and `init` writes
+/// `Int(1)` into. MEASURED: the gate built on that read never fired —
+/// `L6TlsParamSweep` rows 64 and 65 were unchanged by a trial binary that had
+/// it. Slot 1 of a REAL `javax.net.ssl.SSLContext` is the `contextSpi`
+/// REFERENCE (`javap -p`, JDK 25), and `try_alloc_concurrent_synthetic`
+/// upsizes a synthetic allocation to the real class's layout in real-JDK
+/// mode, so an `Int` written there is not an `Int` when it is read back. The
+/// two existing writes are equally inert; they are left alone because
+/// `jca::ssl_context_spi::context_owner` tests that slot for a foreign SPI
+/// and this wave is not re-deciding that.
+///
+/// A stale entry can only be produced by a context that was minted, never
+/// initialised, and then collected — and it can only refuse a LATER context
+/// that reused its identity hash and was itself never initialised, which is a
+/// call HotSpot refuses too. The failure mode of the opposite arrangement
+/// ("initialised" set, refuse when absent) is a false refusal of every
+/// context this crate did not mint, which is much worse.
+///
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Held for one set
+/// operation, after `identity_hash_code` has produced the key, and dropped
+/// before anything re-enters Java.
+fn uninitialized_contexts(
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<i32>> {
+    static T: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<i32>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            std::collections::HashSet::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
+}
+
+/// Called by every `SSLContext.getInstance` registration: the context exists
+/// and is not usable yet.
+pub(crate) fn mark_context_uninitialized(ctx: &dyn NativeContext, this: ObjectRef) {
+    let ih = ctx.identity_hash_code(this);
+    if ih != 0 {
+        uninitialized_contexts().lock().insert(ih);
+    }
+}
+
+/// Called by `init`, and by `getDefault`, whose context is pre-initialised.
+pub(crate) fn mark_context_initialized(ctx: &dyn NativeContext, this: ObjectRef) {
+    let ih = ctx.identity_hash_code(this);
+    if ih != 0 {
+        uninitialized_contexts().lock().remove(&ih);
+    }
+}
+
+/// Refuse a factory or engine request from an `SSLContext` nobody `init`ed.
+///
+/// `sun.security.ssl.SSLContextImpl` guards `engineGetSocketFactory`,
+/// `engineGetServerSocketFactory` and `engineCreateSSLEngine` with
+/// `checkInitialized`. MEASURED on HotSpot 25.0.4+7 —
+/// `SSLContext.getInstance("TLS").getSocketFactory()` is
+/// `IllegalStateException: SSLContext is not initialized`, and CratonVM handed
+/// back a working factory whose key and trust managers were never installed:
+/// a caller whose `init()` threw and was swallowed got no signal at all.
+pub(crate) fn require_context_initialized(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let ih = ctx.identity_hash_code(this);
+    let uninitialized = ih != 0 && uninitialized_contexts().lock().contains(&ih);
+    if uninitialized {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "SSLContext is not initialized".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}

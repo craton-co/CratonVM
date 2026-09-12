@@ -882,6 +882,24 @@ fn url_str_field(
     None
 }
 
+/// The port `java.net.URLStreamHandler.getDefaultPort()` reports for a
+/// protocol, or `-1` for one that has none.
+///
+/// `URL.equals`, `URL.sameFile` and `URL.hashCode` all substitute this for an
+/// absent port before comparing — `http://h:80/p` and `http://h/p` are EQUAL
+/// on HotSpot and hash alike — so the canonical key below has to do the same.
+/// Shared with `net_phase_e`'s `URL.getDefaultPort()` registration, which used
+/// to be the only copy of this table.
+pub(crate) fn url_default_port(protocol: &str) -> i32 {
+    match protocol.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        "ftp" => 21,
+        "gopher" => 70,
+        _ => -1,
+    }
+}
+
 /// Canonical key for `URL.equals`/`hashCode`: the URL's external form,
 /// reconstructed from the protocol/host/port/file/ref fields.
 ///
@@ -924,9 +942,19 @@ fn url_external_form(ctx: &mut dyn NativeContext, url: ObjectRef) -> String {
     if !host.is_empty() {
         out.push_str("//");
         out.push_str(&host);
-        if port >= 0 {
+        // The EFFECTIVE port, always emitted. An absent port is the
+        // protocol's default one (`URLStreamHandler.sameFile`/`hashCode`
+        // both substitute it), so writing the literal text back would make
+        // `http://h:80/p` a different key from `http://h/p` — which is what
+        // `L6UrlSweep` scored on three rows: equals, hashEq and sameFile.
+        let effective = if port >= 0 {
+            port
+        } else {
+            url_default_port(&proto)
+        };
+        if effective >= 0 {
             out.push(':');
-            out.push_str(&port.to_string());
+            out.push_str(&effective.to_string());
         }
     }
     out.push_str(&file);
@@ -1248,6 +1276,17 @@ pub(crate) fn uri_first_char_fault(s: &str) -> Option<(usize, UriCharFault)> {
             }
             continue;
         }
+        // `#` is the fragment delimiter and a URI has at most ONE: the JDK
+        // takes everything after the first one as the fragment and scans it
+        // against a set that does not contain `#`. MEASURED on HotSpot
+        // 25.0.4+7 — `new URI("http://h/p#a#b")` is `Illegal character in
+        // fragment at index 12`, and `http://h/p?q#f#g` at index 14.
+        if c == '#' {
+            if Some(i) == s.find('#') {
+                continue;
+            }
+            return Some((i, UriCharFault::Illegal));
+        }
         let ok = c.is_ascii_alphanumeric()
             || matches!(
                 c,
@@ -1256,8 +1295,6 @@ pub(crate) fn uri_first_char_fault(s: &str) -> Option<(usize, UriCharFault)> {
                 // reserved (RFC 2396 + RFC 2732 host brackets)
                 | ';' | '/' | '?' | ':' | '@' | '&' | '=' | '+' | '$' | ','
                 | '[' | ']'
-                // fragment delimiter
-                | '#'
             );
         if !ok {
             return Some((i, UriCharFault::Illegal));
@@ -1722,6 +1759,143 @@ pub(crate) fn uri_ipv6_authority_fail(s: &str) -> Option<UriParseFail> {
     None
 }
 
+/// The component `java.net.URI` names when an illegal character sits at `pos`.
+///
+/// The JDK names the COMPONENT the offending character sits in, not the URI as
+/// a whole. MEASURED 2026-08-13 (/tmp/W2.java) — five distinct names, and the
+/// boundaries are the delimiters themselves:
+///
+/// ```text
+///   htt<p://h/      Illegal character in scheme name at index 3
+///   //auth<x/p      Illegal character in authority   at index 6
+///   http://h/pa<th  Illegal character in path        at index 11
+///   http://h/p?q<1  Illegal character in query       at index 12
+///   http://h/p#f<1  Illegal character in fragment    at index 12
+/// ```
+///
+/// A relative `/pa<th` with no scheme and no authority is still "path", so the
+/// component is decided by position, not by what the URI has.
+fn uri_illegal_component(s: &str, pos: usize) -> &'static str {
+    let frag = s.find('#');
+    let query = s.find('?').filter(|q| frag.is_none_or(|f| *q < f));
+    let scheme_end = s.find(':').filter(|c| {
+        s[..*c]
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "+-.".contains(ch))
+            && s[..*c].starts_with(|ch: char| ch.is_ascii_alphabetic())
+    });
+    let auth_start = s.find("//").map(|st| st + 2);
+    let auth_stop = auth_start.map(|st| {
+        s[st..]
+            .find(['/', '?', '#'])
+            .map(|r| st + r)
+            .unwrap_or(s.len())
+    });
+    if frag.is_some_and(|f| pos > f) {
+        "Illegal character in fragment"
+    } else if query.is_some_and(|q| pos > q) {
+        "Illegal character in query"
+    } else if scheme_end.is_some_and(|c| pos < c) {
+        "Illegal character in scheme name"
+    } else if auth_start.is_some_and(|st| pos >= st) && auth_stop.is_some_and(|e| pos < e) {
+        "Illegal character in authority"
+    } else {
+        "Illegal character in path"
+    }
+}
+
+/// Every refusal `new URI(String)` owes, **in the order the JDK raises them**.
+///
+/// This exists because the rule had two doors. `URI.create(String)` is
+/// documented as `new URI(str)` with the checked exception translated, and it
+/// carried its OWN transcription of this ladder in `net_phase_e.rs`: a
+/// different order, four of the seven checks, and one catch-all message
+/// (`Illegal character in URI at index 9`) where the constructor names the
+/// component. `L6UriSweep` scored that as four differing rows and the file's
+/// own comments had already predicted it twice ("both doors owe the same
+/// refusals"). One function, two callers, no third transcription.
+pub(crate) fn uri_parse_fail(s: &str) -> Option<UriParseFail> {
+    // Scheme name first — the real JDK parser validates it before anything
+    // else (see `uri_scheme_name_fail_index`).
+    if let Some((pos, reason)) = uri_scheme_name_fail_index(s) {
+        return Some(UriParseFail::at(reason, pos));
+    }
+    if let Some(pos) = uri_closing_bracket_fail_index(s) {
+        return Some(UriParseFail::at(
+            "Expected closing bracket for IPv6 address",
+            pos,
+        ));
+    }
+    let strict = crate::nbflags().uri_strict_chars;
+    let illegal = if strict {
+        uri_first_char_fault(s)
+    } else {
+        s.char_indices()
+            .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
+            .map(|(i, _)| (i, UriCharFault::Illegal))
+    };
+    match illegal {
+        // A `%` that does not begin a `%` HEX HEX triple is its OWN reason in
+        // the JDK, produced by `Parser.scanEscape` before any
+        // component-specific character check runs.
+        Some((pos, UriCharFault::MalformedEscape)) => {
+            return Some(UriParseFail::at("Malformed escape pair", pos));
+        }
+        Some((pos, UriCharFault::Illegal)) => {
+            return Some(UriParseFail::at(uri_illegal_component(s, pos), pos));
+        }
+        None => {}
+    }
+    // Runs AFTER the generic character check on purpose: HotSpot scans the
+    // authority against its character set first, so `http://[abc]<>/p` is an
+    // illegal-character failure and only a character-clean authority reaches
+    // `parseServer`. See `uri_ipv6_authority_fail` for the thirty measured rows.
+    if strict {
+        if let Some(fail) = uri_ipv6_authority_fail(s) {
+            return Some(fail);
+        }
+    }
+    if let Some(pos) = uri_expected_authority_fail_index(s) {
+        return Some(UriParseFail::at("Expected authority", pos));
+    }
+    if let Some(pos) = uri_empty_ssp_fail_index(s) {
+        return Some(UriParseFail::at("Expected scheme-specific part", pos));
+    }
+    None
+}
+
+/// `jdk.internal.util.Exceptions.trim` — "remove leading, trailing and
+/// duplicated space characters".
+///
+/// Every `URISyntaxException` the JDK's parser raises is built as
+/// `new URISyntaxException(formatMsg("%s", filterNonSocketInfo(input)),
+/// reason, index)`, and `formatMsg` ends in that `trim`. So the string
+/// `getInput()` hands back — and the tail of `getMessage()` — is NOT the
+/// argument: `new URI("  http://h/p  ")` reports `http://h/p`. Only U+0020 is
+/// affected; a tab survives, which is how this was told apart from
+/// `String.strip()`. Transcribed from this host's JDK 25.0.4+7 `src.zip`, and
+/// the INDEX still refers to the untrimmed argument, so nothing else may use
+/// this string.
+pub(crate) fn uri_exception_input(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_space = true;
+    for c in s.chars() {
+        if c == ' ' {
+            if in_space {
+                continue;
+            }
+            in_space = true;
+        } else {
+            in_space = false;
+        }
+        out.push(c);
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
 /// Build the `java.net.URISyntaxException` for a [`UriParseFail`], choosing the
 /// two- or three-argument constructor exactly as the JDK's `fail` overloads do.
 /// [`uri_syntax_exception`] for callers outside this module — `URI`'s natives
@@ -1739,7 +1913,7 @@ fn uri_syntax_exception(
     input: &str,
     fail: &UriParseFail,
 ) -> Option<MethodCallFailed> {
-    let input_obj = ctx.create_string(input);
+    let input_obj = ctx.create_string(&uri_exception_input(input));
     let reason_obj = ctx.create_string(fail.reason);
     let built = match fail.index {
         Some(index) => ctx.new_object_initialized(
@@ -2019,187 +2193,13 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(o) => ctx.read_string_units(o).unwrap_or_default(),
         None => Vec::new(),
     };
-    // Reject a malformed scheme name before any other check — the real JDK
-    // parser validates this first (see `uri_scheme_name_fail_index`).
-    if let Some((pos, reason)) = uri_scheme_name_fail_index(&url_str) {
-        let input = ctx.create_string(&url_str);
-        let reason_str = ctx.create_string(reason);
-        if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
-            "java/net/URISyntaxException",
-            "(Ljava/lang/String;Ljava/lang/String;I)V",
-            &[
-                Value::Object(Some(input)),
-                Value::Object(Some(reason_str)),
-                Value::Int(pos as i32),
-            ],
-        ) {
-            return Err(MethodCallFailed::ExceptionThrown(exc));
-        }
-    }
-    // Reject illegal characters like java.net.URI's single-string parser does —
-    // `new URI(String)` must throw URISyntaxException for them. Our parser was
-    // lenient and accepted anything, so malformed input slipped through:
-    //   * control chars: "https://keycloak.org\n" treated as valid (keycloak
-    //     SecureRedirectUrisEnforcerExecutorTest.failUriSyntax);
-    //   * spaces / delimiters: "not a valid uri :{}" treated as valid, so
-    //     HttpHeaderSecurityFilter.setAntiClickJackingUri never threw and
-    //     TestHttpHeaderSecurityFilter.testAntiClickJackingInvalidUri saw no
-    //     ServletException.
-    // `uri_first_illegal_index` mirrors the JDK's legal-character set for ASCII
-    // (unreserved + reserved + `%`/`#`); non-ASCII is left to the lenient path
-    // to avoid over-rejecting inputs the gauntlet relies on. Control chars stay
-    // rejected unconditionally even with the opt-out gate (preserves the
-    // keycloak fix); the broader ASCII check is gated default-ON so it can be
-    // disabled (CRATONVM_URI_STRICT_CHARS=0) if a regression surfaces.
-    // An IPv6 literal in the authority must be `[` <non-empty> `]`. MEASURED
-    // 2026-08-13 (/tmp/W.java) -- both of these are URISyntaxException on
-    // HotSpot and were ACCEPTED here, i.e. a malformed URI parsed clean:
-    //
-    //   new URI("http://[::1/")  Expected closing bracket for IPv6 address at index 11
-    //   new URI("http://[]/")    Expected closing bracket for IPv6 address at index 8
-    //
-    // The reported index is where the address parse stopped: the end of the
-    // authority when the `]` is missing, and the position just past `[` when the
-    // body is empty. `http://[fe80::1]/` and `http://[::1]:80/` stay legal.
-    {
-        let bad = uri_closing_bracket_fail_index(&url_str);
-        {
-            if let Some(pos) = bad {
-                let input = ctx.create_string(&url_str);
-                let reason = ctx.create_string("Expected closing bracket for IPv6 address");
-                if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
-                    "java/net/URISyntaxException",
-                    "(Ljava/lang/String;Ljava/lang/String;I)V",
-                    &[
-                        Value::Object(Some(input)),
-                        Value::Object(Some(reason)),
-                        Value::Int(pos as i32),
-                    ],
-                ) {
-                    return Err(MethodCallFailed::ExceptionThrown(exc));
-                }
-            }
-        }
-    }
-
-    let strict_uri_chars = crate::nbflags().uri_strict_chars;
-    let illegal = if strict_uri_chars {
-        uri_first_char_fault(&url_str)
-    } else {
-        url_str
-            .char_indices()
-            .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
-            .map(|(i, _)| (i, UriCharFault::Illegal))
-    };
-    if let Some((pos, UriCharFault::MalformedEscape)) = illegal {
-        // A `%` that does not begin a `%` HEX HEX triple is its OWN reason in
-        // the JDK, produced by `Parser.scanEscape` before any component-specific
-        // character check runs — see [`UriCharFault`] for the sixteen measured
-        // rows. We reported the component name here, so `getMessage()` read
-        // `Illegal character in path at index 10` where HotSpot says
-        // `Malformed escape pair at index 10`.
-        if let Some(exc) = uri_syntax_exception(
-            ctx,
-            &url_str,
-            &UriParseFail::at("Malformed escape pair", pos),
-        ) {
+    // Every refusal, in the JDK's own order, from the one function
+    // `URI.create(String)` also calls. Seven checks used to be written out
+    // here and four of them again, differently, in `net_phase_e`'s `create`;
+    // see [`uri_parse_fail`] for what that cost.
+    if let Some(fail) = uri_parse_fail(&url_str) {
+        if let Some(exc) = uri_syntax_exception(ctx, &url_str, &fail) {
             return Err(exc);
-        }
-    }
-    if let Some((pos, UriCharFault::Illegal)) = illegal {
-        let input = ctx.create_string(&url_str);
-        // The JDK names the COMPONENT the offending character sits in, not the
-        // URI as a whole. MEASURED 2026-08-13 (/tmp/W2.java) -- five distinct
-        // names, and the boundaries are the delimiters themselves:
-        //
-        //   htt<p://h/      Illegal character in scheme name at index 3
-        //   //auth<x/p      Illegal character in authority   at index 6
-        //   http://h/pa<th  Illegal character in path        at index 11
-        //   http://h/p?q<1  Illegal character in query       at index 12
-        //   http://h/p#f<1  Illegal character in fragment    at index 12
-        //
-        // A relative "/pa<th" with no scheme and no authority is still "path",
-        // so the component is decided by position, not by what the URI has.
-        let component = {
-            let frag = url_str.find('#');
-            let query = url_str.find('?').filter(|q| frag.is_none_or(|f| *q < f));
-            let scheme_end = url_str.find(':').filter(|c| {
-                url_str[..*c]
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || "+-.".contains(ch))
-                    && url_str[..*c].starts_with(|ch: char| ch.is_ascii_alphabetic())
-            });
-            let auth_start = url_str.find("//").map(|s| s + 2);
-            let auth_stop = auth_start.map(|s| {
-                url_str[s..]
-                    .find(['/', '?', '#'])
-                    .map(|r| s + r)
-                    .unwrap_or(url_str.len())
-            });
-            if frag.is_some_and(|f| pos > f) {
-                "fragment"
-            } else if query.is_some_and(|q| pos > q) {
-                "query"
-            } else if scheme_end.is_some_and(|c| pos < c) {
-                "scheme name"
-            } else if auth_start.is_some_and(|s| pos >= s) && auth_stop.is_some_and(|e| pos < e) {
-                "authority"
-            } else {
-                "path"
-            }
-        };
-        let reason = ctx.create_string(&format!("Illegal character in {component}"));
-        if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
-            "java/net/URISyntaxException",
-            "(Ljava/lang/String;Ljava/lang/String;I)V",
-            &[
-                Value::Object(Some(input)),
-                Value::Object(Some(reason)),
-                Value::Int(pos as i32),
-            ],
-        ) {
-            return Err(MethodCallFailed::ExceptionThrown(exc));
-        }
-    }
-    // Reject a bracketed authority whose IPv6 literal, scope id or port the
-    // JDK's server-based parser would refuse. This runs AFTER the generic
-    // character check on purpose: HotSpot scans the authority against its
-    // character set first, so `http://[abc]<>/p` is an illegal-character
-    // failure and only a character-clean authority reaches `parseServer`.
-    // See [`uri_ipv6_authority_fail`] for the thirty measured rows.
-    if strict_uri_chars {
-        if let Some(fail) = uri_ipv6_authority_fail(&url_str) {
-            if let Some(exc) = uri_syntax_exception(ctx, &url_str, &fail) {
-                return Err(exc);
-            }
-        }
-    }
-    // Reject `scheme://` and a bare `//` — an empty authority with NOTHING
-    // after it. See [`uri_expected_authority_fail_index`] for the JDK's
-    // three-way branch and the sixty-six probe rows this was worth.
-    if let Some(pos) = uri_expected_authority_fail_index(&url_str) {
-        if let Some(exc) =
-            uri_syntax_exception(ctx, &url_str, &UriParseFail::at("Expected authority", pos))
-        {
-            return Err(exc);
-        }
-    }
-    // Reject an absolute URI with an empty scheme-specific part (`file:`,
-    // `http:`, …) — the JDK parser throws here, and Spring relies on that throw
-    // to fall back to the deprecated `new URL(String)` path.
-    if let Some(pos) = uri_empty_ssp_fail_index(&url_str) {
-        let input = ctx.create_string(&url_str);
-        let reason = ctx.create_string("Expected scheme-specific part");
-        if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
-            "java/net/URISyntaxException",
-            "(Ljava/lang/String;Ljava/lang/String;I)V",
-            &[
-                Value::Object(Some(input)),
-                Value::Object(Some(reason)),
-                Value::Int(pos as i32),
-            ],
-        ) {
-            return Err(MethodCallFailed::ExceptionThrown(exc));
         }
     }
     url_parse(ctx, this, &url_str);

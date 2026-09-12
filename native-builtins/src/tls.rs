@@ -251,25 +251,22 @@ fn throw_tls_algorithm_exc(ctx: &mut dyn NativeContext, msg: &str) -> MethodCall
 
 /// Refuse a factory request from an `SSLContext` that was never `init()`ed.
 ///
-/// Real JSSE (`sun.security.ssl.SSLContextImpl.engineGetSocketFactory`) throws
-/// `IllegalStateException("SSLContext is not initialized")`. This module used
-/// to hand out a factory regardless, so a caller that skipped `init()` — or
-/// whose `init()` threw and was swallowed — got a factory whose key and trust
-/// managers were never installed, and no signal that anything was missing.
+/// The decision and the message both live in
+/// [`crate::jca::ssl_context_spi::require_context_initialized`], with the two
+/// live registrars. This wrapper keeps the `method` argument the call sites
+/// pass, and deliberately DROPS it from the message: HotSpot's is the bare
+/// `SSLContext is not initialized`, and a helpfully longer one is a
+/// difference a caller comparing messages can see.
 fn require_initialized_context(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-    method: &str,
+    _method: &str,
 ) -> Result<(), MethodCallFailed> {
     if matches!(ctx.get_field(this, CTX_INITIALIZED), Value::Int(1)) {
         return Ok(());
     }
     Err(cratonvm_types::error::RuntimeError::IllegalStateException {
-        message: format!(
-            "SSLContext is not initialized; call SSLContext.init(KeyManager[], \
-             TrustManager[], SecureRandom) before {method}. Refusing to return a \
-             factory with no key or trust managers installed."
-        ),
+        message: "SSLContext is not initialized".to_string(),
     }
     .into())
 }
@@ -1610,10 +1607,12 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
             // `IllegalArgumentException` on HotSpot, and an ALPN list with a
             // hole in it fails on the wire, in another process, minutes later.
             let Some(Value::Object(Some(arr))) = args.get(1) else {
-                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: "protocols was null".into(),
-                }
-                .into());
+                return Err(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: "protocols was null".into(),
+                    }
+                    .into(),
+                );
             };
             let arr = *arr;
             for i in 0..ctx.array_length(arr) {
@@ -1622,10 +1621,12 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
                     _ => None,
                 };
                 if !element.is_some_and(|text| !text.is_empty()) {
-                    return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                        message: "An element of protocols was null/empty".into(),
-                    }
-                    .into());
+                    return Err(
+                        cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                            message: "An element of protocols was null/empty".into(),
+                        }
+                        .into(),
+                    );
                 }
             }
             ctx.set_field(this, PAR_APP_PROTOCOLS, Value::Object(Some(arr)));

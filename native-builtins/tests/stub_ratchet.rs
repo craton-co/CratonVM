@@ -2194,6 +2194,44 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `native-builtins/src/lang_class.rs|java/lang/Package.getPackages|()[Ljava/lang/Package;`
 /// -- and none the other way. Record:
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
+///
+/// # +17 in all three arms, 2026-09-12 — lane 4 wave 4, `java/nio/CharBuffer`
+///
+/// `RETIRED_SHADOW_L4_CHARBUFFER_TRIPLES` retires seventeen triples, each
+/// registered once, so this is +17 and not the +32-against-28 wave 3 reported:
+/// the ratchet's unit is one REGISTRATION and the table's is one triple, and
+/// here they happen to agree.
+///
+/// The PAIRED measurement, both columns off the same three test binaries with
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW=java/nio/CharBuffer` producing the OFF one
+/// — its arm report prints `17 table row(s)`, which is the receipt that it
+/// disarmed this table and not a neighbour under `java/nio/`. Taken TWICE,
+/// before the merge and again on the merged tree, because a delta carried
+/// across a merge is the mistake this file's own history keeps recording:
+///
+/// ```text
+///   arm         base bdb02d94e  merge 62ae280f8  merge 0ad29ab00  merge 9e9959135
+///   (default)   2915 -> 2932    2948 -> 2965     3832 -> 3849     3846 -> 3863
+///   management  2942 -> 2959    2975 -> 2992     3859 -> 3876     3873 -> 3890
+///   synthetic   2915 -> 2932    2948 -> 2965     3832 -> 3849     3846 -> 3863
+/// ```
+///
+/// FOUR independent derivations of the same +17, each with the OFF column
+/// passing at whatever the constants were at that moment — which is what says
+/// the baselines were current on all four trees and that nothing but this wave
+/// moves them. The third column is a merge that took lane T's own table (+884
+/// in one go) straight through the middle of this one, and the +17 does not
+/// notice. The LAST pair is what the constants below are set from; the earlier
+/// three are kept because agreeing four times is the claim, not the number —
+/// subtracting would have made them agree by construction.
+///
+/// **The totals fell in every arm and in BOTH columns — 2, then 13, then 0,
+/// then 8 across the four trees** — so they are dev's, not this wave's: a re-tag moves a row between kinds and cannot change how
+/// many registrations exist. Lane T's +884 on the second merge is the same
+/// statement from the other side: 884 more stubs, total unchanged.
+/// `MEASURED_TOTAL_REGISTRATIONS_*` are documentation rather than assertions,
+/// which is exactly why they go stale, so they are re-frozen here with the stub
+/// baselines rather than left to drift another wave. Same shape as wave 3's 8.
 /// # 2975 → 3859, 2026-09-12 (the sixth merge: dev catches up again, +884
 /// uniformly, TOTAL registrations unchanged 13974 -> 13974)
 ///
@@ -2202,7 +2240,11 @@ use cratonvm_types::compat::CompatibilityMode;
 /// above): the total not moving at all is the cleanest of the four readings
 /// -- every added SyntheticStub row is an existing Bridge relabelled, zero new
 /// registrations, exactly what a table landing on a fresh `dev` predicts.
-/// # 3859 → 3940, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
+/// RE-FREEZE ON THE MERGE, 2026-09-12: a sibling lane re-froze this arm to
+/// 3890 while this wave was in flight, so the number below is that arm's
+/// value plus the SAME +81 -- re-measured on the merged tree, not added
+/// to it, in the three arms and against the same control worktree.
+/// # 3890 → 3971, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
 /// registrations unchanged at 13961)
 ///
 /// 79 triples re-tagged `Bridge` -> `SyntheticStub` by one retirement table
@@ -2228,7 +2270,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
 /// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
 /// Two doubles in every one of the three counts.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3940;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3971;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2599,7 +2641,11 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3940;
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 /// # 2948 → 3832, 2026-09-12 — see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]'s
 /// account of this same merge; `+884` here too, total unchanged 13606 -> 13606.
-/// # 3832 → 3913, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
+/// RE-FREEZE ON THE MERGE, 2026-09-12: a sibling lane re-froze this arm to
+/// 3863 while this wave was in flight, so the number below is that arm's
+/// value plus the SAME +81 -- re-measured on the merged tree, not added
+/// to it, in the three arms and against the same control worktree.
+/// # 3863 → 3944, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
 /// registrations unchanged at 13593)
 ///
 /// 79 triples re-tagged `Bridge` -> `SyntheticStub` by one retirement table
@@ -2625,7 +2671,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 3940;
 /// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
 /// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
 /// Two doubles in every one of the three counts.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3913;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3944;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2865,7 +2911,11 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3913;
 /// `docs/internal/jdk-only/package-getpackages-answered-empty-FIXED-20260911.md`.
 /// # 2948 → 3832, 2026-09-12 — see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]'s
 /// account of this same merge; `+884` here too, total unchanged 13641 -> 13641.
-/// # 3832 → 3913, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
+/// RE-FREEZE ON THE MERGE, 2026-09-12: a sibling lane re-froze this arm to
+/// 3863 while this wave was in flight, so the number below is that arm's
+/// value plus the SAME +81 -- re-measured on the merged tree, not added
+/// to it, in the three arms and against the same control worktree.
+/// # 3863 → 3944, 2026-09-12, L1 wave 7 (+81 on every arm, TOTAL
 /// registrations unchanged at 13628)
 ///
 /// 79 triples re-tagged `Bridge` -> `SyntheticStub` by one retirement table
@@ -2891,7 +2941,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 3913;
 /// (`LinkedHashMap`'s 102 and eight `HashMap` rows included) read
 /// 4011 / 4038 / 4011 = +179, and 87 triples read 3921 / 3948 / 3921 = +89.
 /// Two doubles in every one of the three counts.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3913;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3944;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -2968,7 +3018,7 @@ const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 3913;
 /// was the only trace a real defect left in this gate, and staleness meant
 /// nobody could have read it. The `synthetic-jdk` arm has no constant here and
 /// measured 13645 on the same tree.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13974;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13953;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
@@ -2981,7 +3031,7 @@ const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13974;
 /// dev's staleness rather than either wave's — the localisation is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13606;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13585;
 
 /// The `--features synthetic-jdk` total, which had no constant at all.
 ///
@@ -3007,7 +3057,7 @@ const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13606;
 /// and 13645 on that tree against 13658 on this one is exactly the drift a
 /// sentence cannot track.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13641;
+const MEASURED_TOTAL_REGISTRATIONS_SYNTHETIC_JDK: usize = 13620;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
@@ -3837,6 +3887,62 @@ fn strict_rows() -> Vec<(String, String, String, NativeKind)> {
         .into_iter()
         .map(|(c, m, d, k)| (c.to_string(), m.to_string(), d.to_string(), k))
         .collect()
+}
+
+/// **A retirement is INERT when a second native sits underneath the bridge it
+/// refuses**, and until this test existed nothing could see it.
+///
+/// `register()` re-tags a retired triple's `Bridge` to `SyntheticStub` and
+/// `--jdk-only` then refuses it. A refusal is not a removal: it declines to
+/// insert THAT registration and leaves whatever is already in the slot. So a
+/// triple registered twice -- an older `Intrinsic` first, the honest bridge
+/// second -- keeps dispatching to the older body after the refusal, and the real
+/// JDK bytecode the table exists to reach never runs. The row is in the table,
+/// the census reports zero surviving stubs, the wave measures as accepted, and
+/// nothing changed.
+///
+/// Two waves shipped that way and each was found by hand, months apart:
+///
+/// ```text
+///   java/util/logging  5 triples  an Intrinsic in phases_early.rs   2026-08-11
+///   java/math/BigInteger  3       an Intrinsic in math_bignum.rs    2026-09-10
+/// ```
+///
+/// The instrument is one line of set arithmetic and it needed no new data: the
+/// strict boot's own registry, asked which of its surviving rows the retirement
+/// tables claim. Both waves above are exactly what it prints on the commit
+/// before this one.
+///
+/// Note what this does NOT need: a running VM, a probe, or a refusal report. The
+/// 2026-08-11 wave was diagnosed from a 2029-refusal `--jdk-only-report` and the
+/// 2026-09-10 one from a probe whose rows moved for the wrong reason; both are
+/// answered here by `cargo test`.
+#[test]
+fn no_retired_triple_survives_the_strict_boot() {
+    let mut inert: Vec<String> = strict_rows()
+        .into_iter()
+        .filter(|(c, m, d, _)| {
+            cratonvm_native_api::retired_shadow::triple_is_retired_shadow(c, m, d)
+        })
+        .map(|(c, m, d, k)| format!("  {c}.{m}{d} still dispatches as {k:?}"))
+        .collect();
+    inert.sort();
+    inert.dedup();
+    assert!(
+        inert.is_empty(),
+        "{} retired triple(s) are INERT: a native survives the refusal and the \
+         real JDK bytecode never runs, so the retirement changed nothing.\n{}\n\
+         Fix the REGISTRATION, not this test. Each of these is a second \
+         registration of a triple whose honest bridge is refused; find it with \
+         `NativeMethodRegistry::census()`, which lists every registration with \
+         its site and kind (the last row for a triple owns the slot, every \
+         earlier one is dead code in compatible mode). If the survivor is dead \
+         in compatible mode -- proven by running that census in all three \
+         feature arms -- delete it. If it OWNS the slot in compatible mode, \
+         re-tag it `Bridge` instead so the refusal reaches it.",
+        inert.len(),
+        inert.join("\n")
+    );
 }
 
 /// **A fake must not outlive `--jdk-only` because a SECOND file called it a

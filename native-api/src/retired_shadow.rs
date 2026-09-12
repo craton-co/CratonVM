@@ -6812,11 +6812,10 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// is **13253 rows, 0 diffs**, every ordered pair of a boundary corpus through
 /// every binary operation.
 ///
-/// ## Nine of the 24 are HELD BACK, and each half has its own cause
+/// ## All 24 are retired. Nine were held, and the RULE that held them expired
 ///
-/// With all 24 retired, the probe-tree A/B on two binaries — control
-/// `db988f6a76365f1f` without this table, trial `06307f0eca53c714` with it, same
-/// tree otherwise — reads:
+/// Wave 1 retired ten and held fourteen. With all 24 retired the probe-tree A/B
+/// on two binaries had read:
 ///
 /// ```text
 ///   BigIntegerSweep   control (no table, JIT on)    0 differing lines
@@ -6825,18 +6824,19 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 /// ```
 ///
 /// A positive delta is the one result that is a reason not to retire, so the
-/// nine are held per-TRIPLE — the same instrument the `java/util/logging` wave
-/// used for `Logger.log`'s eighth overload — and each is named:
+/// nine were held per-TRIPLE and the hold was generalised to a rule. Both halves
+/// are now closed, and for different reasons: one was a real defect, the other a
+/// contract that had never been checked against the oracle.
 ///
-/// **`add`, `subtract`, `multiply` — a SURVIVOR.** All three are registered
-/// twice. `phases_late.rs` owns the slot as a `Bridge`; `math_bignum.rs`
-/// registered an `Intrinsic` first and owns no slot, so it is *dead in
-/// compatible mode and never dispatched*. Refusing the `Bridge` under
-/// `--jdk-only` does not reach bytecode — it wakes the dead loser, which
+/// **`add`, `subtract`, `multiply` -- a SURVIVOR, and a real defect.** All three
+/// were registered twice. `phases_late.rs` owns the slot as a `Bridge`;
+/// `math_bignum.rs` registered an `Intrinsic` first which owned no slot and was
+/// *dead in compatible mode in all three feature arms*. Refusing the `Bridge`
+/// under `--jdk-only` did not reach bytecode -- it woke the dead loser, which
 /// returns **null** for a null argument where the real body throws:
 ///
 /// ```text
-///   --jdk-only-report, BigIntegerSweep run:
+///   --jdk-only-report, BigIntegerSweep run, before the fix:
 ///     27 synthetic-native-registered refusals on the retired classes
 ///      3 of them carrying a survivor
 ///        add       survivor=intrinsic@native-builtins/src/math_bignum.rs:1404
@@ -6844,45 +6844,40 @@ static RETIRED_SHADOW_L5_TRIPLES: &[(&str, &str, &str)] = &[
 ///        multiply  survivor=intrinsic@native-builtins/src/math_bignum.rs:1416
 /// ```
 ///
-/// This is the `refused is not retired` check earning its place: the probe rows
-/// moved, so the wave *looked* measurable, and the retirement was inert.
-/// Retiring these three means removing the dead `math_bignum.rs` registrations
-/// first, which changes nothing in compatible mode because they own no slot.
+/// Fixed 2026-09-12 by deleting the three dead registrations, which changes
+/// nothing in compatible mode because they own no slot there. The same shape had
+/// shipped in the `java/util/logging` wave a month earlier and was fixed in the
+/// same change. `stub_ratchet.rs`'s `no_retired_triple_survives_the_strict_boot`
+/// is the gate that makes it impossible to ship a third time: one line of set
+/// arithmetic over the strict boot's registry, asking which of its surviving rows
+/// these tables claim.
 ///
-/// **`remainder`, `mod`, `gcd`, `and`, `or`, `xor` — the JIT DROPPED the
-/// message; blocker cleared 2026-09-11.** These do reach bytecode, and
-/// interpreted they are HotSpot-exact. Once the real body was JIT-compiled the
-/// `NullPointerException` arrived with no message at all. It was not a
-/// `BigInteger` fact — `probes/L2JitNpeProbe.java` asks six null-deref shapes
-/// cold and hot with no JDK class involved and every one of them lost its
-/// message when hot. Fixed and retired as
-/// `docs/internal/fixed-bugs/the-helpful-npe-message-is-lost-in-compiled-code-FIXED-20260911.md`,
-/// pinned by `vm/tests/jit_npe_message_hot_equals_cold.rs`.
+/// **The other eleven -- the rule's premise was false.** Interpreted they were
+/// HotSpot-exact; once the real body was JIT-compiled the `NullPointerException`
+/// arrived with no message. The VM-side defect was real and was fixed by
+/// `0d013f359`. The *rule* built on top of it was not: asked of the oracle at the
+/// same heat, HotSpot drops the message too.
 ///
-/// They are STILL HELD, and not by this reason: the rule below is structural —
-/// every reference-argument row — and lifting it needs the `BigIntegerSweep`
-/// measurement with the JIT on that put it there, which is lane 2's to take.
+/// ```text
+///   probes/L2BigIntNpe14.java -- 15 null-argument rows, cold then 200k warm
+///     HotSpot 25.0.4+7, default flags         9 of 15 hot rows answer a bare
+///                                             `null`, and WHICH nine differs
+///                                             between runs of the same class file
+///     HotSpot -XX:-OmitStackTraceInFastThrow  0 of 15; hot == cold, all helpful
+/// ```
 ///
-/// ## ...and the held set is every REFERENCE-argument row, not a list of six
+/// `OmitStackTraceInFastThrow` is on by default and lets C2 throw a preallocated
+/// exception carrying neither message nor stack trace. So "hot equals cold" was
+/// never the JDK contract, and the run-to-run instability that made the hold
+/// structural rather than empirical is the ORACLE's instability, reproduced. The
+/// stable contract is the interpreted message -- identical under both oracle
+/// configurations -- and this VM matches it on all 30 rows in both modes, never
+/// taking the fast-throw latitude. Record:
+/// `docs/internal/jdk-only/lane-2-biginteger-held-rows-and-inert-retirements-FIXED-20260912.md`.
 ///
-/// The six above are what regressed on the 24-triple binary. On the 13-triple
-/// one, `remainder` and friends were correct and `modInverse` and `modPow`
-/// regressed instead — the same defect surfacing on different rows, because
-/// which bodies the JIT has compiled by the time the probe's null section runs
-/// is not fixed between runs. Reading one run's diff and holding exactly the
-/// rows in it would be freezing a coin flip.
-///
-/// So the hold is structural rather than empirical: **a row is exposed if its
-/// real body can dereference a null reference ARGUMENT**, and wave 1 retires
-/// only signatures that take none. That is the twelve rows of `divide`,
-/// `modInverse`, `modPow`, `add`, `subtract`, `multiply`, `remainder`, `mod`,
-/// `gcd`, `and`, `or`, `xor` held for the JIT reason or the survivor reason,
-/// plus the two `byte[]` constructors, which the sweep never asks with null and
-/// so cannot vouch for either way.
-///
-/// What remains is ten value-shaped rows — `bitCount`, `bitLength`,
+/// The ten value-shaped rows of wave 1 -- `bitCount`, `bitLength`,
 /// `intValueExact`, `isProbablePrime`, `longValueExact`, `not`, `shiftLeft`,
-/// `shiftRight`, `testBit`, `toByteArray` — and they are 0-diff over the whole
+/// `shiftRight`, `testBit`, `toByteArray` -- remain 0-diff over the whole
 /// 13253-row sweep with the JIT on.
 ///
 /// **Seven rows removed on the 2026-09-11 catch-up merge with lane T**:
@@ -6987,12 +6982,64 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/lang/management/MemoryUsage", "getInit", "()J"),
     ("java/lang/management/MemoryUsage", "getMax", "()J"),
     ("java/lang/management/MemoryUsage", "getUsed", "()J"),
+    ("java/math/BigInteger", "<init>", "(I[B)V"),
+    ("java/math/BigInteger", "<init>", "([B)V"),
+    (
+        "java/math/BigInteger",
+        "add",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "and",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "bitCount", "()I"),
     ("java/math/BigInteger", "bitLength", "()I"),
+    (
+        "java/math/BigInteger",
+        "divide",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "gcd",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "intValueExact", "()I"),
     ("java/math/BigInteger", "isProbablePrime", "(I)Z"),
     ("java/math/BigInteger", "longValueExact", "()J"),
+    (
+        "java/math/BigInteger",
+        "mod",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "modInverse",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "modPow",
+        "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "multiply",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "not", "()Ljava/math/BigInteger;"),
+    (
+        "java/math/BigInteger",
+        "or",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
+    (
+        "java/math/BigInteger",
+        "remainder",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     (
         "java/math/BigInteger",
         "shiftLeft",
@@ -7003,8 +7050,18 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
         "shiftRight",
         "(I)Ljava/math/BigInteger;",
     ),
+    (
+        "java/math/BigInteger",
+        "subtract",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
     ("java/math/BigInteger", "testBit", "(I)Z"),
     ("java/math/BigInteger", "toByteArray", "()[B"),
+    (
+        "java/math/BigInteger",
+        "xor",
+        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
+    ),
 ];
 
 /// Lane L1 wave 1, 2026-09-10: the six `java/util` families whose state is
@@ -10354,6 +10411,141 @@ static RETIRED_SHADOW_L5R_TRIPLES: &[(&str, &str, &str)] = &[
     ("sun/misc/Unsafe", "unpark", "(Ljava/lang/Object;)V"),
 ];
 
+/// Lane 4 wave 4, 2026-09-12: `java/nio/CharBuffer`, and the blocker was gone.
+///
+/// The seventeen §1.4 shadows on `java/nio/CharBuffer` whose image method
+/// declares or inherits `Code`. Ten declare it, seven inherit it from
+/// `java/nio/Buffer`. `java/nio/` was admitted as a prefix by wave 1, which
+/// retires this class's 34-row `java/nio/ByteBuffer` twin under it -- same
+/// accessors, same registrar, same shape -- so there is no prefix decision
+/// here, only a table.
+///
+/// # This family was BACKED OUT once, and the interesting part is why it came back
+///
+/// §9.2 of the lane page lost `java/nio/CharBuffer` on the first build of wave
+/// 1: armed, `subSequence(1, 3)` answered `cd` where the oracle says `bc`,
+/// diagnosed as a carrier whose `position`/`limit` the real accessors could not
+/// read. Re-measured on 2026-09-12 the defect does not reproduce, and the
+/// registrar says why in its own comment: `p62_alloc_char_buffer` and every
+/// `wrap`/`subSequence`/`slice` producer in
+/// `native-builtins/src/phases_late/charset_buffers.rs` mint
+/// `java/nio/HeapCharBuffer` -- the real CONCRETE class -- so the real bodies
+/// find real state in real slots. `4ba4f312b` (2026-08-06, "CharBuffer.wrap
+/// stamped the abstract class, so subSequence checked nothing") is that fix,
+/// and it predates the §9.2 measurement: what §9.2 armed was a five-family
+/// scope, and the wrong answer it attributed to this family was not this
+/// family's.
+///
+/// **So the row that reopened this wave is a re-measurement, not a repair.**
+/// That is worth being explicit about, because three of this lane's four waves
+/// so far have been "fix the carrier, then take the rows" and it would be easy
+/// to file this one the same way. Nothing in this wave fixes anything; the
+/// fixing was done five weeks earlier by somebody else.
+///
+/// # `charAt` is carved out, and by the re-tag's own condition
+///
+/// Eighteen registrations on this class clear the §1.4 bucket test, not
+/// seventeen. `charAt(I)C` is the eighteenth and it is NOT here, because
+/// [`crate::registry::NativeMethodRegistry::register`] re-tags a retired triple
+/// only when `effective_category() == NativeKind::Bridge`, and `charAt` is
+/// registered as an `intrinsic` from `native-builtins/src/lib.rs`. A row for it
+/// would be INERT BY CONSTRUCTION -- the predicate would answer `true` and
+/// nothing would ever ask. The shape
+/// [`the_charbuffer_wave_is_seventeen_bridges_without_the_intrinsic`] guards.
+///
+/// # The funnel
+///
+/// Seventeen triples, every one of them reached by
+/// `apps/probes/L4CharBufferSweep.java` under `--nojit
+/// CRATONVM_DISABLE_INTRINSICS=1`, which is what makes the census's
+/// `invocations_complete: true` mean what it says. `session()` and
+/// `checkSession()` are package-private `java.nio.Buffer` internals no probe
+/// can call by name; they are reached 5 and 149 times respectively as callees
+/// of the buffer operations above them, which is the only way anything reaches
+/// them and is how the JDK reaches them too. Both are no-ops here for a reason
+/// the retirement makes real rather than emulated: `Buffer.session()` returns
+/// null when `segment` is null, and this VM never writes `segment`.
+///
+/// # What the retirement does, and the defect it found
+///
+/// One binary against itself, plus a third carrying the table without the fix
+/// the commit before this one makes. `apps/probes/L4CharBufferSweep.java`, 261
+/// rows, oracle stable over three captures:
+///
+/// ```text
+///   L4CharBufferSweep, --jdk-only, 261 rows        rows differing
+///     A  control (origin/dev bdb02d94e)                  0
+///     B  this table, WITHOUT the carrier-side fix        12
+///     C  the fix + this table                             0
+///     D  the fix, this table un-retired (same binary)     0
+/// ```
+///
+/// Arm B is the finding. `CharBuffer.toString()` is `toString(position(),
+/// limit())` in the JDK and this VM held `toString(int, int)` to TWO index
+/// conventions -- absolute for a `StringCharBuffer`, relative to the position
+/// for everything else -- with its own `toString()` passing `0, limit -
+/// position` to cancel the second one out. Retiring `toString()` put a real
+/// body on the calling end and the window moved by exactly `position` on
+/// twelve rows. Bisected to that single row in one pass with
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW`: seventeen runs, sixteen still at 12 and
+/// `toString()Ljava/lang/String;` alone at 0.
+///
+/// **A native that owns both ends of a convention agrees with itself whatever
+/// the convention is.** Three earlier waves in this lane learned that about a
+/// carrier's FIELDS; this is the same sentence about a method's ARGUMENTS, and
+/// the retirement is what asked for the second opinion.
+///
+/// Compatible mode is 0 on the control and 0 on the wave. The re-tag is
+/// mode-blind and `SyntheticStub` is allowed in compatible mode, so the native
+/// still wins there and nothing moves — which is the whole of why a retirement
+/// is a `--jdk-only`-only behaviour change.
+///
+/// **17 refusals, 0 survivors**, every one `synthetic-native-registered` over
+/// the seventeen distinct triples. The control reports ONE of them as
+/// `native-won` rather than seventeen, which is a fact about what the report
+/// records rather than about the other sixteen: the census beside it has all
+/// seventeen at `invocations > 0` with `invocations_complete: true`.
+///
+/// Corpus: `134 passed, 0 failed` on the control and on the wave under
+/// `CRATONVM_ARGS=--jdk-only`, compared VECTOR BY VECTOR and not by totals;
+/// `SUITE=all` 134/134 and `SUITE=core` 93/93 on the wave. Kind map: seventeen
+/// rows amended `bridge -> synthetic-stub` in the 25/linux baseline, after
+/// which the wave fires 870 flips -- exactly the control's count, so the gate
+/// is as red as dev and no redder.
+///
+/// Measured on **linux/x86_64 against JDK 25**.
+static RETIRED_SHADOW_L4_CHARBUFFER_TRIPLES: &[(&str, &str, &str)] = &[
+    (
+        "java/nio/CharBuffer",
+        "allocate",
+        "(I)Ljava/nio/CharBuffer;",
+    ),
+    ("java/nio/CharBuffer", "array", "()[C"),
+    ("java/nio/CharBuffer", "arrayOffset", "()I"),
+    ("java/nio/CharBuffer", "capacity", "()I"),
+    ("java/nio/CharBuffer", "checkSession", "()V"),
+    ("java/nio/CharBuffer", "clear", "()Ljava/nio/CharBuffer;"),
+    ("java/nio/CharBuffer", "flip", "()Ljava/nio/CharBuffer;"),
+    ("java/nio/CharBuffer", "hasArray", "()Z"),
+    ("java/nio/CharBuffer", "hasRemaining", "()Z"),
+    ("java/nio/CharBuffer", "limit", "()I"),
+    ("java/nio/CharBuffer", "limit", "(I)Ljava/nio/CharBuffer;"),
+    ("java/nio/CharBuffer", "position", "()I"),
+    (
+        "java/nio/CharBuffer",
+        "position",
+        "(I)Ljava/nio/CharBuffer;",
+    ),
+    ("java/nio/CharBuffer", "remaining", "()I"),
+    ("java/nio/CharBuffer", "rewind", "()Ljava/nio/CharBuffer;"),
+    (
+        "java/nio/CharBuffer",
+        "session",
+        "()Ljdk/internal/foreign/MemorySessionImpl;",
+    ),
+    ("java/nio/CharBuffer", "toString", "()Ljava/lang/String;"),
+];
+
 /// Lane 5's SECOND residual wave, 2026-09-11 — 33 triples over the two
 /// `Unsafe` spellings, and the two halves earned their rows by different
 /// instruments.
@@ -10687,6 +10879,9 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // `jdk/internal/foreign/layout/` was admitted by wave 2 and its note
     // there says what this line is the other half of.
     RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES,
+    // Lane 4 wave 4. No new prefix either: `java/nio/` was admitted by wave 1,
+    // which retires this class's `java/nio/ByteBuffer` twin under it.
+    RETIRED_SHADOW_L4_CHARBUFFER_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -10779,6 +10974,85 @@ mod tests {
                 ),
                 "{c}.varHandle(PathElement...) must stay a live Bridge"
             );
+        }
+    }
+
+    /// Wave 4's seventeen, and the carve-out the RE-TAG's own condition makes.
+    ///
+    /// Eighteen registrations on `java/nio/CharBuffer` clear the §1.4 bucket
+    /// test. The eighteenth is `charAt(I)C`, registered as an `intrinsic`, and
+    /// `NativeMethodRegistry::register` re-tags a retired triple only when the
+    /// effective category is `Bridge` -- so a row for it would be inert by
+    /// construction. That is a different reason from the FFM waves'
+    /// `varHandle` carve-out (which is a real body this VM cannot service) and
+    /// worth a separate assertion, because it is invisible in the table itself:
+    /// a table row costs nothing and does nothing, and only this test says so.
+    #[test]
+    fn the_charbuffer_wave_is_seventeen_bridges_without_the_intrinsic() {
+        for (c, m, d) in RETIRED_SHADOW_L4_CHARBUFFER_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in lane 4's CharBuffer table and the predicate cannot see it"
+            );
+            assert_eq!(
+                *c, "java/nio/CharBuffer",
+                "this wave is ONE class; {c} is not it"
+            );
+            assert_ne!(
+                *m, "charAt",
+                "charAt(I)C is registered as an intrinsic, and `register` re-tags a \
+                 retired triple only when the effective category is Bridge -- a row \
+                 here would be inert by construction"
+            );
+        }
+        assert_eq!(RETIRED_SHADOW_L4_CHARBUFFER_TRIPLES.len(), 17);
+        assert!(
+            !triple_is_retired_shadow("java/nio/CharBuffer", "charAt", "(I)C"),
+            "charAt is carved out of this wave on purpose"
+        );
+    }
+
+    /// The five typed-buffer families BESIDE CharBuffer are not retired.
+    ///
+    /// They share a registrar and a field layout with it, which is exactly why
+    /// this is worth asserting: `java/nio/` is a prefix wave 1 admitted, so a
+    /// later wave that widens this table by class name rather than by
+    /// measurement would take them silently. None of them has been through a
+    /// probe, and `java/nio/CharBuffer` only came back after one.
+    ///
+    /// `java/nio/Buffer` itself is in the list for a stronger reason: its
+    /// `<init>` is registered as a Bridge with 143 invocations in this wave's
+    /// own probe run, and it is the constructor EVERY buffer in the VM runs.
+    /// Retiring anything on `java/nio/Buffer` is a whole-NIO change, not a
+    /// family's, and this wave measured one family.
+    #[test]
+    fn the_typed_buffer_families_beside_charbuffer_are_not_retired() {
+        for c in [
+            "java/nio/Buffer",
+            "java/nio/IntBuffer",
+            "java/nio/LongBuffer",
+            "java/nio/FloatBuffer",
+            "java/nio/DoubleBuffer",
+            "java/nio/ShortBuffer",
+            "java/nio/HeapCharBuffer",
+            "java/nio/HeapCharBufferR",
+            "java/nio/StringCharBuffer",
+        ] {
+            for (m, d) in [
+                ("position", "()I"),
+                ("limit", "()I"),
+                ("capacity", "()I"),
+                ("remaining", "()I"),
+                ("hasArray", "()Z"),
+                ("toString", "()Ljava/lang/String;"),
+                ("toString", "(II)Ljava/lang/String;"),
+                ("<init>", "(IIIILjava/lang/foreign/MemorySegment;)V"),
+            ] {
+                assert!(
+                    !triple_is_retired_shadow(c, m, d),
+                    "{c}.{m}{d} is retired, and no wave has measured {c}"
+                );
+            }
         }
     }
 
@@ -11713,82 +11987,59 @@ mod tests {
                  adding a third."
             );
         }
-        // The nine BigInteger triples held back, and WHY each is held. A
-        // re-add has to move the blocker first, and the blocker is not in this
-        // file: `add`/`subtract`/`multiply` need the dead `math_bignum.rs`
-        // registrations gone, the other six need the JIT to stop dropping the
-        // helpful-NPE message. Both are measured; see this table's doc comment.
-        for m in ["add", "subtract", "multiply"] {
-            assert!(
-                !triple_is_retired_shadow(
-                    "java/math/BigInteger",
-                    m,
-                    "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
-                ),
-                "BigInteger.{m} was retired, but an older math_bignum.rs \
-                 Intrinsic still owns the slot after the refusal — the \
-                 retirement is INERT and the survivor returns null for a null \
-                 argument where the real body throws."
-            );
-        }
-        for m in [
-            "remainder",
-            "mod",
-            "gcd",
-            "and",
-            "or",
-            "xor",
-            "divide",
-            "modInverse",
-        ] {
-            assert!(
-                !triple_is_retired_shadow(
-                    "java/math/BigInteger",
-                    m,
-                    "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
-                ),
-                "BigInteger.{m} was retired. It reaches bytecode correctly \
-                 INTERPRETED, and loses its NullPointerException message once \
-                 the body is JIT-compiled."
-            );
-        }
-        for (m, d) in [
-            (
-                "modPow",
-                "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-            ),
-            ("<init>", "([B)V"),
-            ("<init>", "(I[B)V"),
-        ] {
-            assert!(
-                !triple_is_retired_shadow("java/math/BigInteger", m, d),
-                "BigInteger.{m}{d} was retired. Wave 1's rule is structural: a \
-                 row whose real body can dereference a null reference ARGUMENT \
-                 is exposed to the JIT's dropped NullPointerException message, \
-                 and which rows show it varies run to run."
-            );
-        }
-
-        // Wave 1's rule, asserted over the TABLE rather than over a list of
-        // names, so a row added later has to satisfy it too. Only the parameter
-        // list is examined: `toByteArray()[B` returns an array and takes
-        // nothing, and reading the whole descriptor would reject it.
-        for (c, m, d) in RETIRED_SHADOW_L2_TRIPLES {
-            if *c != "java/math/BigInteger" {
-                continue;
-            }
-            let params = d
-                .split_once('(')
-                .and_then(|(_, rest)| rest.split_once(')'))
-                .map(|(p, _)| p)
-                .unwrap_or("");
-            assert!(
-                !params.contains('L') && !params.contains('['),
-                "{c}.{m}{d} takes a reference parameter. Until the JIT carries \
-                 the helpful-NPE message into compiled code, such a row \
-                 regresses the message it used to get from the native."
-            );
-        }
+        // **Wave 3, 2026-09-12: the fourteen held rows moved, and the RULE
+        // that held them was retired with them.**
+        //
+        // Wave 1 held every row whose real body can dereference a null
+        // reference ARGUMENT, because retiring such a row traded the native's
+        // constant `NullPointerException` message for a compiled body that
+        // arrived with no message at all -- and which rows showed it varied
+        // between runs, so the hold was made structural rather than copied out
+        // of one diff. `0d013f359` fixed the compiled-code message. Re-measuring
+        // did not confirm the rule; it refuted its PREMISE.
+        //
+        // `probes/L2BigIntNpe14.java` asks all fourteen rows with a null
+        // argument, cold and then after 200k warm iterations of the SAME method,
+        // on the oracle:
+        //
+        // ```text
+        //   HotSpot 25.0.4+7, default flags     9 of 15 hot rows answer a BARE
+        //                                       `null`, and WHICH nine differs
+        //                                       between runs (3 runs: subtract
+        //                                       dropped/dropped/helpful,
+        //                                       remainder dropped/helpful/
+        //                                       helpful, modPow flipped too)
+        //   HotSpot -XX:-OmitStackTraceInFastThrow
+        //                                       0 of 15 -- hot == cold, every
+        //                                       message helpful
+        // ```
+        //
+        // Losing the helpful message in compiled code is what HotSpot ITSELF
+        // does by default: `OmitStackTraceInFastThrow` lets C2 throw a
+        // preallocated exception carrying neither message nor stack trace, and
+        // the run-to-run variance wave 1 measured on this VM is the same
+        // variance the oracle shows. So "hot equals cold" was never the JDK
+        // contract, and a retired row answering a bare `null` when hot is
+        // HotSpot-FAITHFUL rather than regressed. The stable contract is the
+        // interpreted message, which is identical under both oracle
+        // configurations, and this VM reproduces it on all fourteen.
+        //
+        // What replaces the rule is the POPULATION. Lane 2 measured 24
+        // `BigInteger` triples; all 24 are retired. A 25th needs its own
+        // per-class corpus screen and probe-tree A/B, which is what this count
+        // is here to demand.
+        let bigint_rows = RETIRED_SHADOW_L2_TRIPLES
+            .iter()
+            .filter(|(c, _, _)| *c == "java/math/BigInteger")
+            .count();
+        assert_eq!(
+            bigint_rows, 24,
+            "lane 2 measured 24 `java/math/BigInteger` triples -- ten in wave 1, \
+             fourteen in wave 3 -- and this table holds {bigint_rows}. A row \
+             outside that set has been through neither the per-class corpus \
+             screen nor the probe-tree A/B; take both before changing this \
+             number."
+        );
 
         // The ten rows the image says are not shadows. Six are `<init>` on an
         // INTERFACE, which declares no constructor at all; the rest are a
