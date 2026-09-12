@@ -75,14 +75,6 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 /// method outright at the same opcode).
 const MAX_TABLESWITCH_ENTRIES: usize = 1 << 24;
 
-/// Conservative cap on `lookupswitch` `npairs` used by [`bytecode_analysis::step`].
-///
-/// Same rationale as [`MAX_TABLESWITCH_ENTRIES`]. The JVM spec stores
-/// `npairs` as a signed `i32`; any negative value is rejected outright
-/// rather than reinterpreted as a huge `usize` (which previously caused
-/// out-of-bounds reads in liveness scanning).
-const MAX_LOOKUPSWITCH_NPAIRS: usize = 1 << 20;
-
 /// ARM64 callee-saved GPR registers for locals: X19-X28 (10 registers).
 pub const ARM64_LOCAL_GPRS: [u8; 10] = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
 
@@ -123,140 +115,14 @@ struct BasicBlock {
     live_out: u64,
 }
 
-/// Compute the branch target PC for a branch instruction at `pc`, if any.
-/// Returns `None` if the instruction is not a branch or the target is out of bounds.
-fn branch_target(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
-        0x99..=0xa6 | 0xa7 | 0xc6 | 0xc7 => {
-            // JVM branch offsets are big-endian signed i16.
-            let offset = i16::from_be_bytes([*code.get(pc + 1)?, *code.get(pc + 2)?]) as i32;
-            let target = pc as i32 + offset;
-            // Validate the target is non-negative (valid bytecode offset)
-            if target < 0 {
-                return None;
-            }
-            Some(target as usize)
-        }
-        0xc8 | 0xc9 => {
-            // goto_w / jsr_w use a signed 32-bit branch offset.
-            let offset = i32::from_be_bytes([
-                *code.get(pc + 1)?,
-                *code.get(pc + 2)?,
-                *code.get(pc + 3)?,
-                *code.get(pc + 4)?,
-            ]);
-            pc.checked_add_signed(offset as isize)
-        }
-        _ => None,
-    }
-}
-
-/// Returns true if the opcode is an unconditional control transfer (goto, return, athrow, switch).
+/// Does `op` end a block with no fall-through edge, as liveness models it?
+///
+/// [`bytecode_analysis::falls_through`], except that `ret` keeps its
+/// fall-through edge here. Liveness wants a superset of the real
+/// successors, and `ret`'s real ones (the instructions after its `jsr`s)
+/// are not modelled.
 fn is_unconditional(op: u8) -> bool {
-    matches!(
-        op,
-        0xa7    // goto
-        | 0xc8  // goto_w
-        | 0xaa  // tableswitch
-        | 0xab  // lookupswitch
-        | 0xac  // ireturn
-        | 0xad  // lreturn
-        | 0xae  // freturn
-        | 0xaf  // dreturn
-        | 0xb0  // areturn
-        | 0xb1  // return (void)
-        | 0xbf // athrow
-    )
-}
-
-/// Collect all branch targets from a switch instruction at `pc`.
-fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
-    let mut targets = Vec::new();
-    let op = code[pc];
-    let base_pc = pc;
-    let mut p = pc + 1;
-    while p % 4 != 0 {
-        p += 1;
-    }
-
-    match op {
-        // HIGH security fix: same overflow audit as `bytecode_analysis::step` above. The
-        // inner per-target loop already has a `code_len` bound, but if
-        // `count` is allowed to be `i32::MAX` (or wrap via signed overflow)
-        // we still spin billions of iterations, which is a DoS in itself.
-        0xaa => {
-            // tableswitch
-            if p + 12 > code_len {
-                return targets;
-            }
-            let default_off = i32::from_be_bytes([code[p], code[p + 1], code[p + 2], code[p + 3]]);
-            // Use checked arithmetic: a malformed/negative offset must not
-            // wrap to a huge usize. Skip targets that fall outside the code.
-            if let Some(t) = base_pc.checked_add_signed(default_off as isize) {
-                if t < code_len {
-                    targets.push(t);
-                }
-            }
-            let low = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
-            let high = i32::from_be_bytes([code[p + 8], code[p + 9], code[p + 10], code[p + 11]]);
-            let count = match (high as i64)
-                .checked_sub(low as i64)
-                .and_then(|d| d.checked_add(1))
-            {
-                Some(n) if n >= 0 && (n as u64) <= MAX_TABLESWITCH_ENTRIES as u64 => n as usize,
-                _ => return targets, // overflow / cap exceeded → no targets harvested
-            };
-            p += 12;
-            for _ in 0..count {
-                if p + 4 > code_len {
-                    break;
-                }
-                let off = i32::from_be_bytes([code[p], code[p + 1], code[p + 2], code[p + 3]]);
-                if let Some(t) = base_pc.checked_add_signed(off as isize) {
-                    if t < code_len {
-                        targets.push(t);
-                    }
-                }
-                p += 4;
-            }
-        }
-        0xab => {
-            // lookupswitch
-            if p + 8 > code_len {
-                return targets;
-            }
-            let default_off = i32::from_be_bytes([code[p], code[p + 1], code[p + 2], code[p + 3]]);
-            if let Some(t) = base_pc.checked_add_signed(default_off as isize) {
-                if t < code_len {
-                    targets.push(t);
-                }
-            }
-            let npairs_raw =
-                i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
-            if npairs_raw < 0 {
-                return targets;
-            }
-            let npairs = npairs_raw as usize;
-            if npairs > MAX_LOOKUPSWITCH_NPAIRS {
-                return targets;
-            }
-            p += 8;
-            for _ in 0..npairs {
-                if p + 8 > code_len {
-                    break;
-                }
-                let off = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
-                if let Some(t) = base_pc.checked_add_signed(off as isize) {
-                    if t < code_len {
-                        targets.push(t);
-                    }
-                }
-                p += 8;
-            }
-        }
-        _ => {}
-    }
-    targets
+    !bytecode_analysis::falls_through(op) && op != 0xa9
 }
 
 /// RBC.6 local-handler-safety fix v2 — proper CFG-based "definitely
@@ -302,8 +168,8 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
 /// other "when in doubt, don't compile" gate in this scanner).
 ///
 /// Reuses this module's own, already load-bearing bytecode-width/branch
-/// decoding (`bytecode_analysis::step`, `branch_target`, `is_unconditional`,
-/// `switch_targets` — the exact functions `build_cfg` itself uses) so this
+/// decoding (`bytecode_analysis::step`, `bytecode_analysis::offset_branch_target`, `is_unconditional`,
+/// `bytecode_analysis::switch_targets_lenient` — the exact functions `build_cfg` itself uses) so this
 /// can never diverge from the CFG this backend already trusts for register
 /// allocation.
 pub(crate) fn handler_has_unsafe_local_read(
@@ -490,17 +356,17 @@ pub(crate) fn handler_has_unsafe_local_read(
 
         if is_unconditional(op) {
             if matches!(op, 0xaa | 0xab) {
-                for t in switch_targets(code, pc, code_len) {
+                for t in bytecode_analysis::switch_targets_lenient(code, code_len, pc) {
                     merge_successor(&mut safe_at, &mut worklist, t, code_len, propagated);
                 }
-            } else if let Some(t) = branch_target(code, pc) {
+            } else if let Some(t) = bytecode_analysis::offset_branch_target(code, pc) {
                 merge_successor(&mut safe_at, &mut worklist, t, code_len, propagated);
             }
             // return-family / athrow: no successors — this control-flow
             // path ends here, which is exactly the case the old linear
             // scan got wrong by continuing past it.
         } else {
-            if let Some(t) = branch_target(code, pc) {
+            if let Some(t) = bytecode_analysis::offset_branch_target(code, pc) {
                 merge_successor(&mut safe_at, &mut worklist, t, code_len, propagated);
             }
             let next = pc + len;
@@ -537,7 +403,7 @@ fn build_cfg_with_leaders(
     let mut pc = 0;
     while pc < code_len {
         let len = bytecode_analysis::step(code, pc);
-        if let Some(target) = branch_target(code, pc) {
+        if let Some(target) = bytecode_analysis::offset_branch_target(code, pc) {
             if target < code_len {
                 block_starts[target] = true;
             }
@@ -549,7 +415,7 @@ fn build_cfg_with_leaders(
         }
         // Handle switch instructions — mark all targets as block starts
         if matches!(code[pc], 0xaa | 0xab) {
-            for target in switch_targets(code, pc, code_len) {
+            for target in bytecode_analysis::switch_targets_lenient(code, code_len, pc) {
                 if target < code_len {
                     block_starts[target] = true;
                 }
@@ -622,7 +488,7 @@ fn build_cfg_with_leaders(
         loop {
             let len = bytecode_analysis::step(code, pc);
             let next = pc + len;
-            let is_branch = branch_target(code, pc).is_some();
+            let is_branch = bytecode_analysis::offset_branch_target(code, pc).is_some();
             let is_uncond = is_unconditional(code[pc]);
 
             pc = next;
@@ -661,7 +527,7 @@ fn build_cfg_with_leaders(
         let op = code[last_pc];
 
         // Add branch target
-        if let Some(target) = branch_target(code, last_pc) {
+        if let Some(target) = bytecode_analysis::offset_branch_target(code, last_pc) {
             if target < code_len {
                 let target_idx = block_idx_at[target];
                 if target_idx != usize::MAX {
@@ -672,7 +538,7 @@ fn build_cfg_with_leaders(
 
         // Add switch targets
         if matches!(op, 0xaa | 0xab) {
-            for target in switch_targets(code, last_pc, code_len) {
+            for target in bytecode_analysis::switch_targets_lenient(code, code_len, last_pc) {
                 if target < code_len {
                     let target_idx = block_idx_at[target];
                     if target_idx != usize::MAX && !blocks[i].successors.contains(&target_idx) {
@@ -2500,8 +2366,8 @@ mod tests {
     fn branch_target_decodes_wide_branches() {
         let goto_w = [0xc8, 0x00, 0x00, 0x00, 0x05, 0xb1];
         let jsr_w = [0xc9, 0x00, 0x00, 0x00, 0x05, 0xb1];
-        assert_eq!(branch_target(&goto_w, 0), Some(5));
-        assert_eq!(branch_target(&jsr_w, 0), Some(5));
+        assert_eq!(bytecode_analysis::offset_branch_target(&goto_w, 0), Some(5));
+        assert_eq!(bytecode_analysis::offset_branch_target(&jsr_w, 0), Some(5));
         assert!(
             is_unconditional(0xc8),
             "goto_w is terminal for CFG fallthrough"
@@ -2787,7 +2653,7 @@ mod tests {
     fn test_branch_target_negative_returns_none() {
         // Branch at pc=0 with a large negative offset should return None.
         let code = [0xa7, 0x80, 0x00]; // goto with offset -32768
-        assert!(branch_target(&code, 0).is_none());
+        assert!(bytecode_analysis::offset_branch_target(&code, 0).is_none());
     }
 
     #[test]
