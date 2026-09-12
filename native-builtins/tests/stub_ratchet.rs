@@ -2038,7 +2038,40 @@ use cratonvm_types::compat::CompatibilityMode;
 /// is `13609 - 2865 - 10741 = 3` with the wave armed and `13609 - 2728 -
 /// 10878 = 3` with it un-armed. **Invariant across 137 retirements**, where the
 /// level moved by exactly 137.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2892;
+/// # Lane 4 wave 3, 2026-09-12 — 28 table rows, THIRTY-TWO registrations
+///
+/// The group half of `jdk/internal/foreign/layout/`:
+/// `RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES`, 28 triples over `StructLayoutImpl`,
+/// `UnionLayoutImpl`, `SequenceLayoutImpl` and `PaddingLayoutImpl`.
+///
+/// ```text
+///   arm             OFF             ON              delta
+///   (default)   2865 / 13609    2897 / 13609        +32 / 0
+///   management  2892 / 13977    2924 / 13977        +32 / 0
+///   synthetic   2865 / 13644    2897 / 13644        +32 / 0
+/// ```
+///
+/// **+32 against a 28-row table, and the four are not a discrepancy.** THE UNIT
+/// HERE IS ONE REGISTRATION; the table's unit is one triple. `byteSize` and
+/// `byteAlignment` on `StructLayoutImpl` and `UnionLayoutImpl` are each
+/// registered TWICE, from two neighbouring loops in
+/// `native-builtins/src/phases_late/foreign_ffm.rs` (4925/4926 and 4982/4983),
+/// so one shadows the other and both are re-tagged. The same distinction the
+/// `--dump-native-registry` census makes, and the same one wave 2's `51 table
+/// row(s)` against 71 moving registrations made.
+///
+/// **The OFF column was PRINTED, not inferred from a `<=` pass**, and it
+/// reproduces the three constants wave 2 left here exactly. It was taken with
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW` naming the four group classes rather than
+/// the prefix: the prefix would have un-retired wave 2's 137 value-layout rows
+/// as well, and an OFF column that undoes a NEIGHBOUR's wave is not this wave's
+/// before-number. The arm report prints `7 + 7 + 8 + 6 = 28 table row(s)`,
+/// which is the receipt that it armed this table and not that one.
+///
+/// Totals unchanged in every arm: case (b), existing registrations relabelled.
+/// The strict registry's shortfall is unchanged too — `STRICT_UNEXPLAINED_DROP_MAX`
+/// bounds what should NOT move, and 32 more refused stubs do not move it.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2924;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2296,7 +2329,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 2892;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2865;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2897;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -2476,7 +2509,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 2865;
 /// each registration is re-tagged separately. The `--jdk-only-report` census
 /// for the same prefixes reports **15 distinct triples refused, 0 with a
 /// survivor** -- the same population counted the other way.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2865;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 2897;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

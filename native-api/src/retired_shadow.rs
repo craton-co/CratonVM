@@ -5705,6 +5705,223 @@ static RETIRED_SHADOW_L4_FFM_TRIPLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Lane 4 wave 3, 2026-09-12: the four GROUP carriers.
+///
+/// `StructLayoutImpl`, `UnionLayoutImpl`, `SequenceLayoutImpl` and
+/// `PaddingLayoutImpl` — the half of `jdk/internal/foreign/layout/` wave 2 held
+/// back, under the prefix wave 2 admitted. 28 rows of 31: `varHandle` is carved
+/// out on all three classes that register it, for the reason wave 2 carved it
+/// out on the nine value layouts.
+///
+/// # The carrier was the blocker, and it was ONE defect for all four classes
+///
+/// `jdk.internal.foreign.layout.AbstractGroupLayout` declares
+/// `List<MemoryLayout> elements` and this VM stored a bare ARRAY in it; `kind`
+/// and `minByteAlignment` were never written at all. `memberLayouts()` is
+/// `return elements;` — one `getfield` — so the first real body to touch a
+/// group got an array where the JDK's own code calls `List` methods:
+///
+/// ```text
+///   struct.memberLayouts().size()      0          (oracle 2)
+///   struct.byteOffset(groupElement)    cannot resolve a member plainly there
+///   struct.toString()                  NoSuchMethodError: MemoryLayout.size()
+/// ```
+///
+/// Fixed in the commit before this table, through one reader and one writer:
+/// `p67_group_members` decodes whichever shape the field holds and returns the
+/// COUNT beside the array (an `ArrayList` has capacity past its size, and
+/// reading `array_length` would invent trailing members); `p67_group_set_members`
+/// writes the list; `p67_group_set_kind` writes `kind` from the enum's own
+/// statics, so there is one `STRUCT` object in the VM and `==` on it answers
+/// what the JDK expects.
+///
+/// **The list is UNMODIFIABLE and that is measured, not tidy.** HotSpot answers
+/// `UnsupportedOperationException` to `memberLayouts().add(...)`; since the
+/// retired accessor returns the field itself, an `ArrayList` here would hand
+/// out a mutable view of a layout's members.
+///
+/// # The funnel
+///
+/// 31 distinct triples over the four classes, every one of them reached by
+/// `apps/probes/L4FfmLayoutSweep.java` — six were cold on the first pass
+/// (`PaddingLayoutImpl.byteAlignment`, the three `withName` covariant bridges
+/// at the `MemoryLayout` static type, and `UnionLayoutImpl`'s `byteOffset` and
+/// `varHandle`) and the probe was extended until none was. A row no probe
+/// invokes is a row the funnel must not take.
+///
+/// # What the retirement does
+///
+/// One binary against itself, the group table un-retired with
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW` naming the four classes -- which prints
+/// `7 + 7 + 8 + 6 = 28 table row(s)` and is the arm's own receipt that it armed
+/// this table and not its neighbour:
+///
+/// ```text
+///   control (origin/dev)                    13 rows differ
+///   carrier fix, group table un-retired      3
+///   carrier fix + this table                 2
+/// ```
+///
+/// **The retirement fixes one row and breaks none.** `byteOffset` on a padding
+/// layout throws the JDK's own `Bad layout path: attempting to select a group
+/// element from a non-group layout: x4` where the native answered its own
+/// wording. Eleven of the control's thirteen were the carrier, which is the
+/// commit before this one; the two left over are neither this wave's nor a
+/// group's, and both are in `varHandle`:
+///
+///  * `ADDRESS.varHandle().varType()` answers `long` where the oracle says
+///    `MemorySegment`;
+///  * a union's `varHandle` ACCEPTS a misaligned access HotSpot refuses -- a
+///    missing refusal, which is the silent-wrong-answer shape this lane owns,
+///    in the one method carved out of both FFM waves.
+///
+/// **28 refusals, 0 survivors**, and on the control all 28 were `native-won`:
+/// a native winning over real bytecode that was there the whole time.
+///
+/// Measured on **linux/x86_64 against JDK 25**.
+static RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES: &[(&str, &str, &str)] = &[
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "elementCount",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "elementLayout",
+        "()Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "memberLayouts",
+        "()Ljava/util/List;",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "byteAlignment",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "byteOffset",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "byteSize",
+        "()J",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "memberLayouts",
+        "()Ljava/util/List;",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "name",
+        "()Ljava/util/Optional;",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+    ),
+];
+
 /// The 2026-09-11 lane-L6 wave: `java/net/HttpURLConnection` and
 /// `ProxySelector.getDefault` -- 15 rows of a lane of 966, after the corpus
 /// refused 109 that the probe tree had cleared.
@@ -6166,6 +6383,10 @@ pub(crate) const RETIRED_SHADOW_TABLES: &[&[(&str, &str, &str)]] = &[
     // Lane 4 wave 2, added WITH the table rather than after a gate caught it --
     // which is the whole point of the loop this const now feeds.
     RETIRED_SHADOW_L4_FFM_TRIPLES,
+    // Lane 4 wave 3, the group half of the same prefix. No new prefix:
+    // `jdk/internal/foreign/layout/` was admitted by wave 2 and its note
+    // there says what this line is the other half of.
+    RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES,
 ];
 
 #[cfg(test)]
@@ -6220,38 +6441,61 @@ mod tests {
         }
     }
 
-    /// The group layouts sit under the same prefix and are NOT retired.
+    /// Wave 3's group half, and its carve-out.
     ///
-    /// `jdk/internal/foreign/layout/` admits four more carriers to the binary
-    /// search -- `StructLayoutImpl`, `UnionLayoutImpl`, `SequenceLayoutImpl`,
-    /// `PaddingLayoutImpl` -- and the prefix is not the decision. They are held
-    /// back on a measured carrier defect (`AbstractGroupLayout.elements` is a
-    /// `java.util.List` and this VM stores an array there), and a prefix that
-    /// admits them is exactly how a later wave would retire them by accident.
+    /// This test read the other way round until 2026-09-12 -- it asserted the
+    /// four group carriers were NOT retired, because wave 2 held them back on
+    /// a measured carrier defect. Wave 3 fixed the carrier
+    /// (`AbstractGroupLayout.elements` is a `java.util.List` and this VM stored
+    /// an array in it) and took them, so the assertion is inverted rather than
+    /// deleted: the thing worth guarding is still the same, which is that the
+    /// PREFIX is not the decision.
     #[test]
-    fn the_ffm_group_layouts_are_admitted_by_the_prefix_and_not_retired() {
+    fn the_ffm_group_wave_is_four_carriers_without_varhandle() {
+        let mut classes = std::collections::BTreeSet::new();
+        for (c, m, d) in RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES {
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "{c}.{m}{d} is in the lane 4 group table and the predicate cannot see it"
+            );
+            assert!(
+                c.starts_with("jdk/internal/foreign/layout/") && !c.contains("ValueLayouts"),
+                "{c} is not one of the four group carriers this wave measured"
+            );
+            assert_ne!(
+                *m, "varHandle",
+                "{c}.{m}{d} is carved out of this wave on purpose -- the real                  `AbstractLayout.varHandle` reaches `Utils.makeSegmentViewVarHandle`                  and ends in `NoClassDefFoundError: java/lang/invoke/BoundMethodHandle`,                  exactly as it does for the nine value layouts"
+            );
+            classes.insert(*c);
+        }
+        assert_eq!(RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES.len(), 28);
+        assert_eq!(classes.len(), 4, "{classes:?}");
+        for c in &classes {
+            assert!(
+                !triple_is_retired_shadow(
+                    c,
+                    "varHandle",
+                    "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;"
+                ),
+                "{c}.varHandle(PathElement...) must stay a live Bridge"
+            );
+        }
+    }
+
+    /// The segment, arena and session carriers are NOT retired, and not because
+    /// nobody has screened them.
+    ///
+    /// `the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md` decides
+    /// that `cratonvm/internal/foreign/MemorySegmentImpl` is the VM's own
+    /// allocation shape, laid out DELIBERATELY unlike
+    /// `AbstractMemorySegmentImpl`, whose `length`/`readOnly`/`scope` would
+    /// alias the carrier's `ptr`/`size`/`arena`. Retiring one of these runs a
+    /// real body over those three slots. That is not a wave awaiting a
+    /// measurement; it is a wave that must not be run while the decision
+    /// stands, which is why it is asserted here rather than left to a reader.
+    #[test]
+    fn the_ffm_allocation_shape_carriers_are_never_retired() {
         for (c, m, d) in [
-            (
-                "jdk/internal/foreign/layout/StructLayoutImpl",
-                "memberLayouts",
-                "()Ljava/util/List;",
-            ),
-            (
-                "jdk/internal/foreign/layout/UnionLayoutImpl",
-                "memberLayouts",
-                "()Ljava/util/List;",
-            ),
-            (
-                "jdk/internal/foreign/layout/SequenceLayoutImpl",
-                "elementCount",
-                "()J",
-            ),
-            (
-                "jdk/internal/foreign/layout/PaddingLayoutImpl",
-                "toString",
-                "()Ljava/lang/String;",
-            ),
-            // And the half a decision on record keeps out of every wave.
             ("jdk/internal/foreign/ArenaImpl", "close", "()V"),
             ("jdk/internal/foreign/MemorySessionImpl", "close", "()V"),
             (
@@ -6259,10 +6503,15 @@ mod tests {
                 "byteSize",
                 "()J",
             ),
+            (
+                "jdk/internal/foreign/NativeMemorySegmentImpl",
+                "address",
+                "()J",
+            ),
         ] {
             assert!(
                 !triple_is_retired_shadow(c, m, d),
-                "{c}.{m}{d} is retired and this wave did not measure it"
+                "{c}.{m}{d} is retired, and the FFM carrier decision says it must not be"
             );
         }
     }
