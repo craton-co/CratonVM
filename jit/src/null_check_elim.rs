@@ -49,9 +49,17 @@
 //! - Only tracks the first 64 locals (bitmask is `u64`). Methods
 //!   with > 64 locals get no elimination beyond local 63. Covers
 //!   > 99% of real methods.
-//! - Exception handler entries are conservatively treated as having
-//!   IN = 0 (no facts). This is sound (an exception can arise at
-//!   any PC).
+//! - No exception table is consulted. Every instruction that no modelled
+//!   edge reaches — an exception handler, a `jsr` subroutine, dead code —
+//!   is seeded with IN = 0 once the reachable fixpoint settles, and the
+//!   fixpoint is re-run from those seeds. Seeding (rather than leaving the
+//!   code unvisited) is what makes a JOIN sound: a handler that falls
+//!   through into shared code must contribute its facts to the meet, or
+//!   the join keeps facts only the normal path established.
+//! - The per-opcode transfer reads an operand's origin off the TEXTUALLY
+//!   preceding instruction. That is only the dataflow predecessor at a PC
+//!   nothing can jump to, so every such peephole is skipped at a merge
+//!   point, and consumers must do the same (`NullCheckInfo::is_merge_point`).
 
 /// Result of null-check elimination analysis.
 ///
@@ -62,9 +70,26 @@
 pub struct NullCheckInfo {
     /// Per-PC non-null bitmask. Index = bytecode PC, value = u64 mask.
     masks: Vec<u64>,
+    /// `true` at every PC control can reach other than by falling through
+    /// from the textually preceding instruction.
+    merge_points: Vec<bool>,
 }
 
 impl NullCheckInfo {
+    /// Whether control can reach `pc` other than by falling through from the
+    /// instruction textually before it (a branch, switch or `jsr` target, the
+    /// successor of a non-falling-through instruction, or a PC only an
+    /// exception edge reaches).
+    ///
+    /// A consumer that pairs a fact with "the operand on top of the stack came
+    /// from the `aload` just before this PC" must refuse at a merge point: the
+    /// fact about the local still holds there, but the operand may have been
+    /// pushed on another path. Out-of-range PCs, and an empty analysis, answer
+    /// `true`, the refusing direction.
+    pub fn is_merge_point(&self, pc: usize) -> bool {
+        self.merge_points.get(pc).copied().unwrap_or(true)
+    }
+
     /// Returns `true` if `local` is known non-null at the given PC.
     ///
     /// Only valid for `local < 64`. Always returns `false` for
@@ -257,6 +282,88 @@ fn successors(code: &[u8], pc: usize) -> (Option<usize>, Option<usize>) {
     }
 }
 
+/// Every jump target of a `tableswitch`/`lookupswitch` at `pc`, the default
+/// included. Empty for any other opcode. A table that does not fit inside
+/// `len` yields the targets decoded before the overrun; verified bytecode never
+/// has one.
+fn switch_targets(code: &[u8], pc: usize, len: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    if pc >= len || pc >= code.len() || !matches!(code[pc], 0xAA | 0xAB) {
+        return out;
+    }
+    let end = len.min(code.len());
+    let read = |at: usize| -> Option<i32> {
+        (at + 4 <= end).then(|| i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]))
+    };
+    let mut push = |off: i32| {
+        if let Some(t) = pc.checked_add_signed(off as isize).filter(|&t| t < len) {
+            out.push(t);
+        }
+    };
+    let base = pc + 1 + (4 - ((pc + 1) % 4)) % 4;
+    let Some(default) = read(base) else {
+        return out;
+    };
+    push(default);
+    if code[pc] == 0xAA {
+        let (Some(low), Some(high)) = (read(base + 4), read(base + 8)) else {
+            return out;
+        };
+        let count = i64::from(high) - i64::from(low) + 1;
+        if !(0..=65_536).contains(&count) {
+            return out;
+        }
+        for k in 0..count as usize {
+            // Cast: count checked non-negative and bounded above
+            match read(base + 12 + 4 * k) {
+                Some(off) => push(off),
+                None => break,
+            }
+        }
+    } else {
+        let Some(npairs) = read(base + 4) else {
+            return out;
+        };
+        if !(0..=65_536).contains(&npairs) {
+            return out;
+        }
+        for k in 0..npairs as usize {
+            // Cast: npairs checked non-negative and bounded above
+            match read(base + 12 + 8 * k) {
+                Some(off) => push(off),
+                None => break,
+            }
+        }
+    }
+    out
+}
+
+/// Meet `out` into `IN[s]`, queueing `s` when that assigned or narrowed it.
+#[allow(clippy::too_many_arguments)]
+fn meet_into(
+    s: usize,
+    out: u64,
+    is_inst_start: &[bool],
+    in_masks: &mut [u64],
+    visited: &mut [bool],
+    on_worklist: &mut [bool],
+    worklist: &mut Vec<usize>,
+) {
+    if s >= in_masks.len() || !is_inst_start[s] {
+        return;
+    }
+    let new_in = if visited[s] { in_masks[s] & out } else { out };
+    if visited[s] && new_in == in_masks[s] {
+        return;
+    }
+    visited[s] = true;
+    in_masks[s] = new_in;
+    if !on_worklist[s] {
+        on_worklist[s] = true;
+        worklist.push(s);
+    }
+}
+
 /// Compute the `OUT` mask for a basic-block-like step from PC.
 /// Returns `(out_fallthrough, out_branch)` masks. The two are
 /// usually the same, but `ifnull`/`ifnonnull` discriminate (fall-
@@ -265,12 +372,24 @@ fn successors(code: &[u8], pc: usize) -> (Option<usize>, Option<usize>) {
 /// `prev_inst_pc[pc]` gives the PC of the bytecode instruction that
 /// immediately PRECEDES the instruction starting at `pc`, or
 /// `usize::MAX` when none (entry / PC outside any instruction).
-fn transfer(code: &[u8], pc: usize, in_mask: u64, prev_inst_pc: &[usize]) -> (u64, u64) {
+fn transfer(
+    code: &[u8],
+    pc: usize,
+    in_mask: u64,
+    prev_inst_pc: &[usize],
+    merge_points: &[bool],
+) -> (u64, u64) {
     if pc >= code.len() {
         return (in_mask, in_mask);
     }
     let op = code[pc];
     let mut out = in_mask;
+    // Every peephole below attributes this instruction's operand to the
+    // TEXTUAL predecessor. At a merge point that operand may come from any
+    // incoming path — `(c ? a : b).x` makes the `getfield` a join of
+    // `aload a` and `aload b` while `prev_inst_pc` names only `aload b` — so
+    // no fact may be derived from it there.
+    let linear_only = !merge_points.get(pc).copied().unwrap_or(true);
 
     // A dereferencing opcode (`getfield`/`invokevirtual`/`arraylength`/…)
     // whose receiver came from an immediately-preceding `aload N` proves
@@ -287,7 +406,7 @@ fn transfer(code: &[u8], pc: usize, in_mask: u64, prev_inst_pc: &[usize]) -> (u6
     // that SIGSEGV'd on a genuinely-null `arr` instead of throwing NPE.
     // Placing the fact on `OUT[deref_pc]` keeps the optimization for any
     // *subsequent* use of N while preserving the NPE at the deref itself.
-    if opcode_dereferences_receiver(op) {
+    if opcode_dereferences_receiver(op) && linear_only {
         let prev_local = prev_inst_pc.get(pc).copied().and_then(|q| {
             if q == usize::MAX {
                 return None;
@@ -342,7 +461,10 @@ fn transfer(code: &[u8], pc: usize, in_mask: u64, prev_inst_pc: &[usize]) -> (u6
             let prev_was_alloc = prev_inst_pc.get(pc).copied().map_or(false, |q| {
                 q != usize::MAX && q < code.len() && produces_nonnull(code[q])
             });
-            if !prev_was_alloc {
+            // At a merge point the stored value may come from a path that
+            // pushed null (`buf = c ? null : new int[3]`), whatever the
+            // textual predecessor allocated.
+            if !prev_was_alloc || !linear_only {
                 out &= !(1u64 << local);
             }
         }
@@ -364,7 +486,7 @@ fn transfer(code: &[u8], pc: usize, in_mask: u64, prev_inst_pc: &[usize]) -> (u6
     // The `aload N; if{null,nonnull} T` pattern:
     //   * ifnull  T: fall-through ⇒ N non-null, taken ⇒ N null
     //   * ifnonnull T: fall-through ⇒ N null, taken ⇒ N non-null
-    if matches!(op, 0xC6 | 0xC7) {
+    if matches!(op, 0xC6 | 0xC7) && linear_only {
         // The receiver for the if{null,nonnull} test comes from the
         // most-recent push. If the predecessor instruction was
         // `aload N` we can refine. Use prev_inst_pc to find the
@@ -515,9 +637,14 @@ pub fn analyze_with_receiver(
     // narrow. Entry IN is forced to 0 (nothing proven on entry).
     let top: u64 = !0;
     let mut in_masks = vec![top; len];
+    // Whether IN[pc] has been assigned by an edge or a seed. Kept apart from
+    // the mask: `!0` is also a legitimate IN (every tracked local non-null),
+    // so "still at top" cannot double as "never reached".
+    let mut visited = vec![false; len];
     // Entry IN. `this` is the single fact the bytecode cannot prove about
     // itself; everything else starts unproven. See the doc comment.
     in_masks[0] = u64::from(receiver_in_local_0);
+    visited[0] = true;
 
     // Track which PCs are valid instruction starts AND record each
     // instruction's *linear-predecessor* PC. The "linear predecessor"
@@ -547,6 +674,40 @@ pub fn analyze_with_receiver(
         }
     }
 
+    // Merge points: every PC control can reach other than by falling through
+    // from its textual predecessor. `transfer` refuses its predecessor
+    // peepholes there, and the seeding pass below adds the PCs only an
+    // exception edge reaches.
+    let mut merge_points = vec![false; len];
+    merge_points[0] = true;
+    for p in 0..len {
+        if !is_inst_start[p] {
+            continue;
+        }
+        let mut mark = |t: Option<usize>| {
+            if let Some(t) = t.filter(|&t| t < len) {
+                merge_points[t] = true;
+            }
+        };
+        let (ft, tk) = successors(code, p);
+        mark(tk);
+        for t in switch_targets(code, p, len) {
+            mark(Some(t));
+        }
+        match code[p] {
+            // `successors` models `jsr`/`jsr_w` as falling through only;
+            // their subroutine entry is still a jump target.
+            0xA8 => mark(rel16(code, p).and_then(|o| p.checked_add_signed(o as isize))),
+            0xC9 => mark(rel32(code, p).and_then(|o| p.checked_add_signed(o as isize))),
+            _ => {}
+        }
+        // The next instruction after one that never falls through (goto,
+        // return, athrow, a switch, `ret`) is reached, if at all, some other way.
+        if ft.is_none() || code[p] == 0xA9 {
+            mark(Some(p + op_len(code, p)));
+        }
+    }
+
     // Worklist of PCs whose IN may have changed and whose successors
     // need re-visiting.
     let mut worklist: Vec<usize> = Vec::with_capacity(len / 4 + 1);
@@ -561,69 +722,69 @@ pub fn analyze_with_receiver(
     let max_iters = (len as u64).saturating_mul(128).max(4096);
     let mut iter_count: u64 = 0;
 
-    while let Some(pc) = worklist.pop() {
-        on_worklist[pc] = false;
-        iter_count += 1;
-        if iter_count > max_iters {
-            // Bail — analysis didn't converge in budget. Return what
-            // we have; the consumer treats absent facts as false
-            // which is sound.
+    loop {
+        while let Some(pc) = worklist.pop() {
+            on_worklist[pc] = false;
+            iter_count += 1;
+            if iter_count > max_iters {
+                // This is a MUST analysis descending from top: stopped short
+                // of its fixpoint it still holds facts that later iterations
+                // would have removed. No facts is the only sound answer.
+                return NullCheckInfo::default();
+            }
+            if pc >= len || !is_inst_start[pc] {
+                continue;
+            }
+
+            let in_m = in_masks[pc];
+            let (ft_out, tk_out) = transfer(code, pc, in_m, &prev_inst_pc, &merge_points);
+            let (ft_succ, tk_succ) = successors(code, pc);
+
+            if let Some(s) = ft_succ {
+                meet_into(s, ft_out, &is_inst_start, &mut in_masks, &mut visited, &mut on_worklist, &mut worklist);
+            }
+            if let Some(s) = tk_succ {
+                meet_into(s, tk_out, &is_inst_start, &mut in_masks, &mut visited, &mut on_worklist, &mut worklist);
+            }
+            for s in switch_targets(code, pc, len) {
+                meet_into(s, ft_out, &is_inst_start, &mut in_masks, &mut visited, &mut on_worklist, &mut worklist);
+            }
+        }
+
+        // Seed every instruction no modelled edge reached with "nothing
+        // proven" and run the fixpoint again from there. These are exception
+        // handlers, `jsr` subroutines and dead code. A handler that falls
+        // through into shared code now narrows that join; left unvisited it
+        // contributed nothing, and the join kept facts only the normal path
+        // had established (`try { ... a = new int[4]; } catch (E e) {}
+        // return a == null ? -1 : a.length;` elided the null check).
+        let mut seeded = false;
+        for p in 0..len {
+            if is_inst_start[p] && !visited[p] {
+                visited[p] = true;
+                in_masks[p] = 0;
+                merge_points[p] = true;
+                on_worklist[p] = true;
+                worklist.push(p);
+                seeded = true;
+            }
+        }
+        if !seeded {
             break;
-        }
-        if pc >= len || !is_inst_start[pc] {
-            continue;
-        }
-
-        let in_m = in_masks[pc];
-        let (ft_out, tk_out) = transfer(code, pc, in_m, &prev_inst_pc);
-
-        let (ft_succ, tk_succ) = successors(code, pc);
-
-        // Propagate fall-through (out) to fall-through successor.
-        if let Some(s) = ft_succ {
-            if s < len && is_inst_start[s] {
-                let new_in = if in_masks[s] == top {
-                    ft_out
-                } else {
-                    in_masks[s] & ft_out
-                };
-                if new_in != in_masks[s] {
-                    in_masks[s] = new_in;
-                    if !on_worklist[s] {
-                        on_worklist[s] = true;
-                        worklist.push(s);
-                    }
-                }
-            }
-        }
-        // Propagate taken-edge (tk_out) to branch target.
-        if let Some(s) = tk_succ {
-            if s < len && is_inst_start[s] {
-                let new_in = if in_masks[s] == top {
-                    tk_out
-                } else {
-                    in_masks[s] & tk_out
-                };
-                if new_in != in_masks[s] {
-                    in_masks[s] = new_in;
-                    if !on_worklist[s] {
-                        on_worklist[s] = true;
-                        worklist.push(s);
-                    }
-                }
-            }
         }
     }
 
-    // Convert `top` entries (unreachable PCs) to 0 so consumers don't
-    // see spurious facts.
-    for m in in_masks.iter_mut() {
-        if *m == top {
+    // PCs that start no instruction carry no facts.
+    for (m, seen) in in_masks.iter_mut().zip(&visited) {
+        if !*seen {
             *m = 0;
         }
     }
 
-    NullCheckInfo { masks: in_masks }
+    NullCheckInfo {
+        masks: in_masks,
+        merge_points,
+    }
 }
 
 #[cfg(test)]
@@ -843,5 +1004,103 @@ mod receiver_seed_tests {
         // The legacy `compile()` wrapper's empty key has no descriptor.
         assert_eq!(receiver_in_local_zero("", 1), None);
         assert_eq!(receiver_in_local_zero("Foo.bar:(II", 3), None);
+    }
+}
+
+/// Regressions from the 2026-09-12 JIT review: facts that reached a join from
+/// only one of its predecessors.
+#[cfg(test)]
+mod merge_point_tests {
+    use super::*;
+
+    /// `int v = (c ? a : b).x; return b == null ? -1 : v;`
+    /// The `getfield` is a join of `aload_1` and `aload_2`, but its textual
+    /// predecessor is `aload_2`, so "b is non-null" was proven on both paths.
+    #[test]
+    fn a_dereference_at_a_join_proves_nothing_about_its_textual_predecessor() {
+        let code = vec![
+            0x1a, //             0: iload_0
+            0x99, 0x00, 0x07, // 1: ifeq -> 8
+            0x2b, //             4: aload_1
+            0xa7, 0x00, 0x04, // 5: goto -> 9
+            0x2c, //             8: aload_2
+            0xb4, 0x00, 0x01, // 9: getfield #1   (join)
+            0x36, 0x03, //      12: istore 3
+            0x2c, //            14: aload_2
+            0xc7, 0x00, 0x05, // 15: ifnonnull -> 20
+            0x02, //            18: iconst_m1
+            0xac, //            19: ireturn
+            0x1d, //            20: iload_3
+            0xac, //            21: ireturn
+        ];
+        let info = analyze(&code, code.len());
+        assert!(info.is_merge_point(9));
+        assert!(!info.is_nonnull(14, 2), "b was never dereferenced on the c == true path");
+        assert!(!info.is_nonnull(15, 2));
+        assert!(!info.is_nonnull(14, 1));
+    }
+
+    /// A `tableswitch` case nulls local 1 and joins a path on which a
+    /// `getfield` proved it non-null. Switch edges were not decoded, so the
+    /// case never reached the join.
+    #[test]
+    fn a_switch_case_participates_in_the_join_it_reaches() {
+        let code = vec![
+            0x2b, //                          0: aload_1
+            0xb4, 0x00, 0x01, //              1: getfield     (local 1 non-null)
+            0x57, //                          4: pop
+            0x1c, //                          5: iload_2
+            0x99, 0x00, 0x1b, //              6: ifeq -> 33
+            0x1d, //                          9: iload_3
+            0xaa, //                         10: tableswitch
+            0x00, //                         11: padding
+            0x00, 0x00, 0x00, 0x17, //       12: default -> 33
+            0x00, 0x00, 0x00, 0x00, //       16: low 0
+            0x00, 0x00, 0x00, 0x00, //       20: high 0
+            0x00, 0x00, 0x00, 0x12, //       24: case 0 -> 28
+            0x01, //                         28: aconst_null
+            0x4c, //                         29: astore_1
+            0xa7, 0x00, 0x03, //             30: goto -> 33
+            0x2b, //                         33: aload_1      (join)
+            0xc6, 0x00, 0x05, //             34: ifnull -> 39
+            0x03, //                         37: iconst_0
+            0xac, //                         38: ireturn
+            0x04, //                         39: iconst_1
+            0xac, //                         40: ireturn
+        ];
+        let info = analyze(&code, code.len());
+        assert!(info.is_merge_point(28));
+        assert!(info.is_merge_point(33));
+        assert!(!info.is_nonnull(33, 1), "the switch case stored null into local 1");
+        assert!(!info.is_nonnull(34, 1));
+    }
+
+    /// `try { mayThrow(); } catch (E e) { a = null; } if (a == null) ...`
+    /// No exception table is consulted; the handler used to stay unvisited,
+    /// so the join kept "a non-null" from the normal path alone.
+    #[test]
+    fn code_only_an_exception_edge_reaches_is_seeded_into_the_join() {
+        let code = vec![
+            0x2b, //             0: aload_1
+            0xb4, 0x00, 0x01, // 1: getfield     (local 1 non-null)
+            0x57, //             4: pop
+            0xb8, 0x00, 0x02, // 5: invokestatic
+            0xa7, 0x00, 0x06, // 8: goto -> 14
+            0x57, //            11: pop          (handler entry)
+            0x01, //            12: aconst_null
+            0x4c, //            13: astore_1
+            0x2b, //            14: aload_1      (join)
+            0xc6, 0x00, 0x05, // 15: ifnull -> 20
+            0x03, //            18: iconst_0
+            0xac, //            19: ireturn
+            0x04, //            20: iconst_1
+            0xac, //            21: ireturn
+        ];
+        let info = analyze(&code, code.len());
+        assert!(info.is_merge_point(11), "a handler-only entry is a merge point");
+        assert!(!info.is_nonnull(14, 1), "the handler stored null into local 1");
+        assert!(!info.is_nonnull(15, 1));
+        // The fact still holds where only the normal path reaches.
+        assert!(info.is_nonnull(5, 1));
     }
 }

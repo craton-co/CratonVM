@@ -129,6 +129,18 @@ pub(super) fn array_opcode_npe_action(code: &[u8], bc_pc: usize) -> u8 {
 /// form we recognise. The caller falls back to emitting the runtime
 /// check on `None` (always sound).
 pub(super) fn array_receiver_local(code: &[u8], pc: usize) -> Option<usize> {
+    array_receiver(code, pc).map(|(local, _)| local)
+}
+
+/// [`array_receiver_local`], plus the PC of the index push that sits between
+/// the `aload` and the array access.
+///
+/// The pattern names the receiver by TEXTUAL adjacency, which is the dataflow
+/// only when neither the access nor the index push can be jumped to. A caller
+/// that elides a check on the strength of the pair must therefore also refuse
+/// when either PC is a merge point (`NullCheckInfo::is_merge_point`) — the
+/// operand may otherwise have been pushed on another path.
+pub(super) fn array_receiver(code: &[u8], pc: usize) -> Option<(usize, usize)> {
     if pc == 0 {
         return None;
     }
@@ -225,13 +237,13 @@ pub(super) fn array_receiver_local(code: &[u8], pc: usize) -> Option<usize> {
     let aop = code[aload_pc];
     if (0x2A..=0x2D).contains(&aop) {
         // Widening: u8 -> usize (opcode-relative local index, value fits)
-        return Some((aop - 0x2A) as usize);
+        return Some(((aop - 0x2A) as usize, idx_pc));
     }
     // aload <u8> — the index byte is at aload_pc+1, which is strictly < idx_pc
     // because this instruction's forward length is 2 and it ends at idx_pc.
     if aop == 0x19 && aload_pc + 1 < idx_pc {
         // Widening: u8 -> wider int (bytecode operand byte, value fits)
-        return Some(code[aload_pc + 1] as usize);
+        return Some((code[aload_pc + 1] as usize, idx_pc));
     }
     None
 }

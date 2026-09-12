@@ -305,8 +305,13 @@ impl Compiler {
     /// Safe to call instead of `emit_null_check_array_store` at every
     /// inline array-store site; the conservative path is identical.
     pub(super) fn emit_null_check_array_store_at(&mut self, code: &[u8], bc_pc: usize) {
-        if let Some(local) = array_receiver_local(code, bc_pc) {
-            if self.is_local_nonnull(bc_pc, local) {
+        if let Some((local, idx_pc)) = super::null_check_elim::array_receiver(code, bc_pc) {
+            // The receiver is identified by textual adjacency; at a merge
+            // point the array on the stack may have come from another path.
+            if !self.null_check_info.is_merge_point(bc_pc)
+                && !self.null_check_info.is_merge_point(idx_pc)
+                && self.is_local_nonnull(bc_pc, local)
+            {
                 // peephole-null-elim: dataflow proves non-null; skip
                 // the 8-byte TEST/JZ sequence entirely.
                 return;
@@ -371,8 +376,12 @@ impl Compiler {
     /// elide the inline TEST/JZ null check on array loads when the
     /// receiver is proven non-null at `bc_pc` by the dataflow.
     pub(super) fn emit_null_check_array_load_at(&mut self, code: &[u8], bc_pc: usize) {
-        if let Some(local) = array_receiver_local(code, bc_pc) {
-            if self.is_local_nonnull(bc_pc, local) {
+        if let Some((local, idx_pc)) = super::null_check_elim::array_receiver(code, bc_pc) {
+            // See `emit_null_check_array_store_at`: no elision at a merge point.
+            if !self.null_check_info.is_merge_point(bc_pc)
+                && !self.null_check_info.is_merge_point(idx_pc)
+                && self.is_local_nonnull(bc_pc, local)
+            {
                 // peephole-null-elim: dataflow proves non-null; skip
                 // the 8-byte TEST/JZ sequence entirely.
                 return;

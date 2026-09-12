@@ -435,6 +435,13 @@ fails, this table is stale.
 | `IDENTITY_HASH_CODE_OFFSET as i32` | 1 | disp32 | 15234 (was bare `8`) |
 | `NUM_SLOTS_OFFSET` in Rust pointer arithmetic | 1 | n/a | 29422 |
 
+**2026-09-12 — two `HEADER_SIZE as i32` sites removed (13 → 11).** The
+vectorised `double[]` sum (`emit_simd_fp_array_sum`) was retired because it
+reordered strict IEEE additions (`{1e16, 1, -1e16, 1}` summed to 2.0). Its
+pre-header base (`ADD RAX, imm32`) and its scalar-tail `[RCX + R10*8 + disp32]`
+load were both disp32 sites of this pattern; nothing replaced them. The tripwire
+records 11.
+
 **2026-09-11 — the inline `newarray` bump and the StringBuilder intrinsics.**
 Five new **disp8** sites in `x64/objects.rs`, and they are safe against a
 header change for one reason worth stating plainly: they are all behind ONE

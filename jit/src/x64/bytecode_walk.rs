@@ -14348,9 +14348,12 @@ impl Compiler {
                     // local that is proven non-null at this PC, the TEST
                     // can never be zero so `ifnull` is dead and the
                     // fall-through is always taken. Skip both the TEST
-                    // and the JE.
-                    let proven_nonnull = preceding_aload_nonnull_local(code, pc)
-                        .is_some_and(|l| self.is_local_nonnull(pc, l));
+                    // and the JE. Not at a merge point: there the tested value
+                    // may have been pushed on another path than the `aload`
+                    // textually before this PC.
+                    let proven_nonnull = !self.null_check_info.is_merge_point(pc)
+                        && preceding_aload_nonnull_local(code, pc)
+                            .is_some_and(|l| self.is_local_nonnull(pc, l));
                     if proven_nonnull {
                         // No-op: fall through. We still need a non-empty
                         // branch-target record so downstream merges see
@@ -14401,9 +14404,10 @@ impl Compiler {
                     // always taken: emit an unconditional JMP rel32 and
                     // skip the TEST + Jcc pair. Saves the 3-byte TEST
                     // + 1-byte (Jcc opcode-pair high byte) for every
-                    // proven site.
-                    let proven_nonnull = preceding_aload_nonnull_local(code, pc)
-                        .is_some_and(|l| self.is_local_nonnull(pc, l));
+                    // proven site. Not at a merge point (see `ifnull`).
+                    let proven_nonnull = !self.null_check_info.is_merge_point(pc)
+                        && preceding_aload_nonnull_local(code, pc)
+                            .is_some_and(|l| self.is_local_nonnull(pc, l));
                     if proven_nonnull {
                         // JMP rel32 (5 bytes; patched).
                         self.buf.emit_byte(0xE9);
