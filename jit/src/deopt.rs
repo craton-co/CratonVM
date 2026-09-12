@@ -690,6 +690,23 @@ pub fn count_materialization_required(fs: &FrameState) -> usize {
 pub struct MonitorInfo {
     pub object: FrameValue,
     pub lock_depth: u32,
+    /// Must the resume ACQUIRE this monitor (`lock_depth` times) on the
+    /// resuming thread?
+    ///
+    /// `true` for a lock the compiled code never took: escape analysis elided
+    /// its `monitorenter`/`monitorexit` (typically over a scalar-replaced
+    /// object, which the resume materializes first). The interpreter frame
+    /// will run the matching `monitorexit`, so the lock has to exist — this is
+    /// HotSpot's relock-eliminated-locks-on-deopt. Every producer before
+    /// 2026-09-12 (the single-pass backend's scalar-monitor snapshots) emitted
+    /// only such locks, and they carry `true`.
+    ///
+    /// `false` for a lock the compiled code took through the monitor helper:
+    /// the thread still holds it when the frame deoptimizes, and acquiring it
+    /// again would leave it held one level too deep after the interpreter's
+    /// `monitorexit`. The optimizing tier's frame states name these since they
+    /// began recording the builder's monitor stack.
+    pub relock: bool,
 }
 
 /// Complete interpreter frame state at a deopt point.
@@ -1608,6 +1625,7 @@ fn resolve_frame_state_machine(
         .map(|m| MonitorInfo {
             object: resolve_value(&m.object, regs, rbp),
             lock_depth: m.lock_depth,
+            relock: m.relock,
         })
         .collect();
     ReconstructedFrame {
@@ -2009,6 +2027,7 @@ mod deopt_stash_root_tests {
             monitors: vec![MonitorInfo {
                 object: FrameValue::Object(base + 0x3000),
                 lock_depth: 1,
+                relock: true,
             }],
             caller_frames: vec![ReconstructedFrame {
                 method_key: "craton/probe/Stash.caller:()V".to_string(),
@@ -2088,6 +2107,7 @@ mod deopt_stash_root_tests {
             monitors: vec![MonitorInfo {
                 object: FrameValue::Object(0),
                 lock_depth: 1,
+                relock: true,
             }],
             caller_frames: Vec::new(),
         });
@@ -2955,6 +2975,7 @@ fn hash_monitors(monitors: &[MonitorInfo]) -> u64 {
     for m in monitors {
         hash_frame_value(&m.object, &mut h);
         m.lock_depth.hash(&mut h);
+        m.relock.hash(&mut h);
     }
     h.finish()
 }
@@ -2982,7 +3003,9 @@ fn monitors_eq(a: &[MonitorInfo], b: &[MonitorInfo]) -> bool {
     a.len() == b.len()
         && a.iter()
             .zip(b.iter())
-            .all(|(x, y)| x.lock_depth == y.lock_depth && x.object == y.object)
+            .all(|(x, y)| {
+                x.lock_depth == y.lock_depth && x.relock == y.relock && x.object == y.object
+            })
 }
 
 /// Content-addressed store for immutable frame states.
@@ -5208,6 +5231,7 @@ mod deopt_metadata_tests {
         p.frame_state.monitors = vec![MonitorInfo {
             object: FrameValue::StackSlotRef(-40),
             lock_depth: 0,
+            relock: true,
         }];
         let errs = verifier().violations(&[p]);
         assert!(
@@ -5226,10 +5250,12 @@ mod deopt_metadata_tests {
             MonitorInfo {
                 object: FrameValue::StackSlotRef(-40),
                 lock_depth: 1,
+                relock: true,
             },
             MonitorInfo {
                 object: FrameValue::StackSlotRef(-40),
                 lock_depth: 1,
+                relock: true,
             },
         ];
         let errs2 = verifier().violations(&[p2]);
@@ -5247,6 +5273,7 @@ mod deopt_metadata_tests {
                 EliminationCause::ElidedLock,
             )),
             lock_depth: 1,
+            relock: true,
         }];
         let errs3 = verifier().violations(&[p3]);
         assert!(
@@ -5889,6 +5916,7 @@ mod deopt_metadata_soundness_tests {
             p.frame_state.monitors = vec![MonitorInfo {
                 object: bad.clone(),
                 lock_depth: 1,
+                relock: true,
             }];
             let errs = scoped().violations(&[p]);
             assert!(
@@ -5909,6 +5937,7 @@ mod deopt_metadata_soundness_tests {
         p.frame_state.monitors = vec![MonitorInfo {
             object: FrameValue::Object(0),
             lock_depth: 1,
+            relock: true,
         }];
         let errs = scoped().violations(&[p]);
         assert!(
@@ -5941,6 +5970,7 @@ mod deopt_metadata_soundness_tests {
             p.frame_state.monitors = vec![MonitorInfo {
                 object: good.clone(),
                 lock_depth: 2,
+                relock: true,
             }];
             let errs = scoped().violations(&[p]);
             assert!(
@@ -5962,6 +5992,7 @@ mod deopt_metadata_soundness_tests {
         p.frame_state.monitors = vec![MonitorInfo {
             object: FrameValue::StackSlotRef(-64),
             lock_depth: 1,
+            relock: true,
         }];
         let v = scoped().with_oop_map(0x40, OopCoverage::complete([40]));
         let errs = v.violations(&[p]);
@@ -6651,6 +6682,7 @@ mod tests {
             monitors: vec![MonitorInfo {
                 object: FrameValue::RegisterRef(14),
                 lock_depth: 1,
+                relock: true,
             }],
             caller: None,
         };
@@ -6901,6 +6933,7 @@ mod tests {
         let mi = MonitorInfo {
             object: FrameValue::Object(0xDEAD),
             lock_depth: 2,
+            relock: true,
         };
         assert_eq!(mi.lock_depth, 2);
         assert_eq!(mi.object, FrameValue::Object(0xDEAD));
@@ -7224,6 +7257,7 @@ mod tests {
             monitors: vec![MonitorInfo {
                 object: FrameValue::Object(0x1000),
                 lock_depth: 1,
+                relock: true,
             }],
             caller: None,
         };
@@ -7280,6 +7314,7 @@ mod frame_state_interning_tests {
                 monitors: vec![MonitorInfo {
                     object: FrameValue::StackSlotRef(-8 * (level as i32 + 1)),
                     lock_depth: 1,
+                    relock: true,
                 }],
                 caller: built.take(),
             }));
@@ -8057,6 +8092,7 @@ mod frame_state_interning_tests {
         let monitors = vec![MonitorInfo {
             object: FrameValue::StackSlotRef(-40),
             lock_depth: 2,
+            relock: true,
         }];
         let mut ids = Vec::new();
         for bci in 0..16u32 {

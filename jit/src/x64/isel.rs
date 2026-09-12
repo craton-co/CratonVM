@@ -7329,6 +7329,7 @@ mod tests {
             bci: 0,
             locals: vec![f.load],
             stack: Vec::new(),
+            monitors: Vec::new(),
         });
         let ctx = ctx_of(&f.graph, &f.block);
         assert_eq!(

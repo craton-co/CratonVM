@@ -120,6 +120,12 @@ pub struct VirtualObjectInfo {
     /// `VirtualObject` there — else a deopt *before* a store would materialize
     /// the post-store value instead of the field's actual (earlier) value.
     pub store_ctrls: Vec<NodeId>,
+    /// The eliminated field stores' own node ids, parallel to `store_ctrls`.
+    /// When a store's block IS the deopt block, strict dominance cannot answer
+    /// and the id order within the block does — see
+    /// `Lowerer::eliminated_node_precedes_deopt`. A shorter list than
+    /// `store_ctrls` (a hand-built map) makes the same-block case refuse.
+    pub store_nodes: Vec<NodeId>,
 }
 
 /// Maps each scalar-replaced `Op::New` (by IR `NodeId`) to its
@@ -963,9 +969,27 @@ struct Lowerer<'a> {
     /// Bytecode indices an `Op::Guard { bci }` is anchored at.
     guard_bcis: std::collections::HashSet<usize>,
     /// Every node a deopt at a bci can fire from, in node-id order: each
-    /// `Op::Guard { bci }` under its `bci`, and each `Op::Div` / `Op::Rem`
-    /// under its `bytecode_pc`.
+    /// `Op::Guard { bci }` under its `bci`, each `Op::Div` / `Op::Rem` under its
+    /// `bytecode_pc`, and every other node that can transfer to the interpreter
+    /// (`!op_cannot_deopt`) under its `bytecode_pc` mapped through the spliced
+    /// ranges to the bci a deopt from it resumes at.
+    ///
+    /// Before 2026-09-12 only guards and divisions were indexed, so a
+    /// scalar-replaced object live at a call, a field access or an allocation
+    /// had no deopt block and could never be described.
     deopt_sites_by_bci: HashMap<usize, Vec<NodeId>>,
+    /// The reference every LIVE `Op::MonitorEnter` / `Op::MonitorExit` names.
+    ///
+    /// A snapshot monitor entry naming one of these is a lock the compiled
+    /// code really took through the monitor helper, so the thread still holds
+    /// it when the frame deoptimizes and the resume must NOT take it again
+    /// (`MonitorInfo::relock == false`). An entry naming anything else had its
+    /// monitor ops elided by lock elision — they are `Op::Dead` with their
+    /// inputs cleared, which is exactly why they cannot appear here — so the
+    /// compiled code never locked it and the resume must
+    /// (`MonitorInfo::relock == true`). Elision is all-or-nothing per object,
+    /// so one live op on an object means none of its monitors were elided.
+    live_monitor_operands: std::collections::HashSet<NodeId>,
     /// Which inlined callee each safepoint snapshot belongs to, and the caller
     /// scopes stacked above it. Consumed by [`Lowerer::caller_chain_for`] to
     /// fill `FrameState::caller`, which was hard-coded `None` before this
@@ -1728,11 +1752,20 @@ impl<'a> Lowerer<'a> {
                 })
                 .collect(),
             deopt_sites_by_bci: {
+                // `Lowerer::resume_bci`'s mapping, restated: `self` does not
+                // exist yet.
+                let resume = |pc: usize| {
+                    spliced_ranges
+                        .iter()
+                        .find(|&&(start, end, _)| pc >= start && pc < end)
+                        .map_or(pc, |&(_, _, invoke)| invoke)
+                };
                 let mut sites: HashMap<usize, Vec<NodeId>> = HashMap::new();
                 for (id, n) in graph.nodes.iter().enumerate() {
                     let key = match n.op {
                         Op::Guard { bci } => Some(bci),
                         Op::Div | Op::Rem => n.bytecode_pc,
+                        ref op if !op_cannot_deopt(op) => n.bytecode_pc.map(resume),
                         _ => None,
                     };
                     if let Some(bci) = key {
@@ -1741,6 +1774,12 @@ impl<'a> Lowerer<'a> {
                 }
                 sites
             },
+            live_monitor_operands: graph
+                .nodes
+                .iter()
+                .filter(|n| matches!(n.op, Op::MonitorEnter | Op::MonitorExit))
+                .filter_map(|n| n.input_opt(2))
+                .collect(),
             inline_scopes,
             inline_frame_sites,
             inline_frame_rows: Vec::new(),
@@ -2174,7 +2213,12 @@ impl<'a> Lowerer<'a> {
             if widened && !trapping.contains(&sp.bci) {
                 continue;
             }
-            for &v in sp.locals.iter().chain(sp.stack.iter()) {
+            for &v in sp
+                .locals
+                .iter()
+                .chain(sp.stack.iter())
+                .chain(sp.monitors.iter())
+            {
                 if v != NO_NODE {
                     if let Some(cell) = out.get_mut(v as usize) {
                         *cell = true;
@@ -7881,7 +7925,12 @@ impl<'a> Lowerer<'a> {
         }
         let mut deopt_named = vec![false; n];
         for sp in &self.graph.safepoints {
-            for &v in sp.locals.iter().chain(sp.stack.iter()) {
+            for &v in sp
+                .locals
+                .iter()
+                .chain(sp.stack.iter())
+                .chain(sp.monitors.iter())
+            {
                 if v != NO_NODE {
                     if let Some(cell) = deopt_named.get_mut(v as usize) {
                         *cell = true;
@@ -12676,18 +12725,98 @@ impl<'a> Lowerer<'a> {
     /// [`InlineScopeTable`] — every compile today — `caller` is `None` and this
     /// produces exactly the frame state it always did.
     fn resolve_frame_state(&self, sp: &SafepointSnapshot, index: usize) -> FrameState {
-        let (locals, stack) = self.resolve_frame_values(sp);
+        let (locals, stack, monitors) = self.resolve_frame_values(sp);
         FrameState {
             method_key: String::new(),
             bci: sp.bci as u32,
             locals,
             stack,
-            monitors: Vec::new(),
+            monitors,
             caller: self.caller_chain_for(index),
         }
     }
 
-    /// The `(locals, stack)` halves of one snapshot's frame — everything
+    /// Describe one held monitor's locked reference as a frame value.
+    ///
+    /// [`Self::frame_value_for`] with the reference kind forced. The operand of
+    /// a `monitorenter` is a reference by JVMS, but a node's `IrType` is only as
+    /// good as the typing its producer did — a hand-built graph's `Op::Param` is
+    /// `Int` — and an int-typed descriptor here would make the install verifier
+    /// reject the whole compile (`deopt::monitor_object_defect`). A frame word
+    /// holds the full 64-bit value whatever the node's type, so an int stack
+    /// slot is re-spelled as a reference slot. A REGISTER copy of an int-typed
+    /// node is not trusted to hold all 64 bits; the node's home word is used
+    /// instead when it has one, and the answer is `Unsupported` (refuse, never
+    /// guess) when it does not.
+    fn monitor_object_value(&self, obj: NodeId) -> FrameValue {
+        match self.frame_value_for(obj) {
+            FrameValue::StackSlot(off) | FrameValue::StackSlotLong(off) => {
+                FrameValue::StackSlotRef(off)
+            }
+            FrameValue::Register(_) | FrameValue::RegisterLong(_) => self
+                .monitor_object_home(obj)
+                .unwrap_or(FrameValue::Unsupported),
+            other => other,
+        }
+    }
+
+    /// The home frame word of `obj`, as a reference slot, when it has one that
+    /// was written.
+    fn monitor_object_home(&self, obj: NodeId) -> Option<FrameValue> {
+        let node = self.graph.nodes.get(obj as usize)?;
+        if self.home_dropped.get(obj as usize).copied().unwrap_or(false) {
+            return None;
+        }
+        let off = match (self.node_slot.get(obj as usize).copied().flatten(), &node.op) {
+            (Some(slot), _) => slot.get() as i32,
+            (None, Op::Param(idx)) => ((*idx as i32) + 1) * 8,
+            (None, _) => return None,
+        };
+        Some(FrameValue::StackSlotRef(-off))
+    }
+
+    /// The held monitors of one snapshot, outermost first, in the shape
+    /// `deopt::FrameState::monitors` wants.
+    ///
+    /// * **Coalesced per object.** The snapshot has one entry per executed
+    ///   `monitorenter`; a re-entrant lock is one `MonitorInfo` whose
+    ///   `lock_depth` is the count (the install verifier refuses two entries on
+    ///   one object). Order is first occurrence, which is acquisition order.
+    /// * **`relock`** is `true` exactly when no live monitor op names the
+    ///   object — see [`Lowerer::live_monitor_operands`]. The compiled code took
+    ///   every other lock itself, and the thread still holds it at the deopt.
+    /// * `describe` turns the object into a frame value. It is the same
+    ///   describer the locals use, so a scalar-replaced object that a local
+    ///   already defined comes back as a `VirtualObjectRef` to that definition.
+    fn resolve_monitors(
+        &self,
+        sp: &SafepointSnapshot,
+        mut describe: impl FnMut(NodeId) -> FrameValue,
+    ) -> Vec<crate::deopt::MonitorInfo> {
+        if sp.monitors.is_empty() {
+            return Vec::new();
+        }
+        let mut order: Vec<(NodeId, u32)> = Vec::with_capacity(sp.monitors.len());
+        for &obj in &sp.monitors {
+            match order.iter_mut().find(|(o, _)| *o == obj) {
+                Some((_, depth)) => *depth = depth.saturating_add(1),
+                None => order.push((obj, 1)),
+            }
+        }
+        let mut out: Vec<crate::deopt::MonitorInfo> = Vec::with_capacity(order.len());
+        for (obj, lock_depth) in order {
+            let relock = !self.live_monitor_operands.contains(&obj);
+            let object = describe(obj);
+            out.push(crate::deopt::MonitorInfo {
+                object,
+                lock_depth,
+                relock,
+            });
+        }
+        out
+    }
+
+    /// The `(locals, stack, monitors)` of one snapshot's frame — everything
     /// [`Self::resolve_frame_state`] builds except the identity and the caller
     /// chain.
     ///
@@ -12697,7 +12826,10 @@ impl<'a> Lowerer<'a> {
     /// own snapshot as its `caller_snapshot` would recurse until the stack ran
     /// out — inside a compile, for a metadata defect. There is no cycle to
     /// defend against here because this function never looks at a scope.
-    fn resolve_frame_values(&self, sp: &SafepointSnapshot) -> (Vec<FrameValue>, Vec<FrameValue>) {
+    fn resolve_frame_values(
+        &self,
+        sp: &SafepointSnapshot,
+    ) -> (Vec<FrameValue>, Vec<FrameValue>, Vec<crate::deopt::MonitorInfo>) {
         // Guard-surviving scalar replacement (producer): when `sr_map` is set, a
         // snapshot slot holding a scalar-replaced (now-`Op::Dead`) `Op::New`
         // lowers to a `FrameValue::VirtualObject` (first occurrence) /
@@ -12708,6 +12840,7 @@ impl<'a> Lowerer<'a> {
         // exactly the historical `frame_value_for` mapping (byte-identical).
         if let Some(sr) = self.sr_map {
             let deopt_block = self.deopt_block_for_bci(sp.bci);
+            let first_site = deopt_block.and_then(|b| self.deopt_first_site_in_block(sp.bci, b));
             if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SCALAR_DEOPT") {
                 let matches: Vec<NodeId> = sp
                     .locals
@@ -12728,7 +12861,7 @@ impl<'a> Lowerer<'a> {
             let mut locals = Vec::with_capacity(sp.locals.len());
             for &n in &sp.locals {
                 locals.push(if n != NO_NODE && sr.objects.contains_key(&n) {
-                    self.frame_value_for_object(n, deopt_block, sr, &mut emitted)
+                    self.frame_value_for_object(n, deopt_block, first_site, sr, &mut emitted)
                 } else {
                     self.frame_value_for(n)
                 });
@@ -12736,16 +12869,26 @@ impl<'a> Lowerer<'a> {
             let mut stack = Vec::with_capacity(sp.stack.len());
             for &n in &sp.stack {
                 stack.push(if n != NO_NODE && sr.objects.contains_key(&n) {
-                    self.frame_value_for_object(n, deopt_block, sr, &mut emitted)
+                    self.frame_value_for_object(n, deopt_block, first_site, sr, &mut emitted)
                 } else {
                     self.frame_value_for(n)
                 });
             }
-            return (locals, stack);
+            // After locals and stack, sharing `emitted`: a locked object a local
+            // already defined is named by reference, not defined a second time.
+            let monitors = self.resolve_monitors(sp, |n| {
+                if n != NO_NODE && sr.objects.contains_key(&n) {
+                    self.frame_value_for_object(n, deopt_block, first_site, sr, &mut emitted)
+                } else {
+                    self.monitor_object_value(n)
+                }
+            });
+            return (locals, stack, monitors);
         }
         (
             sp.locals.iter().map(|&n| self.frame_value_for(n)).collect(),
             sp.stack.iter().map(|&n| self.frame_value_for(n)).collect(),
+            self.resolve_monitors(sp, |n| self.monitor_object_value(n)),
         )
     }
 
@@ -12800,29 +12943,104 @@ impl<'a> Lowerer<'a> {
                 .caller_snapshot
                 .and_then(|si| self.graph.safepoints.get(si as usize))
                 .map(|sp| self.resolve_frame_values(sp));
-            let (locals, stack) = match described {
+            let (locals, stack, monitors) = match described {
                 Some(parts) => parts,
                 // See "Fail-closed on an undescribed caller" above.
-                None => (vec![FrameValue::Unsupported], Vec::new()),
+                None => (vec![FrameValue::Unsupported], Vec::new(), Vec::new()),
             };
             built = Some(Box::new(FrameState {
                 method_key: sc.method_key.clone(),
                 bci: sc.caller_bci,
                 locals,
                 stack,
-                monitors: Vec::new(),
+                monitors,
                 caller: built.take(),
             }));
         }
         built
     }
 
+    /// Does `op` (a node indexed under `bci` in [`Self::deopt_sites_by_bci`])
+    /// fire the deopt at `bci`?
+    ///
+    /// An explicit `Op::Guard { bci }` does; a division does only when no guard
+    /// is anchored at its bci (the anchored guard owns the trap, and the
+    /// floating division beside it traps nowhere); every other indexed node is
+    /// indexed precisely because it can transfer from that program point.
+    fn fires_deopt_at(op: &Op, bytecode_pc: Option<usize>, bci: usize, anchored: bool) -> bool {
+        match op {
+            Op::Div | Op::Rem => !anchored && bytecode_pc == Some(bci),
+            Op::Guard { bci: gb } => *gb == bci,
+            other => !op_cannot_deopt(other),
+        }
+    }
+
+    /// The lowest node id among the deopt sites at `bci` that sit in `block`.
+    ///
+    /// The builder creates a block's control-pinned nodes in bytecode walk
+    /// order, so a node with a smaller id in the same block executes before
+    /// every one of these sites. See [`Self::eliminated_node_precedes_deopt`].
+    fn deopt_first_site_in_block(&self, bci: usize, block: usize) -> Option<NodeId> {
+        let anchored = self.guard_bcis.contains(&bci);
+        let sites: &[NodeId] = self
+            .deopt_sites_by_bci
+            .get(&bci)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        sites
+            .iter()
+            .copied()
+            .filter(|&site| {
+                self.graph.nodes.get(site as usize).is_some_and(|n| {
+                    Self::fires_deopt_at(&n.op, n.bytecode_pc, bci, anchored)
+                        && self.schedule.node_to_block.get(site as usize).copied() == Some(block)
+                })
+            })
+            .min()
+    }
+
+    /// Had the eliminated node `victim` (an `Op::New` or one of its field
+    /// stores), whose control input is `ctrl`, executed by the time the deopt
+    /// in block `db` fires?
+    ///
+    /// * `ctrl`'s block strictly dominates `db` — yes, on every path.
+    /// * `ctrl`'s block IS `db` — yes exactly when `victim` precedes the first
+    ///   deopt site there (`first_site`). Both are control-pinned nodes of one
+    ///   block, which the builder creates in bytecode walk order and nothing
+    ///   later reorders: a store is a hard barrier to hoisting, an unroll clones
+    ///   whole iterations in execution order, and a load-CSE survivor is the
+    ///   earlier node. A floating division is excluded as a site when a guard
+    ///   is anchored at its bci (always, for built graphs).
+    /// * otherwise — no. Refusing costs a precise resume, never correctness.
+    ///
+    /// The same-block case used to refuse outright, which made the recipe fail
+    /// for the commonest shape there is: `o = new; o.f = x; ...; guard` in one
+    /// straight-line block.
+    fn eliminated_node_precedes_deopt(
+        &self,
+        ctrl: NodeId,
+        victim: Option<NodeId>,
+        db: usize,
+        first_site: Option<NodeId>,
+    ) -> bool {
+        if self.schedule.node_strictly_dominates_block(ctrl, db) {
+            return true;
+        }
+        let same_block = self
+            .schedule
+            .node_to_block
+            .get(ctrl as usize)
+            .is_some_and(|&b| b != usize::MAX && b == db);
+        same_block
+            && matches!((victim, first_site), (Some(v), Some(site)) if v < site)
+    }
+
     /// Block where the deopt at `bci` fires — the program point all of a
-    /// scalar-replaced object's field stores must dominate for its
-    /// `VirtualObject` emission to be temporally correct. v1 deopt points are
-    /// div/rem guards, so the block is that of the `Op::Div`/`Op::Rem` node
-    /// carrying this bci. Returns `None` (⇒ the producer bails to `Undefined`)
-    /// when the block can't be uniquely identified.
+    /// scalar-replaced object's field stores must precede for its
+    /// `VirtualObject` emission to be temporally correct: the block of the
+    /// deopt site(s) [`Self::deopt_sites_by_bci`] indexes under this bci.
+    /// Returns `None` (⇒ the producer bails to `MaterializationRequired`) when
+    /// the block can't be uniquely identified.
     fn deopt_block_for_bci(&self, bci: usize) -> Option<usize> {
         // An `Op::Guard` at this bci OWNS the deopt: since
         // `ir::IrBuilder::add_div_zero_guard`, a division's zero-divisor trap
@@ -12847,15 +13065,11 @@ impl<'a> Lowerer<'a> {
             let Some(n) = self.graph.nodes.get(id) else {
                 continue;
             };
-            // The deopt at `bci` fires from an explicit `Op::Guard { bci }`, or
-            // — for a graph with no guard at this bci — from the div/rem
-            // zero/overflow guard the lowerer emits at the node carrying
-            // `bytecode_pc == bci`.
-            let is_deopt_here = match &n.op {
-                Op::Div | Op::Rem => !anchored && n.bytecode_pc == Some(bci),
-                Op::Guard { bci: gb } => *gb == bci,
-                _ => false,
-            };
+            // The deopt at `bci` fires from an explicit `Op::Guard { bci }`,
+            // from the div/rem zero/overflow guard the lowerer emits at a
+            // division no guard is anchored beside, or from any other node that
+            // can transfer from this program point.
+            let is_deopt_here = Self::fires_deopt_at(&n.op, n.bytecode_pc, bci, anchored);
             if is_deopt_here {
                 let b = *self.schedule.node_to_block.get(id)?;
                 if b == usize::MAX {
@@ -12899,6 +13113,7 @@ impl<'a> Lowerer<'a> {
         &self,
         new_id: NodeId,
         deopt_block: Option<usize>,
+        first_site: Option<NodeId>,
         sr: &ScalarReplacementMap,
         emitted: &mut std::collections::HashSet<NodeId>,
     ) -> FrameValue {
@@ -12929,15 +13144,12 @@ impl<'a> Lowerer<'a> {
             }
         };
         // The allocation and every field store must have executed before the
-        // deopt (strict block dominance — same-block ordering is conservatively
-        // rejected; see `Schedule::node_strictly_dominates_block`). We test the
-        // *control* node of each — the New/store nodes themselves are now
+        // deopt: strict block dominance, or the same block and an earlier node
+        // id (`eliminated_node_precedes_deopt`). We test the *control* node of
+        // each for the block — the New/store nodes themselves are now
         // `Op::Dead` (unscheduled), but their captured control inputs are live
-        // and carry the same block.
-        if !self
-            .schedule
-            .node_strictly_dominates_block(info.new_ctrl, db)
-        {
+        // and carry the same block — and the dead node's own id for the order.
+        if !self.eliminated_node_precedes_deopt(info.new_ctrl, Some(new_id), db, first_site) {
             if dbg {
                 eprintln!(
                     "[DBG_SCALAR_DEOPT] bail new {new_id}: new_ctrl {} (block {:?}) !strict-dom deopt block {db}",
@@ -12947,8 +13159,9 @@ impl<'a> Lowerer<'a> {
             }
             return Self::eliminated_object(new_id, info, EliminationCause::ScalarReplacedObject);
         }
-        for &store_ctrl in &info.store_ctrls {
-            if !self.schedule.node_strictly_dominates_block(store_ctrl, db) {
+        for (k, &store_ctrl) in info.store_ctrls.iter().enumerate() {
+            let store_node = info.store_nodes.get(k).copied();
+            if !self.eliminated_node_precedes_deopt(store_ctrl, store_node, db, first_site) {
                 if dbg {
                     eprintln!(
                         "[DBG_SCALAR_DEOPT] bail new {new_id}: store_ctrl {} (block {:?}) !strict-dom deopt block {db}",
@@ -12998,7 +13211,13 @@ impl<'a> Lowerer<'a> {
                     // turns that refusal into a refusal of the enclosing
                     // object. Fail-closed, one level at a time.
                     if sr.objects.contains_key(&vnode) {
-                        let nested = self.frame_value_for_object(vnode, deopt_block, sr, emitted);
+                        let nested = self.frame_value_for_object(
+                            vnode,
+                            deopt_block,
+                            first_site,
+                            sr,
+                            emitted,
+                        );
                         if matches!(
                             nested,
                             FrameValue::Undefined
@@ -13998,7 +14217,14 @@ fn plan_slots(
         }
     }
     for sp in &graph.safepoints {
-        for &v in sp.locals.iter().chain(sp.stack.iter()) {
+        // A monitor entry pins its reference's home exactly as a local does:
+        // the deopt reads the locked object from that word at any recorded bci.
+        for &v in sp
+            .locals
+            .iter()
+            .chain(sp.stack.iter())
+            .chain(sp.monitors.iter())
+        {
             if v != NO_NODE {
                 if let Some(slot) = pinned.get_mut(v as usize) {
                     *slot = true;
@@ -19388,32 +19614,23 @@ pub(crate) fn lower_inner_with_scopes(
     // `can_deopt_resume` gate stays off for the IR backend and the emitted
     // VirtualObject is never consumed. Sound to enable: the per-slot mapper and
     // the materializer each bail to a safe whole-method re-run on any slot they
-    // cannot reconstruct. Only reachable with `sr_map` set (i.e.
-    // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`), so production is unaffected.
+    // cannot reconstruct. Only reachable with `sr_map` set.
     //
-    // ...unless the graph holds a monitor. Every `FrameState` this lowerer
-    // builds hard-codes `monitors: Vec::new()`, so a precise resume would
-    // rebuild an interpreter frame that believes it holds no lock. The
-    // interpreter's own sink refuses a frame that holds monitors — but it
-    // cannot fire on information that was never recorded, so the omission
-    // defeats the guard rather than tripping it, and the method exits without
-    // the `monitorexit` the lock is waiting for.
-    //
-    // The guard above (`monitor helper absent`) does not cover this: the
-    // helpers ARE wired in production, so that refusal is inert. Until the
-    // frame states carry real monitor state, a monitor-bearing method may be
-    // compiled and may deoptimize — it just may not resume PRECISELY. The
-    // whole-method re-run it falls back to re-enters a re-entrant lock and
-    // stays balanced.
+    // A method that takes a monitor is no longer excluded. Until 2026-09-12
+    // every `FrameState` this lowerer built hard-coded `monitors: Vec::new()`,
+    // so a precise resume would have rebuilt a frame that believed it held no
+    // lock, and this condition refused any graph with a monitor op. The
+    // builder now records its monitor stack in every snapshot, and
+    // `resolve_monitors` lowers it with a `relock` marker: a lock the compiled
+    // code took is still held and is left alone, a lock escape analysis elided
+    // is re-acquired by the resume after the object is materialized
+    // (`build_deopt_frame_inner`). See
+    // `ir-frame-states-carry-no-monitor-stack-FIXED-20260912.md`.
     if sr_map.is_some()
         && cm
             ._deopt_point_boxes
             .iter()
             .any(|p| crate::deopt::count_virtual_objects(&p.frame_state) > 0)
-        && !graph
-            .nodes
-            .iter()
-            .any(|n| matches!(n.op, Op::MonitorEnter | Op::MonitorExit))
     {
         cm.can_deopt_resume = true;
     }
@@ -20780,6 +20997,38 @@ mod tests {",
             calls_to(fake_monitor_exit as *const () as usize),
             1,
             "monitorexit must call the exit helper"
+        );
+
+        // The deopt metadata now names the held lock. Before 2026-09-12 every
+        // lowered frame state hard-coded `monitors: Vec::new()`.
+        let at = |bci: u32| {
+            cm.deopt_points
+                .iter()
+                .find(|p| p.bci == bci)
+                .unwrap_or_else(|| panic!("a deopt point at bci {bci}"))
+        };
+        let exit_point = at(3);
+        assert_eq!(
+            exit_point.frame_state.monitors.len(),
+            1,
+            "the frame at the monitorexit holds the lock the monitorenter took"
+        );
+        let m = &exit_point.frame_state.monitors[0];
+        assert_eq!(m.lock_depth, 1);
+        assert!(
+            !m.relock,
+            "the compiled code took this lock itself; the resume must not take it again"
+        );
+        assert!(
+            matches!(m.object, FrameValue::StackSlotRef(_)),
+            "the locked object is described as a reference slot even though the \
+             hand-built Param is Int-typed, got {:?}",
+            m.object
+        );
+        assert!(
+            at(1).frame_state.monitors.is_empty(),
+            "at the monitorenter itself nothing is held yet: resuming there \
+             re-executes the enter"
         );
     }
     /// COV-03 — build the one-line `void set(Corpus o, X v) { o.f = v; }` graph
@@ -22583,6 +22832,7 @@ mod tests {",
             bci: 5,
             locals: vec![cond, val],
             stack: vec![],
+            monitors: Vec::new(),
         });
 
         let schedule = ir_schedule::schedule(&graph);
@@ -22622,8 +22872,9 @@ mod tests {",
     /// block2 (else):   return 0
     /// ```
     ///
-    /// `same_block_guard` puts the guard in block0 instead (no `If`), so the New/
-    /// store do NOT strictly dominate it — the temporal-hazard bail case.
+    /// `same_block_guard` puts the guard in block0 instead (no `If`), created
+    /// BEFORE the New/store — so the allocation neither dominates the guard's
+    /// block nor precedes the guard inside it: the temporal-hazard bail case.
     /// `dup_local` puts the object in TWO local slots (sharing → `VirtualObjectRef`).
     /// Returns `(graph, sr_map, new_id)`; the New + store are marked `Op::Dead`
     /// (simulating `apply_ea_to_ir`) and `sr_map` captures their control inputs.
@@ -22644,6 +22895,11 @@ mod tests {",
         let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
         let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
         let cond = g.add(Op::Param(0), IrType::Int, vec![start], None);
+        // Same-block mode: the guard comes FIRST, so in block0's execution order
+        // the deopt fires before the object exists.
+        if same_block_guard {
+            let _guard = g.add(Op::Guard { bci: 10 }, IrType::Void, vec![c0, cond], None);
+        }
         // o = new Foo(); o.x = 7  (both controlled by c0 → block0)
         let newo = g.add(
             Op::New {
@@ -22673,9 +22929,7 @@ mod tests {",
         };
 
         let guard_ctrl = if same_block_guard {
-            // Guard in block0 (after the store), no branch → same block as New/store.
-            let guard = g.add(Op::Guard { bci: 10 }, IrType::Void, vec![c0, cond], None);
-            let _ = guard;
+            // Guard already in block0 (before the New), no branch → same block.
             let ret = g.add(Op::Return, IrType::Void, vec![c0, v7], None);
             g.exit = ret;
             c0
@@ -22700,6 +22954,7 @@ mod tests {",
             bci: 10,
             locals,
             stack: vec![],
+            monitors: Vec::new(),
         });
 
         // Simulate `apply_ea_to_ir`: mark the New + store dead (their inputs are
@@ -22719,6 +22974,7 @@ mod tests {",
                 field_values: vec![Some(v7)],
                 new_ctrl,
                 store_ctrls: vec![store_ctrl],
+                store_nodes: vec![store],
             },
         );
         (g, ScalarReplacementMap { objects }, newo)
@@ -22784,6 +23040,7 @@ mod tests {",
             bci: 5,
             locals: vec![arr, idx],
             stack: vec![arr, idx],
+            monitors: Vec::new(),
         });
         let schedule = ir_schedule::schedule(&g);
 
@@ -22932,10 +23189,89 @@ mod tests {",
         }
     }
 
+    /// The commonest shape there is: `o = new Foo(); o.x = 7; ...; guard` in ONE
+    /// straight-line block. Strict block dominance cannot answer (same block),
+    /// and until 2026-09-12 that alone refused the recipe — so an object live at
+    /// a guard in a branch-free method could never be described. The allocation
+    /// and its store precede the guard in the block's execution order, which is
+    /// the builder's node-id order, and the recipe is emitted.
+    #[test]
+    fn test_scalar_deopt_describes_an_object_stored_earlier_in_the_guards_block() {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+            receiver_param: None,
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let cond = g.add(Op::Param(0), IrType::Int, vec![start], None);
+        let newo = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![c0, mem],
+            None,
+        );
+        let f0 = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let v7 = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![c0, mem, newo, f0, v7],
+            None,
+        );
+        // AFTER the store, same control → same block, later in it.
+        let _guard = g.add(Op::Guard { bci: 10 }, IrType::Void, vec![c0, cond], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![c0, v7], None);
+        g.exit = ret;
+        g.safepoints.push(SafepointSnapshot {
+            bci: 10,
+            locals: vec![cond, newo],
+            stack: vec![],
+            monitors: Vec::new(),
+        });
+        g.nodes[newo as usize].op = Op::Dead;
+        g.nodes[newo as usize].inputs.clear();
+        g.nodes[store as usize].op = Op::Dead;
+        g.nodes[store as usize].inputs.clear();
+        let mut objects = HashMap::new();
+        objects.insert(
+            newo,
+            VirtualObjectInfo {
+                array_element_type: None,
+                class_id: 7,
+                num_fields: 1,
+                field_values: vec![Some(v7)],
+                new_ctrl: c0,
+                store_ctrls: vec![c0],
+                store_nodes: vec![store],
+            },
+        );
+        let sr_map = ScalarReplacementMap { objects };
+
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
+        match &deopt_locals_at(&cm, 10)[1] {
+            FrameValue::VirtualObject(state) => {
+                assert_eq!(state.id, newo as usize);
+                assert_eq!(state.field_values, vec![FrameValue::Int(7)]);
+            }
+            other => panic!("expected VirtualObject, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_scalar_deopt_bails_when_store_not_dominating() {
-        // Guard in the SAME block as the New/store → strict dominance fails (v1
-        // conservatively rejects same-block ordering). The bail names the
+        // Guard in the SAME block as the New/store but BEFORE them → neither
+        // strict dominance nor the in-block order proves the object existed
+        // when the guard fires. The bail names the
         // eliminated allocation instead of claiming the slot is undefined, so
         // the resume is REFUSED (safe whole-method re-run) rather than served a
         // fabricated `Int(0)` — which for this reference local would be `null`.
@@ -22995,6 +23331,7 @@ mod tests {",
                 field_values: vec![],
                 new_ctrl: 1, // Proj(0) — the entry control, dominates everything
                 store_ctrls: vec![],
+                store_nodes: vec![],
             },
         );
         sr_map
@@ -23052,6 +23389,7 @@ mod tests {",
                 // dominance gate refuses it.
                 new_ctrl: NO_NODE,
                 store_ctrls: vec![],
+                store_nodes: vec![],
             },
         );
         sr_map
@@ -25807,6 +26145,7 @@ mod tests {",
             bci: 0,
             locals: vec![adds[0]],
             stack: vec![adds[1]],
+            monitors: Vec::new(),
         });
         let schedule = ir_schedule::schedule(&graph);
         let plan = plan_slots(&graph, &schedule, None);
@@ -26466,6 +26805,66 @@ mod tests {",
         lowerer.resolve_frame_state(&graph.safepoints[index], index)
     }
 
+    /// A held monitor lowers with `relock` saying whether the compiled code
+    /// took the lock itself. A live monitor op on the object ⇒ `false` (the
+    /// thread already holds it). Every monitor op on it killed, the way
+    /// `apply_ea_to_ir`'s lock elision leaves them ⇒ `true` (the resume must
+    /// acquire it).
+    #[test]
+    fn a_held_monitor_is_marked_relock_only_when_its_ops_were_elided() {
+        // aload_0; monitorenter; aload_0; monitorexit; return
+        let code = [0x2a, 0xc2, 0x2a, 0xc3, 0xb1, 0, 0];
+        let live = IrBuilder::new(1, 1).build(&code, 5).expect("build");
+        let index = live
+            .safepoints
+            .iter()
+            .position(|s| s.bci == 3)
+            .expect("a snapshot at the monitorexit");
+
+        let fs = resolve_with_scopes(&live, &InlineScopeTable::new(), index);
+        assert_eq!(fs.monitors.len(), 1, "the lock is recorded");
+        assert_eq!(fs.monitors[0].lock_depth, 1);
+        assert!(!fs.monitors[0].relock, "a live lock is not re-acquired");
+
+        let mut elided = IrBuilder::new(1, 1).build(&code, 5).expect("build");
+        let monitor_ops: Vec<NodeId> = elided
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.op, Op::MonitorEnter | Op::MonitorExit))
+            .map(|(id, _)| id as NodeId)
+            .collect();
+        assert_eq!(monitor_ops.len(), 2);
+        for id in monitor_ops {
+            elided.kill(id);
+        }
+        let fs = resolve_with_scopes(&elided, &InlineScopeTable::new(), index);
+        assert_eq!(fs.monitors.len(), 1, "an elided lock is still recorded");
+        assert!(
+            fs.monitors[0].relock,
+            "no live monitor op names the object, so the resume must acquire it"
+        );
+    }
+
+    /// Re-entrant locking of one object is ONE `MonitorInfo` with
+    /// `lock_depth` 2 — the install verifier refuses two entries on one object.
+    #[test]
+    fn a_reentrant_lock_coalesces_into_one_entry_with_its_depth() {
+        // aload_0; monitorenter; aload_0; monitorenter; aload_0; monitorexit;
+        // aload_0; monitorexit; return
+        let code = [0x2a, 0xc2, 0x2a, 0xc2, 0x2a, 0xc3, 0x2a, 0xc3, 0xb1, 0, 0];
+        let g = IrBuilder::new(1, 1).build(&code, 9).expect("build");
+        let index = g
+            .safepoints
+            .iter()
+            .position(|s| s.bci == 5)
+            .expect("a snapshot at the inner monitorexit");
+        assert_eq!(g.safepoints[index].monitors.len(), 2, "two enters recorded");
+        let fs = resolve_with_scopes(&g, &InlineScopeTable::new(), index);
+        assert_eq!(fs.monitors.len(), 1);
+        assert_eq!(fs.monitors[0].lock_depth, 2);
+    }
+
     /// The state of the world today: no scope table, so every deopt frame is
     /// flat. This is the byte-identical-behaviour witness for the whole change.
     #[test]
@@ -26475,6 +26874,7 @@ mod tests {",
             bci: 4,
             locals: vec![NO_NODE],
             stack: vec![],
+            monitors: Vec::new(),
         });
         let fs = resolve_with_scopes(&g, &InlineScopeTable::new(), 0);
         assert_eq!(fs.bci, 4);
@@ -26495,11 +26895,13 @@ mod tests {",
             bci: 12,
             locals: vec![k],
             stack: vec![],
+            monitors: Vec::new(),
         });
         g.safepoints.push(SafepointSnapshot {
             bci: 3,
             locals: vec![NO_NODE],
             stack: vec![],
+            monitors: Vec::new(),
         });
 
         let mut scopes = InlineScopeTable::new();
@@ -26537,6 +26939,7 @@ mod tests {",
                     bci: 100 + d,
                     locals: vec![k],
                     stack: vec![],
+                    monitors: Vec::new(),
                 });
             }
             let trap_index = depth;
@@ -26544,6 +26947,7 @@ mod tests {",
                 bci: 9,
                 locals: vec![NO_NODE],
                 stack: vec![],
+                monitors: Vec::new(),
             });
 
             let mut scopes = InlineScopeTable::new();
@@ -26592,11 +26996,13 @@ mod tests {",
             bci: 12,
             locals: vec![dangling],
             stack: vec![],
+            monitors: Vec::new(),
         });
         g.safepoints.push(SafepointSnapshot {
             bci: 3,
             locals: vec![NO_NODE],
             stack: vec![],
+            monitors: Vec::new(),
         });
 
         let mut scopes = InlineScopeTable::new();
@@ -26638,6 +27044,7 @@ mod tests {",
             bci: 3,
             locals: vec![NO_NODE],
             stack: vec![],
+            monitors: Vec::new(),
         });
 
         let mut scopes = InlineScopeTable::new();
@@ -26792,6 +27199,7 @@ mod tests {",
             bci: 3,
             locals: fp.clone(),
             stack: fp.clone(),
+            monitors: Vec::new(),
         });
         let schedule = ir_schedule::schedule(&graph);
 

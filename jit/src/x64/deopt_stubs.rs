@@ -980,6 +980,7 @@ impl Compiler {
                     .map(|&(new_pc, depth)| crate::deopt::MonitorInfo {
                         object: FrameValue::VirtualObjectRef(new_pc),
                         lock_depth: depth,
+                        relock: true,
                     })
                     .collect()
             })

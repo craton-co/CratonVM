@@ -1286,7 +1286,13 @@ fn check_frame_states(graph: &Graph, v: &mut Violations) {
             .iter()
             .enumerate()
             .map(|(i, id)| ("local", i, *id))
-            .chain(sp.stack.iter().enumerate().map(|(i, id)| ("stack", i, *id)));
+            .chain(sp.stack.iter().enumerate().map(|(i, id)| ("stack", i, *id)))
+            .chain(
+                sp.monitors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| ("monitor", i, *id)),
+            );
         for (kind, i, id) in slots {
             // `NO_NODE` means "undefined at this bci", which is legal.
             if id == NO_NODE {
@@ -1846,6 +1852,7 @@ mod tests {
             bci: 4,
             locals: vec![k, NO_NODE],
             stack: vec![],
+            monitors: Vec::new(),
         });
         // Clean while the slot is live…
         assert!(verify_graph(&g, "test", VerifyOptions::all()).is_ok());
@@ -1876,12 +1883,14 @@ mod tests {
             bci: 4,
             locals: vec![a],
             stack: vec![],
+            monitors: Vec::new(),
         });
         // A second, DIFFERENT frame state at the same bci.
         g.safepoints.push(crate::ir::SafepointSnapshot {
             bci: 4,
             locals: vec![b],
             stack: vec![],
+            monitors: Vec::new(),
         });
         let err = verify_graph(&g, "test", VerifyOptions::default()).unwrap_err();
         let m = message(&err);
@@ -1906,11 +1915,13 @@ mod tests {
             bci: 4,
             locals: vec![a],
             stack: vec![],
+            monitors: Vec::new(),
         });
         g.push_safepoint(crate::ir::SafepointSnapshot {
             bci: 4,
             locals: vec![b],
             stack: vec![],
+            monitors: Vec::new(),
         });
         assert!(g.set_node_frame_snapshot(a, 0));
         assert!(g.set_node_frame_snapshot(b, 1));
@@ -1948,6 +1959,7 @@ mod tests {
                 bci: 4,
                 locals: vec![k],
                 stack: vec![],
+                monitors: Vec::new(),
             });
         }
         assert!(
@@ -1967,6 +1979,7 @@ mod tests {
                 bci,
                 locals: vec![k],
                 stack: vec![],
+                monitors: Vec::new(),
             });
         }
         assert!(verify_graph(&g, "test", VerifyOptions::default()).is_ok());
@@ -1983,11 +1996,13 @@ mod tests {
             bci: 4,
             locals: vec![k],
             stack: vec![],
+            monitors: Vec::new(),
         });
         g.safepoints.push(crate::ir::SafepointSnapshot {
             bci: 4,
             locals: vec![k],
             stack: vec![],
+            monitors: Vec::new(),
         });
         assert!(verify_graph(&g, "test", VerifyOptions::structural()).is_ok());
         assert!(verify_graph(&g, "test", VerifyOptions::default()).is_err());
@@ -2001,6 +2016,7 @@ mod tests {
             bci: 4,
             locals: vec![k],
             stack: vec![],
+            monitors: Vec::new(),
         });
         g.kill(k);
         assert!(verify_graph(&g, "test", VerifyOptions::structural()).is_ok());
@@ -2043,6 +2059,7 @@ mod tests {
                 bci: 0,
                 locals: vec![5, NO_NODE, 900],
                 stack: vec![1234],
+                monitors: Vec::new(),
             }],
             uses: Default::default(),
             receiver_param: None,

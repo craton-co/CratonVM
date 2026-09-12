@@ -384,13 +384,16 @@ candidate. The planner is pure and returns `None` to refuse the whole object:
   `Int`/`Long`, `ConstF(0)` for `Float`/`Double`; any other type drops the plan).
   `Unknown` refuses. Every load must also pass `ea_splice_feasible`;
 * `elide_alloc` starts `true` and is cleared when an earlier EA round's
-  descriptor pins the allocation, or when a snapshot names the allocation or a
-  store, in each case unless `deopt_descriptor_available &&
-  virtual_object_info_for(...)` yields a descriptor. It is also cleared when a
-  store or the allocation fails `ea_splice_feasible`, or when another live node
-  still reads the allocation or a store. `deopt_descriptor_available` is
-  `scalar_deopt_enabled() && deopt_real_enabled()`. With no loads and
-  `!elide_alloc`, there is nothing to do and the plan is `None`.
+  descriptor pins the allocation, when a snapshot names a store, or when a
+  **consultable** snapshot names the allocation (`ea_consumable_snapshot_names`,
+  see §7). The descriptor-pin and consultable-snapshot cases are forgiven when
+  `deopt_descriptor_available && virtual_object_info_for(...)` yields a
+  descriptor. It is also cleared when a store or the allocation fails
+  `ea_splice_feasible`, or when another live node still reads the allocation or
+  a store. `deopt_descriptor_available` is `scalar_deopt_descriptor_available()`,
+  which is `deopt_real_enabled()` (default on); `CRATONVM_SCALAR_DEOPT` is
+  superseded. With no loads and `!elide_alloc`, there is nothing to do and the
+  plan is `None`.
 
 `try_compile_inner` runs escape analysis up to `MAX_EA_ROUNDS` (3) times,
 because one replacement can expose another (a wrapper holding an array). When
@@ -525,35 +528,47 @@ gives it the per-store positions, so the "unproven dominance" bail can become
 
 ---
 
-## 7. Re-enabling elision for snapshot-named allocations
+## 7. Elision for snapshot-named allocations
 
-### Why it is off
+### Status (2026-09-12): it fires by default
 
-`plan_scalar_replacement` sets `elide_alloc = false` when a safepoint snapshot
-names the `Op::New` and no virtual-object descriptor will exist:
+See `allocation-elision-never-fires-by-default-FIXED-20260912.md`. Until then
+`IrBuilder` snapshotted at every bci, so every `Op::New` was snapshot-named.
+With no descriptor by default (`CRATONVM_SCALAR_DEOPT` off), allocation elision
+never fired on builder-produced IR: loads were forwarded, stores died, and the
+`New` survived. Four changes in `try_compile_inner` (`lib.rs`) close that:
 
-```rust
-if ea_snapshot_names(ir_graph, new_node)
-    && !(deopt_descriptor_available && virtual_object_info_for(...).is_some())
-{
-    elide_alloc = false;
-}
-```
+1. **Dead snapshot locals are cut** (`ir_prune_dead_snapshot_locals`). A local
+   the bytecode cannot read again before writing it is not part of the frame
+   an interpreter resumes into, so its slot becomes `NO_NODE`. The cut skips
+   methods with an exception table, loop headers (an OSR entry seeds from those
+   snapshots), and anything with subroutines.
+2. **Only consultable snapshots pin an allocation.**
+   `ea_consumable_snapshot_names` counts a snapshot only when it sits where a
+   deopt can arrive. That means the resume bci of a node that can transfer to
+   the interpreter (`!op_cannot_deopt`, mapped through the spliced ranges), or
+   a join. The candidate's own allocation, stores and loads are treated as
+   already gone. After escape analysis, `ir_prune_unconsumable_snapshots` drops
+   every other snapshot. A graph whose deopting nodes cannot all be attributed
+   to a bci keeps the old rule.
+3. **The recipe is on whenever precise resume is.** When a consultable snapshot
+   does name the object, the elision needs a `VirtualObject` recipe.
+   `scalar_deopt_descriptor_available()` is `deopt_real_enabled()`. With
+   precise resume off, the allocation is kept; nothing relies on the
+   whole-method re-run. The lowerer's recipe now also accepts an allocation and
+   stores in the SAME block as the deopt when they precede its first deopt site
+   in node-id order, and it finds the deopt block of any transferring node, not
+   just guards and divisions.
+4. **Null checks on a fresh allocation fold** to a constant before the
+   optimizer (`ir_fold_null_checks_on_fresh_allocations`). Otherwise the compare
+   is both an `EaOp::Other` escape and a value use.
 
-`deopt_descriptor_available` is `scalar_deopt_enabled() && deopt_real_enabled()`
-— both env-gated and off by default. `IrBuilder` snapshots at **every bci**, so
-every `Op::New` is snapshot-named. Net effect: **allocation elision does not
-fire on builder-produced IR at all.** Loads are still forwarded and stores still
-die; only the `New` survives.
+A backstop remains. If the lowerer still cannot describe an elided object at
+some deopt point of a side-effecting body, the IR artifact is discarded and the
+single-pass body, which keeps the allocation, is used
+(`ir_artifact_names_an_undescribable_elided_object`).
 
-That gate is correct as written. A `SafepointSnapshot` slot is a bare `NodeId`;
-it cannot spell "eliminated". Killing the `New` leaves the slot naming an
-`Op::Dead` node, which `ir_optimize::eliminate_dead_nodes` normalises to
-`NO_NODE`, which `ir_lower::frame_value_for` maps to `FrameValue::Undefined`,
-which every resume sink turns into `Value::Int(0)` — **a null where a live object
-was**, silently.
-
-### What it would take, in order
+### The history: what it took, in order
 
 The prize is not a change in `escape_analysis.rs`; it is making the *refusal*
 representable so that eliding is safe even when the recipe is imperfect.
