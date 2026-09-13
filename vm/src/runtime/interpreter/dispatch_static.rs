@@ -2064,7 +2064,7 @@ pub(super) const OSR_THRESHOLD: u32 = 1_000;
 /// GC-STW-safety on the worker: same discipline as `try_jit_compile_callee_slow`
 /// (see its doc) — every `class_manager` lock is read out and dropped before any
 /// blocking / allocating call (`load_class_concurrent`, eager callee compile), and
-/// `PENDING_COMPACT_FIELD_INFO` is thread-local so the worker stages its own.
+/// every per-compile request travels on the call, so nothing is staged per thread.
 #[allow(clippy::too_many_arguments)]
 /// Allocate the dynamic-dispatch cache pair consumed by both x64 compilation
 /// entry points owned by the interpreter.

@@ -758,7 +758,7 @@ impl Compiler {
         // / caller-saved here is safe (locals live in callee-saved regs). The
         // arm-helper one-shots / dedups internally.
         if shadow_watch() && self.shadow_savebase_slot_off != 0 {
-            let h = ARM_SAVEBASE_WATCH_FN.load(std::sync::atomic::Ordering::Relaxed);
+            let h = self.direct_helpers.arm_savebase_watch;
             if h != 0 {
                 self.emit_lea_r64_mem_disp32(ARG_REGS[0], RBP, -self.shadow_savebase_slot_off);
                 self.emit_call_absolute(h);
@@ -807,7 +807,7 @@ impl Compiler {
         // after we return is not mistaken for the corruptor. RAX holds the return
         // value here; stash it in the (now-dead) savebase slot across the call.
         if shadow_watch() && self.shadow_savebase_slot_off != 0 {
-            let h = DISARM_SAVEBASE_WATCH_FN.load(std::sync::atomic::Ordering::Relaxed);
+            let h = self.direct_helpers.disarm_savebase_watch;
             if h != 0 {
                 self.emit_store_local(self.shadow_savebase_slot_off, RAX);
                 self.emit_call_absolute(h);

@@ -1988,108 +1988,6 @@ pub(super) fn shadow_watch() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_WATCH"))
 }
 
-/// Process-global pointer to the VM-side `jit_arm_savebase_watch(addr)` helper,
-/// registered at VM init. Baked as an absolute call target by the prologue when
-/// `CRATONVM_SHADOW_WATCH` is set. Avoids a `JitRuntimeHelpers` ABI change.
-pub static ARM_SAVEBASE_WATCH_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Register the savebase watchpoint arm-helper (called once from the VM).
-pub fn set_arm_savebase_watch_fn(addr: usize) {
-    ARM_SAVEBASE_WATCH_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Process-global pointer to the VM-side `jit_disarm_savebase_watch()` helper.
-pub static DISARM_SAVEBASE_WATCH_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Register the savebase watchpoint disarm-helper (called once from the VM).
-pub fn set_disarm_savebase_watch_fn(addr: usize) {
-    DISARM_SAVEBASE_WATCH_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Process-global pointer to the VM-side `jit_resolve_static_base` resolver
-/// (`extern "C" fn(vm_ptr, class_id, field_index) -> i64`), registered at VM
-/// init. Called by the backend **while compiling**, never from generated code,
-/// so — like the savebase pair above — it avoids a `JitRuntimeHelpers` ABI
-/// change entirely.
-pub static STATIC_BASE_RESOLVER_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// The `SharedVm` pointer passed back to [`STATIC_BASE_RESOLVER_FN`]. Latched
-/// to the FIRST VM that registers.
-pub static STATIC_BASE_RESOLVER_CTX: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Set once a SECOND VM registers a different context, and never cleared.
-///
-/// `ClassId`s are per-VM, so resolving VM A's `(class_id, field_index)` against
-/// VM B's statics would bake the address of an unrelated class's slot into VM
-/// A's code — the same cross-VM aliasing that made the process-global
-/// `system_class_id` atomic and the unqualified `class_init_memo` wrong (see
-/// `vm-jit-cache-keying.md`). There is no correct answer to give once two
-/// VMs share the process, so the mechanism turns itself off for BOTH and every
-/// static read goes back to the helper: slower, never wrong.
-static STATIC_BASE_RESOLVER_POISONED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Register the compile-time static-slot resolver (called once per VM).
-pub fn set_static_base_resolver(addr: usize, vm_ctx: usize) {
-    use std::sync::atomic::Ordering;
-    if addr == 0 || vm_ctx == 0 {
-        return;
-    }
-    // Store the function BEFORE claiming the context: a reader that observes a
-    // non-zero context must never then read a zero function pointer.
-    STATIC_BASE_RESOLVER_FN.store(addr, Ordering::Release);
-    if let Err(prev) =
-        STATIC_BASE_RESOLVER_CTX.compare_exchange(0, vm_ctx, Ordering::AcqRel, Ordering::Acquire)
-    {
-        if prev != vm_ctx {
-            STATIC_BASE_RESOLVER_POISONED.store(true, Ordering::Release);
-        }
-    }
-}
-
-/// Ask the VM where a static field's storage base pointer lives.
-///
-/// `None` = "not inlineable, keep the helper": no VM registered, two VMs
-/// registered, or the VM itself declined (class not initialized, the class is
-/// `java/lang/System`, nothing published, index switched off).
-pub fn resolve_static_base(class_id_raw: u32, field_index: usize) -> Option<usize> {
-    use std::sync::atomic::Ordering;
-    if STATIC_BASE_RESOLVER_POISONED.load(Ordering::Acquire) {
-        return None;
-    }
-    let ctx = STATIC_BASE_RESOLVER_CTX.load(Ordering::Acquire);
-    if ctx == 0 {
-        return None;
-    }
-    let raw = STATIC_BASE_RESOLVER_FN.load(Ordering::Acquire);
-    if raw == 0 {
-        return None;
-    }
-    // SAFETY: the only writer of these two words is `set_static_base_resolver`,
-    // which the VM calls with `jit_resolve_static_base` and its own `SharedVm`
-    // pointer; the function is `extern "C" fn(i64, i64, i64) -> i64` and the
-    // `SharedVm` outlives every compilation.
-    let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = unsafe { std::mem::transmute(raw) };
-    // Cast: `usize`/`u32` inputs to the C ABI's i64 parameters.
-    //
-    // SAFETY: `f` and `ctx` were published together by
-    // `set_static_base_resolver` and read back under `Acquire`, so the pointer
-    // matches the signature transmuted above and `ctx` is the `SharedVm` that
-    // resolver expects. Both outlive every compilation.
-    let addr = unsafe { f(ctx as i64, class_id_raw as i64, field_index as i64) };
-    if addr == 0 {
-        None
-    } else {
-        // Cast: back to an address; `0` is the sentinel, everything else is a
-        // real (positive, user-space) pointer.
-        Some(addr as u64 as usize)
-    }
-}
-
 /// Default-ON inline (helper-free) compiled `getstatic`.
 ///
 /// Every `getstatic` in compiled code used to `CALL jit_getstatic` — ~35 ns
@@ -3048,7 +2946,7 @@ pub fn callee_saved_gpr_local_homes_enabled() -> bool {
 ///    the original arguments, never reading JIT frame local slots.
 ///
 /// Requested per-compile by `try_compile` (method-entry only) via
-/// [`set_kernel_reg_homes_request`]; OSR compiles (`compile_osr_artifact`)
+/// [`BackendRequest::kernel_reg_homes`]; OSR compiles (`compile_osr_artifact`)
 /// and the legacy [`compile`] test wrapper never set it.
 pub fn kernel_reg_locals_enabled() -> bool {
     use std::sync::OnceLock;
@@ -3063,90 +2961,8 @@ pub fn kernel_reg_locals_enabled() -> bool {
     })
 }
 
-thread_local! {
-    /// Per-compile request flag for the pure-kernel GPR local homes (see
-    /// [`kernel_reg_locals_enabled`]). Set by the method-entry compile path
-    /// immediately before calling [`compile_with_param_slots`]; consumed
-    /// (taken) at its entry so it can never leak into a later compile on the
-    /// same thread.
-    pub(super) static KERNEL_REG_HOMES_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Request pure-kernel GPR local homes for the NEXT `compile_with_param_slots`
-/// call on this thread (method-entry compiles only — never OSR).
-pub fn set_kernel_reg_homes_request(on: bool) {
-    KERNEL_REG_HOMES_REQUEST.with(|c| c.set(on));
-}
-
-thread_local! {
-    /// One-shot request from the bytecode front-end: this method has an
-    /// exception handler that reads locals beyond its incoming parameters, so
-    /// post-invoke exceptions must retain a precise frame until handler entry.
-    pub(super) static PRECISE_EXCEPTION_FRAME_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Request precise exceptional-frame capture for the next method compile.
-pub fn set_precise_exception_frame_request(on: bool) {
-    PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.set(on));
-}
-
-thread_local! {
-    /// One-shot `[start_pc, end_pc)` list of the next method's exception-table
-    /// protected ranges, published by the bytecode front-end.
-    ///
-    /// The backend is otherwise entirely exception-table-blind, and that is
-    /// fine for every lowering that RETURNS to this frame: the shared exception
-    /// stub re-enters the interpreter at the throwing bci and the method's own
-    /// handler table takes over from there. It is NOT fine for the sibling
-    /// tail-call, which tears this frame down and `JMP`s into the callee, so an
-    /// exception the callee raises unwinds straight past a handler that was
-    /// supposed to catch it. See `pc_is_protected`.
-    pub(super) static PROTECTED_RANGES_REQUEST: std::cell::Cell<Option<Vec<(u32, u32)>>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Publish the next method compile's exception-table protected ranges.
-/// One-shot, like [`set_precise_exception_frame_request`], so a bailed compile
-/// cannot leak its ranges into the next unrelated method on this worker thread.
-pub fn set_protected_ranges_request(ranges: Vec<(u32, u32)>) {
-    PROTECTED_RANGES_REQUEST.with(|c| {
-        c.set(if ranges.is_empty() {
-            None
-        } else {
-            Some(ranges)
-        })
-    });
-}
-
-thread_local! {
-    /// OSR-tier sibling of [`KERNEL_REG_HOMES_REQUEST`] — set (only) by the
-    /// interpreter's `compile_osr_artifact` (perf/halfgap-20260717).
-    pub(super) static KERNEL_REG_HOMES_OSR_REQUEST: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
-/// Request pure-kernel GPR local homes for the NEXT OSR-artifact compile on
-/// this thread (perf/halfgap-20260717).
-///
-/// The original kernel-homes rollout vetoed OSR bodies wholesale ("publishes
-/// NO OSR entries") as blanket caution while the feature soaked on the
-/// method-entry tier. The machinery for a register-homed OSR ENTRY has
-/// always existed, though: the OSR trampoline seeds each interpreter local
-/// into `osr_local_assignments[i]`'s register (that is the normal
-/// graph-coloring entry contract), and with kernel homes those assignments
-/// ARE the kernel's callee-saved homes (reference locals are masked back to
-/// frame homes, so GC visibility is unchanged). A pure-kernel body accepted
-/// by the same call/field/alloc/typecheck/spec-BCE-free conditions has no
-/// in-body transition that could observe a stale frame slot. This matters
-/// because once-invoked benchmark-style kernels (`benchArithmetic`,
-/// `matmul`) live their entire life inside the OSR artifact and previously
-/// ran memory-homed. Opt out with `CRATONVM_JIT_KERNEL_REG_OSR=0`.
-pub fn set_kernel_reg_homes_osr_request(on: bool) {
-    KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.set(on));
-}
-
 /// `CRATONVM_JIT_KERNEL_REG_OSR` gate (default **ON**, opt out with `=0`) —
-/// see [`set_kernel_reg_homes_osr_request`].
+/// see [`BackendRequest::kernel_reg_homes_osr`].
 ///
 /// The original 2026-07-18 experiment predated constant long-division
 /// lowering, so Arithmetic was division-bound and register homes had no

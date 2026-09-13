@@ -14,11 +14,9 @@
 /// Every thin direct-call helper address a compile may bake into a `CALL`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectHelperTable {
-    /// Process-global pointer to the VM-side
-    /// `jit_integer_value_of_direct(vm_ptr, value) -> i64` thin helper,
-    /// registered once at VM init (`build_helpers`). Avoids a
-    /// `JitRuntimeHelpers` ABI change (same pattern as
-    /// `x64::ARM_SAVEBASE_WATCH_FN`). `0` = not wired → the recognition below
+    /// The VM-side `jit_integer_value_of_direct(vm_ptr, value) -> i64` thin
+    /// helper, filled in by the VM's `direct_helper_table`. Avoids a
+    /// `JitRuntimeHelpers` ABI change. `0` = not wired → the recognition below
     /// is skipped and `Integer.valueOf` sites use the generic dispatch helper.
     ///
     /// Why: `invokestatic Integer.valueOf(I)` is statically bound and its
@@ -265,6 +263,30 @@ pub struct DirectHelperTable {
     /// served. Indexed by [`varhandle_cas_helper_slot`].
     pub varhandle_cas: [usize; crate::VARHANDLE_CAS_SLOTS],
 
+    /// `extern "C" fn(vm_ctx, class_id, field_index) -> i64`: the VM's
+    /// compile-time static-slot resolver (`jit_resolve_static_base`), called by
+    /// the backends while emitting, never from generated code. `0` = no
+    /// resolver, and every `getstatic` keeps the helper. See
+    /// [`DirectHelperTable::resolve_static_base`].
+    pub static_base_resolver: usize,
+
+    /// The `SharedVm` the resolver answers for. `ClassId`s are per VM, so the
+    /// pair travels together on the compile it belongs to.
+    pub static_base_resolver_ctx: usize,
+
+    /// spring-bug-10 watchpoint (`CRATONVM_SHADOW_WATCH`): the VM's
+    /// `jit_arm_savebase_watch(addr)`, called from the prologue. `0` = none.
+    pub arm_savebase_watch: usize,
+
+    /// The matching `jit_disarm_savebase_watch()`, called from the epilogue.
+    pub disarm_savebase_watch: usize,
+
+}
+
+impl Default for DirectHelperTable {
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 impl DirectHelperTable {
@@ -293,7 +315,45 @@ impl DirectHelperTable {
         varhandle_read: [0; crate::VARHANDLE_READ_SLOTS],
         varhandle_write: [0; crate::VARHANDLE_WRITE_SLOTS],
         varhandle_cas: [0; crate::VARHANDLE_CAS_SLOTS],
+        static_base_resolver: 0,
+        static_base_resolver_ctx: 0,
+        arm_savebase_watch: 0,
+        disarm_savebase_watch: 0,
     };
+
+    /// Ask the VM where a static field's storage base pointer lives.
+    ///
+    /// `None` = "not inlineable, keep the helper": no resolver on this table,
+    /// or the VM declined (class not initialized, the class is
+    /// `java/lang/System`, nothing published, index switched off).
+    ///
+    /// The resolver used to be a process-wide registration latched to the
+    /// first VM, which a second VM had to poison for both. It is per compile
+    /// now, so each VM's compiles ask their own VM.
+    pub fn resolve_static_base(&self, class_id_raw: u32, field_index: usize) -> Option<usize> {
+        let raw = self.static_base_resolver;
+        let ctx = self.static_base_resolver_ctx;
+        if raw == 0 || ctx == 0 {
+            return None;
+        }
+        // SAFETY: the VM fills this field from `jit_resolve_static_base`, an
+        // `extern "C" fn(i64, i64, i64) -> i64` with process lifetime
+        // (`direct_helper_table_for`); a test fills it from a function of the
+        // same signature.
+        let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = unsafe { std::mem::transmute(raw) };
+        // Cast: `usize`/`u32` inputs to the C ABI's i64 parameters.
+        //
+        // SAFETY: `ctx` was published beside `f` as the context that resolver
+        // expects (the `SharedVm`), and it outlives every compilation it runs.
+        let addr = unsafe { f(ctx as i64, class_id_raw as i64, field_index as i64) };
+        if addr == 0 {
+            None
+        } else {
+            // Cast: back to an address; `0` is the sentinel, everything else is
+            // a real (positive, user-space) pointer.
+            Some(addr as u64 as usize)
+        }
+    }
 
     /// Would the `session()` shim answer for a receiver of `class_id`? `false`
     /// whenever it cannot prove `true`: an unwired predicate or class id 0.

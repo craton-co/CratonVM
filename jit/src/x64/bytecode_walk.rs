@@ -5277,10 +5277,9 @@ impl Compiler {
                 //      A static cell is the same 16 bytes.
                 //   3. "The `jit` crate has no `vm` dependency, so it cannot
                 //      resolve a slot address at compile time." It does not
-                //      need one. The VM registers a resolver function pointer
-                //      plus its own `SharedVm` pointer through a process-global
-                //      setter (`set_static_base_resolver`), exactly as it
-                //      registers the savebase watch helpers — no
+                //      need one. The VM passes a resolver function pointer
+                //      plus its own `SharedVm` pointer on the compile's
+                //      `DirectHelperTable`, beside the savebase watch helpers — no
                 //      `JitRuntimeHelpers` field, no golden offset, no ABI
                 //      revision bump, because generated code never calls it.
                 //      Only this backend does, while emitting.

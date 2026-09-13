@@ -1050,8 +1050,12 @@ fn live_monitor_ops_execute_direct_runtime_stubs() {
         0xac, // ireturn
         0x00, 0x00,
     ];
-    let compiled = compile_with_direct_helpers(
-        &direct_helpers,
+    let compiled = compile_with_request(
+        BackendRequest {
+            direct_helpers,
+            ..BackendRequest::default()
+        },
+        Vec::new(), // compact_field_info
         &code,
         7,
         1,
@@ -1165,7 +1169,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         None, // despec: no VM
         Vec::new(),
         None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
-        &crate::DirectHelperTable::EMPTY,
+        crate::x64::BackendRequest::default(),
     )?;
     compiled
         .oop_maps
@@ -5058,8 +5062,9 @@ fn every_single_pass_compact_field_site_guards_its_baked_offset() {
         std::sync::atomic::AtomicUsize::new(0),
     ];
     helpers.read_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
-    set_pending_compact_field_info(vec![(1, 0, false)]);
-    let get = compile(
+    let get = compile_with_request(
+        BackendRequest::default(),
+        vec![(1, 0, false)],
         &get_code,
         5,
         1,
@@ -5106,8 +5111,9 @@ fn every_single_pass_compact_field_site_guards_its_baked_offset() {
     ];
     let mut set_helpers = test_helpers();
     set_helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
-    set_pending_compact_field_info(vec![(2, 0, true)]);
-    let set = compile(
+    let set = compile_with_request(
+        BackendRequest::default(),
+        vec![(2, 0, true)],
         &set_code,
         6,
         2,
@@ -5254,12 +5260,9 @@ fn a_reference_getfield_does_not_read_a_non_reference_cell_as_a_pointer() {
 /// arm emits the two-load direct form and leaves NO call to `jit_getstatic`
 /// behind; a site the resolver declines keeps the helper.
 ///
-/// Both directions are asserted from ONE registration on purpose:
-/// `set_static_base_resolver` deliberately latches its context for the life of
-/// the process (a second VM must never re-point it at its own statics), so the
-/// test resolver instead answers for exactly one `(class, field)` pair and
-/// declines everything else — which also keeps it inert for any other test in
-/// this binary that compiles a `getstatic`.
+/// Both directions are asserted from one table: the test resolver answers for
+/// exactly one `(class, field)` pair and declines everything else. The table
+/// travels on this test's own compiles, so no other test sees it.
 #[test]
 fn test_getstatic_inline_direct_load_and_fallback() {
     use std::sync::atomic::AtomicPtr;
@@ -5291,7 +5294,11 @@ fn test_getstatic_inline_direct_load_and_fallback() {
         // Cast: the address the backend bakes as an immediate.
         cell as *const AtomicPtr<Value> as usize
     });
-    set_static_base_resolver(test_resolver as *const () as usize, cell_addr);
+    let direct_helpers = crate::DirectHelperTable {
+        static_base_resolver: test_resolver as *const () as usize,
+        static_base_resolver_ctx: cell_addr,
+        ..crate::DirectHelperTable::EMPTY
+    };
 
     // getstatic #1 ; ireturn
     let code: Vec<u8> = vec![0xb2, 0x00, 0x01, 0xac, 0, 0];
@@ -5300,7 +5307,12 @@ fn test_getstatic_inline_direct_load_and_fallback() {
     helpers.getstatic = marker_getstatic as *const () as usize;
 
     let build = |field_index: usize| {
-        compile(
+        compile_with_request(
+            BackendRequest {
+                direct_helpers,
+                ..BackendRequest::default()
+            },
+            Vec::new(), // compact_field_info
             &code,
             code_len,
             1,
@@ -6061,8 +6073,9 @@ fn inline_ref_putfield_fast_path_is_gated_on_published_region_bounds() {
     helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
 
     // Compact layout for the site: pc 2, body offset 0, reference field.
-    set_pending_compact_field_info(vec![(2, 0, true)]);
-    let compiled = compile(
+    let compiled = compile_with_request(
+        BackendRequest::default(),
+        vec![(2, 0, true)],
         &code,
         code_len,
         2,
@@ -6259,7 +6272,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             None,                             // despec: no VM
             Vec::new(),
             None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
-            &crate::DirectHelperTable::EMPTY,
+            crate::x64::BackendRequest::default(),
         )
         .expect("reference putfield must compile")
     };
@@ -9086,7 +9099,7 @@ fn instanceof_inline_fixture(
         None, // despec: no VM, so no despeculation verdicts
         Vec::new(),
         None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
-        &crate::DirectHelperTable::EMPTY,
+        crate::x64::BackendRequest::default(),
     )
     .expect("instanceof must compile")
 }
@@ -9281,7 +9294,7 @@ fn keyed_int_method(
         None, // despec: no VM, so no despeculation verdicts
         Vec::new(),
         None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
-        &crate::DirectHelperTable::EMPTY,
+        crate::x64::BackendRequest::default(),
     )
     .expect("int method must compile")
 }
@@ -18014,8 +18027,9 @@ fn the_gated_ref_store_writes_both_cell_shapes_without_a_helper_call() {
     helpers.ref_store_post_young_floor = 0;
     helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
 
-    set_pending_compact_field_info(vec![(2, 0, true)]);
-    let compiled = compile(
+    let compiled = compile_with_request(
+        BackendRequest::default(),
+        vec![(2, 0, true)],
         &code,
         6,
         2,

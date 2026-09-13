@@ -3437,7 +3437,10 @@ pub fn execute(
                         Some(&shared.jit.despec_registry),
                         indy_info,
                         Some(elidable_init_pcs),
-                        &crate::jit::helpers::direct_helper_table(),
+                        crate::jit::x64::BackendRequest {
+                            direct_helpers: crate::jit::helpers::direct_helper_table_for(shared),
+                            ..Default::default()
+                        },
                     )?;
                     // Attach owned metadata to compiled method
                     cm._jit_strings = owned_jit_strings;

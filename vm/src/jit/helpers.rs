@@ -10912,7 +10912,7 @@ pub fn note_class_initialized(vm: &SharedVm, class_id: ClassId) {
 /// # Safety
 ///
 /// `vm_ptr` must be the `SharedVm` pointer the JIT registered alongside this
-/// function (see `set_static_base_resolver`), or 0.
+/// function (see `direct_helper_table_for`), or 0.
 pub unsafe extern "C" fn jit_resolve_static_base(
     vm_ptr: i64,
     class_id_raw: i64,
@@ -27642,27 +27642,8 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     let cursor_in_thread = tlab_off + cratonvm_gc::Tlab::CURSOR_OFFSET;
     let end_in_thread = tlab_off + cratonvm_gc::Tlab::END_OFFSET;
 
-    // spring-bug-10 watchpoint: register the savebase-watch arm-helper so the JIT
-    // prologue (under CRATONVM_SHADOW_WATCH) can bake an absolute call to it.
-    cratonvm_jit::x64::set_arm_savebase_watch_fn(jit_arm_savebase_watch as *const () as usize);
-    cratonvm_jit::x64::set_disarm_savebase_watch_fn(
-        jit_disarm_savebase_watch as *const () as usize,
-    );
-
-    // Compile-time static-slot resolver. Registered through a process-global
-    // setter rather than a `JitRuntimeHelpers` field because it is never called
-    // from generated code — only by the compiler, while emitting — so it needs
-    // no ABI slot, no golden offset and no revision bump. The `SharedVm`
-    // pointer travels with it: the answer is per-VM (`ClassId`s are), and the
-    // setter latches the first VM and permanently disables inlining if a second
-    // one registers, rather than silently resolving VM A's ids against VM B's
-    // statics. A VM-less `build_helpers()` passes 0 and registers nothing.
-    cratonvm_jit::x64::set_static_base_resolver(
-        jit_resolve_static_base as *const () as usize,
-        vm_for_helpers
-            .map(|shared| shared as *const crate::vm::SharedVm as usize)
-            .unwrap_or(0),
-    );
+    // The savebase watchpoint hooks and the compile-time static-slot resolver
+    // travel on each compile: `direct_helper_table` / `direct_helper_table_for`.
 
     // §7/§10 — the execution policy is NOT published to the JIT here.
     //
@@ -27987,6 +27968,13 @@ pub(crate) fn direct_helper_table() -> cratonvm_jit::DirectHelperTable {
         monitor_exit: jit_monitor_exit as *const () as usize,
         preconditions_check_index: jit_preconditions_check_index_direct as *const () as usize,
         reachability_fence: jit_reachability_fence_direct as *const () as usize,
+        // spring-bug-10 watchpoint: the JIT prologue (under CRATONVM_SHADOW_WATCH)
+        // bakes an absolute call to these.
+        arm_savebase_watch: jit_arm_savebase_watch as *const () as usize,
+        disarm_savebase_watch: jit_disarm_savebase_watch as *const () as usize,
+        // No VM here: `direct_helper_table_for` adds the per-VM resolver.
+        static_base_resolver: 0,
+        static_base_resolver_ctx: 0,
         // `Integer.valueOf(I)` / `Integer.intValue()` thin direct-call helpers —
         // same no-ABI-change registration pattern as the savebase watch helpers
         // above. See `jit_integer_value_of_direct` / `jit_integer_int_value_direct`
@@ -29718,6 +29706,23 @@ unsafe fn jit_ffm_segment_set_body(seg: i64, index: i64, kind: i64, value: i64) 
     1
 }
 
+/// [`direct_helper_table`] for a compile in `shared`, with the compile-time
+/// static-slot resolver.
+///
+/// The resolver is never called from generated code, only by the backends
+/// while emitting, so it needs no `JitRuntimeHelpers` ABI slot. Its answer is
+/// per VM (`ClassId`s are), so the `SharedVm` pointer travels with it on the
+/// compile. It used to be a process-wide registration latched to the first VM,
+/// which a second VM had to poison for both.
+pub(crate) fn direct_helper_table_for(shared: &crate::vm::SharedVm) -> cratonvm_jit::DirectHelperTable {
+    cratonvm_jit::DirectHelperTable {
+        static_base_resolver: jit_resolve_static_base as *const () as usize,
+        // Cast: the `SharedVm` address `jit_resolve_static_base` receives back.
+        static_base_resolver_ctx: shared as *const crate::vm::SharedVm as usize,
+        ..direct_helper_table()
+    }
+}
+
 #[cfg(test)]
 mod direct_helper_table_tests {
     use super::*;
@@ -29735,9 +29740,16 @@ mod direct_helper_table_tests {
             ("indy_bridge", t.indy_bridge),
             ("monitor_enter", t.monitor_enter),
             ("nio_byte_element_served_class", t.nio_byte_element_served_class),
+            ("arm_savebase_watch", t.arm_savebase_watch),
+            ("disarm_savebase_watch", t.disarm_savebase_watch),
         ] {
             assert_ne!(addr, 0, "{name} is not wired");
         }
+        assert_eq!(
+            (t.static_base_resolver, t.static_base_resolver_ctx),
+            (0, 0),
+            "a table built without a VM must not carry a resolver"
+        );
         assert!(t.varhandle_read.iter().chain(&t.varhandle_write).chain(&t.varhandle_cas).all(|&a| a != 0));
     }
 }

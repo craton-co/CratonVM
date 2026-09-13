@@ -23518,7 +23518,7 @@ pub fn force_c2_enabled() -> bool {
 ///
 /// A thin adapter — it exists to convert this crate's exception table into the
 /// `(start, end, handler)` triples `find_bypassable_loop_headers` wants, the
-/// same conversion `set_pending_exception_ranges` does at backend entry. The
+/// same conversion `BackendRequest::exception_ranges` does at backend entry. The
 /// decision, and the enumeration behind it, live in `x64::single_pass_only`.
 ///
 /// Called once per compile request, on the compile path only, and rejected on
@@ -25825,7 +25825,7 @@ fn precise_alloc_athrow_enabled() -> bool {
 ///   `ExceptionInInitializerError`/`NoClassDefFoundError` behind the sentinel.
 /// * the inline arm (`try_emit_inline_getstatic`) emits a baked address plus
 ///   two loads and no call at all. It is reached only when
-///   `resolve_static_base` answers, and the VM side of that resolver
+///   `DirectHelperTable::resolve_static_base` answers, and the VM side of that resolver
 ///   (`jit_resolve_static_base`) returns 0 unless
 ///   `class_init_memo::is_initialized` already holds for the owning class.
 ///   Initialization is monotonic in the JVM, so a site compiled on that arm can
@@ -26298,7 +26298,7 @@ fn precise_exception_frame_sites_supported(
 /// OSR compile of a method with a non-empty exception table outright, on the
 /// grounds that an OSR artifact carries no handler ranges. Staging the same
 /// three requests the method-entry path stages (`set_precise_exception_frame_
-/// request` / `set_protected_ranges_request` / `set_pending_exception_ranges`)
+/// request` / `BackendRequest::protected_ranges` / `BackendRequest::exception_ranges`)
 /// gives the OSR body reason-9 frames at its protected-range invokes — but only
 /// where every throwing site in those ranges publishes one. That is exactly
 /// this predicate, so `compile_osr_artifact` calls it rather than growing a
@@ -29898,7 +29898,8 @@ fn try_compile_inner(
                     note_jit_pipeline_stage(JIT_STAGE_LOWER);
                     let metrics_lower = metrics.phase(metrics::Phase::Lower);
                     ir_lower::clear_lower_bail();
-                    let lowered = ir_lower::lower_inner(
+                    let lowered = ir_lower::lower_inner_with_direct_helpers(
+                        direct_helpers,
                         &graph,
                         &schedule,
                         num_params,
@@ -32954,23 +32955,24 @@ fn try_compile_inner(
         cached.class_name, cached.method_name, cached.method_descriptor
     );
 
-    x64::set_pending_verified_max_stack(cached.max_stack as usize);
-    // The request is one-shot and consumed at x64 compiler entry. Set it only
-    // after every resolver/admission early return above so a failed front-end
-    // attempt cannot leak the request into the next method compiled on this
-    // thread.
-    x64::set_precise_exception_frame_request(precise_exception_frames);
-    // Same one-shot contract, set at the same point and for the same reason.
-    // Unlike the flag above this is published for EVERY method with handlers,
-    // not just the precise-frame ones: the sibling tail-call it suppresses
-    // escapes a handler regardless of how that handler reconstructs its locals.
-    x64::set_protected_ranges_request(
-        cached
-            .exception_table
-            .iter()
-            .map(|entry| (entry.start_pc as u32, entry.end_pc as u32))
-            .collect(),
-    );
+    // What the single-pass backend is asked to do beyond the tables above: a
+    // value handed to the call, so a front-end bail cannot leak it into the
+    // next method compiled on this thread.
+    let mut backend = x64::BackendRequest {
+        direct_helpers: *direct_helpers,
+        verified_max_stack: Some(cached.max_stack as usize),
+        precise_exception_frames,
+        ..x64::BackendRequest::default()
+    };
+    // Unlike the flag above the protected ranges go with EVERY method that has
+    // handlers, not just the precise-frame ones: the sibling tail-call they
+    // suppress escapes a handler regardless of how that handler reconstructs
+    // its locals.
+    backend.protected_ranges = cached
+        .exception_table
+        .iter()
+        .map(|entry| (entry.start_pc as u32, entry.end_pc as u32))
+        .collect();
     // Pure-kernel GPR local homes: this is the METHOD-ENTRY compile path
     // (OSR artifacts go through the interpreter's `compile_osr_artifact`,
     // which never sets this), so request the kernel register homes. The
@@ -32978,26 +32980,18 @@ fn try_compile_inner(
     // with no speculative-BCE guards, keeps reference locals frame-homed,
     // and publishes the body without OSR entry points — see
     // `x64::kernel_reg_locals_enabled` for the safety argument.
-    x64::set_kernel_reg_homes_request(true);
+    backend.kernel_reg_homes = true;
     // Exception-handler entry edges are invisible to the backend's bytecode
     // branch decoding, so stage this method's protected ranges for
     // `find_bypassable_loop_headers`: a handler that can be entered from
     // outside a loop lands in the body without running its pre-header. Staged
-    // as `(start_pc, end_pc, handler_pc)`, one-shot, taken at backend entry.
-    // An empty exception table stages an empty vec → unchanged codegen.
-    x64::set_pending_exception_ranges(
-        cached
-            .exception_table
-            .iter()
-            .map(|e| {
-                (
-                    e.start_pc as usize,
-                    e.end_pc as usize,
-                    e.handler_pc as usize,
-                )
-            })
-            .collect(),
-    );
+    // as `(start_pc, end_pc, handler_pc)`. An empty exception table passes an
+    // empty vec → unchanged codegen.
+    backend.exception_ranges = cached
+        .exception_table
+        .iter()
+        .map(|e| (e.start_pc as usize, e.end_pc as usize, e.handler_pc as usize))
+        .collect();
     // The same table again, with the one thing a compiled `catch` needs that
     // no liveness analysis does: WHICH throwables each entry takes.
     //
@@ -33042,7 +33036,8 @@ fn try_compile_inner(
             ));
         }
         if resolvable {
-            x64::set_pending_local_handler_table(table, cached.declaring_class_id.as_u32());
+            backend.local_handler_table = table;
+            backend.local_handler_class = cached.declaring_class_id.as_u32();
         }
     }
     // Phase 10 (single-pass backend). Like `lower_inner`, this one call does
@@ -33141,7 +33136,7 @@ fn try_compile_inner(
         despec,
         indy_info,
         elidable_init_pcs,
-        direct_helpers,
+        backend,
     )?;
     drop(metrics_single_pass);
 

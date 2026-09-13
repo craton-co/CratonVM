@@ -150,6 +150,8 @@ pub use bytecode_compat::*;
 // declared visibility, so nothing here became more public than it was.
 mod licm;
 pub use licm::*;
+mod backend_request;
+pub use backend_request::BackendRequest;
 pub(crate) mod stack_kinds;
 // ---------------------------------------------------------------------------
 // HIGH-1 / Fix 1 — null-check elimination helper
@@ -578,7 +580,7 @@ struct Compiler {
 
     /// `[start_pc, end_pc)` ranges covered by this method's exception table.
     /// Empty when the method has no handlers. Consulted only by
-    /// [`Compiler::pc_is_protected`]; see `PROTECTED_RANGES_REQUEST`.
+    /// [`Compiler::pc_is_protected`]; see `BackendRequest::protected_ranges`.
     protected_ranges: Vec<(u32, u32)>,
     /// This method's exception table as `(start_pc, end_pc, handler_pc, catch
     /// type name)`, non-empty exactly when compiled local handlers are ARMED

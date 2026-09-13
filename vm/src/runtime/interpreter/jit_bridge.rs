@@ -951,15 +951,15 @@ pub(super) fn compile_osr_artifact(
             // here for the first time (see the three `set_*_request` calls
             // immediately before `compile_with_param_slots` below):
             //
-            //   1. `set_precise_exception_frame_request(true)` makes every
+            //   1. `BackendRequest::precise_exception_frames(true)` makes every
             //      invoke inside a protected range publish a **reason-9**
             //      (`DeoptReason::PendingException`) frame keyed on the
             //      THROWING bci, not on the stale back-edge pc the live
             //      interpreter frame is parked at;
-            //   2. `set_protected_ranges_request` suppresses the sibling
+            //   2. `BackendRequest::protected_ranges` suppresses the sibling
             //      tail-call inside a `try` (which would tear this frame down
             //      and `JMP`, unwinding past the handler);
-            //   3. `set_pending_exception_ranges` makes the handler entry edges
+            //   3. `BackendRequest::exception_ranges` makes the handler entry edges
             //      visible to `find_bypassable_loop_headers`.
             //
             // and the ADMISSION rule that makes the stale-resume fallback
@@ -3235,7 +3235,11 @@ pub(super) fn compile_osr_artifact(
             // (benchArithmetic, matmul) live entirely in this artifact and
             // previously ran memory-homed. Opt out:
             // `CRATONVM_JIT_KERNEL_REG_OSR=0`.
-            crate::jit::x64::set_kernel_reg_homes_osr_request(true);
+            let mut backend = crate::jit::x64::BackendRequest {
+                direct_helpers: crate::jit::helpers::direct_helper_table_for(shared),
+                kernel_reg_homes_osr: true,
+                ..Default::default()
+            };
             // ── The RBC.6b lift's three staged requests ──────────────────
             //
             // `jit::try_compile` has always staged these for a method-entry
@@ -3244,8 +3248,8 @@ pub(super) fn compile_osr_artifact(
             // every method with an exception table. Staged here, at the same
             // point `try_compile` stages them — after every early return above,
             // so a refused attempt cannot leak a request into the next method
-            // compiled on this worker thread, and all three are consumed
-            // (`take`n) at backend entry.
+            // compiled on this worker thread, and all three travel on this
+            // compile's `BackendRequest`.
             //
             // Set unconditionally, including the empty-table case, so the
             // request state this compile runs under is decided HERE rather than
@@ -3277,25 +3281,15 @@ pub(super) fn compile_osr_artifact(
             //     `find_bypassable_loop_headers` needs them or a handler
             //     entered from outside a loop lands in the body without running
             //     its pre-header.
-            crate::jit::x64::set_precise_exception_frame_request(!osr_exception_table.is_empty());
-            crate::jit::x64::set_protected_ranges_request(
-                osr_exception_table
-                    .iter()
-                    .map(|e| (e.start_pc as u32, e.end_pc as u32))
-                    .collect(),
-            );
-            crate::jit::x64::set_pending_exception_ranges(
-                osr_exception_table
-                    .iter()
-                    .map(|e| {
-                        (
-                            e.start_pc as usize,
-                            e.end_pc as usize,
-                            e.handler_pc as usize,
-                        )
-                    })
-                    .collect(),
-            );
+            backend.precise_exception_frames = !osr_exception_table.is_empty();
+            backend.protected_ranges = osr_exception_table
+                .iter()
+                .map(|e| (e.start_pc as u32, e.end_pc as u32))
+                .collect();
+            backend.exception_ranges = osr_exception_table
+                .iter()
+                .map(|e| (e.start_pc as usize, e.end_pc as usize, e.handler_pc as usize))
+                .collect();
             // ── Compiled local exception handlers, OSR tier ─────────────────
             //
             // The same table a fourth time, with catch TYPES, so this artifact
@@ -3338,7 +3332,8 @@ pub(super) fn compile_osr_artifact(
                 });
                 drop(cm_lock);
                 if let Some(table) = table {
-                    crate::jit::x64::set_pending_local_handler_table(table, class_id.as_u32());
+                    backend.local_handler_table = table;
+                    backend.local_handler_class = class_id.as_u32();
                 }
             }
             // This artifact's install epoch was stamped by the `compile_gate`
@@ -3412,7 +3407,7 @@ pub(super) fn compile_osr_artifact(
                 Some(&shared.jit.despec_registry),
                 indy_info,
                 Some(elidable_init_pcs),
-                &crate::jit::helpers::direct_helper_table(),
+                backend,
             );
             let Some(mut cm) = cm else {
                 // RBC.2 — a backend bail here is just as permanent as one in
@@ -6927,7 +6922,7 @@ pub(super) fn compile_optimizing_artifact(
                 despec: Some(&shared.jit.despec_registry),
                 cp_invoke_declaring_class_resolver: Some(&c_invoke_declaring_class_resolver),
                 self_call_identity_stable: self_call_identity,
-                direct_helpers: &crate::jit::helpers::direct_helper_table(),
+                direct_helpers: &crate::jit::helpers::direct_helper_table_for(shared),
             })?;
         let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
         let needs_ctx = compiled.needs_context();
@@ -7163,7 +7158,7 @@ pub(super) fn compile_optimizing_artifact(
             despec: Some(&shared.jit.despec_registry),
             cp_invoke_declaring_class_resolver: Some(&invoke_declaring_class_resolver),
             self_call_identity_stable: self_call_identity,
-            direct_helpers: &crate::jit::helpers::direct_helper_table(),
+            direct_helpers: &crate::jit::helpers::direct_helper_table_for(shared),
         })?;
     Some(compiled)
 }
@@ -9104,7 +9099,7 @@ pub(super) fn try_jit_compile_callee_slow(
             despec: Some(&shared.jit.despec_registry),
             cp_invoke_declaring_class_resolver: Some(&invoke_declaring_class_resolver),
             self_call_identity_stable: self_call_identity,
-            direct_helpers: &crate::jit::helpers::direct_helper_table(),
+            direct_helpers: &crate::jit::helpers::direct_helper_table_for(shared),
         })?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(

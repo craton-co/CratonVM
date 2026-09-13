@@ -307,7 +307,7 @@ pub enum Op {
     ///
     /// Two lowerings, chosen exactly as the single-pass backend's `0xb2` arm
     /// chooses: a direct load through the class's baked base-POINTER cell when
-    /// `x64::resolve_static_base` accepts the site (which it does only for a
+    /// `DirectHelperTable::resolve_static_base` accepts the site (which it does only for a
     /// class already initialised at compile time), and `helpers.getstatic`
     /// otherwise — that helper runs `<clinit>` on first touch and reports a
     /// failure as the `i64::MIN` deopt sentinel with a pending Java exception.

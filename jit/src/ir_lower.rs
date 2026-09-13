@@ -408,6 +408,10 @@ pub(crate) fn incoming_abi_reg_capacity() -> usize {
 // ── Lowering state ───────────────────────────────────────────────────
 
 struct Lowerer<'a> {
+    /// The compile's direct-helper table. Its `resolve_static_base` decides
+    /// whether a `getstatic` loads its slot directly. `EMPTY` from
+    /// `Lowerer::new`; `lower_inner_with_scopes` sets it.
+    direct_helpers: crate::DirectHelperTable,
     graph: &'a Graph,
     schedule: &'a Schedule,
     buf: ExecutableBuffer,
@@ -1614,6 +1618,7 @@ impl<'a> Lowerer<'a> {
         );
 
         Lowerer {
+            direct_helpers: crate::DirectHelperTable::EMPTY,
             graph,
             schedule,
             buf,
@@ -4644,7 +4649,7 @@ impl<'a> Lowerer<'a> {
         if !wide && !is_float && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
             return false;
         }
-        let Some(base_cell) = crate::x64::resolve_static_base(class_id, field_index as usize)
+        let Some(base_cell) = self.direct_helpers.resolve_static_base(class_id, field_index as usize)
         else {
             return false;
         };
@@ -18399,12 +18404,48 @@ pub(crate) fn lower_inner(
     compact_fields: &HashMap<(usize, bool), (u32, bool, u8)>,
     inline_frame_sites: &crate::ir::IrInlineFrameSites,
 ) -> Option<CompiledMethod> {
+    lower_inner_with_direct_helpers(
+        &crate::DirectHelperTable::EMPTY,
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        branch_hints,
+        spliced_ranges,
+        sr_map,
+        direct_calls,
+        ic_slots,
+        compact_fields,
+        inline_frame_sites,
+    )
+}
+
+/// [`lower_inner`] for a compile that carries the VM's direct-helper table,
+/// which the IR `getstatic` lowering asks for a static slot's base.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_inner_with_direct_helpers(
+    direct_helpers: &crate::DirectHelperTable,
+    graph: &Graph,
+    schedule: &Schedule,
+    num_params: usize,
+    num_locals: usize,
+    helpers: &JitRuntimeHelpers,
+    branch_hints: &HashMap<usize, bool>,
+    spliced_ranges: &[(usize, usize, usize)],
+    sr_map: Option<&ScalarReplacementMap>,
+    direct_calls: &HashMap<usize, (usize, bool)>,
+    ic_slots: &HashMap<usize, (usize, usize)>,
+    compact_fields: &HashMap<(usize, bool), (u32, bool, u8)>,
+    inline_frame_sites: &crate::ir::IrInlineFrameSites,
+) -> Option<CompiledMethod> {
     // No inlined callee scopes: every deopt point is a single flat frame, which
     // is what this path has always produced. The inline FRAME sites are a
     // different table with a different consumer (stack traces, not deopt), so
     // this path forwards the caller's rather than substituting an empty one.
     let no_scopes = InlineScopeTable::new();
     lower_inner_with_scopes(
+        direct_helpers,
         graph,
         schedule,
         num_params,
@@ -18433,6 +18474,7 @@ pub(crate) fn lower_inner(
 ///
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_inner_with_scopes(
+    direct_helpers: &crate::DirectHelperTable,
     graph: &Graph,
     schedule: &Schedule,
     num_params: usize,
@@ -18807,6 +18849,7 @@ pub(crate) fn lower_inner_with_scopes(
         inline_scopes,
         inline_frame_sites,
     );
+    lowerer.direct_helpers = *direct_helpers;
 
     // Null-check and bounds-check elimination. Runs on the SCHEDULED graph
     // because both facts are dominance facts and dominance is over the block
