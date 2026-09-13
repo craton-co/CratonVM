@@ -2715,16 +2715,40 @@ pub fn take_local_handlers_disarmed() -> bool {
 }
 
 /// activate-ir-optimizer Front 3.2: guard-surviving scalar replacement
-/// (`CRATONVM_SCALAR_DEOPT`, default-OFF, read-once). When ON *and*
-/// `deopt_real_enabled()`, the IR lowerer emits a `FrameValue::VirtualObject`
-/// for a scalar-replaced object that is live at a deopt point (instead of
-/// `Undefined` → whole-method re-run), so a precise resume re-materializes it via
-/// `materialize_virtual_objects`. Gated by BOTH flags because it only has effect
-/// on the precise-resume path (itself `deopt_real`-gated); OFF ⇒ the lowerer is
-/// passed `sr_map = None` ⇒ byte-identical to the prior producer.
+/// (`CRATONVM_SCALAR_DEOPT`, read-once).
+///
+/// **SUPERSEDED 2026-09-12.** It used to be the opt-in half of the gate that
+/// let the IR lowerer emit a `FrameValue::VirtualObject` for a scalar-replaced
+/// object live at a deopt point. That recipe is now emitted whenever precise
+/// resume is on — see [`scalar_deopt_descriptor_available`] and
+/// `allocation-elision-never-fires-by-default-FIXED-20260912.md` — so setting
+/// this flag changes nothing. It is still declared and still read (by that
+/// function) so the flag registries and a run that sets it stay consistent.
 pub fn scalar_deopt_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SCALAR_DEOPT"))
+}
+
+/// Will a scalar-replaced object that a REAL deopt point names get a
+/// `FrameValue::VirtualObject` recipe (so its allocation may be removed)?
+///
+/// Exactly [`deopt_real_enabled`] — the precise-resume switch, default ON. The
+/// recipe is only consumed by a precise resume, so it is emitted exactly when
+/// one can happen. With precise resume OFF the answer is `false`, and the rule
+/// `plan_scalar_replacement` applies is the conservative one: an allocation a
+/// consultable deopt snapshot names KEEPS its allocation. It never relies on the
+/// whole-method re-run.
+///
+/// The one place the rule and the recipe can still disagree — the lowerer
+/// failing to describe an elided object at a point it did elide for
+/// (`MaterializationRequired`) — is caught after lowering by
+/// [`ir_artifact_names_an_undescribable_elided_object`].
+///
+/// This was `scalar_deopt_enabled() && deopt_real_enabled()`;
+/// `CRATONVM_SCALAR_DEOPT` is read here only so it keeps its read site.
+pub(crate) fn scalar_deopt_descriptor_available() -> bool {
+    let _superseded = scalar_deopt_enabled();
+    deopt_real_enabled()
 }
 
 /// deopt-osr: CI/test gate for the eager-deopt differential verifier
@@ -5263,13 +5287,18 @@ impl OsrEntryPlan {
                 ),
             ));
         }
-        if !rframe.monitors.is_empty() {
+        // Only a monitor the resume would have to ACQUIRE refuses: the in-place
+        // transfer has no re-lock path. A lock the compiled code took itself
+        // (`relock == false`) is still held by this thread and the live frame
+        // releases it with its own `monitorexit`, exactly as before IR frame
+        // states recorded monitors at all.
+        if rframe.monitors.iter().any(|m| m.relock) {
             return Err(osr_refusal(
                 OSR_REFUSE_EXIT_REPLAY,
                 format!(
-                    "exit at bci {} holds {} monitor(s)",
+                    "exit at bci {} holds {} monitor(s) that must be re-acquired",
                     rframe.bci,
-                    rframe.monitors.len()
+                    rframe.monitors.iter().filter(|m| m.relock).count()
                 ),
             ));
         }
@@ -5509,10 +5538,15 @@ impl CompiledMethod {
                     ),
                 ));
             }
-            if !fs.monitors.is_empty() {
+            // See `resume_after_exit`: only an elided (`relock`) monitor has no
+            // path through the in-place transfer.
+            if fs.monitors.iter().any(|m| m.relock) {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
-                    format!("deopt point at bci {} holds monitors", p.bci),
+                    format!(
+                        "deopt point at bci {} holds monitors that must be re-acquired",
+                        p.bci
+                    ),
                 ));
             }
             // A RETHROW point is asked a NARROWER question, because it is
@@ -5858,10 +5892,15 @@ impl CompiledMethod {
                     format!("{}: entry contract has an inlined caller scope", label()),
                 ));
             }
-            if !fs.monitors.is_empty() {
+            // A lock the compiled body takes itself is taken by the
+            // interpreter before the entry and released by the body's own
+            // `monitorexit`. An ELIDED one (`relock`) would be held by the
+            // interpreter and released by nobody: the body has no monitor op
+            // for it. Refuse only that.
+            if fs.monitors.iter().any(|m| m.relock) {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
-                    format!("{}: entry contract holds monitors", label()),
+                    format!("{}: entry contract holds an elided monitor", label()),
                 ));
             }
             // `osr-01` item 4. The precise contract is what the loop below
@@ -20055,12 +20094,546 @@ fn ea_splice_feasible(ir_graph: &ir::Graph, victim: ir::NodeId) -> bool {
         .is_some()
 }
 
-/// True when some safepoint snapshot slot names `id`.
+/// True when some safepoint snapshot slot names `id` — a local, an operand-stack
+/// entry, or a held monitor.
 fn ea_snapshot_names(ir_graph: &ir::Graph, id: ir::NodeId) -> bool {
+    ir_graph.safepoints.iter().any(|sp| {
+        sp.locals
+            .iter()
+            .chain(sp.stack.iter())
+            .chain(sp.monitors.iter())
+            .any(|&v| v == id)
+    })
+}
+
+// ── Which snapshots a deopt can consult (#49) ────────────────────────
+//
+// `IrBuilder::build` records a snapshot at EVERY bytecode boundary, because the
+// builder's own trap planting and the String/unbox intrinsics ask "is there a
+// snapshot at this pc" mid-walk. Most of those snapshots describe program
+// points nothing can resume at, and every one of them used to pin whatever it
+// named: a fresh `new`'s reference sits on the stack or in a local at several of
+// them, so escape analysis could forward its field loads but never remove the
+// allocation itself (`allocation-elision-never-fires-by-default-FIXED-20260912.md`).
+//
+// Three narrowings, each sound on its own:
+//
+// 1. `ir_prune_dead_snapshot_locals` — a local the bytecode cannot read again
+//    before writing it is not part of the frame an interpreter resumes into.
+// 2. `ea_consumable_snapshot_names` — the allocation planner asks only about
+//    snapshots at a program point a deopt can arrive at.
+// 3. `ir_prune_unconsumable_snapshots` — after escape analysis, the rest are
+//    dropped, so no deopt point is ever built from one.
+
+/// The bytecode indices at which a deopt of `ir_graph` can consult a snapshot,
+/// with the nodes in `ignore` treated as already gone.
+///
+/// A snapshot is consultable at:
+///
+/// * every bci a node that can transfer to the interpreter
+///   (`!ir_lower::op_cannot_deopt`) resumes at — its `bytecode_pc` mapped
+///   through `spliced_ranges` exactly as `ir_lower`'s `resume_bci` maps it, plus
+///   an `Op::Guard`'s own `bci` field. Every deopt stub and every exceptional
+///   exit the lowerer emits is emitted while lowering such a node, at its bci;
+/// * every `Op::Merge` / `Op::Region` bci — a join is where an optimizing OSR
+///   entry is planned and where `ir_lower` treats a loop header as trapping.
+///
+/// `None` means "cannot be attributed; treat EVERY snapshot as consultable":
+/// some node that can deopt carries no `bytecode_pc`, or — when
+/// `spliced_ranges` is not known (`None`) — resumes at a pc no snapshot
+/// describes, which is what a relocated callee pc looks like before mapping.
+fn ir_consumable_snapshot_bcis(
+    ir_graph: &ir::Graph,
+    spliced_ranges: Option<&[(usize, usize, usize)]>,
+    ignore: &std::collections::HashSet<ir::NodeId>,
+) -> Option<std::collections::HashSet<usize>> {
+    let snapshot_bcis: std::collections::HashSet<usize> =
+        ir_graph.safepoints.iter().map(|sp| sp.bci).collect();
+    let resume = |pc: usize| -> usize {
+        match spliced_ranges {
+            Some(ranges) => ranges
+                .iter()
+                .find(|&&(start, end, _)| pc >= start && pc < end)
+                .map_or(pc, |&(_, _, invoke)| invoke),
+            None => pc,
+        }
+    };
+    let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (idx, n) in ir_graph.nodes.iter().enumerate() {
+        if n.op == ir::Op::Dead {
+            continue;
+        }
+        if matches!(n.op, ir::Op::Merge | ir::Op::Region) {
+            if let Some(pc) = n.bytecode_pc {
+                out.insert(resume(pc));
+            }
+            continue;
+        }
+        if ir_lower::op_cannot_deopt(&n.op) {
+            continue;
+        }
+        // Attribution is checked BEFORE `ignore`: an unattributable victim is
+        // as good a sign as any that this graph was not built from bytecode.
+        let pc = n.bytecode_pc?;
+        let at = resume(pc);
+        if spliced_ranges.is_none() && !snapshot_bcis.contains(&at) {
+            return None;
+        }
+        if ignore.contains(&(idx as ir::NodeId)) {
+            continue;
+        }
+        out.insert(at);
+        if let ir::Op::Guard { bci } = n.op {
+            out.insert(resume(bci));
+        }
+    }
+    Some(out)
+}
+
+/// Snapshot indices a live node outside `ignore` names through
+/// `Node::frame_snapshot` — consulted by that node's own deopt whatever its bci.
+fn ir_claimed_snapshots(
+    ir_graph: &ir::Graph,
+    ignore: &std::collections::HashSet<ir::NodeId>,
+) -> std::collections::HashSet<u32> {
     ir_graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(idx, n)| n.op != ir::Op::Dead && !ignore.contains(&(*idx as ir::NodeId)))
+        .filter_map(|(_, n)| n.frame_snapshot)
+        .collect()
+}
+
+/// [`ea_snapshot_names`], asked only of the snapshots a deopt can consult once
+/// the nodes in `ignore` (the candidate's own allocation, stores and loads, all
+/// of which the plan retires) are gone.
+///
+/// Falls back to [`ea_snapshot_names`] when the graph cannot be attributed. The
+/// answer is never narrower than what [`ir_prune_unconsumable_snapshots`] keeps
+/// after the plans are applied: that pass sees the same graph minus every
+/// plan's victims, with the spliced ranges known.
+fn ea_consumable_snapshot_names(
+    ir_graph: &ir::Graph,
+    id: ir::NodeId,
+    ignore: &std::collections::HashSet<ir::NodeId>,
+) -> bool {
+    let Some(consumable) = ir_consumable_snapshot_bcis(ir_graph, None, ignore) else {
+        return ea_snapshot_names(ir_graph, id);
+    };
+    let claimed = ir_claimed_snapshots(ir_graph, ignore);
+    ir_graph.safepoints.iter().enumerate().any(|(si, sp)| {
+        (consumable.contains(&sp.bci) || claimed.contains(&(si as u32)))
+            && sp
+                .locals
+                .iter()
+                .chain(sp.stack.iter())
+                .chain(sp.monitors.iter())
+                .any(|&v| v == id)
+    })
+}
+
+/// Drop every snapshot no deopt of the finished graph can consult. Returns how
+/// many were dropped.
+///
+/// Runs after escape analysis, which is the last pass that mutates the graph
+/// before scheduling. A dropped snapshot would otherwise still become a
+/// `DeoptimizationPoint` (at whatever native offset its bci's nodes produced)
+/// naming the allocations the planner just removed. A graph that cannot be
+/// attributed keeps every snapshot.
+fn ir_prune_unconsumable_snapshots(
+    ir_graph: &mut ir::Graph,
+    spliced_ranges: &[(usize, usize, usize)],
+) -> usize {
+    let nothing_ignored: std::collections::HashSet<ir::NodeId> = std::collections::HashSet::new();
+    let Some(consumable) =
+        ir_consumable_snapshot_bcis(ir_graph, Some(spliced_ranges), &nothing_ignored)
+    else {
+        return 0;
+    };
+    let claimed = ir_claimed_snapshots(ir_graph, &nothing_ignored);
+    let keep: Vec<bool> = ir_graph
         .safepoints
         .iter()
-        .any(|sp| sp.locals.iter().chain(sp.stack.iter()).any(|&v| v == id))
+        .enumerate()
+        .map(|(si, sp)| consumable.contains(&sp.bci) || claimed.contains(&(si as u32)))
+        .collect();
+    ir_graph.retain_safepoints(&keep)
+}
+
+/// One instruction as local-variable liveness sees it.
+struct IrLivenessInsn {
+    pc: usize,
+    succs: Vec<usize>,
+    uses: Vec<usize>,
+    defs: Vec<usize>,
+}
+
+/// Decode `code[..code_len]` for [`ir_prune_dead_snapshot_locals`]. `None` for
+/// anything liveness cannot model soundly: subroutines (`jsr`/`ret`), `wide
+/// ret`, a malformed switch, or a branch that leaves the method.
+fn decode_for_local_liveness(code: &[u8], code_len: usize) -> Option<Vec<IrLivenessInsn>> {
+    let byte = |p: usize| -> Option<u8> {
+        if p < code_len {
+            code.get(p).copied()
+        } else {
+            None
+        }
+    };
+    let u16_at =
+        |p: usize| -> Option<usize> { Some(usize::from(u16::from_be_bytes([byte(p)?, byte(p + 1)?]))) };
+    let i16_at =
+        |p: usize| -> Option<i64> { Some(i64::from(i16::from_be_bytes([byte(p)?, byte(p + 1)?]))) };
+    let i32_at = |p: usize| -> Option<i64> {
+        Some(i64::from(i32::from_be_bytes([
+            byte(p)?,
+            byte(p + 1)?,
+            byte(p + 2)?,
+            byte(p + 3)?,
+        ])))
+    };
+    let target = |pc: usize, off: i64| -> Option<usize> {
+        let t = i64::try_from(pc).ok()?.checked_add(off)?;
+        usize::try_from(t).ok().filter(|&t| t < code_len)
+    };
+    let mut out: Vec<IrLivenessInsn> = Vec::new();
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = byte(pc)?;
+        let len = x64::bytecode_len_at(code, pc);
+        if len == 0 || pc.checked_add(len)? > code_len {
+            return None;
+        }
+        let next = pc + len;
+        let mut uses: Vec<usize> = Vec::new();
+        let mut defs: Vec<usize> = Vec::new();
+        let mut succs: Vec<usize> = Vec::new();
+        let mut falls_through = true;
+        match op {
+            // Loads. `lload`/`dload` read both halves of a category-2 value.
+            0x15 | 0x17 | 0x19 => uses.push(usize::from(byte(pc + 1)?)),
+            0x16 | 0x18 => {
+                let i = usize::from(byte(pc + 1)?);
+                uses.extend([i, i + 1]);
+            }
+            0x1a..=0x1d => uses.push(usize::from(op - 0x1a)),
+            0x1e..=0x21 => {
+                let i = usize::from(op - 0x1e);
+                uses.extend([i, i + 1]);
+            }
+            0x22..=0x25 => uses.push(usize::from(op - 0x22)),
+            0x26..=0x29 => {
+                let i = usize::from(op - 0x26);
+                uses.extend([i, i + 1]);
+            }
+            0x2a..=0x2d => uses.push(usize::from(op - 0x2a)),
+            // Stores.
+            0x36 | 0x38 | 0x3a => defs.push(usize::from(byte(pc + 1)?)),
+            0x37 | 0x39 => {
+                let i = usize::from(byte(pc + 1)?);
+                defs.extend([i, i + 1]);
+            }
+            0x3b..=0x3e => defs.push(usize::from(op - 0x3b)),
+            0x3f..=0x42 => {
+                let i = usize::from(op - 0x3f);
+                defs.extend([i, i + 1]);
+            }
+            0x43..=0x46 => defs.push(usize::from(op - 0x43)),
+            0x47..=0x4a => {
+                let i = usize::from(op - 0x47);
+                defs.extend([i, i + 1]);
+            }
+            0x4b..=0x4e => defs.push(usize::from(op - 0x4b)),
+            // `iinc` reads its slot. Its write is not modelled as a kill, which
+            // can only keep the slot live longer.
+            0x84 => uses.push(usize::from(byte(pc + 1)?)),
+            0xc4 => {
+                let widened = byte(pc + 1)?;
+                let i = u16_at(pc + 2)?;
+                match widened {
+                    0x15 | 0x17 | 0x19 | 0x84 => uses.push(i),
+                    0x16 | 0x18 => uses.extend([i, i + 1]),
+                    0x36 | 0x38 | 0x3a => defs.push(i),
+                    0x37 | 0x39 => defs.extend([i, i + 1]),
+                    _ => return None,
+                }
+            }
+            0x99..=0xa6 | 0xc6 | 0xc7 => succs.push(target(pc, i16_at(pc + 1)?)?),
+            0xa7 => {
+                succs.push(target(pc, i16_at(pc + 1)?)?);
+                falls_through = false;
+            }
+            0xc8 => {
+                succs.push(target(pc, i32_at(pc + 1)?)?);
+                falls_through = false;
+            }
+            // Subroutines make local liveness path-dependent.
+            0xa8 | 0xa9 | 0xc9 => return None,
+            0xaa | 0xab => {
+                let mut p = pc + 1;
+                while p % 4 != 0 {
+                    p += 1;
+                }
+                succs.push(target(pc, i32_at(p)?)?);
+                if op == 0xaa {
+                    let low = i32_at(p + 4)?;
+                    let high = i32_at(p + 8)?;
+                    if high < low || high - low >= 65_536 {
+                        return None;
+                    }
+                    let count = usize::try_from(high - low + 1).ok()?;
+                    for k in 0..count {
+                        succs.push(target(pc, i32_at(p + 12 + 4 * k)?)?);
+                    }
+                } else {
+                    let npairs = i32_at(p + 4)?;
+                    if !(0..=65_536).contains(&npairs) {
+                        return None;
+                    }
+                    let npairs = usize::try_from(npairs).ok()?;
+                    for k in 0..npairs {
+                        succs.push(target(pc, i32_at(p + 12 + 8 * k)?)?);
+                    }
+                }
+                falls_through = false;
+            }
+            0xac..=0xb1 | 0xbf => falls_through = false,
+            _ => {}
+        }
+        if falls_through && next < code_len {
+            succs.push(next);
+        }
+        out.push(IrLivenessInsn {
+            pc,
+            succs,
+            uses,
+            defs,
+        });
+        pc = next;
+    }
+    Some(out)
+}
+
+/// Clear every safepoint-snapshot LOCAL the bytecode can no longer read, and
+/// return how many were cleared.
+///
+/// A local that is not live-in at a bci (JVMS local-variable liveness: no path
+/// from here reads it before writing it) is not part of the frame an
+/// interpreter resumes into there. Resuming with `Undefined` in its place — the
+/// value every resume sink turns into `Int(0)` — is exactly as correct as
+/// resuming with the old value, because nothing reads it. HotSpot's
+/// `MethodLiveness` makes the same cut for its debug info.
+///
+/// The cut is what lets an allocation stored in a local stop being named by
+/// every later snapshot: `Foo o = new Foo(); int v = o.x; ... guard` no longer
+/// holds `o` in the guard's frame once `o` is never read again.
+///
+/// Conservative in every direction it can be:
+///
+/// * the CALLER must not call this for a method with an exception table — a
+///   handler reads locals the normal flow does not, and handler code is not
+///   walked here;
+/// * a loop header (any backward-branch target) is left untouched: an
+///   optimizing OSR entry seeds this tier's frame from the snapshot there and
+///   refuses a value live in the graph but unnamed by it;
+/// * any construct liveness cannot model (subroutines, `wide ret`, a malformed
+///   table, a local index past the snapshot's width) prunes nothing, and so does
+///   a fixed point that fails to converge in `MAX_ROUNDS`.
+///
+/// Only locals are cut. The operand stack is always fully live.
+fn ir_prune_dead_snapshot_locals(ir_graph: &mut ir::Graph, code: &[u8], code_len: usize) -> usize {
+    const MAX_LOCALS: usize = 1024;
+    const MAX_ROUNDS: usize = 64;
+    if ir_graph.safepoints.is_empty() || code_len == 0 || code_len > code.len() {
+        return 0;
+    }
+    let num_locals = ir_graph
+        .safepoints
+        .iter()
+        .map(|sp| sp.locals.len())
+        .max()
+        .unwrap_or(0);
+    if num_locals == 0 || num_locals > MAX_LOCALS {
+        return 0;
+    }
+    let Some(insns) = decode_for_local_liveness(code, code_len) else {
+        return 0;
+    };
+    let mut index_of: Vec<usize> = vec![usize::MAX; code_len];
+    for (i, insn) in insns.iter().enumerate() {
+        index_of[insn.pc] = i;
+    }
+    let mut loop_headers: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for insn in &insns {
+        for &s in &insn.succs {
+            // A branch into the middle of an instruction: the decode and the
+            // method disagree, so prove nothing.
+            if index_of.get(s).copied().unwrap_or(usize::MAX) == usize::MAX {
+                return 0;
+            }
+            if s <= insn.pc {
+                loop_headers.insert(s);
+            }
+        }
+        if insn
+            .uses
+            .iter()
+            .chain(insn.defs.iter())
+            .any(|&l| l >= num_locals)
+        {
+            return 0;
+        }
+    }
+    let words = num_locals.div_ceil(64);
+    let n = insns.len();
+    let mut live_in: Vec<u64> = vec![0; n * words];
+    let mut scratch: Vec<u64> = vec![0; words];
+    let mut converged = false;
+    for _ in 0..MAX_ROUNDS {
+        let mut changed = false;
+        for i in (0..n).rev() {
+            scratch.iter_mut().for_each(|w| *w = 0);
+            for &s in &insns[i].succs {
+                let si = index_of[s];
+                for w in 0..words {
+                    scratch[w] |= live_in[si * words + w];
+                }
+            }
+            for &d in &insns[i].defs {
+                scratch[d / 64] &= !(1u64 << (d % 64));
+            }
+            for &u in &insns[i].uses {
+                scratch[u / 64] |= 1u64 << (u % 64);
+            }
+            let row = &mut live_in[i * words..(i + 1) * words];
+            if row[..] != scratch[..] {
+                row.copy_from_slice(&scratch);
+                changed = true;
+            }
+        }
+        if !changed {
+            converged = true;
+            break;
+        }
+    }
+    if !converged {
+        return 0;
+    }
+    let mut cleared = 0usize;
+    for sp in ir_graph.safepoints.iter_mut() {
+        if sp.bci >= code_len || loop_headers.contains(&sp.bci) {
+            continue;
+        }
+        let i = index_of[sp.bci];
+        if i == usize::MAX {
+            continue;
+        }
+        let row = &live_in[i * words..(i + 1) * words];
+        for (k, slot) in sp.locals.iter_mut().enumerate() {
+            // A plain write is fine here: it REMOVES a reference, and the
+            // def-use lists tolerate a stale superset entry (see `UseLists`).
+            if *slot != ir::NO_NODE && row[k / 64] & (1u64 << (k % 64)) == 0 {
+                *slot = ir::NO_NODE;
+                cleared += 1;
+            }
+        }
+    }
+    cleared
+}
+
+/// Fold `o == null` / `o != null` where `o` is a fresh `Op::New` or
+/// `Op::NewArray` to the constant it must be. Returns how many compares folded.
+///
+/// Sound because an allocation never yields null: it either produces an object
+/// or throws before producing anything (OOM, or a negative array length). Run
+/// before escape analysis for two reasons. The live `Op::Cmp` is a VALUE use of
+/// the allocation, which `plan_scalar_replacement` refuses to strand; and the
+/// null literal makes the bridge classify the compare `EaOp::Other`, which the
+/// analysis treats as a global escape. Either alone pinned the allocation.
+fn ir_fold_null_checks_on_fresh_allocations(ir_graph: &mut ir::Graph) -> usize {
+    let mut folds: Vec<(ir::NodeId, i64)> = Vec::new();
+    {
+        let g: &ir::Graph = ir_graph;
+        let is_fresh = |id: ir::NodeId| {
+            g.node_opt(id)
+                .is_some_and(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }))
+        };
+        let is_null = |id: ir::NodeId| {
+            g.node_opt(id)
+                .is_some_and(|n| n.op == ir::Op::Const(0) && n.ty == ir::IrType::Ref)
+        };
+        for (idx, n) in g.nodes.iter().enumerate() {
+            let ir::Op::Cmp(cc) = &n.op else {
+                continue;
+            };
+            if n.inputs.len() < 2 {
+                continue;
+            }
+            let (a, b) = (n.inputs[0], n.inputs[1]);
+            let fresh_vs_null = (is_fresh(a) && is_null(b)) || (is_fresh(b) && is_null(a));
+            if !fresh_vs_null {
+                continue;
+            }
+            let value = match cc {
+                ir::CmpOp::Eq => 0,
+                ir::CmpOp::Ne => 1,
+                _ => continue,
+            };
+            folds.push((idx as ir::NodeId, value));
+        }
+    }
+    for &(cmp, value) in &folds {
+        let c = ir_graph.add(ir::Op::Const(value), ir::IrType::Int, vec![], None);
+        ir_graph.replace_all_uses(cmp, c);
+        ir_graph.kill(cmp);
+    }
+    folds.len()
+}
+
+/// Does a lowered artifact carry a deopt point that names an allocation escape
+/// analysis removed but the lowerer could not describe?
+///
+/// The backstop for the rule [`scalar_deopt_descriptor_available`] documents:
+/// the planner elides an allocation a consultable snapshot names only when a
+/// recipe will exist, and the lowerer can still refuse that recipe at a
+/// particular point (`MaterializationRequired` with an allocation cause). Such
+/// a point is unresumable, and the sink falls back to re-running the method.
+fn ir_artifact_names_an_undescribable_elided_object(cm: &CompiledMethod) -> bool {
+    fn value_names_one(v: &deopt::FrameValue) -> bool {
+        match v {
+            deopt::FrameValue::MaterializationRequired(e) => matches!(
+                e.cause,
+                deopt::EliminationCause::ScalarReplacedObject
+                    | deopt::EliminationCause::NestedVirtualObject
+            ),
+            deopt::FrameValue::VirtualObject(state) => state.field_values.iter().any(value_names_one),
+            _ => false,
+        }
+    }
+    fn state_names_one(fs: &deopt::FrameState) -> bool {
+        let mut scope = Some(fs);
+        let mut depth = 0usize;
+        while let Some(s) = scope {
+            if s.locals.iter().chain(s.stack.iter()).any(value_names_one)
+                || s.monitors.iter().any(|m| value_names_one(&m.object))
+            {
+                return true;
+            }
+            depth += 1;
+            // Deeper than any inliner builds: treat a malformed chain as
+            // naming one rather than walk it further.
+            if depth > 256 {
+                return true;
+            }
+            scope = s.caller.as_deref();
+        }
+        false
+    }
+    cm.deopt_points.iter().any(|p| state_names_one(&p.frame_state))
+        || cm
+            ._deopt_point_boxes
+            .iter()
+            .any(|p| state_names_one(&p.frame_state))
 }
 
 /// How [`apply_ea_to_ir`] retires one node.
@@ -20371,7 +20944,21 @@ fn plan_scalar_replacement(
         // to silently retarget it.
         elide_alloc = false;
     }
-    if ea_snapshot_names(ir_graph, new_node) {
+    // Only a snapshot a deopt can CONSULT pins the allocation (#49). The
+    // candidate's own allocation, stores and loads are retired by this very
+    // plan, so a snapshot that is consultable only because of one of them is
+    // not. `ir_prune_unconsumable_snapshots` drops the rest after the plans are
+    // applied, so no deopt point is ever built from one that names a dead node.
+    //
+    // The rule for one that IS consultable: keep the allocation unless a
+    // virtual-object recipe will exist, which is exactly when precise resume is
+    // on (`scalar_deopt_descriptor_available`). Never "elide and fall back to
+    // re-running the method".
+    let own_victims: std::collections::HashSet<ir::NodeId> = std::iter::once(new_node)
+        .chain(stores.iter().copied())
+        .chain(load_plans.iter().map(|&(l, _)| l))
+        .collect();
+    if ea_consumable_snapshot_names(ir_graph, new_node, &own_victims) {
         if deopt_descriptor_available
             && virtual_object_info_for(ir_graph, reverse_map, info).is_some()
         {
@@ -20490,7 +21077,7 @@ fn apply_ea_to_ir_pinned(
     // the same predicate the caller uses to decide whether to call
     // `build_scalar_replacement_map` (the EA block in `try_compile_inner`); if
     // the two ever disagree, an elided allocation loses its deopt descriptor.
-    let deopt_descriptor_available = scalar_deopt_enabled() && deopt_real_enabled();
+    let deopt_descriptor_available = scalar_deopt_descriptor_available();
 
     // ── Phase 1: plan (no mutation) ──────────────────────────────────
     let mut plans: Vec<EaScalarPlan> = Vec::new();
@@ -20732,7 +21319,12 @@ fn apply_ea_to_ir_pinned(
         if let EaVictimKind::Forwarded(v) = kind {
             forwarded.insert(victim, v);
             for sp in ir_graph.safepoints.iter_mut() {
-                for slot in sp.locals.iter_mut().chain(sp.stack.iter_mut()) {
+                for slot in sp
+                    .locals
+                    .iter_mut()
+                    .chain(sp.stack.iter_mut())
+                    .chain(sp.monitors.iter_mut())
+                {
                     if *slot == victim {
                         *slot = v;
                     }
@@ -20758,8 +21350,8 @@ fn apply_ea_to_ir_pinned(
 /// (which only mutates the graph). An object whose `Op::New` or any *stored*
 /// field value cannot be mapped to an IR node is **omitted** — the producer then
 /// leaves its slot `Undefined` (safe whole-method re-run) rather than emit a
-/// partial/garbage object. Only called when `scalar_deopt_enabled() &&
-/// deopt_real_enabled()`.
+/// partial/garbage object. Only called when
+/// `scalar_deopt_descriptor_available()`.
 ///
 /// Also omitted: any candidate `apply_ea_to_ir` will *refuse* to elide. Those
 /// keep a real allocation, and a `VirtualObject` recipe for a live object would
@@ -20778,7 +21370,7 @@ fn build_scalar_replacement_map(
     }
     // The predicate `apply_ea_to_ir` will compute for itself. Recomputed rather
     // than passed in so the two cannot drift apart at the call site.
-    let deopt_descriptor_available = scalar_deopt_enabled() && deopt_real_enabled();
+    let deopt_descriptor_available = scalar_deopt_descriptor_available();
     let mut objects: HashMap<ir::NodeId, ir_lower::VirtualObjectInfo> = HashMap::new();
     for info in &ea_result.scalar_replaceable {
         // Only objects `apply_ea_to_ir` will actually ELIDE may be described. A
@@ -20849,15 +21441,19 @@ fn virtual_object_info_for(
             Some(ea) => field_values.push(Some(*reverse_map.get(ea)?)),
         }
     }
-    // Capture each eliminated store's control node (its block). A store with
-    // no resolvable control omits the object (can't prove dominance).
+    // Capture each eliminated store's control node (its block) and the store's
+    // own id (its position within that block — see
+    // `ir_lower::Lowerer::eliminated_node_precedes_deopt`). A store with no
+    // resolvable control omits the object (can't prove dominance).
     let mut store_ctrls: Vec<ir::NodeId> = Vec::with_capacity(info.eliminated_stores.len());
+    let mut store_nodes: Vec<ir::NodeId> = Vec::with_capacity(info.eliminated_stores.len());
     for ea in &info.eliminated_stores {
         let ir_store = match reverse_map.get(ea) {
             Some(&id) => id,
             None => continue, // a store with no IR node can't have executed observably
         };
         store_ctrls.push(ctrl_of(ir_store)?);
+        store_nodes.push(ir_store);
     }
     Some((
         ir_new,
@@ -20870,6 +21466,7 @@ fn virtual_object_info_for(
             field_values,
             new_ctrl,
             store_ctrls,
+            store_nodes,
         },
     ))
 }
@@ -25871,20 +26468,18 @@ pub fn bytecode_commits_side_effect(code: &[u8], code_len: usize) -> bool {
 
 /// Does this method body enter or exit a monitor anywhere?
 ///
-/// Asked by the deopt sinks, not by the compiler. Every `FrameState` the
-/// optimizing IR lowerer builds hard-codes `monitors: Vec::new()` — an empty
-/// list by construction, not a measurement — so a frame reconstructed from a
-/// body that had taken a lock before it trapped describes a frame that believes
-/// it holds none. `build_deopt_frame_inner` re-acquires exactly the monitors the
-/// frame names, which for such a body is nothing, and the resumed interpreter
-/// frame then runs a `monitorexit` against a lock its own bookkeeping never
-/// recorded.
+/// Asked by the deopt sinks, not by the compiler. Written when every
+/// `FrameState` the optimizing IR lowerer built hard-coded `monitors:
+/// Vec::new()`, so a frame reconstructed from a body that had taken a lock
+/// described a frame that believed it held none. The optimizing tier now
+/// records the builder's monitor stack, with a `relock` marker on elided locks
+/// (`ir-frame-states-carry-no-monitor-stack-FIXED-20260912.md`).
 ///
-/// `ir_lower`'s own comment says the same thing from the emission side ("the
-/// interpreter's own sink refuses a frame that holds monitors — but it cannot
-/// fire on information that was never recorded, so the omission defeats the
-/// guard rather than tripping it"). This is the predicate that lets the sink
-/// fire on something it CAN see: the callee's bytecode.
+/// The predicate is still needed by the sinks' additive arm, which cannot tell
+/// which backend produced an artifact: the SINGLE-PASS backend describes only
+/// the monitors it scalar-replaced, and a non-scalar elision there
+/// (`has_elided_monitor`) leaves no trace in the frame. This is the check that
+/// fires on something the sink CAN see for both: the callee's bytecode.
 ///
 /// Whole-body and conservative, for the reason
 /// [`ir_unresumable_protected_trap`]'s side-effect scan is: pc order is not
@@ -29299,6 +29894,18 @@ fn try_compile_inner(
                 // Nothing on the success path changes.
                 let mut ir_verify_bail = false;
 
+                // #49, before any pass reads the snapshots as DCE roots: cut the
+                // snapshot locals the bytecode can never read again. Not for a
+                // method with an exception table — a handler reads locals the
+                // normal flow does not. See `ir_prune_dead_snapshot_locals`.
+                if cached.exception_table.is_empty() {
+                    ir_prune_dead_snapshot_locals(&mut graph, code, code_len);
+                }
+                // #49: `o == null` on a fresh allocation is a constant, and left
+                // as a compare it pins the allocation. Before the optimizer, so
+                // the branch it decided can fold too.
+                ir_fold_null_checks_on_fresh_allocations(&mut graph);
+
                 // Phase 3 (optimize). `ir_optimize::optimize` is opaque — GVN,
                 // DCE, reassociation, LICM and unrolling all run inside it and
                 // it publishes no per-pass boundary — so this is one row, not
@@ -29336,8 +29943,8 @@ fn try_compile_inner(
                 // Guard-surviving scalar replacement (Front 3.2): metadata for
                 // scalar-replaced objects so the IR lowerer can emit a
                 // `FrameValue::VirtualObject` at a deopt point. Populated from EA
-                // below, only when `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`
-                // are both on; otherwise stays `None` ⇒ byte-identical lowering.
+                // below whenever `scalar_deopt_descriptor_available()` (precise
+                // resume on, the default); otherwise stays `None`.
                 let mut sr_map: Option<ir_lower::ScalarReplacementMap> = None;
 
                 // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
@@ -29372,18 +29979,16 @@ fn try_compile_inner(
                     })
                     .unwrap_or_default();
 
-                // Latched BEFORE escape analysis, because lock elision deletes
-                // the evidence. `lower_inner` refuses precise deopt resume for a
-                // graph that still holds a `MonitorEnter`/`MonitorExit` (frame
-                // states carry no monitor stack), but elision marks the monitors
-                // `Op::Dead` first, so the check saw none: a guard deopt inside
-                // `synchronized (new Object()) { ... }` resumed precisely with no
-                // lock held and the interpreter's `monitorexit` threw
-                // IllegalMonitorStateException. See the use below.
-                let had_monitors = graph
-                    .nodes
-                    .iter()
-                    .any(|n| matches!(n.op, ir::Op::MonitorEnter | ir::Op::MonitorExit));
+                // No "had monitors" latch any more. It existed because frame
+                // states carried no monitor stack, so a guard deopt inside
+                // `synchronized (new Object()) { ... }` whose monitors lock
+                // elision had deleted resumed precisely with no lock held and the
+                // interpreter's `monitorexit` threw
+                // IllegalMonitorStateException. Snapshots now record the monitor
+                // stack, and `ir_lower::Lowerer::resolve_monitors` marks an
+                // elided lock `relock`, which the resume re-acquires on the
+                // materialized object. See
+                // `ir-frame-states-carry-no-monitor-stack-FIXED-20260912.md`.
 
                 // --- Escape analysis (Phase 41 + G46 wiring) ---
                 // Convert IR graph to escape analysis graph, run analysis,
@@ -29519,8 +30124,7 @@ fn try_compile_inner(
                                 // Capture guard-surviving-SR metadata (gated) BEFORE
                                 // `apply_ea_to_ir` marks the News/stores dead and clears
                                 // their (control) inputs — the dominance gate needs them.
-                                if scalar_deopt_enabled()
-                                    && deopt_real_enabled()
+                                if scalar_deopt_descriptor_available()
                                     && !ea_result.scalar_replaceable.is_empty()
                                 {
                                     let round_map = build_scalar_replacement_map(
@@ -29583,6 +30187,12 @@ fn try_compile_inner(
                         graph.nodes.len(),
                     );
                 }
+
+                // #49: escape analysis was the last mutator, so which snapshots
+                // a deopt can consult is now final. Drop the others — they would
+                // still become deopt points naming the allocations the planner
+                // just removed. See `ir_prune_unconsumable_snapshots`.
+                ir_prune_unconsumable_snapshots(&mut graph, &ir_spliced_ranges);
 
                 // cov-06: array allocations are now supported directly by the
                 // optimizing tier through the shared `emit_new_array_stub`,
@@ -29662,8 +30272,8 @@ fn try_compile_inner(
                     drop(metrics_schedule);
                     // Supply BOTH the profiled branch hints (Step 4) and the
                     // guard-surviving scalar-replacement map (Front 3.2) to the
-                    // shared lowering body. `sr_map` is `None` unless
-                    // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL` are set.
+                    // shared lowering body. `sr_map` is `None` when precise resume
+                    // is off (`scalar_deopt_descriptor_available`).
                     // Phase 7 (lower). `lower_inner` selects instructions,
                     // encodes them and installs the executable buffer in one
                     // call, which is why `Phase::Encode` and `Phase::Install`
@@ -29743,6 +30353,33 @@ fn try_compile_inner(
                         &ir_inline_frame_sites,
                     );
                     drop(metrics_lower);
+                    // #49 backstop. The planner elides an allocation a
+                    // consultable snapshot names only when a recipe will exist,
+                    // and the lowerer can still refuse the recipe at one point
+                    // (a same-block order it cannot prove, an ambiguous deopt
+                    // block). That point is unresumable, and its sink re-runs the
+                    // method from entry — harmless for a body that commits no
+                    // side effect, a duplicated effect for one that does. For
+                    // that one, discard this artifact: the single-pass backend
+                    // keeps the allocation.
+                    let lowered = match lowered {
+                        Some(cm)
+                            if ir_artifact_names_an_undescribable_elided_object(&cm)
+                                && bytecode_commits_side_effect(code, code_len) =>
+                        {
+                            if ir_stage_reporting() {
+                                eprintln!(
+                                    "[ir] {}.{}{}: a deopt point names an elided allocation \
+                                     it cannot describe in a side-effecting body -- keeping \
+                                     the single-pass body",
+                                    cached.class_name, cached.method_name, cached.method_descriptor,
+                                );
+                            }
+                            drop(cm);
+                            None
+                        }
+                        other => other,
+                    };
                     // The C1->C2 acceptance gate. A body that lowered but
                     // applied no transform the baseline tier lacks is a
                     // differently-emitted version of the same computation
@@ -29798,12 +30435,6 @@ fn try_compile_inner(
                         other => other,
                     };
                     if let Some(mut compiled) = lowered {
-                        // A method that had monitors before lock elision may not
-                        // resume precisely, whatever the post-elision graph
-                        // shows; see `had_monitors`.
-                        if had_monitors {
-                            compiled.can_deopt_resume = false;
-                        }
                         // cov-06 residual: a surviving `Op::New` or
                         // `Op::NewArray` allocation call can fail (OOM, or a
                         // negative length for an array) and stash a pending
@@ -36243,6 +36874,7 @@ mod tests {
             bci: 3,
             locals: vec![NO_NODE],
             stack: vec![f.newobj],
+            monitors: Vec::new(),
         });
         run_ea(&mut f.g);
 
@@ -36252,7 +36884,7 @@ mod tests {
         // does not apply and the opposite is the correct answer, so assert that
         // instead of asserting the default's behaviour into a build that does
         // not have it.
-        if scalar_deopt_enabled() && deopt_real_enabled() {
+        if scalar_deopt_descriptor_available() {
             assert_eq!(
                 f.g.nodes[f.newobj as usize].op,
                 Op::Dead,
@@ -36297,6 +36929,7 @@ mod tests {
             bci: 3,
             locals: vec![NO_NODE],
             stack: vec![f.val],
+            monitors: Vec::new(),
         });
         run_ea(&mut f.g);
 
@@ -36324,6 +36957,7 @@ mod tests {
             bci: 13,
             locals: vec![f.load],
             stack: vec![NO_NODE],
+            monitors: Vec::new(),
         });
         run_ea(&mut f.g);
 
@@ -36450,6 +37084,7 @@ mod tests {
             bci: 3,
             locals: vec![NO_NODE],
             stack: vec![m_exit],
+            monitors: Vec::new(),
         });
         (g, newobj, m_enter, m_exit)
     }
@@ -36890,48 +37525,20 @@ mod tests {
             Op::Const(42),
             "the field load must resolve to the stored value (42)"
         );
-        // The ALLOCATION, however, is retained. The builder records a safepoint
-        // snapshot at every bytecode boundary, and the fresh reference sits on
-        // the operand stack (and, in the astore variant, in a local) at several
-        // of them — so a snapshot slot names the `Op::New`. With
-        // `CRATONVM_SCALAR_DEOPT` off no `FrameValue::VirtualObject` descriptor
-        // is emitted for it, and killing it would leave those slots resolving to
-        // `FrameValue::Undefined` ⇒ `Value::Int(0)` ⇒ a NULL where a live object
-        // was. `apply_ea_to_ir` refuses the elision instead; see the "May the
-        // ALLOCATION itself go?" block in `plan_scalar_replacement`.
-        // The retention rule is the DEFAULT path's, and it inverts under
-        // `CRATONVM_SCALAR_DEOPT` — which is the flag whose entire job is to
-        // make this elision legal. Asserted per arm rather than left
-        // unconditional: stated as an invariant it reads as a property of the
-        // compiler, and it is a property of a flag.
-        if scalar_deopt_enabled() && deopt_real_enabled() {
-            assert!(
-                !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
-                "with the deopt descriptor available the allocation is elided"
-            );
-            // A snapshot slot DOES still name the (now dead) node here, and
-            // that is the point rather than a leak: `build_scalar_replacement_map`
-            // describes it, and `ir_lower::frame_value_for_object` resolves the
-            // slot to a `FrameValue::VirtualObject` from that description. The
-            // map is not returned by `apply_ea_to_ir`, so this test cannot check
-            // the pairing — `ir_lower`'s own `test_scalar_deopt_emits_virtual_object`
-            // does, and `probes/ScalarDeoptProbe.java` checks the answers
-            // end-to-end.
-            return;
-        }
+        // The ALLOCATION goes too, in every configuration (#49). The builder
+        // records a snapshot at every bytecode boundary and the fresh reference
+        // sits on the stack at several of them, but none of those is a program
+        // point a deopt can arrive at: this body has no guard, call or other
+        // transferring node left once the allocation, its store and its load
+        // are retired. Until 2026-09-12 any snapshot slot naming the `Op::New`
+        // kept it unless `CRATONVM_SCALAR_DEOPT` supplied a descriptor.
         assert!(
-            graph.safepoints.iter().any(|sp| sp
-                .locals
-                .iter()
-                .chain(sp.stack.iter())
-                .any(|&s| matches!(graph.nodes.get(s as usize), Some(n) if matches!(n.op, Op::New { .. })))),
-            "precondition: a deopt snapshot slot names the allocation"
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "no consultable snapshot names the allocation, so it is elided"
         );
-        assert!(
-            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
-            "the New is retained because a deopt snapshot names it and no \
-             virtual-object descriptor will be emitted"
-        );
+        // The unconsultable snapshots still name the dead node until the
+        // pipeline's prune drops them; after it, none does.
+        ir_prune_unconsumable_snapshots(&mut graph, &[]);
         assert_no_snapshot_names_a_dead_node(&graph);
     }
 
@@ -37036,24 +37643,266 @@ mod tests {
             Op::Const(42),
             "the field load (via astore/aload local) must resolve to the stored value (42)"
         );
-        // Same rule as `ir_new_scalar_replaces_end_to_end`, and the same arm
-        // split: on the default path the allocation is live in a deopt snapshot
-        // (here in local 0 as well as on the stack) so the elision is refused
-        // and the object stays real and initialised; with the descriptor
-        // available it goes. The property this test is really about — the field
-        // load resolving to the stored value — is asserted above, in both arms.
-        if scalar_deopt_enabled() && deopt_real_enabled() {
+        // Same rule as `ir_new_scalar_replaces_end_to_end` (#49): the object sits
+        // in local 0 and on the stack at several snapshots, none of which a
+        // deopt can consult once the allocation's own nodes are retired, so the
+        // allocation is elided in every configuration.
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "no consultable snapshot names the allocation, so it is elided"
+        );
+        ir_prune_unconsumable_snapshots(&mut graph, &[]);
+        assert_no_snapshot_names_a_dead_node(&graph);
+    }
+
+    /// The pipeline between `IrBuilder::build` and scheduling, in
+    /// `try_compile_inner`'s order: dead-local pruning, the null-check fold, the
+    /// optimizer, every escape-analysis round (with the scalar-replacement map
+    /// when precise resume is on), and the unconsumable-snapshot prune.
+    fn run_ir_pipeline_through_escape_analysis(
+        code: &[u8],
+        code_len: usize,
+        builder: crate::ir::IrBuilder,
+    ) -> (crate::ir::Graph, Option<ir_lower::ScalarReplacementMap>) {
+        let mut graph = builder.build(code, code_len).expect("IR build");
+        ir_prune_dead_snapshot_locals(&mut graph, code, code_len);
+        ir_fold_null_checks_on_fresh_allocations(&mut graph);
+        ir_optimize::optimize(&mut graph);
+        let mut sr_map: Option<ir_lower::ScalarReplacementMap> = None;
+        let mut pinned: std::collections::HashSet<crate::ir::NodeId> =
+            std::collections::HashSet::new();
+        for _ in 0..3 {
+            let (ea, id_map) = escape_analysis_from_ir(&graph);
+            let result = escape_analysis::analyze_escapes(&ea);
+            if result.scalar_replaceable.is_empty() && result.lock_elisions.is_empty() {
+                break;
+            }
+            if scalar_deopt_descriptor_available() && !result.scalar_replaceable.is_empty() {
+                let round = build_scalar_replacement_map(&graph, &id_map, &result, &pinned);
+                for vo in round.objects.values() {
+                    for fv in vo.field_values.iter().flatten() {
+                        pinned.insert(*fv);
+                    }
+                }
+                match sr_map.as_mut() {
+                    Some(acc) => acc.objects.extend(round.objects),
+                    None => sr_map = Some(round),
+                }
+            }
+            if apply_ea_to_ir_pinned(&mut graph, &id_map, &result, &pinned) == 0 {
+                break;
+            }
+        }
+        ir_prune_unconsumable_snapshots(&mut graph, &[]);
+        (graph, sr_map)
+    }
+
+    /// `static int f(int x)` with `Foo o = new Foo(); o.x = x;` and
+    /// `new_info`/`field_info` rows for the given putfield/getfield pcs.
+    fn foo_builder(num_locals: usize, putfield_pc: usize, getfield_pc: usize) -> crate::ir::IrBuilder {
+        use std::collections::{HashMap, HashSet};
+        let mut builder = crate::ir::IrBuilder::new(1, num_locals);
+        let mut new_info = HashMap::new();
+        new_info.insert(0usize, (7u32, 1usize)); // new @0: class 7, 1 field
+        let mut init_pcs = HashSet::new();
+        init_pcs.insert(4usize); // <init> @4 is trivial + elidable
+        builder.set_new_info(new_info, init_pcs);
+        let mut fi = HashMap::new();
+        fi.insert(putfield_pc, (0usize, b'I'));
+        fi.insert(getfield_pc, (0usize, b'I'));
+        builder.set_field_info(fi);
+        builder
+    }
+
+    /// #49: a snapshot local the bytecode can never read again is cut, and one
+    /// it still reads is not.
+    #[test]
+    fn dead_snapshot_locals_are_cut_and_live_ones_kept() {
+        use crate::ir::{IrBuilder, NO_NODE};
+        //  0: iload_0  1: istore_1  2: iload_0  3: ireturn
+        // Local 1 is written at 1 and never read; local 0 is read at 2.
+        let code = [0x1a, 0x3c, 0x1a, 0xac, 0, 0];
+        let mut graph = IrBuilder::new(1, 2).build(&code, 4).expect("build");
+        let at = |g: &crate::ir::Graph, bci: usize| {
+            g.safepoints
+                .iter()
+                .find(|s| s.bci == bci)
+                .map(|s| s.locals.clone())
+                .expect("a snapshot")
+        };
+        assert_ne!(at(&graph, 2)[1], NO_NODE, "precondition: the builder recorded local 1");
+        assert!(ir_prune_dead_snapshot_locals(&mut graph, &code, 4) > 0);
+        assert_eq!(at(&graph, 2)[1], NO_NODE, "local 1 is dead at bci 2");
+        assert_ne!(at(&graph, 2)[0], NO_NODE, "local 0 is read at bci 2");
+        assert_eq!(at(&graph, 3)[0], NO_NODE, "nothing is read after the return's operand");
+    }
+
+    /// #49, the plain shape: `Foo o = new Foo(); o.x = x; int r = o.x;` followed
+    /// by a division whose zero guard is a real deopt point. After optimization
+    /// in a default run there is NO allocation left, and — the part a recipe
+    /// could not fake — no surviving snapshot names the removed allocation at
+    /// all: the object is dead at the guard, so the elision needed no
+    /// virtual-object descriptor.
+    #[test]
+    fn an_allocation_dead_at_a_later_guard_is_elided_by_default() {
+        use crate::ir::Op;
+        // static int f(int x) { Foo o = new Foo(); o.x = x; int r = o.x; return 100 / x + r; }
+        let code = [
+            0xbb, 0x00, 0x01, //  0: new #1
+            0x59, //  3: dup
+            0xb7, 0x00, 0x02, //  4: invokespecial Foo.<init> (elided)
+            0x4c, //  7: astore_1
+            0x2b, //  8: aload_1
+            0x1a, //  9: iload_0
+            0xb5, 0x00, 0x03, // 10: putfield x
+            0x2b, // 13: aload_1
+            0xb4, 0x00, 0x03, // 14: getfield x
+            0x3d, // 17: istore_2
+            0x10, 0x64, // 18: bipush 100
+            0x1a, // 20: iload_0
+            0x6c, // 21: idiv      <- the guard
+            0x1c, // 22: iload_2
+            0x60, // 23: iadd
+            0xac, // 24: ireturn
+            0x00, 0x00,
+        ];
+        let (graph, _sr) = run_ir_pipeline_through_escape_analysis(&code, 25, foo_builder(3, 10, 14));
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::Guard { bci: 21 })),
+            "precondition: the division's guard is a real deopt point"
+        );
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the non-escaping allocation must be elided"
+        );
+        assert_eq!(
+            graph.safepoints.iter().map(|s| s.bci).collect::<Vec<_>>(),
+            vec![21],
+            "only the snapshot a deopt can consult survives"
+        );
+        assert_no_snapshot_names_a_dead_node(&graph);
+    }
+
+    /// #49, with `if (o != null)` in the way. The null check on a fresh
+    /// allocation folds to a constant before escape analysis, so it neither
+    /// escapes the object nor counts as a value use that pins it.
+    #[test]
+    fn a_null_check_on_a_fresh_allocation_does_not_pin_it() {
+        use crate::ir::Op;
+        let code = [
+            0xbb, 0x00, 0x01, //  0: new #1
+            0x59, //  3: dup
+            0xb7, 0x00, 0x02, //  4: invokespecial Foo.<init> (elided)
+            0x4c, //  7: astore_1
+            0x2b, //  8: aload_1
+            0x1a, //  9: iload_0
+            0xb5, 0x00, 0x03, // 10: putfield x
+            0x2b, // 13: aload_1
+            0xb4, 0x00, 0x03, // 14: getfield x
+            0x3d, // 17: istore_2
+            0x2b, // 18: aload_1
+            0xc6, 0x00, 0x06, // 19: ifnull +6 -> 25
+            0x84, 0x02, 0x01, // 22: iinc 2, 1
+            0x10, 0x64, // 25: bipush 100
+            0x1a, // 27: iload_0
+            0x6c, // 28: idiv      <- the guard
+            0x1c, // 29: iload_2
+            0x60, // 30: iadd
+            0xac, // 31: ireturn
+            0x00, 0x00,
+        ];
+        // The fold alone, on the unoptimized graph: the compare is gone.
+        let mut built = foo_builder(3, 10, 14).build(&code, 32).expect("IR build");
+        assert_eq!(
+            ir_fold_null_checks_on_fresh_allocations(&mut built),
+            1,
+            "`o == null` on the fresh `new` folds"
+        );
+
+        let (graph, _sr) = run_ir_pipeline_through_escape_analysis(&code, 32, foo_builder(3, 10, 14));
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "a null check must not keep the allocation alive"
+        );
+        assert_no_snapshot_names_a_dead_node(&graph);
+    }
+
+    /// #49, the other half: the allocation IS live at a real deopt point (the
+    /// field is read after the division), so eliding it needs the
+    /// virtual-object recipe. With precise resume on (the default) the
+    /// allocation goes, and the guard's deopt frame carries a
+    /// `FrameValue::VirtualObject` the resume materializes. With it off the
+    /// allocation must stay.
+    #[test]
+    fn an_allocation_live_at_a_guard_is_elided_with_a_materialization_recipe() {
+        use crate::deopt::FrameValue;
+        use crate::ir::Op;
+        // static int f(int x) { Foo o = new Foo(); o.x = x; int q = 100 / x; return o.x + q; }
+        let code = [
+            0xbb, 0x00, 0x01, //  0: new #1
+            0x59, //  3: dup
+            0xb7, 0x00, 0x02, //  4: invokespecial Foo.<init> (elided)
+            0x4c, //  7: astore_1
+            0x2b, //  8: aload_1
+            0x1a, //  9: iload_0
+            0xb5, 0x00, 0x03, // 10: putfield x
+            0x10, 0x64, // 13: bipush 100
+            0x1a, // 15: iload_0
+            0x6c, // 16: idiv      <- the guard; `o` is still live here
+            0x3d, // 17: istore_2
+            0x2b, // 18: aload_1
+            0xb4, 0x00, 0x03, // 19: getfield x
+            0x1c, // 22: iload_2
+            0x60, // 23: iadd
+            0xac, // 24: ireturn
+            0x00, 0x00,
+        ];
+        let (graph, sr_map) =
+            run_ir_pipeline_through_escape_analysis(&code, 25, foo_builder(3, 10, 19));
+        if !scalar_deopt_descriptor_available() {
             assert!(
-                !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
-                "with the deopt descriptor available the allocation is elided"
+                graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+                "without precise resume a consultable snapshot keeps the allocation"
             );
             return;
         }
         assert!(
-            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
-            "the New is retained because a deopt snapshot names it"
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "with a recipe available the allocation is elided"
         );
-        assert_no_snapshot_names_a_dead_node(&graph);
+        let sr_map = sr_map.expect("the elided object is described");
+        let schedule = ir_schedule::schedule(&graph);
+        // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` and every field is a `usize`, so all-zero is a valid value; the elided graph calls no helper.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let cm = ir_lower::lower_with_scalar_deopt(&graph, &schedule, 1, 3, &helpers, Some(&sr_map))
+            .expect("lower");
+        let point = cm
+            ._deopt_point_boxes
+            .iter()
+            .find(|p| p.bci == 16)
+            .expect("the division's guard publishes a deopt point");
+        match point.frame_state.locals.get(1) {
+            Some(FrameValue::VirtualObject(state)) => {
+                assert_eq!(state.class_id, 7);
+                assert_eq!(state.num_fields, 1);
+                assert!(
+                    !matches!(
+                        state.field_values[0],
+                        FrameValue::MaterializationRequired(_)
+                            | FrameValue::Undefined
+                            | FrameValue::Unsupported
+                    ),
+                    "the stored field must be described, got {:?}",
+                    state.field_values[0]
+                );
+            }
+            other => panic!("local 1 must be the object's recipe, got {other:?}"),
+        }
+        assert!(crate::deopt::frame_state_is_resumable(&point.frame_state));
+        assert!(
+            !ir_artifact_names_an_undescribable_elided_object(&cm),
+            "the backstop must not discard a fully described artifact"
+        );
     }
 
     // A `<init>` whose receiver is NOT a fresh `new` (e.g. a super() call on

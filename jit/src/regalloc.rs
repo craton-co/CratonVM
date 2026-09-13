@@ -4728,7 +4728,12 @@ pub fn build_live_model(graph: &Graph, schedule: &Schedule) -> LiveModel {
         }
     }
     for sp in &graph.safepoints {
-        for &v in sp.locals.iter().chain(sp.stack.iter()) {
+        for &v in sp
+            .locals
+            .iter()
+            .chain(sp.stack.iter())
+            .chain(sp.monitors.iter())
+        {
             if v != NO_NODE {
                 if let Some(slot) = pinned.get_mut(v as usize) {
                     *slot = true;

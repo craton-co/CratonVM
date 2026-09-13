@@ -754,6 +754,7 @@ mod tests {
             monitors: vec![MonitorInfo {
                 object: FrameValue::VirtualObjectRef(0),
                 lock_depth: 2,
+                relock: true,
             }],
             caller_frames: Vec::new(),
         };

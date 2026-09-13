@@ -2616,6 +2616,7 @@ fn an_unsupported_caller_local_refuses_where_the_in_place_transfer_tolerates_it(
     with_monitor.monitors = vec![cratonvm_jit::deopt::MonitorInfo {
         object: FrameValue::Int(0),
         lock_depth: 1,
+        relock: true,
     }];
     let err = caller_frame_values(&with_monitor).unwrap_err();
     assert!(err.contains("monitor"), "{err}");

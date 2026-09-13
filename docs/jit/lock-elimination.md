@@ -496,69 +496,66 @@ object is still a candidate for full elision on the next analysis pass.
 
 ---
 
-## 8. Deopt after elision: no precise resume
+## 8. Deopt after elision: relock on resume
 
-Verified against the source 2026-09-12. **A method that had monitors elided
-cannot deopt-resume precisely.** A deopt from its compiled body falls back to
-the whole-method re-run. The reason is that no frame state this tier builds can
-describe a held monitor.
+Updated 2026-09-12 (`ir-frame-states-carry-no-monitor-stack-FIXED-20260912.md`).
+**A deopt inside a region whose monitors were elided resumes precisely, and the
+resume re-acquires the elided lock.** This is HotSpot's relock-on-deopt.
 
-### Why
+### What the frame state records
 
-Every `FrameState` `ir_lower` builds hard-codes `monitors: Vec::new()`. A precise
-resume would rebuild an interpreter frame that believes it holds no lock. The
-interpreter's own sink refuses a frame that holds monitors, but it cannot act on
-information that was never recorded.
+`ir::IrBuilder` keeps an abstract monitor stack. `monitorenter` pushes the
+locked reference, and `monitorexit` must pop the innermost one. The operand is
+matched through a loop header's single-value φ, because the header gives the
+lock temp an eager φ. Every `SafepointSnapshot` copies the stack into
+`monitors`. The builder refuses the method (single-pass still compiles it) on
+any of these:
 
-So `ir_lower::lower_inner` sets `CompiledMethod::can_deopt_resume = true` only
-when all three hold: `sr_map` is set, some deopt point carries a
-`VirtualObject`, **and no `Op::MonitorEnter` / `Op::MonitorExit` remains in the
-graph**.
+* a `monitorexit` naming anything but the innermost held reference;
+* a `return` with a monitor held;
+* two edges into a join holding different monitors;
+* a monitor op inside a spliced callee.
 
-That last test alone was not enough. Lock elision runs **before** lowering and
-turns the monitors into `Op::Dead`, so the post-elision graph showed none. A
-guard deopt inside `synchronized (new Object()) { ... }` then resumed precisely
-with no lock held, and the interpreter's `monitorexit` threw
-`IllegalMonitorStateException`.
+`ir_lower::Lowerer::resolve_monitors` turns each snapshot's stack into
+`deopt::MonitorInfo` entries:
 
-### The latch
+* re-entrant entries on one object coalesce into one `lock_depth`;
+* the object is described like a local: a reference slot, or a
+  `VirtualObject` / `VirtualObjectRef` when escape analysis scalar-replaced it;
+* **`relock`** is `true` exactly when no live `MonitorEnter` / `MonitorExit` still
+  names the object. Lock elision kills every monitor on the object (§4) and
+  clears their inputs, so a surviving op means the compiled code took the lock
+  itself.
 
-`try_compile_inner` (`jit/src/lib.rs`) records `had_monitors` **before** escape
-analysis runs:
+### What the VM does with it
 
-```rust
-let had_monitors = graph
-    .nodes
-    .iter()
-    .any(|n| matches!(n.op, ir::Op::MonitorEnter | ir::Op::MonitorExit));
-```
+`build_deopt_frame_inner` (`deopt_resume.rs`) handles the two kinds differently:
 
-After `lower_inner` returns an artifact, `if had_monitors {
-compiled.can_deopt_resume = false; }`. That holds whether or not elision
-actually removed anything, and whatever the post-elision graph shows.
+* a `relock == false` monitor is still held by the thread (the monitor table is
+  the interpreter's only record of block monitors), so it is pinned and checked
+  and otherwise left alone;
+* a `relock == true` monitor is entered `lock_depth` times, after the object is
+  materialized if it was virtual.
 
-The single-pass backend has the same rule under a different name.
-`x64/driver.rs` sets `can_deopt_resume = !deopt_points.is_empty() &&
-!compiler.has_elided_monitor`, and likewise `can_osr_exit` with
-`osr_exit_points`.
+The sinks and OSR transfers that have no relock path (`resume_from_ir_deopt`,
+the in-place OSR exit, `resume_after_exit`, `osr_exit_policy`, the OSR entry
+contract) refuse only `relock` monitors. The single-pass backend's Phase C
+monitors (scalar-replaced `synchronized` blocks) were already relock-only and
+carry `relock == true`.
 
-### What the VM does instead
+### What was removed
 
-Each deopt sink admits a precise resume on `(deopt_real_enabled() &&
-compiled.can_deopt_resume)`, OR-ed with
-`sink_precise_resume_allowed_for(...)` (`vm/src/runtime/interpreter/deopt_resume.rs`).
-The second arm is additive, and for a monitor-bearing method it is always
-false. `sink_precise_resume_allowed` requires all of:
+* The `had_monitors` latch in `try_compile_inner`.
+* The clause in `ir_lower::lower_inner` that kept `can_deopt_resume` false for a
+  graph holding a monitor op.
 
-* `cratonvm_jit::deopt_sink_resume_enabled()` (default on;
-  `CRATONVM_JIT_DEOPT_SINK_RESUME=0` turns it off);
-* the method is not `ACC_SYNCHRONIZED`;
-* `!cratonvm_jit::bytecode_holds_monitor(code, code_len)`, a scan for any
-  `monitorenter` / `monitorexit` opcode. Elision is a codegen decision, not a
-  bytecode rewrite, so the opcodes are still there to see;
-* a resume bci inside the method's code.
+### What stays
 
-With both arms false, the sink takes the whole-method re-run. `ir_lower`'s
-comment gives the argument: the re-run re-enters a re-entrant lock and stays
-balanced. The method may still be compiled and may still deoptimize; it may not
-resume **precisely**.
+* `sink_precise_resume_allowed` still refuses a body whose bytecode takes a
+  monitor (`bytecode_holds_monitor`). That arm serves both backends and cannot
+  tell them apart, and the single-pass backend's non-scalar elision
+  (`has_elided_monitor`) still leaves no trace in its frame. An optimizing-tier
+  body resumes through the `can_deopt_resume` arm.
+* An `ACC_SYNCHRONIZED` method carrying virtual objects still refuses: its
+  method monitor is taken by the invoke path, not a `monitorenter`, and is not a
+  frame-state entry.
