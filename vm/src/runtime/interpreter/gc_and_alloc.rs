@@ -1795,11 +1795,7 @@ pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
 }
 
 /// [`maybe_gc_forced`] with the caller's identity, for the census.
-pub(super) fn maybe_gc_forced_at(
-    shared: &SharedVm,
-    thread: &mut JvmThread,
-    site: &'static str,
-) {
+pub(super) fn maybe_gc_forced_at(shared: &SharedVm, thread: &mut JvmThread, site: &'static str) {
     cratonvm_types::gc_entry_census::note_forced_at(site);
     // CRIT (TLAB UAF) — retire this thread's TLAB before initiating GC, exactly
     // as `maybe_gc` and `force_gc_from_native` do. This forced path (allocation
@@ -3780,14 +3776,7 @@ pub(crate) fn tlab_alloc_object(
 ) -> Option<ObjectRef> {
     let (body_size, gc_flags) = shape_of_reserved(num_fields, total_size);
     tlab_alloc_object_inner(
-        thread,
-        shared,
-        class_id,
-        num_fields,
-        body_size,
-        gc_flags,
-        total_size,
-        false,
+        thread, shared, class_id, num_fields, body_size, gc_flags, total_size, false,
     )
 }
 
@@ -3873,14 +3862,7 @@ pub(crate) fn tlab_alloc_object_guarded_refill(
 ) -> Option<ObjectRef> {
     let (body_size, gc_flags) = shape_of_reserved(num_fields, total_size);
     tlab_alloc_object_inner(
-        thread,
-        shared,
-        class_id,
-        num_fields,
-        body_size,
-        gc_flags,
-        total_size,
-        true,
+        thread, shared, class_id, num_fields, body_size, gc_flags, total_size, true,
     )
 }
 
@@ -4253,12 +4235,12 @@ pub fn tlab_object_shape_counts() -> (u64, u64, u64) {
 /// a fifteen-minute rebuild. See [`TlabSite`].
 pub(crate) fn compact_tlab_site_mask() -> u32 {
     static G: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_COMPACT_TLAB_SITES") {
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_COMPACT_TLAB_SITES") {
             Ok(v) => v.trim().parse::<u32>().unwrap_or(u32::MAX),
             Err(_) => u32::MAX,
-        }
-    })
+        },
+    )
 }
 
 /// The TLAB object allocation sites, as mask bits for
@@ -4689,7 +4671,7 @@ pub(super) fn tlab_alloc_shaped_inner(
             unsafe { shape.init_header(ptr, class_id, hash) };
             shared.mem.heap.note_tlab_object(ptr, total_size);
         }) {
-                shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
+            shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
             shared
                 .mem
                 .bytes_allocated_total
@@ -4856,7 +4838,6 @@ pub(super) fn init_object_header(
         cratonvm_gc::heap::HEADER_SIZE + num_fields * cratonvm_gc::heap::SLOT_SIZE,
     );
 }
-
 
 /// Shared-heap allocation path (with lock). Used for TLAB misses and large objects.
 pub(crate) fn alloc_object_shared(
@@ -5278,7 +5259,6 @@ pub(super) fn scan_frame_roots(
         out.truncate(write);
     }
 }
-
 
 /// `CRATONVM_GC_G1_ONLY_JIT_PINS=1` -- restore the pre-2026-09-06 gate on the
 /// two deposit-side publications of a parked thread's CONSERVATIVE JIT-frame

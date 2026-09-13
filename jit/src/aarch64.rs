@@ -2892,7 +2892,11 @@ mod tests {
 
         let mut e3 = Aarch64Emitter::new();
         e3.mov_imm64(Reg::X0, 0x1234_0000_0000_5678);
-        assert_eq!(e3.code().len(), 8, "MOVZ #0x5678 then MOVK #0x1234, LSL #48");
+        assert_eq!(
+            e3.code().len(),
+            8,
+            "MOVZ #0x5678 then MOVK #0x1234, LSL #48"
+        );
     }
 
     /// Patching a TBZ must not destroy its bit number.
@@ -2945,7 +2949,11 @@ mod tests {
         assert!(e.and_imm_w(Reg::X0, Reg::X1, 0xFF));
         assert_eq!(last_inst(&e), 0x1200_1C20, "and w0, w1, #0xff");
         assert!(e.and_imm(Reg::X0, Reg::X0, 0x5555_5555_5555_5555));
-        assert_eq!(last_inst(&e), 0x9200_F000, "and x0, x0, #0x5555555555555555");
+        assert_eq!(
+            last_inst(&e),
+            0x9200_F000,
+            "and x0, x0, #0x5555555555555555"
+        );
         assert!(e.and_imm(Reg::X2, Reg::X2, 31));
         assert_eq!(last_inst(&e), 0x9240_1042, "and x2, x2, #31");
         assert!(e.orr_imm(Reg::X0, Reg::X0, 0xFFFF_FFFF_0000_0000));
@@ -2970,17 +2978,42 @@ mod tests {
     fn test_conditional_select_encodings() {
         let mut e = Aarch64Emitter::new();
         e.cset(Reg::X0, Cond::EQ);
-        assert_eq!(last_inst(&e), 0x9A9F_17E0, "cset x0, eq = csinc x0, xzr, xzr, ne");
+        assert_eq!(
+            last_inst(&e),
+            0x9A9F_17E0,
+            "cset x0, eq = csinc x0, xzr, xzr, ne"
+        );
         e.csetm(Reg::X1, Cond::LT);
-        assert_eq!(last_inst(&e), 0xDA9F_A3E1, "csetm x1, lt = csinv x1, xzr, xzr, ge");
+        assert_eq!(
+            last_inst(&e),
+            0xDA9F_A3E1,
+            "csetm x1, lt = csinv x1, xzr, xzr, ge"
+        );
         e.cneg(Reg::X0, Reg::X0, Cond::LT);
-        assert_eq!(last_inst(&e), 0xDA80_A400, "cneg x0, x0, lt = csneg x0, x0, x0, ge");
+        assert_eq!(
+            last_inst(&e),
+            0xDA80_A400,
+            "cneg x0, x0, lt = csneg x0, x0, x0, ge"
+        );
         e.csel(Reg::X2, Reg::X3, Reg::X4, Cond::HI);
         assert_eq!(last_inst(&e), 0x9A84_8062, "csel x2, x3, x4, hi");
 
-        for c in [Cond::EQ, Cond::HS, Cond::MI, Cond::VS, Cond::HI, Cond::GE, Cond::GT, Cond::AL] {
+        for c in [
+            Cond::EQ,
+            Cond::HS,
+            Cond::MI,
+            Cond::VS,
+            Cond::HI,
+            Cond::GE,
+            Cond::GT,
+            Cond::AL,
+        ] {
             assert_eq!(c.invert().invert(), c);
-            assert_eq!(c.invert().enc(), c.enc() ^ 1, "{c:?} inverts by flipping bit 0");
+            assert_eq!(
+                c.invert().enc(),
+                c.enc() ^ 1,
+                "{c:?} inverts by flipping bit 0"
+            );
         }
     }
 
@@ -3013,7 +3046,11 @@ mod tests {
         // something.
         let mut s = Aarch64Emitter::new();
         s.add(Reg::X16, Reg::SP, Reg::X16);
-        assert_ne!(last_inst(&s), 0x8B30_63F0, "shifted-register ADD is not SP-relative");
+        assert_ne!(
+            last_inst(&s),
+            0x8B30_63F0,
+            "shifted-register ADD is not SP-relative"
+        );
     }
 
     #[test]

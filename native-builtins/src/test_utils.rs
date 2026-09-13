@@ -1586,7 +1586,11 @@ impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
     }
 
     fn list_loaded_class_ids(&self) -> Vec<ClassId> {
-        self.loaded_class_ids.iter().copied().map(ClassId::new).collect()
+        self.loaded_class_ids
+            .iter()
+            .copied()
+            .map(ClassId::new)
+            .collect()
     }
 
     fn module_for_package(&self, pkg: &str) -> Option<String> {

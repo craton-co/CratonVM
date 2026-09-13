@@ -2731,7 +2731,9 @@ impl ZMarkWorker {
                 .fetch_add(scanned as u64, Ordering::Relaxed);
         }
         if marked_here > 0 {
-            stats.objects_marked.fetch_add(marked_here, Ordering::Relaxed);
+            stats
+                .objects_marked
+                .fetch_add(marked_here, Ordering::Relaxed);
         }
         if off_heap_here > 0 {
             stats
@@ -5013,9 +5015,7 @@ mod pool_cost {
                 drop(pool);
             }
             let per = start.elapsed() / ROUNDS as u32;
-            eprintln!(
-                "[pool-cost] workers={workers} construct+begin+end+drop = {per:?} per cycle"
-            );
+            eprintln!("[pool-cost] workers={workers} construct+begin+end+drop = {per:?} per cycle");
         }
     }
 }

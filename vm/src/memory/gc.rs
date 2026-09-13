@@ -1105,8 +1105,7 @@ pub fn update_all_roots(
     // registers. This is what makes the moving collector correct under JIT.
     if crate::jit::conservative_roots::shadow_stack_enabled() {
         let _rewritten = thread.shadow_stack.remap(pointer_map);
-        if crate::runtime::env_cache::dbg_shadow() && _rewritten > 0
-        {
+        if crate::runtime::env_cache::dbg_shadow() && _rewritten > 0 {
             eprintln!(
                 "[SHADOW] remap: depth={} rewritten={}",
                 thread.shadow_stack.depth(),
@@ -2388,7 +2387,8 @@ fn verify_no_stale_refs(
                             frame.pc,
                             addr,
                             frame.local_kind_at(li),
-                            heap.map(|h| h.is_heap_addr(addr).is_some()).unwrap_or(false),
+                            heap.map(|h| h.is_heap_addr(addr).is_some())
+                                .unwrap_or(false),
                             heap.map(|h| h.collection_count()).unwrap_or(0),
                         );
                         // AND WHETHER THE COLLECTOR WAS GIVEN IT. Armed by
@@ -2540,7 +2540,8 @@ fn verify_no_stale_refs(
                             si,
                             frame.pc,
                             addr,
-                            heap.map(|h| h.is_heap_addr(addr).is_some()).unwrap_or(false),
+                            heap.map(|h| h.is_heap_addr(addr).is_some())
+                                .unwrap_or(false),
                             heap.map(|h| h.collection_count()).unwrap_or(0),
                         );
                     }

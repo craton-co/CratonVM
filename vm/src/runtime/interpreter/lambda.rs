@@ -2566,8 +2566,8 @@ pub(super) fn try_invoke_cached_lambda_impl(
     // retired frame slot, so every interpreted lambda call used to destroy the
     // slot the next interpreted call at that depth would have rebuilt itself
     // in. See `install_and_run_cached_frame`.
-    let out = install_and_run_cached_frame(shared, thread, cached, args, Some("lambda-impl"))
-        .map(Some);
+    let out =
+        install_and_run_cached_frame(shared, thread, cached, args, Some("lambda-impl")).map(Some);
     // The INTERPRETED arm, and the one that matters most for a constant body:
     // a two-byte `iconst_1; ireturn` may never be nominated for compilation at
     // all, so the two compiled screens above would never see it.

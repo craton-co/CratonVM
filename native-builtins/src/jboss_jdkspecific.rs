@@ -576,25 +576,25 @@ fn register_module_in_loader_catalog(ctx: &mut dyn NativeContext, module: Object
 
     // The module's OWN loader. `Module.getClassLoader()` answers null for a
     // boot-loader module, which is a real answer here and not a failure.
-    let loader = match ctx.invoke_virtual(module, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-    {
-        Ok(Some(Value::Object(l))) => l,
-        // Could not ask. Fall back to the previous behaviour rather than
-        // skipping the module: the app-loader catalog is where `--module-path`
-        // modules belong, and half a catalog beats none.
-        _ => match ctx.invoke(
-            "java/lang/ClassLoader",
-            "getSystemClassLoader",
-            "()Ljava/lang/ClassLoader;",
-            &[],
-        ) {
-            Ok(Some(Value::Object(Some(l)))) => Some(l),
-            _ => {
-                ctx.unpin_native_roots(module_pin);
-                return;
-            }
-        },
-    };
+    let loader =
+        match ctx.invoke_virtual(module, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]) {
+            Ok(Some(Value::Object(l))) => l,
+            // Could not ask. Fall back to the previous behaviour rather than
+            // skipping the module: the app-loader catalog is where `--module-path`
+            // modules belong, and half a catalog beats none.
+            _ => match ctx.invoke(
+                "java/lang/ClassLoader",
+                "getSystemClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            ) {
+                Ok(Some(Value::Object(Some(l)))) => Some(l),
+                _ => {
+                    ctx.unpin_native_roots(module_pin);
+                    return;
+                }
+            },
+        };
 
     let loader_pin = loader.map(|l| (ctx.pin_native_root(l), l));
     let loader = loader_pin.map(|(pin, l)| ctx.read_native_pin(pin, l));
@@ -2498,9 +2498,7 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
                 },
             };
             if let Some(name) = module_name {
-                if let Some(platform) =
-                    crate::classloader::platform_loader_for_module(ctx, &name)
-                {
+                if let Some(platform) = crate::classloader::platform_loader_for_module(ctx, &name) {
                     return Ok(Some(Value::Object(Some(platform))));
                 }
             }
@@ -2717,14 +2715,16 @@ mod tests {
             let metadata = fields
                 .iter()
                 .enumerate()
-                .map(|(slot_index, (name, descriptor))| cratonvm_native_api::FieldMetadata {
-                    name: (*name).to_string(),
-                    descriptor: (*descriptor).to_string(),
-                    access_flags: 0,
-                    slot_index,
-                    declaring_class_id: cid,
-                    is_static: false,
-                })
+                .map(
+                    |(slot_index, (name, descriptor))| cratonvm_native_api::FieldMetadata {
+                        name: (*name).to_string(),
+                        descriptor: (*descriptor).to_string(),
+                        access_flags: 0,
+                        slot_index,
+                        declaring_class_id: cid,
+                        is_static: false,
+                    },
+                )
                 .collect();
             ctx.set_declared_fields(cid, metadata);
         }

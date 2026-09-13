@@ -1127,9 +1127,7 @@ pub(super) fn array_load_ref(
     // the operand stack in this same safepoint-free window; its first
     // `HEADER_SIZE` bytes are a live header. See `registry_probe_restored`.
     let header = unsafe { &*(base as *const ObjectHeader) };
-    if header.kind() != ObjectKind::Array
-        || header.element_type() != ArrayElementType::Reference
-    {
+    if header.kind() != ObjectKind::Array || header.element_type() != ArrayElementType::Reference {
         site_stats::bump(site_stats::REFARR_MISS_SHAPE);
         return false;
     }
@@ -1145,7 +1143,9 @@ pub(super) fn array_load_ref(
     // SAFETY: `index < length` and the stride is the one `read_prim_element`
     // uses for a reference element, so the slot lies inside the array body.
     let raw = unsafe {
-        cratonvm_types::narrow_oop::read_ref_slot((base as *const u8).add(cratonvm_types::ARRAY_DATA_OFFSET + offset))
+        cratonvm_types::narrow_oop::read_ref_slot(
+            (base as *const u8).add(cratonvm_types::ARRAY_DATA_OFFSET + offset),
+        )
     };
     let cv = if raw == 0 {
         CompactValue::null()
@@ -1274,13 +1274,13 @@ mod tests {
         use ArrayElementType::*;
         // (load opcode, store opcode, element type, byte width)
         let expected: &[(u8, u8, ArrayElementType, usize)] = &[
-            (0x2e, 0x4f, Int, 4),      // iaload  / iastore
-            (0x2f, 0x50, Long, 8),     // laload  / lastore
-            (0x30, 0x51, Float, 4),    // faload  / fastore
-            (0x31, 0x52, Double, 8),   // daload  / dastore
-            (0x33, 0x54, Byte, 1),     // baload  / bastore
-            (0x34, 0x55, Char, 2),     // caload  / castore
-            (0x35, 0x56, Short, 2),    // saload  / sastore
+            (0x2e, 0x4f, Int, 4),    // iaload  / iastore
+            (0x2f, 0x50, Long, 8),   // laload  / lastore
+            (0x30, 0x51, Float, 4),  // faload  / fastore
+            (0x31, 0x52, Double, 8), // daload  / dastore
+            (0x33, 0x54, Byte, 1),   // baload  / bastore
+            (0x34, 0x55, Char, 2),   // caload  / castore
+            (0x35, 0x56, Short, 2),  // saload  / sastore
         ];
         for &(load, store, et, width) in expected {
             assert_eq!(

@@ -51,8 +51,8 @@
 //! [rbp - (N+1)*8 .. ] = operand stack spill area
 //! ```
 
-pub(crate) use crate::bytecode_analysis;
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo};
+pub(crate) use crate::bytecode_analysis;
 use cratonvm_jit_api::JitRuntimeHelpers;
 // JEP 358 (helpful NPE) inline-codegen path: the canonical operation-kind
 // vocabulary baked into the inline null-check failure stubs. Single source of
@@ -208,12 +208,12 @@ pub use driver::*;
 mod loop_rewrite;
 pub use loop_rewrite::*;
 pub mod bytecode_walk;
-mod op_local_stack;
-mod op_array;
 mod op_arith;
+mod op_array;
 mod op_control;
 mod op_field;
 mod op_invoke;
+mod op_local_stack;
 mod op_object;
 /// Test-only view of the E27-1 N2b compile-time needle screen.
 ///

@@ -443,8 +443,7 @@ fn choose_sink_block(
             best = cand;
             continue;
         }
-        if equal_depth && depth[cand] == depth[best] && cand != best && dom.dominates(best, cand)
-        {
+        if equal_depth && depth[cand] == depth[best] && cand != best && dom.dominates(best, cand) {
             best = cand;
         }
     }
@@ -1479,8 +1478,7 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
                 let Some(&tb) = node_to_block.get(term as usize) else {
                     continue;
                 };
-                if tb >= num_blocks || blocks[tb].terminator != Some(term) || !is_if(graph, term)
-                {
+                if tb >= num_blocks || blocks[tb].terminator != Some(term) || !is_if(graph, term) {
                     continue;
                 }
                 let succ_block = node_to_block[id];
@@ -4629,18 +4627,12 @@ mod tests {
     fn chk_dominators_match_the_dense_fixpoint_on_hand_built_cfgs() {
         assert_dominators_match_reference("empty", &[]);
         assert_dominators_match_reference("single block", &cfg(1, &[]));
-        assert_dominators_match_reference(
-            "diamond",
-            &cfg(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]),
-        );
+        assert_dominators_match_reference("diamond", &cfg(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]));
         // 0 -> 1 (outer header) -> 2 (inner header) -> 3 (inner latch) -> 2,
         // 2 -> 4 (outer latch) -> 1, 1 -> 5 (exit).
         assert_dominators_match_reference(
             "nested loops",
-            &cfg(
-                6,
-                &[(0, 1), (1, 2), (2, 3), (3, 2), (2, 4), (4, 1), (1, 5)],
-            ),
+            &cfg(6, &[(0, 1), (1, 2), (2, 3), (3, 2), (2, 4), (4, 1), (1, 5)]),
         );
         // A loop with two entries: neither 1 nor 2 dominates the other.
         assert_dominators_match_reference(
@@ -4695,7 +4687,11 @@ mod tests {
         let d = Dominators::compute(&cfg(5, &[(0, 1), (0, 2), (1, 3), (2, 3), (4, 3)]));
         assert_eq!(d.idom(0), None, "the entry has no immediate dominator");
         assert_eq!(d.idom(1), Some(0));
-        assert_eq!(d.idom(3), Some(0), "a join's idom is the branch, not an arm");
+        assert_eq!(
+            d.idom(3),
+            Some(0),
+            "a join's idom is the branch, not an arm"
+        );
         assert_eq!(d.idom(4), None, "an unreachable block has none");
         assert_eq!(d.idom(5), None, "nor does an out-of-range index");
     }
@@ -4720,7 +4716,10 @@ mod tests {
             assert!(dom.dominates(a, 3), "{a} must dominate the unreachable 3");
             assert!(dom.dominates(a, 4), "{a} must dominate the unreachable 4");
         }
-        assert!(!dom.dominates(3, 1), "an unreachable block dominates no reachable one");
+        assert!(
+            !dom.dominates(3, 1),
+            "an unreachable block dominates no reachable one"
+        );
 
         // Every use unreachable: the last unreachable block.
         assert_eq!(deepest_common_dominator(&dom, &[3], 5), Some(4));

@@ -2027,7 +2027,9 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                     return Err(cratonvm_types::error::MethodCallFailed::InternalError(
                         cratonvm_types::error::VmError::Runtime(
                             cratonvm_types::error::RuntimeError::NullPointerException {
-                                message: Some("MethodType.methodType: ptypes must not be null".to_string()),
+                                message: Some(
+                                    "MethodType.methodType: ptypes must not be null".to_string(),
+                                ),
                             },
                         ),
                     ));
@@ -2089,9 +2091,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                     cratonvm_types::error::VmError::Runtime(
                         cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
                             index: raw,
-                            message: Some(format!(
-                                "Index {raw} out of bounds for length {len}"
-                            )),
+                            message: Some(format!("Index {raw} out of bounds for length {len}")),
                         },
                     ),
                 ));
@@ -2464,8 +2464,8 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                     field_desc: (elem as char).to_string(),
                     field_index: -1,
                     class_id: 0,
-                                    read_only: false,
-},
+                    read_only: false,
+                },
             );
             Ok(Some(Value::Object(Some(vh))))
         },
@@ -2514,8 +2514,8 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                     field_desc: (elem as char).to_string(),
                     field_index: -1,
                     class_id: 0,
-                                    read_only: false,
-},
+                    read_only: false,
+                },
             );
             Ok(Some(Value::Object(Some(vh))))
         },
@@ -2969,8 +2969,8 @@ pub(crate) fn alloc_instance_var_handle(
             field_desc: field_desc.to_string(),
             field_index,
             class_id: class_id.as_u32(),
-                    read_only: false,
-},
+            read_only: false,
+        },
     );
     Ok(vh)
 }
@@ -3010,8 +3010,8 @@ pub(crate) fn alloc_static_var_handle(
             field_desc: field_desc.to_string(),
             field_index: -1,
             class_id: 0,
-                    read_only: false,
-},
+            read_only: false,
+        },
     );
     Ok(vh)
 }
@@ -5480,10 +5480,7 @@ fn vh_mark_read_only(ctx: &mut dyn NativeContext, vh: ObjectRef) {
 /// beats the null coordinate. Read-only against an unsupported MODE is not
 /// observable — both raise `UnsupportedOperationException` — so the order
 /// between those two is free and this one is placed first for both.
-fn vh_check_read_only(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> Result<(), MethodCallFailed> {
+fn vh_check_read_only(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<(), MethodCallFailed> {
     if !vh_read_only_handle_uoe_enabled() {
         return Ok(());
     }
@@ -5617,8 +5614,9 @@ fn vh_check_access_mode_supported(
             // `UnsupportedOperationException: getAndAdd is not supported for a
             // VarHandle over a variable of type a reference` -- the fallback
             // describing itself.
-            None => vh_read_string(ctx, this, VH_FIELD_DESC)
-                .and_then(|s| s.as_bytes().first().copied()),
+            None => {
+                vh_read_string(ctx, this, VH_FIELD_DESC).and_then(|s| s.as_bytes().first().copied())
+            }
         },
     };
     // An undeterminable descriptor keeps today's behaviour rather than
@@ -8107,14 +8105,8 @@ fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         None => -1,
     };
 
-    let vh = alloc_instance_var_handle(
-        ctx,
-        &class,
-        &field_name,
-        &field_desc,
-        field_index,
-        class_id,
-    )?;
+    let vh =
+        alloc_instance_var_handle(ctx, &class, &field_name, &field_desc, field_index, class_id)?;
     // A `final` field yields a READ-ONLY handle. Decided here, once, because
     // this is where the field is already resolved.
     if vh_field_is_final(ctx, class_id, &field_name) {
@@ -14134,10 +14126,12 @@ fn invoke_narrowing_arg_refusal(
     let narrows = declared_params
         .iter()
         .zip(site_params.iter())
-        .any(|(d, site)| match (primitive_char(d), primitive_char(site)) {
-            (Some(to), Some(from)) => !primitive_widens(from, to),
-            _ => false,
-        });
+        .any(
+            |(d, site)| match (primitive_char(d), primitive_char(site)) {
+                (Some(to), Some(from)) => !primitive_widens(from, to),
+                _ => false,
+            },
+        );
     if !narrows {
         return None;
     }
@@ -17722,8 +17716,8 @@ mod tests {
                 field_desc: "I".to_string(),
                 field_index: 0,
                 class_id: cid,
-                            read_only: false,
-},
+                read_only: false,
+            },
         );
         let old = varhandle_get_and_add(
             &mut ctx,
@@ -17855,8 +17849,8 @@ mod tests {
                 field_desc: "I".to_string(),
                 field_index: 0,
                 class_id: cid,
-                            read_only: false,
-},
+                read_only: false,
+            },
         );
         let old = varhandle_get_and_set(
             &mut ctx,
@@ -17985,8 +17979,8 @@ mod tests {
                 field_desc: "I".to_string(),
                 field_index: 0,
                 class_id: cid,
-                            read_only: false,
-},
+                read_only: false,
+            },
         );
         // Matching expected → updates and returns the witness (old value).
         let witness = varhandle_compare_and_exchange(
@@ -18033,8 +18027,8 @@ mod tests {
                 field_desc: "I".to_string(),
                 field_index: 0,
                 class_id: cid,
-                            read_only: false,
-},
+                read_only: false,
+            },
         );
         // expected = 99 (wrong) → no swap; witness is the real current 30.
         let witness = varhandle_compare_and_exchange(
@@ -18079,8 +18073,8 @@ mod tests {
                 field_desc: "I".to_string(),
                 field_index: 0,
                 class_id: cid,
-                            read_only: false,
-},
+                read_only: false,
+            },
         );
         // Wrong expected → no swap, returns 0 (false).
         let miss = varhandle_compare_and_set(
@@ -18718,8 +18712,8 @@ mod vh_plan_memo_tests {
                     field_desc: "I".to_string(),
                     field_index: 7,
                     class_id: 0,
-                                    read_only: false,
-}),
+                    read_only: false,
+                }),
             );
         }
         // Deliberately NOT asserting that the memo is stale here. That would be
@@ -18752,8 +18746,8 @@ mod vh_plan_memo_tests {
                 field_desc: "Ljava/lang/String;".to_string(),
                 field_index: 3,
                 class_id: 0,
-                            read_only: false,
-}),
+                read_only: false,
+            }),
         );
         vh_meta_bump_generation();
         for _ in 0..4 {

@@ -227,7 +227,9 @@ pub fn dump() {
         } else {
             0.0
         };
-        eprintln!("[field-phases]   {name} {per:8.1} raw  {corrected:8.1} corrected  {pct:5.1}% raw");
+        eprintln!(
+            "[field-phases]   {name} {per:8.1} raw  {corrected:8.1} corrected  {pct:5.1}% raw"
+        );
     }
     eprintln!(
         "[field-phases]   {:8.1} cyc/access measured (rdtsc overhead INCLUDED; ranking, not costing)",

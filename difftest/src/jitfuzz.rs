@@ -45,7 +45,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::classgen::VType::{Double, Float, Int, Long};
-use crate::classgen::{self, op, Asm, ClassVersion, CodeBody, ConstantPool, Frame, Label, MethodDef, VType};
+use crate::classgen::{
+    self, op, Asm, ClassVersion, CodeBody, ConstantPool, Frame, Label, MethodDef, VType,
+};
 use crate::generate::Rng;
 use crate::ledger::Observation;
 use crate::oracle::{self, ChannelDiff, Normalizer, Verdict};
@@ -343,27 +345,27 @@ fn obj_t() -> VType {
 
 fn declared_locals(wide_hi: bool) -> Vec<VType> {
     let mut l = vec![
-        Int,                   // 0 a
-        Long,                  // 1 b
-        VType::Top,            // 2
-        Float,                 // 3 f
-        Double,                // 4 d
-        VType::Top,            // 5
-        Long,                  // 6 acc
-        VType::Top,            // 7
-        Int,                   // 8 i
-        Int,                   // 9 j
-        Int,                   // 10 k
-        Long,                  // 11 y
-        VType::Top,            // 12
-        obj_t(),               // 13 o
-        VType::obj("[I"),      // 14 ia
-        VType::obj("[I"),      // 15 ib
-        VType::obj("[D"),      // 16 da
-        Int,                   // 17 g
-        Double,                // 18 z
-        VType::Top,            // 19
-        Float,                 // 20 x
+        Int,              // 0 a
+        Long,             // 1 b
+        VType::Top,       // 2
+        Float,            // 3 f
+        Double,           // 4 d
+        VType::Top,       // 5
+        Long,             // 6 acc
+        VType::Top,       // 7
+        Int,              // 8 i
+        Int,              // 9 j
+        Int,              // 10 k
+        Long,             // 11 y
+        VType::Top,       // 12
+        obj_t(),          // 13 o
+        VType::obj("[I"), // 14 ia
+        VType::obj("[I"), // 15 ib
+        VType::obj("[D"), // 16 da
+        Int,              // 17 g
+        Double,           // 18 z
+        VType::Top,       // 19
+        Float,            // 20 x
     ];
     debug_assert_eq!(l.len(), X + 1);
     if wide_hi {
@@ -439,10 +441,12 @@ impl Em<'_> {
         self.a.simple(op::IALOAD, &[VType::obj("[I"), Int], &[Int]);
     }
     fn iastore(&mut self) {
-        self.a.simple(op::IASTORE, &[VType::obj("[I"), Int, Int], &[]);
+        self.a
+            .simple(op::IASTORE, &[VType::obj("[I"), Int, Int], &[]);
     }
     fn daload(&mut self) {
-        self.a.simple(op::DALOAD, &[VType::obj("[D"), Int], &[Double]);
+        self.a
+            .simple(op::DALOAD, &[VType::obj("[D"), Int], &[Double]);
     }
     fn dastore(&mut self) {
         self.a
@@ -827,7 +831,19 @@ fn fp_rem(em: &mut Em, r: &mut Rng) {
     for n in 0..2 {
         match r.below(4) {
             v @ 0..=1 => {
-                let k = pick(r, &[0.0f32, -0.0, 1.5, -2.5, f32::INFINITY, f32::NAN, 1.0e-45, 3.0]);
+                let k = pick(
+                    r,
+                    &[
+                        0.0f32,
+                        -0.0,
+                        1.5,
+                        -2.5,
+                        f32::INFINITY,
+                        f32::NAN,
+                        1.0e-45,
+                        3.0,
+                    ],
+                );
                 if v == 0 {
                     em.ld(Float, F);
                     em.a.fconst(k);
@@ -839,7 +855,19 @@ fn fp_rem(em: &mut Em, r: &mut Rng) {
                 em.fbits();
             }
             v => {
-                let k = pick(r, &[0.0f64, -0.0, 1.5, -2.5, f64::INFINITY, f64::NAN, 1e-300, 3.0]);
+                let k = pick(
+                    r,
+                    &[
+                        0.0f64,
+                        -0.0,
+                        1.5,
+                        -2.5,
+                        f64::INFINITY,
+                        f64::NAN,
+                        1e-300,
+                        3.0,
+                    ],
+                );
                 if v == 2 {
                     em.ld(Double, D);
                     em.a.dconst(k);
@@ -914,7 +942,13 @@ fn switches(em: &mut Em, r: &mut Rng) {
     if r.below(2) == 0 {
         let (low, n) = pick(
             r,
-            &[(-1, 4usize), (0, 3), (i32::MAX - 2, 3), (i32::MIN, 3), (30, 4)],
+            &[
+                (-1, 4usize),
+                (0, 3),
+                (i32::MAX - 2, 3),
+                (i32::MIN, 3),
+                (30, 4),
+            ],
         );
         em.ld(Int, A);
         if r.below(2) == 0 {
@@ -1621,8 +1655,7 @@ pub fn build_main_method(cp: &mut ConstantPool, p: &JitProgram) -> Result<CodeBo
     em.bind(end, &[]);
     em.a.getstatic("java/lang/System", "out", "Ljava/io/PrintStream;");
     em.a.sconst(&format!("{} {CHECKSUM_NAME} ", crate::checksum::MARKER));
-    em.a
-        .invokevirtual("java/io/PrintStream", "print", "(Ljava/lang/String;)V");
+    em.a.invokevirtual("java/io/PrintStream", "print", "(Ljava/lang/String;)V");
     em.a.getstatic("java/lang/System", "out", "Ljava/io/PrintStream;");
     em.ld(Long, MACC);
     em.a.invokevirtual("java/io/PrintStream", "println", "(J)V");
@@ -1658,9 +1691,18 @@ pub fn build_class(p: &JitProgram, version: ClassVersion) -> Result<Vec<u8>, Str
 /// disassembly of `t`.
 pub fn describe(p: &JitProgram) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "program {} (seed {}, rounds {})", p.name, p.seed, p.rounds);
+    let _ = writeln!(
+        s,
+        "program {} (seed {}, rounds {})",
+        p.name, p.seed, p.rounds
+    );
     for (i, sn) in p.snippets.iter().enumerate() {
-        let _ = writeln!(s, "  snippet {i}: {} (seed {:#018x})", sn.category.label(), sn.seed);
+        let _ = writeln!(
+            s,
+            "  snippet {i}: {} (seed {:#018x})",
+            sn.category.label(),
+            sn.seed
+        );
     }
     for (i, inp) in p.inputs.iter().enumerate() {
         let _ = writeln!(
@@ -1690,7 +1732,10 @@ pub fn describe(p: &JitProgram) -> String {
 /// Shrink `p` while `still_fails` holds: drop snippets one at a time, then
 /// inputs, then halve `rounds`. Greedy rather than ddmin because every probe
 /// costs VM runs and programs have at most a handful of each.
-pub fn minimize_program(p: &JitProgram, mut still_fails: impl FnMut(&JitProgram) -> bool) -> JitProgram {
+pub fn minimize_program(
+    p: &JitProgram,
+    mut still_fails: impl FnMut(&JitProgram) -> bool,
+) -> JitProgram {
     let mut cur = p.clone();
     let mut i = 0usize;
     while cur.snippets.len() > 1 && i < cur.snippets.len() {
@@ -1803,7 +1848,12 @@ fn reference_problem(o: &Observation) -> Option<String> {
         return Some(format!(
             "reference exited {:?}: {}",
             o.exit_code,
-            o.stderr.lines().rev().take(5).collect::<Vec<_>>().join(" / ")
+            o.stderr
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" / ")
         ));
     }
     if let Some(e) = &o.exception {
@@ -1836,7 +1886,11 @@ fn env_for(mode: Mode, cfg: &FuzzConfig) -> &[(String, String)] {
 }
 
 /// Run one program under the reference and every other mode.
-pub fn run_program(bin: &Path, p: &JitProgram, cfg: &FuzzConfig) -> Result<ProgramReport, RunError> {
+pub fn run_program(
+    bin: &Path,
+    p: &JitProgram,
+    cfg: &FuzzConfig,
+) -> Result<ProgramReport, RunError> {
     let mut report = ProgramReport {
         program: p.clone(),
         build_error: None,
@@ -1852,7 +1906,8 @@ pub fn run_program(bin: &Path, p: &JitProgram, cfg: &FuzzConfig) -> Result<Progr
             return Ok(report);
         }
     };
-    let reference = runner::run_cratonvm_with_env(bin, &dir, &p.name, cfg.reference, cfg.timeout, &[])?;
+    let reference =
+        runner::run_cratonvm_with_env(bin, &dir, &p.name, cfg.reference, cfg.timeout, &[])?;
     if let Some(problem) = reference_problem(&reference) {
         report.invalid_reference = Some(problem);
         report.reference = Some(reference);
@@ -1870,9 +1925,18 @@ pub fn run_program(bin: &Path, p: &JitProgram, cfg: &FuzzConfig) -> Result<Progr
             continue;
         }
         let normalizer = Normalizer::for_mode(mode);
-        let obs = runner::run_cratonvm_with_env(bin, &dir, &p.name, mode, cfg.timeout, env_for(mode, cfg))?;
+        let obs = runner::run_cratonvm_with_env(
+            bin,
+            &dir,
+            &p.name,
+            mode,
+            cfg.timeout,
+            env_for(mode, cfg),
+        )?;
         let reject = cfg.fail_on_ir_verify_reject
-            && obs.stderr.contains(crate::pathgate::IR_VERIFY_REJECT_MARKER);
+            && obs
+                .stderr
+                .contains(crate::pathgate::IR_VERIFY_REJECT_MARKER);
         match oracle::compare(&obs, &reference, &normalizer) {
             Verdict::Agree if !reject => {}
             Verdict::Agree => report.splits.push(ModeSplit {
@@ -1883,8 +1947,14 @@ pub fn run_program(bin: &Path, p: &JitProgram, cfg: &FuzzConfig) -> Result<Progr
                 observation: obs,
             }),
             Verdict::Diverge(diffs) => {
-                let again =
-                    runner::run_cratonvm_with_env(bin, &dir, &p.name, mode, cfg.timeout, env_for(mode, cfg))?;
+                let again = runner::run_cratonvm_with_env(
+                    bin,
+                    &dir,
+                    &p.name,
+                    mode,
+                    cfg.timeout,
+                    env_for(mode, cfg),
+                )?;
                 let flaky = oracle::compare(&again, &reference, &normalizer).agrees();
                 report.splits.push(ModeSplit {
                     mode,
@@ -1902,7 +1972,13 @@ pub fn run_program(bin: &Path, p: &JitProgram, cfg: &FuzzConfig) -> Result<Progr
 
 /// Whether `cand` still makes any of `modes` disagree with the reference (or,
 /// for a failure that was an invalid reference, still invalidates it).
-fn still_fails(bin: &Path, cand: &JitProgram, modes: &[Mode], invalid_ref: bool, cfg: &FuzzConfig) -> bool {
+fn still_fails(
+    bin: &Path,
+    cand: &JitProgram,
+    modes: &[Mode],
+    invalid_ref: bool,
+    cfg: &FuzzConfig,
+) -> bool {
     let narrowed = FuzzConfig {
         modes: modes.to_vec(),
         hotspot: false,
@@ -1918,7 +1994,13 @@ fn still_fails(bin: &Path, cand: &JitProgram, modes: &[Mode], invalid_ref: bool,
 }
 
 /// The command line that reproduces `mode` on a staged class.
-pub fn repro_command(bin: &Path, dir: &Path, class: &str, mode: Mode, extra_env: &[(String, String)]) -> String {
+pub fn repro_command(
+    bin: &Path,
+    dir: &Path,
+    class: &str,
+    mode: Mode,
+    extra_env: &[(String, String)],
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     for (k, v) in mode.env_overrides() {
         parts.push(format!("{k}={v}"));
@@ -1941,7 +2023,13 @@ pub fn render_report(r: &ProgramReport, bin: &Path, class_dir: &Path, cfg: &Fuzz
     let mut s = String::new();
     let p = &r.program;
     let cats: Vec<&str> = p.categories().iter().map(|c| c.label()).collect();
-    let _ = writeln!(s, "{} — seed {} — categories {}", p.name, p.seed, cats.join(","));
+    let _ = writeln!(
+        s,
+        "{} — seed {} — categories {}",
+        p.name,
+        p.seed,
+        cats.join(",")
+    );
     if let Some(e) = &r.build_error {
         let _ = writeln!(s, "  BUILD  generator/assembler rejected the program: {e}");
     }
@@ -1964,16 +2052,36 @@ pub fn render_report(r: &ProgramReport, bin: &Path, class_dir: &Path, cfg: &Fuzz
             cfg.reference.label(),
             split.mode.label(),
             chans.join(","),
-            if split.flaky { " (did not reproduce on re-run)" } else { "" },
-            if split.ir_verify_reject { " (IR verifier rejected a method)" } else { "" }
+            if split.flaky {
+                " (did not reproduce on re-run)"
+            } else {
+                ""
+            },
+            if split.ir_verify_reject {
+                " (IR verifier rejected a method)"
+            } else {
+                ""
+            }
         );
         for d in &split.diffs {
-            let _ = writeln!(s, "      {}: {} != {}", d.channel.label(), one_line(&d.cratonvm), one_line(&d.hotspot));
+            let _ = writeln!(
+                s,
+                "      {}: {} != {}",
+                d.channel.label(),
+                one_line(&d.cratonvm),
+                one_line(&d.hotspot)
+            );
         }
         let _ = writeln!(
             s,
             "      repro: {}",
-            repro_command(bin, class_dir, &p.name, split.mode, env_for(split.mode, cfg))
+            repro_command(
+                bin,
+                class_dir,
+                &p.name,
+                split.mode,
+                env_for(split.mode, cfg)
+            )
         );
     }
     for d in &r.hotspot_diffs {
@@ -2039,14 +2147,21 @@ pub fn fuzz(
             p.clone()
         };
         let dir = write_failure(bin, &report, &minimized, cfg)?;
-        log(&format!("  FAIL  {} [{}] -> {}", p.name, labels(&p), dir.display()));
+        log(&format!(
+            "  FAIL  {} [{}] -> {}",
+            p.name,
+            labels(&p),
+            dir.display()
+        ));
         for line in render_report(&report, bin, &dir, cfg).lines() {
             log(&format!("        {line}"));
         }
         summary.written.push(dir);
         summary.failures.push(report);
         if summary.failures.len() >= max_failures {
-            log(&format!("  (stopping after {max_failures} failing program(s))"));
+            log(&format!(
+                "  (stopping after {max_failures} failing program(s))"
+            ));
             break;
         }
     }
@@ -2054,13 +2169,22 @@ pub fn fuzz(
 }
 
 fn labels(p: &JitProgram) -> String {
-    p.categories().iter().map(|c| c.label()).collect::<Vec<_>>().join(",")
+    p.categories()
+        .iter()
+        .map(|c| c.label())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Write `<out>/<name>/`: the minimized class (runnable as-is with
 /// `-cp <out>/<name>`), `original/<name>.class`, `report.txt`, and
 /// `program.txt` for both versions.
-fn write_failure(bin: &Path, report: &ProgramReport, minimized: &JitProgram, cfg: &FuzzConfig) -> Result<PathBuf, RunError> {
+fn write_failure(
+    bin: &Path,
+    report: &ProgramReport,
+    minimized: &JitProgram,
+    cfg: &FuzzConfig,
+) -> Result<PathBuf, RunError> {
     let name = &report.program.name;
     let dir = cfg.out_dir.join(name);
     let orig_dir = dir.join("original");
@@ -2096,7 +2220,17 @@ fn write_failure(bin: &Path, report: &ProgramReport, minimized: &JitProgram, cfg
             split.mode.label(),
             split.observation.stdout,
             split.mode.label(),
-            split.observation.stderr.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+            split
+                .observation
+                .stderr
+                .lines()
+                .rev()
+                .take(40)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
     std::fs::write(dir.join("report.txt"), text).map_err(io_err)?;
@@ -2121,8 +2255,10 @@ mod tests {
     #[test]
     fn generation_is_byte_identical_per_seed() {
         for seed in 0..32u64 {
-            let a = build_class(&generate_program(seed, DEFAULT_ROUNDS), ClassVersion::Java8).unwrap();
-            let b = build_class(&generate_program(seed, DEFAULT_ROUNDS), ClassVersion::Java8).unwrap();
+            let a =
+                build_class(&generate_program(seed, DEFAULT_ROUNDS), ClassVersion::Java8).unwrap();
+            let b =
+                build_class(&generate_program(seed, DEFAULT_ROUNDS), ClassVersion::Java8).unwrap();
             assert_eq!(a, b, "seed {seed} is not deterministic");
         }
         let a = build_class(&generate_program(1, DEFAULT_ROUNDS), ClassVersion::Java8).unwrap();
@@ -2137,8 +2273,9 @@ mod tests {
             for version in [ClassVersion::Java8, ClassVersion::Java5] {
                 let bytes = build_class(&p, version)
                     .unwrap_or_else(|e| panic!("seed {seed}: {e}\n{}", describe(&p)));
-                classgen::check_class_shape(&bytes)
-                    .unwrap_or_else(|e| panic!("seed {seed} v{}: {e}\n{}", version.major(), describe(&p)));
+                classgen::check_class_shape(&bytes).unwrap_or_else(|e| {
+                    panic!("seed {seed} v{}: {e}\n{}", version.major(), describe(&p))
+                });
                 let scan = crate::matrix::scan_class_bytes(&p.name, &bytes)
                     .unwrap_or_else(|| panic!("seed {seed}: matrix scanner rejected the class"));
                 assert_eq!(scan.methods, 2);
@@ -2155,13 +2292,17 @@ mod tests {
                 let p = JitProgram {
                     seed: sub,
                     name: "One".into(),
-                    snippets: vec![Snippet { category: c, seed: sub }],
+                    snippets: vec![Snippet {
+                        category: c,
+                        seed: sub,
+                    }],
                     inputs: generate_program(sub, 1).inputs,
                     rounds: 1,
                 };
                 let bytes = build_class(&p, ClassVersion::Java8)
                     .unwrap_or_else(|e| panic!("{} sub-seed {sub}: {e}", c.label()));
-                classgen::check_class_shape(&bytes).unwrap_or_else(|e| panic!("{}: {e}", c.label()));
+                classgen::check_class_shape(&bytes)
+                    .unwrap_or_else(|e| panic!("{}: {e}", c.label()));
             }
         }
     }
@@ -2190,12 +2331,45 @@ mod tests {
             }
         }
         let want = [
-            op::IDIV, op::IREM, op::LDIV, op::LREM, op::ISHL, op::ISHR, op::IUSHR, op::LSHL,
-            op::LSHR, op::LUSHR, op::FCMPL, op::FCMPG, op::DCMPL, op::DCMPG, op::F2I, op::F2L,
-            op::D2I, op::D2L, op::FREM, op::DREM, op::I2B, op::I2C, op::I2S, op::TABLESWITCH,
-            op::LOOKUPSWITCH, op::DUP_X2, op::DUP2_X1, op::DUP2_X2, op::SWAP, op::POP2,
-            op::WIDE, op::IFNULL, op::CHECKCAST, op::IALOAD, op::IASTORE, op::DALOAD,
-            op::DASTORE, op::IF_ICMPGT, op::IF_ICMPLT,
+            op::IDIV,
+            op::IREM,
+            op::LDIV,
+            op::LREM,
+            op::ISHL,
+            op::ISHR,
+            op::IUSHR,
+            op::LSHL,
+            op::LSHR,
+            op::LUSHR,
+            op::FCMPL,
+            op::FCMPG,
+            op::DCMPL,
+            op::DCMPG,
+            op::F2I,
+            op::F2L,
+            op::D2I,
+            op::D2L,
+            op::FREM,
+            op::DREM,
+            op::I2B,
+            op::I2C,
+            op::I2S,
+            op::TABLESWITCH,
+            op::LOOKUPSWITCH,
+            op::DUP_X2,
+            op::DUP2_X1,
+            op::DUP2_X2,
+            op::SWAP,
+            op::POP2,
+            op::WIDE,
+            op::IFNULL,
+            op::CHECKCAST,
+            op::IALOAD,
+            op::IASTORE,
+            op::DALOAD,
+            op::DASTORE,
+            op::IF_ICMPGT,
+            op::IF_ICMPLT,
         ];
         for o in want {
             assert!(
@@ -2212,7 +2386,8 @@ mod tests {
         let mut ints = false;
         let mut nan = false;
         for seed in 0..64u64 {
-            let bytes = build_class(&generate_program(seed, DEFAULT_ROUNDS), ClassVersion::Java8).unwrap();
+            let bytes =
+                build_class(&generate_program(seed, DEFAULT_ROUNDS), ClassVersion::Java8).unwrap();
             ints |= bytes.windows(5).any(|w| w == [3, 0x80, 0, 0, 0]);
             nan |= bytes.windows(5).any(|w| w == [4, 0x7f, 0xc0, 0, 0]);
         }
@@ -2228,7 +2403,9 @@ mod tests {
             seed: 1,
         });
         let min = minimize_program(&p, |c| {
-            c.snippets.iter().any(|s| s.category == Category::StackShuffles)
+            c.snippets
+                .iter()
+                .any(|s| s.category == Category::StackShuffles)
         });
         assert_eq!(min.snippets.len(), 1);
         assert_eq!(min.snippets[0].category, Category::StackShuffles);
@@ -2261,6 +2438,9 @@ mod tests {
         );
         assert!(cmd.contains("CRATONVM_JIT_FORCE_C2=1"), "{cmd}");
         assert!(cmd.contains("CRATONVM_DBG_GC_STRESS=65536"), "{cmd}");
-        assert!(cmd.ends_with("-cp out/JitFuzz_3 JitFuzz_3") || cmd.contains("JitFuzz_3 JitFuzz_3"), "{cmd}");
+        assert!(
+            cmd.ends_with("-cp out/JitFuzz_3 JitFuzz_3") || cmd.contains("JitFuzz_3 JitFuzz_3"),
+            "{cmd}"
+        );
     }
 }

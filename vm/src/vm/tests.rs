@@ -1286,8 +1286,8 @@ fn system_get_property_native() {
         // edited on every JDK update is not pinning anything about this VM.
         // What is under test is that `java.version` resolves to a real value
         // for the release line the VM targets.
-        let v = read_java_string(&shared.mem.heap, obj)
-            .expect("java.version must resolve to a string");
+        let v =
+            read_java_string(&shared.mem.heap, obj).expect("java.version must resolve to a string");
         assert!(
             v.starts_with("25."),
             "java.version should report the JDK 25 line this VM targets, got {v:?}"
@@ -65792,7 +65792,10 @@ fn zgc_refill_tlab_carves_a_chunk_and_retire_returns_the_tail() {
         .refill_tlab(64 * 1024)
         .expect("ZGC must hand the VM thread's TLAB a chunk");
     assert!(!ptr.is_null());
-    assert!(size >= 8 * 1024 && size <= 64 * 1024, "chunk of {size} bytes");
+    assert!(
+        size >= 8 * 1024 && size <= 64 * 1024,
+        "chunk of {size} bytes"
+    );
     let mut tlab = unsafe { cratonvm_gc::Tlab::new(ptr, size) };
     assert!(tlab.alloc(128, 8).is_some());
     // The chunk was charged whole at refill; the retire credits the tail back.
@@ -65808,7 +65811,10 @@ fn zgc_refill_tlab_carves_a_chunk_and_retire_returns_the_tail() {
         panic!("GcBackend::Zgc must build a Zgc heap");
     };
     let (refills, refill_bytes, tails, tail_bytes) = z.vm_tlab_engagement();
-    assert_eq!((refills, refill_bytes, tails, tail_bytes), (1, size, 1, size - 128));
+    assert_eq!(
+        (refills, refill_bytes, tails, tail_bytes),
+        (1, size, 1, size - 128)
+    );
 }
 
 #[test]
@@ -75928,8 +75934,10 @@ fn s33_mic_entry_ptr_direct_dispatch_simulation() {
     assert_eq!(entry, 0); // Not yet compiled
 
     // After compilation, store the tagged entry word
-    mic.cached_entry_word
-        .store(0xFF00FF00 | cratonvm_jit::JIT_IC_NEEDS_CONTEXT_TAG, Ordering::Release);
+    mic.cached_entry_word.store(
+        0xFF00FF00 | cratonvm_jit::JIT_IC_NEEDS_CONTEXT_TAG,
+        Ordering::Release,
+    );
 
     // Now the fast path would use this entry pointer directly, with the ABI
     // decoded from the same word

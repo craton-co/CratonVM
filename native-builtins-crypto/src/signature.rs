@@ -91,12 +91,8 @@ impl DigestAlgorithm {
         match self {
             DigestAlgorithm::Md2 | DigestAlgorithm::Md5 => 16,
             DigestAlgorithm::Sha1 => 20,
-            DigestAlgorithm::Sha224
-            | DigestAlgorithm::Sha512_224
-            | DigestAlgorithm::Sha3_224 => 28,
-            DigestAlgorithm::Sha256
-            | DigestAlgorithm::Sha512_256
-            | DigestAlgorithm::Sha3_256 => 32,
+            DigestAlgorithm::Sha224 | DigestAlgorithm::Sha512_224 | DigestAlgorithm::Sha3_224 => 28,
+            DigestAlgorithm::Sha256 | DigestAlgorithm::Sha512_256 | DigestAlgorithm::Sha3_256 => 32,
             DigestAlgorithm::Sha384 | DigestAlgorithm::Sha3_384 => 48,
             DigestAlgorithm::Sha512 | DigestAlgorithm::Sha3_512 => 64,
         }
@@ -141,7 +137,6 @@ impl DigestAlgorithm {
         out
     }
 }
-
 
 /// The `rsa` crate's PKCS#1 v1.5 padding scheme for `digest`, built from
 /// [`DigestAlgorithm::pkcs1v15_digest_info_prefix`].
@@ -193,9 +188,7 @@ pub fn verify_rsa_pkcs1_v15_prehashed(
     let key = rsa_public_key_for_verify(modulus_be, exponent_be, signature)?;
     // PRESERVED NEGATIVE: see `verify_rsa_pkcs1_v15_checked`. A failure from
     // here on is "the padded digest did not match", which is an answer.
-    Ok(key
-        .verify(pkcs1v15_scheme(digest), hash, signature)
-        .is_ok())
+    Ok(key.verify(pkcs1v15_scheme(digest), hash, signature).is_ok())
 }
 
 /// The key/signature validation both PKCS#1 v1.5 verify entry points share,
@@ -506,29 +499,29 @@ mod tests {
         assert_eq!(
             DigestAlgorithm::Sha1.pkcs1v15_digest_info_prefix(),
             vec![
-                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
-                0x04, 0x14,
+                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
+                0x14,
             ]
         );
         assert_eq!(
             DigestAlgorithm::Sha256.pkcs1v15_digest_info_prefix(),
             vec![
-                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
-                0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x01, 0x05, 0x00, 0x04, 0x20,
             ]
         );
         assert_eq!(
             DigestAlgorithm::Sha384.pkcs1v15_digest_info_prefix(),
             vec![
-                0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
-                0x02, 0x02, 0x05, 0x00, 0x04, 0x30,
+                0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x02, 0x05, 0x00, 0x04, 0x30,
             ]
         );
         assert_eq!(
             DigestAlgorithm::Sha512.pkcs1v15_digest_info_prefix(),
             vec![
-                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
-                0x02, 0x03, 0x05, 0x00, 0x04, 0x40,
+                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x03, 0x05, 0x00, 0x04, 0x40,
             ]
         );
         // MD2 and MD5, also published by the RFC, and the two whose OID arc is
@@ -536,15 +529,15 @@ mod tests {
         assert_eq!(
             DigestAlgorithm::Md2.pkcs1v15_digest_info_prefix(),
             vec![
-                0x30, 0x20, 0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02,
-                0x02, 0x05, 0x00, 0x04, 0x10,
+                0x30, 0x20, 0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x02,
+                0x05, 0x00, 0x04, 0x10,
             ]
         );
         assert_eq!(
             DigestAlgorithm::Md5.pkcs1v15_digest_info_prefix(),
             vec![
-                0x30, 0x20, 0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02,
-                0x05, 0x05, 0x00, 0x04, 0x10,
+                0x30, 0x20, 0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x05,
+                0x05, 0x00, 0x04, 0x10,
             ]
         );
     }
@@ -588,7 +581,10 @@ mod tests {
             assert_eq!(p[2], 0x30, "{d:?}");
             assert_eq!(p[3] as usize, p.len() - 4 - 2, "{d:?}: inner DER length");
             assert_eq!(*p.last().unwrap() as usize, d.output_len(), "{d:?}");
-            assert!(seen.insert(p), "{d:?} shares a DigestInfo prefix with another digest");
+            assert!(
+                seen.insert(p),
+                "{d:?} shares a DigestInfo prefix with another digest"
+            );
         }
         assert_eq!(seen.len(), all.len());
     }

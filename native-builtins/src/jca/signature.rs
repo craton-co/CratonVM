@@ -436,7 +436,9 @@ const SIG_SHA3_512_RSA: i32 = 34;
 /// carry parallel per-index arms, which is how `SHA512withRSA` came to sign
 /// after the verify side had taken a `DigestAlgorithm` "all along" (the comment
 /// on `SIG_SHA1_RSA`'s sign arm records that asymmetry).
-fn rsa_pkcs1_digest(alg: i32) -> Option<cratonvm_native_builtins_crypto::signature::DigestAlgorithm> {
+fn rsa_pkcs1_digest(
+    alg: i32,
+) -> Option<cratonvm_native_builtins_crypto::signature::DigestAlgorithm> {
     use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
     Some(match alg {
         SIG_MD2_RSA => D::Md2,
@@ -551,9 +553,7 @@ fn ecdsa_family_spi_class(name: &str) -> Option<&'static str> {
         ("NONE", false) => "sun/security/ec/ECDSASignature$Raw",
         ("NONE", true) => "sun/security/ec/ECDSASignature$RawinP1363Format",
         ("SHA1", false) | ("SHA-1", false) => "sun/security/ec/ECDSASignature$SHA1",
-        ("SHA1", true) | ("SHA-1", true) => {
-            "sun/security/ec/ECDSASignature$SHA1inP1363Format"
-        }
+        ("SHA1", true) | ("SHA-1", true) => "sun/security/ec/ECDSASignature$SHA1inP1363Format",
         ("SHA224", false) | ("SHA-224", false) => "sun/security/ec/ECDSASignature$SHA224",
         ("SHA224", true) | ("SHA-224", true) => {
             "sun/security/ec/ECDSASignature$SHA224inP1363Format"
@@ -640,9 +640,7 @@ fn dsa_family_spi_class(name: &str) -> Option<&'static str> {
         ("NONE", false) => "sun/security/provider/DSA$RawDSA",
         ("NONE", true) => "sun/security/provider/DSA$RawDSAinP1363Format",
         ("SHA1", false) | ("SHA-1", false) => "sun/security/provider/DSA$SHA1withDSA",
-        ("SHA1", true) | ("SHA-1", true) => {
-            "sun/security/provider/DSA$SHA1withDSAinP1363Format"
-        }
+        ("SHA1", true) | ("SHA-1", true) => "sun/security/provider/DSA$SHA1withDSAinP1363Format",
         ("SHA224", false) | ("SHA-224", false) => "sun/security/provider/DSA$SHA224withDSA",
         ("SHA224", true) | ("SHA-224", true) => {
             "sun/security/provider/DSA$SHA224withDSAinP1363Format"

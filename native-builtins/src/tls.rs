@@ -959,10 +959,12 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
             // when nothing maps: the application ran unrestricted believing it
             // had restricted. MEASURED, `L6TlsParamSweep` row 94.
             let Some(Value::Object(Some(arr))) = args.get(1).copied() else {
-                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: "CipherSuites cannot be null".into(),
-                }
-                .into());
+                return Err(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: "CipherSuites cannot be null".into(),
+                    }
+                    .into(),
+                );
             };
             for i in 0..ctx.array_length(arr) {
                 let name = match ctx.get_array_element(arr, i) {
@@ -970,10 +972,12 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
                     _ => String::new(),
                 };
                 if !crate::t27_tls::is_cipher_suite_name(&name) {
-                    return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                        message: format!("Unsupported CipherSuite: {name}"),
-                    }
-                    .into());
+                    return Err(
+                        cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                            message: format!("Unsupported CipherSuite: {name}"),
+                        }
+                        .into(),
+                    );
                 }
             }
             ctx.set_field(this, ENG_ENABLED_CIPHERS, Value::Object(Some(arr)));

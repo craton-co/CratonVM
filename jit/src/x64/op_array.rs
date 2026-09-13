@@ -27,7 +27,6 @@ impl Compiler {
         _branch_targets: &[bool],
     ) -> WalkStep {
         match op {
-
             // iaload — load int from int[] array (inline)
             0x2e => {
                 let index_slot = self.pop_stack();
@@ -250,8 +249,7 @@ impl Compiler {
                 let barrier_armed = zgc_read_barrier_blocks_inline_fields();
                 let gate_taken = barrier_armed && !no_aastore_barrier_gate();
                 if barrier_armed && !gate_taken {
-                    AASTORE_ZGC_GATE_SUPPRESSED
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    AASTORE_ZGC_GATE_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 if dbg_aastore_barrier_gate() {
                     let verdict = if gate_taken {
@@ -389,10 +387,9 @@ impl Compiler {
                         // armed is precisely the defect this gate exists to
                         // avoid. Failing closed is the only correct answer.
                         crate::note_jit_bail_site_at("aastore-zgc-barrier-no-helper", pc, 0x53);
-                        return WalkStep::Return( false);
+                        return WalkStep::Return(false);
                     }
-                    AASTORE_ZGC_GATE_FALLBACKS
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    AASTORE_ZGC_GATE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Args: (vm_ptr, array_ptr, index, val). Loaded in
                     // ARG_REGS order after `flush_scratch_registers`, so
                     // every source is a frame slot (or a callee-saved

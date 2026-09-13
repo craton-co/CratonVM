@@ -80,7 +80,8 @@ fn an_installed_cell_is_what_a_jit_site_bakes() {
             "with the cell refused the counter is the leaked Box, as before 2026-09-11"
         );
         assert_ne!(
-            layout_replace_epoch_guard().0 as usize, p as usize,
+            layout_replace_epoch_guard().0 as usize,
+            p as usize,
             "a refused cell must not be what a JIT site bakes"
         );
         return;

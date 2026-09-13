@@ -4649,7 +4649,9 @@ impl<'a> Lowerer<'a> {
         if !wide && !is_float && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
             return false;
         }
-        let Some(base_cell) = self.direct_helpers.resolve_static_base(class_id, field_index as usize)
+        let Some(base_cell) = self
+            .direct_helpers
+            .resolve_static_base(class_id, field_index as usize)
         else {
             return false;
         };
@@ -12769,10 +12771,18 @@ impl<'a> Lowerer<'a> {
     /// was written.
     fn monitor_object_home(&self, obj: NodeId) -> Option<FrameValue> {
         let node = self.graph.nodes.get(obj as usize)?;
-        if self.home_dropped.get(obj as usize).copied().unwrap_or(false) {
+        if self
+            .home_dropped
+            .get(obj as usize)
+            .copied()
+            .unwrap_or(false)
+        {
             return None;
         }
-        let off = match (self.node_slot.get(obj as usize).copied().flatten(), &node.op) {
+        let off = match (
+            self.node_slot.get(obj as usize).copied().flatten(),
+            &node.op,
+        ) {
             (Some(slot), _) => slot.get() as i32,
             (None, Op::Param(idx)) => ((*idx as i32) + 1) * 8,
             (None, _) => return None,
@@ -12834,7 +12844,11 @@ impl<'a> Lowerer<'a> {
     fn resolve_frame_values(
         &self,
         sp: &SafepointSnapshot,
-    ) -> (Vec<FrameValue>, Vec<FrameValue>, Vec<crate::deopt::MonitorInfo>) {
+    ) -> (
+        Vec<FrameValue>,
+        Vec<FrameValue>,
+        Vec<crate::deopt::MonitorInfo>,
+    ) {
         // Guard-surviving scalar replacement (producer): when `sr_map` is set, a
         // snapshot slot holding a scalar-replaced (now-`Op::Dead`) `Op::New`
         // lowers to a `FrameValue::VirtualObject` (first occurrence) /
@@ -13036,8 +13050,7 @@ impl<'a> Lowerer<'a> {
             .node_to_block
             .get(ctrl as usize)
             .is_some_and(|&b| b != usize::MAX && b == db);
-        same_block
-            && matches!((victim, first_site), (Some(v), Some(site)) if v < site)
+        same_block && matches!((victim, first_site), (Some(v), Some(site)) if v < site)
     }
 
     /// Block where the deopt at `bci` fires — the program point all of a
@@ -20696,12 +20709,12 @@ mod tests {",
         static FLAG: u8 = 0;
         extern "C" fn slow_poll() {}
         let cases: [(&[u8], usize, &str, &[i64], i32); 6] = [
-            (&[0x05, 0xac], 0, "()Z", &[], 0),                  // iconst_2
-            (&[0x11, 0x00, 0xC8, 0xac], 0, "()B", &[], -56),    // sipush 200
-            (&[0x02, 0xac], 0, "()C", &[], 65535),              // iconst_m1
-            (&[0x1a, 0xac], 1, "(I)S", &[70000], 4464),         // iload_0
-            (&[0x1a, 0xac], 1, "(I)S", &[-70000], -4464),       // iload_0
-            (&[0x1a, 0xac], 1, "(I)I", &[70000], 70000),        // control
+            (&[0x05, 0xac], 0, "()Z", &[], 0),               // iconst_2
+            (&[0x11, 0x00, 0xC8, 0xac], 0, "()B", &[], -56), // sipush 200
+            (&[0x02, 0xac], 0, "()C", &[], 65535),           // iconst_m1
+            (&[0x1a, 0xac], 1, "(I)S", &[70000], 4464),      // iload_0
+            (&[0x1a, 0xac], 1, "(I)S", &[-70000], -4464),    // iload_0
+            (&[0x1a, 0xac], 1, "(I)I", &[70000], 70000),     // control
         ];
         for (code, n, desc, args, want) in cases {
             let mut builder = IrBuilder::new(n, n);
@@ -22917,7 +22930,7 @@ mod tests {",
 
         // Guard passes (cond != 0): normal return of `val`.
         let _ = take_last_deopt(); // clear any stale state
-        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+                                   // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let ok = unsafe { method.try_call(&[1, 777]).expect("call (guard ok)") };
         assert_eq!(ok, 777, "guard passes → returns val");
         assert!(take_last_deopt().is_none(), "no deopt when guard passes");
@@ -25301,7 +25314,9 @@ mod tests {",
     /// header is pc 0.
     #[test]
     fn a_do_while_at_the_method_entry_compiles_via_ir() {
-        let code = [0x1a, 0x06, 0x64, 0x3b, 0x1a, 0x9d, 0xff, 0xfb, 0x1a, 0xac, 0, 0];
+        let code = [
+            0x1a, 0x06, 0x64, 0x3b, 0x1a, 0x9d, 0xff, 0xfb, 0x1a, 0xac, 0, 0,
+        ];
         let cm = compile_via_ir(&code, 10, 1, 1).expect("a do/while at pc 0 compiles via IR");
         // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") } as i32 as i64;
@@ -25337,7 +25352,8 @@ mod tests {",
             0x1c, 0x60, 0x3c, 0xa7, 0x00, 0x06, 0x84, 0x01, 0xff, 0x84, 0x02, 0x01, 0x1c, 0x1a,
             0xa1, 0xff, 0xeb, 0x1b, 0xac, 0, 0,
         ];
-        let cm = compile_via_ir(&code, 33, 1, 3).expect("a rotated loop with an if/else compiles via IR");
+        let cm = compile_via_ir(&code, 33, 1, 3)
+            .expect("a rotated loop with an if/else compiles via IR");
         // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") } as i32 as i64;
         for (n, want) in [(0i64, 0i64), (1, 0), (2, -1), (3, 1), (5, 4), (6, 3)] {
@@ -25431,7 +25447,7 @@ mod tests {",
 
         let _ = take_last_deopt(); // clear any stale state
                                    // divisor != 0 → normal result, no deopt.
-        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+                                   // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let ok = unsafe { cm.try_call(&[20, 4]).expect("call (b != 0)") };
         assert_eq!(ok, 5, "20 / 4 = 5");
         assert!(take_last_deopt().is_none(), "no deopt when divisor != 0");
@@ -25470,7 +25486,7 @@ mod tests {",
         let _ = take_last_deopt(); // clear any stale state
                                    // divisor != 0 → normal full-64-bit result, no deopt. A 32-bit IDIV
                                    // would mishandle this dividend (> i32::MAX).
-        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+                                   // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         let ok = unsafe { cm.try_call(&[0x1_0000_0000, 2]).expect("call (b != 0)") };
         assert_eq!(ok, 0x8000_0000, "0x1_0000_0000 / 2 (genuinely 64-bit)");
         assert!(take_last_deopt().is_none(), "no deopt when divisor != 0");

@@ -263,11 +263,13 @@ fn caller_blocks_jit_by_name_fails_open_on_unresolvable_method() {
     }
     let class_id = shared
         .load_class_concurrent("EligibleVectorAdd")
-        .unwrap_or_else(|e| panic!(
-            "EligibleVectorAdd did not load from the fixtures classpath ({e:?}). \
+        .unwrap_or_else(|e| {
+            panic!(
+                "EligibleVectorAdd did not load from the fixtures classpath ({e:?}). \
              `.gitignore` keeps test_classes/**/*.class out of the repo, so a fresh \
              checkout has none: run `bash test_classes/gpu/build-fixtures.sh` first."
-        ));
+            )
+        });
 
     assert!(!caller_blocks_jit_by_name(
         &shared,
@@ -341,11 +343,13 @@ fn offload_cache_registry_skip_for_eligible_method_without_device() {
 
     let class_id = shared
         .load_class_concurrent("EligibleVectorAdd")
-        .unwrap_or_else(|e| panic!(
-            "EligibleVectorAdd did not load from the fixtures classpath ({e:?}). \
+        .unwrap_or_else(|e| {
+            panic!(
+                "EligibleVectorAdd did not load from the fixtures classpath ({e:?}). \
              `.gitignore` keeps test_classes/**/*.class out of the repo, so a fresh \
              checkout has none: run `bash test_classes/gpu/build-fixtures.sh` first."
-        ));
+            )
+        });
 
     let cm = shared.classes.class_manager.read();
     let class = cm.get_class(class_id).expect("class must be resolvable");
@@ -622,11 +626,13 @@ fn device_vector_add_handled_with_correct_output() {
     let class_id = vm
         .shared
         .load_class_concurrent("EligibleVectorAdd")
-        .unwrap_or_else(|e| panic!(
-            "EligibleVectorAdd did not load from the fixtures classpath ({e:?}). \
+        .unwrap_or_else(|e| {
+            panic!(
+                "EligibleVectorAdd did not load from the fixtures classpath ({e:?}). \
              `.gitignore` keeps test_classes/**/*.class out of the repo, so a fresh \
              checkout has none: run `bash test_classes/gpu/build-fixtures.sh` first."
-        ));
+            )
+        });
     ensure_class_initialized_shared(&vm.shared, &mut vm.main_thread, class_id)
         .expect("EligibleVectorAdd must initialize cleanly (no <clinit> to fail)");
 
@@ -709,11 +715,13 @@ fn device_dot_product_handled_with_value_matches_host_reference() {
     let class_id = vm
         .shared
         .load_class_concurrent("EligibleDotProduct")
-        .unwrap_or_else(|e| panic!(
-            "EligibleDotProduct did not load from the fixtures classpath ({e:?}). \
+        .unwrap_or_else(|e| {
+            panic!(
+                "EligibleDotProduct did not load from the fixtures classpath ({e:?}). \
              `.gitignore` keeps test_classes/**/*.class out of the repo, so a fresh \
              checkout has none: run `bash test_classes/gpu/build-fixtures.sh` first."
-        ));
+            )
+        });
     ensure_class_initialized_shared(&vm.shared, &mut vm.main_thread, class_id)
         .expect("EligibleDotProduct must initialize cleanly (no <clinit> to fail)");
 
@@ -780,11 +788,13 @@ fn device_vector_add_below_min_work_keeps_call_site_hooked() {
     let class_id = vm
         .shared
         .load_class_concurrent("EligibleVectorAdd")
-        .unwrap_or_else(|e| panic!(
-            "EligibleVectorAdd did not load from the fixtures classpath ({e:?}). \
+        .unwrap_or_else(|e| {
+            panic!(
+                "EligibleVectorAdd did not load from the fixtures classpath ({e:?}). \
              `.gitignore` keeps test_classes/**/*.class out of the repo, so a fresh \
              checkout has none: run `bash test_classes/gpu/build-fixtures.sh` first."
-        ));
+            )
+        });
     ensure_class_initialized_shared(&vm.shared, &mut vm.main_thread, class_id)
         .expect("EligibleVectorAdd must initialize cleanly");
 
@@ -865,11 +875,13 @@ fn device_submission_completes_spontaneously_without_any_poll_call() {
     let class_id = vm
         .shared
         .load_class_concurrent("EligibleVectorAdd")
-        .unwrap_or_else(|e| panic!(
-            "EligibleVectorAdd did not load from the fixtures classpath ({e:?}). \
+        .unwrap_or_else(|e| {
+            panic!(
+                "EligibleVectorAdd did not load from the fixtures classpath ({e:?}). \
              `.gitignore` keeps test_classes/**/*.class out of the repo, so a fresh \
              checkout has none: run `bash test_classes/gpu/build-fixtures.sh` first."
-        ));
+            )
+        });
     ensure_class_initialized_shared(&vm.shared, &mut vm.main_thread, class_id)
         .expect("EligibleVectorAdd must initialize cleanly");
 

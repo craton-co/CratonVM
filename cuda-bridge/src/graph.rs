@@ -293,7 +293,8 @@ impl GraphExec {
                 .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
             // SAFETY: both handles live on the bound context and the call only
             // enqueues.
-            let status = unsafe { cudarc::driver::sys::lib().cuGraphLaunch(self.raw, stream.raw()) };
+            let status =
+                unsafe { cudarc::driver::sys::lib().cuGraphLaunch(self.raw, stream.raw()) };
             if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 return Err(DeviceError::Driver(format!("cuGraphLaunch: {status:?}")));
             }
@@ -338,17 +339,13 @@ impl GraphExec {
     /// a local `Vec<u64>` for device addresses — only need to outlive
     /// the call. Both are bound for the whole function and anchored
     /// after it.
-    pub fn set_kernel_node_args(
-        &self,
-        node: GraphNode,
-        args: &KernelArgs,
-    ) -> Result<()> {
+    pub fn set_kernel_node_args(&self, node: GraphNode, args: &KernelArgs) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
             self.device
                 .bind_to_thread()
                 .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
-    
+
             // Read the node's current parameters. This is what supplies
             // `func` -- cudarc keeps `CudaFunction`'s raw handle private, and
             // asking the node is better than reaching for it anyway: the
@@ -364,7 +361,7 @@ impl GraphExec {
                     "cuGraphKernelNodeGetParams_v2: {rc:?}"
                 )));
             }
-    
+
             // Two backing stores, the same shape the launch path documents:
             // device addresses need a stable 8-byte slot to point AT, and
             // scalars are pointed at directly inside `args.raw`.
@@ -390,7 +387,7 @@ impl GraphExec {
                     }
                 })
                 .collect();
-    
+
             params.kernelParams = param_ptrs.as_mut_ptr();
             // v2 params carry `func` AND a `kern`/`ctx` pair, and the driver
             // reads `kern` only when `func` is null. The getter returns both
@@ -404,13 +401,14 @@ impl GraphExec {
             // error. We supply arguments the `kernelParams` way, as the
             // launch path does.
             params.extra = std::ptr::null_mut();
-    
+
             // SAFETY: every pointer in `param_ptrs` borrows into `args.raw`
             // or `addrs`, both alive here and un-reallocated since the
             // pointers were taken; the driver copies the parameter bytes
             // before returning.
             let rc = unsafe {
-                cudarc::driver::sys::lib().cuGraphExecKernelNodeSetParams_v2(self.raw, node.0, &params)
+                cudarc::driver::sys::lib()
+                    .cuGraphExecKernelNodeSetParams_v2(self.raw, node.0, &params)
             };
             // Liveness anchor: the call has returned, so the raw pointers are
             // no longer dereferenced. Naming both stores here makes a future
@@ -478,8 +476,9 @@ impl Stream {
             self.bind_device()?;
             // SAFETY: the stream belongs to the context bound above and the
             // call only changes that stream's mode.
-            let status =
-                unsafe { cudarc::driver::sys::lib().cuStreamBeginCapture_v2(self.raw(), mode.raw()) };
+            let status = unsafe {
+                cudarc::driver::sys::lib().cuStreamBeginCapture_v2(self.raw(), mode.raw())
+            };
             if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 return Err(DeviceError::Driver(format!(
                     "cuStreamBeginCapture_v2: {status:?}"
@@ -514,7 +513,8 @@ impl Stream {
             self.set_capturing(false);
             let mut raw: cudarc::driver::sys::CUgraph = std::ptr::null_mut();
             // SAFETY: valid out-pointer, stream on the bound context.
-            let status = unsafe { cudarc::driver::sys::lib().cuStreamEndCapture(self.raw(), &mut raw) };
+            let status =
+                unsafe { cudarc::driver::sys::lib().cuStreamEndCapture(self.raw(), &mut raw) };
             if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 return Err(DeviceError::Driver(format!(
                     "cuStreamEndCapture: {status:?}"
@@ -552,7 +552,8 @@ impl Stream {
         #[cfg(feature = "cuda")]
         {
             self.bind_device()?;
-            let mut status_out = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+            let mut status_out =
+                cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
             let mut id: cudarc::driver::sys::cuuint64_t = 0;
             let mut graph: cudarc::driver::sys::CUgraph = std::ptr::null_mut();
             let mut deps: *const cudarc::driver::sys::CUgraphNode = std::ptr::null();
@@ -575,7 +576,8 @@ impl Stream {
                     "cuStreamGetCaptureInfo_v2: {rc:?}"
                 )));
             }
-            if status_out != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+            if status_out
+                != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
             {
                 return Ok(None);
             }

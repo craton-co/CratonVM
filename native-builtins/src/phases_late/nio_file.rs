@@ -111,7 +111,6 @@ pub(crate) fn p57_alloc_path_raw(
     Ok(p57_write_path_fields(ctx, obj, text))
 }
 
-
 /// Field index on a synthetic `java/nio/file/FileSystem` that, when set, holds
 /// the OS path of a mounted JAR (see `newFileSystem`). Field 0 is the separator.
 pub(crate) const P57_FS_JAR_FIELD: usize = 1;
@@ -475,9 +474,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             {
                 let head = uri_text.split('/').next().unwrap_or("");
                 let scheme = match head.split_once(':') {
-                    Some((s, _)) if !s.is_empty() && s.chars().all(|c| {
-                        c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'
-                    }) && s.starts_with(|c: char| c.is_ascii_alphabetic()) => s.to_ascii_lowercase(),
+                    Some((s, _))
+                        if !s.is_empty()
+                            && s.chars().all(|c| {
+                                c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'
+                            })
+                            && s.starts_with(|c: char| c.is_ascii_alphabetic()) =>
+                    {
+                        s.to_ascii_lowercase()
+                    }
                     _ => {
                         return Err(RuntimeError::IllegalArgumentException {
                             message: format!("URI is not absolute: {uri_text}"),
@@ -5359,12 +5364,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         let s = ctx.create_string(&content);
                         Ok(Some(Value::Object(Some(s))))
                     }
-                    Ok(Err(len)) => Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
-                        RuntimeError::IOException {
-                            message: "MalformedInputException".into(),
-                        }
-                        .into()
-                    })),
+                    Ok(Err(len)) => {
+                        Err(p57_malformed_input(ctx, len as i32).unwrap_or_else(|| {
+                            RuntimeError::IOException {
+                                message: "MalformedInputException".into(),
+                            }
+                            .into()
+                        }))
+                    }
                     Err(e) => Err(p57_fs_error(ctx, &e, &p)),
                 },
             }
@@ -10663,9 +10670,7 @@ pub(crate) fn p57_decode_with_charset(
         }
         // Every byte is a character. A latin-1 decode CANNOT fail, which is
         // the row that caught this.
-        Some("sun/nio/cs/ISO_8859_1") => {
-            Ok(Ok(bytes.iter().map(|&b| b as char).collect()))
-        }
+        Some("sun/nio/cs/ISO_8859_1") => Ok(Ok(bytes.iter().map(|&b| b as char).collect())),
         // US-ASCII REPORTS. `Files.readString`/`readAllLines` decode with a
         // `CharsetDecoder` left on its default action, which is REPORT, not
         // REPLACE -- so a byte above 0x7F is a `MalformedInputException` and
@@ -19215,8 +19220,7 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
                 // `basic_file_attributes_file_key_object` for why a string that
                 // prints identically is not good enough.
                 Ok(Some(
-                    basic_file_attributes_file_key_object(ctx, this)
-                        .unwrap_or(Value::Object(None)),
+                    basic_file_attributes_file_key_object(ctx, this).unwrap_or(Value::Object(None)),
                 ))
             },
         );
@@ -22697,9 +22701,7 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
                 "SKIP_SIBLINGS" => 3,
                 _ => {
                     return Err(RuntimeError::IllegalArgumentException {
-                        message: format!(
-                            "No enum constant java.nio.file.FileVisitResult.{name}"
-                        ),
+                        message: format!("No enum constant java.nio.file.FileVisitResult.{name}"),
                     }
                     .into())
                 }

@@ -1671,7 +1671,11 @@ fn sb_count_slot(
 
 /// No class model (the mock) — the historical index heuristic, unchanged.
 fn sb_raw_count_heuristic(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> i32 {
-    let slot = if ctx.object_num_fields(this) >= 3 { 2 } else { 1 };
+    let slot = if ctx.object_num_fields(this) >= 3 {
+        2
+    } else {
+        1
+    };
     match ctx.get_field(this, slot) {
         Value::Int(v) => v,
         _ => 0,
@@ -7683,11 +7687,9 @@ pub(crate) fn native_string_lines(ctx: &mut dyn NativeContext, args: &[Value]) -
         // instance of the `java.util.stream.Stream` INTERFACE is a synthetic
         // stream stand-in, which is precisely what a strict run must not get in
         // place of `java.base`'s own pipeline.
-        Err(_) => crate::util_concurrent_ext::refused_class(
-            &mut *scope,
-            "java/util/stream/Stream",
-            1,
-        )?,
+        Err(_) => {
+            crate::util_concurrent_ext::refused_class(&mut *scope, "java/util/stream/Stream", 1)?
+        }
     };
     let stream_obj = scope.alloc_object(stream_class_id, 1);
     // The backing array is allocated after the stream, so the stream's address

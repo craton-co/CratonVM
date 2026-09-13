@@ -96,9 +96,8 @@ pub(super) fn bytecode_loop_xform_rewrites_bytecode() -> bool {
 /// now measures the deopt-real-off configuration rather than the transform.
 pub(super) fn bytecode_loop_xform_flag() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| {
-        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_BYTECODE_LOOP_XFORM")
-    })
+    *ARMED
+        .get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_BYTECODE_LOOP_XFORM"))
 }
 
 /// Is the native byte-copy unroller (the `0xa7` arm of `compile_bytecode`)

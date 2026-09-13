@@ -24,8 +24,9 @@
 #![cfg(all(feature = "gpu-it", feature = "cuda"))]
 
 use cratonvm_cuda_bridge::graph::CaptureMode;
-use cratonvm_cuda_bridge::{DeviceBuffer, DeviceContext, DeviceModule, KernelArgs, LaunchConfig,
-                           Stream};
+use cratonvm_cuda_bridge::{
+    DeviceBuffer, DeviceContext, DeviceModule, KernelArgs, LaunchConfig, Stream,
+};
 
 /// A kernel small enough that the launch cost dominates it, which is the
 /// regime the whole exercise is about. `sm_70` so the driver JIT accepts it
@@ -464,7 +465,8 @@ fn a_captured_nodes_scalar_argument_can_be_changed_between_replays() {
     stream.synchronize().expect("drain 3");
     out.to_host(&mut host).expect("read 3");
     assert_eq!(
-        host[0], 33 + 100 + 10 + 10,
+        host[0],
+        33 + 100 + 10 + 10,
         "only the first node should have changed"
     );
     assert!(host.iter().all(|&v| v == 153));

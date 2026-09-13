@@ -261,7 +261,10 @@ mod tests {
         assert!(n > 0);
         // SAFETY: `[base, committed)` is committed by construction.
         let slice = unsafe { std::slice::from_raw_parts_mut(heap.base() as *mut u8, n) };
-        assert!(slice.iter().all(|&b| b == 0), "committed pages arrive zeroed");
+        assert!(
+            slice.iter().all(|&b| b == 0),
+            "committed pages arrive zeroed"
+        );
         slice[0] = 0xAB;
         slice[n - 1] = 0xCD;
         assert_eq!((slice[0], slice[n - 1]), (0xAB, 0xCD));

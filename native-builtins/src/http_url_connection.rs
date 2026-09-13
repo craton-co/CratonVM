@@ -1307,7 +1307,9 @@ fn huc_real_perform_inner(
                     .and_then(|()| live.tcp.flush());
                 ctx.end_blocking_region();
                 pushed.map_err(|e| {
-                    ioex(format!("HttpURLConnection fixed-length body write failed: {e}"))
+                    ioex(format!(
+                        "HttpURLConnection fixed-length body write failed: {e}"
+                    ))
                 })?;
                 live.written = live.expected;
             }

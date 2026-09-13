@@ -255,8 +255,7 @@ mod build_script {
             let expected = current_java_src(temp.path());
             fs::create_dir_all(&manifest).expect("create manifest dir");
             fs::create_dir_all(&expected).expect("create gpu4j source dir");
-            fs::create_dir_all(documented_java_src(temp.path()))
-                .expect("create legacy source dir");
+            fs::create_dir_all(documented_java_src(temp.path())).expect("create legacy source dir");
 
             let resolution = resolve_java_root_from(None, &manifest, false);
 
@@ -282,8 +281,7 @@ mod build_script {
             fs::create_dir_all(&expected).expect("create gpu4j-core source dir");
             fs::create_dir_all(aggregator_java_src(temp.path()))
                 .expect("create aggregator source dir");
-            fs::create_dir_all(documented_java_src(temp.path()))
-                .expect("create flat source dir");
+            fs::create_dir_all(documented_java_src(temp.path())).expect("create flat source dir");
 
             let resolution = resolve_java_root_from(None, &manifest, false);
 

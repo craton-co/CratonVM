@@ -2961,7 +2961,6 @@ fn locale_calendar_name(
         .map(|(name, _)| name.to_string())
 }
 
-
 /// `java.text.Normalizer`'s two null contracts, measured rather than guessed.
 ///
 /// Both public entry points take `(CharSequence src, Normalizer.Form form)`

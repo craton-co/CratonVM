@@ -5712,10 +5712,8 @@ mod tests {
     /// everything".
     #[test]
     fn the_incremental_walk_returns_what_the_whole_list_walk_returns_first() {
-        let dir = std::env::temp_dir().join(format!(
-            "cratonvm_test_first_url_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cratonvm_test_first_url_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let first = dir.join("first");
         let second = dir.join("second");

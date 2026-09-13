@@ -60,9 +60,9 @@ use cratonvm_reader::method::ClassFileMethod;
 use parking_lot::RwLock;
 
 use crate::classloading::{Class, ClassId, ClassStore};
+use crate::jit::conservative_roots::{ActiveCompiledFrame, InlinedLevel};
 use crate::native::registry::StackTraceEntry;
 use crate::runtime::frame::Frame;
-use crate::jit::conservative_roots::{ActiveCompiledFrame, InlinedLevel};
 use crate::runtime::fx_collections::{fx_hashmap, FxHashMap};
 
 /// Sentinel "unknown line number" value — `-1` matches HotSpot's
@@ -1349,10 +1349,7 @@ fn push_inlined_chain(
 /// line — a confidently wrong line, which is the single worst outcome
 /// available in this file. One comparison buys immunity from it at a crate
 /// boundary this module cannot otherwise police.
-fn inlined_frame_entry(
-    class_store: &ClassStore,
-    level: &InlinedLevel,
-) -> Option<StackTraceEntry> {
+fn inlined_frame_entry(class_store: &ClassStore, level: &InlinedLevel) -> Option<StackTraceEntry> {
     let InlinedLevel {
         label,
         bci,

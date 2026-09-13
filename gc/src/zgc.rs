@@ -68,8 +68,8 @@ use crate::heap::{
     array_data_size, read_prim_element, write_prim_element, ArrayElementType, ObjectHeader,
     ObjectKind, ARRAY_DATA_OFFSET, GC_FLAG_MARKED, HEADER_SIZE, SLOT_SIZE,
 };
-use cratonvm_types::MARK_WORD_OFFSET;
 use crate::reference::{ReferenceProcessingResult, ReferenceProcessor, ReferenceType};
+use cratonvm_types::MARK_WORD_OFFSET;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
@@ -125,8 +125,8 @@ mod vm_tlab;
 pub(crate) use vm_tlab::zgc_vm_tlab_enabled_by_default;
 
 pub(crate) use starts::{
-    zgc_mark_bits_enabled, zgc_start_bits_enabled_by_default, ZObjectStartBits,
-    ZObjectStarts, ZObjectStartsSnapshot,
+    zgc_mark_bits_enabled, zgc_start_bits_enabled_by_default, ZObjectStartBits, ZObjectStarts,
+    ZObjectStartsSnapshot,
 };
 
 /// Real colored-pointer encoding and virtual address space.
@@ -2046,11 +2046,11 @@ impl ZgcRealHeap {
                 gen_recards_after_relocation: AtomicUsize::new(0),
                 parallel_mark_cycles: AtomicUsize::new(0),
                 compaction_cycles: AtomicUsize::new(0),
-            trigger_stress: AtomicUsize::new(0),
-            trigger_threshold: AtomicUsize::new(0),
-            trigger_headroom: AtomicUsize::new(0),
-            trigger_alloc_budget: AtomicUsize::new(0),
-            trigger_hard_alloc_fail: AtomicUsize::new(0),
+                trigger_stress: AtomicUsize::new(0),
+                trigger_threshold: AtomicUsize::new(0),
+                trigger_headroom: AtomicUsize::new(0),
+                trigger_alloc_budget: AtomicUsize::new(0),
+                trigger_hard_alloc_fail: AtomicUsize::new(0),
                 objects_relocated: AtomicUsize::new(0),
                 vacated_spans_published: AtomicUsize::new(0),
                 vacated_bytes_published: AtomicUsize::new(0),
@@ -2077,7 +2077,7 @@ impl ZgcRealHeap {
                 forwarding_words_read: AtomicUsize::new(0),
                 bytes_uncommitted: AtomicUsize::new(0),
                 conc_black_claims: AtomicUsize::new(0),
-            tlab_retire_skipped_at_safepoint: AtomicUsize::new(0),
+                tlab_retire_skipped_at_safepoint: AtomicUsize::new(0),
                 relocation_on_page_pins: AtomicUsize::new(0),
                 slide_verifications: AtomicUsize::new(0),
                 slide_verified_survivors: AtomicUsize::new(0),
@@ -2423,8 +2423,7 @@ impl ZgcRealHeap {
             threshold * BOOTSTRAP_PERCENT as u64 / 100
         } else {
             // bytes = rate/2^20 * nanos * safety
-            let headroom = (rate.saturating_mul(mark_nanos) >> 20)
-                .saturating_mul(SAFETY_NUMERATOR)
+            let headroom = (rate.saturating_mul(mark_nanos) >> 20).saturating_mul(SAFETY_NUMERATOR)
                 / SAFETY_DENOMINATOR;
             threshold.saturating_sub(headroom)
         };
@@ -2453,7 +2452,9 @@ impl ZgcRealHeap {
             self.pause_target_ms.load(Ordering::Relaxed),
             self.pause_affordable_span.load(Ordering::Relaxed),
             self.alloc_trigger_bytes.load(Ordering::Relaxed),
-            self.counters.pause_target_unreachable.load(Ordering::Relaxed),
+            self.counters
+                .pause_target_unreachable
+                .load(Ordering::Relaxed),
         )
     }
 
@@ -2737,7 +2738,11 @@ impl ZgcRealHeap {
             return;
         }
         let prior = self.conc_mark_nanos_ewma.load(Ordering::Relaxed);
-        let next = if prior == 0 { nanos } else { (prior + nanos) / 2 };
+        let next = if prior == 0 {
+            nanos
+        } else {
+            (prior + nanos) / 2
+        };
         self.conc_mark_nanos_ewma.store(next, Ordering::Relaxed);
     }
 
@@ -2920,8 +2925,11 @@ impl ZgcRealHeap {
         let roots_us = clock.lap();
         *self.counters.conc_pool.lock() = Some(coordinator);
         self.conc_cycle_active.store(true, Ordering::Release);
-        self.counters.conc_cycles_started.fetch_add(1, Ordering::Relaxed);
-        self.counters.conc_mark_started_at
+        self.counters
+            .conc_cycles_started
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .conc_mark_started_at
             .store(Self::monotonic_nanos(), Ordering::Relaxed);
 
         if let Some(t0) = started_at {
@@ -2975,7 +2983,9 @@ impl ZgcRealHeap {
         let started = self.counters.conc_mark_started_at.load(Ordering::Relaxed);
         if started != 0 {
             let elapsed = Self::monotonic_nanos().saturating_sub(started);
-            self.counters.conc_phase_nanos.fetch_add(elapsed, Ordering::Relaxed);
+            self.counters
+                .conc_phase_nanos
+                .fetch_add(elapsed, Ordering::Relaxed);
             // ...and into the average the ADAPTIVE window is sized from. This
             // is the only measurement of "how long does a mark take on this
             // workload" the collector has, and it is the whole input the fixed
@@ -3011,7 +3021,8 @@ impl ZgcRealHeap {
         let replayed = self.drain_mark_ingress(&mut pending);
         self.set_mark_active(false);
         if replayed > 0 {
-            self.counters.conc_ingress_replayed
+            self.counters
+                .conc_ingress_replayed
                 .fetch_add(replayed, Ordering::Relaxed);
         }
         // `push_roots` is the right verb for these: it gates on `is_in_heap`,
@@ -3058,12 +3069,16 @@ impl ZgcRealHeap {
                  mutator race. Falling back to a stop-the-world mark rather than sweeping \
                  against it"
             );
-            self.counters.parallel_mark_fallbacks.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .parallel_mark_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
             // The pool drops here; `ZMarkCoordinator::drop` joins every worker.
             return None;
         }
 
-        self.counters.conc_cycles_completed.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .conc_cycles_completed
+            .fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
             target: "zgc",
             passes = report.passes,
@@ -3140,7 +3155,9 @@ impl ZgcRealHeap {
             return;
         }
         let addr = ptr as usize;
-        self.counters.conc_black_allocations.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .conc_black_allocations
+            .fetch_add(1, Ordering::Relaxed);
         // ---- ALREADY BLACK? -----------------------------------------------
         //
         // `tlab_refill` blackens a whole chunk at a time and
@@ -3163,7 +3180,9 @@ impl ZgcRealHeap {
             return;
         }
         self.mark_set(addr);
-        self.counters.conc_black_claims.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .conc_black_claims
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// A monotonic-enough clock reading in nanoseconds, or `0` if the platform
@@ -3251,7 +3270,9 @@ impl ZgcRealHeap {
             self.counters.trigger_threshold.load(Ordering::Relaxed),
             self.counters.trigger_headroom.load(Ordering::Relaxed),
             self.counters.trigger_alloc_budget.load(Ordering::Relaxed),
-            self.counters.trigger_hard_alloc_fail.load(Ordering::Relaxed),
+            self.counters
+                .trigger_hard_alloc_fail
+                .load(Ordering::Relaxed),
         )
     }
 
@@ -3344,15 +3365,21 @@ impl ZgcRealHeap {
     /// `Arena::compact_low_to`.
     pub fn vacated_publication(&self) -> (usize, usize) {
         (
-            self.counters.vacated_spans_published.load(Ordering::Relaxed),
-            self.counters.vacated_bytes_published.load(Ordering::Relaxed),
+            self.counters
+                .vacated_spans_published
+                .load(Ordering::Relaxed),
+            self.counters
+                .vacated_bytes_published
+                .load(Ordering::Relaxed),
         )
     }
 
     pub fn high_compaction_engagement(&self) -> (usize, usize, usize, usize) {
         (
             self.counters.high_compaction_cycles.load(Ordering::Relaxed),
-            self.counters.high_compaction_declined.load(Ordering::Relaxed),
+            self.counters
+                .high_compaction_declined
+                .load(Ordering::Relaxed),
             self.counters.high_objects_relocated.load(Ordering::Relaxed),
             self.counters.high_bytes_copied.load(Ordering::Relaxed),
         )
@@ -3380,7 +3407,9 @@ impl ZgcRealHeap {
     /// Cycles that compacted with a compiled frame live, on the per-cycle
     /// coverage proof. See the field doc for why a zero here is informative.
     pub fn relocation_on_proven_jit(&self) -> usize {
-        self.counters.relocation_on_proven_jit.load(Ordering::Relaxed)
+        self.counters
+            .relocation_on_proven_jit
+            .load(Ordering::Relaxed)
     }
 
     /// Refills served by a recycled block, split into the preferred rung and
@@ -3389,7 +3418,9 @@ impl ZgcRealHeap {
         (
             self.counters.tlab_refill_recycled.load(Ordering::Relaxed),
             self.counters.tlab_refill_starved.load(Ordering::Relaxed),
-            self.counters.tlab_refill_starved_bytes.load(Ordering::Relaxed),
+            self.counters
+                .tlab_refill_starved_bytes
+                .load(Ordering::Relaxed),
         )
     }
 
@@ -3397,8 +3428,12 @@ impl ZgcRealHeap {
     /// consumed. See [`Self::compaction_targets_recorded`].
     pub fn compaction_target_engagement(&self) -> (usize, usize) {
         (
-            self.counters.compaction_targets_recorded.load(Ordering::Relaxed),
-            self.counters.compaction_targets_consumed.load(Ordering::Relaxed),
+            self.counters
+                .compaction_targets_recorded
+                .load(Ordering::Relaxed),
+            self.counters
+                .compaction_targets_consumed
+                .load(Ordering::Relaxed),
         )
     }
 
@@ -3413,12 +3448,16 @@ impl ZgcRealHeap {
     pub fn relocation_coverage_reason_counts(
         &self,
     ) -> [usize; crate::gc_quiescence::incomplete_reason::COUNT] {
-        std::array::from_fn(|i| self.counters.relocation_coverage_reasons[i].load(Ordering::Relaxed))
+        std::array::from_fn(|i| {
+            self.counters.relocation_coverage_reasons[i].load(Ordering::Relaxed)
+        })
     }
 
     /// Lifetime count of TLAB cells a retire could not lock.
     pub fn tlab_retire_skipped(&self) -> usize {
-        self.counters.tlab_retire_skipped_total.load(Ordering::Relaxed)
+        self.counters
+            .tlab_retire_skipped_total
+            .load(Ordering::Relaxed)
     }
 
     /// Cells the SAFEPOINT retire could not lock -- the dangerous half of
@@ -3445,7 +3484,9 @@ impl ZgcRealHeap {
     pub fn driver_engagement(&self) -> (usize, usize) {
         (
             self.counters.driver_passes.load(Ordering::Relaxed),
-            self.counters.parallel_mark_fallbacks.load(Ordering::Relaxed),
+            self.counters
+                .parallel_mark_fallbacks
+                .load(Ordering::Relaxed),
         )
     }
 
@@ -3462,7 +3503,10 @@ impl ZgcRealHeap {
         ZFragGauge {
             samples: self.counters.frag_samples.load(Ordering::Relaxed),
             worst_permille: (worst != usize::MAX).then_some(worst),
-            free_permille: self.counters.frag_worst_free_permille.load(Ordering::Relaxed),
+            free_permille: self
+                .counters
+                .frag_worst_free_permille
+                .load(Ordering::Relaxed),
             worst_cycle: self.counters.frag_worst_cycle.load(Ordering::Relaxed),
         }
     }
@@ -3504,14 +3548,21 @@ impl ZgcRealHeap {
         let largest_permille = servable.saturating_mul(1000) / capacity;
         self.counters.frag_samples.fetch_add(1, Ordering::Relaxed);
         if largest_permille < self.counters.frag_worst_permille.load(Ordering::Relaxed) {
-            self.counters.frag_worst_permille
+            self.counters
+                .frag_worst_permille
                 .store(largest_permille, Ordering::Relaxed);
-            self.counters.frag_worst_free_permille
+            self.counters
+                .frag_worst_free_permille
                 .store(free_permille, Ordering::Relaxed);
-            self.counters.frag_worst_cycle.store(cycle, Ordering::Relaxed);
+            self.counters
+                .frag_worst_cycle
+                .store(cycle, Ordering::Relaxed);
         }
         if largest_permille < ZGC_FRAG_FLOOR_PERMILLE
-            && !self.counters.frag_floor_warned.swap(true, Ordering::Relaxed)
+            && !self
+                .counters
+                .frag_floor_warned
+                .swap(true, Ordering::Relaxed)
         {
             tracing::warn!(
                 target: "cratonvm::gc::guard",
@@ -3620,7 +3671,10 @@ impl ZgcRealHeap {
         // spread over them, handoffs are correspondingly rarer per bucket and
         // about as frequent overall. `Z_SATB_HANDOFF_INTERVAL` is divided by the
         // bucket count for that reason; see its own note.
-        let n = self.counters.mark_ingress.push(satb_ingress_slot(), old_addr as u64);
+        let n = self
+            .counters
+            .mark_ingress
+            .push(satb_ingress_slot(), old_addr as u64);
         if n % Z_SATB_HANDOFF_PER_BUCKET == 0 {
             self.hand_satb_batch_to_the_marker();
         }
@@ -3669,7 +3723,8 @@ impl ZgcRealHeap {
         if self.counters.mark_ingress.drain_into(&mut batch) == 0 {
             return;
         }
-        self.counters.conc_ingress_replayed
+        self.counters
+            .conc_ingress_replayed
             .fetch_add(batch.len(), Ordering::Relaxed);
         pool.push_roots(&batch);
 
@@ -4003,7 +4058,10 @@ impl ZgcRealHeap {
     /// evidence for its size. `measure_the_pool_construction_cost` is the
     /// instrument that measures what this actually removes; the mark pause is
     /// dominated by the coordination protocol and moves under it.
-    fn persistent_mark_pool(&self, workers: usize) -> Option<std::sync::Arc<mark::ZMarkCoordinator>> {
+    fn persistent_mark_pool(
+        &self,
+        workers: usize,
+    ) -> Option<std::sync::Arc<mark::ZMarkCoordinator>> {
         match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_MARK_POOL_PERSISTENT") {
             Some(raw) => {
                 let v = raw.to_string_lossy().trim().to_ascii_lowercase();
@@ -4076,7 +4134,8 @@ impl ZgcRealHeap {
         };
         coordinator.push_roots(roots);
         let _clear_ctx = ClearCycleContext(
-            self.persistent_mark_pool(workers).map(|_| std::sync::Arc::clone(&coordinator)),
+            self.persistent_mark_pool(workers)
+                .map(|_| std::sync::Arc::clone(&coordinator)),
         );
 
         // One restart is budgeted rather than zero, for the reason the old
@@ -4109,7 +4168,8 @@ impl ZgcRealHeap {
             Ordering::Relaxed,
         );
         coordinator.end_cycle();
-        self.counters.driver_passes
+        self.counters
+            .driver_passes
             .fetch_add(outcome.passes, Ordering::Relaxed);
 
         if !outcome.mark_set_complete {
@@ -4474,7 +4534,8 @@ impl ZgcRealHeap {
         for w in self.young_pages.iter() {
             w.store(0, Ordering::Relaxed);
         }
-        self.young_page_grid_overflow.store(false, Ordering::Relaxed);
+        self.young_page_grid_overflow
+            .store(false, Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::Release);
     }
 
@@ -4501,12 +4562,13 @@ impl ZgcRealHeap {
             return 0;
         }
         let limit = (floor - self.arena_base) / Self::Z_YOUNG_GRAIN_BYTES;
-        (0..limit).filter(|pg| {
-            self.young_pages
-                .get(pg >> 6)
-                .is_some_and(|w| w.load(Ordering::Relaxed) & (1u64 << (pg & 63)) != 0)
-        })
-        .count()
+        (0..limit)
+            .filter(|pg| {
+                self.young_pages
+                    .get(pg >> 6)
+                    .is_some_and(|w| w.load(Ordering::Relaxed) & (1u64 << (pg & 63)) != 0)
+            })
+            .count()
     }
 
     fn addr_is_young(&self, addr: usize, promotion_age: u8) -> bool {
@@ -4720,7 +4782,8 @@ impl ZgcRealHeap {
                 carded += 1;
             }
         }
-        self.counters.gen_recards_after_relocation
+        self.counters
+            .gen_recards_after_relocation
             .fetch_add(carded, Ordering::Relaxed);
         carded
     }
@@ -4830,7 +4893,9 @@ impl ZgcRealHeap {
             self.counters.gen_old_retained.load(Ordering::Relaxed),
             self.counters.gen_remembered_roots.load(Ordering::Relaxed),
             self.counters.gen_promotions.load(Ordering::Relaxed),
-            self.counters.gen_recards_after_relocation.load(Ordering::Relaxed),
+            self.counters
+                .gen_recards_after_relocation
+                .load(Ordering::Relaxed),
         )
     }
 
@@ -4876,7 +4941,9 @@ impl ZgcRealHeap {
     }
 
     pub fn promotions_by_slide(&self) -> usize {
-        self.counters.gen_promotions_by_slide.load(Ordering::Relaxed)
+        self.counters
+            .gen_promotions_by_slide
+            .load(Ordering::Relaxed)
     }
 
     /// `(collections the nursery trigger asked for, the nursery budget in bytes)`
@@ -4898,7 +4965,9 @@ impl ZgcRealHeap {
     /// see [`Self::gen_nursery_overshoot_max`]. Read against the budget on
     /// [`Self::nursery_trigger_stats`]; alone it says nothing.
     pub fn nursery_overshoot_max(&self) -> usize {
-        self.counters.gen_nursery_overshoot_max.load(Ordering::Relaxed)
+        self.counters
+            .gen_nursery_overshoot_max
+            .load(Ordering::Relaxed)
     }
 
     pub fn nursery_trigger_stats(&self) -> (usize, usize) {
@@ -5074,7 +5143,8 @@ impl ZgcRealHeap {
         // collector's bounded wait could not outlast forbids this cycle's
         // slide. `false` in every build without `gpu-offload`. See
         // `vm_heap::gpu_relocation_forbidden`.
-        self.relocation_enabled.load(Ordering::Relaxed) && !crate::vm_heap::gpu_relocation_forbidden()
+        self.relocation_enabled.load(Ordering::Relaxed)
+            && !crate::vm_heap::gpu_relocation_forbidden()
     }
 
     /// Turn the stop-the-world slide on or off for THIS heap.
@@ -5313,7 +5383,8 @@ impl ZgcRealHeap {
             return false;
         }
         // THE VACUOUS-ZERO SCREEN. See point 2 above.
-        if crate::gc_quiescence::is_active() && crate::gc_quiescence::conservative_jit_scans() == 0 {
+        if crate::gc_quiescence::is_active() && crate::gc_quiescence::conservative_jit_scans() == 0
+        {
             return false;
         }
         true
@@ -5327,7 +5398,9 @@ impl ZgcRealHeap {
     /// high means the new path never opened and the finding is unfixed; high
     /// with `skipped_jit` low means it is carrying the workload.
     pub fn relocation_on_page_pins(&self) -> usize {
-        self.counters.relocation_on_page_pins.load(Ordering::Relaxed)
+        self.counters
+            .relocation_on_page_pins
+            .load(Ordering::Relaxed)
     }
 
     /// `(slides_verified, survivors_walked, missed_rewrites, unregistered_targets)`
@@ -5341,11 +5414,15 @@ impl ZgcRealHeap {
     pub fn slide_verification_stats(&self) -> (usize, usize, usize, usize) {
         (
             self.counters.slide_verifications.load(Ordering::Relaxed),
-            self.counters.slide_verified_survivors.load(Ordering::Relaxed),
+            self.counters
+                .slide_verified_survivors
+                .load(Ordering::Relaxed),
             self.counters
                 .slide_verify_missed_rewrites
                 .load(Ordering::Relaxed),
-            self.counters.slide_verify_unregistered.load(Ordering::Relaxed),
+            self.counters
+                .slide_verify_unregistered
+                .load(Ordering::Relaxed),
         )
     }
 }
@@ -5507,7 +5584,9 @@ impl ZgcRealHeap {
         let (blocks_before, free_bytes, largest) = arena.high_free_shape();
         let gain = free_bytes.saturating_sub(largest);
         if gain < ZGC_LARGE_OBJECT_MIN {
-            self.counters.high_compaction_declined.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .high_compaction_declined
+                .fetch_add(1, Ordering::Relaxed);
             return (0, 0);
         }
 
@@ -5691,9 +5770,15 @@ impl ZgcRealHeap {
         }
 
         let reclaimed = arena.compact_high_to(floor - base, &vacated);
-        self.counters.high_compaction_cycles.fetch_add(1, Ordering::Relaxed);
-        self.counters.high_objects_relocated.fetch_add(moved, Ordering::Relaxed);
-        self.counters.high_bytes_copied.fetch_add(copied, Ordering::Relaxed);
+        self.counters
+            .high_compaction_cycles
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .high_objects_relocated
+            .fetch_add(moved, Ordering::Relaxed);
+        self.counters
+            .high_bytes_copied
+            .fetch_add(copied, Ordering::Relaxed);
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ZGC_HIGH").is_some() {
             let (blocks_after, bytes_after, largest_after) = arena.high_free_shape();
             eprintln!(
@@ -5869,7 +5954,9 @@ impl ZgcRealHeap {
         // `probes/OopMapPeerCoverage.java` reports 42 skips across both kinds,
         // which is exactly the reading a conflated counter cannot act on.
         if self.tlab_retire_incomplete.load(Ordering::Acquire) {
-            self.counters.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .relocation_skipped_jit
+                .fetch_add(1, Ordering::Relaxed);
             if let Some(slot) = self
                 .counters
                 .relocation_skip_reasons
@@ -5915,7 +6002,9 @@ impl ZgcRealHeap {
         };
         let frames_are_rewritable = frames_are_rewritable && !(blanket && compiled_frames_live);
         if compiled_frames_live && !frames_are_rewritable {
-            self.counters.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .relocation_skipped_jit
+                .fetch_add(1, Ordering::Relaxed);
             if let Some(r) = refusal {
                 if let Some(slot) = self.counters.relocation_skip_reasons.get(r) {
                     slot.fetch_add(1, Ordering::Relaxed);
@@ -5933,7 +6022,8 @@ impl ZgcRealHeap {
             return (0, reclaimed, cratonvm_types::PointerMap::default());
         }
         if compiled_frames_live {
-            self.counters.relocation_on_proven_jit
+            self.counters
+                .relocation_on_proven_jit
                 .fetch_add(1, Ordering::Relaxed);
         }
         // WHICH of the two licences this cycle used. `relocation_on_proven_jit`
@@ -5941,7 +6031,9 @@ impl ZgcRealHeap {
         // cycle whose proof PASSED from one whose proof failed on a reason page
         // pinning covers -- and those are different claims about the collector.
         if crate::gc_quiescence::moving_young_coverage_incomplete() {
-            self.counters.relocation_on_page_pins.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .relocation_on_page_pins
+                .fetch_add(1, Ordering::Relaxed);
         }
         // A RETAINED TLAB CHUNK IS NOW A REFUSAL ABOVE, not a ruling-out. The
         // paragraph that used to stand here said it "could never fire" on the
@@ -6599,9 +6691,11 @@ impl ZgcRealHeap {
                         vacated.push((lo - base, hi - base));
                     }
                     let bytes: usize = vacated.iter().map(|(s, e)| e - s).sum();
-                    self.counters.vacated_spans_published
+                    self.counters
+                        .vacated_spans_published
                         .fetch_add(vacated.len(), Ordering::Relaxed);
-                    self.counters.vacated_bytes_published
+                    self.counters
+                        .vacated_bytes_published
                         .fetch_add(bytes, Ordering::Relaxed);
                 }
                 // WHERE A FORWARDING WORD CAN LIVE. `compact_low_to` zeroes
@@ -7233,7 +7327,10 @@ impl ZgcRealHeap {
         // Cap the log, not the screen: the skip must happen for every offender
         // or the walk still faults, but sixteen lines is enough to see the
         // shape and a million would itself be the hang.
-        let n = self.counters.unwalkable_reports.fetch_add(1, Ordering::Relaxed);
+        let n = self
+            .counters
+            .unwalkable_reports
+            .fetch_add(1, Ordering::Relaxed);
         if n < 16 {
             tracing::error!(
                 target: "cratonvm::gc::guard",
@@ -7293,7 +7390,9 @@ impl ZgcRealHeap {
         // the only thing that can tell "every slot resolved" from "the
         // verifier never ran" — see the field docs on
         // `ZgcCounters::slide_verifications`.
-        self.counters.slide_verifications.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .slide_verifications
+            .fetch_add(1, Ordering::Relaxed);
         self.counters
             .slide_verified_survivors
             .fetch_add(live_now.len(), Ordering::Relaxed);
@@ -7649,7 +7748,8 @@ impl ZgcRealHeap {
                 );
             }
             *self.counters.compaction_target.lock() = Some((w.start, w.end, gc_now));
-            self.counters.compaction_targets_recorded
+            self.counters
+                .compaction_targets_recorded
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -7661,7 +7761,8 @@ impl ZgcRealHeap {
     /// selector to one part of the arena forever.
     fn take_compaction_target_pages(&self) -> Option<(u64, u64)> {
         let (start, end, _recorded_at) = self.counters.compaction_target.lock().take()?;
-        self.counters.compaction_targets_consumed
+        self.counters
+            .compaction_targets_consumed
             .fetch_add(1, Ordering::Relaxed);
         if end <= start {
             return None;
@@ -8743,7 +8844,8 @@ impl ZgcRealHeap {
             self.stamp_lo.store(lo, Ordering::Release);
             self.stamp_hi.store(hi, Ordering::Release);
         }
-        self.counters.forwarding_words_stamped
+        self.counters
+            .forwarding_words_stamped
             .fetch_add(stamped, Ordering::Relaxed);
     }
 
@@ -8803,7 +8905,8 @@ impl ZgcRealHeap {
         // SAFETY: bounded above, 8-aligned, and inside a `Vec<u8>` that lives
         // for as long as this heap. Reading a `u64` out of initialised arena
         // bytes is well-defined whatever they hold.
-        let mark = unsafe { (*((addr + MARK_WORD_OFFSET) as *const AtomicU64)).load(Ordering::Relaxed) };
+        let mark =
+            unsafe { (*((addr + MARK_WORD_OFFSET) as *const AtomicU64)).load(Ordering::Relaxed) };
         if !cratonvm_types::ObjectHeader::is_forwarded_mark(mark) {
             return None;
         }
@@ -8836,7 +8939,9 @@ impl ZgcRealHeap {
 
     pub fn forwarding_word_engagement(&self) -> (usize, usize) {
         (
-            self.counters.forwarding_words_stamped.load(Ordering::Relaxed),
+            self.counters
+                .forwarding_words_stamped
+                .load(Ordering::Relaxed),
             self.counters.forwarding_words_read.load(Ordering::Relaxed),
         )
     }
@@ -8850,7 +8955,9 @@ impl ZgcRealHeap {
         // `stamp_forwarding_words` for why that split is a property of sliding
         // compaction rather than of this function.
         if let Some(target) = self.forwarding_word_at(addr) {
-            self.counters.forwarding_words_read.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .forwarding_words_read
+                .fetch_add(1, Ordering::Relaxed);
             return Some(target);
         }
         let reloc = self.counters.relocations.lock();
@@ -9135,7 +9242,8 @@ impl ZgcRealHeap {
             Some((from, (to, class_id, size, cycle))) => {
                 let still_live = self.registry.contains(to);
                 let cycles_ago = self
-                    .counters.corpse_cycle
+                    .counters
+                    .corpse_cycle
                     .load(Ordering::Relaxed)
                     .saturating_sub(cycle + 1);
                 tracing::error!(
@@ -9260,7 +9368,9 @@ impl ZgcRealHeap {
         match &self.mark_bits {
             Some(bits) => bits.insert(base),
             // SAFETY: as `mark_is_set`.
-            None => self.header_ref(base as *mut u8).add_gc_flags(GC_FLAG_MARKED),
+            None => self
+                .header_ref(base as *mut u8)
+                .add_gc_flags(GC_FLAG_MARKED),
         }
     }
 
@@ -9638,7 +9748,8 @@ impl ZgcRealHeap {
     pub fn concurrent_mark_skip_set(&self) -> Option<std::sync::Arc<FxHashSet<usize>>> {
         // Clone the handle under the read lock and return; the guard is gone
         // by the time the caller walks anything.
-        self.counters.mark_ref_skip
+        self.counters
+            .mark_ref_skip
             .read()
             .as_ref()
             .map(std::sync::Arc::clone)
@@ -10324,7 +10435,7 @@ fn recycled_chunk_size(
         && bump_headroom < want
         && direct_reserve_spare
         && size >= (want / 64).max(need))
-        .then_some(size)
+    .then_some(size)
 }
 
 /// Is the starved floor allowed to fire at all?
@@ -10361,15 +10472,15 @@ fn starved_recycle_permitted(publish_vacated: bool) -> bool {
 /// that differs by it differs by far more than this decision.
 fn starved_recycle_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(
-        || match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_TLAB_STARVED_RECYCLE") {
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_TLAB_STARVED_RECYCLE") {
             Some(raw) => {
                 let v = raw.to_string_lossy().trim().to_ascii_lowercase();
                 !matches!(v.as_str(), "0" | "off" | "false" | "no")
             }
             None => true,
-        },
-    )
+        }
+    })
 }
 
 /// Share of the arena that TLAB chunks may hold in RESERVATION at one time.
@@ -10986,10 +11097,7 @@ const ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET: usize = 25;
 /// `CRATONVM_ZGC_ALLOC_TRIGGER=0` is an explicit refusal and stays off even
 /// with a target set -- that is the arm that measures the target alone.
 fn zgc_alloc_trigger_percent() -> usize {
-    alloc_trigger_percent_for(
-        zgc_alloc_trigger_percent_explicit(),
-        zgc_pause_target_ms(),
-    )
+    alloc_trigger_percent_for(zgc_alloc_trigger_percent_explicit(), zgc_pause_target_ms())
 }
 
 /// The decision itself, without the environment: the operator's percentage if
@@ -11038,8 +11146,8 @@ fn alloc_trigger_percent_for(explicit: Option<usize>, _pause_target_ms: u64) -> 
 /// between the two cursors is provably empty.
 fn zgc_bitmap_bounds_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_BITMAP_BOUNDS") {
+    *CACHED.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_BITMAP_BOUNDS") {
             Ok(value) => {
                 let value = value.trim();
                 !matches!(
@@ -11048,8 +11156,8 @@ fn zgc_bitmap_bounds_enabled() -> bool {
                 )
             }
             Err(_) => true,
-        }
-    })
+        },
+    )
 }
 
 /// The floor under [`zgc_alloc_trigger_percent`]'s budget.
@@ -11923,7 +12031,10 @@ impl barrier::ZBarrierContext for ZgcRealHeap {
         // The count comes back from the bucket's own lock; there is no shared
         // counter on this path either, and the key is per-thread for the same
         // reason. See `satb_pre_barrier_slow` and `satb_ingress_slot`.
-        let _ = self.counters.mark_ingress.push(satb_ingress_slot(), absolute as u64);
+        let _ = self
+            .counters
+            .mark_ingress
+            .push(satb_ingress_slot(), absolute as u64);
     }
 
     fn stats(&self) -> &barrier::ZBarrierStats {
@@ -11987,7 +12098,6 @@ impl ZgcRealHeap {
             }
         });
     }
-
 }
 
 impl mark::ZMarkContext for ZgcRealHeap {
@@ -12122,7 +12232,11 @@ impl mark::ZMarkContext for ZgcRealHeap {
             // No cycle open. Trace everything (including referents) and say so
             // ONCE -- see `concurrent_mark_skip_set` for why leaking beats
             // dropping an edge, and why the latch is not optional.
-            if !self.counters.mark_ref_skip_warned.swap(true, Ordering::Relaxed) {
+            if !self
+                .counters
+                .mark_ref_skip_warned
+                .swap(true, Ordering::Relaxed)
+            {
                 tracing::warn!(
                     target: "zgc",
                     "zgc concurrent mark: visit_refs ran with no skip-set snapshot; \
@@ -12148,7 +12262,11 @@ impl mark::ZMarkContext for ZgcRealHeap {
                     // No cycle open. Trace everything (including referents) and
                     // say so ONCE — see `concurrent_mark_skip_set` for why leaking
                     // beats dropping an edge, and why the latch is not optional.
-                    if !self.counters.mark_ref_skip_warned.swap(true, Ordering::Relaxed) {
+                    if !self
+                        .counters
+                        .mark_ref_skip_warned
+                        .swap(true, Ordering::Relaxed)
+                    {
                         tracing::warn!(
                             target: "zgc",
                             "zgc concurrent mark: visit_refs ran with no skip-set snapshot; \
@@ -12997,8 +13115,7 @@ impl GarbageCollector for ZgcRealHeap {
                         // allocation before a heap fills, not the first. The
                         // element keeps its old value on this arm; nothing is
                         // half-written. See `ARRAY_STORE_OUT_OF_MEMORY`.
-                        let Some(wrapper) =
-                            self.try_alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1)
+                        let Some(wrapper) = self.try_alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1)
                         else {
                             return Err(crate::heap::ARRAY_STORE_OUT_OF_MEMORY);
                         };
@@ -13082,10 +13199,14 @@ impl GarbageCollector for ZgcRealHeap {
             // workload is the whole question when the collection COUNT is
             // what differs between two arms.
             if a >= self.gc_threshold {
-                self.counters.trigger_threshold.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .trigger_threshold
+                    .fetch_add(1, Ordering::Relaxed);
             }
             if self.headroom_low.load(Ordering::Relaxed) {
-                self.counters.trigger_headroom.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .trigger_headroom
+                    .fetch_add(1, Ordering::Relaxed);
             }
             return true;
         }
@@ -13266,7 +13387,9 @@ impl GarbageCollector for ZgcRealHeap {
                 arena.decommit_unbumped_middle() + arena.decommit_free_blocks()
             };
             if released != 0 {
-                self.counters.bytes_uncommitted.fetch_add(released, Ordering::Relaxed);
+                self.counters
+                    .bytes_uncommitted
+                    .fetch_add(released, Ordering::Relaxed);
                 // RETRACT THE INLINE-LOAD BOUND. This is the half that was
                 // missing, and it is a fault rather than a slowdown.
                 //
@@ -13302,7 +13425,10 @@ impl GarbageCollector for ZgcRealHeap {
                 // compiled; `set_barrier_color` documents the same manoeuvre for
                 // the same table.
                 if zgc_jit_read_bounds_enabled()
-                    && !self.counters.jit_read_bounds_retracted.swap(true, Ordering::Relaxed)
+                    && !self
+                        .counters
+                        .jit_read_bounds_retracted
+                        .swap(true, Ordering::Relaxed)
                 {
                     crate::gen_heap::publish_jit_read_bounds(0, 0, 0);
                     tracing::info!(
@@ -13458,14 +13584,16 @@ impl GarbageCollector for ZgcRealHeap {
         // marker runs so both get the same roots.
         let gen_extra_roots: Vec<usize> = if young_cycle {
             let extra = self.young_extra_roots(promo_age);
-            self.counters.gen_remembered_roots
+            self.counters
+                .gen_remembered_roots
                 .fetch_add(extra.len(), Ordering::Relaxed);
             extra
         } else {
             Vec::new()
         };
         if young_cycle {
-            self.counters.gen_old_retained
+            self.counters
+                .gen_old_retained
                 .fetch_add(gen_old_retained, Ordering::Relaxed);
         }
 
@@ -13477,7 +13605,8 @@ impl GarbageCollector for ZgcRealHeap {
         // it. Mirrors the G1 marker's `g1_set_reference_skip_set`; see
         // `enumerate_references`'s doc comment.
         let ref_skip_objs: FxHashSet<usize> = self
-            .counters.ref_processor
+            .counters
+            .ref_processor
             .lock()
             .reference_object_addresses()
             .into_iter()
@@ -13553,7 +13682,9 @@ impl GarbageCollector for ZgcRealHeap {
             self.end_concurrent_mark_cycle();
             match driven {
                 Some(stats) => {
-                    self.counters.parallel_mark_cycles.fetch_add(1, Ordering::Relaxed);
+                    self.counters
+                        .parallel_mark_cycles
+                        .fetch_add(1, Ordering::Relaxed);
                     // `off_head_children` is this loop's `wild_skipped` under
                     // another name — the engine's own doc says so.
                     wild_skipped = stats.off_heap_children as usize;
@@ -13573,7 +13704,9 @@ impl GarbageCollector for ZgcRealHeap {
                 // bits already set are idempotent, so the fallback is a
                 // superset of whatever the driver managed.
                 None => {
-                    self.counters.parallel_mark_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    self.counters
+                        .parallel_mark_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
                     parallel_ok = false;
                 }
             }
@@ -14051,23 +14184,29 @@ impl GarbageCollector for ZgcRealHeap {
         let mut live_bytes = bytes_copied;
         if young_cycle {
             live_bytes = live_bytes.saturating_add(self.gen_old_live_bytes.load(Ordering::Relaxed));
-            self.counters.gen_sweep_skipped
+            self.counters
+                .gen_sweep_skipped
                 .fetch_add(registered_count.saturating_sub(swept), Ordering::Relaxed);
         }
         // The engagement counters for the two cost reductions, published
         // whether or not this cycle was young -- so a run whose young cycles all
         // ended up as majors reports zeroes rather than nothing.
         if zero_bytes_skipped != 0 {
-            self.counters.gen_zero_bytes_skipped
+            self.counters
+                .gen_zero_bytes_skipped
                 .fetch_add(zero_bytes_skipped, Ordering::Relaxed);
         }
         if dead_in_runs != 0 {
-            self.counters.gen_dead_runs.fetch_add(dead_runs, Ordering::Relaxed);
-            self.counters.gen_dead_objects
+            self.counters
+                .gen_dead_runs
+                .fetch_add(dead_runs, Ordering::Relaxed);
+            self.counters
+                .gen_dead_objects
                 .fetch_add(dead_in_runs, Ordering::Relaxed);
         }
         if gen_promoted != 0 {
-            self.counters.gen_promotions
+            self.counters
+                .gen_promotions
                 .fetch_add(gen_promoted, Ordering::Relaxed);
             // ARM THE BARRIER. Published after the sweep has set every one of
             // those ages and written every promotion card, so a store that sees
@@ -14082,7 +14221,9 @@ impl GarbageCollector for ZgcRealHeap {
             crate::gen_heap::set_jit_ref_store_post_active(true);
         }
         if self.gen_nursery_triggered.swap(false, Ordering::Relaxed) {
-            self.counters.gen_nursery_triggers.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .gen_nursery_triggers
+                .fetch_add(1, Ordering::Relaxed);
             // HOW FAR PAST THE BUDGET THE NURSERY GOT. Measured from
             // `self.allocated` -- which this collection has NOT reset yet, the
             // reset being ~60 lines below -- against the same watermark and
@@ -14096,7 +14237,8 @@ impl GarbageCollector for ZgcRealHeap {
                 .load(Ordering::Relaxed)
                 .saturating_sub(self.cycle_alloc_watermark.load(Ordering::Relaxed));
             let over = grew.saturating_sub(budget);
-            self.counters.gen_nursery_overshoot_max
+            self.counters
+                .gen_nursery_overshoot_max
                 .fetch_max(over, Ordering::Relaxed);
         }
         if young_cycle {
@@ -14202,7 +14344,8 @@ impl GarbageCollector for ZgcRealHeap {
         // away the one signal this whole mechanism exists to carry.
         self.hard_alloc_failure.store(false, Ordering::Relaxed);
         // Re-arm the stress trigger against the post-sweep live figure.
-        self.counters.gc_stress_mark
+        self.counters
+            .gc_stress_mark
             .store(self.allocated.load(Ordering::Relaxed), Ordering::Relaxed);
         let cycle = self.gc_count.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -14383,7 +14526,9 @@ impl GarbageCollector for ZgcRealHeap {
                 // them.
                 self.pause_target_ms.load(Ordering::Relaxed),
                 self.pause_affordable_span.load(Ordering::Relaxed),
-                self.counters.pause_target_unreachable.load(Ordering::Relaxed),
+                self.counters
+                    .pause_target_unreachable
+                    .load(Ordering::Relaxed),
             );
         }
 
@@ -14424,8 +14569,12 @@ impl GarbageCollector for ZgcRealHeap {
             let live_now: Vec<usize> = self.registry.snapshot().bases();
             let (moved, reclaimed, map) = self.relocate_stw(&live_now);
             if moved > 0 {
-                self.counters.compaction_cycles.fetch_add(1, Ordering::Relaxed);
-                self.counters.objects_relocated.fetch_add(moved, Ordering::Relaxed);
+                self.counters
+                    .compaction_cycles
+                    .fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .objects_relocated
+                    .fetch_add(moved, Ordering::Relaxed);
                 for r in roots.iter_mut() {
                     if let Some(to) = map.get(&(r.as_ptr() as usize)) {
                         // SAFETY: `to` is an object base this slide just wrote,
@@ -14486,7 +14635,8 @@ impl GarbageCollector for ZgcRealHeap {
                     self.gen_young_floor.store(post_slide, Ordering::Relaxed);
                     self.gen_old_live_bytes
                         .store(bytes_copied, Ordering::Relaxed);
-                    self.counters.gen_promotions_by_slide
+                    self.counters
+                        .gen_promotions_by_slide
                         .fetch_add(moved, Ordering::Relaxed);
                     tracing::debug!(
                         target: "zgc",
@@ -14604,7 +14754,10 @@ impl GarbageCollector for ZgcRealHeap {
         // `remove_collected` already ran in `process_references`, BEFORE the
         // slide, so no dead entry is left for a survivor to inherit.
         if !pointer_map.is_empty() {
-            self.counters.ref_processor.lock().update_after_gc(&pointer_map);
+            self.counters
+                .ref_processor
+                .lock()
+                .update_after_gc(&pointer_map);
 
             // SAME FAMILY: the resurrected-finalizer list is an OUTPUT, and
             // its contract says POST-move.
@@ -14872,12 +15025,13 @@ pub(crate) mod tests {
         // re-derive its padded size.
         let mut top = base + capacity;
         let mut dead_spans: Vec<(usize, usize)> = Vec::new();
-        let mut alloc_dead = |heap: &ZgcRealHeap, top: &mut usize, spans: &mut Vec<(usize, usize)>| {
-            let o = heap.alloc_object(ClassId::new(1), FIELDS).as_ptr() as usize;
-            spans.push((o, *top));
-            *top = o;
-            o
-        };
+        let mut alloc_dead =
+            |heap: &ZgcRealHeap, top: &mut usize, spans: &mut Vec<(usize, usize)>| {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS).as_ptr() as usize;
+                spans.push((o, *top));
+                *top = o;
+                o
+            };
 
         // (1) A long CONTIGUOUS dead run at the very top. Coalesced this is one
         //     multi-granule block, which is the only shape `decommit_free_blocks`
@@ -14939,7 +15093,6 @@ pub(crate) mod tests {
             );
         }
     }
-
 
     // ------------------------------------------------------------------
     // TLAB chunk recycling
@@ -15031,10 +15184,16 @@ pub(crate) mod tests {
     fn the_recycled_chunk_decision_refuses_the_three_cases_it_must() {
         const CHUNK: usize = 512 * 1024;
         // 1. Nothing on the free list: ask for a full chunk.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, 0, CHUNK * 4, true, true), None);
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, 0, CHUNK * 4, true, true),
+            None
+        );
         // 2. Below the floor (`want / 8` = `max_tlab_alloc`): a buffer that
         //    small is churn, not a buffer.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8, CHUNK * 4, true, true), None);
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8, CHUNK * 4, true, true),
+            None
+        );
         assert_eq!(
             recycled_chunk_size(CHUNK, 64, CHUNK / 8, CHUNK * 4, true, true),
             Some(CHUNK / 8),
@@ -15042,8 +15201,14 @@ pub(crate) mod tests {
         );
         // 3. At or above a full chunk: there is nothing to decide, the ordinary
         //    `alloc(want)` finds it.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK, CHUNK * 4, true, true), None);
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4, CHUNK * 4, true, true), None);
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK, CHUNK * 4, true, true),
+            None
+        );
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK * 4, CHUNK * 4, true, true),
+            None
+        );
     }
 
     /// The guarantee `tlab_refill`'s contract rests on: whatever size comes
@@ -15056,24 +15221,26 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         for need in [8usize, 1024, CHUNK / 8, CHUNK / 8 + 8, CHUNK / 2] {
             for headroom in [0usize, CHUNK - 8, CHUNK, CHUNK * 4] {
-            for largest in [
-                0usize,
-                4096,
-                CHUNK / 8,
-                CHUNK / 2,
-                CHUNK - 96,
-                CHUNK,
-                CHUNK * 2,
-            ] {
-                if let Some(size) = recycled_chunk_size(CHUNK, need, largest, headroom, true, true) {
-                    assert!(
-                        size >= need,
-                        "need={need} largest={largest} produced a {size}-byte chunk",
-                    );
-                    assert!(size <= largest, "cannot carve more than the block holds");
-                    assert_eq!(size % ZGC_TLAB_ALIGN, 0, "chunks stay on the object grid");
+                for largest in [
+                    0usize,
+                    4096,
+                    CHUNK / 8,
+                    CHUNK / 2,
+                    CHUNK - 96,
+                    CHUNK,
+                    CHUNK * 2,
+                ] {
+                    if let Some(size) =
+                        recycled_chunk_size(CHUNK, need, largest, headroom, true, true)
+                    {
+                        assert!(
+                            size >= need,
+                            "need={need} largest={largest} produced a {size}-byte chunk",
+                        );
+                        assert!(size <= largest, "cannot carve more than the block holds");
+                        assert_eq!(size % ZGC_TLAB_ALIGN, 0, "chunks stay on the object grid");
+                    }
                 }
-            }
             }
         }
     }
@@ -15112,7 +15279,10 @@ pub(crate) mod tests {
         );
         // ...and `need` still bounds it in the starved regime, or the refill
         // would install a chunk its own allocation cannot use.
-        assert_eq!(recycled_chunk_size(CHUNK, short + 8, short, 0, true, true), None);
+        assert_eq!(
+            recycled_chunk_size(CHUNK, short + 8, short, 0, true, true),
+            None
+        );
     }
 
     /// **The starved floor is INERT while the vacated-span publication is off,
@@ -15480,7 +15650,11 @@ pub(crate) mod tests {
         // A YOUNG cycle. None of `below` is rooted, so all of it must go.
         let _ = head;
         let _ = gen_collect(&heap, &mut roots);
-        assert_eq!(heap.generational_stats().0, 1, "that must have been a minor");
+        assert_eq!(
+            heap.generational_stats().0,
+            1,
+            "that must have been a minor"
+        );
         let survivors = below
             .iter()
             .filter(|a| heap.is_object_address(**a).is_some())
@@ -15591,7 +15765,10 @@ pub(crate) mod tests {
             );
             return;
         }
-        assert_eq!(returned, 0, "a heap that has not collected returned nothing");
+        assert_eq!(
+            returned, 0,
+            "a heap that has not collected returned nothing"
+        );
         assert!(
             committed * 8 < CAP,
             "a fresh 256 MiB heap has committed {committed} bytes; lazy commit \
@@ -15811,9 +15988,7 @@ pub(crate) mod tests {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
             || {
-                let _ = heap.relocate_stw_for_test(
-                    &pre.iter().copied().collect::<Vec<_>>(),
-                );
+                let _ = heap.relocate_stw_for_test(&pre.iter().copied().collect::<Vec<_>>());
             },
         );
         assert_eq!(
@@ -16012,7 +16187,8 @@ pub(crate) mod tests {
         crate::gc_quiescence::leave();
         crate::gc_quiescence::publish_pinned_jit_roots(&[]);
         assert_eq!(
-            roots[0].as_ptr() as usize, pinned,
+            roots[0].as_ptr() as usize,
+            pinned,
             "the conservatively-pinned object MOVED; a JIT frame's register or \
              spill slot now names a vacated span"
         );
@@ -16038,7 +16214,7 @@ pub(crate) mod tests {
             crate::gc_quiescence::incomplete_reason::JIT_RELOCATION_UNSUPPORTED,
         ] {
             let _serial = quiescence_test_guard();
-        let (heap, mut roots, pre) = sparse_pages_for_relocation();
+            let (heap, mut roots, pre) = sparse_pages_for_relocation();
             let stw = unsafe { StopTheWorldToken::new() };
             let _depth = crate::gc_quiescence::enter();
             crate::gc_quiescence::begin_moving_young_coverage_cycle();
@@ -16283,7 +16459,8 @@ pub(crate) mod tests {
         // headroom, so the cycle opens late -- capped at the ceiling.
         heap.allocated.store(1024 * 1024, Ordering::Relaxed);
         heap.refresh_adaptive_conc_start(1_000_000_000);
-        heap.conc_mark_nanos_ewma.store(1_000_000, Ordering::Relaxed); // 1 ms
+        heap.conc_mark_nanos_ewma
+            .store(1_000_000, Ordering::Relaxed); // 1 ms
         heap.allocated.store(2 * 1024 * 1024, Ordering::Relaxed);
         heap.refresh_adaptive_conc_start(2_000_000_000);
         let slow = heap.conc_start_bytes.load(Ordering::Relaxed) as u64;
@@ -16296,8 +16473,7 @@ pub(crate) mod tests {
         // headroom, and the FLOOR is what stops it opening at nothing.
         heap.conc_mark_nanos_ewma
             .store(60_000_000_000, Ordering::Relaxed); // 60 s
-        heap.allocated
-            .store(48 * 1024 * 1024, Ordering::Relaxed);
+        heap.allocated.store(48 * 1024 * 1024, Ordering::Relaxed);
         heap.refresh_adaptive_conc_start(2_100_000_000);
         let fast = heap.conc_start_bytes.load(Ordering::Relaxed) as u64;
         assert_eq!(
@@ -16330,7 +16506,8 @@ pub(crate) mod tests {
         let before = heap.gc_threshold / 3;
         heap.conc_start_bytes.store(before, Ordering::Relaxed);
         // Enough state that an ACTIVE refresh would certainly move it.
-        heap.conc_mark_nanos_ewma.store(5_000_000_000, Ordering::Relaxed);
+        heap.conc_mark_nanos_ewma
+            .store(5_000_000_000, Ordering::Relaxed);
         heap.alloc_rate_scaled.store(1 << 20, Ordering::Relaxed);
         heap.refresh_adaptive_conc_start(12_345);
         assert_eq!(
@@ -17112,8 +17289,9 @@ pub(crate) mod tests {
             serial.first().copied().unwrap_or(0),
             serial.last().copied().unwrap_or(0),
             s_med,
-            100.0 * (serial.last().copied().unwrap_or(0) - serial.first().copied().unwrap_or(0))
-                as f64
+            100.0
+                * (serial.last().copied().unwrap_or(0) - serial.first().copied().unwrap_or(0))
+                    as f64
                 / s_med.max(1) as f64,
         );
     }
@@ -17183,7 +17361,10 @@ pub(crate) mod tests {
             let mut roots = [head];
             heap.collect_garbage(&stw, &mut roots, &NoMonitors);
             let kept = live.iter().filter(|a| heap.registry.contains(**a)).count();
-            let leaked = garbage.iter().filter(|a| heap.registry.contains(**a)).count();
+            let leaked = garbage
+                .iter()
+                .filter(|a| heap.registry.contains(**a))
+                .count();
             (kept, leaked)
         }
         let bitmap = survivors_of(true);
@@ -17238,8 +17419,7 @@ pub(crate) mod tests {
         let heap = std::sync::Arc::new(heap_on_mark_arm(8 * 1024 * 1024, true));
         // Adjacent allocations, so most of them share a bitmap word with a
         // neighbour -- which is the whole reason a plain RMW would lose one.
-        let bases: std::sync::Arc<Vec<usize>> =
-            std::sync::Arc::new(mark_arm_chain(&heap, OBJECTS));
+        let bases: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(mark_arm_chain(&heap, OBJECTS));
         let wins = std::sync::Arc::new(AtomicUsize::new(0));
         let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
         let mut handles = Vec::new();
@@ -17269,7 +17449,10 @@ pub(crate) mod tests {
              exactly one thread must win each object"
         );
         for b in bases.iter() {
-            assert!(heap.mark_is_set(*b), "0x{b:x} was claimed but is not marked");
+            assert!(
+                heap.mark_is_set(*b),
+                "0x{b:x} was claimed but is not marked"
+            );
         }
     }
 
@@ -17342,7 +17525,8 @@ pub(crate) mod tests {
         let monitors = RecordingMonitors::new(false);
         let (addrs, still) = sweep_a_heap_of_garbage(&heap, &monitors, 400);
         assert_eq!(
-            still, 0,
+            still,
+            0,
             "{} of {} unrooted objects are still registered after a sweep that \
              was not asked for the dead addresses",
             still,
@@ -18986,7 +19170,8 @@ pub(crate) mod tests {
             panic!("the holder's reference must still name an object");
         };
         assert_ne!(
-            target_now.as_ptr() as usize, before,
+            target_now.as_ptr() as usize,
+            before,
             "the target had two dead large objects around it; it must have been \
              packed upward, or this test is not exercising the slide"
         );
@@ -21764,7 +21949,10 @@ pub(crate) mod tests {
         let mut guard = 0;
         while heap.try_alloc_object(ClassId::new(0), 1).is_some() {
             guard += 1;
-            assert!(guard < 1_000_000, "a 1 MiB heap cannot serve this many objects");
+            assert!(
+                guard < 1_000_000,
+                "a 1 MiB heap cannot serve this many objects"
+            );
         }
         assert_eq!(
             heap.set_array_element(arr, 1, Value::Int(9)),
@@ -21986,7 +22174,11 @@ pub(crate) mod tests {
         // 200 ms over a 500 MiB span: twice the target, so half the span.
         heap.refresh_pause_target_budget(200_000_000, 100 * MIB, 400 * MIB);
         let (_, affordable, budget, _) = heap.pause_target_state();
-        assert_eq!(affordable, (250 * MIB) as u64, "twice over means half the span");
+        assert_eq!(
+            affordable,
+            (250 * MIB) as u64,
+            "twice over means half the span"
+        );
         assert_eq!(budget, 150 * MIB, "budget is affordable - live");
 
         // Inside the hysteresis band (over three quarters of the target,
@@ -22104,7 +22296,10 @@ pub(crate) mod tests {
         // affordable span at something far too small to be useful.
         heap.refresh_pause_target_budget(103_000_000, 1 * MIB, 4 * MIB);
         let seeded = heap.pause_target_state().1;
-        assert!(seeded > 0 && seeded < (6 * MIB) as u64, "a tiny seed: {seeded}");
+        assert!(
+            seeded > 0 && seeded < (6 * MIB) as u64,
+            "a tiny seed: {seeded}"
+        );
 
         // Now the real live set exists, and it is bigger than that seed, so
         // the clause goes inert -- and must forget, not remember.
@@ -22210,7 +22405,10 @@ pub(crate) mod tests {
             heap.refresh_pause_target_budget(200_000_000, 900 * MIB, 100 * MIB);
         }
         let (target, affordable, budget, gave_up) = heap.pause_target_state();
-        assert_eq!(target, 0, "the loop disables itself rather than retrying forever");
+        assert_eq!(
+            target, 0,
+            "the loop disables itself rather than retrying forever"
+        );
         assert_eq!(affordable, 0);
         assert_eq!(
             budget, heap.alloc_trigger_percent_bytes,
@@ -22240,7 +22438,10 @@ pub(crate) mod tests {
         heap.set_pause_target_ms(u64::MAX / 2_000_000);
         heap.refresh_pause_target_budget(1_000_000, 8 * MIB, 8 * MIB);
         assert_eq!(heap.pause_target_state().1, 0);
-        assert_eq!(heap.pause_target_state().2, heap.alloc_trigger_percent_bytes);
+        assert_eq!(
+            heap.pause_target_state().2,
+            heap.alloc_trigger_percent_bytes
+        );
         // And the other operand: a pause the clock reports as ~292 years,
         // against an ordinary target.
         let heap = ZgcRealHeap::with_capacity(64 * MIB);
@@ -22251,7 +22452,10 @@ pub(crate) mod tests {
             budget, heap.alloc_trigger_percent_bytes,
             "an absurdly expensive pause goes inert rather than wrapping"
         );
-        assert!(unreachable > 0, "and reports that it could not meet the target");
+        assert!(
+            unreachable > 0,
+            "and reports that it could not meet the target"
+        );
     }
 
     /// The allocation-rate clause of `needs_gc` fires on GARBAGE, well below
@@ -22864,7 +23068,10 @@ pub(crate) mod tests {
             "the fixture relocates nothing even with no compiled frame live,              so the first half proved nothing about the guard"
         );
         assert_eq!(
-            heap2.counters.relocation_skipped_jit.load(Ordering::Relaxed),
+            heap2
+                .counters
+                .relocation_skipped_jit
+                .load(Ordering::Relaxed),
             0,
             "the refusal fired with no compiled frame live"
         );
@@ -22955,7 +23162,11 @@ pub(crate) mod tests {
             .map(|(was, now)| (*was, now.as_ptr() as usize))
             .collect();
 
-        let stored = heap.counters.ref_processor.lock().reference_object_addresses();
+        let stored = heap
+            .counters
+            .ref_processor
+            .lock()
+            .reference_object_addresses();
         let stored_set: std::collections::HashSet<usize> = stored.iter().copied().collect();
 
         let mut stale = Vec::new();
@@ -23308,7 +23519,10 @@ pub(crate) mod tests {
             "the slide wrote into the peer's buffer below its published tail"
         );
         let stale = unsafe { std::slice::from_raw_parts(tail.0 as *const u8, tail.1 - tail.0) };
-        assert!(stale.iter().all(|b| *b == 0), "the slide wrote into the published tail");
+        assert!(
+            stale.iter().all(|b| *b == 0),
+            "the slide wrote into the published tail"
+        );
     }
 
     /// Nested critical sections on one array: the inner release must not

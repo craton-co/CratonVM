@@ -225,7 +225,11 @@ impl PathGateReport {
 }
 
 /// Compare `obs` against the reference; `None` when they agree.
-pub fn split_details(obs: &Observation, reference: &Observation, mode: Mode) -> Option<Vec<String>> {
+pub fn split_details(
+    obs: &Observation,
+    reference: &Observation,
+    mode: Mode,
+) -> Option<Vec<String>> {
     match oracle::compare(obs, reference, &Normalizer::for_mode(mode)) {
         Verdict::Agree => None,
         Verdict::Diverge(diffs) => Some(
@@ -286,7 +290,8 @@ pub fn run_path_gate(cfg: &PathGateConfig) -> Result<PathGateReport, RunError> {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        let (classpath, main_class) = if source.extension().and_then(|s| s.to_str()) == Some("java") {
+        let (classpath, main_class) = if source.extension().and_then(|s| s.to_str()) == Some("java")
+        {
             match runner::compile_java(&source, &workdir, cfg.jdk_home.as_deref(), cfg.timeout) {
                 Ok(cls) => (workdir.clone(), cls),
                 Err(e) => {
@@ -331,7 +336,14 @@ pub fn run_path_gate(cfg: &PathGateConfig) -> Result<PathGateReport, RunError> {
                 });
             }
         }
-        report.record(&main_class, cfg.reference, &judged, splits, &rejects, &cfg.known);
+        report.record(
+            &main_class,
+            cfg.reference,
+            &judged,
+            splits,
+            &rejects,
+            &cfg.known,
+        );
     }
     let _ = std::fs::remove_dir_all(&workdir);
     Ok(report)
@@ -352,7 +364,11 @@ pub fn render(report: &PathGateReport, reference: Mode) -> String {
         "resolved known split (remove it from the known file)",
         &report.resolved_known,
     );
-    line(&mut s, "flaky split (did not reproduce; not gated)", &report.flaky);
+    line(
+        &mut s,
+        "flaky split (did not reproduce; not gated)",
+        &report.flaky,
+    );
     let reject_tag = if report.fail_on_ir_verify_reject {
         "IR verifier rejected a method (gated)"
     } else {
@@ -408,7 +424,14 @@ mod tests {
     fn a_new_reproducible_split_fails_the_gate() {
         let mut r = PathGateReport::default();
         let judged = [Mode::IrJit, Mode::OsrEager];
-        r.record("P", Mode::NoJit, &judged, vec![split(Mode::IrJit, false)], &[], &KnownSplits::default());
+        r.record(
+            "P",
+            Mode::NoJit,
+            &judged,
+            vec![split(Mode::IrJit, false)],
+            &[],
+            &KnownSplits::default(),
+        );
         assert_eq!(r.new_splits, vec!["P: nojit≠ir-jit".to_string()]);
         assert_eq!(r.exit_code(), 1);
     }
@@ -457,7 +480,14 @@ mod tests {
     #[test]
     fn verifier_rejections_gate_only_when_asked() {
         let mut r = PathGateReport::default();
-        r.record("P", Mode::NoJit, &[Mode::IrJit], vec![], &[Mode::IrJit], &KnownSplits::default());
+        r.record(
+            "P",
+            Mode::NoJit,
+            &[Mode::IrJit],
+            vec![],
+            &[Mode::IrJit],
+            &KnownSplits::default(),
+        );
         assert_eq!(r.exit_code(), 0);
         r.fail_on_ir_verify_reject = true;
         assert_eq!(r.exit_code(), 1);

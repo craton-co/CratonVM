@@ -571,11 +571,7 @@ mod tests {
 
         for c in 0..8 {
             let want = c == 2 || c == 6;
-            assert_eq!(
-                t.is_dirty_addr(BASE + c * G1_CARD_BYTES),
-                want,
-                "card {c}"
-            );
+            assert_eq!(t.is_dirty_addr(BASE + c * G1_CARD_BYTES), want, "card {c}");
         }
     }
 
@@ -590,10 +586,16 @@ mod tests {
         let keep = t.empty_set(BASE, 4 * G1_CARD_BYTES);
         t.clean_and_redirty(BASE, 4 * G1_CARD_BYTES, &keep);
         for c in 0..4 {
-            assert!(!t.is_dirty_addr(BASE + c * G1_CARD_BYTES), "card {c} cleaned");
+            assert!(
+                !t.is_dirty_addr(BASE + c * G1_CARD_BYTES),
+                "card {c} cleaned"
+            );
         }
         for c in 4..8 {
-            assert!(t.is_dirty_addr(BASE + c * G1_CARD_BYTES), "card {c} untouched");
+            assert!(
+                t.is_dirty_addr(BASE + c * G1_CARD_BYTES),
+                "card {c} untouched"
+            );
         }
     }
 

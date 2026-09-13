@@ -1407,9 +1407,9 @@ pub unsafe fn for_each_object_reference(
         return false;
     }
     let header = unsafe { &*(obj as *const ObjectHeader) };
-    let Some(total) = crate::concurrent_mark::concurrent_mark_object_size(
-        obj as *const ObjectHeader,
-    ) else {
+    let Some(total) =
+        crate::concurrent_mark::concurrent_mark_object_size(obj as *const ObjectHeader)
+    else {
         return false;
     };
     if total > max_bytes {
@@ -1451,9 +1451,8 @@ pub unsafe fn for_each_object_reference(
     let num_slots = header.num_slots() as usize;
     for i in 0..num_slots {
         let slot = obj + HEADER_SIZE + i * cratonvm_types::SLOT_SIZE;
-        let value = unsafe {
-            crate::heap::read_value_cell_checked(slot as *const Value, "oracle-walk")
-        };
+        let value =
+            unsafe { crate::heap::read_value_cell_checked(slot as *const Value, "oracle-walk") };
         if let Value::Object(Some(r)) = value {
             f(r.as_ptr() as usize);
         }

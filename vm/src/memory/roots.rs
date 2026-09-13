@@ -474,10 +474,8 @@ pub fn static_root_slots_enabled() -> bool {
 /// verifier's job (`CRATONVM_DBG_STATIC_SLOT_VERIFY=1`), and no counter can
 /// stand in for it: a list that is missing a slot is indistinguishable here
 /// from one that is not.
-static STATIC_SLOTS_RECORDED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static STATIC_SLOT_FALLBACKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static STATIC_SLOTS_RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STATIC_SLOT_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `(slots_recorded, full_walk_fallbacks)` — see [`STATIC_SLOTS_RECORDED`].
 pub fn static_root_slot_counts() -> (u64, u64) {
@@ -1824,8 +1822,23 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
              dataflow={} PUBLISHED={}) use=(masked={} unmasked={} regwords={} \
              deadspill={} outgoing={}) \
              oracle=(words={} reachable={} UNREACHABLE={} walk_incomplete={})",
-            ro_e.0, ro_e.1, ro_e.2, ro_e.3, ro_e.4, ro_e.5, ro_e.6, ro_e.7,
-            ro_u.0, ro_u.1, ro_u.2, ro_u.3, ro_u.4, ro_o.0, ro_o.1, ro_o.2, ro_o.3,
+            ro_e.0,
+            ro_e.1,
+            ro_e.2,
+            ro_e.3,
+            ro_e.4,
+            ro_e.5,
+            ro_e.6,
+            ro_e.7,
+            ro_u.0,
+            ro_u.1,
+            ro_u.2,
+            ro_u.3,
+            ro_u.4,
+            ro_o.0,
+            ro_o.1,
+            ro_o.2,
+            ro_o.3,
         );
         // Engagement counter for the cross-thread coverage handshake, printed
         // beside the verdict it produces so any claim about it carries the

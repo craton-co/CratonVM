@@ -434,7 +434,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(controller.is_quiesced(), "the marker parks on an empty gray set");
+        assert!(
+            controller.is_quiesced(),
+            "the marker parks on an empty gray set"
+        );
 
         let a = g1.alloc_object(ClassId::new(1), 0);
         let t0 = std::time::Instant::now();

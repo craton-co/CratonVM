@@ -139,7 +139,9 @@ fn one_context_many_threads() {
     for t in 0..THREADS {
         let ctx = Arc::clone(&ctx);
         let module = Arc::clone(&module);
-        handles.push(std::thread::spawn(move || pipeline(&ctx, &module, t as i32)));
+        handles.push(std::thread::spawn(move || {
+            pipeline(&ctx, &module, t as i32)
+        }));
     }
     let mut failures = Vec::new();
     for h in handles {
@@ -177,8 +179,8 @@ fn many_contexts_many_threads_reported() {
     for t in 0..THREADS {
         handles.push(std::thread::spawn(move || {
             let ctx = DeviceContext::new(0).map_err(|e| format!("ctx: {e}"))?;
-            let module =
-                DeviceModule::from_ptx(&ctx, PTX, &["twiceplus"]).map_err(|e| format!("mod: {e}"))?;
+            let module = DeviceModule::from_ptx(&ctx, PTX, &["twiceplus"])
+                .map_err(|e| format!("mod: {e}"))?;
             pipeline(&ctx, &module, t as i32)
         }));
     }

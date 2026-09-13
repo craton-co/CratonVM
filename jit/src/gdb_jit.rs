@@ -136,7 +136,11 @@ pub fn build_elf(start: u64, size: u64, name: &str) -> Vec<u8> {
     put_u64(&mut symtab, size); // st_size
 
     let mut out = Vec::with_capacity(
-        ELF_HEADER_SIZE + shstrtab.len() + strtab.len() + symtab.len() + 16
+        ELF_HEADER_SIZE
+            + shstrtab.len()
+            + strtab.len()
+            + symtab.len()
+            + 16
             + SECTION_COUNT * SECTION_HEADER_SIZE,
     );
     // Header; e_shoff is patched once the section data is laid out.
@@ -526,7 +530,10 @@ mod tests {
         assert_eq!(secs.len(), 5);
         let shstr = &secs[SHSTRTAB_SECTION as usize];
         let shstr_bytes = &elf[shstr.offset..shstr.offset + shstr.size];
-        let names: Vec<&str> = secs.iter().map(|s| cstr(shstr_bytes, s.name as usize)).collect();
+        let names: Vec<&str> = secs
+            .iter()
+            .map(|s| cstr(shstr_bytes, s.name as usize))
+            .collect();
         assert_eq!(names, ["", ".text", ".symtab", ".strtab", ".shstrtab"]);
 
         let text = &secs[TEXT_SECTION as usize];

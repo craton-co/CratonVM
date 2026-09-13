@@ -772,15 +772,18 @@ fn curve_algo_from_named_param_spec(
         return None;
     }
     let pin = ctx.pin_native_root(spec);
-    let params = ["()Ljava/security/spec/AlgorithmParameterSpec;", "()Ljava/security/spec/NamedParameterSpec;"]
-        .into_iter()
-        .find_map(|desc| {
-            let spec = ctx.read_native_pin(pin, spec);
-            match ctx.invoke_virtual(spec, "getParams", desc, &[]) {
-                Ok(Some(Value::Object(Some(o)))) => Some(o),
-                _ => None,
-            }
-        });
+    let params = [
+        "()Ljava/security/spec/AlgorithmParameterSpec;",
+        "()Ljava/security/spec/NamedParameterSpec;",
+    ]
+    .into_iter()
+    .find_map(|desc| {
+        let spec = ctx.read_native_pin(pin, spec);
+        match ctx.invoke_virtual(spec, "getParams", desc, &[]) {
+            Ok(Some(Value::Object(Some(o)))) => Some(o),
+            _ => None,
+        }
+    });
     let name = params.and_then(|p| {
         let p_pin = ctx.pin_native_root(p);
         let out = match ctx.invoke_virtual(p, "getName", "()Ljava/lang/String;", &[]) {
@@ -2087,7 +2090,9 @@ pub(crate) fn get_instance_offers(name: &str) -> bool {
         return true;
     }
     crate::jca::provider_chain::find_service_provider("KeyFactory", name)
-        .and_then(|p| crate::jca::provider_chain::service_implementation_class("KeyFactory", &p, name))
+        .and_then(|p| {
+            crate::jca::provider_chain::service_implementation_class("KeyFactory", &p, name)
+        })
         .is_some()
 }
 
@@ -3569,7 +3574,13 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         "cannot generate a usable {} public key from the given KeySpec",
         algo_name(algo)
     );
-    let msg = encoded_spec_decode_message(ctx, algo, args, "java/security/spec/X509EncodedKeySpec", fallback);
+    let msg = encoded_spec_decode_message(
+        ctx,
+        algo,
+        args,
+        "java/security/spec/X509EncodedKeySpec",
+        fallback,
+    );
     Err(throw_invalid_key_spec(ctx, &msg))
 }
 
@@ -3770,7 +3781,13 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         "cannot generate a usable {} private key from the given KeySpec",
         algo_name(algo)
     );
-    let msg = encoded_spec_decode_message(ctx, algo, args, "java/security/spec/PKCS8EncodedKeySpec", fallback);
+    let msg = encoded_spec_decode_message(
+        ctx,
+        algo,
+        args,
+        "java/security/spec/PKCS8EncodedKeySpec",
+        fallback,
+    );
     Err(throw_invalid_key_spec(ctx, &msg))
 }
 

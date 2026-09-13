@@ -68,11 +68,10 @@ pub use field_layout::clear_class_layouts;
 pub use field_layout::{
     class_layout, class_layout_for_fields, compact_field_slot, compact_field_storage,
     compact_object_body_size, compact_object_field_storage, compact_ref_fields_enabled,
-    compact_tlab_body_size, layout_replace_epoch, layout_replace_epoch_guard,
-    single_layout_domain,
-    foreign_layout_refusals, is_compact_object, layout_generation, layout_replace_guard,
-    next_layout_domain, object_body_size, pack_fields_by_width_enabled, read_compact_field,
-    register_class_layout, set_compact_ref_fields_enabled, set_pack_fields_by_width_enabled,
+    compact_tlab_body_size, foreign_layout_refusals, is_compact_object, layout_generation,
+    layout_replace_epoch, layout_replace_epoch_guard, layout_replace_guard, next_layout_domain,
+    object_body_size, pack_fields_by_width_enabled, read_compact_field, register_class_layout,
+    set_compact_ref_fields_enabled, set_pack_fields_by_width_enabled, single_layout_domain,
     unregister_class_layout, with_class_layout, write_compact_field, CompactLayout,
     FieldStorageKind, FIRST_LAYOUT_DOMAIN,
 };
@@ -101,22 +100,19 @@ pub use subsystem_config::{
 // state until 2026-07-26; see `header-shrink.md` §6.2 and the
 // `every_public_heap_constant_is_reachable` test below.
 pub use heap_types::{
-    CARD_SHIFT, CARD_SIZE_BYTES,
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     element_type_tag_at, kind_tag_at, object_kind_from_tag, oob_index_code,
-    plausible_object_header_at,
-    primitive_array_kind_tags_byte, ArrayElementType, ObjectHeader, ObjectKind,
-    ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET, ARRAY_STORE_OUT_OF_MEMORY, AUTOBOX_CLASS_ID,
-    FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
-    FIELD_CELL_TAG_OBJECT, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK, GC_FLAGS_BYTE_OFFSET,
-    GC_FLAG_COMPACT, GC_FLAG_HEADER, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
-    INFLATED_PTR_MASK,
-    KIND_TAGS_BYTE_OFFSET, KIND_TAG_BYTE_MASK, MARK_FORWARDED, MARK_HASH_MASK, MARK_HASH_SHIFT,
-    MARK_INFLATED, MARK_NEUTRAL, MARK_QUARTET_MASK, MARK_QUARTET_SHIFT, MARK_RESERVED_MASK,
-    MARK_STATE_MASK,
-    MARK_THIN_LOCKED, MARK_WORD_OFFSET, MAX_GC_AGE, NUM_SLOTS_OFFSET, REF_ELEMENT_SIZE,
-    REF_FIELD_SIZE, SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT,
-    THIN_LOCK_RECURSION_MASK, THIN_LOCK_RECURSION_SHIFT,
+    plausible_object_header_at, primitive_array_kind_tags_byte, ArrayElementType, ObjectHeader,
+    ObjectKind, ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET, ARRAY_STORE_OUT_OF_MEMORY,
+    AUTOBOX_CLASS_ID, CARD_SHIFT, CARD_SIZE_BYTES, FIELD_CELL_PAYLOAD32_OFFSET,
+    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OBJECT, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK,
+    GC_FLAGS_BYTE_OFFSET, GC_FLAG_COMPACT, GC_FLAG_HEADER, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
+    HEADER_SIZE, INFLATED_PTR_MASK, KIND_TAGS_BYTE_OFFSET, KIND_TAG_BYTE_MASK, MARK_FORWARDED,
+    MARK_HASH_MASK, MARK_HASH_SHIFT, MARK_INFLATED, MARK_NEUTRAL, MARK_QUARTET_MASK,
+    MARK_QUARTET_SHIFT, MARK_RESERVED_MASK, MARK_STATE_MASK, MARK_THIN_LOCKED, MARK_WORD_OFFSET,
+    MAX_GC_AGE, NUM_SLOTS_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
+    THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT, THIN_LOCK_RECURSION_MASK,
+    THIN_LOCK_RECURSION_SHIFT,
 };
 pub use intern::{intern, intern_arc, StringPool};
 pub use narrow_oop::{
@@ -767,10 +763,8 @@ pub mod osr_refusal_census {
     /// amount of plumbing at this door buys anything.
     static IR_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
     static IR_INELIGIBLE: AtomicU64 = AtomicU64::new(0);
-    static REFUSALS: std::sync::Mutex<Vec<(&'static str, u64)>> =
-        std::sync::Mutex::new(Vec::new());
-    static NAMED: std::sync::Mutex<Vec<(String, &'static str)>> =
-        std::sync::Mutex::new(Vec::new());
+    static REFUSALS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
+    static NAMED: std::sync::Mutex<Vec<(String, &'static str)>> = std::sync::Mutex::new(Vec::new());
     const MAX_NAMED: usize = 48;
 
     /// One entry into `compile_osr_artifact`.

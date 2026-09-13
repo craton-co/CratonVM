@@ -112,7 +112,9 @@ pub fn clamp_region_size(requested: usize) -> usize {
 /// 1 MiB regions up to a 2 GiB heap, then 2/4/8/16/32 MiB — and tops out at
 /// [`G1_MAX_REGION_SIZE`], after which the count grows again by necessity.
 pub fn g1_ergonomic_region_size(total_bytes: usize) -> usize {
-    clamp_region_size((total_bytes / G1_TARGET_REGION_COUNT).max(crate::region::DEFAULT_REGION_SIZE))
+    clamp_region_size(
+        (total_bytes / G1_TARGET_REGION_COUNT).max(crate::region::DEFAULT_REGION_SIZE),
+    )
 }
 
 /// Explicit G1 tuning overrides wired from the `-XX:` knobs, applied by
@@ -614,7 +616,8 @@ impl VmHeap {
         // SAFETY: `o` is an object the allocator has just finished laying out;
         // its header is initialised and mapped.
         let base = o.as_ptr() as usize;
-        let size = unsafe { crate::gen_heap::gen_object_total_size(&*(base as *const ObjectHeader)) };
+        let size =
+            unsafe { crate::gen_heap::gen_object_total_size(&*(base as *const ObjectHeader)) };
         crate::gc_quiescence::note_allocated_range(base, base.saturating_add(size.max(8)));
         o
     }
@@ -3447,13 +3450,11 @@ impl VmHeap {
                          from_native={native}"
                     );
                     {
-                        let (att, ok, total) =
-                            cratonvm_types::gc_entry_census::refill_totals();
+                        let (att, ok, total) = cratonvm_types::gc_entry_census::refill_totals();
                         eprintln!(
                             "[GC] zgc-entry:   tlab refills attempted={att} refill_succeeded={ok};                              bytes_allocated_total={total} (the wedge break's re-arm,                              one break per 64 MB)"
                         );
-                        let (rt, rok) =
-                            cratonvm_types::gc_entry_census::refill_retry_totals();
+                        let (rt, rok) = cratonvm_types::gc_entry_census::refill_retry_totals();
                         eprintln!(
                             "[GC] zgc-entry:   post-break refill retries={rt}                              retry_succeeded={rok} (a success seeds the TLAB, whose                              allocations re-arm the breaker)"
                         );
@@ -4118,7 +4119,6 @@ impl VmHeap {
             VmHeap::Zgc(h) => h.note_tlab_object(ptr, footprint),
         }
     }
-
 
     /// Check if a raw address is within a live (non-Free) region of the heap.
     /// For generational GC, always returns false (not applicable).
@@ -4883,7 +4883,9 @@ mod gc_summary_key_tests {
                 }
                 if s < i {
                     let k = &line[s..i];
-                    if !k.chars().next().unwrap_or('0').is_ascii_digit() && !out.contains(&k.to_string()) {
+                    if !k.chars().next().unwrap_or('0').is_ascii_digit()
+                        && !out.contains(&k.to_string())
+                    {
                         out.push(k.to_string());
                     }
                 }
@@ -4891,8 +4893,7 @@ mod gc_summary_key_tests {
             out
         };
 
-        let mut owner: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut owner: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut collisions: Vec<String> = Vec::new();
         for (idx, line) in lines.iter().enumerate() {
             for k in keys_of(line) {

@@ -1182,8 +1182,8 @@ pub(super) fn find_bypassable_loop_headers(
             opaque = true;
         }
         if bytecode_analysis::is_offset_branch(op) {
-            if let Some(t) =
-                bytecode_analysis::offset_branch_target(&code[..code_len], pc).filter(|&t| t < code_len)
+            if let Some(t) = bytecode_analysis::offset_branch_target(&code[..code_len], pc)
+                .filter(|&t| t < code_len)
             {
                 edges.push((pc, t));
             }

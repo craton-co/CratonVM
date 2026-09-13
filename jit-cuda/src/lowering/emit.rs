@@ -4592,12 +4592,7 @@ impl<'a> Emitter<'a> {
         // produces.
         let stored = if kind == ParamKind::BoolArray {
             let masked = self.regs.fresh_reg(RegKind::S32);
-            writeln!(
-                self.body,
-                "    and.b32 {}, {}, 1;",
-                masked.name, value.name
-            )
-            .unwrap();
+            writeln!(self.body, "    and.b32 {}, {}, 1;", masked.name, value.name).unwrap();
             masked.name
         } else {
             value.name.clone()
@@ -4642,8 +4637,7 @@ impl<'a> Emitter<'a> {
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
         let name = self.param_len_operand(param_idx);
-        let r = self
-            .param_len_reg[param_idx]
+        let r = self.param_len_reg[param_idx]
             .clone()
             .unwrap_or_else(|| Reg {
                 kind: RegKind::S32,
@@ -4764,7 +4758,12 @@ impl<'a> Emitter<'a> {
         let ret_ptr = self.regs.fresh_reg(RegKind::U64);
         writeln!(self.body, "L_reduce_atomic:").unwrap();
         writeln!(self.body, "    mov.u32 {}, %laneid;", lane.name).unwrap();
-        writeln!(self.body, "    setp.eq.u32 {}, {}, 0;", is_lane0.name, lane.name).unwrap();
+        writeln!(
+            self.body,
+            "    setp.eq.u32 {}, {}, 0;",
+            is_lane0.name, lane.name
+        )
+        .unwrap();
         writeln!(
             self.body,
             "    setp.ne{mov_suffix} {}, {}, {zero};",
@@ -4797,8 +4796,12 @@ impl<'a> Emitter<'a> {
                 let hi = self.regs.fresh_reg(RegKind::U32);
                 let lo2 = self.regs.fresh_reg(RegKind::U32);
                 let hi2 = self.regs.fresh_reg(RegKind::U32);
-                writeln!(self.body, "    mov.b64 {{{}, {}}}, {};", lo.name, hi.name, acc.name)
-                    .unwrap();
+                writeln!(
+                    self.body,
+                    "    mov.b64 {{{}, {}}}, {};",
+                    lo.name, hi.name, acc.name
+                )
+                .unwrap();
                 writeln!(
                     self.body,
                     "    shfl.sync.down.b32 {}, {}, {offset}, 0x1f, 0xffffffff;",
@@ -4811,8 +4814,12 @@ impl<'a> Emitter<'a> {
                     hi2.name, hi.name
                 )
                 .unwrap();
-                writeln!(self.body, "    mov.b64 {}, {{{}, {}}};", other.name, lo2.name, hi2.name)
-                    .unwrap();
+                writeln!(
+                    self.body,
+                    "    mov.b64 {}, {{{}, {}}};",
+                    other.name, lo2.name, hi2.name
+                )
+                .unwrap();
             } else {
                 let bits = self.regs.fresh_reg(RegKind::U32);
                 let bits2 = self.regs.fresh_reg(RegKind::U32);
@@ -4833,7 +4840,6 @@ impl<'a> Emitter<'a> {
             .unwrap();
         }
     }
-
 }
 
 /// Find the loop bound for the canonical pattern by inspecting the
@@ -5095,7 +5101,10 @@ fn local_is_ever_stored(bytes: &[u8], slot: u16) -> Result<bool, LoweringError> 
             // iinc
             0x84 => bytes.get(pc + 1).map(|b| (*b as u16, 1)),
             // wide istore/fstore/astore and wide iinc: one slot
-            0xC4 if matches!(bytes.get(pc + 1), Some(0x36) | Some(0x38) | Some(0x3A) | Some(0x84)) =>
+            0xC4 if matches!(
+                bytes.get(pc + 1),
+                Some(0x36) | Some(0x38) | Some(0x3A) | Some(0x84)
+            ) =>
             {
                 Some((u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]), 1))
             }

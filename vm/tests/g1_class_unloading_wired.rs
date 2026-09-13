@@ -126,10 +126,8 @@ fn g1s_mark_cycle_still_drives_class_unloading() {
 /// reads the remark function's own body.
 #[test]
 fn the_remark_driver_body_reaches_the_unloader() {
-    let src = std::fs::read_to_string(
-        crate_root().join("src/runtime/interpreter/gc_and_alloc.rs"),
-    )
-    .expect("gc_and_alloc.rs must be readable");
+    let src = std::fs::read_to_string(crate_root().join("src/runtime/interpreter/gc_and_alloc.rs"))
+        .expect("gc_and_alloc.rs must be readable");
 
     let start = src
         .find("fn g1_remark_process_references")
@@ -142,7 +140,10 @@ fn the_remark_driver_body_reaches_the_unloader() {
         .unwrap_or(src.len());
     let body = &src[start..end];
 
-    for needle in ["gc_reconcile_defining_loaders", "unload_dead_class_metadata"] {
+    for needle in [
+        "gc_reconcile_defining_loaders",
+        "unload_dead_class_metadata",
+    ] {
         assert!(
             body.contains(needle),
             "`g1_remark_process_references` no longer calls `{needle}`. The \

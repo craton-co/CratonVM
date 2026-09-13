@@ -1857,7 +1857,10 @@ mod tests {
                 offset_of!(H, ref_store_post_young_floor),
             ),
             ("g1_barrier_addr", offset_of!(H, g1_barrier_addr)),
-            ("g1_post_write_barrier", offset_of!(H, g1_post_write_barrier)),
+            (
+                "g1_post_write_barrier",
+                offset_of!(H, g1_post_write_barrier),
+            ),
             (
                 "ref_store_post_skip_mask",
                 offset_of!(H, ref_store_post_skip_mask),

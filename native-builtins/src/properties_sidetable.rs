@@ -1211,7 +1211,9 @@ pub fn replace_real_map(
                 Ok(Some(Value::Object(Some(m)))) => m,
                 other => {
                     if props_stderr_diag() {
-                        eprintln!("[PROPS-REAL-MAP] could not construct the backing map: {other:?}");
+                        eprintln!(
+                            "[PROPS-REAL-MAP] could not construct the backing map: {other:?}"
+                        );
                     }
                     ctx.unpin_native_roots(this_pin);
                     return 0;
@@ -2992,10 +2994,7 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // it cannot argue is that a clone should differ from its source on the very
     // property the loudness depends on -- a clone with a CHM is a receiver
     // where those bodies quietly succeed while the original still throws.
-    let source_has_backing = matches!(
-        ctx.get_field_by_name(this, "map"),
-        Value::Object(Some(_))
-    );
+    let source_has_backing = matches!(ctx.get_field_by_name(this, "map"), Value::Object(Some(_)));
 
     // Step 1 — precisely what the real body's `cloneHashtable()` already
     // reaches (`Object.clone` -> `native_object_clone`). That native
@@ -6156,8 +6155,13 @@ mod tests {
         // Only the production half of the file: the test module below defines
         // nested helper `fn`s, and a naive split would hand this very test's
         // body to one of them.
-        let src = src.split("
-mod tests {").next().unwrap_or(src);
+        let src = src
+            .split(
+                "
+mod tests {",
+            )
+            .next()
+            .unwrap_or(src);
         let mut fns: Vec<(String, Vec<&str>)> = Vec::new();
         for line in src.lines() {
             let t = line.trim_start();
@@ -6238,7 +6242,12 @@ mod tests {").next().unwrap_or(src);
                 // A plain binding: `let id =` / `let id: T =`. A destructuring
                 // `let Some(Value::Object(Some(this))) = ...` yields `Some`
                 // followed by `(`, and is not a name anything reuses.
-                if id.is_empty() || !matches!(after_let[end..].trim_start().chars().next(), Some('=') | Some(':')) {
+                if id.is_empty()
+                    || !matches!(
+                        after_let[end..].trim_start().chars().next(),
+                        Some('=') | Some(':')
+                    )
+                {
                     continue;
                 }
                 // ...and not a binding whose own value expression CONTAINS the
@@ -6258,9 +6267,9 @@ mod tests {").next().unwrap_or(src);
                 if id.is_empty() || id == receiver || pinned_before.contains(&id) {
                     continue;
                 }
-                let used_after = body[call_at + 1..].iter().any(|l| {
-                    !l.trim_start().starts_with("//") && mentions(l, id)
-                });
+                let used_after = body[call_at + 1..]
+                    .iter()
+                    .any(|l| !l.trim_start().starts_with("//") && mentions(l, id));
                 if used_after {
                     offenders.push(format!("{name} holds `{id}`"));
                 }

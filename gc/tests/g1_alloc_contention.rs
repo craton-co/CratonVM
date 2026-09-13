@@ -110,7 +110,11 @@ fn object_allocation_throughput() {
     let elapsed = t0.elapsed();
 
     let total = served.load(Ordering::Relaxed);
-    assert_eq!(total, n * PER_THREAD, "the heap was too small for the probe");
+    assert_eq!(
+        total,
+        n * PER_THREAD,
+        "the heap was too small for the probe"
+    );
     eprintln!(
         "[F-11 probe] objects threads={n} bytes={obj_bytes} allocations={total} elapsed={:?} per_alloc={:.1}ns",
         elapsed,

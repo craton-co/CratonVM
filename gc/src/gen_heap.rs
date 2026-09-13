@@ -1725,10 +1725,8 @@ pub fn young_bytes_uncommitted() -> u64 {
 ///
 /// Separating those two populations is the next measurement, and it needs a
 /// workload rather than another counter.
-pub static OBJECT_START_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static OBJECT_START_MISSES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static OBJECT_START_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static OBJECT_START_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Misses that the header-shaped deduction then ACCEPTED.
 ///
 /// This is the recoverable half of the miss population, and it needs no new
@@ -3555,8 +3553,7 @@ impl GenerationalHeap {
         for (i, bits) in [yf, yt].into_iter().enumerate() {
             match &bits {
                 Some(b) => {
-                    self.object_starts[i]
-                        .store(Arc::as_ptr(b) as usize, Ordering::Release);
+                    self.object_starts[i].store(Arc::as_ptr(b) as usize, Ordering::Release);
                 }
                 None => {
                     // Retire before dropping the old `Arc`, so no reader can be
@@ -3568,11 +3565,7 @@ impl GenerationalHeap {
         }
     }
 
-    fn store_commit_bits_locked(
-        &self,
-        yf: Option<Arc<[AtomicU64]>>,
-        yt: Option<Arc<[AtomicU64]>>,
-    ) {
+    fn store_commit_bits_locked(&self, yf: Option<Arc<[AtomicU64]>>, yt: Option<Arc<[AtomicU64]>>) {
         let mut hold = self.commit_bits_hold.lock();
         for (i, bits) in [yf, yt, None].into_iter().enumerate() {
             match &bits {
@@ -5033,7 +5026,6 @@ impl GenerationalHeap {
         if !self.region_range_committed(slot, region_base, addr, HEADER_SIZE) {
             return None;
         }
-
 
         // Validate raw enum tags before constructing an `ObjectHeader`
         // reference. Conservative root scans can land on arbitrary arena words;
@@ -9111,7 +9103,11 @@ impl GenerationalHeap {
             // parallel evacuator actually spread the work rather than merely
             // starting threads — see `PAR_EVAC_HELPER_SCANS`.
             crate::gen_evac::note_par_evac_helper_scans(
-                shards.iter().skip(1).map(|s| s.objects_scanned as u64).sum(),
+                shards
+                    .iter()
+                    .skip(1)
+                    .map(|s| s.objects_scanned as u64)
+                    .sum(),
             );
             // The two arms whose absence would not fail now: promotion takes
             // the old generation's lock (the copy phase's only shared-lock
@@ -9119,7 +9115,10 @@ impl GenerationalHeap {
             // whose loss surfaces a cycle later, somewhere else.
             crate::gen_evac::note_par_evac_arms(
                 shards.iter().map(|s| s.tally[1]).sum(),
-                shards.iter().map(|s| s.deferred_dirty_cards.len() as u64).sum(),
+                shards
+                    .iter()
+                    .map(|s| s.deferred_dirty_cards.len() as u64)
+                    .sum(),
             );
             for shard in &shards {
                 objects_copied += shard.objects_copied;
@@ -9366,10 +9365,8 @@ impl GenerationalHeap {
         // "survivors of a young collection" -- the later phases add a handful
         // of resurrected finalizables and, after a major GC, compose in a
         // compaction map, neither of which is the quantity being predicted.
-        self.prev_survivor_count.store(
-            pointer_map.len(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.prev_survivor_count
+            .store(pointer_map.len(), std::sync::atomic::Ordering::Relaxed);
         if mv_phase_on {
             // The numbers that decide what a slow drain MEANS. `bytes_before`
             // is the young occupancy the cycle started from, so
@@ -11379,12 +11376,8 @@ impl GenerationalHeap {
         // the sweep-edges scan still sees as a root becomes an object the sweep
         // frees.
         if gc_flags().late_resolve_dropped && !dropped_snapshot.is_empty() {
-            let (bases, leftover, _interior) = resolve_candidate_bases(
-                from_base,
-                used_bytes,
-                &exact_skips,
-                &dropped_snapshot,
-            );
+            let (bases, leftover, _interior) =
+                resolve_candidate_bases(from_base, used_bytes, &exact_skips, &dropped_snapshot);
             let recovered = bases.len();
             for base in bases {
                 mark_edge_precise(base, &mark_ctx, &side_bits, &mut worklist, "late-dropped");
@@ -14781,9 +14774,7 @@ impl GenerationalHeap {
                                         .unwrap_or_else(|| format!("cid{hcid:#x}"));
                                     format!(
                                         "YOUNG {hname}@{optr:#x} (kind={} slots={} alen={})",
-                                        ObjectHeader::kind_tag(
-                                            h.mark_word.load(Ordering::Relaxed)
-                                        ),
+                                        ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)),
                                         h.num_slots(),
                                         h.array_length(),
                                     )
@@ -14810,9 +14801,8 @@ impl GenerationalHeap {
                         report(
                             &|| {
                                 // SAFETY: `optr` is a live old-gen object header.
-                                let ocid = unsafe {
-                                    (*(optr as *const ObjectHeader)).class_id.as_u32()
-                                };
+                                let ocid =
+                                    unsafe { (*(optr as *const ObjectHeader)).class_id.as_u32() };
                                 let oname = crate::gc::resolve_class_info(ocid)
                                     .map(|(n, _)| n)
                                     .unwrap_or_else(|| format!("cid{ocid:#x}"));
@@ -17086,8 +17076,10 @@ impl GenerationalHeap {
             eprintln!(
                 "[forward-refused] ^ header_at_old_ptr: class_id={cid} kind_tag={kind_tag} \
                  elem_tag={elem_tag} nearest_recorded_start={} delta={}",
-                near.map(|a| format!("0x{a:x}")).unwrap_or_else(|| "none".into()),
-                near.map(|a| (old_ptr as usize).saturating_sub(a) as i64).unwrap_or(-1),
+                near.map(|a| format!("0x{a:x}"))
+                    .unwrap_or_else(|| "none".into()),
+                near.map(|a| (old_ptr as usize).saturating_sub(a) as i64)
+                    .unwrap_or(-1),
             );
             if let Some(w) = LAST_OBJSTART_WALK.lock().as_ref() {
                 eprintln!("[forward-refused] ^ objstart_walk: {w}");
@@ -17790,8 +17782,12 @@ impl GenerationalHeap {
                     if !have.contains(&(obj_ptr as usize, slot_idx)) {
                         missing += 1;
                         if first.is_none() {
-                            first =
-                                Some((obj_ptr as usize, header.class_id.as_u32(), slot_idx, raw as usize));
+                            first = Some((
+                                obj_ptr as usize,
+                                header.class_id.as_u32(),
+                                slot_idx,
+                                raw as usize,
+                            ));
                         }
                     }
                 });
@@ -21882,7 +21878,10 @@ mod tests {
     fn a_zero_run_shorter_than_one_slot_is_still_a_desync() {
         let mut buf = vec![0u64; 8];
         let base = put_header(&mut buf, 8, plain_object(1));
-        assert_eq!(zero_run_empty_object_resume(base, 0, 8, 64, &[], None), None);
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 8, 64, &[], None),
+            None
+        );
     }
 
     /// Several empty objects in a row are still empty objects.
@@ -21963,7 +21962,10 @@ mod tests {
     fn a_zero_run_to_the_end_of_used_is_not_a_desync() {
         let mut buf = vec![0u64; 4];
         let base = buf.as_mut_ptr() as usize;
-        assert_eq!(zero_run_empty_object_resume(base, 0, 32, 32, &[], None), Some(32));
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 32, 32, &[], None),
+            Some(32)
+        );
     }
 
     /// If the header the run lands on does not size plausibly, `run_end` is not
@@ -22579,7 +22581,10 @@ mod tests {
         let base = young_from.base_ptr() as usize;
         let used = young_from.used();
         let skips = young_from.free_blocks_sorted();
-        assert!(used > 32 * 1024, "the fixture must fill enough anchor buckets");
+        assert!(
+            used > 32 * 1024,
+            "the fixture must fill enough anchor buckets"
+        );
 
         // Reference: ONE chunk over the whole span, which is the sequential
         // walk's shape.
@@ -22850,8 +22855,7 @@ mod tests {
         const N: usize = 400;
         let (head, _) = alloc_chain(&heap, N);
         let mut roots = vec![head];
-        let result =
-            with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+        let result = with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
 
         assert_eq!(result.stats.objects_copied, N, "every chain node survives");
         assert_ne!(roots[0].as_ptr(), head.as_ptr(), "the head was relocated");
@@ -23006,8 +23010,7 @@ mod tests {
             let _dead = heap.alloc_object(ClassId::new(2), 1);
         }
         let mut roots = vec![live];
-        let result =
-            with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+        let result = with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
         assert_eq!(
             result.stats.objects_copied, 1,
             "only the rooted object may be copied",
@@ -23142,7 +23145,6 @@ mod tests {
             WIDTH * DEPTH,
         );
     }
-
 
     /// Survivors must tenure through the PARALLEL evacuator, not just the
     /// serial one.
@@ -27169,10 +27171,19 @@ mod tests {
                     })
                     .collect();
                 // Nodes: left, right, value, shared-target.
-                fn build(heap: &GenerationalHeap, shared: &[ObjectRef], depth: u32, seed: i32) -> ObjectRef {
+                fn build(
+                    heap: &GenerationalHeap,
+                    shared: &[ObjectRef],
+                    depth: u32,
+                    seed: i32,
+                ) -> ObjectRef {
                     let n = heap.alloc_object(ClassId::new(0), 4);
                     heap.set_field(n, 2, Value::Int(seed));
-                    heap.set_field(n, 3, Value::Object(Some(shared[(seed as usize) % shared.len()])));
+                    heap.set_field(
+                        n,
+                        3,
+                        Value::Object(Some(shared[(seed as usize) % shared.len()])),
+                    );
                     if depth > 0 {
                         let l = build(heap, shared, depth - 1, seed * 2);
                         heap.set_field(n, 0, Value::Object(Some(l)));
@@ -27181,7 +27192,11 @@ mod tests {
                     }
                     n
                 }
-                fn check(heap: &GenerationalHeap, n: ObjectRef, addrs: &mut Vec<Vec<usize>>) -> i64 {
+                fn check(
+                    heap: &GenerationalHeap,
+                    n: ObjectRef,
+                    addrs: &mut Vec<Vec<usize>>,
+                ) -> i64 {
                     let seed = heap.get_field(n, 2).as_int().unwrap_or(i32::MIN);
                     let mut s = i64::from(seed);
                     let Value::Object(Some(t)) = heap.get_field(n, 3) else {
@@ -27208,10 +27223,17 @@ mod tests {
                 for cycle in 0..(PROMOTION_AGE as usize + 1) {
                     heap.collect_garbage(&stw(), &mut roots, &monitors);
                     let mut addrs = vec![Vec::new(); 64];
-                    assert_eq!(check(&heap, roots[0], &mut addrs), expected, "cycle {cycle}");
+                    assert_eq!(
+                        check(&heap, roots[0], &mut addrs),
+                        expected,
+                        "cycle {cycle}"
+                    );
                     for (i, a) in addrs.iter().enumerate() {
                         a.iter().for_each(|&x| {
-                            assert_eq!(x, a[0], "cycle {cycle}: shared object {i} has two addresses")
+                            assert_eq!(
+                                x, a[0],
+                                "cycle {cycle}: shared object {i} has two addresses"
+                            )
                         });
                     }
                 }
@@ -27240,7 +27262,11 @@ mod tests {
         let t5 = next_young_trigger(&mut fb, t4, floor, ceiling, cap, 150, 200, 10 << 20);
         assert_eq!(t5, 64 << 20, "under the goal: trial closed, threshold kept");
         let t6 = next_young_trigger(&mut fb, t5, floor, ceiling, cap, 40, 200, 10 << 20);
-        assert_eq!(t6, (64 << 20) + cap / 32, "comfortably under: additive room back");
+        assert_eq!(
+            t6,
+            (64 << 20) + cap / 32,
+            "comfortably under: additive room back"
+        );
         let mut fb2 = TriggerFeedback::default();
         let a = next_young_trigger(&mut fb2, 128 << 20, floor, ceiling, cap, 400, 200, 8 << 20);
         let b = next_young_trigger(&mut fb2, a, floor, ceiling, cap, 220, 200, 8 << 20);
@@ -27334,7 +27360,10 @@ mod tests {
             // and is still mapped.
             .filter(|&off| unsafe { std::ptr::read(base.add(off) as *const u64) } != 0)
             .count();
-        assert_eq!(stale, 0, "{stale} non-zero words remain in the evacuated semi-space");
+        assert_eq!(
+            stale, 0,
+            "{stale} non-zero words remain in the evacuated semi-space"
+        );
     }
 
     /// `CRATONVM_GC_SYNC_YOUNG_WIPE` restores the in-pause memset: no helper
@@ -27353,7 +27382,10 @@ mod tests {
                 let used_before = heap.lock_young_from().used();
                 let mut roots = vec![keep];
                 heap.collect_garbage(&stw(), &mut roots, &monitors);
-                assert!(heap.evacuated_wipe.lock().is_none(), "no wipe thread was spawned");
+                assert!(
+                    heap.evacuated_wipe.lock().is_none(),
+                    "no wipe thread was spawned"
+                );
                 assert!(!heap.wipe_in_flight.load(Ordering::Acquire));
                 let to = heap.young_to.lock();
                 let base = to.base_ptr();
@@ -29035,11 +29067,9 @@ pub fn disarm_jit_ref_store_marker() {
     // unsigned counter to a huge value, i.e. a gate armed for the life of the
     // process — safe, but it would silently withdraw the fast path everywhere
     // and look like the feature simply not paying.
-    let _ = JIT_REF_STORE_PRE_MARKERS.fetch_update(
-        Ordering::AcqRel,
-        Ordering::Acquire,
-        |n| Some(n.saturating_sub(1)),
-    );
+    let _ = JIT_REF_STORE_PRE_MARKERS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        Some(n.saturating_sub(1))
+    });
     refresh_jit_ref_store_pre_active();
 }
 
@@ -29130,7 +29160,9 @@ pub fn jit_ref_store_post_skip_mask() -> u8 {
 pub fn publish_jit_ref_store_plan(young_floor: u8) {
     refresh_jit_ref_store_pre_active();
     JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
-    JIT_REF_STORE_GATES.post_skip_mask.store(0, Ordering::Release);
+    JIT_REF_STORE_GATES
+        .post_skip_mask
+        .store(0, Ordering::Release);
     JIT_REF_STORE_GATES
         .young_floor
         .store(young_floor, Ordering::Release);
@@ -29162,7 +29194,9 @@ pub fn clear_jit_ref_store_plan() {
     JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
     JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
     JIT_REF_STORE_GATES.young_floor.store(0, Ordering::Release);
-    JIT_REF_STORE_GATES.post_skip_mask.store(0, Ordering::Release);
+    JIT_REF_STORE_GATES
+        .post_skip_mask
+        .store(0, Ordering::Release);
     JIT_REF_STORE_GATES.published.store(0, Ordering::Release);
 }
 

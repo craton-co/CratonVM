@@ -4191,37 +4191,38 @@ pub fn execute(
                                             ));
                                     let mut materialize_failed = false;
                                     if resume_allowed {
-                                        let cached =
-                                            Arc::new(CachedBytecodeMethod {
-                                                declaring_class_id: class_id,
-                                                tiering_settled: std::sync::atomic::AtomicU32::new(0),
-                                                class_name: Arc::from(class_name_str.as_str()),
-                                                method_name: Arc::from(method_name),
-                                                method_descriptor: Arc::from(method_descriptor),
-                                                source_file: source_file.as_deref().map(Arc::from),
-                                                code: crate::runtime::frame::padded_bytecode(
-                                                    &code_attr.code,
-                                                ),
-                                                exception_table: Arc::from(
-                                                    code_attr.exception_table.as_slice(),
-                                                ),
-                                                max_stack: code_attr.max_stack,
-                                                max_locals: code_attr.max_locals,
-                                                num_params: count_method_params(method_descriptor)
-                                                    as u16,
-                                                is_synchronized,
-                                                is_static,
-                                                force_native_cache: std::sync::OnceLock::new(),
-                                                descriptor_facts_cache: std::sync::OnceLock::new(),
-                                                intercept_shape_cache: std::sync::OnceLock::new(),
-                                                interp_invocations:
-                                                    std::sync::atomic::AtomicU32::new(0),
-                                                native_callback_cache: std::sync::OnceLock::new(),
-                                                invoc_key: std::sync::OnceLock::new(),
-                                                jit_probe_generation:
-                                                    std::sync::atomic::AtomicU64::new(0),
-                                                quickened: std::sync::OnceLock::new(),
-                                            });
+                                        let cached = Arc::new(CachedBytecodeMethod {
+                                            declaring_class_id: class_id,
+                                            tiering_settled: std::sync::atomic::AtomicU32::new(0),
+                                            class_name: Arc::from(class_name_str.as_str()),
+                                            method_name: Arc::from(method_name),
+                                            method_descriptor: Arc::from(method_descriptor),
+                                            source_file: source_file.as_deref().map(Arc::from),
+                                            code: crate::runtime::frame::padded_bytecode(
+                                                &code_attr.code,
+                                            ),
+                                            exception_table: Arc::from(
+                                                code_attr.exception_table.as_slice(),
+                                            ),
+                                            max_stack: code_attr.max_stack,
+                                            max_locals: code_attr.max_locals,
+                                            num_params: count_method_params(method_descriptor)
+                                                as u16,
+                                            is_synchronized,
+                                            is_static,
+                                            force_native_cache: std::sync::OnceLock::new(),
+                                            descriptor_facts_cache: std::sync::OnceLock::new(),
+                                            intercept_shape_cache: std::sync::OnceLock::new(),
+                                            interp_invocations: std::sync::atomic::AtomicU32::new(
+                                                0,
+                                            ),
+                                            native_callback_cache: std::sync::OnceLock::new(),
+                                            invoc_key: std::sync::OnceLock::new(),
+                                            jit_probe_generation: std::sync::atomic::AtomicU64::new(
+                                                0,
+                                            ),
+                                            quickened: std::sync::OnceLock::new(),
+                                        });
                                         let pin_base = thread.native_pin_roots.len();
                                         let built = build_deopt_frame_inner(
                                             shared,
@@ -5114,7 +5115,11 @@ pub fn pop_and_recycle_frame_with_reason(
     // moving collection between the acquire and the return relocates the
     // object, and `memory/gc.rs` already remaps `monitor_on_exit` for exactly
     // this reason.
-    if thread.frames.last().is_some_and(|f| f.monitor_on_exit.is_some()) {
+    if thread
+        .frames
+        .last()
+        .is_some_and(|f| f.monitor_on_exit.is_some())
+    {
         let tid = thread.thread_id;
         let monitor = thread
             .frames
@@ -5836,17 +5841,16 @@ fn execute_frame_from_index(
     // (`CRATONVM_DBG_OSR_FRAME_TRACE`) records every arrival inside the
     // call, so it keeps the floor at 0 and the old call rate.
     // `CRATONVM_JIT_NO_OSR_INLINE_GATE=1` restores the unconditional call.
-    let osr_call_floor: u32 = if crate::runtime::env_cache::no_osr_inline_gate()
-        || osr_frame_trace::enabled()
-    {
-        0
-    } else if matches!(thread.kind, crate::threading::ThreadKind::Virtual)
-        || !crate::runtime::env_cache::osr_backedge_enabled()
-    {
-        u32::MAX
-    } else {
-        crate::runtime::env_cache::tier_osr_backedge().unwrap_or(OSR_THRESHOLD)
-    };
+    let osr_call_floor: u32 =
+        if crate::runtime::env_cache::no_osr_inline_gate() || osr_frame_trace::enabled() {
+            0
+        } else if matches!(thread.kind, crate::threading::ThreadKind::Virtual)
+            || !crate::runtime::env_cache::osr_backedge_enabled()
+        {
+            u32::MAX
+        } else {
+            crate::runtime::env_cache::tier_osr_backedge().unwrap_or(OSR_THRESHOLD)
+        };
     macro_rules! backedge_poll_needed {
         () => {
             backedge_poll_gate_off
@@ -5973,21 +5977,21 @@ fn execute_frame_from_index(
                     let osr_due = $frame.backward_count >= osr_call_floor;
                     let _ = $frame;
                     if osr_due {
-                    match try_osr_with_backoff(
-                        shared,
-                        thread,
-                        &mut frame_idx,
-                        initial_frame_idx,
-                        entry_pc,
-                    ) {
-                        OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                        OsrBackoffOutcome::ContinueDispatch => continue,
-                        OsrBackoffOutcome::ThrowJava(exc) => {
-                            pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                            continue;
+                        match try_osr_with_backoff(
+                            shared,
+                            thread,
+                            &mut frame_idx,
+                            initial_frame_idx,
+                            entry_pc,
+                        ) {
+                            OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                            OsrBackoffOutcome::ContinueDispatch => continue,
+                            OsrBackoffOutcome::ThrowJava(exc) => {
+                                pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                continue;
+                            }
+                            OsrBackoffOutcome::Skip => {}
                         }
-                        OsrBackoffOutcome::Skip => {}
-                    }
                     }
                     if backedge_poll_needed!() {
                         safepoint_check(shared, thread);
@@ -6059,7 +6063,9 @@ fn execute_frame_from_index(
                 // Two conversion points that disagree is one conversion point too
                 // many; until they are merged they must at least agree.
                 let re = match re {
-                    RuntimeError::NotImplemented { feature } if feature == "operand stack overflow" => {
+                    RuntimeError::NotImplemented { feature }
+                        if feature == "operand stack overflow" =>
+                    {
                         RuntimeError::StackOverflowError
                     }
                     other => other,
@@ -6326,12 +6332,7 @@ fn execute_frame_from_index(
                                 if pgo_enabled {
                                     // profile at the `if_icmplt` pc, not the
                                     // fused pair's start
-                                    record_branch_for_frame(
-                                        shared,
-                                        frame,
-                                        saved_pc + 2,
-                                        taken,
-                                    );
+                                    record_branch_for_frame(shared, frame, saved_pc + 2, taken);
                                 }
                                 if taken {
                                     let offset = ((ob1 as i16) << 8) | (ob2 as i16); // Cast: bytecode operand decoding
@@ -6353,22 +6354,22 @@ fn execute_frame_from_index(
                                         let osr_due = frame.backward_count >= osr_call_floor;
                                         let _ = frame;
                                         if osr_due {
-                                        match try_osr_with_backoff(
-                                            shared,
-                                            thread,
-                                            &mut frame_idx,
-                                            initial_frame_idx,
-                                            entry_pc,
-                                        ) {
-                                            OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                            OsrBackoffOutcome::ContinueDispatch => continue,
-                                            OsrBackoffOutcome::ThrowJava(exc) => {
-                                                pending_java_exception =
-                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                                continue;
+                                            match try_osr_with_backoff(
+                                                shared,
+                                                thread,
+                                                &mut frame_idx,
+                                                initial_frame_idx,
+                                                entry_pc,
+                                            ) {
+                                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                                    pending_java_exception =
+                                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                                    continue;
+                                                }
+                                                OsrBackoffOutcome::Skip => {}
                                             }
-                                            OsrBackoffOutcome::Skip => {}
-                                        }
                                         }
                                         if backedge_poll_needed!() {
                                             safepoint_check(shared, thread);
@@ -6711,21 +6712,22 @@ fn execute_frame_from_index(
                         let osr_due = frame.backward_count >= osr_call_floor;
                         let _ = frame; // drop borrow before try_osr
                         if osr_due {
-                        match try_osr_with_backoff(
-                            shared,
-                            thread,
-                            &mut frame_idx,
-                            initial_frame_idx,
-                            entry_pc,
-                        ) {
-                            OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                            OsrBackoffOutcome::ContinueDispatch => continue,
-                            OsrBackoffOutcome::ThrowJava(exc) => {
-                                pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                                continue;
+                            match try_osr_with_backoff(
+                                shared,
+                                thread,
+                                &mut frame_idx,
+                                initial_frame_idx,
+                                entry_pc,
+                            ) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception =
+                                        Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                    continue;
+                                }
+                                OsrBackoffOutcome::Skip => {}
                             }
-                            OsrBackoffOutcome::Skip => {}
-                        }
                         }
                         if backedge_poll_needed!() {
                             safepoint_check(shared, thread);
@@ -7773,11 +7775,20 @@ fn execute_frame_from_index(
                         if frame.stack.len() >= 2 {
                             let idx_cv = frame.stack.peek_compact();
                             let arr_cv = frame.stack.peek_compact_at(1);
-                            if let (Some(index), Some(aptr)) = (idx_cv.as_int(), arr_cv.as_object_ptr()) {
+                            if let (Some(index), Some(aptr)) =
+                                (idx_cv.as_int(), arr_cv.as_object_ptr())
+                            {
                                 // SAFETY: an `Object`-tagged operand-stack slot holds a
                                 // heap address; `array_store_prim` re-validates it.
                                 let arr_ref = unsafe { ObjectRef::from_raw(aptr as *mut u8) };
-                                if field_fast::array_store_prim(zgc, arr_ref, index, opcode, cv, kind_of_popped) {
+                                if field_fast::array_store_prim(
+                                    zgc,
+                                    arr_ref,
+                                    index,
+                                    opcode,
+                                    cv,
+                                    kind_of_popped,
+                                ) {
                                     frame.stack.pop_compact();
                                     frame.stack.pop_compact();
                                     frame.pc = saved_pc + 1;
@@ -8039,7 +8050,8 @@ fn execute_frame_from_index(
                             Some(Ok(_)) => {
                                 continue;
                             }
-                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e)
+                            {
                                 FastPathInvokeError::Runtime(re) => {
                                     pending_runtime_error = Some((re, saved_pc));
                                     continue;
@@ -8055,8 +8067,7 @@ fn execute_frame_from_index(
                     }
                     if nonvirtual_fast_door_on {
                         match invoke_fast::execute_nonvirtual_fast_door(
-                            shared, thread, frame_idx, cp_index, false,
-                            saved_pc,
+                            shared, thread, frame_idx, cp_index, false, saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
@@ -8065,7 +8076,8 @@ fn execute_frame_from_index(
                             Some(Ok(_)) => {
                                 continue;
                             }
-                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e)
+                            {
                                 FastPathInvokeError::Runtime(re) => {
                                     pending_runtime_error = Some((re, saved_pc));
                                     continue;
@@ -8176,7 +8188,8 @@ fn execute_frame_from_index(
                             Some(Ok(_)) => {
                                 continue;
                             }
-                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e)
+                            {
                                 FastPathInvokeError::Runtime(re) => {
                                     pending_runtime_error = Some((re, saved_pc));
                                     continue;
@@ -8288,8 +8301,7 @@ fn execute_frame_from_index(
                     thread.frames[frame_idx].pc = saved_pc + 3;
                     if nonvirtual_fast_door_on {
                         match invoke_fast::execute_invokestatic_fast_door(
-                            shared, thread, frame_idx, cp_index,
-                            saved_pc,
+                            shared, thread, frame_idx, cp_index, saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
@@ -8298,7 +8310,8 @@ fn execute_frame_from_index(
                             Some(Ok(_)) => {
                                 continue;
                             }
-                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e)
+                            {
                                 FastPathInvokeError::Runtime(re) => {
                                     pending_runtime_error = Some((re, saved_pc));
                                     continue;
@@ -8379,7 +8392,8 @@ fn execute_frame_from_index(
                             Some(Ok(_)) => {
                                 continue;
                             }
-                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e)
+                            {
                                 FastPathInvokeError::Runtime(re) => {
                                     pending_runtime_error = Some((re, saved_pc));
                                     continue;
@@ -9216,21 +9230,21 @@ fn execute_frame_from_index(
                     thread.frames[frame_idx].backward_count += 1;
                     let osr_due = thread.frames[frame_idx].backward_count >= osr_call_floor;
                     if osr_due {
-                    match try_osr_with_backoff(
-                        shared,
-                        thread,
-                        &mut frame_idx,
-                        initial_frame_idx,
-                        new_pc,
-                    ) {
-                        OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                        OsrBackoffOutcome::ContinueDispatch => continue,
-                        OsrBackoffOutcome::ThrowJava(exc) => {
-                            pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
-                            continue;
+                        match try_osr_with_backoff(
+                            shared,
+                            thread,
+                            &mut frame_idx,
+                            initial_frame_idx,
+                            new_pc,
+                        ) {
+                            OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                            OsrBackoffOutcome::ContinueDispatch => continue,
+                            OsrBackoffOutcome::ThrowJava(exc) => {
+                                pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                                continue;
+                            }
+                            OsrBackoffOutcome::Skip => {}
                         }
-                        OsrBackoffOutcome::Skip => {}
-                    }
                     }
                     if backedge_poll_needed!() {
                         safepoint_check(shared, thread);
@@ -9531,8 +9545,8 @@ mod invoke_fast;
 // The interpreter's resolved constant pool: per-thread, lock-free site caches
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
-pub mod invoke_phases;
 pub mod field_phases;
+pub mod invoke_phases;
 pub mod site_cache;
 pub use site_cache::{
     CastSiteCache, ClassSiteCache, FastFieldSite, FastFieldSiteCache, FieldSiteCache,

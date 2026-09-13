@@ -1172,8 +1172,11 @@ fn watch_addr() -> usize {
         cratonvm_types::flags::runtime_var("CRATONVM_DBG_WATCH_ADDR")
             .ok()
             .and_then(|v| {
-                usize::from_str_radix(v.trim().trim_start_matches("0x").trim_start_matches("0X"), 16)
-                    .ok()
+                usize::from_str_radix(
+                    v.trim().trim_start_matches("0x").trim_start_matches("0X"),
+                    16,
+                )
+                .ok()
             })
             .unwrap_or(0)
     })

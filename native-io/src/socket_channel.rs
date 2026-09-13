@@ -1408,9 +1408,7 @@ pub fn gc_scan_channel_roots(roots: &mut Vec<ObjectRef>) {
     }
 }
 
-pub fn channel_fields_update_after_gc(
-    pointer_map: &cratonvm_types::PointerMap,
-) {
+pub fn channel_fields_update_after_gc(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -2214,8 +2212,10 @@ thread_local! {
 
 static CLOSE_PHASE_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CLOSE_PHASE_SLOW_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static CLOSE_PHASE_SLOW: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
-static CLOSE_PHASE_MAX_US: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+static CLOSE_PHASE_SLOW: [std::sync::atomic::AtomicU64; 12] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+static CLOSE_PHASE_MAX_US: [std::sync::atomic::AtomicU64; 12] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 fn close_phases_enabled() -> bool {
     static G: OnceLock<bool> = OnceLock::new();
@@ -4541,8 +4541,8 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             }
         }
         // GC: `capture_stack_trace` above allocates the trace it captures.
-    let bb = ctx.read_native_pin(bb_pin, bb);
-    let written = buffer_write_bytes(ctx, bb, scratch.prefix(n as usize));
+        let bb = ctx.read_native_pin(bb_pin, bb);
+        let written = buffer_write_bytes(ctx, bb, scratch.prefix(n as usize));
         buffer_advance(ctx, bb, written);
     }
     ctx.unpin_native_roots(bb_pin);
@@ -6549,7 +6549,12 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     // subclassed from outside it. The `foreign_nio_delegate` guard inside each
     // native is the second line of defence.
     for c in [scimpl, sscimpl] {
-        r.register(c, "implConfigureBlocking", "(Z)V", sc_impl_configure_blocking);
+        r.register(
+            c,
+            "implConfigureBlocking",
+            "(Z)V",
+            sc_impl_configure_blocking,
+        );
     }
     r.register(scimpl, "toString", "()Ljava/lang/String;", sc_to_string);
     r.register(sscimpl, "toString", "()Ljava/lang/String;", ssc_to_string);
@@ -6918,9 +6923,7 @@ pub fn gc_scan_ssc_socket_cache_roots(roots: &mut Vec<ObjectRef>) {
 /// is stable across a move; the `ObjectRef` discriminator is not, and must be
 /// rewritten or the next lookup silently misses — and a later object landing at
 /// the old address would match instead.
-pub fn ssc_socket_cache_update_after_gc(
-    pointer_map: &cratonvm_types::PointerMap,
-) {
+pub fn ssc_socket_cache_update_after_gc(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -7010,9 +7013,7 @@ pub fn gc_scan_ss_back_ref_roots(roots: &mut Vec<ObjectRef>) {
 /// Relocate both receiver and channel references after moving GC. The
 /// identity-hash bucket remains stable while its ObjectRef discriminator must
 /// be updated to preserve collision-safe lookup.
-pub fn ss_back_ref_update_after_gc(
-    pointer_map: &cratonvm_types::PointerMap,
-) {
+pub fn ss_back_ref_update_after_gc(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }

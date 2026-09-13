@@ -2629,7 +2629,10 @@ mod tests {
         let mut reg = ModuleRegistry::new();
         // A `--module-path` module: `vm_init` re-registers these with
         // `automatic = false`, which is what `is_class_path_only` reads.
-        reg.register(sample_desc("mod.on.module.path"), vec!["com/mp".to_string()]);
+        reg.register(
+            sample_desc("mod.on.module.path"),
+            vec!["com/mp".to_string()],
+        );
         // A modular jar found by the APPLICATION class-path scan.
         let mut cp_jar = sample_desc("org.apache.tomcat.catalina");
         cp_jar.automatic = true;

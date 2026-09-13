@@ -423,7 +423,10 @@ impl Compiler {
             // would leave the pair naming two different frames. Both halves
             // move together or neither does.
             if self.inline_cm_tls_disp != 0 {
-                self.emit_mov_tls_disp32_imm32(self.inline_cm_tls_disp as u32, self.compile_id.id());
+                self.emit_mov_tls_disp32_imm32(
+                    self.inline_cm_tls_disp as u32,
+                    self.compile_id.id(),
+                );
             }
             return;
         }
@@ -632,7 +635,10 @@ impl Compiler {
                 // not have to decode the call that created it — which it cannot
                 // do when the caller reached us through `CALL R11`.
                 if self.inline_cm_tls_disp != 0 {
-                    self.emit_mov_tls_disp32_imm32(self.inline_cm_tls_disp as u32, self.compile_id.id());
+                    self.emit_mov_tls_disp32_imm32(
+                        self.inline_cm_tls_disp as u32,
+                        self.compile_id.id(),
+                    );
                 }
                 // Debug self-check: also call the verify helper (wired into
                 // `frame_record` by `build_helpers` when the knob is on), which

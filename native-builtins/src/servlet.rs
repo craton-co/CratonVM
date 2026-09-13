@@ -6873,7 +6873,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     "()V",
                     &[Value::Object(Some(exc))],
                 );
-                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                    exc,
+                ));
             }
             return Err(RuntimeError::IllegalStateException {
                 message: "InvalidMarkException".into(),

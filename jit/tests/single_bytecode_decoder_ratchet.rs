@@ -70,10 +70,12 @@ fn fn_name(line: &str) -> Option<&str> {
     let code = code_of(line);
     let at = code.find("fn ")?;
     let before = &code[..at];
-    if !before
-        .split_whitespace()
-        .all(|w| matches!(w, "pub" | "pub(crate)" | "pub(super)" | "const" | "unsafe" | "async") || w.starts_with("extern"))
-    {
+    if !before.split_whitespace().all(|w| {
+        matches!(
+            w,
+            "pub" | "pub(crate)" | "pub(super)" | "const" | "unsafe" | "async"
+        ) || w.starts_with("extern")
+    }) {
         return None;
     }
     let rest = &code[at + 3..];
@@ -102,7 +104,12 @@ fn has_padding(body: &str, rem: &str, not3: &str) -> bool {
 fn switch_decoders(root: &Path) -> Vec<(String, String)> {
     let rem = format!("% {}", 4);
     let not3 = format!("& !{}", 3);
-    let opcodes = [format!("0x{}a", "a"), format!("0x{}b", "a"), format!("0x{}A", "A"), format!("0x{}B", "A")];
+    let opcodes = [
+        format!("0x{}a", "a"),
+        format!("0x{}b", "a"),
+        format!("0x{}A", "A"),
+        format!("0x{}B", "A"),
+    ];
     let mut files = Vec::new();
     rust_sources(root, &mut files);
     files.sort();
@@ -139,7 +146,9 @@ fn switch_decoders(root: &Path) -> Vec<(String, String)> {
                 }
                 j += 1;
             }
-            if has_padding(&body, &rem, &not3) && opcodes.iter().any(|op| body.contains(op.as_str())) {
+            if has_padding(&body, &rem, &not3)
+                && opcodes.iter().any(|op| body.contains(op.as_str()))
+            {
                 found.push((rel.clone(), name.to_string()));
             }
             i = if seen { j + 1 } else { i + 1 };

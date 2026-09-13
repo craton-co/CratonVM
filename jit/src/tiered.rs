@@ -187,7 +187,9 @@ pub fn current_thread_cpu_time() -> Option<std::time::Duration> {
         // A FILETIME counts 100-nanosecond intervals in two 32-bit halves.
         let ticks = |t: FileTime| (u64::from(t.high) << 32) | u64::from(t.low);
         return Some(std::time::Duration::from_nanos(
-            ticks(kernel).saturating_add(ticks(user)).saturating_mul(100),
+            ticks(kernel)
+                .saturating_add(ticks(user))
+                .saturating_mul(100),
         ));
     }
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -2830,7 +2832,8 @@ impl TieredCompilationManager {
                     if action == DeoptAction::MakeNotCompilable {
                         state.ineligible = true;
                     }
-                    if (at_site >= PER_BCI_TRAP_LIMIT || state.deopt_count >= PER_METHOD_TRAP_CUTOFF)
+                    if (at_site >= PER_BCI_TRAP_LIMIT
+                        || state.deopt_count >= PER_METHOD_TRAP_CUTOFF)
                         && !state.c2_bailout
                     {
                         state.c2_bailout = true;
@@ -3607,13 +3610,16 @@ mod tests {
         let mgr = epoch_driven_manager(&Arc::new(AtomicU64::new(1)));
         let key = MethodKey::new("craton/test/OsrRetry", "loop", "()V");
         for attempt in 0..MAX_TIER_FAIL_RETRIES {
-            let task = mgr
-                .request_osr(&key, 9)
-                .unwrap_or_else(|| panic!("attempt {attempt}: a failed OSR compile must be retried"));
+            let task = mgr.request_osr(&key, 9).unwrap_or_else(|| {
+                panic!("attempt {attempt}: a failed OSR compile must be retried")
+            });
             assert_eq!(mgr.next_fresh_task(), Some(task));
             mgr.core
                 .complete_task(&key, CompilationTier::C2, 1, false, true, false);
-            assert!(!mgr.is_osr_denied(&key), "a failed compile must not deny OSR");
+            assert!(
+                !mgr.is_osr_denied(&key),
+                "a failed compile must not deny OSR"
+            );
         }
         assert!(
             mgr.request_osr(&key, 9).is_none(),
@@ -4088,7 +4094,10 @@ mod tests {
                 "an evicted body drops the tier even when the deopt is not charged"
             );
         }
-        assert_eq!(mgr.stats().soft_deoptimizations.load(Ordering::Relaxed), 150);
+        assert_eq!(
+            mgr.stats().soft_deoptimizations.load(Ordering::Relaxed),
+            150
+        );
         assert!(
             mgr.request_osr(&key, 30).is_some(),
             "OSR stays available: nothing here was a counted trap"
@@ -4128,7 +4137,10 @@ mod tests {
         );
         let methods = mgr.core.methods.lock();
         let state = &methods[&key];
-        assert!(!state.c2_bailout, "decayed counts must not reach the per-bci limit");
+        assert!(
+            !state.c2_bailout,
+            "decayed counts must not reach the per-bci limit"
+        );
         assert_eq!(
             state.trap_counts[&(DeoptReason::ClassCheck, 5)],
             (PER_BCI_TRAP_LIMIT - 1) / 2 + 1
@@ -4158,7 +4170,10 @@ mod tests {
         assert!(!state.queued_for_compilation);
         assert!(state.queued_tier.is_none());
         drop(methods);
-        assert!(mgr.queue_empty(), "the queued request is dropped, not left behind");
+        assert!(
+            mgr.queue_empty(),
+            "the queued request is dropped, not left behind"
+        );
     }
 
     // ── Tier-4 compile-time guard (jit-inlining-and-ir-calls) ────────────
@@ -5410,8 +5425,10 @@ mod tests {
             c1_threshold: 1,
             ..CompilationPolicy::default()
         };
-        let mgr =
-            TieredCompilationManager::with_install_epoch_source(policy, Some(Arc::new(AtomicU64::new(1))));
+        let mgr = TieredCompilationManager::with_install_epoch_source(
+            policy,
+            Some(Arc::new(AtomicU64::new(1))),
+        );
         let app = MethodKey::with_class_id(ClassId::new(7), "com/example/Foo", "run", "()V");
         let plugin = MethodKey::with_class_id(ClassId::new(9), "com/example/Foo", "run", "()V");
         assert_ne!(app, plugin);
@@ -5433,7 +5450,10 @@ mod tests {
         let states = mgr.method_states();
         assert!(states.iter().all(|(k, _, _)| *k != app));
         assert!(states.iter().any(|(k, _, _)| *k == plugin));
-        assert!(!mgr.is_osr_denied(&app), "unload forgets the class's denials");
+        assert!(
+            !mgr.is_osr_denied(&app),
+            "unload forgets the class's denials"
+        );
         // The app's C1 request (never dispatched here) went with its class.
         assert_eq!(mgr.queue_size(), 1, "the plugin's queued request survives");
     }
@@ -5452,7 +5472,10 @@ mod tests {
         assert!(mgr.is_osr_denied(&plugin));
 
         mgr.on_class_redefined(ClassId::new(7), "com/example/Bar");
-        assert!(!mgr.is_osr_denied(&app), "the redefined class forgets its denials");
+        assert!(
+            !mgr.is_osr_denied(&app),
+            "the redefined class forgets its denials"
+        );
         assert!(
             mgr.is_osr_denied(&plugin),
             "the other loader's same-named class keeps its denials"
@@ -5478,7 +5501,11 @@ mod tests {
         assert_eq!(mgr.branch_window_balance(), 1);
         epoch.store(2, Ordering::Release);
         assert_eq!(mgr.next_fresh_task(), None);
-        assert_eq!(mgr.branch_window_balance(), 0, "a stale drop closes the window");
+        assert_eq!(
+            mgr.branch_window_balance(),
+            0,
+            "a stale drop closes the window"
+        );
 
         // 2. An OSR C2 completion never opened one and must not close one.
         let osr = epoch_key("windowOsr");
@@ -5558,8 +5585,12 @@ mod tests {
     fn a_contained_panic_is_visible_to_the_panic_hook_as_contained() {
         assert!(!compile_panic_is_contained());
         let inside = contain_compile_panic(compile_panic_is_contained).expect("no panic");
-        assert!(inside, "the crash handler must see the scope while the hook runs");
-        let caught = contain_compile_panic(|| -> () { panic!("deliberate contained panic (test)") });
+        assert!(
+            inside,
+            "the crash handler must see the scope while the hook runs"
+        );
+        let caught =
+            contain_compile_panic(|| -> () { panic!("deliberate contained panic (test)") });
         assert!(caught.is_err());
         assert!(
             !compile_panic_is_contained(),
@@ -5604,10 +5635,17 @@ mod tests {
         while mgr.completed_compilations() == 0 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
-        assert_eq!(mgr.worker_panics(), 1, "the panic was contained and counted");
+        assert_eq!(
+            mgr.worker_panics(),
+            1,
+            "the panic was contained and counted"
+        );
 
         // The same lane keeps serving: the next C1 compile still runs.
-        assert_eq!(mgr.on_method_invocation(&healthy), Some(CompilationTier::C1));
+        assert_eq!(
+            mgr.on_method_invocation(&healthy),
+            Some(CompilationTier::C1)
+        );
         assert_eq!(
             rx.recv_timeout(WORKER_RENDEZVOUS)
                 .expect("the worker must survive the panic"),
@@ -5628,7 +5666,11 @@ mod tests {
                 "and its slot is released"
             );
         }
-        assert_eq!(mgr.inflight_install_epoch(), 0, "the in-flight epoch is reset");
+        assert_eq!(
+            mgr.inflight_install_epoch(),
+            0,
+            "the in-flight epoch is reset"
+        );
         assert!(mgr.compiler_active());
         drop(bg);
     }

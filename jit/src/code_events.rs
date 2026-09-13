@@ -56,7 +56,12 @@ pub enum CodeTier {
 
 /// `java/lang/String.hashCode()I [c1]`, `... [c2]`, `... [osr@<bci>]`, or
 /// `<label> [stub:<kind>]`.
-pub fn method_name(class_name: &str, method_name: &str, descriptor: &str, tier: CodeTier) -> String {
+pub fn method_name(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    tier: CodeTier,
+) -> String {
     let base = format!("{class_name}.{method_name}{descriptor}");
     with_tier_suffix(&base, tier)
 }

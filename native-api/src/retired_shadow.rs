@@ -7270,24 +7270,44 @@ static RETIRED_SHADOW_L2_TRIPLES: &[(&str, &str, &str)] = &[
 /// accessor shim no bytecode can name. The seven `ResourceBundle` rows that
 /// would have joined it are moot — the whole family is HELD.
 static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
-    ("java/time/Duration", "parse", "(Ljava/lang/CharSequence;)Ljava/time/Duration;"),
+    (
+        "java/time/Duration",
+        "parse",
+        "(Ljava/lang/CharSequence;)Ljava/time/Duration;",
+    ),
     ("java/time/ZoneId", "systemDefault", "()Ljava/time/ZoneId;"),
     ("java/util/ArrayDeque", "<init>", "()V"),
     ("java/util/ArrayDeque", "<init>", "(I)V"),
-    ("java/util/ArrayDeque", "<init>", "(Ljava/util/Collection;)V"),
+    (
+        "java/util/ArrayDeque",
+        "<init>",
+        "(Ljava/util/Collection;)V",
+    ),
     ("java/util/ArrayDeque", "add", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayDeque", "addAll", "(Ljava/util/Collection;)Z"),
+    (
+        "java/util/ArrayDeque",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+    ),
     ("java/util/ArrayDeque", "addFirst", "(Ljava/lang/Object;)V"),
     ("java/util/ArrayDeque", "addLast", "(Ljava/lang/Object;)V"),
     ("java/util/ArrayDeque", "clear", "()V"),
     ("java/util/ArrayDeque", "contains", "(Ljava/lang/Object;)Z"),
     ("java/util/ArrayDeque", "element", "()Ljava/lang/Object;"),
-    ("java/util/ArrayDeque", "forEach", "(Ljava/util/function/Consumer;)V"),
+    (
+        "java/util/ArrayDeque",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
     ("java/util/ArrayDeque", "getFirst", "()Ljava/lang/Object;"),
     ("java/util/ArrayDeque", "getLast", "()Ljava/lang/Object;"),
     ("java/util/ArrayDeque", "isEmpty", "()Z"),
     ("java/util/ArrayDeque", "offer", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayDeque", "offerFirst", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/ArrayDeque",
+        "offerFirst",
+        "(Ljava/lang/Object;)Z",
+    ),
     ("java/util/ArrayDeque", "offerLast", "(Ljava/lang/Object;)Z"),
     ("java/util/ArrayDeque", "peek", "()Ljava/lang/Object;"),
     ("java/util/ArrayDeque", "peekFirst", "()Ljava/lang/Object;"),
@@ -7299,13 +7319,37 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/ArrayDeque", "push", "(Ljava/lang/Object;)V"),
     ("java/util/ArrayDeque", "remove", "()Ljava/lang/Object;"),
     ("java/util/ArrayDeque", "remove", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayDeque", "removeAll", "(Ljava/util/Collection;)Z"),
-    ("java/util/ArrayDeque", "removeFirst", "()Ljava/lang/Object;"),
-    ("java/util/ArrayDeque", "removeFirstOccurrence", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayDeque", "removeIf", "(Ljava/util/function/Predicate;)Z"),
+    (
+        "java/util/ArrayDeque",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/ArrayDeque",
+        "removeFirst",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/ArrayDeque",
+        "removeFirstOccurrence",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/ArrayDeque",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
     ("java/util/ArrayDeque", "removeLast", "()Ljava/lang/Object;"),
-    ("java/util/ArrayDeque", "removeLastOccurrence", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayDeque", "retainAll", "(Ljava/util/Collection;)Z"),
+    (
+        "java/util/ArrayDeque",
+        "removeLastOccurrence",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/ArrayDeque",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+    ),
     ("java/util/ArrayDeque", "size", "()I"),
     ("java/util/ArrayDeque", "toArray", "()[Ljava/lang/Object;"),
     ("java/util/ArrayDeque", "toString", "()Ljava/lang/String;"),
@@ -7313,182 +7357,578 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/ArrayList", "addAll", "(Ljava/util/Collection;)Z"),
     ("java/util/ArrayList", "ensureCapacity", "(I)V"),
     ("java/util/ArrayList", "equals", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayList", "forEach", "(Ljava/util/function/Consumer;)V"),
+    (
+        "java/util/ArrayList",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
     ("java/util/ArrayList", "hashCode", "()I"),
     ("java/util/ArrayList", "indexOf", "(Ljava/lang/Object;)I"),
-    ("java/util/ArrayList", "lastIndexOf", "(Ljava/lang/Object;)I"),
-    ("java/util/ArrayList", "listIterator", "()Ljava/util/ListIterator;"),
-    ("java/util/ArrayList", "listIterator", "(I)Ljava/util/ListIterator;"),
+    (
+        "java/util/ArrayList",
+        "lastIndexOf",
+        "(Ljava/lang/Object;)I",
+    ),
+    (
+        "java/util/ArrayList",
+        "listIterator",
+        "()Ljava/util/ListIterator;",
+    ),
+    (
+        "java/util/ArrayList",
+        "listIterator",
+        "(I)Ljava/util/ListIterator;",
+    ),
     ("java/util/ArrayList", "remove", "(I)Ljava/lang/Object;"),
     ("java/util/ArrayList", "remove", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayList", "removeAll", "(Ljava/util/Collection;)Z"),
-    ("java/util/ArrayList", "removeIf", "(Ljava/util/function/Predicate;)Z"),
-    ("java/util/ArrayList", "replaceAll", "(Ljava/util/function/UnaryOperator;)V"),
-    ("java/util/ArrayList", "retainAll", "(Ljava/util/Collection;)Z"),
-    ("java/util/ArrayList", "set", "(ILjava/lang/Object;)Ljava/lang/Object;"),
+    (
+        "java/util/ArrayList",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/ArrayList",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    (
+        "java/util/ArrayList",
+        "replaceAll",
+        "(Ljava/util/function/UnaryOperator;)V",
+    ),
+    (
+        "java/util/ArrayList",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/ArrayList",
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+    ),
     ("java/util/ArrayList", "sort", "(Ljava/util/Comparator;)V"),
-    ("java/util/ArrayList", "stream", "()Ljava/util/stream/Stream;"),
-    ("java/util/ArrayList", "toArray", "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;"),
+    (
+        "java/util/ArrayList",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/ArrayList",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
     ("java/util/ArrayList", "toString", "()Ljava/lang/String;"),
     ("java/util/ArrayList", "trimToSize", "()V"),
     ("java/util/ArrayList$Itr", "remove", "()V"),
-    ("java/util/ArrayList$ListItr", "add", "(Ljava/lang/Object;)V"),
+    (
+        "java/util/ArrayList$ListItr",
+        "add",
+        "(Ljava/lang/Object;)V",
+    ),
     ("java/util/ArrayList$ListItr", "hasNext", "()Z"),
     ("java/util/ArrayList$ListItr", "hasPrevious", "()Z"),
-    ("java/util/ArrayList$ListItr", "next", "()Ljava/lang/Object;"),
+    (
+        "java/util/ArrayList$ListItr",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
     ("java/util/ArrayList$ListItr", "nextIndex", "()I"),
-    ("java/util/ArrayList$ListItr", "previous", "()Ljava/lang/Object;"),
+    (
+        "java/util/ArrayList$ListItr",
+        "previous",
+        "()Ljava/lang/Object;",
+    ),
     ("java/util/ArrayList$ListItr", "previousIndex", "()I"),
     ("java/util/ArrayList$ListItr", "remove", "()V"),
-    ("java/util/ArrayList$ListItr", "set", "(Ljava/lang/Object;)V"),
-    ("java/util/ArrayList$SubList", "add", "(ILjava/lang/Object;)V"),
-    ("java/util/ArrayList$SubList", "add", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayList$SubList", "addAll", "(ILjava/util/Collection;)Z"),
-    ("java/util/ArrayList$SubList", "addAll", "(Ljava/util/Collection;)Z"),
-    ("java/util/ArrayList$SubList", "addFirst", "(Ljava/lang/Object;)V"),
-    ("java/util/ArrayList$SubList", "addLast", "(Ljava/lang/Object;)V"),
+    (
+        "java/util/ArrayList$ListItr",
+        "set",
+        "(Ljava/lang/Object;)V",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "add",
+        "(ILjava/lang/Object;)V",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "add",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "addAll",
+        "(ILjava/util/Collection;)Z",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "addFirst",
+        "(Ljava/lang/Object;)V",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "addLast",
+        "(Ljava/lang/Object;)V",
+    ),
     ("java/util/ArrayList$SubList", "clear", "()V"),
-    ("java/util/ArrayList$SubList", "contains", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayList$SubList", "containsAll", "(Ljava/util/Collection;)Z"),
-    ("java/util/ArrayList$SubList", "equals", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayList$SubList", "forEach", "(Ljava/util/function/Consumer;)V"),
-    ("java/util/ArrayList$SubList", "get", "(I)Ljava/lang/Object;"),
-    ("java/util/ArrayList$SubList", "getFirst", "()Ljava/lang/Object;"),
-    ("java/util/ArrayList$SubList", "getLast", "()Ljava/lang/Object;"),
+    (
+        "java/util/ArrayList$SubList",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "containsAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "get",
+        "(I)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "getFirst",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "getLast",
+        "()Ljava/lang/Object;",
+    ),
     ("java/util/ArrayList$SubList", "hashCode", "()I"),
-    ("java/util/ArrayList$SubList", "indexOf", "(Ljava/lang/Object;)I"),
+    (
+        "java/util/ArrayList$SubList",
+        "indexOf",
+        "(Ljava/lang/Object;)I",
+    ),
     ("java/util/ArrayList$SubList", "isEmpty", "()Z"),
-    ("java/util/ArrayList$SubList", "iterator", "()Ljava/util/Iterator;"),
-    ("java/util/ArrayList$SubList", "lastIndexOf", "(Ljava/lang/Object;)I"),
-    ("java/util/ArrayList$SubList", "listIterator", "()Ljava/util/ListIterator;"),
-    ("java/util/ArrayList$SubList", "listIterator", "(I)Ljava/util/ListIterator;"),
-    ("java/util/ArrayList$SubList", "parallelStream", "()Ljava/util/stream/Stream;"),
-    ("java/util/ArrayList$SubList", "remove", "(I)Ljava/lang/Object;"),
-    ("java/util/ArrayList$SubList", "remove", "(Ljava/lang/Object;)Z"),
-    ("java/util/ArrayList$SubList", "removeAll", "(Ljava/util/Collection;)Z"),
-    ("java/util/ArrayList$SubList", "removeFirst", "()Ljava/lang/Object;"),
-    ("java/util/ArrayList$SubList", "removeIf", "(Ljava/util/function/Predicate;)Z"),
-    ("java/util/ArrayList$SubList", "removeLast", "()Ljava/lang/Object;"),
-    ("java/util/ArrayList$SubList", "replaceAll", "(Ljava/util/function/UnaryOperator;)V"),
-    ("java/util/ArrayList$SubList", "retainAll", "(Ljava/util/Collection;)Z"),
-    ("java/util/ArrayList$SubList", "reversed", "()Ljava/util/List;"),
-    ("java/util/ArrayList$SubList", "set", "(ILjava/lang/Object;)Ljava/lang/Object;"),
+    (
+        "java/util/ArrayList$SubList",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "lastIndexOf",
+        "(Ljava/lang/Object;)I",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "listIterator",
+        "()Ljava/util/ListIterator;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "listIterator",
+        "(I)Ljava/util/ListIterator;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "parallelStream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "remove",
+        "(I)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "removeFirst",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "removeLast",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "replaceAll",
+        "(Ljava/util/function/UnaryOperator;)V",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "reversed",
+        "()Ljava/util/List;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+    ),
     ("java/util/ArrayList$SubList", "size", "()I"),
-    ("java/util/ArrayList$SubList", "sort", "(Ljava/util/Comparator;)V"),
-    ("java/util/ArrayList$SubList", "spliterator", "()Ljava/util/Spliterator;"),
-    ("java/util/ArrayList$SubList", "stream", "()Ljava/util/stream/Stream;"),
-    ("java/util/ArrayList$SubList", "subList", "(II)Ljava/util/List;"),
-    ("java/util/ArrayList$SubList", "toArray", "()[Ljava/lang/Object;"),
+    (
+        "java/util/ArrayList$SubList",
+        "sort",
+        "(Ljava/util/Comparator;)V",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "subList",
+        "(II)Ljava/util/List;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
     (
         "java/util/ArrayList$SubList",
         "toArray",
         "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
     ),
-    ("java/util/ArrayList$SubList", "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
-    ("java/util/ArrayList$SubList", "toString", "()Ljava/lang/String;"),
-    ("java/util/ArrayList$SubList$1", "add", "(Ljava/lang/Object;)V"),
-    ("java/util/ArrayList$SubList$1", "forEachRemaining", "(Ljava/util/function/Consumer;)V"),
+    (
+        "java/util/ArrayList$SubList",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/ArrayList$SubList",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/ArrayList$SubList$1",
+        "add",
+        "(Ljava/lang/Object;)V",
+    ),
+    (
+        "java/util/ArrayList$SubList$1",
+        "forEachRemaining",
+        "(Ljava/util/function/Consumer;)V",
+    ),
     ("java/util/ArrayList$SubList$1", "hasNext", "()Z"),
     ("java/util/ArrayList$SubList$1", "hasPrevious", "()Z"),
-    ("java/util/ArrayList$SubList$1", "next", "()Ljava/lang/Object;"),
+    (
+        "java/util/ArrayList$SubList$1",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
     ("java/util/ArrayList$SubList$1", "nextIndex", "()I"),
-    ("java/util/ArrayList$SubList$1", "previous", "()Ljava/lang/Object;"),
+    (
+        "java/util/ArrayList$SubList$1",
+        "previous",
+        "()Ljava/lang/Object;",
+    ),
     ("java/util/ArrayList$SubList$1", "previousIndex", "()I"),
     ("java/util/ArrayList$SubList$1", "remove", "()V"),
-    ("java/util/ArrayList$SubList$1", "set", "(Ljava/lang/Object;)V"),
-    ("java/util/Arrays", "asList", "([Ljava/lang/Object;)Ljava/util/List;"),
+    (
+        "java/util/ArrayList$SubList$1",
+        "set",
+        "(Ljava/lang/Object;)V",
+    ),
+    (
+        "java/util/Arrays",
+        "asList",
+        "([Ljava/lang/Object;)Ljava/util/List;",
+    ),
     ("java/util/Arrays", "binarySearch", "([II)I"),
     ("java/util/Arrays", "copyOf", "([BI)[B"),
     ("java/util/Arrays", "copyOf", "([II)[I"),
-    ("java/util/Arrays", "copyOf", "([Ljava/lang/Object;I)[Ljava/lang/Object;"),
-    ("java/util/Arrays", "copyOf", "([Ljava/lang/Object;ILjava/lang/Class;)[Ljava/lang/Object;"),
+    (
+        "java/util/Arrays",
+        "copyOf",
+        "([Ljava/lang/Object;I)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Arrays",
+        "copyOf",
+        "([Ljava/lang/Object;ILjava/lang/Class;)[Ljava/lang/Object;",
+    ),
     ("java/util/Arrays", "copyOfRange", "([BII)[B"),
-    ("java/util/Arrays", "copyOfRange", "([Ljava/lang/Object;II)[Ljava/lang/Object;"),
+    (
+        "java/util/Arrays",
+        "copyOfRange",
+        "([Ljava/lang/Object;II)[Ljava/lang/Object;",
+    ),
     ("java/util/Arrays", "equals", "([B[B)Z"),
     ("java/util/Arrays", "equals", "([I[I)Z"),
     ("java/util/Arrays", "fill", "([II)V"),
-    ("java/util/Arrays", "fill", "([Ljava/lang/Object;Ljava/lang/Object;)V"),
+    (
+        "java/util/Arrays",
+        "fill",
+        "([Ljava/lang/Object;Ljava/lang/Object;)V",
+    ),
     ("java/util/Arrays", "hashCode", "([B)I"),
     ("java/util/Arrays", "hashCode", "([Ljava/lang/Object;)I"),
     ("java/util/Arrays", "sort", "([I)V"),
     ("java/util/Arrays", "sort", "([JII)V"),
     ("java/util/Arrays", "sort", "([Ljava/lang/Object;)V"),
-    ("java/util/Arrays", "stream", "([Ljava/lang/Object;)Ljava/util/stream/Stream;"),
-    ("java/util/Arrays", "toString", "([Ljava/lang/Object;)Ljava/lang/String;"),
-    ("java/util/Arrays$ArrayList", "<init>", "([Ljava/lang/Object;)V"),
+    (
+        "java/util/Arrays",
+        "stream",
+        "([Ljava/lang/Object;)Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/Arrays",
+        "toString",
+        "([Ljava/lang/Object;)Ljava/lang/String;",
+    ),
+    (
+        "java/util/Arrays$ArrayList",
+        "<init>",
+        "([Ljava/lang/Object;)V",
+    ),
     ("java/util/Arrays$ArrayList", "get", "(I)Ljava/lang/Object;"),
     ("java/util/Arrays$ArrayList", "isEmpty", "()Z"),
     ("java/util/Arrays$ArrayList", "size", "()I"),
-    ("java/util/Arrays$ArrayList", "toArray", "()[Ljava/lang/Object;"),
-    ("java/util/Collections", "addAll", "(Ljava/util/Collection;[Ljava/lang/Object;)Z"),
-    ("java/util/Collections", "emptyEnumeration", "()Ljava/util/Enumeration;"),
-    ("java/util/Collections", "emptyIterator", "()Ljava/util/Iterator;"),
+    (
+        "java/util/Arrays$ArrayList",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Collections",
+        "addAll",
+        "(Ljava/util/Collection;[Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Collections",
+        "emptyEnumeration",
+        "()Ljava/util/Enumeration;",
+    ),
+    (
+        "java/util/Collections",
+        "emptyIterator",
+        "()Ljava/util/Iterator;",
+    ),
     ("java/util/Collections", "emptyList", "()Ljava/util/List;"),
-    ("java/util/Collections", "emptyListIterator", "()Ljava/util/ListIterator;"),
+    (
+        "java/util/Collections",
+        "emptyListIterator",
+        "()Ljava/util/ListIterator;",
+    ),
     ("java/util/Collections", "emptyMap", "()Ljava/util/Map;"),
     ("java/util/Collections", "emptySet", "()Ljava/util/Set;"),
-    ("java/util/Collections", "fill", "(Ljava/util/List;Ljava/lang/Object;)V"),
-    ("java/util/Collections", "frequency", "(Ljava/util/Collection;Ljava/lang/Object;)I"),
-    ("java/util/Collections", "max", "(Ljava/util/Collection;)Ljava/lang/Object;"),
-    ("java/util/Collections", "min", "(Ljava/util/Collection;)Ljava/lang/Object;"),
-    ("java/util/Collections", "nCopies", "(ILjava/lang/Object;)Ljava/util/List;"),
-    ("java/util/Collections", "newSetFromMap", "(Ljava/util/Map;)Ljava/util/Set;"),
+    (
+        "java/util/Collections",
+        "fill",
+        "(Ljava/util/List;Ljava/lang/Object;)V",
+    ),
+    (
+        "java/util/Collections",
+        "frequency",
+        "(Ljava/util/Collection;Ljava/lang/Object;)I",
+    ),
+    (
+        "java/util/Collections",
+        "max",
+        "(Ljava/util/Collection;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Collections",
+        "min",
+        "(Ljava/util/Collection;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Collections",
+        "nCopies",
+        "(ILjava/lang/Object;)Ljava/util/List;",
+    ),
+    (
+        "java/util/Collections",
+        "newSetFromMap",
+        "(Ljava/util/Map;)Ljava/util/Set;",
+    ),
     ("java/util/Collections", "reverse", "(Ljava/util/List;)V"),
     ("java/util/Collections", "shuffle", "(Ljava/util/List;)V"),
-    ("java/util/Collections", "singleton", "(Ljava/lang/Object;)Ljava/util/Set;"),
-    ("java/util/Collections", "singletonList", "(Ljava/lang/Object;)Ljava/util/List;"),
+    (
+        "java/util/Collections",
+        "singleton",
+        "(Ljava/lang/Object;)Ljava/util/Set;",
+    ),
+    (
+        "java/util/Collections",
+        "singletonList",
+        "(Ljava/lang/Object;)Ljava/util/List;",
+    ),
     (
         "java/util/Collections",
         "singletonMap",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
     ),
     ("java/util/Collections", "sort", "(Ljava/util/List;)V"),
-    ("java/util/Collections", "sort", "(Ljava/util/List;Ljava/util/Comparator;)V"),
+    (
+        "java/util/Collections",
+        "sort",
+        "(Ljava/util/List;Ljava/util/Comparator;)V",
+    ),
     ("java/util/Collections", "swap", "(Ljava/util/List;II)V"),
     (
         "java/util/Collections",
         "synchronizedCollection",
         "(Ljava/util/Collection;)Ljava/util/Collection;",
     ),
-    ("java/util/Collections", "synchronizedList", "(Ljava/util/List;)Ljava/util/List;"),
-    ("java/util/Collections", "synchronizedSet", "(Ljava/util/Set;)Ljava/util/Set;"),
-    ("java/util/Collections$EmptyEnumeration", "hasMoreElements", "()Z"),
-    ("java/util/Collections$EmptyEnumeration", "nextElement", "()Ljava/lang/Object;"),
+    (
+        "java/util/Collections",
+        "synchronizedList",
+        "(Ljava/util/List;)Ljava/util/List;",
+    ),
+    (
+        "java/util/Collections",
+        "synchronizedSet",
+        "(Ljava/util/Set;)Ljava/util/Set;",
+    ),
+    (
+        "java/util/Collections$EmptyEnumeration",
+        "hasMoreElements",
+        "()Z",
+    ),
+    (
+        "java/util/Collections$EmptyEnumeration",
+        "nextElement",
+        "()Ljava/lang/Object;",
+    ),
     ("java/util/Collections$EmptyIterator", "hasNext", "()Z"),
-    ("java/util/Collections$EmptyIterator", "next", "()Ljava/lang/Object;"),
+    (
+        "java/util/Collections$EmptyIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
     ("java/util/Collections$EmptyIterator", "remove", "()V"),
-    ("java/util/Collections$EmptyListIterator", "add", "(Ljava/lang/Object;)V"),
+    (
+        "java/util/Collections$EmptyListIterator",
+        "add",
+        "(Ljava/lang/Object;)V",
+    ),
     ("java/util/Collections$EmptyListIterator", "hasNext", "()Z"),
-    ("java/util/Collections$EmptyListIterator", "hasPrevious", "()Z"),
-    ("java/util/Collections$EmptyListIterator", "next", "()Ljava/lang/Object;"),
-    ("java/util/Collections$EmptyListIterator", "nextIndex", "()I"),
-    ("java/util/Collections$EmptyListIterator", "previous", "()Ljava/lang/Object;"),
-    ("java/util/Collections$EmptyListIterator", "previousIndex", "()I"),
+    (
+        "java/util/Collections$EmptyListIterator",
+        "hasPrevious",
+        "()Z",
+    ),
+    (
+        "java/util/Collections$EmptyListIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Collections$EmptyListIterator",
+        "nextIndex",
+        "()I",
+    ),
+    (
+        "java/util/Collections$EmptyListIterator",
+        "previous",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Collections$EmptyListIterator",
+        "previousIndex",
+        "()I",
+    ),
     ("java/util/Collections$EmptyListIterator", "remove", "()V"),
-    ("java/util/Collections$EmptyListIterator", "set", "(Ljava/lang/Object;)V"),
-    ("java/util/Collections$SetFromMap", "contains", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/Collections$EmptyListIterator",
+        "set",
+        "(Ljava/lang/Object;)V",
+    ),
+    (
+        "java/util/Collections$SetFromMap",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
     ("java/util/Collections$SetFromMap", "isEmpty", "()Z"),
-    ("java/util/Collections$SetFromMap", "iterator", "()Ljava/util/Iterator;"),
+    (
+        "java/util/Collections$SetFromMap",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
     ("java/util/Collections$SetFromMap", "size", "()I"),
-    ("java/util/Collections$SetFromMap", "toArray", "()[Ljava/lang/Object;"),
+    (
+        "java/util/Collections$SetFromMap",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
     ("java/util/LinkedList", "<init>", "()V"),
-    ("java/util/LinkedList", "<init>", "(Ljava/util/Collection;)V"),
+    (
+        "java/util/LinkedList",
+        "<init>",
+        "(Ljava/util/Collection;)V",
+    ),
     ("java/util/LinkedList", "add", "(ILjava/lang/Object;)V"),
     ("java/util/LinkedList", "add", "(Ljava/lang/Object;)Z"),
-    ("java/util/LinkedList", "addAll", "(ILjava/util/Collection;)Z"),
-    ("java/util/LinkedList", "addAll", "(Ljava/util/Collection;)Z"),
+    (
+        "java/util/LinkedList",
+        "addAll",
+        "(ILjava/util/Collection;)Z",
+    ),
+    (
+        "java/util/LinkedList",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+    ),
     ("java/util/LinkedList", "addFirst", "(Ljava/lang/Object;)V"),
     ("java/util/LinkedList", "addLast", "(Ljava/lang/Object;)V"),
     ("java/util/LinkedList", "clear", "()V"),
     ("java/util/LinkedList", "contains", "(Ljava/lang/Object;)Z"),
-    ("java/util/LinkedList", "descendingIterator", "()Ljava/util/Iterator;"),
+    (
+        "java/util/LinkedList",
+        "descendingIterator",
+        "()Ljava/util/Iterator;",
+    ),
     ("java/util/LinkedList", "get", "(I)Ljava/lang/Object;"),
     ("java/util/LinkedList", "getFirst", "()Ljava/lang/Object;"),
     ("java/util/LinkedList", "getLast", "()Ljava/lang/Object;"),
     ("java/util/LinkedList", "isEmpty", "()Z"),
     ("java/util/LinkedList", "iterator", "()Ljava/util/Iterator;"),
-    ("java/util/LinkedList", "listIterator", "()Ljava/util/ListIterator;"),
-    ("java/util/LinkedList", "listIterator", "(I)Ljava/util/ListIterator;"),
+    (
+        "java/util/LinkedList",
+        "listIterator",
+        "()Ljava/util/ListIterator;",
+    ),
+    (
+        "java/util/LinkedList",
+        "listIterator",
+        "(I)Ljava/util/ListIterator;",
+    ),
     ("java/util/LinkedList", "offer", "(Ljava/lang/Object;)Z"),
     ("java/util/LinkedList", "peek", "()Ljava/lang/Object;"),
     ("java/util/LinkedList", "poll", "()Ljava/lang/Object;"),
@@ -7496,34 +7936,94 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/LinkedList", "pollLast", "()Ljava/lang/Object;"),
     ("java/util/LinkedList", "remove", "(I)Ljava/lang/Object;"),
     ("java/util/LinkedList", "remove", "(Ljava/lang/Object;)Z"),
-    ("java/util/LinkedList", "removeFirst", "()Ljava/lang/Object;"),
-    ("java/util/LinkedList", "removeFirstOccurrence", "(Ljava/lang/Object;)Z"),
-    ("java/util/LinkedList", "removeIf", "(Ljava/util/function/Predicate;)Z"),
+    (
+        "java/util/LinkedList",
+        "removeFirst",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/LinkedList",
+        "removeFirstOccurrence",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/LinkedList",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
     ("java/util/LinkedList", "removeLast", "()Ljava/lang/Object;"),
-    ("java/util/LinkedList", "removeLastOccurrence", "(Ljava/lang/Object;)Z"),
-    ("java/util/LinkedList", "set", "(ILjava/lang/Object;)Ljava/lang/Object;"),
+    (
+        "java/util/LinkedList",
+        "removeLastOccurrence",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/LinkedList",
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+    ),
     ("java/util/LinkedList", "size", "()I"),
-    ("java/util/LinkedList", "spliterator", "()Ljava/util/Spliterator;"),
-    ("java/util/LinkedList", "stream", "()Ljava/util/stream/Stream;"),
+    (
+        "java/util/LinkedList",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/LinkedList",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
     ("java/util/LinkedList", "toArray", "()[Ljava/lang/Object;"),
-    ("java/util/LinkedList", "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
+    (
+        "java/util/LinkedList",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
     ("java/util/LinkedList", "toString", "()Ljava/lang/String;"),
-    ("java/util/LinkedList$ListItr", "add", "(Ljava/lang/Object;)V"),
+    (
+        "java/util/LinkedList$ListItr",
+        "add",
+        "(Ljava/lang/Object;)V",
+    ),
     ("java/util/LinkedList$ListItr", "hasNext", "()Z"),
     ("java/util/LinkedList$ListItr", "hasPrevious", "()Z"),
-    ("java/util/LinkedList$ListItr", "next", "()Ljava/lang/Object;"),
+    (
+        "java/util/LinkedList$ListItr",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
     ("java/util/LinkedList$ListItr", "nextIndex", "()I"),
-    ("java/util/LinkedList$ListItr", "previous", "()Ljava/lang/Object;"),
+    (
+        "java/util/LinkedList$ListItr",
+        "previous",
+        "()Ljava/lang/Object;",
+    ),
     ("java/util/LinkedList$ListItr", "previousIndex", "()I"),
     ("java/util/LinkedList$ListItr", "remove", "()V"),
-    ("java/util/LinkedList$ListItr", "set", "(Ljava/lang/Object;)V"),
+    (
+        "java/util/LinkedList$ListItr",
+        "set",
+        "(Ljava/lang/Object;)V",
+    ),
     ("java/util/Optional", "empty", "()Ljava/util/Optional;"),
     ("java/util/Optional", "equals", "(Ljava/lang/Object;)Z"),
-    ("java/util/Optional", "filter", "(Ljava/util/function/Predicate;)Ljava/util/Optional;"),
-    ("java/util/Optional", "flatMap", "(Ljava/util/function/Function;)Ljava/util/Optional;"),
+    (
+        "java/util/Optional",
+        "filter",
+        "(Ljava/util/function/Predicate;)Ljava/util/Optional;",
+    ),
+    (
+        "java/util/Optional",
+        "flatMap",
+        "(Ljava/util/function/Function;)Ljava/util/Optional;",
+    ),
     ("java/util/Optional", "get", "()Ljava/lang/Object;"),
     ("java/util/Optional", "hashCode", "()I"),
-    ("java/util/Optional", "ifPresent", "(Ljava/util/function/Consumer;)V"),
+    (
+        "java/util/Optional",
+        "ifPresent",
+        "(Ljava/util/function/Consumer;)V",
+    ),
     (
         "java/util/Optional",
         "ifPresentOrElse",
@@ -7531,52 +8031,144 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
     ),
     ("java/util/Optional", "isEmpty", "()Z"),
     ("java/util/Optional", "isPresent", "()Z"),
-    ("java/util/Optional", "map", "(Ljava/util/function/Function;)Ljava/util/Optional;"),
-    ("java/util/Optional", "of", "(Ljava/lang/Object;)Ljava/util/Optional;"),
-    ("java/util/Optional", "ofNullable", "(Ljava/lang/Object;)Ljava/util/Optional;"),
-    ("java/util/Optional", "or", "(Ljava/util/function/Supplier;)Ljava/util/Optional;"),
-    ("java/util/Optional", "orElse", "(Ljava/lang/Object;)Ljava/lang/Object;"),
-    ("java/util/Optional", "orElseGet", "(Ljava/util/function/Supplier;)Ljava/lang/Object;"),
+    (
+        "java/util/Optional",
+        "map",
+        "(Ljava/util/function/Function;)Ljava/util/Optional;",
+    ),
+    (
+        "java/util/Optional",
+        "of",
+        "(Ljava/lang/Object;)Ljava/util/Optional;",
+    ),
+    (
+        "java/util/Optional",
+        "ofNullable",
+        "(Ljava/lang/Object;)Ljava/util/Optional;",
+    ),
+    (
+        "java/util/Optional",
+        "or",
+        "(Ljava/util/function/Supplier;)Ljava/util/Optional;",
+    ),
+    (
+        "java/util/Optional",
+        "orElse",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Optional",
+        "orElseGet",
+        "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
+    ),
     ("java/util/Optional", "orElseThrow", "()Ljava/lang/Object;"),
-    ("java/util/Optional", "orElseThrow", "(Ljava/util/function/Supplier;)Ljava/lang/Object;"),
-    ("java/util/Optional", "stream", "()Ljava/util/stream/Stream;"),
+    (
+        "java/util/Optional",
+        "orElseThrow",
+        "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Optional",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
     ("java/util/Optional", "toString", "()Ljava/lang/String;"),
-    ("java/util/OptionalDouble", "empty", "()Ljava/util/OptionalDouble;"),
+    (
+        "java/util/OptionalDouble",
+        "empty",
+        "()Ljava/util/OptionalDouble;",
+    ),
     ("java/util/OptionalDouble", "getAsDouble", "()D"),
-    ("java/util/OptionalDouble", "ifPresent", "(Ljava/util/function/DoubleConsumer;)V"),
+    (
+        "java/util/OptionalDouble",
+        "ifPresent",
+        "(Ljava/util/function/DoubleConsumer;)V",
+    ),
     ("java/util/OptionalDouble", "isPresent", "()Z"),
-    ("java/util/OptionalDouble", "of", "(D)Ljava/util/OptionalDouble;"),
+    (
+        "java/util/OptionalDouble",
+        "of",
+        "(D)Ljava/util/OptionalDouble;",
+    ),
     ("java/util/OptionalDouble", "orElse", "(D)D"),
-    ("java/util/OptionalInt", "empty", "()Ljava/util/OptionalInt;"),
+    (
+        "java/util/OptionalInt",
+        "empty",
+        "()Ljava/util/OptionalInt;",
+    ),
     ("java/util/OptionalInt", "getAsInt", "()I"),
-    ("java/util/OptionalInt", "ifPresent", "(Ljava/util/function/IntConsumer;)V"),
+    (
+        "java/util/OptionalInt",
+        "ifPresent",
+        "(Ljava/util/function/IntConsumer;)V",
+    ),
     ("java/util/OptionalInt", "isPresent", "()Z"),
     ("java/util/OptionalInt", "of", "(I)Ljava/util/OptionalInt;"),
     ("java/util/OptionalInt", "orElse", "(I)I"),
-    ("java/util/OptionalLong", "empty", "()Ljava/util/OptionalLong;"),
+    (
+        "java/util/OptionalLong",
+        "empty",
+        "()Ljava/util/OptionalLong;",
+    ),
     ("java/util/OptionalLong", "getAsLong", "()J"),
-    ("java/util/OptionalLong", "ifPresent", "(Ljava/util/function/LongConsumer;)V"),
+    (
+        "java/util/OptionalLong",
+        "ifPresent",
+        "(Ljava/util/function/LongConsumer;)V",
+    ),
     ("java/util/OptionalLong", "isPresent", "()Z"),
-    ("java/util/OptionalLong", "of", "(J)Ljava/util/OptionalLong;"),
+    (
+        "java/util/OptionalLong",
+        "of",
+        "(J)Ljava/util/OptionalLong;",
+    ),
     ("java/util/OptionalLong", "orElse", "(J)J"),
     ("java/util/PriorityQueue", "<init>", "()V"),
     ("java/util/PriorityQueue", "<init>", "(I)V"),
-    ("java/util/PriorityQueue", "<init>", "(Ljava/util/Collection;)V"),
-    ("java/util/PriorityQueue", "<init>", "(Ljava/util/Comparator;)V"),
+    (
+        "java/util/PriorityQueue",
+        "<init>",
+        "(Ljava/util/Collection;)V",
+    ),
+    (
+        "java/util/PriorityQueue",
+        "<init>",
+        "(Ljava/util/Comparator;)V",
+    ),
     ("java/util/PriorityQueue", "add", "(Ljava/lang/Object;)Z"),
     ("java/util/PriorityQueue", "clear", "()V"),
-    ("java/util/PriorityQueue", "contains", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/PriorityQueue",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
     ("java/util/PriorityQueue", "isEmpty", "()Z"),
-    ("java/util/PriorityQueue", "iterator", "()Ljava/util/Iterator;"),
+    (
+        "java/util/PriorityQueue",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
     ("java/util/PriorityQueue", "offer", "(Ljava/lang/Object;)Z"),
     ("java/util/PriorityQueue", "peek", "()Ljava/lang/Object;"),
     ("java/util/PriorityQueue", "poll", "()Ljava/lang/Object;"),
     ("java/util/PriorityQueue", "remove", "(Ljava/lang/Object;)Z"),
     ("java/util/PriorityQueue", "size", "()I"),
-    ("java/util/PriorityQueue", "toArray", "()[Ljava/lang/Object;"),
-    ("java/util/PriorityQueue", "toString", "()Ljava/lang/String;"),
+    (
+        "java/util/PriorityQueue",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/PriorityQueue",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
     ("java/util/PriorityQueue$Itr", "hasNext", "()Z"),
-    ("java/util/PriorityQueue$Itr", "next", "()Ljava/lang/Object;"),
+    (
+        "java/util/PriorityQueue$Itr",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
     ("java/util/PriorityQueue$Itr", "remove", "()V"),
     ("java/util/Stack", "<init>", "()V"),
     ("java/util/Stack", "add", "(Ljava/lang/Object;)Z"),
@@ -7589,10 +8181,18 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/Stack", "iterator", "()Ljava/util/Iterator;"),
     ("java/util/Stack", "peek", "()Ljava/lang/Object;"),
     ("java/util/Stack", "pop", "()Ljava/lang/Object;"),
-    ("java/util/Stack", "push", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+    (
+        "java/util/Stack",
+        "push",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
     ("java/util/Stack", "remove", "(I)Ljava/lang/Object;"),
     ("java/util/Stack", "search", "(Ljava/lang/Object;)I"),
-    ("java/util/Stack", "set", "(ILjava/lang/Object;)Ljava/lang/Object;"),
+    (
+        "java/util/Stack",
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+    ),
     ("java/util/Stack", "size", "()I"),
     ("java/util/Stack", "toArray", "()[Ljava/lang/Object;"),
     ("java/util/Stack", "toString", "()Ljava/lang/String;"),
@@ -7604,17 +8204,41 @@ static RETIRED_SHADOW_L1_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/zip/CRC32C", "update", "(I)V"),
     ("java/util/zip/CRC32C", "update", "([B)V"),
     ("java/util/zip/CRC32C", "update", "([BII)V"),
-    ("java/util/zip/ZipEntry", "setComment", "(Ljava/lang/String;)V"),
+    (
+        "java/util/zip/ZipEntry",
+        "setComment",
+        "(Ljava/lang/String;)V",
+    ),
     ("java/util/zip/ZipFile", "<init>", "(Ljava/io/File;)V"),
     ("java/util/zip/ZipFile", "<init>", "(Ljava/lang/String;)V"),
     ("java/util/zip/ZipFile", "close", "()V"),
-    ("java/util/zip/ZipFile", "entries", "()Ljava/util/Enumeration;"),
-    ("java/util/zip/ZipFile", "getComment", "()Ljava/lang/String;"),
-    ("java/util/zip/ZipFile", "getEntry", "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;"),
-    ("java/util/zip/ZipFile", "getInputStream", "(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;"),
+    (
+        "java/util/zip/ZipFile",
+        "entries",
+        "()Ljava/util/Enumeration;",
+    ),
+    (
+        "java/util/zip/ZipFile",
+        "getComment",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/zip/ZipFile",
+        "getEntry",
+        "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;",
+    ),
+    (
+        "java/util/zip/ZipFile",
+        "getInputStream",
+        "(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;",
+    ),
     ("java/util/zip/ZipFile", "getName", "()Ljava/lang/String;"),
     ("java/util/zip/ZipFile", "size", "()I"),
-    ("java/util/zip/ZipFile", "stream", "()Ljava/util/stream/Stream;"),
+    (
+        "java/util/zip/ZipFile",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
 ];
 
 /// Lane 1 wave 3 — `java/util/HashMap` and its six view/iterator classes, the
@@ -10904,20 +11528,64 @@ static RETIRED_SHADOW_L4_FFM_GROUP_TRIPLES: &[(&str, &str, &str)] = &[
 /// this table appears in the refusal set and ZERO refusals carry a survivor.
 static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/net/HttpURLConnection", "<init>", "(Ljava/net/URL;)V"),
-    ("java/net/HttpURLConnection", "addRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
-    ("java/net/HttpURLConnection", "getHeaderFieldDate", "(Ljava/lang/String;J)J"),
-    ("java/net/HttpURLConnection", "getInstanceFollowRedirects", "()Z"),
-    ("java/net/HttpURLConnection", "getRequestMethod", "()Ljava/lang/String;"),
-    ("java/net/HttpURLConnection", "getRequestProperties", "()Ljava/util/Map;"),
-    ("java/net/HttpURLConnection", "getRequestProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
-    ("java/net/HttpURLConnection", "setChunkedStreamingMode", "(I)V"),
+    (
+        "java/net/HttpURLConnection",
+        "addRequestProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+    ),
+    (
+        "java/net/HttpURLConnection",
+        "getHeaderFieldDate",
+        "(Ljava/lang/String;J)J",
+    ),
+    (
+        "java/net/HttpURLConnection",
+        "getInstanceFollowRedirects",
+        "()Z",
+    ),
+    (
+        "java/net/HttpURLConnection",
+        "getRequestMethod",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/net/HttpURLConnection",
+        "getRequestProperties",
+        "()Ljava/util/Map;",
+    ),
+    (
+        "java/net/HttpURLConnection",
+        "getRequestProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    (
+        "java/net/HttpURLConnection",
+        "setChunkedStreamingMode",
+        "(I)V",
+    ),
     ("java/net/HttpURLConnection", "setConnectTimeout", "(I)V"),
     ("java/net/HttpURLConnection", "setDoOutput", "(Z)V"),
-    ("java/net/HttpURLConnection", "setFixedLengthStreamingMode", "(I)V"),
+    (
+        "java/net/HttpURLConnection",
+        "setFixedLengthStreamingMode",
+        "(I)V",
+    ),
     ("java/net/HttpURLConnection", "setReadTimeout", "(I)V"),
-    ("java/net/HttpURLConnection", "setRequestMethod", "(Ljava/lang/String;)V"),
-    ("java/net/HttpURLConnection", "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
-    ("java/net/ProxySelector", "getDefault", "()Ljava/net/ProxySelector;"),
+    (
+        "java/net/HttpURLConnection",
+        "setRequestMethod",
+        "(Ljava/lang/String;)V",
+    ),
+    (
+        "java/net/HttpURLConnection",
+        "setRequestProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+    ),
+    (
+        "java/net/ProxySelector",
+        "getDefault",
+        "()Ljava/net/ProxySelector;",
+    ),
 ];
 
 /// Is this exact triple a retired §1.4 shadow?
@@ -11039,71 +11707,199 @@ static RETIRED_SHADOW_L6_TRIPLES: &[(&str, &str, &str)] = &[
 /// table's account cover rows it never saw.
 static RETIRED_SHADOW_L5R_TRIPLES: &[(&str, &str, &str)] = &[
     ("sun/misc/Unsafe", "addressSize", "()I"),
-    ("sun/misc/Unsafe", "allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;"),
+    (
+        "sun/misc/Unsafe",
+        "allocateInstance",
+        "(Ljava/lang/Class;)Ljava/lang/Object;",
+    ),
     ("sun/misc/Unsafe", "allocateMemory", "(J)J"),
     ("sun/misc/Unsafe", "arrayBaseOffset", "(Ljava/lang/Class;)I"),
     ("sun/misc/Unsafe", "arrayIndexScale", "(Ljava/lang/Class;)I"),
-    ("sun/misc/Unsafe", "compareAndSwapInt", "(Ljava/lang/Object;JII)Z"),
-    ("sun/misc/Unsafe", "compareAndSwapLong", "(Ljava/lang/Object;JJJ)Z"),
-    ("sun/misc/Unsafe", "compareAndSwapObject", "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z"),
-    ("sun/misc/Unsafe", "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V"),
+    (
+        "sun/misc/Unsafe",
+        "compareAndSwapInt",
+        "(Ljava/lang/Object;JII)Z",
+    ),
+    (
+        "sun/misc/Unsafe",
+        "compareAndSwapLong",
+        "(Ljava/lang/Object;JJJ)Z",
+    ),
+    (
+        "sun/misc/Unsafe",
+        "compareAndSwapObject",
+        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "sun/misc/Unsafe",
+        "copyMemory",
+        "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
+    ),
     ("sun/misc/Unsafe", "freeMemory", "(J)V"),
     ("sun/misc/Unsafe", "fullFence", "()V"),
     ("sun/misc/Unsafe", "getAndAddInt", "(Ljava/lang/Object;JI)I"),
-    ("sun/misc/Unsafe", "getAndAddLong", "(Ljava/lang/Object;JJ)J"),
+    (
+        "sun/misc/Unsafe",
+        "getAndAddLong",
+        "(Ljava/lang/Object;JJ)J",
+    ),
     ("sun/misc/Unsafe", "getAndSetInt", "(Ljava/lang/Object;JI)I"),
-    ("sun/misc/Unsafe", "getAndSetLong", "(Ljava/lang/Object;JJ)J"),
-    ("sun/misc/Unsafe", "getAndSetObject", "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;"),
+    (
+        "sun/misc/Unsafe",
+        "getAndSetLong",
+        "(Ljava/lang/Object;JJ)J",
+    ),
+    (
+        "sun/misc/Unsafe",
+        "getAndSetObject",
+        "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;",
+    ),
     ("sun/misc/Unsafe", "getBoolean", "(Ljava/lang/Object;J)Z"),
-    ("sun/misc/Unsafe", "getBooleanVolatile", "(Ljava/lang/Object;J)Z"),
+    (
+        "sun/misc/Unsafe",
+        "getBooleanVolatile",
+        "(Ljava/lang/Object;J)Z",
+    ),
     ("sun/misc/Unsafe", "getByte", "(J)B"),
     ("sun/misc/Unsafe", "getByte", "(Ljava/lang/Object;J)B"),
-    ("sun/misc/Unsafe", "getByteVolatile", "(Ljava/lang/Object;J)B"),
+    (
+        "sun/misc/Unsafe",
+        "getByteVolatile",
+        "(Ljava/lang/Object;J)B",
+    ),
     ("sun/misc/Unsafe", "getChar", "(Ljava/lang/Object;J)C"),
-    ("sun/misc/Unsafe", "getCharVolatile", "(Ljava/lang/Object;J)C"),
+    (
+        "sun/misc/Unsafe",
+        "getCharVolatile",
+        "(Ljava/lang/Object;J)C",
+    ),
     ("sun/misc/Unsafe", "getDouble", "(Ljava/lang/Object;J)D"),
-    ("sun/misc/Unsafe", "getDoubleVolatile", "(Ljava/lang/Object;J)D"),
+    (
+        "sun/misc/Unsafe",
+        "getDoubleVolatile",
+        "(Ljava/lang/Object;J)D",
+    ),
     ("sun/misc/Unsafe", "getFloat", "(Ljava/lang/Object;J)F"),
-    ("sun/misc/Unsafe", "getFloatVolatile", "(Ljava/lang/Object;J)F"),
+    (
+        "sun/misc/Unsafe",
+        "getFloatVolatile",
+        "(Ljava/lang/Object;J)F",
+    ),
     ("sun/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I"),
-    ("sun/misc/Unsafe", "getIntVolatile", "(Ljava/lang/Object;J)I"),
+    (
+        "sun/misc/Unsafe",
+        "getIntVolatile",
+        "(Ljava/lang/Object;J)I",
+    ),
     ("sun/misc/Unsafe", "getLoadAverage", "([DI)I"),
     ("sun/misc/Unsafe", "getLong", "(J)J"),
     ("sun/misc/Unsafe", "getLong", "(Ljava/lang/Object;J)J"),
-    ("sun/misc/Unsafe", "getLongVolatile", "(Ljava/lang/Object;J)J"),
-    ("sun/misc/Unsafe", "getObject", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
-    ("sun/misc/Unsafe", "getObjectVolatile", "(Ljava/lang/Object;J)Ljava/lang/Object;"),
+    (
+        "sun/misc/Unsafe",
+        "getLongVolatile",
+        "(Ljava/lang/Object;J)J",
+    ),
+    (
+        "sun/misc/Unsafe",
+        "getObject",
+        "(Ljava/lang/Object;J)Ljava/lang/Object;",
+    ),
+    (
+        "sun/misc/Unsafe",
+        "getObjectVolatile",
+        "(Ljava/lang/Object;J)Ljava/lang/Object;",
+    ),
     ("sun/misc/Unsafe", "getShort", "(Ljava/lang/Object;J)S"),
-    ("sun/misc/Unsafe", "getShortVolatile", "(Ljava/lang/Object;J)S"),
+    (
+        "sun/misc/Unsafe",
+        "getShortVolatile",
+        "(Ljava/lang/Object;J)S",
+    ),
     ("sun/misc/Unsafe", "loadFence", "()V"),
-    ("sun/misc/Unsafe", "objectFieldOffset", "(Ljava/lang/reflect/Field;)J"),
+    (
+        "sun/misc/Unsafe",
+        "objectFieldOffset",
+        "(Ljava/lang/reflect/Field;)J",
+    ),
     ("sun/misc/Unsafe", "pageSize", "()I"),
     ("sun/misc/Unsafe", "park", "(ZJ)V"),
     ("sun/misc/Unsafe", "putBoolean", "(Ljava/lang/Object;JZ)V"),
-    ("sun/misc/Unsafe", "putBooleanVolatile", "(Ljava/lang/Object;JZ)V"),
+    (
+        "sun/misc/Unsafe",
+        "putBooleanVolatile",
+        "(Ljava/lang/Object;JZ)V",
+    ),
     ("sun/misc/Unsafe", "putByte", "(Ljava/lang/Object;JB)V"),
-    ("sun/misc/Unsafe", "putByteVolatile", "(Ljava/lang/Object;JB)V"),
+    (
+        "sun/misc/Unsafe",
+        "putByteVolatile",
+        "(Ljava/lang/Object;JB)V",
+    ),
     ("sun/misc/Unsafe", "putChar", "(Ljava/lang/Object;JC)V"),
-    ("sun/misc/Unsafe", "putCharVolatile", "(Ljava/lang/Object;JC)V"),
+    (
+        "sun/misc/Unsafe",
+        "putCharVolatile",
+        "(Ljava/lang/Object;JC)V",
+    ),
     ("sun/misc/Unsafe", "putDouble", "(Ljava/lang/Object;JD)V"),
-    ("sun/misc/Unsafe", "putDoubleVolatile", "(Ljava/lang/Object;JD)V"),
+    (
+        "sun/misc/Unsafe",
+        "putDoubleVolatile",
+        "(Ljava/lang/Object;JD)V",
+    ),
     ("sun/misc/Unsafe", "putFloat", "(Ljava/lang/Object;JF)V"),
-    ("sun/misc/Unsafe", "putFloatVolatile", "(Ljava/lang/Object;JF)V"),
+    (
+        "sun/misc/Unsafe",
+        "putFloatVolatile",
+        "(Ljava/lang/Object;JF)V",
+    ),
     ("sun/misc/Unsafe", "putInt", "(Ljava/lang/Object;JI)V"),
-    ("sun/misc/Unsafe", "putIntVolatile", "(Ljava/lang/Object;JI)V"),
+    (
+        "sun/misc/Unsafe",
+        "putIntVolatile",
+        "(Ljava/lang/Object;JI)V",
+    ),
     ("sun/misc/Unsafe", "putLong", "(JJ)V"),
     ("sun/misc/Unsafe", "putLong", "(Ljava/lang/Object;JJ)V"),
-    ("sun/misc/Unsafe", "putLongVolatile", "(Ljava/lang/Object;JJ)V"),
-    ("sun/misc/Unsafe", "putObject", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
-    ("sun/misc/Unsafe", "putObjectVolatile", "(Ljava/lang/Object;JLjava/lang/Object;)V"),
+    (
+        "sun/misc/Unsafe",
+        "putLongVolatile",
+        "(Ljava/lang/Object;JJ)V",
+    ),
+    (
+        "sun/misc/Unsafe",
+        "putObject",
+        "(Ljava/lang/Object;JLjava/lang/Object;)V",
+    ),
+    (
+        "sun/misc/Unsafe",
+        "putObjectVolatile",
+        "(Ljava/lang/Object;JLjava/lang/Object;)V",
+    ),
     ("sun/misc/Unsafe", "putShort", "(Ljava/lang/Object;JS)V"),
-    ("sun/misc/Unsafe", "putShortVolatile", "(Ljava/lang/Object;JS)V"),
+    (
+        "sun/misc/Unsafe",
+        "putShortVolatile",
+        "(Ljava/lang/Object;JS)V",
+    ),
     ("sun/misc/Unsafe", "reallocateMemory", "(JJ)J"),
     ("sun/misc/Unsafe", "setMemory", "(Ljava/lang/Object;JJB)V"),
-    ("sun/misc/Unsafe", "staticFieldBase", "(Ljava/lang/reflect/Field;)Ljava/lang/Object;"),
-    ("sun/misc/Unsafe", "staticFieldOffset", "(Ljava/lang/reflect/Field;)J"),
+    (
+        "sun/misc/Unsafe",
+        "staticFieldBase",
+        "(Ljava/lang/reflect/Field;)Ljava/lang/Object;",
+    ),
+    (
+        "sun/misc/Unsafe",
+        "staticFieldOffset",
+        "(Ljava/lang/reflect/Field;)J",
+    ),
     ("sun/misc/Unsafe", "storeFence", "()V"),
-    ("sun/misc/Unsafe", "throwException", "(Ljava/lang/Throwable;)V"),
+    (
+        "sun/misc/Unsafe",
+        "throwException",
+        "(Ljava/lang/Throwable;)V",
+    ),
     ("sun/misc/Unsafe", "unpark", "(Ljava/lang/Object;)V"),
 ];
 
@@ -11931,12 +12727,28 @@ static RETIRED_SHADOW_L4_PRINTWRITER_TRIPLES: &[(&str, &str, &str)] = &[
 /// Measured on **linux/x86_64 against JDK 25**.
 static RETIRED_SHADOW_L4_PRINTSTREAM_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/io/PrintStream", "<init>", "(Ljava/io/OutputStream;)V"),
-    ("java/io/PrintStream", "<init>", "(Ljava/io/OutputStream;Z)V"),
-    ("java/io/PrintStream", "append", "(Ljava/lang/CharSequence;)Ljava/io/PrintStream;"),
+    (
+        "java/io/PrintStream",
+        "<init>",
+        "(Ljava/io/OutputStream;Z)V",
+    ),
+    (
+        "java/io/PrintStream",
+        "append",
+        "(Ljava/lang/CharSequence;)Ljava/io/PrintStream;",
+    ),
     ("java/io/PrintStream", "close", "()V"),
     ("java/io/PrintStream", "flush", "()V"),
-    ("java/io/PrintStream", "format", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;"),
-    ("java/io/PrintStream", "format", "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;"),
+    (
+        "java/io/PrintStream",
+        "format",
+        "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;",
+    ),
+    (
+        "java/io/PrintStream",
+        "format",
+        "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;",
+    ),
     ("java/io/PrintStream", "print", "(C)V"),
     ("java/io/PrintStream", "print", "(D)V"),
     ("java/io/PrintStream", "print", "(F)V"),
@@ -11945,8 +12757,16 @@ static RETIRED_SHADOW_L4_PRINTSTREAM_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/io/PrintStream", "print", "(Ljava/lang/Object;)V"),
     ("java/io/PrintStream", "print", "(Ljava/lang/String;)V"),
     ("java/io/PrintStream", "print", "(Z)V"),
-    ("java/io/PrintStream", "printf", "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;"),
-    ("java/io/PrintStream", "printf", "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;"),
+    (
+        "java/io/PrintStream",
+        "printf",
+        "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;",
+    ),
+    (
+        "java/io/PrintStream",
+        "printf",
+        "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;",
+    ),
     ("java/io/PrintStream", "println", "()V"),
     ("java/io/PrintStream", "println", "(C)V"),
     ("java/io/PrintStream", "println", "(D)V"),
@@ -12373,14 +13193,20 @@ mod tests {
         assert_eq!(RETIRED_SHADOW_L4_PRINTWRITER_TRIPLES.len(), 7);
         assert_eq!(RETIRED_SHADOW_L4_PRINTSTREAM_TRIPLES.len(), 29);
         for (c, m, d) in RETIRED_SHADOW_L4_PRINTWRITER_TRIPLES {
-            assert_eq!(*c, "java/io/PrintWriter", "{c}.{m}{d} is not this table's class");
+            assert_eq!(
+                *c, "java/io/PrintWriter",
+                "{c}.{m}{d} is not this table's class"
+            );
             assert!(
                 triple_is_retired_shadow(c, m, d),
                 "{c}.{m}{d} is in the wave-6 PrintWriter table and the predicate cannot see it"
             );
         }
         for (c, m, d) in RETIRED_SHADOW_L4_PRINTSTREAM_TRIPLES {
-            assert_eq!(*c, "java/io/PrintStream", "{c}.{m}{d} is not this table's class");
+            assert_eq!(
+                *c, "java/io/PrintStream",
+                "{c}.{m}{d} is not this table's class"
+            );
             assert!(
                 triple_is_retired_shadow(c, m, d),
                 "{c}.{m}{d} is in the wave-6 PrintStream table and the predicate cannot see it"
@@ -12404,7 +13230,11 @@ mod tests {
         // present, sorted, reachable, and doing nothing. Two waves have shipped
         // inert rows in this campaign already.
         assert!(
-            !triple_is_retired_shadow("java/io/PrintStream", "charset", "()Ljava/nio/charset/Charset;"),
+            !triple_is_retired_shadow(
+                "java/io/PrintStream",
+                "charset",
+                "()Ljava/nio/charset/Charset;"
+            ),
             "PrintStream.charset() is registered Intrinsic; a retirement row on it is inert"
         );
 
@@ -12561,7 +13391,10 @@ mod tests {
             .split("pub fn triple_is_retired_shadow(")
             .nth(1)
             .expect("the predicate is in this file");
-        let body = body.split("\n}\n").next().expect("the predicate has a body");
+        let body = body
+            .split("\n}\n")
+            .next()
+            .expect("the predicate has a body");
         let total = body.matches("RETIRED_SHADOW_").count();
         let allowed = body.matches("RETIRED_SHADOW_PREFIXES").count()
             + body.matches("RETIRED_SHADOW_TABLES").count();
@@ -13722,7 +14555,12 @@ mod tests {
     #[test]
     fn the_phase2_table_is_sorted_and_unique() {
         for w in RETIRED_SHADOW_PHASE2_TRIPLES.windows(2) {
-            assert!(w[0] < w[1], "out of order or duplicated: {:?} then {:?}", w[0], w[1]);
+            assert!(
+                w[0] < w[1],
+                "out of order or duplicated: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -13731,7 +14569,10 @@ mod tests {
     #[test]
     fn every_phase2_entry_is_reachable() {
         for (c, m, d) in RETIRED_SHADOW_PHASE2_TRIPLES {
-            assert!(triple_is_retired_shadow(c, m, d), "unreachable entry: {c}.{m}{d}");
+            assert!(
+                triple_is_retired_shadow(c, m, d),
+                "unreachable entry: {c}.{m}{d}"
+            );
         }
     }
 
@@ -14224,7 +15065,11 @@ mod tests {
                 "getParent",
                 "()Ljava/lang/ClassLoader;",
             ),
-            ("java/lang/ClassLoader", "<init>", "(Ljava/lang/ClassLoader;)V"),
+            (
+                "java/lang/ClassLoader",
+                "<init>",
+                "(Ljava/lang/ClassLoader;)V",
+            ),
             (
                 "java/lang/ClassLoader",
                 "getSystemClassLoader",
@@ -14288,23 +15133,82 @@ mod tests {
     fn the_l5_prefixes_retire_nothing_on_their_own() {
         for (c, m, d) in [
             // The sub-word CAS layer -- see this table's doc comment.
-            ("jdk/internal/misc/Unsafe", "compareAndSetByte", "(Ljava/lang/Object;JBB)Z"),
-            ("jdk/internal/misc/Unsafe", "compareAndSetShort", "(Ljava/lang/Object;JSS)Z"),
-            ("jdk/internal/misc/Unsafe", "compareAndExchangeByte", "(Ljava/lang/Object;JBB)B"),
-            ("jdk/internal/misc/Unsafe", "compareAndExchangeShort", "(Ljava/lang/Object;JSS)S"),
-            ("jdk/internal/misc/Unsafe", "getAndAddByte", "(Ljava/lang/Object;JB)B"),
-            ("jdk/internal/misc/Unsafe", "getAndAddShort", "(Ljava/lang/Object;JS)S"),
+            (
+                "jdk/internal/misc/Unsafe",
+                "compareAndSetByte",
+                "(Ljava/lang/Object;JBB)Z",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "compareAndSetShort",
+                "(Ljava/lang/Object;JSS)Z",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "compareAndExchangeByte",
+                "(Ljava/lang/Object;JBB)B",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "compareAndExchangeShort",
+                "(Ljava/lang/Object;JSS)S",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "getAndAddByte",
+                "(Ljava/lang/Object;JB)B",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "getAndAddShort",
+                "(Ljava/lang/Object;JS)S",
+            ),
             // The unaligned family: a slot index has no bytes to address.
-            ("jdk/internal/misc/Unsafe", "getIntUnaligned", "(Ljava/lang/Object;J)I"),
-            ("jdk/internal/misc/Unsafe", "getLongUnaligned", "(Ljava/lang/Object;J)J"),
-            ("jdk/internal/misc/Unsafe", "getShortUnaligned", "(Ljava/lang/Object;J)S"),
-            ("jdk/internal/misc/Unsafe", "getCharUnaligned", "(Ljava/lang/Object;J)C"),
-            ("jdk/internal/misc/Unsafe", "putIntUnaligned", "(Ljava/lang/Object;JI)V"),
-            ("jdk/internal/misc/Unsafe", "putLongUnaligned", "(Ljava/lang/Object;JJ)V"),
-            ("jdk/internal/misc/Unsafe", "putShortUnaligned", "(Ljava/lang/Object;JS)V"),
-            ("jdk/internal/misc/Unsafe", "putCharUnaligned", "(Ljava/lang/Object;JC)V"),
+            (
+                "jdk/internal/misc/Unsafe",
+                "getIntUnaligned",
+                "(Ljava/lang/Object;J)I",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "getLongUnaligned",
+                "(Ljava/lang/Object;J)J",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "getShortUnaligned",
+                "(Ljava/lang/Object;J)S",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "getCharUnaligned",
+                "(Ljava/lang/Object;J)C",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "putIntUnaligned",
+                "(Ljava/lang/Object;JI)V",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "putLongUnaligned",
+                "(Ljava/lang/Object;JJ)V",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "putShortUnaligned",
+                "(Ljava/lang/Object;JS)V",
+            ),
+            (
+                "jdk/internal/misc/Unsafe",
+                "putCharUnaligned",
+                "(Ljava/lang/Object;JC)V",
+            ),
         ] {
-            assert!(!triple_is_retired_shadow(c, m, d), "wrongly retired: {c}.{m}{d}");
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "wrongly retired: {c}.{m}{d}"
+            );
         }
     }
 
@@ -14338,10 +15242,17 @@ Ljava/nio/channels/FileChannel;"
             // ArenaImpl: measured, and REJECTED by precondition 2. Listed here
             // rather than merely omitted, so that "not in the table" does not
             // read as "not yet looked at".
-            ("jdk/internal/foreign/ArenaImpl", "allocate", "(J)Ljava/lang/foreign/MemorySegment;"),
+            (
+                "jdk/internal/foreign/ArenaImpl",
+                "allocate",
+                "(J)Ljava/lang/foreign/MemorySegment;",
+            ),
             ("jdk/internal/foreign/ArenaImpl", "close", "()V"),
         ] {
-            assert!(!triple_is_retired_shadow(c, m, d), "wrongly retired: {c}.{m}{d}");
+            assert!(
+                !triple_is_retired_shadow(c, m, d),
+                "wrongly retired: {c}.{m}{d}"
+            );
         }
     }
 
@@ -16070,16 +16981,17 @@ Ljava/nio/channels/FileChannel;"
             ),
             ("java/lang/ref/Reference", "get", "()Ljava/lang/Object;"),
             ("java/io/File", "getName", "()Ljava/lang/String;"),
-            ("java/net/URL", "openConnection", "()Ljava/net/URLConnection;"),
+            (
+                "java/net/URL",
+                "openConnection",
+                "()Ljava/net/URLConnection;",
+            ),
         ] {
             assert!(
-                RETIRED_SHADOW_LT_TRIPLES
-                    .binary_search(&(c, m, d))
-                    .is_err(),
+                RETIRED_SHADOW_LT_TRIPLES.binary_search(&(c, m, d)).is_err(),
                 "{c}.{m}{d} is in RETIRED_SHADOW_LT_TRIPLES, and no lane-T entry \
                  should name that class"
             );
         }
     }
-
 }

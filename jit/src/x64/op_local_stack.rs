@@ -46,13 +46,9 @@ impl Compiler {
                 let val = op as i32 - 3; // Widening: always safe
                 if self.try_const_arith_peephole(val, pc + 1, code, code_len, &branch_targets) {
                     pc += 2;
-                } else if let Some(next_pc) = self.try_const_compare_peephole(
-                    val,
-                    pc + 1,
-                    code,
-                    code_len,
-                    &branch_targets,
-                ) {
+                } else if let Some(next_pc) =
+                    self.try_const_compare_peephole(val, pc + 1, code, code_len, &branch_targets)
+                {
                     pc = next_pc;
                 } else {
                     self.emit_mov_imm32_sx(RAX, val);
@@ -120,13 +116,9 @@ impl Compiler {
                 let val = code[pc + 1] as i8 as i32; // Widening: always safe
                 if self.try_const_arith_peephole(val, pc + 2, code, code_len, &branch_targets) {
                     pc += 3;
-                } else if let Some(next_pc) = self.try_const_compare_peephole(
-                    val,
-                    pc + 2,
-                    code,
-                    code_len,
-                    &branch_targets,
-                ) {
+                } else if let Some(next_pc) =
+                    self.try_const_compare_peephole(val, pc + 2, code, code_len, &branch_targets)
+                {
                     pc = next_pc;
                 } else {
                     self.emit_mov_imm32_sx(RAX, val);
@@ -140,13 +132,9 @@ impl Compiler {
                 let val = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                 if self.try_const_arith_peephole(val, pc + 3, code, code_len, &branch_targets) {
                     pc += 4;
-                } else if let Some(next_pc) = self.try_const_compare_peephole(
-                    val,
-                    pc + 3,
-                    code,
-                    code_len,
-                    &branch_targets,
-                ) {
+                } else if let Some(next_pc) =
+                    self.try_const_compare_peephole(val, pc + 3, code, code_len, &branch_targets)
+                {
                     pc = next_pc;
                 } else {
                     self.emit_mov_imm32_sx(RAX, val);
@@ -162,7 +150,7 @@ impl Compiler {
                     return WalkStep::Next(pc);
                 }
                 if self.ldc_class_info_idx.contains_key(&pc) {
-                    return WalkStep::Return( false);
+                    return WalkStep::Return(false);
                 }
                 if self.emit_ldc_string(pc) {
                     pc += 2;
@@ -173,7 +161,7 @@ impl Compiler {
                     // `ldc_string_cp` unwired, or no context slot. Bail the
                     // site rather than fall through to `ldc_info`, which
                     // does not hold this pc and would push a null.
-                    return WalkStep::Return( false);
+                    return WalkStep::Return(false);
                 }
                 let val = self.ldc_info_idx.get(&pc).map(|&i| self.ldc_info[i].1);
                 match val {
@@ -182,7 +170,7 @@ impl Compiler {
                         self.push_from_rax();
                         pc += 2;
                     }
-                    None => return WalkStep::Return( false),
+                    None => return WalkStep::Return(false),
                 }
             }
 
@@ -193,7 +181,7 @@ impl Compiler {
                     return WalkStep::Next(pc);
                 }
                 if self.ldc_class_info_idx.contains_key(&pc) {
-                    return WalkStep::Return( false);
+                    return WalkStep::Return(false);
                 }
                 if self.emit_ldc_string(pc) {
                     pc += 3;
@@ -204,7 +192,7 @@ impl Compiler {
                     // `ldc_string_cp` unwired, or no context slot. Bail the
                     // site rather than fall through to `ldc_info`, which
                     // does not hold this pc and would push a null.
-                    return WalkStep::Return( false);
+                    return WalkStep::Return(false);
                 }
                 let val = self.ldc_info_idx.get(&pc).map(|&i| self.ldc_info[i].1);
                 match val {
@@ -213,7 +201,7 @@ impl Compiler {
                         self.push_from_rax();
                         pc += 3;
                     }
-                    None => return WalkStep::Return( false),
+                    None => return WalkStep::Return(false),
                 }
             }
 
@@ -245,7 +233,7 @@ impl Compiler {
                     }
                     None => {
                         // Not resolved — bail out; method will stay interpreted
-                        return WalkStep::Return( false);
+                        return WalkStep::Return(false);
                     }
                 }
             }
@@ -658,8 +646,7 @@ impl Compiler {
             // `canonicalize_stack` resolves arbitrary offset permutations as
             // a parallel-move problem at the next branch/call boundary.
             0x5a => {
-                if dupx_codegen_disabled() || dup_x1_codegen_disabled() || self.stack.len() < 2
-                {
+                if dupx_codegen_disabled() || dup_x1_codegen_disabled() || self.stack.len() < 2 {
                     self.fail("singlepass-codegen/dup_x1-unsupported-shape");
                     let _ = self.push_stack();
                 } else {
@@ -1303,7 +1290,7 @@ impl Compiler {
                     // emit for a form neither walk models.
                     _ => {
                         self.fail("singlepass-codegen/wide-unsupported-opcode");
-                        return WalkStep::Return( false);
+                        return WalkStep::Return(false);
                     }
                 }
             }

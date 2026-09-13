@@ -1609,7 +1609,11 @@ pub(crate) fn native_p64_lhm_reversed(
         // The LOWER of the two is the frame base to truncate at; a null key
         // with a reference value would otherwise leave `val_pin` held for the
         // whole walk.
-        let pair_base = if key_pin != usize::MAX { key_pin } else { val_pin };
+        let pair_base = if key_pin != usize::MAX {
+            key_pin
+        } else {
+            val_pin
+        };
         let new_lhm = ctx.read_native_pin(new_lhm_pin, new_lhm);
         let key = match (*key, key_pin) {
             (Value::Object(Some(o)), p) if p != usize::MAX => {

@@ -3360,8 +3360,7 @@ struct NativeDiagState {
 /// object.
 /// Stores `NativeContext::set_field_by_name` DROPPED because the receiver's
 /// class does not declare the named field.
-static FIELD_BY_NAME_DROPPED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static FIELD_BY_NAME_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many `set_field_by_name` calls named a field their receiver does not
 /// have. Always counted; see [`note_field_by_name_dropped`] for what a non-zero
@@ -8458,7 +8457,10 @@ impl<'a> NativeContextImpl<'a> {
         }
         // Every tiering verdict recorded against the old bytecode (ineligible,
         // c2_bailout, trap counts, OSR denials) says nothing about the new one.
-        self.shared.jit.tiered_manager.on_class_redefined(class_id, &name);
+        self.shared
+            .jit
+            .tiered_manager
+            .on_class_redefined(class_id, &name);
         Ok(())
     }
 }
@@ -12151,11 +12153,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                 && resolved_from_receiver
                 && !arms_poly_call_site(&class_name, method_name))
             .then(|| {
-                crate::runtime::native_callee_memo::arm(
-                    receiver_class_id,
-                    method_name,
-                    descriptor,
-                )
+                crate::runtime::native_callee_memo::arm(receiver_class_id, method_name, descriptor)
             });
             let result = if needs_exact_class_dispatch {
                 invoke_on_class_shared(
@@ -33813,14 +33811,12 @@ mod tests {
 
         // Permissive: allowed, and recorded exactly once per kind per thread.
         let (shared, caps) = vm_in_mode(CapabilityMode::Permissive);
-        assert!(
-            check_native_dispatch_capability_for_slot(
-                &shared,
-                CapabilityKind::ProcessSpawn,
-                None
-            )
-            .is_ok()
-        );
+        assert!(check_native_dispatch_capability_for_slot(
+            &shared,
+            CapabilityKind::ProcessSpawn,
+            None
+        )
+        .is_ok());
         assert_eq!(caps.audit_report().total_checks(), 1);
         for _ in 0..8 {
             assert!(check_native_dispatch_capability_for_slot(
@@ -33839,10 +33835,12 @@ mod tests {
 
         // Audit: allowed, and every use tallied as ungranted.
         let (shared, caps) = vm_in_mode(CapabilityMode::Audit);
-        assert!(
-            check_native_dispatch_capability_for_slot(&shared, CapabilityKind::RawMemory, None)
-                .is_ok()
-        );
+        assert!(check_native_dispatch_capability_for_slot(
+            &shared,
+            CapabilityKind::RawMemory,
+            None
+        )
+        .is_ok());
         assert_eq!(caps.audit_report().total_ungranted(), 1);
         drop(shared);
 

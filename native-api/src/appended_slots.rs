@@ -274,7 +274,10 @@ mod tests {
         let mut ctx = crate::test_mock::MockNativeContext::new();
         let cid = ctx.declare_class("p/Both", &[("x", "I"), ("y", "I")]);
         assert_eq!(base_for_class_id(&ctx, cid), 2);
-        assert_eq!(base_for_class_id(&ctx, cid), base_for_class(&mut ctx, "p/Both"));
+        assert_eq!(
+            base_for_class_id(&ctx, cid),
+            base_for_class(&mut ctx, "p/Both")
+        );
         assert_eq!(
             base_for_class_id(&ctx, cratonvm_types::ClassId::new(9999)),
             0,

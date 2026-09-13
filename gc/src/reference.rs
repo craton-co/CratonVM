@@ -2241,7 +2241,10 @@ mod tests {
     fn a_queued_object_is_not_enqueued_twice() {
         let ft = FinalizerThread::new();
         assert!(ft.enqueue(0xBEEF), "first enqueue is accepted");
-        assert!(!ft.enqueue(0xBEEF), "a second enqueue while queued is refused");
+        assert!(
+            !ft.enqueue(0xBEEF),
+            "a second enqueue while queued is refused"
+        );
         assert!(!ft.enqueue(0xBEEF), "and stays refused");
         assert_eq!(ft.pending_count(), 1);
 

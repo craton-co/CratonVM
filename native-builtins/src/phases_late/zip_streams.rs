@@ -1019,10 +1019,7 @@ pub fn register_p59_bulk_stream_transfer(r: &mut NativeMethodRegistry) {
     // now runs the JDK's own `transferTo`, which is what it should have been
     // doing: the header of this function calls that method "ordinary
     // bytecode".
-    for class in [
-        "java/io/ByteArrayInputStream",
-        "java/io/FileInputStream",
-    ] {
+    for class in ["java/io/ByteArrayInputStream", "java/io/FileInputStream"] {
         r.register(
             class,
             "transferTo",

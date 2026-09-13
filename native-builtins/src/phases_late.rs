@@ -10595,7 +10595,11 @@ Lio/quarkus/runtime/shutdown/ShutdownListener;";
                 p.len() - 3,
                 "the supplier is the RuntimeValue before LaunchMode ({desc})"
             );
-            assert_eq!(p[3], LoggingSetupArg::Null, "the handler RuntimeValue is null");
+            assert_eq!(
+                p[3],
+                LoggingSetupArg::Null,
+                "the handler RuntimeValue is null"
+            );
         }
     }
 

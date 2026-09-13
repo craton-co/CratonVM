@@ -4390,7 +4390,12 @@ pub(crate) fn despeculate_trapped_method(
         // epoch). The bare name hash `h` marked an entry no reader ever asked
         // for, so the next compile retried the IR tier on the method that had
         // just trapped.
-        cratonvm_jit::note_ir_method_refused(class_name, method_name, descriptor, declaring_class_id);
+        cratonvm_jit::note_ir_method_refused(
+            class_name,
+            method_name,
+            descriptor,
+            declaring_class_id,
+        );
         if !decided {
             cratonvm_jit::ir::note_site_trap_repeat();
         }
@@ -6810,7 +6815,8 @@ unsafe fn jit_anewarray_object_body(vm_ptr: i64, component_class_id_raw: i64, le
     // W1-vm, as in `jit_newarray`: an overflowing size is an allocation that
     // can never succeed. `unwrap_or(0)` probed with size 0, which always
     // passes, and handed the impossible length onward.
-    let Ok(data_size) = cratonvm_types::array_data_size(length as usize, ArrayElementType::Reference)
+    let Ok(data_size) =
+        cratonvm_types::array_data_size(length as usize, ArrayElementType::Reference)
     else {
         return jit_newarray_oom(vm, length as usize);
     };
@@ -7040,12 +7046,9 @@ unsafe fn jit_bastore_body(array_ptr: i64, index: i64, val: i64) {
 // pointer to an int array object. Null triggers a pending NPE + `i64::MIN` deopt
 // sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
-    contain(
-        "jit_iaload",
-        OnPanic::Deopt,
-        i64::MIN,
-        || jit_iaload_body(array_ptr, index),
-    )
+    contain("jit_iaload", OnPanic::Deopt, i64::MIN, || {
+        jit_iaload_body(array_ptr, index)
+    })
 }
 
 /// Body of [`jit_iaload`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -7092,12 +7095,9 @@ unsafe fn jit_iaload_body(array_ptr: i64, index: i64) -> i64 {
 // pointer to an int array object. Null aborts the process — see `jit_bastore` for
 // the rationale. Out-of-bounds is handled gracefully.
 pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
-    contain(
-        "jit_iastore",
-        OnPanic::Deopt,
-        (),
-        || jit_iastore_body(array_ptr, index, val),
-    );
+    contain("jit_iastore", OnPanic::Deopt, (), || {
+        jit_iastore_body(array_ptr, index, val)
+    });
 }
 
 /// Body of [`jit_iastore`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -7365,8 +7365,7 @@ fn jit_ref_word_implausible(raw: u64, site: &'static str) -> i64 {
             // and a clean run never reaches it, so the increment costs nothing
             // and this is the one number that must be readable without anyone
             // having remembered to set a diagnostic flag first.
-            ref_load_census::COLORED_WORDS_SEEN
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ref_load_census::COLORED_WORDS_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if !zgc_jit_load_barrier_suppressed() {
                 panic!(
                     "ZGC colored word {raw:#018x} reached the JIT read helper `{site}` \
@@ -7748,9 +7747,8 @@ pub fn jit_ref_load_routes() -> (Option<u64>, u64) {
 #[cfg(feature = "zgc")]
 fn zgc_jit_load_barrier_suppressed() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_flag_on("CRATONVM_ZGC_NO_JIT_LOAD_BARRIER")
-    })
+    *CACHE
+        .get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_ZGC_NO_JIT_LOAD_BARRIER"))
 }
 
 /// Announce, once, that the kill switch above turned a live reference into
@@ -7947,7 +7945,6 @@ unsafe fn jit_load_ref_slot(
     jit_decode_ref_word(raw, site)
 }
 
-
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm
 // pointer -- the universal JIT-helper caller contract, the same one jit_aastore
 // and jit_getfield state. It is read only on the successful element-read path:
@@ -7966,12 +7963,9 @@ unsafe fn jit_load_ref_slot(
 // pinned together by `let _: HelperFnAaload = jit_aaload;` further down this
 // file, which is why this change could not land half done.
 pub unsafe extern "C" fn jit_aaload(vm_ptr: i64, array_ptr: i64, index: i64) -> i64 {
-    contain(
-        "jit_aaload",
-        OnPanic::Deopt,
-        i64::MIN,
-        || jit_aaload_body(vm_ptr, array_ptr, index),
-    )
+    contain("jit_aaload", OnPanic::Deopt, i64::MIN, || {
+        jit_aaload_body(vm_ptr, array_ptr, index)
+    })
 }
 
 /// Body of [`jit_aaload`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -8455,12 +8449,9 @@ unsafe fn jit_multianewarray_2d_body(vm_ptr: i64, site: i64, dim1: i64, dim2: i6
 // pointer to any array object. Null triggers a pending NPE + `i64::MIN` deopt
 // sentinel (JVMS §arraylength requires NullPointerException on null).
 pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
-    contain(
-        "jit_arraylength",
-        OnPanic::Deopt,
-        i64::MIN,
-        || jit_arraylength_body(array_ptr),
-    )
+    contain("jit_arraylength", OnPanic::Deopt, i64::MIN, || {
+        jit_arraylength_body(array_ptr)
+    })
 }
 
 /// Body of [`jit_arraylength`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -8844,7 +8835,9 @@ fn compact_inline_dbg() -> bool {
 fn null_field_provenance_watch() -> Option<&'static str> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
-        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_NULL_FIELD_PROVENANCE").ok())
+        .get_or_init(|| {
+            cratonvm_types::flags::runtime_var("CRATONVM_DBG_NULL_FIELD_PROVENANCE").ok()
+        })
         .as_deref()
 }
 
@@ -9471,12 +9464,9 @@ pub fn membership_walks_by_site() -> Vec<(&'static str, u64)> {
 }
 
 pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
-    contain(
-        "jit_getfield",
-        OnPanic::Deopt,
-        i64::MIN,
-        || jit_getfield_body(vm_ptr, obj_ptr, field_index),
-    )
+    contain("jit_getfield", OnPanic::Deopt, i64::MIN, || {
+        jit_getfield_body(vm_ptr, obj_ptr, field_index)
+    })
 }
 
 /// Body of [`jit_getfield`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -10202,12 +10192,9 @@ unsafe fn jit_putfield_slot_in_bounds(obj_ptr: i64, field_index: i64) -> bool {
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i64) {
-    contain(
-        "jit_putfield_int",
-        OnPanic::Deopt,
-        (),
-        || jit_putfield_int_body(obj_ptr, field_index, val),
-    );
+    contain("jit_putfield_int", OnPanic::Deopt, (), || {
+        jit_putfield_int_body(obj_ptr, field_index, val)
+    });
 }
 
 /// Body of [`jit_putfield_int`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -10287,12 +10274,9 @@ unsafe fn jit_putfield_int_body(obj_ptr: i64, field_index: i64, val: i64) {
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: i64) {
-    contain(
-        "jit_putfield_long",
-        OnPanic::Deopt,
-        (),
-        || jit_putfield_long_body(obj_ptr, field_index, val),
-    );
+    contain("jit_putfield_long", OnPanic::Deopt, (), || {
+        jit_putfield_long_body(obj_ptr, field_index, val)
+    });
 }
 
 /// Body of [`jit_putfield_long`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -10334,12 +10318,9 @@ unsafe fn jit_putfield_long_body(obj_ptr: i64, field_index: i64, val: i64) {
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val: i64) {
-    contain(
-        "jit_putfield_float",
-        OnPanic::Deopt,
-        (),
-        || jit_putfield_float_body(obj_ptr, field_index, val),
-    );
+    contain("jit_putfield_float", OnPanic::Deopt, (), || {
+        jit_putfield_float_body(obj_ptr, field_index, val)
+    });
 }
 
 /// Body of [`jit_putfield_float`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -10382,12 +10363,9 @@ unsafe fn jit_putfield_float_body(obj_ptr: i64, field_index: i64, val: i64) {
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val: i64) {
-    contain(
-        "jit_putfield_double",
-        OnPanic::Deopt,
-        (),
-        || jit_putfield_double_body(obj_ptr, field_index, val),
-    );
+    contain("jit_putfield_double", OnPanic::Deopt, (), || {
+        jit_putfield_double_body(obj_ptr, field_index, val)
+    });
 }
 
 /// Body of [`jit_putfield_double`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -12725,12 +12703,9 @@ pub unsafe extern "C" fn jit_throw_aioobe(
     array_ptr: i64,
     bytecode_pc: i64,
 ) -> i64 {
-    contain(
-        "jit_throw_aioobe",
-        OnPanic::Deopt,
-        i64::MIN,
-        || jit_throw_aioobe_body(index, length, array_ptr, bytecode_pc),
-    )
+    contain("jit_throw_aioobe", OnPanic::Deopt, i64::MIN, || {
+        jit_throw_aioobe_body(index, length, array_ptr, bytecode_pc)
+    })
 }
 
 /// Body of [`jit_throw_aioobe`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -12837,12 +12812,9 @@ pub(crate) fn rbc6_dbg() -> bool {
 // SAFETY: Called from JIT-compiled code at a div-by-zero guard. Sets two
 // thread-locals and returns a sentinel; no pointer dereferences.
 pub unsafe extern "C" fn jit_throw_arithmetic() -> i64 {
-    contain(
-        "jit_throw_arithmetic",
-        OnPanic::Deopt,
-        i64::MIN,
-        || jit_throw_arithmetic_body(),
-    )
+    contain("jit_throw_arithmetic", OnPanic::Deopt, i64::MIN, || {
+        jit_throw_arithmetic_body()
+    })
 }
 
 /// Body of [`jit_throw_arithmetic`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -12924,12 +12896,9 @@ pub unsafe extern "C" fn jit_set_throw_bci(bci: i64) {
 }
 
 pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
-    contain(
-        "jit_throw_exception",
-        OnPanic::Deopt,
-        i64::MIN,
-        || jit_throw_exception_body(exc_ptr, bci),
-    )
+    contain("jit_throw_exception", OnPanic::Deopt, i64::MIN, || {
+        jit_throw_exception_body(exc_ptr, bci)
+    })
 }
 
 /// Body of [`jit_throw_exception`]. Panic-guarded via [`contain`] with [`OnPanic::Deopt`].
@@ -13537,7 +13506,10 @@ fn admit_jit_fast_native_resolved(
 /// number this prints is the acceptance criterion, not the ns/op.
 /// Leaf-native dispatches served from compiled code this run.
 pub fn leaf_native_hit_count() -> u64 {
-    jit_counter_total(|b| b.leaf_native_hits.load(std::sync::atomic::Ordering::Relaxed))
+    jit_counter_total(|b| {
+        b.leaf_native_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 /// This thread's +1 for a leaf dispatch. See [`JitCounterBlock`].
@@ -15234,10 +15206,7 @@ fn compiled_offload_sites(
 /// A non-zero reference slot is treated as a live heap pointer. That is
 /// the same contract `forward_jit_reference_args` runs under one line
 /// earlier in the caller, and these are the arguments it just forwarded.
-unsafe fn decode_static_args(
-    descriptor: &str,
-    args: &[i64],
-) -> Option<Vec<cratonvm_types::Value>> {
+unsafe fn decode_static_args(descriptor: &str, args: &[i64]) -> Option<Vec<cratonvm_types::Value>> {
     use cratonvm_types::{ObjectRef, Value};
     let bytes = descriptor.as_bytes();
     let mut p = bytes.iter().position(|&b| b == b'(')? + 1;
@@ -17648,8 +17617,14 @@ unsafe fn try_varhandle_instance_field_cas(
     }
     // One implementation, shared with the thin direct helper, so what the two
     // consider a servable handle cannot drift.
-    let swapped =
-        varhandle_instance_field_cas_shared(vm, vh_raw, recv_raw, expected_desc, args_slice[2], args_slice[3])?;
+    let swapped = varhandle_instance_field_cas_shared(
+        vm,
+        vh_raw,
+        recv_raw,
+        expected_desc,
+        args_slice[2],
+        args_slice[3],
+    )?;
     Some(i64::from(swapped))
 }
 
@@ -18092,9 +18067,13 @@ unsafe fn varhandle_read_direct_reference(
 ) -> i64 {
     if vh != 0 && receiver != 0 {
         if let Some((thread, _guard)) = jit_thread_mut() {
-            if let Some(bits) =
-                varhandle_instance_field_read_bits(vm, vh as u64, receiver as u64, b'L', Some(thread))
-            {
+            if let Some(bits) = varhandle_instance_field_read_bits(
+                vm,
+                vh as u64,
+                receiver as u64,
+                b'L',
+                Some(thread),
+            ) {
                 VARHANDLE_READ_DIRECT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return bits;
@@ -18525,7 +18504,6 @@ const fn vh_write_info(mode: usize, kind: usize) -> JitInvokeInfo {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // `VarHandle` compareAndSet thin direct-call helpers.
 //
@@ -18579,9 +18557,12 @@ unsafe fn varhandle_instance_field_cas_shared(
     let receiver = vm.mem.heap.is_object_address(recv_raw as usize)?;
     // The same GC-stable key `vh_meta_get` files the handle under.
     let heap = &vm.mem.heap;
-    let key = vm.threads.monitors.java_identity_hash(vh, heap.identity_hash_code(vh), || {
-        heap.next_identity_hash()
-    });
+    let key = vm
+        .threads
+        .monitors
+        .java_identity_hash(vh, heap.identity_hash_code(vh), || {
+            heap.next_identity_hash()
+        });
     let plan = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)?;
     // Reference/primitive agreement between the variable and the call site, the
     // same test the read and write sides make. `site_kind` is the bound slot's
@@ -18630,7 +18611,8 @@ unsafe fn varhandle_cas_direct_impl(
     crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
-    let site_kind = cratonvm_jit::VARHANDLE_CAS_KINDS[slot % cratonvm_jit::VARHANDLE_CAS_KINDS.len()];
+    let site_kind =
+        cratonvm_jit::VARHANDLE_CAS_KINDS[slot % cratonvm_jit::VARHANDLE_CAS_KINDS.len()];
     if vh != 0 && receiver != 0 {
         if let Some(swapped) = varhandle_instance_field_cas_shared(
             vm,
@@ -18722,8 +18704,15 @@ const VARHANDLE_CAS_DESCRIPTORS: [&str; 9] = [
 /// `jit_invoke_dispatch` keys its per-site memos on `(vm_identity, info
 /// address)`, so the address has to be process-stable.
 static VARHANDLE_CAS_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_CAS_SLOTS] = [
-    vh_cas_info(0), vh_cas_info(1), vh_cas_info(2), vh_cas_info(3), vh_cas_info(4),
-    vh_cas_info(5), vh_cas_info(6), vh_cas_info(7), vh_cas_info(8),
+    vh_cas_info(0),
+    vh_cas_info(1),
+    vh_cas_info(2),
+    vh_cas_info(3),
+    vh_cas_info(4),
+    vh_cas_info(5),
+    vh_cas_info(6),
+    vh_cas_info(7),
+    vh_cas_info(8),
 ];
 
 /// One entry of [`VARHANDLE_CAS_INFOS`]. `num_jit_args: 4` counts the receiver
@@ -19411,12 +19400,11 @@ unsafe fn jit_integer_value_of_direct_body(vm_ptr: i64, value: i64) -> i64 {
                 // The shape planner, not a bare legacy size: every TLAB object
                 // site has to agree with the header its allocation will be
                 // stamped with. See `plan_tlab_object_shape`.
-                let (requested_size, _, _) =
-                    crate::runtime::interpreter::plan_tlab_object_shape_at(
-                        class_id,
-                        slots,
-                        crate::runtime::interpreter::tlab_site::JIT_HELPER,
-                    );
+                let (requested_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+                    class_id,
+                    slots,
+                    crate::runtime::interpreter::tlab_site::JIT_HELPER,
+                );
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
@@ -19724,12 +19712,11 @@ unsafe fn jit_long_value_of_direct_body(vm_ptr: i64, value: i64) -> i64 {
                 // The shape planner, not a bare legacy size: every TLAB object
                 // site has to agree with the header its allocation will be
                 // stamped with. See `plan_tlab_object_shape`.
-                let (requested_size, _, _) =
-                    crate::runtime::interpreter::plan_tlab_object_shape_at(
-                        class_id,
-                        slots,
-                        crate::runtime::interpreter::tlab_site::JIT_HELPER,
-                    );
+                let (requested_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+                    class_id,
+                    slots,
+                    crate::runtime::interpreter::tlab_site::JIT_HELPER,
+                );
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
@@ -19756,7 +19743,9 @@ unsafe fn jit_long_value_of_direct_body(vm_ptr: i64, value: i64) -> i64 {
                         &*(object.as_ptr() as *const cratonvm_types::ObjectHeader)
                     });
                     if compact {
-                        vm.mem.heap.set_field_as(object, 0, Value::Long(value), b'J');
+                        vm.mem
+                            .heap
+                            .set_field_as(object, 0, Value::Long(value), b'J');
                     } else {
                         // SAFETY: `object` is a live legacy-layout allocation
                         // with >= 1 slot (`slots.max(1)` above) -- now CHECKED
@@ -21604,7 +21593,11 @@ fn call_integer_native_raw_inner(
                         && (vm.mem.heap.needs_gc_for_jit_allocation()
                             || vm.mem.heap.old_gen_needs_gc())
                     {
-                        crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
+                        crate::runtime::interpreter::maybe_gc_forced_pub_at(
+                            vm,
+                            thread,
+                            "jit-helpers",
+                        );
                     }
                     vm.mem.heap.clear_young_spill_pressure();
                 }
@@ -28018,14 +28011,16 @@ pub(crate) fn direct_helper_table() -> cratonvm_jit::DirectHelperTable {
         // the predicate would answer for every receiver, which is precisely
         // the unsound version.
         buffer_session: jit_buffer_session_direct as *const () as usize,
-        buffer_session_served_class: cratonvm_native_builtins::buffer_session::class_is_served as *const () as usize,
+        buffer_session_served_class: cratonvm_native_builtins::buffer_session::class_is_served
+            as *const () as usize,
         // The predicate the OPTIMIZING door's bind is gated on. The JIT crate
         // does not depend on `native-io`, so it cannot ask the served-class
         // table directly; publishing the function pointer keeps the planner's
         // "will the helper serve this receiver?" and the helper's own prologue
         // reading the SAME table, which is the property that makes the bind
         // gate meaningful rather than a guess.
-        nio_byte_element_served_class: cratonvm_native_io::direct_buffer::elem_fastpath::class_is_served as *const () as usize,
+        nio_byte_element_served_class:
+            cratonvm_native_io::direct_buffer::elem_fastpath::class_is_served as *const () as usize,
         md_update_byte: jit_md_update_byte_direct as *const () as usize,
         thread_current_thread: jit_thread_current_thread_direct as *const () as usize,
         monitor_enter: jit_monitor_enter as *const () as usize,
@@ -28092,7 +28087,6 @@ pub(crate) fn direct_helper_table() -> cratonvm_jit::DirectHelperTable {
         varhandle_cas: varhandle_cas_direct_fns(),
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Helper-slot signature checks (`docs/jit/helper-abi.md` §4)
@@ -29778,7 +29772,9 @@ unsafe fn jit_ffm_segment_set_body(seg: i64, index: i64, kind: i64, value: i64) 
 /// per VM (`ClassId`s are), so the `SharedVm` pointer travels with it on the
 /// compile. It used to be a process-wide registration latched to the first VM,
 /// which a second VM had to poison for both.
-pub(crate) fn direct_helper_table_for(shared: &crate::vm::SharedVm) -> cratonvm_jit::DirectHelperTable {
+pub(crate) fn direct_helper_table_for(
+    shared: &crate::vm::SharedVm,
+) -> cratonvm_jit::DirectHelperTable {
     cratonvm_jit::DirectHelperTable {
         static_base_resolver: jit_resolve_static_base as *const () as usize,
         // Cast: the `SharedVm` address `jit_resolve_static_base` receives back.
@@ -29794,16 +29790,28 @@ mod direct_helper_table_tests {
     #[test]
     fn every_direct_helper_is_wired_and_the_long_and_integer_helpers_are_distinct() {
         let t = direct_helper_table();
-        assert_ne!(t.long_value_of, t.integer_value_of, "Long.valueOf is wired to Integer.valueOf's helper");
-        assert_ne!(t.long_long_value, t.integer_int_value, "Long.longValue is wired to Integer.intValue's helper");
-        assert_ne!(t.long_value_of, t.long_long_value, "both Long helpers hold one address");
+        assert_ne!(
+            t.long_value_of, t.integer_value_of,
+            "Long.valueOf is wired to Integer.valueOf's helper"
+        );
+        assert_ne!(
+            t.long_long_value, t.integer_int_value,
+            "Long.longValue is wired to Integer.intValue's helper"
+        );
+        assert_ne!(
+            t.long_value_of, t.long_long_value,
+            "both Long helpers hold one address"
+        );
         assert_ne!(t.monitor_enter, t.monitor_exit);
         for (name, addr) in [
             ("integer_value_of", t.integer_value_of),
             ("thread_current_thread", t.thread_current_thread),
             ("indy_bridge", t.indy_bridge),
             ("monitor_enter", t.monitor_enter),
-            ("nio_byte_element_served_class", t.nio_byte_element_served_class),
+            (
+                "nio_byte_element_served_class",
+                t.nio_byte_element_served_class,
+            ),
             ("arm_savebase_watch", t.arm_savebase_watch),
             ("disarm_savebase_watch", t.disarm_savebase_watch),
         ] {
@@ -29814,6 +29822,11 @@ mod direct_helper_table_tests {
             (0, 0),
             "a table built without a VM must not carry a resolver"
         );
-        assert!(t.varhandle_read.iter().chain(&t.varhandle_write).chain(&t.varhandle_cas).all(|&a| a != 0));
+        assert!(t
+            .varhandle_read
+            .iter()
+            .chain(&t.varhandle_write)
+            .chain(&t.varhandle_cas)
+            .all(|&a| a != 0));
     }
 }

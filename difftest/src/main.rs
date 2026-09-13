@@ -33,13 +33,13 @@ use cratonvm_difftest::classgen::{self, ClassVersion};
 use cratonvm_difftest::generate::{self, Rng, TargetFamily};
 use cratonvm_difftest::harness::{self, RunOne};
 use cratonvm_difftest::jitfuzz::{self, FuzzConfig};
-use cratonvm_difftest::pathgate::{self, KnownSplits, PathGateConfig};
 use cratonvm_difftest::ledger::{self, Ledger};
 use cratonvm_difftest::matrix::{self, CoverageMatrix, GeneratorIndex};
 use cratonvm_difftest::minimize;
 use cratonvm_difftest::mutate;
 use cratonvm_difftest::opcorpus::{self, OpcodeCorpusConfig};
 use cratonvm_difftest::oracle::Normalizer;
+use cratonvm_difftest::pathgate::{self, KnownSplits, PathGateConfig};
 use cratonvm_difftest::runner::{self, Mode, RunError, RunnerConfig, DEFAULT_TIMEOUT};
 
 /// Gate / run exit-code contract (design §3.5). These describe the *divergence
@@ -501,7 +501,10 @@ fn main() -> ExitCode {
 // ---------------------------------------------------------------------------
 
 fn cmd_path_gate(args: &PathGateArgs) -> ExitCode {
-    let known_path = args.known.clone().unwrap_or_else(pathgate::default_known_path);
+    let known_path = args
+        .known
+        .clone()
+        .unwrap_or_else(pathgate::default_known_path);
     let known = match KnownSplits::load(&known_path) {
         Ok(k) => k,
         Err(e) => {
@@ -575,7 +578,9 @@ fn cmd_fuzz_jit(args: &FuzzJitArgs) -> ExitCode {
         match kv.split_once('=') {
             Some((k, v)) if !k.is_empty() => extra_env.push((k.to_string(), v.to_string())),
             _ => {
-                eprintln!("cratonvm-difftest fuzz-jit: --extra-env expects KEY=VALUE (got {kv:?}).");
+                eprintln!(
+                    "cratonvm-difftest fuzz-jit: --extra-env expects KEY=VALUE (got {kv:?})."
+                );
                 return ExitCode::from(exit::BOOTSTRAP);
             }
         }
@@ -585,7 +590,10 @@ fn cmd_fuzz_jit(args: &FuzzJitArgs) -> ExitCode {
     if args.dry_run {
         if let Some(dump) = &args.dump {
             if let Err(e) = std::fs::create_dir_all(dump) {
-                eprintln!("cratonvm-difftest fuzz-jit: cannot create {}: {e}", dump.display());
+                eprintln!(
+                    "cratonvm-difftest fuzz-jit: cannot create {}: {e}",
+                    dump.display()
+                );
                 return ExitCode::from(exit::BOOTSTRAP);
             }
         }
@@ -597,10 +605,18 @@ fn cmd_fuzz_jit(args: &FuzzJitArgs) -> ExitCode {
                 .and_then(|b| classgen::check_class_shape(&b).map(|()| b));
             match checked {
                 Ok(bytes) => {
-                    println!("  OK    {} ({} bytes) [{}]", p.name, bytes.len(), cats.join(","));
+                    println!(
+                        "  OK    {} ({} bytes) [{}]",
+                        p.name,
+                        bytes.len(),
+                        cats.join(",")
+                    );
                     if let Some(dump) = &args.dump {
                         let _ = std::fs::write(dump.join(format!("{}.class", p.name)), &bytes);
-                        let _ = std::fs::write(dump.join(format!("{}.txt", p.name)), jitfuzz::describe(&p));
+                        let _ = std::fs::write(
+                            dump.join(format!("{}.txt", p.name)),
+                            jitfuzz::describe(&p),
+                        );
                     }
                 }
                 Err(e) => {
@@ -613,7 +629,11 @@ fn cmd_fuzz_jit(args: &FuzzJitArgs) -> ExitCode {
             "cratonvm-difftest fuzz-jit --dry-run — {} program(s), {bad} rejected by the generator's own checks",
             end - args.seed
         );
-        return ExitCode::from(if bad == 0 { exit::OK } else { exit::NEW_DIVERGENCE });
+        return ExitCode::from(if bad == 0 {
+            exit::OK
+        } else {
+            exit::NEW_DIVERGENCE
+        });
     }
 
     let Some(bin) = runner::cratonvm_binary() else {
@@ -624,7 +644,10 @@ fn cmd_fuzz_jit(args: &FuzzJitArgs) -> ExitCode {
         return ExitCode::from(exit::BOOTSTRAP);
     };
     if args.hotspot && !runner::java_available(args.jdk.as_deref()) {
-        eprintln!("cratonvm-difftest fuzz-jit: --hotspot needs java — exit {}.", exit::BOOTSTRAP);
+        eprintln!(
+            "cratonvm-difftest fuzz-jit: --hotspot needs java — exit {}.",
+            exit::BOOTSTRAP
+        );
         return ExitCode::from(exit::BOOTSTRAP);
     }
 
@@ -660,9 +683,14 @@ fn cmd_fuzz_jit(args: &FuzzJitArgs) -> ExitCode {
         args.extra_env.join(" "),
         version.major()
     );
-    let result = jitfuzz::fuzz(&bin, args.seed, args.count, args.max_failures.max(1), &cfg, |line| {
-        println!("{line}")
-    });
+    let result = jitfuzz::fuzz(
+        &bin,
+        args.seed,
+        args.count,
+        args.max_failures.max(1),
+        &cfg,
+        |line| println!("{line}"),
+    );
     let _ = std::fs::remove_dir_all(&work_dir);
     match result {
         Ok(summary) => {
@@ -683,7 +711,10 @@ fn cmd_fuzz_jit(args: &FuzzJitArgs) -> ExitCode {
             })
         }
         Err(e) => {
-            eprintln!("cratonvm-difftest fuzz-jit: {e} — exit {}.", exit::BOOTSTRAP);
+            eprintln!(
+                "cratonvm-difftest fuzz-jit: {e} — exit {}.",
+                exit::BOOTSTRAP
+            );
             ExitCode::from(exit::BOOTSTRAP)
         }
     }

@@ -3974,7 +3974,10 @@ mod tests {
                 "disagreement at {addr:#x}"
             );
             assert_eq!(index.contains_from(addr), reference.contains_key(&addr));
-            assert_eq!(index.resolve(addr), reference.get(&addr).copied().unwrap_or(addr));
+            assert_eq!(
+                index.resolve(addr),
+                reference.get(&addr).copied().unwrap_or(addr)
+            );
         }
         assert_eq!(index.len(), 3);
         assert_eq!(

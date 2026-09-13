@@ -2279,8 +2279,13 @@ in_native_pins={} frames={}
                 {
                     use std::fmt::Write as _;
                     for f in thread.frames.iter().rev().take(6) {
-                        let _ = write!(stk, "
-[WATCH-ALLOC]     at {}.{}", f.class_name(), f.method_name());
+                        let _ = write!(
+                            stk,
+                            "
+[WATCH-ALLOC]     at {}.{}",
+                            f.class_name(),
+                            f.method_name()
+                        );
                     }
                 }
                 eprintln!(

@@ -153,7 +153,11 @@ pub static XT_PEER_SHADOW_UNTRUSTED: AtomicU64 = AtomicU64::new(0);
 /// mistake that SIGSEGV'd the band verifier on a `base` of `0x5555_0000_0004`.
 /// Returns the number of slots scanned, or `None` if the window could not be
 /// trusted (which must keep the cycle refusing rather than claim coverage).
-pub fn scan_peer_shadow_window<F>(os_tid: u32, is_obj: &F, out: &mut Vec<ObjectRef>) -> Option<usize>
+pub fn scan_peer_shadow_window<F>(
+    os_tid: u32,
+    is_obj: &F,
+    out: &mut Vec<ObjectRef>,
+) -> Option<usize>
 where
     F: Fn(usize) -> Option<ObjectRef>,
 {
@@ -635,11 +639,7 @@ mod imp {
             // registers are not heap and not frame-band memory, and a Cheney
             // copy never rewrites them, so if one names an object this cycle
             // relocates, the peer resumes holding a vacated address.
-            cratonvm_gc::gc_quiescence::record_peer_reg(
-                os_tid,
-                ((off - OFF_GPR_LO) / 8) as u8,
-                v,
-            );
+            cratonvm_gc::gc_quiescence::record_peer_reg(os_tid, ((off - OFF_GPR_LO) / 8) as u8, v);
             if let Some(o) = is_obj(v) {
                 roots.push(o);
                 found += 1;
@@ -797,7 +797,6 @@ mod imp {
         }
         newly
     }
-
 
     /// Number of times the audit found an in-process thread that was absent
     /// from the roster `take_over_pass` was given AND had its `Rip` inside a
@@ -1078,9 +1077,9 @@ mod imp {
                         // has to store into. `snapshot_peer` copies from `rsp`,
                         // so the base is the context's Rsp.
                         // SAFETY: `ctx` is a fully-initialized CONTEXT copy.
-                        let peer_rsp = unsafe {
-                            (ctx.as_ptr().add(OFF_RSP) as *const u64).read_unaligned()
-                        } as usize;
+                        let peer_rsp =
+                            unsafe { (ctx.as_ptr().add(OFF_RSP) as *const u64).read_unaligned() }
+                                as usize;
                         let pairing = cratonvm_gc::gc_quiescence::peer_reg_pairing_enabled();
                         for i in 0..band_len / 8 {
                             let w = unsafe {
@@ -1110,12 +1109,13 @@ mod imp {
                         // incomplete and any coverage credited on it is a lie.
                         // An untrusted window refuses the pin rather than
                         // claiming coverage it does not have.
-                        let shadow_ok = if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled()
-                        {
-                            super::scan_peer_shadow_window(tid, is_obj, &mut candidates).is_some()
-                        } else {
-                            true
-                        };
+                        let shadow_ok =
+                            if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled() {
+                                super::scan_peer_shadow_window(tid, is_obj, &mut candidates)
+                                    .is_some()
+                            } else {
+                                true
+                            };
                         found_total += candidates.len();
                         // PIN, exactly as the Linux arm does. A window is only
                         // COUNTED here when `snapshot_peer` returned `Some`,
@@ -1173,9 +1173,7 @@ mod imp {
         // and the rest of the heap may move. See the Linux arm for the full
         // argument and for why the pins alone are not sufficient without the
         // second site in `interpreter::gc_and_alloc` agreeing.
-        if windows > 0
-            && !(super::helper_window_discharge_enabled() && unpinned_windows == 0)
-        {
+        if windows > 0 && !(super::helper_window_discharge_enabled() && unpinned_windows == 0) {
             cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                 cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
             );
@@ -2133,12 +2131,13 @@ mod imp {
                         // incomplete and any coverage credited on it is a lie.
                         // An untrusted window refuses the pin rather than
                         // claiming coverage it does not have.
-                        let shadow_ok = if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled()
-                        {
-                            super::scan_peer_shadow_window(tid, is_obj, &mut candidates).is_some()
-                        } else {
-                            true
-                        };
+                        let shadow_ok =
+                            if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled() {
+                                super::scan_peer_shadow_window(tid, is_obj, &mut candidates)
+                                    .is_some()
+                            } else {
+                                true
+                            };
                         found_total += candidates.len();
                         let roots_this_window = candidates.len();
                         // PIN, rather than refuse the whole cycle.
@@ -2252,9 +2251,7 @@ mod imp {
         // `[GC] xt_peer_scan` line say how many windows a future discharge
         // would have to cover.
         XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(unpinned_windows as u64, Ordering::Release);
-        if windows > 0
-            && !(helper_window_discharge_enabled() && unpinned_windows == 0)
-        {
+        if windows > 0 && !(helper_window_discharge_enabled() && unpinned_windows == 0) {
             cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                 cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
             );

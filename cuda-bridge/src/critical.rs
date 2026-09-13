@@ -633,7 +633,9 @@ impl CriticalToken {
     /// that forgets to check [`CriticalToken::is_revoked`] still has
     /// nothing to write through.
     pub fn keepalive_addrs(&self) -> Vec<usize> {
-        self.registry.keepalive_addrs_of(self.id).unwrap_or_default()
+        self.registry
+            .keepalive_addrs_of(self.id)
+            .unwrap_or_default()
     }
 }
 
@@ -2098,7 +2100,10 @@ mod tests {
         );
         let outcome = reg.wait_for_drain(Duration::from_millis(2));
         assert!(!outcome.drained());
-        assert!(!outcome.may_relocate(), "a DMA against the arena forbids the move");
+        assert!(
+            !outcome.may_relocate(),
+            "a DMA against the arena forbids the move"
+        );
         // The narrower wait the collector actually uses agrees.
         let clearance = reg.wait_for_relocation_clearance(Duration::from_millis(2));
         assert!(!clearance.may_relocate());

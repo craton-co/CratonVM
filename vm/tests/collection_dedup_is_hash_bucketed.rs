@@ -95,7 +95,10 @@ fn set_of_array_does_not_compare_every_pair() {
     let mut vm = Vm::new(VmConfig::new().with_classpath(vec![test_resources_dir()]));
     const N: i32 = 2000;
     let calls = int_of(&mut vm, "setOfEqualsCalls", "(I)I", &[Value::Int(N)]);
-    assert!(calls >= 0, "Set.of kept the wrong number of {N} pairwise-unequal keys");
+    assert!(
+        calls >= 0,
+        "Set.of kept the wrong number of {N} pairwise-unequal keys"
+    );
     assert!(
         calls < N,
         "Set.of made {calls} equals() calls over {N} keys with distinct hashes — its duplicate \
@@ -106,7 +109,10 @@ fn set_of_array_does_not_compare_every_pair() {
 #[test]
 fn set_of_still_rejects_a_duplicate() {
     let mut vm = Vm::new(VmConfig::new().with_classpath(vec![test_resources_dir()]));
-    assert_eq!(int_of(&mut vm, "setOfRejectsSameHashDuplicate", "()I", &[]), 1);
+    assert_eq!(
+        int_of(&mut vm, "setOfRejectsSameHashDuplicate", "()I", &[]),
+        1
+    );
 }
 
 #[test]

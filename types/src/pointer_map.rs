@@ -385,7 +385,11 @@ mod tests {
     #[test]
     fn the_parallel_fold_equals_the_sequential_one_and_last_pair_wins() {
         let sources: Vec<Vec<(usize, usize)>> = (0..8)
-            .map(|w| (0..5000usize).map(|i| ((i * 8) ^ (w * 40), i + w)).collect())
+            .map(|w| {
+                (0..5000usize)
+                    .map(|i| ((i * 8) ^ (w * 40), i + w))
+                    .collect()
+            })
             .collect();
         let mut seq = PointerMap::new();
         for s in &sources {

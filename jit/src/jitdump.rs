@@ -161,7 +161,12 @@ pub fn encode_code_close(out: &mut Vec<u8>, timestamp: u64) {
 /// Append a `JIT_CODE_UNWINDING_INFO` record. `unwinding` is `.eh_frame`
 /// followed by `.eh_frame_hdr` (the last `eh_frame_hdr_size` bytes), which is
 /// how `perf inject` splits it. The record is padded to an 8-byte boundary.
-pub fn encode_unwinding_info(out: &mut Vec<u8>, timestamp: u64, unwinding: &[u8], eh_frame_hdr_size: usize) {
+pub fn encode_unwinding_info(
+    out: &mut Vec<u8>,
+    timestamp: u64,
+    unwinding: &[u8],
+    eh_frame_hdr_size: usize,
+) {
     let content = UNWINDING_INFO_FIXED_SIZE + unwinding.len();
     let total = align8(content);
     put_prefix(out, JIT_CODE_UNWINDING_INFO, total, timestamp);
@@ -229,7 +234,7 @@ pub fn build_x64_eh_frame(code_size: usize) -> Vec<u8> {
     buf.push(DWARF_RA); // return address register
     buf.push(1); // augmentation data length
     buf.push(DW_EH_PE_PCREL | DW_EH_PE_SDATA4); // FDE pointer encoding
-    // Initial state: CFA = RSP + 8, RA at CFA - 8.
+                                                // Initial state: CFA = RSP + 8, RA at CFA - 8.
     buf.extend_from_slice(&[DW_CFA_DEF_CFA, DWARF_RSP, 8]);
     buf.extend_from_slice(&[DW_CFA_OFFSET | DWARF_RA, 1]);
     pad_to_8_with_nops(&mut buf, cie_start);
@@ -239,7 +244,7 @@ pub fn build_x64_eh_frame(code_size: usize) -> Vec<u8> {
     // --- FDE ---
     let fde_start = buf.len();
     buf.extend_from_slice(&[0; 4]); // length, patched
-    // CIE pointer: distance from this field back to the CIE.
+                                    // CIE pointer: distance from this field back to the CIE.
     buf.extend_from_slice(&((fde_start + 4 - cie_start) as u32).to_ne_bytes());
     // pc_begin, pc-relative: the code starts align8(code_size) before
     // `.eh_frame`, and this field is at `.eh_frame + fde_start + 8`.
@@ -247,7 +252,7 @@ pub fn build_x64_eh_frame(code_size: usize) -> Vec<u8> {
     buf.extend_from_slice(&(pc_begin as i32).to_ne_bytes());
     buf.extend_from_slice(&(u32::try_from(code_size).unwrap_or(u32::MAX)).to_ne_bytes()); // pc_range
     buf.push(0); // augmentation data length
-    // After `push rbp` (1 byte): CFA = RSP + 16, RBP saved at CFA - 16.
+                 // After `push rbp` (1 byte): CFA = RSP + 16, RBP saved at CFA - 16.
     buf.push(DW_CFA_ADVANCE_LOC | 1);
     buf.extend_from_slice(&[DW_CFA_DEF_CFA_OFFSET, 16]);
     buf.extend_from_slice(&[DW_CFA_OFFSET | DWARF_RBP, 2]);
@@ -267,10 +272,10 @@ pub fn build_x64_eh_frame(code_size: usize) -> Vec<u8> {
     buf.push(DW_EH_PE_PCREL | DW_EH_PE_SDATA4); // eh_frame_ptr encoding
     buf.push(DW_EH_PE_UDATA4); // fde_count encoding
     buf.push(DW_EH_PE_DATAREL | DW_EH_PE_SDATA4); // table encoding
-    // eh_frame_ptr, relative to this field (at hdr + 4).
+                                                  // eh_frame_ptr, relative to this field (at hdr + 4).
     buf.extend_from_slice(&(-((eh_frame_size + 4) as i64) as i32).to_ne_bytes());
     buf.extend_from_slice(&1u32.to_ne_bytes()); // fde_count
-    // Table entry, both relative to the start of `.eh_frame_hdr`.
+                                                // Table entry, both relative to the start of `.eh_frame_hdr`.
     let initial_loc = -((align8(code_size) + eh_frame_size) as i64);
     buf.extend_from_slice(&(initial_loc as i32).to_ne_bytes());
     let fde_addr = -((eh_frame_size - fde_start) as i64);
@@ -318,7 +323,9 @@ pub fn enabled() -> bool {
     )))]
     {
         // Say so once rather than silently producing nothing.
-        fail(format_args!("jitdump is only produced on Linux x86-64/aarch64"));
+        fail(format_args!(
+            "jitdump is only produced on Linux x86-64/aarch64"
+        ));
         false
     }
 }
@@ -376,7 +383,10 @@ mod linux {
     const SYS_GETTID: i64 = 178;
 
     fn monotonic_ns() -> u64 {
-        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         // SAFETY: `ts` is a live, writable `struct timespec` (two `long`s on
         // LP64) and the clock id is a kernel constant.
         let rc = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
@@ -616,7 +626,11 @@ mod tests {
         let fde_start = cie_len;
         let fde_len = u32_at(&buf, fde_start) as usize + 4;
         assert_eq!(fde_len % 8, 0);
-        assert_eq!(u32_at(&buf, fde_start + 4) as usize, fde_start + 4, "CIE pointer");
+        assert_eq!(
+            u32_at(&buf, fde_start + 4) as usize,
+            fde_start + 4,
+            "CIE pointer"
+        );
         assert_eq!(fde_start + fde_len + 4, eh_frame_size);
         assert_eq!(u32_at(&buf, eh_frame_size - 4), 0, "terminator");
 
@@ -630,9 +644,17 @@ mod tests {
         let hdr = eh_frame_size;
         let hdr_addr = e + hdr as i64;
         assert_eq!(buf[hdr], 1);
-        assert_eq!(hdr_addr + 4 + i32_at(&buf, hdr + 4) as i64, e, "eh_frame_ptr");
+        assert_eq!(
+            hdr_addr + 4 + i32_at(&buf, hdr + 4) as i64,
+            e,
+            "eh_frame_ptr"
+        );
         assert_eq!(u32_at(&buf, hdr + 8), 1, "fde_count");
-        assert_eq!(hdr_addr + i32_at(&buf, hdr + 12) as i64, text, "initial_loc");
+        assert_eq!(
+            hdr_addr + i32_at(&buf, hdr + 12) as i64,
+            text,
+            "initial_loc"
+        );
         assert_eq!(
             hdr_addr + i32_at(&buf, hdr + 16) as i64,
             e + fde_start as i64,
@@ -642,7 +664,9 @@ mod tests {
 
     #[test]
     fn the_frame_record_check_reads_the_bytes() {
-        assert!(has_standard_x64_frame_record(&[0x55, 0x48, 0x89, 0xE5, 0x48]));
+        assert!(has_standard_x64_frame_record(&[
+            0x55, 0x48, 0x89, 0xE5, 0x48
+        ]));
         assert!(!has_standard_x64_frame_record(&[0x48, 0x89, 0xE5]));
         assert!(!has_standard_x64_frame_record(&[0x55]));
     }

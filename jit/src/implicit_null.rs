@@ -291,7 +291,10 @@ mod tests {
     #[test]
     fn elision_needs_a_recovering_fault_handler_as_well_as_the_flag() {
         if !enabled() {
-            assert!(!active(), "the kill switch turns elision off whatever else holds");
+            assert!(
+                !active(),
+                "the kill switch turns elision off whatever else holds"
+            );
             return;
         }
         // Process-wide: another test may already have stood in for the

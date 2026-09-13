@@ -189,8 +189,12 @@ impl ZgcRealHeap {
         if after >= self.gc_threshold && after >= self.gc_rearm.load(Ordering::Relaxed) {
             self.native_alloc_pressure.store(true, Ordering::Relaxed);
         }
-        self.counters.vm_tlab_refills.fetch_add(1, Ordering::Relaxed);
-        self.counters.vm_tlab_refill_bytes.fetch_add(size, Ordering::Relaxed);
+        self.counters
+            .vm_tlab_refills
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .vm_tlab_refill_bytes
+            .fetch_add(size, Ordering::Relaxed);
         Some((ptr, size))
     }
 
@@ -212,7 +216,6 @@ impl ZgcRealHeap {
         crate::gc_quiescence::note_allocated(std::slice::from_ref(&addr));
         self.allocate_black_if_marking(ptr);
     }
-
 
     /// The reserved tails of TLABs whose owners could not retire before this
     /// collection (blocked in native, or frozen in compiled code). Consumed
@@ -248,7 +251,9 @@ impl ZgcRealHeap {
             self.counters.vm_tlab_refills.load(Ordering::Relaxed),
             self.counters.vm_tlab_refill_bytes.load(Ordering::Relaxed),
             self.counters.vm_tlab_tails_returned.load(Ordering::Relaxed),
-            self.counters.vm_tlab_tail_bytes_returned.load(Ordering::Relaxed),
+            self.counters
+                .vm_tlab_tail_bytes_returned
+                .load(Ordering::Relaxed),
         )
     }
 
@@ -308,8 +313,11 @@ impl crate::tlab::TlabTailSink for ZgcRealHeap {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |a| {
                 Some(a.saturating_sub(bytes))
             });
-        self.counters.vm_tlab_tails_returned.fetch_add(1, Ordering::Relaxed);
-        self.counters.vm_tlab_tail_bytes_returned
+        self.counters
+            .vm_tlab_tails_returned
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .vm_tlab_tail_bytes_returned
             .fetch_add(bytes, Ordering::Relaxed);
         true
     }
@@ -467,7 +475,11 @@ mod tests {
         tlab.retire();
         let tail = size - consumed;
         let free_after = heap.arena.lock().free_list_bytes();
-        assert_eq!(free_after - free_before, tail, "the tail must be free-listed once");
+        assert_eq!(
+            free_after - free_before,
+            tail,
+            "the tail must be free-listed once"
+        );
         assert_eq!(
             allocated_before - heap.allocated.load(Ordering::Relaxed),
             tail,

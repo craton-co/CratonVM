@@ -3643,10 +3643,7 @@ fn shadow_window_for_thread_why(
 /// return its `[base, top)` window. Both resolvers end here, so a window
 /// reached through the frame cache and one reached through the installed
 /// thread are held to identical invariants.
-fn shadow_window_at(
-    thread_ptr: usize,
-    shadow_off: i32,
-) -> Result<(usize, usize), &'static str> {
+fn shadow_window_at(thread_ptr: usize, shadow_off: i32) -> Result<(usize, usize), &'static str> {
     let ss = thread_ptr
         .checked_add(shadow_off as usize)
         .ok_or("shadow-addr-overflow")?;
@@ -3685,12 +3682,12 @@ fn shadow_window_at(
     if thread_ptr < 0x1_0000 {
         return Err("thread-addr-low");
     }
-    let top = read_word(cratonvm_gc::shadow_stack::ShadowStack::TOP_OFFSET)
-        .ok_or("top-unreadable")?;
-    let end = read_word(cratonvm_gc::shadow_stack::ShadowStack::END_OFFSET)
-        .ok_or("end-unreadable")?;
-    let base = read_word(cratonvm_gc::shadow_stack::ShadowStack::BASE_OFFSET)
-        .ok_or("base-unreadable")?;
+    let top =
+        read_word(cratonvm_gc::shadow_stack::ShadowStack::TOP_OFFSET).ok_or("top-unreadable")?;
+    let end =
+        read_word(cratonvm_gc::shadow_stack::ShadowStack::END_OFFSET).ok_or("end-unreadable")?;
+    let base =
+        read_word(cratonvm_gc::shadow_stack::ShadowStack::BASE_OFFSET).ok_or("base-unreadable")?;
     const SHADOW_BYTES: usize = cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS * 8;
     if base < 0x1_0000 || base & 0x7 != 0 || top & 0x7 != 0 || end & 0x7 != 0 {
         return Err("fields-misaligned");
@@ -3776,8 +3773,7 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
     // `gen_heap::RELOCATABLE_HEAPS_LIVE`.
     if bounds_guard_enabled() {
         if !cratonvm_gc::gen_heap::published_bounds_represent_every_live_heap() {
-            *reason_out =
-                cratonvm_gc::gc_quiescence::incomplete_reason::BOUNDS_NOT_REPRESENTATIVE;
+            *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::BOUNDS_NOT_REPRESENTATIVE;
             return true;
         }
         if !cratonvm_gc::gen_heap::movable_bounds_are_live() {
@@ -4291,8 +4287,7 @@ fn band_slot_is_verifiable_with_map(
     // and gets the range exclusion below rather than this -- otherwise the
     // half-line would swallow its whole spill area, which is precisely the
     // region the oop maps describe.
-    if !layout.callee_saved_shallow && layout.callee_saved_lo > 0 && off >= layout.callee_saved_lo
-    {
+    if !layout.callee_saved_shallow && layout.callee_saved_lo > 0 && off >= layout.callee_saved_lo {
         return false;
     }
     if layout.is_register_image(off) {
@@ -5242,7 +5237,8 @@ pub fn publish_peer_jit_coverage_for_stw() {
     // names the term without any new bookkeeping. Only taken when the debug
     // flag is on — it is two array reads either side of a proof that already
     // walks the stack.
-    let before = xt_coverage_dbg().then(cratonvm_gc::gc_quiescence::moving_young_incomplete_reason_mask);
+    let before =
+        xt_coverage_dbg().then(cratonvm_gc::gc_quiescence::moving_young_incomplete_reason_mask);
     let proven = refresh_moving_young_coverage_for_current_thread();
     // Read the depth AFTER the proof: it prunes returned entries, and the
     // deposit must not claim more than the proof covered.
@@ -5600,10 +5596,10 @@ pub struct InlinedLevel {
 /// aarch64 frame reachable from a capture trips them first.
 fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> {
     use cratonvm_jit::{
-        note_compiled_frame_line as note, FRAME_LINE_ANSWERED_IR,
-        FRAME_LINE_ANSWERED_SINGLE_PASS, FRAME_LINE_REFUSED_ID_UNRECORDED,
-        FRAME_LINE_REFUSED_IR_UNTRANSLATED, FRAME_LINE_REFUSED_NO_SP_ID,
-        FRAME_LINE_REFUSED_OUT_OF_RANGE, FRAME_LINE_REFUSED_SWITCHED_OFF,
+        note_compiled_frame_line as note, FRAME_LINE_ANSWERED_IR, FRAME_LINE_ANSWERED_SINGLE_PASS,
+        FRAME_LINE_REFUSED_ID_UNRECORDED, FRAME_LINE_REFUSED_IR_UNTRANSLATED,
+        FRAME_LINE_REFUSED_NO_SP_ID, FRAME_LINE_REFUSED_OUT_OF_RANGE,
+        FRAME_LINE_REFUSED_SWITCHED_OFF,
     };
     // Every exit below names a census column. That is not decoration: a trace
     // prints `(Unknown Source)` for all five refusals and there is no other
@@ -6328,9 +6324,7 @@ pub static NO_JIT_ROOT_SCAN_SUPPRESSED: std::sync::atomic::AtomicU64 =
 
 pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     if dbg_no_jit_root_scan() {
-        let n = NO_JIT_ROOT_SCAN_SUPPRESSED
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
+        let n = NO_JIT_ROOT_SCAN_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n == 1 {
             eprintln!(
                 "[jitrootscan] CRATONVM_DBG_NO_JIT_ROOT_SCAN engaged                  -- conservative JIT frame roots are NOT being published (UNSOUND)"
@@ -6555,8 +6549,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                             if unreg_declined_dbg() {
                                 let mut would: Vec<ObjectRef> = Vec::new();
                                 scan_one_frame(search_lo, high, heap, &mut would);
-                                UNREG_DECLINED_ROOTS
-                                    .fetch_add(would.len(), Ordering::Relaxed);
+                                UNREG_DECLINED_ROOTS.fetch_add(would.len(), Ordering::Relaxed);
                                 // Every address, every time: the victim this is
                                 // meant to explain is named by a DIFFERENT probe
                                 // after the fact, so a rate-limited sample of
@@ -6571,11 +6564,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                                         if cm.method_label.is_empty() {
                                             format!("<unlabelled>+0x{:x}", word - entry)
                                         } else {
-                                            format!(
-                                                "{}+0x{:x}",
-                                                cm.method_label,
-                                                word - entry
-                                            )
+                                            format!("{}+0x{:x}", cm.method_label, word - entry)
                                         }
                                     }
                                     None => "<body reclaimed>".to_string(),
@@ -6614,8 +6603,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                             }
                         }
                         band_path::A5_SWEEPS.fetch_add(1, Ordering::Relaxed);
-                        band_path::A5_ROOTS
-                            .fetch_add(out.len() - __a5_before, Ordering::Relaxed);
+                        band_path::A5_ROOTS.fetch_add(out.len() - __a5_before, Ordering::Relaxed);
                         // MARKING AND THE RELOCATION LICENCE ARE TWO QUESTIONS,
                         // and until 2026-09-08 this site answered both with the
                         // one `accept` above.
@@ -7064,9 +7052,9 @@ pub fn remap_active_jit_frames(pointer_map: &cratonvm_types::PointerMap) {
                     let boundary_cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
                     let (found, examined, n) =
                         remap_one_jit_frame(info.exact_rbp, boundary_cm, pointer_map);
-                        if stale_frame_word_check_enabled() {
-                            audit_stale_frame_words(info.exact_rbp, boundary_cm, pointer_map);
-                        }
+                    if stale_frame_word_check_enabled() {
+                        audit_stale_frame_words(info.exact_rbp, boundary_cm, pointer_map);
+                    }
                     dbg_frames += 1;
                     dbg_slots.set(dbg_slots.get() + n);
                     if found {
@@ -7458,8 +7446,7 @@ fn remap_unmapped_frame_dupes(
         // Slots the precise loop already handled are skipped: it rewrote them,
         // so their value is now a to-space address, and a second lookup would
         // miss anyway -- but skipping keeps the intent explicit.
-        let is_named =
-            off > 0 && off <= i16::MAX as i64 && named.contains(&(off as i16));
+        let is_named = off > 0 && off <= i16::MAX as i64 && named.contains(&(off as i16));
         if !is_named {
             // SAFETY: aligned word inside this thread's live compiled frame,
             // bounded by the frame size recorded at compile time.
@@ -7888,13 +7875,12 @@ fn report_remap_residue(
                 };
                 // Last resort before "unexplained": is this the same object a
                 // named slot of this frame already points at?
-                let verdict = if verdict == StaleVerdict::OutsideLocals
-                    && mapped_vals.contains(&new)
-                {
-                    StaleVerdict::DuplicateOfMapped
-                } else {
-                    verdict
-                };
+                let verdict =
+                    if verdict == StaleVerdict::OutsideLocals && mapped_vals.contains(&new) {
+                        StaleVerdict::DuplicateOfMapped
+                    } else {
+                        verdict
+                    };
                 match verdict {
                     StaleVerdict::NotLive => {}
                     StaleVerdict::LocalOopUnmapped => oracle_local_oop += 1,
@@ -7930,7 +7916,8 @@ fn report_remap_residue(
                         // an outgoing-argument word are three different
                         // questions, and the oracle above cannot tell them
                         // apart.
-                        cm.frame_layout.region_name(i32::try_from(off).unwrap_or(i32::MAX)),
+                        cm.frame_layout
+                            .region_name(i32::try_from(off).unwrap_or(i32::MAX)),
                         w,
                         new
                     ));
@@ -9327,9 +9314,8 @@ fn pin_unnamed_frame_refs(rbp: usize, cm: &cratonvm_jit::CompiledMethod, heap: &
     let mut pins: Vec<usize> = Vec::new();
     while a <= rbp {
         let off = (rbp - a) as i64;
-        let is_named = off > 0
-            && off <= i16::MAX as i64
-            && named[..named_len].contains(&(off as i16));
+        let is_named =
+            off > 0 && off <= i16::MAX as i64 && named[..named_len].contains(&(off as i16));
         if !is_named {
             // SAFETY: aligned word inside this thread's live compiled frame,
             // bounded by the recorded frame size.
@@ -9375,7 +9361,13 @@ fn scan_active_oop_map_at_rbp(
 /// Read each oop slot listed in `slot_offsets` (positive byte distances below
 /// `rbp`), validate via `heap.is_object_address`, and push any hit into `out`.
 /// Used by [`scan_one_frame_precise`].
-fn scan_oop_slots(rbp: usize, slot_offsets: &[i16], method_label: &str, heap: &VmHeap, out: &mut Vec<ObjectRef>) {
+fn scan_oop_slots(
+    rbp: usize,
+    slot_offsets: &[i16],
+    method_label: &str,
+    heap: &VmHeap,
+    out: &mut Vec<ObjectRef>,
+) {
     for &offset in slot_offsets {
         // x64 map entries are positive distances from RBP to slots in the
         // downward-growing local/spill area: `off` means `[rbp - off]`.
@@ -9403,7 +9395,6 @@ fn scan_oop_slots(rbp: usize, slot_offsets: &[i16], method_label: &str, heap: &V
         }
     }
 }
-
 
 /// Scan a single JIT frame's spill region.
 ///
@@ -10403,9 +10394,13 @@ mod coverage_oracle_gate_tests {
             .split("pub fn verify_active_coverage_into")
             .nth(1)
             .expect("the gate is defined in this file");
-        let body = &gate[..gate.find("
+        let body = &gate[..gate
+            .find(
+                "
 }
-").expect("the gate has a body")];
+",
+            )
+            .expect("the gate has a body")];
         for counter in [
             "NEVER_MAPPED_WHILE_COVERED",
             "NEVER_MAPPED_WHILE_SHADOW_COVERED",
@@ -12226,7 +12221,6 @@ mod tests {
              false-positive floor the exclusion removes",
         );
     }
-
 
     /// A SHALLOW callee-save area must not blind the verifier to the spill area.
     ///

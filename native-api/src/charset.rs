@@ -125,9 +125,8 @@ pub fn canonical_charset_name(name: &str) -> Option<&'static str> {
         // UTF-8, and an unmapped name here is an `UnsupportedCharsetException`
         // out of `Charset.forName` at bootstrap. The rest of the row is the
         // JDK's own alias list for `sun.nio.cs.US_ASCII`.
-        "USASCII" | "ASCII" | "ANSIX3.41968" | "ANSIX3.41986" | "ISO646US"
-        | "ISO646.IRV:1991" | "646" | "CSASCII" | "IBM367" | "CP367"
-        | "ISOIR6" | "US" => "US-ASCII",
+        "USASCII" | "ASCII" | "ANSIX3.41968" | "ANSIX3.41986" | "ISO646US" | "ISO646.IRV:1991"
+        | "646" | "CSASCII" | "IBM367" | "CP367" | "ISOIR6" | "US" => "US-ASCII",
         // The JDK also accepts the historic `8859_1` spelling (used by
         // c3p0's resource-path reader) in addition to the ISO-prefixed
         // aliases. Underscores are removed above, yielding `88591`.

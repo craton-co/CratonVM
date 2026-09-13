@@ -495,8 +495,7 @@ impl ConstIntern {
         self.upto = graph.nodes.len();
 
         let id = *self.map.get(&(val, ty))?;
-        if matches!(graph.nodes.get(id as usize), Some(n) if n.op == Op::Const(val) && n.ty == ty)
-        {
+        if matches!(graph.nodes.get(id as usize), Some(n) if n.op == Op::Const(val) && n.ty == ty) {
             return Some(id);
         }
         match const_node_by_scan(graph, val, ty) {
@@ -5781,8 +5780,15 @@ mod tests {
         // …and it materializes back to a single `Const`, with no operand
         // anywhere in the graph holding the placeholder.
         let mut g = probe_graph();
-        let mat = build_affine(&mut g, &mut ConstIntern::new(), seven.root, seven.k, seven.c, IrType::Int)
-            .expect("a rootless form with k == 0 is exactly a constant");
+        let mat = build_affine(
+            &mut g,
+            &mut ConstIntern::new(),
+            seven.root,
+            seven.k,
+            seven.c,
+            IrType::Int,
+        )
+        .expect("a rootless form with k == 0 is exactly a constant");
         assert_eq!(g.nodes[mat as usize].op, Op::Const(7));
         assert!(
             g.nodes.iter().all(|n| !n.inputs.contains(&NO_NODE)),
@@ -6993,7 +6999,10 @@ mod tests {
         let limit = g.add(Op::Const(100), IrType::Int, vec![], None);
         let cond = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![acc, limit], None);
         g.add(Op::Guard { bci: 0 }, IrType::Void, vec![exit, cond], None);
-        assert!(unroll(&mut g), "a post-loop effect is not a loop side effect");
+        assert!(
+            unroll(&mut g),
+            "a post-loop effect is not a loop side effect"
+        );
     }
 
     #[test]

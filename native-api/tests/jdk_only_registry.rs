@@ -194,7 +194,6 @@ fn strict_registration_refuses_synthetic_stub() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // 2b. A refusal is NOT automatically a retirement
 // ---------------------------------------------------------------------------
@@ -255,7 +254,10 @@ fn a_refusal_over_an_owned_triple_names_the_survivor() {
         "one refusal landed on an owned triple, got {survived:?}"
     );
     let (class, method, descriptor, survivor) = survived[0];
-    assert_eq!((class, method, descriptor), ("com/example/Survivor", "m", "()I"));
+    assert_eq!(
+        (class, method, descriptor),
+        ("com/example/Survivor", "m", "()I")
+    );
     assert!(
         survivor.starts_with("intrinsic@"),
         "the survivor's KIND leads, because an Intrinsic survivor is the one \

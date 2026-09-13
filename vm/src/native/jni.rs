@@ -10623,7 +10623,10 @@ mod tests {
         let ok = jni_new_direct_byte_buffer(env, as_ptr, 64);
         assert_ne!(ok, 0);
         let published = jni_get_direct_buffer_address(env, ok);
-        assert!(!published.is_null(), "a block that covers its capacity must publish");
+        assert!(
+            !published.is_null(),
+            "a block that covers its capacity must publish"
+        );
         assert!(
             !cratonvm_native_builtins::unsafe_arena_addr_is_tagged(published as i64),
             "the published address must be translated, not the handle again"

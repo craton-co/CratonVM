@@ -280,7 +280,6 @@ pub struct DirectHelperTable {
 
     /// The matching `jit_disarm_savebase_watch()`, called from the epilogue.
     pub disarm_savebase_watch: usize,
-
 }
 
 impl Default for DirectHelperTable {

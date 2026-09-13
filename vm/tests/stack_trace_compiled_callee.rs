@@ -224,7 +224,9 @@ fn run_arm(
     extra_env: &[(&str, &str)],
 ) -> (String, String) {
     let mut cmd = Command::new(bin);
-    cmd.arg("--java-home").arg(jdk).env("CRATONVM_DBG_JITC", "1");
+    cmd.arg("--java-home")
+        .arg(jdk)
+        .env("CRATONVM_DBG_JITC", "1");
     for &(key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -543,8 +545,16 @@ fn an_exception_raised_by_compiled_code_keeps_the_frame_that_raised_it() {
          so it no longer reverts the snapshot — and with it goes the only way to attribute a \
          missing frame in a warmed-up trace to this recovery inside one binary.\n\
          rows: {}\ndefault: {}",
-        no_snap.iter().map(|f| render(f)).collect::<Vec<_>>().join(" | "),
-        jit_rows.iter().map(|f| render(f)).collect::<Vec<_>>().join(" | ")
+        no_snap
+            .iter()
+            .map(|f| render(f))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        jit_rows
+            .iter()
+            .map(|f| render(f))
+            .collect::<Vec<_>>()
+            .join(" | ")
     );
 
     // The trap-site table: the recovered frame goes back to carrying no bci.
@@ -557,7 +567,14 @@ fn an_exception_raised_by_compiled_code_keeps_the_frame_that_raised_it() {
     );
     let no_trap: Vec<Vec<Frame>> = ROWS
         .iter()
-        .map(|r| parse_row(&no_trap_out, &no_trap_err, *r, "CRATONVM_JIT_NO_NPE_TRAP_LINES=1"))
+        .map(|r| {
+            parse_row(
+                &no_trap_out,
+                &no_trap_err,
+                *r,
+                "CRATONVM_JIT_NO_NPE_TRAP_LINES=1",
+            )
+        })
         .collect();
     assert!(
         no_trap
@@ -568,7 +585,15 @@ fn an_exception_raised_by_compiled_code_keeps_the_frame_that_raised_it() {
          halves (the emitter's ten-byte trampoline and the walk's override read the same name \
          deliberately), or `big` was never a snapshotted frame in this run and the default arm's \
          line proves nothing about the table.\nrows: {}\ndefault: {}",
-        no_trap.iter().map(|f| render(f)).collect::<Vec<_>>().join(" | "),
-        jit_rows.iter().map(|f| render(f)).collect::<Vec<_>>().join(" | ")
+        no_trap
+            .iter()
+            .map(|f| render(f))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        jit_rows
+            .iter()
+            .map(|f| render(f))
+            .collect::<Vec<_>>()
+            .join(" | ")
     );
 }

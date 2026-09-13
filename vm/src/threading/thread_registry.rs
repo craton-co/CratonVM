@@ -1634,7 +1634,9 @@ impl ThreadRegistry {
 
     pub fn remove_jmx_locked_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
         self.with_self_jmx_monitors(thread_id, |book| {
-            book.locked.lock().retain(|o| o.as_ptr() != monitor.as_ptr());
+            book.locked
+                .lock()
+                .retain(|o| o.as_ptr() != monitor.as_ptr());
         });
     }
 

@@ -21,8 +21,8 @@
 //! common case. Raising it would require switching every `u64` bitset (and
 //! the `interference: Vec<u64>` graph) to a wider/dynamic bitset type.
 
-use crate::bytecode_analysis;
 use super::x64::{LOCAL_REGS, LOCAL_XMMS};
+use crate::bytecode_analysis;
 
 /// The GPR pool this allocator may colour Java locals into.
 ///
@@ -2078,7 +2078,12 @@ mod tests {
         assert!(!handler_has_unsafe_local_read(&code, code.len(), 0, 0));
         // wide iinc 70 1 reads a slot the mask cannot name.
         let code = [0xc4, 0x84, 0x00, 70, 0x00, 0x01, 0xb1];
-        assert!(handler_has_unsafe_local_read(&code, code.len(), 0, u64::MAX));
+        assert!(handler_has_unsafe_local_read(
+            &code,
+            code.len(),
+            0,
+            u64::MAX
+        ));
     }
 
     // T1.1.22-25 — invariant checker unit tests.
@@ -2178,8 +2183,16 @@ mod tests {
             5,
             "invokedynamic"
         );
-        assert_eq!(bytecode_analysis::step(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5, "goto_w");
-        assert_eq!(bytecode_analysis::step(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5, "jsr_w");
+        assert_eq!(
+            bytecode_analysis::step(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0),
+            5,
+            "goto_w"
+        );
+        assert_eq!(
+            bytecode_analysis::step(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0),
+            5,
+            "jsr_w"
+        );
     }
 
     /// `live_locals_per_pc_all` must be a strict SUPERSET of what the 64-local

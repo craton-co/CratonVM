@@ -2664,9 +2664,7 @@ impl Arena {
                 // already dropped above, and every span starts at or above it),
                 // so an overlap here is a containment; dropping on the weaker
                 // test costs at most a few bytes and can never double-publish.
-                let inside_vacated = vacated
-                    .iter()
-                    .any(|&(s, e)| off < e && s < off + size);
+                let inside_vacated = vacated.iter().any(|&(s, e)| off < e && s < off + size);
                 (!overlaps_touched && !inside_vacated).then_some((off, size))
             })
             .collect();
@@ -2842,7 +2840,10 @@ impl Arena {
         // The high region too, or a reset arena hands out bytes that still
         // hold a previous object's header — the exact hazard `reset`'s own
         // contract exists to close.
-        { let n = self.data.len(); self.data.fill_zero(self.high_cursor, n); }
+        {
+            let n = self.data.len();
+            self.data.fill_zero(self.high_cursor, n);
+        }
         self.cursor = 0;
         self.high_cursor = self.data.len();
         self.clear_free_list();
@@ -3180,11 +3181,7 @@ impl Arena {
         for (off, size) in low {
             released += self.decommit_span(off, off + size, "free-list-low");
         }
-        let high: Vec<(usize, usize)> = self
-            .free_high
-            .iter()
-            .map(|b| (b.offset, b.size))
-            .collect();
+        let high: Vec<(usize, usize)> = self.free_high.iter().map(|b| (b.offset, b.size)).collect();
         for (off, size) in high {
             released += self.decommit_span(off, off + size, "free-list-high");
         }
@@ -4048,13 +4045,7 @@ mod tests {
         // then dead.
         //
         // SAFETY: the test owns the arena and nothing else reads these bytes.
-        unsafe {
-            std::ptr::copy(
-                (base + c) as *const u8,
-                (base + b) as *mut u8,
-                1024,
-            )
-        };
+        unsafe { std::ptr::copy((base + c) as *const u8, (base + b) as *mut u8, 1024) };
         let new_floor = b;
         let reclaimed = arena.compact_high_to(d, &[(d, new_floor)]);
 
@@ -4191,9 +4182,9 @@ mod tests {
         assert_eq!(arena.low_bump_headroom(), 0, "the two ends have met");
 
         let before = small_allocations_in_large_region();
-        let p = arena.alloc(64, 8).expect(
-            "the last resort must still serve this rather than raise OutOfMemoryError",
-        );
+        let p = arena
+            .alloc(64, 8)
+            .expect("the last resort must still serve this rather than raise OutOfMemoryError");
         let off = p as usize - arena.base_ptr() as usize;
         assert!(
             off >= arena.high_cursor(),

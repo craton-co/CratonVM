@@ -275,7 +275,10 @@ mod tests {
             .expect("worker finishes");
         assert_eq!(C.get(), 1);
         C.dec_token(token);
-        assert!(C.is_zero(), "the exited thread's stripe must be back at zero");
+        assert!(
+            C.is_zero(),
+            "the exited thread's stripe must be back at zero"
+        );
         C.reset();
     }
 

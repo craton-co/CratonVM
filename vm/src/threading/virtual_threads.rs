@@ -872,8 +872,7 @@ fn spawn_starvation_watchdog(
                 // blocked in `monitorenter` stays blocked across as many pauses
                 // as you like, so its stalled samples simply resume accruing
                 // from the first pause-free interval.
-                let (pause_epoch, pause_now) =
-                    crate::threading::gc_barrier::stw_pause_state();
+                let (pause_epoch, pause_now) = crate::threading::gc_barrier::stw_pause_state();
                 let paused_in_interval = pause_now || pause_epoch != last_pause_epoch;
                 last_pause_epoch = pause_epoch;
                 // `CRATONVM_DBG_CARRIER=1` -- one line per sample, printed

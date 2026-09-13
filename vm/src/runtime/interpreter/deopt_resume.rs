@@ -2065,7 +2065,6 @@ pub(super) fn stamp_compilation_epoch(
     }
 }
 
-
 /// jit-invokedynamic-groovy-regression fix — does the stashed reconstructed
 /// frame belong to `cached`? The producer bakes the compiling method's
 /// `"<class>.<method>:<descriptor>"` key into every snapshot
@@ -2341,10 +2340,7 @@ pub(super) fn real_frame_deopt_resume_and_despeculate(
             .lock()
             .deopt_count_at_bci(&method_key, rframe.bci);
         if bci_deopts >= PER_BCI_DESPEC_LIMIT {
-            shared
-                .jit
-                .despec_registry
-                .insert(&method_key, rframe.bci);
+            shared.jit.despec_registry.insert(&method_key, rframe.bci);
             if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] per-bci de-spec: {} bci={} ({} deopts ≥ {}) — \
@@ -2864,7 +2860,11 @@ mod deopt_step3_tests {
             "the frame's own monitorexit releases it"
         );
         assert!(
-            shared.threads.monitors.exit(held, thread.thread_id).is_err(),
+            shared
+                .threads
+                .monitors
+                .exit(held, thread.thread_id)
+                .is_err(),
             "held exactly once: the resume must not have entered it again"
         );
     }
@@ -2913,7 +2913,11 @@ mod deopt_step3_tests {
             "the resume acquired the elided lock"
         );
         assert!(
-            shared.threads.monitors.exit(held, thread.thread_id).is_err(),
+            shared
+                .threads
+                .monitors
+                .exit(held, thread.thread_id)
+                .is_err(),
             "exactly once"
         );
     }

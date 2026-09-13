@@ -1355,9 +1355,7 @@ pub fn emit_jit_compile_decision_event(
         let event = EventInstance {
             type_id,
             start_time: decision.start_time_ns,
-            end_time: decision
-                .start_time_ns
-                .saturating_add(decision.duration_ns),
+            end_time: decision.start_time_ns.saturating_add(decision.duration_ns),
             thread_id: current_jfr_thread_id(),
             fields,
         };

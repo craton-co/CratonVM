@@ -1368,7 +1368,8 @@ pub fn any_class_redefined() -> bool {
 const JAVA_UTIL_BITMAP_WORDS: usize = 1 << 14; // 1 M class ids, 128 KiB
 #[allow(clippy::declare_interior_mutable_const)]
 const JAVA_UTIL_ZERO: AtomicU64 = AtomicU64::new(0);
-static JAVA_UTIL_CLASS_BITS: [AtomicU64; JAVA_UTIL_BITMAP_WORDS] = [JAVA_UTIL_ZERO; JAVA_UTIL_BITMAP_WORDS];
+static JAVA_UTIL_CLASS_BITS: [AtomicU64; JAVA_UTIL_BITMAP_WORDS] =
+    [JAVA_UTIL_ZERO; JAVA_UTIL_BITMAP_WORDS];
 
 /// Record that `id` names a `java/util/` class (no-op out of range).
 fn note_java_util_class(id: ClassId) {
@@ -5776,9 +5777,7 @@ impl ClassManager {
         if loader_flags().dbg_define {
             let hit = match loader_flags().dbg_dupclass_filter.as_deref() {
                 Some(f) => name.contains(f),
-                None => {
-                    name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass")
-                }
+                None => name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass"),
             };
             if hit {
                 eprintln!(
@@ -5788,8 +5787,11 @@ impl ClassManager {
                     bytes.len()
                 );
                 if loader_flags().dbg_dupclass_bt {
-                    eprintln!("[DEFINE-DBG-BT] {name}
-{}", std::backtrace::Backtrace::force_capture());
+                    eprintln!(
+                        "[DEFINE-DBG-BT] {name}
+{}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
                 }
             }
         }
@@ -13144,8 +13146,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             descriptor: cratonvm_types::intern_arc(d),
             attributes: vec![],
         };
-        let mut fields: Vec<ClassFileField> =
-            constants.iter().map(|c| mk(c, descriptor)).collect();
+        let mut fields: Vec<ClassFileField> = constants.iter().map(|c| mk(c, descriptor)).collect();
         fields.push(mk("$VALUES", &format!("[{descriptor}")));
         fields
     }
@@ -13523,12 +13524,18 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             named_field("lowerBounds", "[Ljava/lang/reflect/Type;"),
         ],
         "sun/reflect/generics/reflectiveObjects/TypeVariableImpl" => vec![
-            named_field("genericDeclaration", "Ljava/lang/reflect/GenericDeclaration;"),
+            named_field(
+                "genericDeclaration",
+                "Ljava/lang/reflect/GenericDeclaration;",
+            ),
             named_field("name", "Ljava/lang/String;"),
             named_field("bounds", "[Ljava/lang/Object;"),
         ],
         "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => {
-            vec![named_field("genericComponentType", "Ljava/lang/reflect/Type;")]
+            vec![named_field(
+                "genericComponentType",
+                "Ljava/lang/reflect/Type;",
+            )]
         }
         // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields
         // (data, size) -- `AL_FIELD_DATA`, `AL_FIELD_SIZE`, `AL_NUM_FIELDS = 2`
@@ -14559,7 +14566,10 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             vec![
                 named_field("override", "Z"),
                 named_field("accessCheckCache", "Ljava/lang/Object;"),
-                named_field("parameterData", "Ljava/lang/reflect/Executable$ParameterData;"),
+                named_field(
+                    "parameterData",
+                    "Ljava/lang/reflect/Executable$ParameterData;",
+                ),
                 named_field("declaredAnnotations", "Ljava/util/Map;"),
                 named_field("clazz", "Ljava/lang/Class;"),
                 named_field("slot", "I"),
@@ -14574,7 +14584,10 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/lang/reflect/Constructor" => vec![
             named_field("override", "Z"),
             named_field("accessCheckCache", "Ljava/lang/Object;"),
-            named_field("parameterData", "Ljava/lang/reflect/Executable$ParameterData;"),
+            named_field(
+                "parameterData",
+                "Ljava/lang/reflect/Executable$ParameterData;",
+            ),
             named_field("declaredAnnotations", "Ljava/util/Map;"),
             named_field("clazz", "Ljava/lang/Class;"),
             named_field("slot", "I"),
@@ -15540,13 +15553,25 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // the same table.
         "java/util/logging/LogManager" | "org/jboss/logmanager/LogManager" => vec![
             named_field("props", "Ljava/util/Properties;"),
-            named_field("systemContext", "Ljava/util/logging/LogManager$LoggerContext;"),
-            named_field("userContext", "Ljava/util/logging/LogManager$LoggerContext;"),
+            named_field(
+                "systemContext",
+                "Ljava/util/logging/LogManager$LoggerContext;",
+            ),
+            named_field(
+                "userContext",
+                "Ljava/util/logging/LogManager$LoggerContext;",
+            ),
             named_field("rootLogger", "Ljava/util/logging/Logger;"),
             named_field("readPrimordialConfiguration", "Z"),
             named_field("globalHandlersState", "I"),
-            named_field("configurationLock", "Ljava/util/concurrent/locks/ReentrantLock;"),
-            named_field("closeOnResetLoggers", "Ljava/util/concurrent/CopyOnWriteArrayList;"),
+            named_field(
+                "configurationLock",
+                "Ljava/util/concurrent/locks/ReentrantLock;",
+            ),
+            named_field(
+                "closeOnResetLoggers",
+                "Ljava/util/concurrent/CopyOnWriteArrayList;",
+            ),
             named_field("listeners", "Ljava/util/Map;"),
             named_field("initializedCalled", "Z"),
             named_field("initializationDone", "Z"),
@@ -19100,7 +19125,9 @@ mod tests {
 
         // An application exception `jdk_superclass` has never heard of keeps
         // the three this arm was written for.
-        assert!(!jdk_chain_reaches_throwable("com/example/app/WidgetException"));
+        assert!(!jdk_chain_reaches_throwable(
+            "com/example/app/WidgetException"
+        ));
         assert_eq!(
             synthetic_stub_total_field_count("com/example/app/WidgetException"),
             3

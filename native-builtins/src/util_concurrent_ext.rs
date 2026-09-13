@@ -525,14 +525,22 @@ fn native_atomic_long_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_atomic_long_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.set(long)")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicLong.set(long)",
+    )?;
     let val = args.get(1).copied().unwrap_or(Value::Long(0));
     ctx.set_field_volatile(this, 0, val);
     Ok(None)
 }
 
 fn native_atomic_long_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.getAndSet(long)")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicLong.getAndSet(long)",
+    )?;
     let new_val = args.get(1).copied().unwrap_or(Value::Long(0));
     loop {
         let current = ctx.get_field_volatile(this, 0);
@@ -543,7 +551,11 @@ fn native_atomic_long_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 fn native_atomic_long_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.compareAndSet(long, long)")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicLong.compareAndSet(long, long)",
+    )?;
     let expected = args.get(1).copied().unwrap_or(Value::Long(0));
     let new_val = args.get(2).copied().unwrap_or(Value::Long(0));
     let result = ctx.compare_and_swap_field(this, 0, expected, new_val);
@@ -557,7 +569,11 @@ fn native_atomic_long_get_and_increment(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.getAndIncrement()")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicLong.getAndIncrement()",
+    )?;
     let old = ctx.atomic_fetch_add_long(this, 0, 1)?;
     Ok(Some(Value::Long(old)))
 }
@@ -566,13 +582,21 @@ fn native_atomic_long_get_and_decrement(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.getAndDecrement()")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicLong.getAndDecrement()",
+    )?;
     let old = ctx.atomic_fetch_add_long(this, 0, -1)?;
     Ok(Some(Value::Long(old)))
 }
 
 fn native_atomic_long_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.getAndAdd(long)")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicLong.getAndAdd(long)",
+    )?;
     let delta = match args.get(1) {
         Some(Value::Long(d)) => *d,
         _ => 0,
@@ -585,7 +609,11 @@ fn native_atomic_long_increment_and_get(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.incrementAndGet()")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicLong.incrementAndGet()",
+    )?;
     let old = ctx.atomic_fetch_add_long(this, 0, 1)?;
     Ok(Some(Value::Long(old.wrapping_add(1))))
 }
@@ -594,13 +622,21 @@ fn native_atomic_long_decrement_and_get(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.decrementAndGet()")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicLong.decrementAndGet()",
+    )?;
     let old = ctx.atomic_fetch_add_long(this, 0, -1)?;
     Ok(Some(Value::Long(old.wrapping_sub(1))))
 }
 
 fn native_atomic_long_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.addAndGet(long)")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicLong.addAndGet(long)",
+    )?;
     let delta = match args.get(1) {
         Some(Value::Long(d)) => *d,
         _ => 0,
@@ -610,7 +646,11 @@ fn native_atomic_long_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 fn native_atomic_long_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.intValue()")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicLong.intValue()",
+    )?;
     let val = ctx.get_field_volatile(this, 0);
     match val {
         Value::Long(v) => Ok(Some(Value::Int(v as i32))),
@@ -685,7 +725,11 @@ fn native_atomic_ref_init_value(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_atomic_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicReference.get()")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicReference.get()",
+    )?;
     let val = ctx.get_field_volatile(this, 0);
     if crate::nbflags().dbg_loader_trace {
         if let Value::Object(Some(o)) = val {
@@ -708,14 +752,22 @@ fn native_atomic_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_atomic_ref_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicReference.set(Object)")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicReference.set(Object)",
+    )?;
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field_volatile(this, 0, val);
     Ok(None)
 }
 
 fn native_atomic_ref_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicReference.getAndSet(Object)")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicReference.getAndSet(Object)",
+    )?;
     let new_val = args.get(1).copied().unwrap_or(Value::Object(None));
     loop {
         let current = ctx.get_field_volatile(this, 0);
@@ -726,7 +778,11 @@ fn native_atomic_ref_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 fn native_atomic_ref_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicReference.toString()")?;
+    let this = atomic_receiver(
+        ctx,
+        args,
+        "java.util.concurrent.atomic.AtomicReference.toString()",
+    )?;
     let val = ctx.get_field_volatile(this, 0);
     let text = match val {
         Value::Object(Some(obj)) => crate::lang_string::invoke_to_string(ctx, obj)?,
@@ -1863,8 +1919,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.monitor_enter(this);
             let (mut old_arr, size) = cowal_read_state(ctx, this);
-            let new_arr =
-                cowal_pinned_new_array(ctx, size + 1, &mut this, &mut old_arr, &mut elem);
+            let new_arr = cowal_pinned_new_array(ctx, size + 1, &mut this, &mut old_arr, &mut elem);
             if let Some(old) = old_arr {
                 for i in 0..size {
                     ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -1930,8 +1985,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 .into());
             }
             let idx = raw_idx as usize;
-            let new_arr =
-                cowal_pinned_new_array(ctx, size + 1, &mut this, &mut old_arr, &mut elem);
+            let new_arr = cowal_pinned_new_array(ctx, size + 1, &mut this, &mut old_arr, &mut elem);
             if let Some(old) = old_arr {
                 for i in 0..idx.min(size) {
                     ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -3261,7 +3315,8 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 let new_keys_obj =
                     scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
                 let new_keys_h = scope.root(new_keys_obj);
-                let new_vals = scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+                let new_vals =
+                    scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
                 let new_keys = scope.get(&new_keys_h);
                 let keys_arr = scope.get(&keys_src_h);
                 let vals_arr = scope.get(&vals_src_h);

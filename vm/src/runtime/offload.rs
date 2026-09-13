@@ -564,8 +564,7 @@ impl OffloadCache {
                     let target = match cuda_bridge::driver_cuda_version() {
                         Ok(v) => {
                             let driver_isa = jit_cuda::target::max_isa_for_cuda_version(v);
-                            let clamped =
-                                jit_cuda::target::clamp_target_to_isa(probed, driver_isa);
+                            let clamped = jit_cuda::target::clamp_target_to_isa(probed, driver_isa);
                             if clamped != probed {
                                 tracing::warn!(
                                     "gpu offload: device {} is sm_{}{} but the installed                                      driver (CUDA {}.{}) only parses PTX ISA {}.{}; lowering                                      for sm_{}{} instead",
@@ -697,7 +696,12 @@ impl OffloadCache {
         // A read first: the common case is an empty streak, and taking the
         // write lock on every offloaded dispatch would be a cost on the path
         // this whole feature exists to make fast.
-        if self.min_work_streak.read().get(&site).is_none_or(|n| *n == 0) {
+        if self
+            .min_work_streak
+            .read()
+            .get(&site)
+            .is_none_or(|n| *n == 0)
+        {
             return;
         }
         self.min_work_streak.write().insert(site, 0);
@@ -815,7 +819,10 @@ impl OffloadCache {
             }
         }
         let graph_handle = self.replay_binding_on(stream)?;
-        graphs().read().get(&graph_handle).and_then(|g| g.flag.clone())
+        graphs()
+            .read()
+            .get(&graph_handle)
+            .and_then(|g| g.flag.clone())
     }
 
     /// Stop recording, instantiate, and register the result.
@@ -1696,10 +1703,7 @@ pub fn try_dispatch(
                 kernel.signature.is_reduction && method_descriptor.ends_with(")J");
             if !is_void && !is_int_reduction && !is_long_reduction {
                 if timed {
-                    cratonvm_types::gpu_refusal_census::add(
-                        2,
-                        mark.elapsed().as_nanos() as u64,
-                    );
+                    cratonvm_types::gpu_refusal_census::add(2, mark.elapsed().as_nanos() as u64);
                 }
                 refuse!(3, DispatchOutcome::FallThrough);
             }
@@ -1736,19 +1740,11 @@ pub fn try_dispatch(
             // result off it directly. See `Completion::Caller`.
             if timed {
                 cratonvm_types::gpu_offload_phase_census::note_call();
-                cratonvm_types::gpu_offload_phase_census::add(
-                    2,
-                    mark.elapsed().as_nanos() as u64,
-                );
+                cratonvm_types::gpu_offload_phase_census::add(2, mark.elapsed().as_nanos() as u64);
                 mark = std::time::Instant::now();
             }
-            let submission = dispatch_method_sync(
-                shared,
-                class_name,
-                method_name,
-                method_descriptor,
-                args,
-            );
+            let submission =
+                dispatch_method_sync(shared, class_name, method_name, method_descriptor, args);
             let dispatch_ns = if timed {
                 let n = mark.elapsed().as_nanos() as u64;
                 mark = std::time::Instant::now();
@@ -2827,7 +2823,13 @@ impl GcCriticalGuard {
     ) -> Self {
         use cuda_bridge::critical::{default_token_lease, global, OwnerId, Registry};
         let owner = OwnerId::current(vm, submission, site);
-        let token = Registry::acquire_with(global(), owner, default_token_lease(), relocation, keepalive);
+        let token = Registry::acquire_with(
+            global(),
+            owner,
+            default_token_lease(),
+            relocation,
+            keepalive,
+        );
         Self { token }
     }
 
@@ -3033,9 +3035,7 @@ impl OffloadCache {
     /// contend for ordering (a chunked writeback belongs to one
     /// bytecode dispatch, which has already been given its own stream).
     fn default_internal_stream(&self) -> Result<std::sync::Arc<Stream>, cuda_bridge::DeviceError> {
-        let ctx = self
-            .device()
-            .ok_or(cuda_bridge::DeviceError::NoDriver)?;
+        let ctx = self.device().ok_or(cuda_bridge::DeviceError::NoDriver)?;
         if let Some(s) = self.chunk_stream_pool(ctx).first() {
             return Ok(std::sync::Arc::clone(s));
         }
@@ -3339,8 +3339,7 @@ impl OffloadCache {
         //     completion event, the submission-table entry and the host
         //     callback, exactly as in a capture.
         if let Some(graph_handle) = self.replay_binding_on(&stream) {
-            if let Err(reason) =
-                self.update_next_node(graph_handle, class_id, method_index, &args)
+            if let Err(reason) = self.update_next_node(graph_handle, class_id, method_index, &args)
             {
                 return make(SubmissionStatus::Failed {
                     message: format!("graph argument update refused: {reason}"),
@@ -3783,21 +3782,13 @@ pub fn dispatch_gemm(
             let a = match resident_f32(ctx, a_handle, a_elems, "A") {
                 Ok(b) => b,
                 Err(e) => {
-                    return record_failed_submission(
-                        Some(stream),
-                        kind_of_device_message(&e),
-                        e,
-                    )
+                    return record_failed_submission(Some(stream), kind_of_device_message(&e), e)
                 }
             };
             let b = match resident_f32(ctx, b_handle, b_elems, "B") {
                 Ok(b) => b,
                 Err(e) => {
-                    return record_failed_submission(
-                        Some(stream),
-                        kind_of_device_message(&e),
-                        e,
-                    )
+                    return record_failed_submission(Some(stream), kind_of_device_message(&e), e)
                 }
             };
             let args = kernels::gemm_args(&*a, &*b, &*c_buf, m, n, k, a_strides, b_strides);
@@ -3810,21 +3801,13 @@ pub fn dispatch_gemm(
             let a = match resident_i16(ctx, a_handle, a_elems, "A") {
                 Ok(b) => b,
                 Err(e) => {
-                    return record_failed_submission(
-                        Some(stream),
-                        kind_of_device_message(&e),
-                        e,
-                    )
+                    return record_failed_submission(Some(stream), kind_of_device_message(&e), e)
                 }
             };
             let b = match resident_i16(ctx, b_handle, b_elems, "B") {
                 Ok(b) => b,
                 Err(e) => {
-                    return record_failed_submission(
-                        Some(stream),
-                        kind_of_device_message(&e),
-                        e,
-                    )
+                    return record_failed_submission(Some(stream), kind_of_device_message(&e), e)
                 }
             };
             let args = kernels::gemm_args(&*a, &*b, &*c_buf, m, n, k, a_strides, b_strides);
@@ -5195,7 +5178,9 @@ fn dispatch_method_inner(
                 // the DeviceBuffer in the resident state so this
                 // path skips the H→D copy when the bytes haven't
                 // changed since the previous kernel.
-                if let Some((etype, len, arr_handle)) = try_gpu_array_shape(shared, &cache, *obj_ref) {
+                if let Some((etype, len, arr_handle)) =
+                    try_gpu_array_shape(shared, &cache, *obj_ref)
+                {
                     match marshal_resident_array_arg(ctx, etype, len, arr_handle) {
                         Ok((args_after, wb)) => {
                             kernel_args = args_after(kernel_args);
@@ -6656,9 +6641,7 @@ pub(crate) mod input_cache {
         if removed {
             rebuild_filter(tables);
         }
-        cratonvm_types::gpu_jit_gate_census::note_compiled_write_drain(
-            buckets.count_ones() as u64,
-        );
+        cratonvm_types::gpu_jit_gate_census::note_compiled_write_drain(buckets.count_ones() as u64);
     }
 
     fn map() -> &'static Mutex<FxHashMap<usize, FxHashMap<ObjectRef, Entry>>> {
@@ -8536,7 +8519,7 @@ fn marshal_array_arg(
             );
             return Err(format!(
                 "submitMethod: unsupported array element type: {other:?}"
-            ))
+            ));
         }
     };
     Ok((push, wb, bytes_uploaded))
@@ -8580,11 +8563,11 @@ mod marshaller_analyzer_agreement {
         ];
         for (component, elem) in cases {
             let array_ty = FieldType::Array(Box::new(component.clone()));
-            let analyzer_admits =
-                ParamKind::from_field(&array_ty).is_some_and(ParamKind::is_array);
+            let analyzer_admits = ParamKind::from_field(&array_ty).is_some_and(ParamKind::is_array);
             let marshaller_admits = is_marshallable_array_element(elem);
             assert_eq!(
-                analyzer_admits, marshaller_admits,
+                analyzer_admits,
+                marshaller_admits,
                 concat!(
                     "{:?}[]: the analyzer {} it but the marshaller ",
                     "{} it. Analyzer-admits/marshaller-refuses is the SILENT ",
@@ -8594,7 +8577,11 @@ mod marshaller_analyzer_agreement {
                 ),
                 component,
                 if analyzer_admits { "admits" } else { "rejects" },
-                if marshaller_admits { "accepts" } else { "refuses" },
+                if marshaller_admits {
+                    "accepts"
+                } else {
+                    "refuses"
+                },
             );
         }
     }
@@ -8614,12 +8601,16 @@ mod marshaller_analyzer_agreement {
             ArrayElementType::Char,
             ArrayElementType::Boolean,
         ] {
-            assert!(is_marshallable_array_element(t), "{t:?} must be marshallable");
+            assert!(
+                is_marshallable_array_element(t),
+                "{t:?} must be marshallable"
+            );
         }
-        for t in [
-            ArrayElementType::Reference,
-        ] {
-            assert!(!is_marshallable_array_element(t), "{t:?} must not be marshallable");
+        for t in [ArrayElementType::Reference] {
+            assert!(
+                !is_marshallable_array_element(t),
+                "{t:?} must not be marshallable"
+            );
         }
     }
 }

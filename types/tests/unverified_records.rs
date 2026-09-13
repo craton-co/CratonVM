@@ -91,10 +91,7 @@ const UNVERIFIED_MARKERS: &[&str] = &[
 /// binary, and any unverified phrasing left in it is history — every one of the
 /// four records repaired on 2026-09-01 QUOTES its old status so the reader can
 /// see what changed, and that quotation must not re-trip this test.
-const DISCHARGE_MARKERS: &[&str] = &[
-    "VERIFIED AGAINST A BINARY",
-    "Verified against a binary",
-];
+const DISCHARGE_MARKERS: &[&str] = &["VERIFIED AGAINST A BINARY", "Verified against a binary"];
 
 /// Records whose own status block says they have never met a binary.
 ///
@@ -161,8 +158,7 @@ const DISCHARGE_MARKERS: &[&str] = &[
 /// the real path and look like evidence. `W7-24` is the opposite — its own
 /// reproduce line is `--jdk-only`. Read the record for its arm; do not assume
 /// the neighbour's.
-const ALLOWED: &[(&str, &str)] = &[
-];
+const ALLOWED: &[(&str, &str)] = &[];
 
 /// The walk must see at least this many pages, or it is broken rather than the
 /// tree being clean. Without this a mistyped path passes silently — the
@@ -222,7 +218,10 @@ fn unverified_marker(text: &str) -> Option<&'static str> {
         })
         .find_map(|l| {
             let lower = l.to_ascii_lowercase();
-            UNVERIFIED_MARKERS.iter().copied().find(|m| lower.contains(*m))
+            UNVERIFIED_MARKERS
+                .iter()
+                .copied()
+                .find(|m| lower.contains(*m))
         })
 }
 

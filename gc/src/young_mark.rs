@@ -689,9 +689,20 @@ mod tests {
         // several within one word, and revisits in DESCENDING order to prove
         // the cursor does not assume ascending input.
         let addrs: Vec<usize> = vec![
-            BASE, BASE + 8, BASE + 16, BASE + 504, BASE + 512, BASE + 520,
-            BASE + 1024, BASE + 1032, BASE + 2040, BASE + 2048, BASE + 4088,
-            BASE + 512, BASE + 8, BASE + 3000,
+            BASE,
+            BASE + 8,
+            BASE + 16,
+            BASE + 504,
+            BASE + 512,
+            BASE + 520,
+            BASE + 1024,
+            BASE + 1032,
+            BASE + 2040,
+            BASE + 2048,
+            BASE + 4088,
+            BASE + 512,
+            BASE + 8,
+            BASE + 3000,
         ];
 
         let direct = ObjectStartBits::new(BASE, SPAN);

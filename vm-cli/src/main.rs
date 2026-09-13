@@ -605,9 +605,7 @@ bytes-saved={saved}"
                 }
             }
             let (gated, declined) = cratonvm_jit::x64::ref_store_site_counts();
-            eprintln!(
-                "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
-            );
+            eprintln!("[cratonvm] compiled reference stores: gated={gated} declined={declined}");
             // What the DECLINED sites cost, only under the trace. Printed
             // separately from the gated pair because it is the number that was
             // missing: `declined=N` with no execution line reads exactly like a
@@ -691,7 +689,9 @@ fresh-ctor={fresh_ctor} body={body}"
             // opt-in, so no method containing a `new` reaches that tier -- and
             // printing both is what separates that from "emitted and refused".
             let (bump, stub) = cratonvm_jit::runtime_lowering::ir_alloc_site_counts();
-            eprintln!("[cratonvm] optimizing-tier allocations: inline-bump={bump} stub-only={stub}");
+            eprintln!(
+                "[cratonvm] optimizing-tier allocations: inline-bump={bump} stub-only={stub}"
+            );
             // getfield receiver null checks. The PAIR, never the ratio: an
             // all-zero pair means the trusted-oop arm was never reached at all
             // (no inline getfield compiled), while zero-elided-with-nonzero-
@@ -715,8 +715,7 @@ fresh-ctor={fresh_ctor} body={body}"
             // into the single-pass pair above: the two tiers prove the fact by
             // different routes, and folding them would hide a tier that had
             // stopped proving it at all.
-            let (ir_seed, ir_el, ir_em) =
-                cratonvm_jit::metrics::ir_receiver_null_check_counts();
+            let (ir_seed, ir_el, ir_em) = cratonvm_jit::metrics::ir_receiver_null_check_counts();
             eprintln!(
                 "[cratonvm] optimizing-tier receiver null checks: seeded={ir_seed} \
                  elided={ir_el} emitted={ir_em}"
@@ -4785,8 +4784,8 @@ fn run() -> Result<()> {
     // starts with the heap it was told it may have — and a Surefire fork with a
     // stale `-Xms` is exactly the case this has to survive.
     if let Some(initial) = &args.initial_heap {
-        let size = parse_size(initial)
-            .with_context(|| format!("Invalid initial heap size: {initial}"))?;
+        let size =
+            parse_size(initial).with_context(|| format!("Invalid initial heap size: {initial}"))?;
         let clamped = size.min(config.max_heap_size);
         if clamped != size && args.verbose_gc {
             eprintln!(
@@ -6131,8 +6130,7 @@ fn run() -> Result<()> {
             // still send through it, and a bind that moved nothing looks
             // exactly like a bind that was never reached unless both are
             // printed.
-            let (cd_served, cd_declined) =
-                cratonvm_vm::jit::helpers::varhandle_cas_direct_counts();
+            let (cd_served, cd_declined) = cratonvm_vm::jit::helpers::varhandle_cas_direct_counts();
             let (cd_sp, cd_osr) = cratonvm_jit::varhandle_cas_direct_helper_sites();
             eprintln!(
                 "[cratonvm] VarHandle CAS thin direct calls: served={cd_served} declined={cd_declined}                  (sites: singlepass={cd_sp} osr={cd_osr})",
@@ -6314,10 +6312,8 @@ fn run() -> Result<()> {
             let resig = cratonvm_vm::jit::xt_root_scan::XT_PEER_RESIGNALS.load(O::Relaxed);
             let saved =
                 cratonvm_vm::jit::xt_root_scan::XT_PEERS_CLASSIFIED_AFTER_RETRY.load(O::Relaxed);
-            let hw_pin =
-                cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_PINNED.load(O::Relaxed);
-            let hw_ref =
-                cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_REFUSED.load(O::Relaxed);
+            let hw_pin = cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_PINNED.load(O::Relaxed);
+            let hw_ref = cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_REFUSED.load(O::Relaxed);
             eprintln!(
                 "[GC] xt_peer_scan: unclassified_peers={peers} cycles_with_unclassified={cycles} \
                  taken_over={taken} xt_roots={roots} helper_windows={hw} hw_pinned={hw_pin} hw_refused={hw_ref} \
@@ -6355,10 +6351,9 @@ discarded={bs_d} dropped={bs_x} unrouted={bs_u} enabled={bs_on}"
                     cratonvm_vm::jit::conservative_roots::jit_vacated_frame_census();
                 if jv_n > 0 {
                     let mut per = String::new();
-                    for (i, name) in
-                        cratonvm_vm::jit::conservative_roots::JIT_VACATED_REGION_NAMES
-                            .iter()
-                            .enumerate()
+                    for (i, name) in cratonvm_vm::jit::conservative_roots::JIT_VACATED_REGION_NAMES
+                        .iter()
+                        .enumerate()
                     {
                         if jv_per[i] > 0 {
                             per.push_str(&format!(" {name}={}", jv_per[i]));
@@ -6400,8 +6395,8 @@ with_ref_hoist_span={fl_rh} with_arith_span={fl_ar}"
                 "[GC] root_remap_audit: cycles={rra_c} roots_rescanned={rra_r} \
                  moved_entries={rra_m} UNREMAPPED={rra_u}"
             );
-            let sfw_f = cratonvm_vm::jit::conservative_roots::stale_frame_audit::FRAMES
-                .load(O::Relaxed);
+            let sfw_f =
+                cratonvm_vm::jit::conservative_roots::stale_frame_audit::FRAMES.load(O::Relaxed);
             let sfw_s =
                 cratonvm_vm::jit::conservative_roots::stale_frame_audit::STALE.load(O::Relaxed);
             let sfw_u = cratonvm_vm::jit::conservative_roots::stale_frame_audit::STALE_UNMODELLED
@@ -6412,21 +6407,20 @@ with_ref_hoist_span={fl_rh} with_arith_span={fl_ar}"
             );
             // Unnamed-frame-ref pins: objects a compiled frame named in a slot
             // its oop maps do not. FRAMES is the denominator.
-            let urp_f = cratonvm_vm::jit::conservative_roots::unnamed_ref_pins::FRAMES
+            let urp_f =
+                cratonvm_vm::jit::conservative_roots::unnamed_ref_pins::FRAMES.load(O::Relaxed);
+            let urp_p =
+                cratonvm_vm::jit::conservative_roots::unnamed_ref_pins::PINNED.load(O::Relaxed);
+            let urp_d = cratonvm_vm::jit::conservative_roots::unnamed_ref_pins::DUPLICATE_OF_MAPPED
                 .load(O::Relaxed);
-            let urp_p = cratonvm_vm::jit::conservative_roots::unnamed_ref_pins::PINNED
-                .load(O::Relaxed);
-            let urp_d =
-                cratonvm_vm::jit::conservative_roots::unnamed_ref_pins::DUPLICATE_OF_MAPPED
-                    .load(O::Relaxed);
             eprintln!(
                 "[GC] unnamed_frame_ref_pins: frames={urp_f} pinned={urp_p}                  duplicate_of_mapped={urp_d} enabled={}",
                 cratonvm_vm::jit::conservative_roots::pin_unnamed_frame_refs_enabled(),
             );
             // Unmapped-duplicate remap: words no oop map named that still held
             // a moved address after the precise remap. FRAMES is the denominator.
-            let udr_f = cratonvm_vm::jit::conservative_roots::unmapped_dupe_remap::FRAMES
-                .load(O::Relaxed);
+            let udr_f =
+                cratonvm_vm::jit::conservative_roots::unmapped_dupe_remap::FRAMES.load(O::Relaxed);
             let udr_r = cratonvm_vm::jit::conservative_roots::unmapped_dupe_remap::REWRITTEN
                 .load(O::Relaxed);
             eprintln!(
@@ -7560,8 +7554,7 @@ fn main() {
         // about the first. See
         // `hibernate-reactive-double-panic-abort-FIXED-20260901` and
         // `crash_handler::current_thread_name`.
-        let thread_name_owned =
-            cratonvm_vm::runtime::crash_handler::current_thread_name();
+        let thread_name_owned = cratonvm_vm::runtime::crash_handler::current_thread_name();
         let thread_name = thread_name_owned.as_deref().unwrap_or("<unnamed>");
 
         // Is this thread's thread-local storage still usable?
@@ -9361,7 +9354,11 @@ mod diff_hotspot {
             } else {
                 (&c_err, &h_err)
             };
-            let stream = if out_diff.is_some() { "stdout" } else { "stderr" };
+            let stream = if out_diff.is_some() {
+                "stdout"
+            } else {
+                "stderr"
+            };
             let rules = relax_line(&at(c, idx)).1;
             let rule_list = if rules.is_empty() {
                 "masked".to_string()

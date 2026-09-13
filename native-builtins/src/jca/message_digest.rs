@@ -544,9 +544,7 @@ fn md_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => {
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some(
-                    "Cannot read the array length because \"input\" is null".to_string(),
-                ),
+                message: Some("Cannot read the array length because \"input\" is null".to_string()),
             }
             .into())
         }
@@ -630,9 +628,7 @@ fn md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             return Err(crate::phases_early::throw_jca_exc(
                 ctx,
                 "java/lang/ArrayIndexOutOfBoundsException",
-                &format!(
-                    "Range [{off_i}, {off_i} + {len_i}) out of bounds for length {total}"
-                ),
+                &format!("Range [{off_i}, {off_i} + {len_i}) out of bounds for length {total}"),
             ));
         }
         return Err(RuntimeError::IllegalArgumentException {
@@ -667,10 +663,9 @@ fn md_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let buf = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
     };
     let rem = match ctx.invoke_virtual(buf, "remaining", "()I", &[])? {
@@ -744,9 +739,7 @@ fn md_digest_input(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => {
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some(
-                    "Cannot read the array length because \"input\" is null".to_string(),
-                ),
+                message: Some("Cannot read the array length because \"input\" is null".to_string()),
             }
             .into())
         }

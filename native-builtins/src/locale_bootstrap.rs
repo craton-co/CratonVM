@@ -480,7 +480,10 @@ fn append_locale_variant(tag: &mut String, variant: &str) -> String {
         s.bytes().all(|b| b.is_ascii_alphanumeric())
             && ((5..=8).contains(&n) || (n == 4 && s.as_bytes()[0].is_ascii_digit()))
     };
-    let split = subs.iter().position(|s| !well_formed(s)).unwrap_or(subs.len());
+    let split = subs
+        .iter()
+        .position(|s| !well_formed(s))
+        .unwrap_or(subs.len());
     for sub in &subs[..split] {
         tag.push('-');
         tag.push_str(sub);
@@ -2089,12 +2092,17 @@ mod locale_service_provider_delegation_tests {
     ///
     /// These are mock tests because the defect is invisible on a JDK 25 image,
     /// and a JDK 25 image is what CI has.
-    fn adapter_and_spi_mirror(ctx: &mut MockNativeContext, spi_class: &str) -> (ObjectRef, ObjectRef) {
+    fn adapter_and_spi_mirror(
+        ctx: &mut MockNativeContext,
+        spi_class: &str,
+    ) -> (ObjectRef, ObjectRef) {
         let adapter_cid = ctx
             .ensure_class_initialized("sun/util/locale/provider/CLDRLocaleProviderAdapter")
             .expect("declare adapter");
         let adapter = ctx.alloc_object(adapter_cid, 0);
-        let spi_cid = ctx.ensure_class_initialized(spi_class).expect("declare spi");
+        let spi_cid = ctx
+            .ensure_class_initialized(spi_class)
+            .expect("declare spi");
         let mirror = ctx.get_class_mirror(spi_cid);
         (adapter, mirror)
     }
@@ -2267,10 +2275,12 @@ mod locale_service_provider_delegation_tests {
             _args: &[Value],
         ) -> Option<MethodCallResult> {
             if method_name == "getDecimalFormatSymbolsProvider" {
-                Some(Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
-                    message: "the resource-bundle chain is unavailable".to_string(),
-                }
-                .into()))
+                Some(Err(
+                    cratonvm_types::error::RuntimeError::IllegalAccessException {
+                        message: "the resource-bundle chain is unavailable".to_string(),
+                    }
+                    .into(),
+                ))
             } else {
                 None
             }

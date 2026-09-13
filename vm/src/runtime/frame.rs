@@ -775,8 +775,7 @@ fn note_dead_arg(args: &[Value], site: &'static str) {
     }
     for (i, a) in args.iter().enumerate() {
         let Value::Object(Some(o)) = a else { continue };
-        let Some(reason) =
-            cratonvm_gc::gen_heap::dead_young_ref_reason_global(o.as_ptr() as usize)
+        let Some(reason) = cratonvm_gc::gen_heap::dead_young_ref_reason_global(o.as_ptr() as usize)
         else {
             continue;
         };
@@ -1000,7 +999,9 @@ fn build_cached_compact_parts(
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *ON.get_or_init(|| cratonvm_types::flags().gc.dbg_deadref_store) {
             for (i, (cv, _)) in args.iter().enumerate() {
-                let Some(p) = cv.as_object_ptr() else { continue };
+                let Some(p) = cv.as_object_ptr() else {
+                    continue;
+                };
                 let Some(reason) = cratonvm_gc::gen_heap::dead_young_ref_reason_global(p as usize)
                 else {
                     continue;
@@ -1050,7 +1051,6 @@ fn build_cached_compact_parts(
         eff_max_locals,
     }
 }
-
 
 /// [`build_cached_compact_parts`] for arguments that are still `Value`s.
 ///
@@ -1519,7 +1519,6 @@ impl Frame {
 
         self.reset_cached_tail(cached, eff_max_locals);
     }
-
 
     /// A `Frame` from pieces [`build_cached_compact_parts`] produced.
     #[inline]
@@ -3207,7 +3206,6 @@ impl FrameStack {
         self.depth += 1;
         true
     }
-
 
     /// Build a frame for `cached` **in** the stack's next slot.
     ///

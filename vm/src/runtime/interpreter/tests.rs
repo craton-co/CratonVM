@@ -5371,9 +5371,12 @@ fn declared_cfg_test(parent_src: &str, stem: &str) -> bool {
 #[test]
 fn the_cfg_test_classifier_reads_the_whole_attribute_run() {
     // The plain form.
-    assert!(declared_cfg_test("#[cfg(test)]
+    assert!(declared_cfg_test(
+        "#[cfg(test)]
 mod tests;
-", "tests"));
+",
+        "tests"
+    ));
     // The form `jit/src/x64.rs` actually uses: test-only AND x86-64-only, with
     // the reason for the second attribute written between them.
     assert!(declared_cfg_test(
@@ -5393,8 +5396,11 @@ mod tests;
         "tests"
     ));
     // A production module is still production.
-    assert!(!declared_cfg_test("mod isel;
-", "isel"));
+    assert!(!declared_cfg_test(
+        "mod isel;
+",
+        "isel"
+    ));
     assert!(!declared_cfg_test(
         "#[cfg(target_arch = \"x86_64\")]
 mod simd;

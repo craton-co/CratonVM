@@ -1981,9 +1981,9 @@ fn zip_entry_err(
 /// answers it without ever consulting the double's overrides.
 macro_rules! uc_subclass_guard {
     ($ctx:expr, $args:expr, $name:literal, $desc:literal) => {
-        if let Some(forwarded) = crate::http_url_connection::subclass_runs_its_own_bytecode(
-            $ctx, $args, $name, $desc,
-        ) {
+        if let Some(forwarded) =
+            crate::http_url_connection::subclass_runs_its_own_bytecode($ctx, $args, $name, $desc)
+        {
             return forwarded;
         }
     };
@@ -17925,7 +17925,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         // argument" said the same thing in words no JDK ever prints.
         let Some(Value::Object(Some(pkt))) = args.get(1).copied() else {
             return Err(npe(
-                "Cannot enter synchronized block because \"p\" is null".to_string(),
+                "Cannot enter synchronized block because \"p\" is null".to_string()
             ));
         };
         ds_require_not_closed(ctx, this)?;
@@ -20003,7 +20003,12 @@ fn request_queue_ready() -> &'static parking_lot::Condvar {
 /// queue under the same lock, so a request can never be parked behind a
 /// dispatcher that has already exited. Dropping it drops its `reply` sender,
 /// which is what releases the connection thread waiting on it.
-fn re10_enqueue(server_id: i32, state: &ServerState, pending: PendingRequest, drop_if_stopped: bool) {
+fn re10_enqueue(
+    server_id: i32,
+    state: &ServerState,
+    pending: PendingRequest,
+    drop_if_stopped: bool,
+) {
     let mut q = request_queue().lock();
     if drop_if_stopped && !state.running.load(Ordering::SeqCst) {
         return;
@@ -20058,7 +20063,9 @@ fn http_chunked_request_len(data: &[u8]) -> Option<usize> {
         if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
-        let n = usize::from_str_radix(size, 16).ok().filter(|&n| n <= MAX_CHUNK)?;
+        let n = usize::from_str_radix(size, 16)
+            .ok()
+            .filter(|&n| n <= MAX_CHUNK)?;
         pos += nl + 2;
         if n == 0 {
             loop {
@@ -20818,8 +20825,13 @@ fn re10_dispatch_pending(
             let mut q = request_queue().lock();
             // FIFO. `pop()` served the NEWEST request first, so under a burst
             // the oldest waiter was the last one answered.
-            q.get_mut(&server_id)
-                .and_then(|v| if v.is_empty() { None } else { Some(v.remove(0)) })
+            q.get_mut(&server_id).and_then(|v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            })
         };
         let Some(req) = req_opt else { break };
         drained += 1;
@@ -21192,7 +21204,11 @@ fn re10_lingering_close(mut stream: TcpStream) {
 /// a request asking for `Connection: close` (lingering close, as the one-shot
 /// path does), a malformed request (already answered by the parser), or
 /// `stop()` shutting the socket.
-fn re10_serve_connection(server_id: i32, state: std::sync::Arc<ServerState>, mut stream: TcpStream) {
+fn re10_serve_connection(
+    server_id: i32,
+    state: std::sync::Arc<ServerState>,
+    mut stream: TcpStream,
+) {
     let local = stream.local_addr().ok();
     let peer = stream.peer_addr().ok();
     let conn_id = state.next_conn.fetch_add(1, Ordering::Relaxed);
@@ -21237,7 +21253,11 @@ fn re10_serve_connection(server_id: i32, state: std::sync::Arc<ServerState>, mut
         let Ok(bytes) = response.recv() else {
             break false;
         };
-        if stream.write_all(&bytes).and_then(|()| stream.flush()).is_err() {
+        if stream
+            .write_all(&bytes)
+            .and_then(|()| stream.flush())
+            .is_err()
+        {
             break false;
         }
         if !persistent {
@@ -24007,10 +24027,18 @@ mod tests {
     fn re10_connection_close_and_http10_requests_are_not_persistent() {
         let (mut stream, client) =
             re10_pipelined(b"GET /a HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n");
-        assert!(!parse_http_request_core(&mut stream, Vec::new(), false, true).unwrap().persistent);
+        assert!(
+            !parse_http_request_core(&mut stream, Vec::new(), false, true)
+                .unwrap()
+                .persistent
+        );
         drop(client.join());
         let (mut stream, client) = re10_pipelined(b"GET /a HTTP/1.0\r\n\r\n");
-        assert!(!parse_http_request_core(&mut stream, Vec::new(), false, true).unwrap().persistent);
+        assert!(
+            !parse_http_request_core(&mut stream, Vec::new(), false, true)
+                .unwrap()
+                .persistent
+        );
         drop(client.join());
     }
 
@@ -24020,7 +24048,10 @@ mod tests {
         // "3\r\n" + "abc\r\n" + "0\r\n" + "\r\n" = 3 + 5 + 3 + 2
         assert_eq!(http_chunked_request_len(b"3\r\nabc\r\n0\r\n\r\n"), Some(13));
         // "0\r\n" + "X-T: 1\r\n" + "\r\n" = 3 + 8 + 2; "NEXT" is the next request
-        assert_eq!(http_chunked_request_len(b"0\r\nX-T: 1\r\n\r\nNEXT"), Some(13));
+        assert_eq!(
+            http_chunked_request_len(b"0\r\nX-T: 1\r\n\r\nNEXT"),
+            Some(13)
+        );
         assert_eq!(http_chunked_request_len(b"zz\r\n"), None);
     }
 

@@ -247,7 +247,10 @@ mod tests {
     fn a_large_requested_backlog_queues_more_than_std_would() {
         let listener = bind_tcp_listener("127.0.0.1:0".parse().unwrap(), 1024).unwrap();
         let queued = queued_without_accept(&listener, 180);
-        assert!(queued > STD_BACKLOG as usize, "only {queued} queued with backlog 1024");
+        assert!(
+            queued > STD_BACKLOG as usize,
+            "only {queued} queued with backlog 1024"
+        );
     }
 
     #[test]
@@ -263,7 +266,10 @@ mod tests {
         let listener: TcpListener = socket.into();
         listen_existing(&listener, 1024).unwrap();
         let queued = queued_without_accept(&listener, 180);
-        assert!(queued > STD_BACKLOG as usize, "only {queued} queued after deferred listen");
+        assert!(
+            queued > STD_BACKLOG as usize,
+            "only {queued} queued after deferred listen"
+        );
     }
 
     #[test]

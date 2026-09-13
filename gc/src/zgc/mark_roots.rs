@@ -146,7 +146,10 @@ impl std::fmt::Debug for ZMarkRootFilter {
             .field("armed", &self.armed.load(Ordering::Relaxed))
             .field("any_class", &self.any_class.load(Ordering::Relaxed))
             .field("any_addr", &self.any_addr.load(Ordering::Relaxed))
-            .field("class_overflow", &self.class_overflow.load(Ordering::Relaxed))
+            .field(
+                "class_overflow",
+                &self.class_overflow.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -304,7 +307,10 @@ mod tests {
         // pass. Built from the same accessors the rebuild reads, so this also
         // catches an accessor that stops reporting a table.
         for addr in cratonvm_types::mirror_pin::pinned_owner_addrs() {
-            assert!(filter.may_own_extra_roots(addr), "mirror owner {addr:#x} rejected");
+            assert!(
+                filter.may_own_extra_roots(addr),
+                "mirror owner {addr:#x} rejected"
+            );
         }
         if let Some(metadata) = cratonvm_types::metadata_pin::snapshot() {
             for owner in metadata.keys() {

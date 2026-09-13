@@ -958,10 +958,22 @@ mod tests {
     #[test]
     fn admissions_nest() {
         let _guard = COUNTER_LOCK.lock();
-        let outer = admit(NO_ID, &unique("nest-outer"), "m", "()V", CompileDoor::MethodEntry)
-            .expect("admits");
-        let inner = admit(NO_ID, &unique("nest-inner"), "m", "()V", CompileDoor::MethodEntry)
-            .expect("admits");
+        let outer = admit(
+            NO_ID,
+            &unique("nest-outer"),
+            "m",
+            "()V",
+            CompileDoor::MethodEntry,
+        )
+        .expect("admits");
+        let inner = admit(
+            NO_ID,
+            &unique("nest-inner"),
+            "m",
+            "()V",
+            CompileDoor::MethodEntry,
+        )
+        .expect("admits");
         drop(inner);
         assert!(
             admission_is_open(),
@@ -1135,8 +1147,14 @@ mod tests {
         let _guard = COUNTER_LOCK.lock();
         let before = undeclared_direct_bind_rows(CompileDoor::Osr);
 
-        let a = admit(NO_ID, &unique("rows-undeclared"), "m", "()V", CompileDoor::Osr)
-            .expect("admits");
+        let a = admit(
+            NO_ID,
+            &unique("rows-undeclared"),
+            "m",
+            "()V",
+            CompileDoor::Osr,
+        )
+        .expect("admits");
         note_direct_binds(&a, 7);
         assert_eq!(
             undeclared_direct_bind_rows(CompileDoor::Osr),

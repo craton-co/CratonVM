@@ -643,7 +643,10 @@ fn value_blocks_resume(v: &FrameValue) -> bool {
     match v {
         FrameValue::Unsupported | FrameValue::MaterializationRequired(_) => true,
         FrameValue::VirtualObject(state) => {
-            state.field_values.iter().any(contains_materialization_required)
+            state
+                .field_values
+                .iter()
+                .any(contains_materialization_required)
                 || names_unspilled_register(v)
         }
         other => names_unspilled_register(other),
@@ -3001,11 +3004,9 @@ fn count_materialization_required_in(v: &FrameValue) -> usize {
 /// [`hash_monitors`].
 fn monitors_eq(a: &[MonitorInfo], b: &[MonitorInfo]) -> bool {
     a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| {
-                x.lock_depth == y.lock_depth && x.relock == y.relock && x.object == y.object
-            })
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.lock_depth == y.lock_depth && x.relock == y.relock && x.object == y.object
+        })
 }
 
 /// Content-addressed store for immutable frame states.
@@ -8166,8 +8167,14 @@ mod frame_state_interning_tests {
     /// `Unsupported`), so resumability refuses it up front (review #88).
     #[test]
     fn a_register_past_the_spilled_files_blocks_the_resume() {
-        assert_eq!(SavedRegisters::default().gpr.len(), SPILLED_REGISTER_FILE_LEN);
-        assert_eq!(SavedRegisters::default().xmm.len(), SPILLED_REGISTER_FILE_LEN);
+        assert_eq!(
+            SavedRegisters::default().gpr.len(),
+            SPILLED_REGISTER_FILE_LEN
+        );
+        assert_eq!(
+            SavedRegisters::default().xmm.len(),
+            SPILLED_REGISTER_FILE_LEN
+        );
         let fs = |v: FrameValue| FrameState {
             method_key: String::from("T.m()V"),
             bci: 0,

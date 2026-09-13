@@ -138,10 +138,7 @@ pub fn min_isa_for_target(sm_major: u32, sm_minor: u32) -> IsaVersion {
     // see the module doc. A target this new will be refused by the
     // driver for being an unknown architecture, which is a clear error,
     // rather than accepted against a version we invented.
-    TARGET_TABLE
-        .last()
-        .map(|&(_, isa)| isa)
-        .unwrap_or((6, 0))
+    TARGET_TABLE.last().map(|&(_, isa)| isa).unwrap_or((6, 0))
 }
 
 /// `(target, first PTX ISA version that admits it)`, **ascending**.
@@ -382,9 +379,21 @@ mod tests {
     /// range safe.
     #[test]
     fn a_capability_between_two_known_rows_rounds_up() {
-        assert_eq!(min_isa_for_target(8, 8), (7, 8), "sm_88 sits between sm_87 and sm_89");
-        assert_eq!(min_isa_for_target(10, 2), (8, 8), "sm_102 sits between sm_101 and sm_103");
-        assert_eq!(min_isa_for_target(11, 0), (8, 7), "sm_110 sits between sm_103 and sm_120");
+        assert_eq!(
+            min_isa_for_target(8, 8),
+            (7, 8),
+            "sm_88 sits between sm_87 and sm_89"
+        );
+        assert_eq!(
+            min_isa_for_target(10, 2),
+            (8, 8),
+            "sm_102 sits between sm_101 and sm_103"
+        );
+        assert_eq!(
+            min_isa_for_target(11, 0),
+            (8, 7),
+            "sm_110 sits between sm_103 and sm_120"
+        );
     }
 
     #[test]

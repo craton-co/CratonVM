@@ -729,7 +729,8 @@ fn a_warmed_up_stack_trace_keeps_every_frame_and_every_line() {
         let main_frame = line_of(frames, "main")
             .unwrap_or_else(|| panic!("[{TAG}] {row}: no `main` frame in {}", render(frames)));
         assert_eq!(
-            main_frame.line, want_main,
+            main_frame.line,
+            want_main,
             "[{TAG}] {row}: `main` reports line {} but the probe prints that row from line \
              {want_main} of {}. A LOW value here is defect 3 — an OSR-entered frame reporting the \
              back-edge it tiered up at instead of the call it is suspended in.\ngot: {}",
@@ -747,9 +748,7 @@ fn a_warmed_up_stack_trace_keeps_every_frame_and_every_line() {
             .iter()
             .map(|frames| {
                 line_of(frames, method)
-                    .unwrap_or_else(|| {
-                        panic!("[{TAG}] no `{method}` frame in {}", render(frames))
-                    })
+                    .unwrap_or_else(|| panic!("[{TAG}] no `{method}` frame in {}", render(frames)))
                     .line
             })
             .collect();

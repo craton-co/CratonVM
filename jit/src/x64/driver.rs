@@ -1185,11 +1185,12 @@ pub fn compile_with_param_slots(
     // `AttributesImpl.ensureCapacity` witness.
     let bypassable_headers =
         find_bypassable_loop_headers(code, code_len, &loops, &exception_ranges);
-    let hoist_info = if is_baseline || cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_AALOAD_LICM") {
-        Vec::new()
-    } else {
-        find_loop_hoists(code, code_len, &loops)
-    };
+    let hoist_info =
+        if is_baseline || cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_AALOAD_LICM") {
+            Vec::new()
+        } else {
+            find_loop_hoists(code, code_len, &loops)
+        };
     // Per-bci de-spec (same registry the speculative-BCE guards use): the
     // hoisted aaload's null+bounds preheader guard deopts at the loop-header
     // bci; once a header crosses the de-spec threshold, drop its hoists so
@@ -1221,12 +1222,13 @@ pub fn compile_with_param_slots(
     // hoist changes the emitted body of essentially every loop over an array
     // in the VM, so it needs one, and the bisect it serves must reach the
     // level the change is at (the emission, not the analysis).
-    let array_len_hoist_info =
-        if is_baseline || cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_ARRAYLEN_LICM") {
-            Vec::new()
-        } else {
-            find_array_len_hoists(code, code_len, &loops)
-        };
+    let array_len_hoist_info = if is_baseline
+        || cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_ARRAYLEN_LICM")
+    {
+        Vec::new()
+    } else {
+        find_array_len_hoists(code, code_len, &loops)
+    };
     // One filter, not the aaload hoist's two. There is no per-bci de-spec to
     // apply because this pre-header speculates on nothing: it throws the NPE
     // the body would have thrown rather than deopting, so there is no failed
@@ -1708,8 +1710,7 @@ pub fn compile_with_param_slots(
         scalar_base,
     );
     let num_scalar_slots = sr_plan.total_slots;
-    let force_inline_new =
-        cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_ENABLE_INLINE_NEW");
+    let force_inline_new = cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_ENABLE_INLINE_NEW");
     let cache_jit_thread_for_inline_new = needs_heap
         && helpers.get_current_thread != 0
         && helpers.tlab_post_init != 0

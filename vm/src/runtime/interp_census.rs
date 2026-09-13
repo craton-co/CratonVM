@@ -368,9 +368,7 @@ pub fn report_at_exit() {
         // recording on for the rest of the process, which is the global cost
         // the window exists to avoid.
         let (wo, wc, ws) = cratonvm_jit::profile::c2_branch_window_census();
-        eprintln!(
-            "[c2-supersede] branch-profile window: opened={wo} closed={wc} still_open={ws}"
-        );
+        eprintln!("[c2-supersede] branch-profile window: opened={wo} closed={wc} still_open={ws}");
         // The C1->C2 acceptance gate. `unjudged` is the one to read first: a
         // non-zero there means the per-compile evidence slot was not armed on
         // the thread that compiled, so the gate accepted without judging --
@@ -438,17 +436,13 @@ pub fn report_at_exit() {
         // explicit `JMP` — so frequency-driven block layout could not pay,
         // whatever it reordered.
         let (ft_elided, ft_jmps) = cratonvm_jit::ir_lower::ir_fallthrough_census();
-        eprintln!(
-            "[c2-supersede] ir block exits: fell_through={ft_elided} jmp_emitted={ft_jmps}"
-        );
+        eprintln!("[c2-supersede] ir block exits: fell_through={ft_elided} jmp_emitted={ft_jmps}");
         // Safepoint polls, by shape. The inline shape branches over its own
         // slow path on the FAST path, so a hot loop pays a taken jump and
         // carries ~230 bytes it never enters; `CRATONVM_JIT_IR_POLL_OUTLINE`
         // moves the block after the body and inverts the test.
         let (poll_out, poll_inline) = cratonvm_jit::ir_lower::ir_poll_census();
-        eprintln!(
-            "[c2-supersede] ir safepoint polls: outlined={poll_out} inline={poll_inline}"
-        );
+        eprintln!("[c2-supersede] ir safepoint polls: outlined={poll_out} inline={poll_inline}");
         // Reads eliminated as redundant with one already performed in the
         // same block (`CRATONVM_JIT_IR_LOAD_CSE`). A zero with the flag on means
         // no method in this workload read one cell twice out of one heap state
@@ -466,8 +460,7 @@ pub fn report_at_exit() {
         // of them — and only this distinguishes them.
         let declines = cratonvm_jit::metrics::ir_getfield_declines();
         if !declines.is_empty() {
-            let joined: Vec<String> =
-                declines.iter().map(|(n, v)| format!("{n}={v}")).collect();
+            let joined: Vec<String> = declines.iter().map(|(n, v)| format!("{n}={v}")).collect();
             eprintln!(
                 "[c2-supersede] ir getfield inline declines: {}",
                 joined.join(" ")
@@ -511,9 +504,7 @@ pub fn report_at_exit() {
         // non-zero for every spliced statically-bound call until 2026-09-09;
         // see `c2-splice-getstatic-and-the-calls-it-left-behind-20260909.md`.
         let (bd_own, bd_splice) = cratonvm_jit::ir_lower::ir_blind_dispatch_census();
-        eprintln!(
-            "[c2-supersede] ir blind dispatches: own_code={bd_own} in_splice={bd_splice}"
-        );
+        eprintln!("[c2-supersede] ir blind dispatches: own_code={bd_own} in_splice={bd_splice}");
         let (held, spent, retired) = cratonvm_jit::deferred_new_retry_census();
         eprintln!(
             "[c2-supersede] deferred-new retries: held={held} spent={spent} retired={retired} re_offered={}",

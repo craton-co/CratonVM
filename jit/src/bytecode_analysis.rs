@@ -329,7 +329,10 @@ pub(crate) fn switch_targets_lenient(code: &[u8], code_len: usize, pc: usize) ->
     let base = switch_operand_base(pc);
     let fits = |at: usize, n: usize| at.checked_add(n).is_some_and(|e| e <= code_len);
     let push = |off: i32, out: &mut Vec<usize>| {
-        if let Some(t) = pc.checked_add_signed(off as isize).filter(|&t| t < code_len) {
+        if let Some(t) = pc
+            .checked_add_signed(off as isize)
+            .filter(|&t| t < code_len)
+        {
             out.push(t);
         }
     };
@@ -918,7 +921,9 @@ mod tests {
     /// The class reader's decoder is the oracle: the verifier and the IR
     /// builder already trust it, so the JIT's table must agree byte for byte.
     fn reader_len(code: &[u8], pc: usize) -> Option<usize> {
-        Instruction::decode(code, pc).ok().map(|(_, next)| next - pc)
+        Instruction::decode(code, pc)
+            .ok()
+            .map(|(_, next)| next - pc)
     }
 
     /// Operand bytes that make each fixed-width opcode decodable.
@@ -971,7 +976,9 @@ mod tests {
 
     #[test]
     fn wide_forms_match_the_class_reader() {
-        for op in [0x15u8, 0x16, 0x17, 0x18, 0x19, 0x36, 0x37, 0x38, 0x39, 0x3a, 0xa9] {
+        for op in [
+            0x15u8, 0x16, 0x17, 0x18, 0x19, 0x36, 0x37, 0x38, 0x39, 0x3a, 0xa9,
+        ] {
             let code = [0xc4, op, 0x01, 0x00];
             assert_eq!(insn_len(&code, 0), Some(4), "wide {op:#04x}");
             assert_eq!(reader_len(&code, 0), Some(4), "reader wide {op:#04x}");
@@ -1032,8 +1039,16 @@ mod tests {
             let pad = (4 - (pc + 1) % 4) % 4;
             let expected = 1 + pad + 12 + 3 * 4;
             assert_eq!(code.len() - pc, expected, "fixture, lead {lead}");
-            assert_eq!(insn_len(&code, pc), Some(expected), "tableswitch lead {lead}");
-            assert_eq!(reader_len(&code, pc), Some(expected), "reader tableswitch lead {lead}");
+            assert_eq!(
+                insn_len(&code, pc),
+                Some(expected),
+                "tableswitch lead {lead}"
+            );
+            assert_eq!(
+                reader_len(&code, pc),
+                Some(expected),
+                "reader tableswitch lead {lead}"
+            );
             let table = switch_table(&code, code.len(), pc).expect("tableswitch decodes");
             assert_eq!(table.len, expected);
             assert_eq!(table.default, 0);
@@ -1042,8 +1057,16 @@ mod tests {
             let (code, pc) = lookupswitch_at(lead, &[-7, 9]);
             let pad = (4 - (pc + 1) % 4) % 4;
             let expected = 1 + pad + 8 + 2 * 8;
-            assert_eq!(insn_len(&code, pc), Some(expected), "lookupswitch lead {lead}");
-            assert_eq!(reader_len(&code, pc), Some(expected), "reader lookupswitch lead {lead}");
+            assert_eq!(
+                insn_len(&code, pc),
+                Some(expected),
+                "lookupswitch lead {lead}"
+            );
+            assert_eq!(
+                reader_len(&code, pc),
+                Some(expected),
+                "reader lookupswitch lead {lead}"
+            );
             let table = switch_table(&code, code.len(), pc).expect("lookupswitch decodes");
             assert_eq!(table.cases, vec![(-7, 0), (9, 0)]);
             assert_eq!(table.targets().collect::<Vec<_>>(), vec![0, 0, 0]);
@@ -1064,7 +1087,11 @@ mod tests {
         code[pc + 8..pc + 12].copy_from_slice(&6i32.to_be_bytes()); // low = 6 > high
         assert_eq!(insn_len(&code, pc), None);
         assert_eq!(switch_table(&code, code.len(), pc), None);
-        assert_eq!(switch_targets_lenient(&code, code.len(), pc), vec![0], "default only");
+        assert_eq!(
+            switch_targets_lenient(&code, code.len(), pc),
+            vec![0],
+            "default only"
+        );
 
         // Negative npairs.
         let mut neg = vec![0xab, 0x00, 0x00, 0x00];
@@ -1111,11 +1138,20 @@ mod tests {
     #[test]
     fn subroutines_are_opaque_and_exits_do_not_fall_through() {
         let mut out = Vec::new();
-        for code in [&[0xa8u8, 0x00, 0x03][..], &[0xa9, 0x01][..], &[0xc9, 0, 0, 0, 5][..]] {
-            assert!(!explicit_targets(code, code.len(), 0, &mut out), "{code:02x?}");
+        for code in [
+            &[0xa8u8, 0x00, 0x03][..],
+            &[0xa9, 0x01][..],
+            &[0xc9, 0, 0, 0, 5][..],
+        ] {
+            assert!(
+                !explicit_targets(code, code.len(), 0, &mut out),
+                "{code:02x?}"
+            );
             assert!(is_subroutine_op(code[0]));
         }
-        for op in [0xa7u8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0, 0xb1, 0xbf, 0xc8] {
+        for op in [
+            0xa7u8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0, 0xb1, 0xbf, 0xc8,
+        ] {
             assert!(!falls_through(op), "{op:#04x}");
         }
         for op in [0x00u8, 0x99, 0xa6, 0xa8, 0xb6, 0xc6, 0xc7, 0xc9] {
@@ -1153,7 +1189,11 @@ mod tests {
         let verified = cratonvm_reader::verified_code(&code).expect("verifies");
         for vi in verified.instructions() {
             let pc = vi.pc as usize;
-            assert_eq!(insn_len(&code, pc), Some(vi.next_pc as usize - pc), "pc {pc}");
+            assert_eq!(
+                insn_len(&code, pc),
+                Some(vi.next_pc as usize - pc),
+                "pc {pc}"
+            );
         }
         let targets = branch_target_map(&code, code.len());
         let marked: Vec<usize> = (0..code.len()).filter(|&p| targets[p]).collect();
@@ -1184,7 +1224,10 @@ mod tests {
         assert!(cfg.dominates(n(2), n(11)));
         assert!(cfg.dominates(n(5), n(15)));
         assert!(!cfg.is_reachable(n(14)));
-        assert!(!cfg.dominates(n(14), n(15)), "unreachable dominates nothing");
+        assert!(
+            !cfg.dominates(n(14), n(15)),
+            "unreachable dominates nothing"
+        );
         assert_eq!(cfg.idom(n(8)), Some(n(5)));
         assert_eq!(cfg.idom(n(0)), None);
         let body = cfg.natural_loop(n(2), n(11)).expect("natural loop");
@@ -1198,7 +1241,11 @@ mod tests {
         assert_eq!(body_pcs, vec![2, 3, 5, 8, 11]);
         assert_eq!(cfg.rpo()[0], 0);
         assert_eq!(cfg.preds(n(2)).len(), 2, "entry fall-through and the goto");
-        assert_eq!(cfg.natural_loop(n(5), n(11)), None, "5 -> 11 is not a back edge");
+        assert_eq!(
+            cfg.natural_loop(n(5), n(11)),
+            None,
+            "5 -> 11 is not a back edge"
+        );
     }
 
     #[test]
@@ -1224,7 +1271,9 @@ mod tests {
         assert!(!cfg.dominates(n(3), n(11)));
         assert!(cfg.dominates(n(8), n(3)));
         assert_eq!(cfg.loop_headers(), vec![n(8)]);
-        let body = cfg.natural_loop(n(8), n(7)).expect("7 -> 8 is the back edge");
+        let body = cfg
+            .natural_loop(n(8), n(7))
+            .expect("7 -> 8 is the back edge");
         for pc in [3, 6, 7, 8, 9, 11] {
             assert!(body[n(pc)], "pc {pc} in the body");
         }
@@ -1266,7 +1315,8 @@ mod tests {
         let code = vec![0x04, 0x3c, 0x1b, 0xac, 0x4d, 0x02, 0xac];
         let plain = InsnCfg::build(&code, code.len()).expect("cfg builds");
         assert!(!plain.is_reachable(plain.node_of(4).unwrap()));
-        let cfg = InsnCfg::build_with_handlers(&code, code.len(), &[(0, 4, 4)]).expect("cfg builds");
+        let cfg =
+            InsnCfg::build_with_handlers(&code, code.len(), &[(0, 4, 4)]).expect("cfg builds");
         let n = |pc| cfg.node_of(pc).unwrap();
         assert!(cfg.is_reachable(n(4)));
         assert_eq!(cfg.preds(n(4)).len(), 4, "every protected instruction");

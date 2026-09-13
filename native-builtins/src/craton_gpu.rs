@@ -369,10 +369,20 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     // capture-side entry points is the EXECUTOR handle, not a stream: a
     // capture belongs to the stream every dispatch on that executor lands
     // on, which is the one `resolve_or_create_default_stream` hands out.
-    registry.register(KLASS, "graphBeginCapture", "(J)Z", builtin_graph_begin_capture);
+    registry.register(
+        KLASS,
+        "graphBeginCapture",
+        "(J)Z",
+        builtin_graph_begin_capture,
+    );
     registry.register(KLASS, "graphEndCapture", "(J)J", builtin_graph_end_capture);
     registry.register(KLASS, "graphReplay", "(JJ)J", builtin_graph_replay);
-    registry.register(KLASS, "graphBeginReplay", "(JJ)Z", builtin_graph_begin_replay);
+    registry.register(
+        KLASS,
+        "graphBeginReplay",
+        "(JJ)Z",
+        builtin_graph_begin_replay,
+    );
     registry.register(KLASS, "graphEndReplay", "(J)J", builtin_graph_end_replay);
     registry.register(KLASS, "graphNodeCount", "(J)I", builtin_graph_node_count);
     registry.register(KLASS, "releaseGraph", "(J)V", builtin_release_graph);
@@ -780,8 +790,7 @@ fn fill_java_array(
     //
     // Native-endian on both sides, so this is one memcpy.
     let want = element_count * element_byte_width(element_type);
-    if want > 0 && bytes.len() >= want && ctx.write_primitive_array_bytes(obj, 0, &bytes[..want])
-    {
+    if want > 0 && bytes.len() >= want && ctx.write_primitive_array_bytes(obj, 0, &bytes[..want]) {
         return;
     }
 

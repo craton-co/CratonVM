@@ -27,7 +27,6 @@ impl Compiler {
         branch_targets: &[bool],
     ) -> WalkStep {
         match op {
-
             // ifeq..ifle (0x99..0x9e) — compare int against zero
             0x99..=0x9e => {
                 self.flush_scratch_registers();
@@ -35,7 +34,7 @@ impl Compiler {
                 let target_pc = match pc.checked_add_signed(offset as isize) {
                     // Cast: address arithmetic
                     Some(t) => t,
-                    None => return WalkStep::Return( false), // invalid branch target
+                    None => return WalkStep::Return(false), // invalid branch target
                 };
                 if target_pc <= pc {
                     self.emit_safepoint_poll();
@@ -90,7 +89,7 @@ impl Compiler {
                 let target_pc = match pc.checked_add_signed(offset as isize) {
                     // Cast: address arithmetic
                     Some(t) => t,
-                    None => return WalkStep::Return( false), // invalid branch target
+                    None => return WalkStep::Return(false), // invalid branch target
                 };
                 if target_pc <= pc {
                     self.emit_safepoint_poll();
@@ -168,7 +167,7 @@ impl Compiler {
                 let target_pc = match pc.checked_add_signed(offset as isize) {
                     // Cast: address arithmetic
                     Some(t) => t,
-                    None => return WalkStep::Return( false), // invalid branch target
+                    None => return WalkStep::Return(false), // invalid branch target
                 };
                 // Flush scratch registers before any branch -- they are
                 // caller-saved and not valid across basic block boundaries.
@@ -416,8 +415,7 @@ impl Compiler {
                                     let mut rel_bytes = [0u8; 4];
                                     rel_bytes.copy_from_slice(&self.buf.as_slice()[po..po + 4]);
                                     let orig_rel32 = i32::from_le_bytes(rel_bytes);
-                                    let orig_next_pc =
-                                        buf_base.wrapping_add(po).wrapping_add(4);
+                                    let orig_next_pc = buf_base.wrapping_add(po).wrapping_add(4);
                                     let helper_addr =
                                         // Widening: usize address & i32 rel32 -> i64 (no truncation; rel math)
                                         (orig_next_pc as i64).wrapping_add(orig_rel32 as i64);
@@ -497,8 +495,7 @@ impl Compiler {
                                 // original slot — per-iteration cache
                                 // hits collide and miss across copies for
                                 // any receiver-type-varying loop.
-                                let mut cloned_ic_slots: HashMap<(u8, usize), i64> =
-                                    HashMap::new();
+                                let mut cloned_ic_slots: HashMap<(u8, usize), i64> = HashMap::new();
                                 for &(po, kind, original_ptr) in &orig_ic_patches {
                                     let copy_po = po + shift_us;
                                     let fresh_ptr = *cloned_ic_slots
@@ -576,18 +573,15 @@ impl Compiler {
                                 // that nothing downstream catches, so the
                                 // condition is written rather than assumed.
                                 self.implicit_null_sites
-                                    .extend(orig_implicit_null.iter().map(
-                                        |&(fault, recover)| {
-                                            let recover = if recover >= body_start
-                                                && recover < body_end
-                                            {
-                                                recover + shift_us
-                                            } else {
-                                                recover
-                                            };
-                                            (fault + shift_us, recover)
-                                        },
-                                    ));
+                                    .extend(orig_implicit_null.iter().map(|&(fault, recover)| {
+                                        let recover = if recover >= body_start && recover < body_end
+                                        {
+                                            recover + shift_us
+                                        } else {
+                                            recover
+                                        };
+                                        (fault + shift_us, recover)
+                                    }));
                                 // Deopt stub patches: (patch_offset, bci,
                                 // reason). bci and reason are the same
                                 // across copies (it's the same logical
@@ -614,9 +608,9 @@ impl Compiler {
                                 // tuple itself so the late patcher
                                 // re-resolves the copy.
                                 self.jump_table_patches.extend(
-                                    orig_jump_table_patches.iter().map(|&(eo, tb, tpc)| {
-                                        (eo + shift_us, tb + shift_us, tpc)
-                                    }),
+                                    orig_jump_table_patches
+                                        .iter()
+                                        .map(|&(eo, tb, tpc)| (eo + shift_us, tb + shift_us, tpc)),
                                 );
                                 // Oop maps: each entry stashes the
                                 // native_pc_offset of the instruction
@@ -632,9 +626,8 @@ impl Compiler {
                                     // saturate-add via usize for safe
                                     // arithmetic.
                                     // Cast: non-negative index/count to usize
-                                    copy.native_pc_offset = (e.native_pc_offset as usize)
-                                        .wrapping_add(shift_us)
-                                        as u32; // Cast: native_pc_offset width
+                                    copy.native_pc_offset =
+                                        (e.native_pc_offset as usize).wrapping_add(shift_us) as u32; // Cast: native_pc_offset width
                                     copy
                                 }));
                                 // Helper-call patches: track the
@@ -653,8 +646,7 @@ impl Compiler {
                                 // IC patches: same idea — record the
                                 // shifted imm64 location with its kind
                                 // so any later pass can find it.
-                                let mut cloned_patches =
-                                    Vec::with_capacity(orig_ic_patches.len());
+                                let mut cloned_patches = Vec::with_capacity(orig_ic_patches.len());
                                 for &(po, kind, original_ptr) in &orig_ic_patches {
                                     let Some(&cloned_ptr) =
                                         cloned_ic_slots.get(&(kind, original_ptr))
@@ -663,13 +655,9 @@ impl Compiler {
                                         // code pointing at the wrong call-site state.
                                         // Reject this compilation and fall back to the
                                         // interpreter instead of publishing unsafe code.
-                                        return WalkStep::Return( false);
+                                        return WalkStep::Return(false);
                                     };
-                                    cloned_patches.push((
-                                        po + shift_us,
-                                        kind,
-                                        cloned_ptr as usize,
-                                    ));
+                                    cloned_patches.push((po + shift_us, kind, cloned_ptr as usize));
                                 }
                                 self.ic_patches.extend(cloned_patches);
                             }
@@ -1029,8 +1017,7 @@ impl Compiler {
                 // already-translated bci in would double-apply it under a
                 // bytecode loop rewrite (identity, and byte-identical, on an
                 // ordinary compile).
-                let precise_athrow_stub =
-                    self.precise_exception_frames && self.pc_is_protected(pc);
+                let precise_athrow_stub = self.precise_exception_frames && self.pc_is_protected(pc);
                 if precise_athrow_stub {
                     if !self.exc_frame_box_ptr_by_bci.contains_key(&pc) {
                         let box_ptr = self.build_and_record_deopt_point(
@@ -1070,7 +1057,7 @@ impl Compiler {
                 let target_pc = match pc.checked_add_signed(offset as isize) {
                     // Cast: address arithmetic
                     Some(t) => t,
-                    None => return WalkStep::Return( false), // invalid branch target
+                    None => return WalkStep::Return(false), // invalid branch target
                 };
                 if target_pc <= pc {
                     self.emit_safepoint_poll();
@@ -1113,7 +1100,7 @@ impl Compiler {
                 let target_pc = match pc.checked_add_signed(offset as isize) {
                     // Cast: address arithmetic
                     Some(t) => t,
-                    None => return WalkStep::Return( false), // invalid branch target
+                    None => return WalkStep::Return(false), // invalid branch target
                 };
                 if target_pc <= pc {
                     self.emit_safepoint_poll();
@@ -1151,7 +1138,7 @@ impl Compiler {
                 let target_pc = match pc.checked_add_signed(offset as isize) {
                     // Cast: address arithmetic
                     Some(t) => t,
-                    None => return WalkStep::Return( false), // invalid branch target
+                    None => return WalkStep::Return(false), // invalid branch target
                 };
                 if target_pc <= pc {
                     self.emit_safepoint_poll();
@@ -1209,7 +1196,7 @@ impl Compiler {
                 let target_pc = match pc.checked_add_signed(offset as isize) {
                     // Cast: address arithmetic
                     Some(t) => t,
-                    None => return WalkStep::Return( false), // invalid branch target
+                    None => return WalkStep::Return(false), // invalid branch target
                 };
                 if target_pc <= pc {
                     self.emit_safepoint_poll();

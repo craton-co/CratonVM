@@ -54,7 +54,6 @@ impl Compiler {
         branch_targets: &[bool],
     ) -> WalkStep {
         match op {
-
             // invokestatic — self-call, direct call, inline, or dispatch helper
             0xb8 => {
                 self.flush_scratch_registers();
@@ -85,7 +84,7 @@ impl Compiler {
                             // out of JIT compilation; the interpreter can
                             // execute the ordinary invoke path safely.
                             self.fail("singlepass-codegen/lambda-int-to-double-stack-shape");
-                            return WalkStep::Return( false);
+                            return WalkStep::Return(false);
                         };
                         let lambda_slot = self.stack[self.stack.len() - 2];
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
@@ -190,8 +189,7 @@ impl Compiler {
                     matches!(prev_insn_int_const(code, code_len, pc), Some(0..=0xFFFF))
                 });
 
-                if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct
-                {
+                if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct {
                     if callee_entry == crate::MATH_SQRT_INTRINSIC {
                         // Math.sqrt(double) intrinsic: inline SQRTSD — no call overhead
                         let arg_slot = self.pop_stack();
@@ -635,9 +633,7 @@ impl Compiler {
                     // `doubleToRawLongBits` is specified to return. The
                     // canonicalising `doubleToLongBits` is not matched by
                     // the resolver and so cannot reach here.
-                    else if callee_entry
-                        == crate::JitIntrinsic::DoubleToRawLongBits.as_entry()
-                    {
+                    else if callee_entry == crate::JitIntrinsic::DoubleToRawLongBits.as_entry() {
                         // Double.doubleToRawLongBits(d): the argument's
                         // 64 bits, unchanged, as a long.
                         let arg = self.pop_stack();
@@ -830,12 +826,12 @@ impl Compiler {
                         self.load_slot_to_reg(RAX, val);
                         self.load_slot_to_reg(RCX, dist);
                         // ROL EAX, CL: D3 /0 = D3 C0 ; ROR EAX, CL: D3 /1 = D3 C8
-                        let modrm =
-                            if callee_entry == crate::JitIntrinsic::IntRotateLeft.as_entry() {
-                                0xC0u8
-                            } else {
-                                0xC8u8
-                            };
+                        let modrm = if callee_entry == crate::JitIntrinsic::IntRotateLeft.as_entry()
+                        {
+                            0xC0u8
+                        } else {
+                            0xC8u8
+                        };
                         self.buf.emit(&[0xD3, modrm]);
                         // MOVSXD RAX, EAX (48 63 C0): a 32-bit rotate may set
                         // the high bit (negative int); re-extend to the
@@ -934,8 +930,7 @@ impl Compiler {
                         // BSWAP RAX: 48 0F C8
                         self.buf.emit(&[0x48, 0x0F, 0xC8]);
                         self.push_from_rax();
-                    } else if callee_entry == crate::JitIntrinsic::LongHighestOneBit.as_entry()
-                    {
+                    } else if callee_entry == crate::JitIntrinsic::LongHighestOneBit.as_entry() {
                         // Long.highestOneBit(j): 1L << bitIndex of the MSB,
                         // or 0 for a zero input. BSR leaves the index in
                         // RCX; SHL forms the mask; a CMOVZ keyed on the
@@ -1045,9 +1040,10 @@ impl Compiler {
                     // (non-speculative) call dispatch below instead of
                     // re-emitting a guard proven to always fail.
                     else if callee_entry == crate::JitIntrinsic::ArraycopyPrimitive.as_entry()
-                        && !self.despec.as_ref().is_some_and(|registry| {
-                            registry.contains(&self.method_key, pc as u32)
-                        })
+                        && !self
+                            .despec
+                            .as_ref()
+                            .is_some_and(|registry| registry.contains(&self.method_key, pc as u32))
                     {
                         // Phase 2 — System.arraycopy(src, srcPos, dst,
                         // dstPos, len). The descriptor is type-erased;
@@ -1158,7 +1154,7 @@ impl Compiler {
                             // `spill-range-exhausted` said only that some
                             // range somewhere did not fit.
                             self.fail("singlepass-codegen/arraycopy-scratch-spill-exhausted");
-                            return WalkStep::Return( false);
+                            return WalkStep::Return(false);
                         }
                         let s_src = scratch_base;
                         let s_src_pos = scratch_base + 8;
@@ -1560,7 +1556,7 @@ impl Compiler {
                                 // compile (always safe: the method falls
                                 // back to the interpreter).
                                 self.fail("singlepass-codegen/arraycopy-args-spill-exhausted");
-                                return WalkStep::Return( false);
+                                return WalkStep::Return(false);
                             }
                             None => {
                                 // Wire every bail branch to a shared deopt stub
@@ -1699,11 +1695,9 @@ impl Compiler {
                             == crate::JitIntrinsic::ArraysEquals1.as_entry()
                         {
                             0
-                        } else if callee_entry == crate::JitIntrinsic::ArraysEquals2.as_entry()
-                        {
+                        } else if callee_entry == crate::JitIntrinsic::ArraysEquals2.as_entry() {
                             1
-                        } else if callee_entry == crate::JitIntrinsic::ArraysEquals4.as_entry()
-                        {
+                        } else if callee_entry == crate::JitIntrinsic::ArraysEquals4.as_entry() {
                             2
                         } else {
                             3
@@ -1889,8 +1883,7 @@ impl Compiler {
                         // non-negative, so signed compare still works).
 
                         // SIB scale bits + load/store encodings per width.
-                        let is_int =
-                            callee_entry == crate::JitIntrinsic::ArraysSortInt.as_entry();
+                        let is_int = callee_entry == crate::JitIntrinsic::ArraysSortInt.as_entry();
                         let is_long =
                             callee_entry == crate::JitIntrinsic::ArraysSortLong.as_entry();
                         let is_char =
@@ -2333,10 +2326,8 @@ impl Compiler {
                             // sit above the argument slots `pop_stack` just handed
                             // back, or the copy below reverses the arguments into
                             // themselves and the callee gets arg0 in every slot.
-                            let base = self.reserve_direct_call_service_slots(
-                                args_frame_top,
-                                &arg_slots,
-                            )?;
+                            let base =
+                                self.reserve_direct_call_service_slots(args_frame_top, &arg_slots)?;
                             for (i, slot) in arg_slots.iter().enumerate() {
                                 self.load_slot_to_reg(R11, *slot);
                                 let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
@@ -2528,7 +2519,7 @@ impl Compiler {
                     if n > 0 {
                         let Some(args_end) = self.checked_spill_range_end(args_base_offset, n)
                         else {
-                            return WalkStep::Return( false);
+                            return WalkStep::Return(false);
                         };
                         self.next_spill_offset = args_end;
                         // Store args in reverse offset order so they form
@@ -2659,10 +2650,8 @@ impl Compiler {
                     // whole compile — correctness first; a self-recursive
                     // method that also contains an invokedynamic is rare
                     // enough that staying interpreted is acceptable.
-                    if !self.indy_info.is_empty()
-                        && !(is_tail_call && self.body_entry_offset > 0)
-                    {
-                        return WalkStep::Return( false);
+                    if !self.indy_info.is_empty() && !(is_tail_call && self.body_entry_offset > 0) {
+                        return WalkStep::Return(false);
                     }
 
                     // value-stack-usize-underflow-nio-worker-panic fix:
@@ -2990,7 +2979,6 @@ impl Compiler {
         _branch_targets: &[bool],
     ) -> WalkStep {
         match op {
-
             // invokevirtual / invokespecial / invokeinterface — direct call or dispatch helper
             0xb6 | 0xb7 | 0xb9 => {
                 // Scalar replacement: skip <init>()V on scalar-replaced objects
@@ -3083,8 +3071,7 @@ impl Compiler {
                             let stack_checkpoint = self.stack.clone();
                             let oop_marks_checkpoint = self.stack_oop_marks.clone();
                             let spill_checkpoint = self.next_spill_offset;
-                            let exception_check_stubs_checkpoint =
-                                self.exception_check_stubs.len();
+                            let exception_check_stubs_checkpoint = self.exception_check_stubs.len();
                             let deopt_stubs_checkpoint = self.deopt_stubs.len();
                             let forward_patches_checkpoint = self.forward_patches.len();
                             let jump_table_patches_checkpoint = self.jump_table_patches.len();
@@ -3123,8 +3110,7 @@ impl Compiler {
                                 let variant_jump_table_patches = self.jump_table_patches.len();
                                 let variant_self_call_patches = self.self_call_patches.len();
                                 let variant_bounds_stubs = self.bounds_check_stubs.len();
-                                let variant_null_store_stubs =
-                                    self.null_check_store_stubs.len();
+                                let variant_null_store_stubs = self.null_check_store_stubs.len();
 
                                 // Land the previous variant's mismatch edge
                                 // exactly here. If this variant then fails and
@@ -3148,8 +3134,7 @@ impl Compiler {
                                 if self.try_emit_inline_site(pc, site) {
                                     // Hit: skip every later guard AND the
                                     // normal-dispatch bytes entirely.
-                                    guarded_virtual_done_patches
-                                        .push(self.emit_jmp_rel32_patch());
+                                    guarded_virtual_done_patches.push(self.emit_jmp_rel32_patch());
                                     spliced_any = true;
                                     pending_miss = Some(this_miss);
                                     // The inline body consumed the
@@ -3182,12 +3167,10 @@ impl Compiler {
                                     self.stack = stack_checkpoint.clone();
                                     self.stack_oop_marks = oop_marks_checkpoint.clone();
                                     self.next_spill_offset = spill_checkpoint;
-                                    self.exception_check_stubs
-                                        .truncate(variant_exception_stubs);
+                                    self.exception_check_stubs.truncate(variant_exception_stubs);
                                     self.deopt_stubs.truncate(variant_deopt_stubs);
                                     self.forward_patches.truncate(variant_forward_patches);
-                                    self.jump_table_patches
-                                        .truncate(variant_jump_table_patches);
+                                    self.jump_table_patches.truncate(variant_jump_table_patches);
                                     self.self_call_patches.truncate(variant_self_call_patches);
                                     self.bounds_check_stubs.truncate(variant_bounds_stubs);
                                     self.null_check_store_stubs
@@ -3372,13 +3355,11 @@ impl Compiler {
                     // today's behaviour AND today's exceptions. Nothing
                     // here has to reproduce an exception.
                     if !intrinsic_handled
-                        && (callee_entry
-                            == crate::JitIntrinsic::FfmSegmentGetAtIndex.as_entry()
-                            || callee_entry
-                                == crate::JitIntrinsic::FfmSegmentSetAtIndex.as_entry())
+                        && (callee_entry == crate::JitIntrinsic::FfmSegmentGetAtIndex.as_entry()
+                            || callee_entry == crate::JitIntrinsic::FfmSegmentSetAtIndex.as_entry())
                     {
-                        let is_get = callee_entry
-                            == crate::JitIntrinsic::FfmSegmentGetAtIndex.as_entry();
+                        let is_get =
+                            callee_entry == crate::JitIntrinsic::FfmSegmentGetAtIndex.as_entry();
                         let helper = if is_get {
                             self.helpers.ffm_segment_get
                         } else {
@@ -3409,15 +3390,12 @@ impl Compiler {
                                 // outlives the code being emitted.
                                 let ret_tag = unsafe { (*info).return_type };
                                 if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_FFM") {
-                                    eprintln!(
-                                        "[ffm] EMITTED pc={pc} kind={kind} is_get={is_get}"
-                                    );
+                                    eprintln!("[ffm] EMITTED pc={pc} kind={kind} is_get={is_get}");
                                 }
                                 self.flush_scratch_registers();
                                 // Operands, deepest first: receiver, layout,
                                 // index, and (set only) the value.
-                                let value_slot =
-                                    if is_get { None } else { Some(self.pop_stack()) };
+                                let value_slot = if is_get { None } else { Some(self.pop_stack()) };
                                 let index_slot = self.pop_stack();
                                 let layout_slot = self.pop_stack();
                                 let recv_slot = self.pop_stack();
@@ -3430,10 +3408,8 @@ impl Compiler {
                                     match self.reserve_spill_slots(1, SpillReason::HelperArgs) {
                                         Some(b) => Some(b),
                                         None => {
-                                            self.fail(
-                                                "singlepass-codegen/ffm-out-spill-exhausted",
-                                            );
-                                            return WalkStep::Return( false);
+                                            self.fail("singlepass-codegen/ffm-out-spill-exhausted");
+                                            return WalkStep::Return(false);
                                         }
                                     }
                                 } else {
@@ -3457,15 +3433,11 @@ impl Compiler {
                                 // cannot arise fails the COMPILE, which
                                 // drops the method to the interpreter.
                                 match (out_base, value_slot) {
-                                    (Some(out), _) => {
-                                        self.emit_lea_frame_slot(ARG_REGS[3], out)
-                                    }
+                                    (Some(out), _) => self.emit_lea_frame_slot(ARG_REGS[3], out),
                                     (None, Some(v)) => self.load_slot_to_reg(ARG_REGS[3], v),
                                     (None, None) => {
-                                        self.fail(
-                                            "singlepass-codegen/ffm-missing-arg3-operand",
-                                        );
-                                        return WalkStep::Return( false);
+                                        self.fail("singlepass-codegen/ffm-missing-arg3-operand");
+                                        return WalkStep::Return(false);
                                     }
                                 }
                                 self.emit_call_absolute(helper);
@@ -3485,10 +3457,8 @@ impl Compiler {
                                 {
                                     Some(b) => b,
                                     None => {
-                                        self.fail(
-                                            "singlepass-codegen/ffm-args-spill-exhausted",
-                                        );
-                                        return WalkStep::Return( false);
+                                        self.fail("singlepass-codegen/ffm-args-spill-exhausted");
+                                        return WalkStep::Return(false);
                                     }
                                 };
                                 // `jit_invoke_dispatch`'s buffer runs
@@ -3581,7 +3551,7 @@ impl Compiler {
                                     );
                                 }
                                 self.fail("singlepass-codegen/ffm-unhandled-sentinel");
-                                return WalkStep::Return( false);
+                                return WalkStep::Return(false);
                             }
                         }
                     }
@@ -3624,8 +3594,7 @@ impl Compiler {
                         // per-object COMPACT/LEGACY branch, the deopt stub
                         // -- is shared, which is the whole reason it belongs
                         // in this block rather than beside it.
-                        let is_load =
-                            callee_entry == crate::JitIntrinsic::AtomicIntGet.as_entry();
+                        let is_load = callee_entry == crate::JitIntrinsic::AtomicIntGet.as_entry();
                         let plan: Option<(i32, bool, bool)> = if is_load {
                             Some((0, false, false))
                         } else if callee_entry
@@ -3644,12 +3613,10 @@ impl Compiler {
                             == crate::JitIntrinsic::AtomicIntDecrementAndGet.as_entry()
                         {
                             Some((-1, true, false))
-                        } else if callee_entry
-                            == crate::JitIntrinsic::AtomicIntGetAndAdd.as_entry()
+                        } else if callee_entry == crate::JitIntrinsic::AtomicIntGetAndAdd.as_entry()
                         {
                             Some((0, false, true))
-                        } else if callee_entry
-                            == crate::JitIntrinsic::AtomicIntAddAndGet.as_entry()
+                        } else if callee_entry == crate::JitIntrinsic::AtomicIntAddAndGet.as_entry()
                         {
                             Some((0, true, true))
                         } else {
@@ -3776,12 +3743,9 @@ impl Compiler {
                     // (`compareAndExchange`, which returns the witness, is
                     // NOT claimed here and keeps its native).
                     if !intrinsic_handled
-                        && callee_entry
-                            == crate::JitIntrinsic::AtomicIntCompareAndSet.as_entry()
+                        && callee_entry == crate::JitIntrinsic::AtomicIntCompareAndSet.as_entry()
                     {
-                        if let Some(layout) =
-                            crate::AtomicIntFieldLayout::new(0, guard_class_id)
-                        {
+                        if let Some(layout) = crate::AtomicIntFieldLayout::new(0, guard_class_id) {
                             self.flush_scratch_registers();
                             if crate::deopt_real_enabled() {
                                 self.snapshot_pre_intrinsic_call(
@@ -3870,8 +3834,7 @@ impl Compiler {
                     // correct volatile/acquire load, so the `get` arm owes
                     // no `LOCK` and no fence.
                     if !intrinsic_handled {
-                        let is_load =
-                            callee_entry == crate::JitIntrinsic::AtomicLongGet.as_entry();
+                        let is_load = callee_entry == crate::JitIntrinsic::AtomicLongGet.as_entry();
                         // (delta_imm, return_post_add, delta_is_arg)
                         let plan: Option<(i32, bool, bool)> = if is_load {
                             Some((0, false, false))
@@ -4021,12 +3984,9 @@ impl Compiler {
                     // (`compareAndExchange`, which returns the witness, is
                     // NOT claimed here and keeps its native).
                     if !intrinsic_handled
-                        && callee_entry
-                            == crate::JitIntrinsic::AtomicLongCompareAndSet.as_entry()
+                        && callee_entry == crate::JitIntrinsic::AtomicLongCompareAndSet.as_entry()
                     {
-                        if let Some(layout) =
-                            crate::AtomicLongFieldLayout::new(0, guard_class_id)
-                        {
+                        if let Some(layout) = crate::AtomicLongFieldLayout::new(0, guard_class_id) {
                             self.flush_scratch_registers();
                             if crate::deopt_real_enabled() {
                                 self.snapshot_pre_intrinsic_call(
@@ -4108,8 +4068,7 @@ impl Compiler {
                     // `Long.longValue` on `null` raises today. Nothing is
                     // CALLed on the inline path.
                     if !intrinsic_handled {
-                        let is_long =
-                            callee_entry == crate::JitIntrinsic::LongLongValue.as_entry();
+                        let is_long = callee_entry == crate::JitIntrinsic::LongLongValue.as_entry();
                         let is_int =
                             callee_entry == crate::JitIntrinsic::IntegerIntValue.as_entry();
                         if is_long || is_int {
@@ -4239,8 +4198,8 @@ impl Compiler {
                             || callee_entry
                                 == crate::JitIntrinsic::StringBuilderAppendChar.as_entry())
                     {
-                        let is_append = callee_entry
-                            == crate::JitIntrinsic::StringBuilderAppendChar.as_entry();
+                        let is_append =
+                            callee_entry == crate::JitIntrinsic::StringBuilderAppendChar.as_entry();
                         let info_ptr = self
                             .invoke_info_idx
                             .get(&pc)
@@ -4354,7 +4313,7 @@ impl Compiler {
                                     Some(base) => base,
                                     None => {
                                         self.fail("singlepass-codegen/sb-args-spill-exhausted");
-                                        return WalkStep::Return( false);
+                                        return WalkStep::Return(false);
                                     }
                                 };
                                 // `jit_invoke_dispatch`'s buffer runs
@@ -4411,7 +4370,7 @@ impl Compiler {
                             // interpreter.
                             _ => {
                                 self.fail("singlepass-codegen/sb-intrinsic-unemittable");
-                                return WalkStep::Return( false);
+                                return WalkStep::Return(false);
                             }
                         }
                     }
@@ -4443,17 +4402,13 @@ impl Compiler {
                     // exact NPE / StringIndexOutOfBoundsException / value
                     // semantics. No `CALL` is emitted on the inline path.
                     if let Some(layout) = self.string_layout {
-                        let acc = if callee_entry
-                            == crate::JitIntrinsic::StringLength.as_entry()
-                        {
+                        let acc = if callee_entry == crate::JitIntrinsic::StringLength.as_entry() {
                             Some(0u8)
-                        } else if callee_entry == crate::JitIntrinsic::StringIsEmpty.as_entry()
-                        {
+                        } else if callee_entry == crate::JitIntrinsic::StringIsEmpty.as_entry() {
                             Some(1)
                         } else if callee_entry == crate::JitIntrinsic::StringCharAt.as_entry() {
                             Some(2)
-                        } else if callee_entry == crate::JitIntrinsic::StringHashCode.as_entry()
-                        {
+                        } else if callee_entry == crate::JitIntrinsic::StringHashCode.as_entry() {
                             Some(3)
                         } else {
                             None
@@ -5351,8 +5306,7 @@ impl Compiler {
                     {
                         let crc32c_byte = crate::JitIntrinsic::Crc32cUpdateByte.as_entry();
                         let crc32c_bytes = crate::JitIntrinsic::Crc32cUpdateBytes.as_entry();
-                        let is_crc32c =
-                            callee_entry == crc32c_byte || callee_entry == crc32c_bytes;
+                        let is_crc32c = callee_entry == crc32c_byte || callee_entry == crc32c_bytes;
                         let is_byte_form = callee_entry == crc32c_byte;
                         let is_bytes_form = callee_entry == crc32c_bytes;
 
@@ -5422,7 +5376,7 @@ impl Compiler {
                             let scratch_slots = if is_byte_form { 2 } else { 4 };
                             if !self.spill_range_fits(self.next_spill_offset, scratch_slots) {
                                 self.fail("singlepass-codegen/intrinsic-pin-spill-exhausted");
-                                return WalkStep::Return( false);
+                                return WalkStep::Return(false);
                             }
                             let s_recv = self.next_spill_offset;
                             let s_a = self.next_spill_offset + 8;
@@ -5539,11 +5493,11 @@ impl Compiler {
                                 let loop_label = self.buf.pos();
                                 self.buf.emit(&[0x4D, 0x39, 0xD9]); // CMP R9,R11
                                 let done_patch = self.emit_jcc_rel32_patch(0x8D); // JGE
-                                // EAX = byte = arr[R9].
-                                // MOVZX EAX, BYTE [R8 + R9 + HDR]
-                                //   43 0F B6 44 08 dd
-                                //   (REX.X for R9 index, REX.B for
-                                //    R8 base → 0x43; SIB scale=1).
+                                                                                  // EAX = byte = arr[R9].
+                                                                                  // MOVZX EAX, BYTE [R8 + R9 + HDR]
+                                                                                  //   43 0F B6 44 08 dd
+                                                                                  //   (REX.X for R9 index, REX.B for
+                                                                                  //    R8 base → 0x43; SIB scale=1).
                                 self.buf.emit(&[
                                     0x43,
                                     0x0F,
@@ -5570,7 +5524,6 @@ impl Compiler {
                                 // .done:
                                 self.patch_rel32_to_here(done_patch);
                             }
-
 
                             // --- write CRC state back to slot 0 ---
                             // RAX = receiver again (reload — RAX was
@@ -5680,10 +5633,8 @@ impl Compiler {
                             // sit above the argument slots `pop_stack` just handed
                             // back, or the copy below reverses the arguments into
                             // themselves and the callee gets arg0 in every slot.
-                            let base = self.reserve_direct_call_service_slots(
-                                args_frame_top,
-                                &arg_slots,
-                            )?;
+                            let base =
+                                self.reserve_direct_call_service_slots(args_frame_top, &arg_slots)?;
                             for (i, slot) in arg_slots.iter().enumerate() {
                                 self.load_slot_to_reg(R11, *slot);
                                 let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
@@ -5898,10 +5849,9 @@ impl Compiler {
 
                         let args_base_offset = pre_pop_spill;
                         if n > 0 {
-                            let Some(args_end) =
-                                self.checked_spill_range_end(args_base_offset, n)
+                            let Some(args_end) = self.checked_spill_range_end(args_base_offset, n)
                             else {
-                                return WalkStep::Return( false);
+                                return WalkStep::Return(false);
                             };
                             self.next_spill_offset = args_end;
                             // Store args in reverse offset order (same fix
@@ -6098,12 +6048,11 @@ impl Compiler {
                             info_ref.class_name,
                             info_ref.method_name,
                         );
-                        let inline_virtual_ic_allowed =
-                            crate::direct_jit_callee_calls_enabled()
-                                && sp_inline_ic_enabled()
-                                && site_allowed
-                                && !regex_backtracking_frame
-                                && !protected_precise_handler_call;
+                        let inline_virtual_ic_allowed = crate::direct_jit_callee_calls_enabled()
+                            && sp_inline_ic_enabled()
+                            && site_allowed
+                            && !regex_backtracking_frame
+                            && !protected_precise_handler_call;
                         let pic_inline = inline_virtual_ic_allowed
                             && sp_inline_pic_enabled()
                             && pic_ptr.is_some()
@@ -6709,9 +6658,7 @@ impl Compiler {
                             // .noctx: Java args begin at ARG_REGS[0].
                             let noctx_off = self.buf.pos();
                             let noctx_rel = (noctx_off as i64) - (noctx_patch as i64 + 4);
-                            debug_assert!(
-                                (i32::MIN as i64..=i32::MAX as i64).contains(&noctx_rel)
-                            );
+                            debug_assert!((i32::MIN as i64..=i32::MAX as i64).contains(&noctx_rel));
                             self.buf.try_patch_i32(noctx_patch, noctx_rel as i32).ok();
                             for i in 0..n {
                                 let spill_off = args_base_offset + ((n - 1 - i) as i32) * 8;
@@ -6721,9 +6668,7 @@ impl Compiler {
                             // .call
                             let call_off = self.buf.pos();
                             let call_rel = (call_off as i64) - (ctx_call_patch as i64 + 4);
-                            debug_assert!(
-                                (i32::MIN as i64..=i32::MAX as i64).contains(&call_rel)
-                            );
+                            debug_assert!((i32::MIN as i64..=i32::MAX as i64).contains(&call_rel));
                             self.buf.try_patch_i32(ctx_call_patch, call_rel as i32).ok();
 
                             // SECURITY FIX (V1): same hardening as the
@@ -6835,8 +6780,7 @@ impl Compiler {
                             // RAX alone; the imm64-via-RAX fallback
                             // would overwrite RAX anyway, but that
                             // happens after we've already stored).
-                            let pic_arg: i64 =
-                                pic_ptr.map(|p| p as *const _ as i64).unwrap_or(0); // Cast: function pointer for JIT call target
+                            let pic_arg: i64 = pic_ptr.map(|p| p as *const _ as i64).unwrap_or(0); // Cast: function pointer for JIT call target
                             #[cfg(target_os = "windows")]
                             {
                                 // 5th arg at [RSP + 32]
@@ -6991,7 +6935,6 @@ impl Compiler {
         _branch_targets: &[bool],
     ) -> WalkStep {
         match op {
-
             // invokedynamic — unconditional deopt to the interpreter.
             //
             // This instruction is never actually JIT-executed: rather than
@@ -7027,7 +6970,7 @@ impl Compiler {
                     // exactly like every other CP-resolved metadata miss
                     // in this backend (see 0x12/0x13 above) — never emit
                     // unsound code for an unresolvable call site.
-                    return WalkStep::Return( false);
+                    return WalkStep::Return(false);
                 };
 
                 self.flush_scratch_registers();
@@ -7056,8 +6999,7 @@ impl Compiler {
                 // `kind` tag), so ONE call sequence and one entry serve
                 // both. Every other bootstrap kind still falls through to
                 // the trap.
-                let bridge_entry =
-                    self.direct_helpers.indy_bridge;
+                let bridge_entry = self.direct_helpers.indy_bridge;
                 if bridge_site != 0 && bridge_entry != 0 && ret_type != b'V' {
                     if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                         eprintln!("[cratonvm-jitc] indy bridge pc={} args={}", pc, arg_slots);
@@ -7078,8 +7020,7 @@ impl Compiler {
                     let (arg_slots_vec, arg_oops) = self.pop_invoke_args(arg_slots);
                     let post_pop_spill = self.next_spill_offset;
                     if arg_slots > 0 {
-                        let Some(args_end) =
-                            self.checked_spill_range_end(pre_pop_spill, arg_slots)
+                        let Some(args_end) = self.checked_spill_range_end(pre_pop_spill, arg_slots)
                         else {
                             if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                                 eprintln!(
@@ -7087,7 +7028,7 @@ impl Compiler {
                                     pc, pre_pop_spill, arg_slots
                                 );
                             }
-                            return WalkStep::Return( false);
+                            return WalkStep::Return(false);
                         };
                         self.next_spill_offset = args_end;
                         for (i, slot) in arg_slots_vec.iter().enumerate() {
@@ -7216,9 +7157,7 @@ impl Compiler {
                     .is_some_and(|p| !crate::deopt::frame_state_is_resumable(&p.frame_state));
                 if unresumable_trap {
                     if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
-                        eprintln!(
-                            "[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}"
-                        );
+                        eprintln!("[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}");
                     }
                     self.buf.mark_codegen_unencodable("unresumable-indy-trap");
                 }

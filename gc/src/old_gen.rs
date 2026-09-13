@@ -1888,9 +1888,15 @@ mod tests {
         let used = og.used();
         // SAFETY: `[p + 1024, p + 4096)` is the untouched tail of the block just carved.
         unsafe { og.release_unused_tail(p.add(1024), 3072) };
-        assert_eq!(og.reclaim_epoch(), epoch, "a never-used tail is not a reclaim");
+        assert_eq!(
+            og.reclaim_epoch(),
+            epoch,
+            "a never-used tail is not a reclaim"
+        );
         assert_eq!(og.used(), used - 3072);
-        let again = og.alloc(3072, 8).expect("the tail is a servable free block");
+        let again = og
+            .alloc(3072, 8)
+            .expect("the tail is a servable free block");
         assert_eq!(again as usize, p as usize + 1024);
     }
 

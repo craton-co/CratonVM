@@ -365,13 +365,13 @@ fn jndi_put_binding(
     let mut bindings = bindings;
     if size >= cap {
         let new_cap = cap * 2;
-    // GC: the grow path ALLOCATES, and everything it then touches is a Rust
-    // local holding a pre-allocation address — the old array it copies from,
-    // the element it stores, and the receiver it publishes into. Under a
-    // moving collector those go stale; under the Generational non-moving young
-    // sweep an object nothing else roots is ZEROED in place. Root them for the
-    // duration of the grow and re-read each one at its use. See
-    // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
+        // GC: the grow path ALLOCATES, and everything it then touches is a Rust
+        // local holding a pre-allocation address — the old array it copies from,
+        // the element it stores, and the receiver it publishes into. Under a
+        // moving collector those go stale; under the Generational non-moving young
+        // sweep an object nothing else roots is ZEROED in place. Root them for the
+        // duration of the grow and re-read each one at its use. See
+        // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
         // TWO allocations here, so even `new_keys` is stale by the time
         // `new_vals` returns.
         let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
@@ -959,21 +959,15 @@ fn stax_create_event_reader(
     let events_h = scope.root(events_arr_obj);
 
     // START_DOCUMENT event
-    let start_doc = try_alloc_concurrent_synthetic(
-        &mut *scope,
-        "javax/xml/stream/events/XMLEvent",
-        3,
-    )?;
+    let start_doc =
+        try_alloc_concurrent_synthetic(&mut *scope, "javax/xml/stream/events/XMLEvent", 3)?;
     scope.set_field(start_doc, 0, Value::Int(STAX_START_DOCUMENT));
     let events_arr = scope.get(&events_h);
     scope.set_array_element(events_arr, 0, Value::Object(Some(start_doc)));
 
     for (i, ev) in events.iter().enumerate() {
-        let event_obj = try_alloc_concurrent_synthetic(
-            &mut *scope,
-            "javax/xml/stream/events/XMLEvent",
-            3,
-        )?;
+        let event_obj =
+            try_alloc_concurrent_synthetic(&mut *scope, "javax/xml/stream/events/XMLEvent", 3)?;
         let event_h = scope.root(event_obj);
         scope.set_field(event_obj, 0, Value::Int(ev.event_type));
         if let Some(ref name) = ev.name {
@@ -991,18 +985,14 @@ fn stax_create_event_reader(
         scope.set_array_element(events_arr, i + 1, Value::Object(Some(event_obj)));
     }
 
-    let end_doc = try_alloc_concurrent_synthetic(
-        &mut *scope,
-        "javax/xml/stream/events/XMLEvent",
-        3,
-    )?;
+    let end_doc =
+        try_alloc_concurrent_synthetic(&mut *scope, "javax/xml/stream/events/XMLEvent", 3)?;
     scope.set_field(end_doc, 0, Value::Int(STAX_END_DOCUMENT));
     let events_arr = scope.get(&events_h);
     scope.set_array_element(events_arr, event_count + 1, Value::Object(Some(end_doc)));
 
     let total = (event_count + 2) as i32;
-    let reader =
-        try_alloc_concurrent_synthetic(&mut *scope, "javax/xml/stream/XMLEventReader", 3)?;
+    let reader = try_alloc_concurrent_synthetic(&mut *scope, "javax/xml/stream/XMLEventReader", 3)?;
     let events_arr = scope.get(&events_h);
     scope.set_field(reader, 0, Value::Object(Some(events_arr)));
     scope.set_field(reader, 1, Value::Int(total));
@@ -1027,21 +1017,15 @@ fn stax_create_stream_reader(
     let events_h = scope.root(events_arr_obj);
 
     // START_DOCUMENT event
-    let start_doc = try_alloc_concurrent_synthetic(
-        &mut *scope,
-        "javax/xml/stream/events/XMLEvent",
-        3,
-    )?;
+    let start_doc =
+        try_alloc_concurrent_synthetic(&mut *scope, "javax/xml/stream/events/XMLEvent", 3)?;
     scope.set_field(start_doc, 0, Value::Int(STAX_START_DOCUMENT));
     let events_arr = scope.get(&events_h);
     scope.set_array_element(events_arr, 0, Value::Object(Some(start_doc)));
 
     for (i, ev) in events.iter().enumerate() {
-        let event_obj = try_alloc_concurrent_synthetic(
-            &mut *scope,
-            "javax/xml/stream/events/XMLEvent",
-            3,
-        )?;
+        let event_obj =
+            try_alloc_concurrent_synthetic(&mut *scope, "javax/xml/stream/events/XMLEvent", 3)?;
         let event_h = scope.root(event_obj);
         scope.set_field(event_obj, 0, Value::Int(ev.event_type));
         if let Some(ref name) = ev.name {
@@ -1059,11 +1043,8 @@ fn stax_create_stream_reader(
         scope.set_array_element(events_arr, i + 1, Value::Object(Some(event_obj)));
     }
 
-    let end_doc = try_alloc_concurrent_synthetic(
-        &mut *scope,
-        "javax/xml/stream/events/XMLEvent",
-        3,
-    )?;
+    let end_doc =
+        try_alloc_concurrent_synthetic(&mut *scope, "javax/xml/stream/events/XMLEvent", 3)?;
     scope.set_field(end_doc, 0, Value::Int(STAX_END_DOCUMENT));
     let events_arr = scope.get(&events_h);
     scope.set_array_element(events_arr, event_count + 1, Value::Object(Some(end_doc)));
@@ -1654,11 +1635,8 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
             for (i, name) in charsets.iter().enumerate() {
                 let key = scope.create_string(name);
                 let key_h = scope.root(key);
-                let charset = try_alloc_concurrent_synthetic(
-                    &mut *scope,
-                    "java/nio/charset/Charset",
-                    2,
-                )?;
+                let charset =
+                    try_alloc_concurrent_synthetic(&mut *scope, "java/nio/charset/Charset", 2)?;
                 let charset_h = scope.root(charset);
                 let name_s = scope.create_string(name);
                 let charset = scope.get(&charset_h);

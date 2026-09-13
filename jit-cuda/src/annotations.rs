@@ -419,8 +419,7 @@ fn as_enum_const_name<'a>(value: &'a ElementValue, cp: &'a ConstantPool) -> Opti
 /// Named here rather than inline in the match so
 /// `rust_enum_names_match_the_java_definitions` can compare this list
 /// against the compiled `.class` file and fail when the two drift.
-pub(crate) const GRID_SHAPE_NAMES: [&str; 3] =
-    ["ELEMENTWISE", "ROW_PER_THREAD", "BLOCK_REDUCTION"];
+pub(crate) const GRID_SHAPE_NAMES: [&str; 3] = ["ELEMENTWISE", "ROW_PER_THREAD", "BLOCK_REDUCTION"];
 
 fn parse_grid_shape(value: &ElementValue, cp: &ConstantPool) -> GridShape {
     match as_enum_const_name(value, cp) {
@@ -467,7 +466,6 @@ pub(crate) fn parse_admission_flags(value: &ElementValue, cp: &ConstantPool) -> 
     }
     out
 }
-
 
 fn parse_gpu_kernel(ann: &Annotation, cp: &ConstantPool) -> GpuKernelAttrs {
     let mut out = GpuKernelAttrs::default();
@@ -600,8 +598,8 @@ mod tests {
                 );
                 continue;
             }
-            let bytes = std::fs::read(&path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let bytes =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             let class_file = cratonvm_reader::class_reader::read_class(&bytes)
                 .unwrap_or_else(|e| panic!("parse {}: {e:?}", path.display()));
             // An enum's constants are its `static final` fields typed as
@@ -618,12 +616,10 @@ mod tests {
                 .map(|f| f.name.to_string())
                 .collect();
             java_names.sort();
-            let mut rust_sorted: Vec<String> =
-                rust_names.iter().map(|s| s.to_string()).collect();
+            let mut rust_sorted: Vec<String> = rust_names.iter().map(|s| s.to_string()).collect();
             rust_sorted.sort();
             assert_eq!(
-                java_names,
-                rust_sorted,
+                java_names, rust_sorted,
                 "craton.gpu.{class} and this crate's parser disagree about the \
                  constant set.\n  Java: {java_names:?}\n  Rust: {rust_sorted:?}\n\
                  A name only Java has is a value this crate will not recognise; \
@@ -898,5 +894,4 @@ mod tests {
             AdmissionFlags::STRICT
         );
     }
-
 }

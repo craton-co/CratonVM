@@ -23,7 +23,6 @@ use crate::{unsafe_obj, unsafe_offset};
 // Native implementations
 // ---------------------------------------------------------------------------
 
-
 /// `Unsafe.loadLoadFence()` — ensures that loads before the fence are not
 /// reordered with loads after it. Maps to an acquire fence.
 fn native_unsafe_load_load_fence(

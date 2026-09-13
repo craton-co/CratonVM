@@ -1448,10 +1448,10 @@ use backend_stub as backend;
 // `cuda-bindings` each generate them from the vendor's `cuda.h` -- but
 // they are distinct Rust paths, so `stream.rs`, `event.rs` and
 // `graph.rs` name them through this alias rather than a vendor path.
-#[cfg(feature = "cuda")]
-pub(crate) use cudarc::driver::sys as drvsys;
 #[cfg(feature = "cuda-oxide")]
 pub(crate) use backend_oxide::sys as drvsys;
+#[cfg(feature = "cuda")]
+pub(crate) use cudarc::driver::sys as drvsys;
 
 pub mod critical;
 pub mod event;

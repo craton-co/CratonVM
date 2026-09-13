@@ -3383,11 +3383,7 @@ mod tests {
 
         // The conversion `sweep_young_non_moving` actually performs.
         assert_eq!(
-            skip_spans_hold_no_root(
-                &[(base + offset, base + offset + size)],
-                &[root],
-                "test"
-            ),
+            skip_spans_hold_no_root(&[(base + offset, base + offset + size)], &[root], "test"),
             1,
             "converted to absolute [start, end), the same span matches"
         );

@@ -203,8 +203,12 @@ pub(crate) struct DeviceContextInner {
 impl DeviceContextInner {
     pub(crate) fn new(device_ordinal: u32) -> Result<Self> {
         let ctx = CudaContext::new(device_ordinal as usize).map_err(map_err("cuCtxCreate"))?;
-        let copy_h2d = ctx.new_stream().map_err(map_err("cuStreamCreate copy_h2d"))?;
-        let copy_d2h = ctx.new_stream().map_err(map_err("cuStreamCreate copy_d2h"))?;
+        let copy_h2d = ctx
+            .new_stream()
+            .map_err(map_err("cuStreamCreate copy_h2d"))?;
+        let copy_d2h = ctx
+            .new_stream()
+            .map_err(map_err("cuStreamCreate copy_d2h"))?;
         let event_pool = Arc::new(EventPool {
             free: std::sync::Mutex::new(Vec::new()),
             ctx: ctx.clone(),
@@ -235,7 +239,9 @@ impl DeviceContextInner {
     }
 
     pub(crate) fn bind_to_thread(&self) -> Result<()> {
-        self.ctx.bind_to_thread().map_err(map_err("cuCtxSetCurrent"))
+        self.ctx
+            .bind_to_thread()
+            .map_err(map_err("cuCtxSetCurrent"))
     }
 
     /// The handle whose context owns everything this backend allocates.
@@ -853,9 +859,12 @@ pub(crate) mod drv {
         let mut ev: sys::CUevent = std::ptr::null_mut();
         // SAFETY: `ev` is a live out-param for the duration of the call.
         unsafe {
-            sys::cuEventCreate(&mut ev, sys::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING as u32)
-                .result()
-                .map_err(|e| DeviceError::Driver(format!("cuEventCreate: {e}")))?;
+            sys::cuEventCreate(
+                &mut ev,
+                sys::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING as u32,
+            )
+            .result()
+            .map_err(|e| DeviceError::Driver(format!("cuEventCreate: {e}")))?;
         }
         Ok(ev)
     }

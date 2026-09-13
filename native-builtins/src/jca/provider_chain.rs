@@ -1651,18 +1651,33 @@ pub(crate) fn build_third_party_engine(
     // `[_ => default]` shape this function's own doc names as the defect it
     // exists to remove. They are still refusals; they are no longer silent.
     if third_party_service_class(Some(provider), type_str, algo).is_none() {
-        tracing::warn!(provider, type_str, algo, "jca chain: no third-party service class");
+        tracing::warn!(
+            provider,
+            type_str,
+            algo,
+            "jca chain: no third-party service class"
+        );
         return Ok(None);
     }
     let Some(impl_result) = build_jca_impl(ctx, provider, type_str, algo) else {
-        tracing::warn!(provider, type_str, algo, "jca chain: build_jca_impl declined");
+        tracing::warn!(
+            provider,
+            type_str,
+            algo,
+            "jca chain: build_jca_impl declined"
+        );
         return Ok(None);
     };
     let engine = match impl_result? {
         Some(Value::Object(Some(o))) => o,
         other => {
-            tracing::warn!(provider, type_str, algo, ?other,
-                "jca chain: the impl class did not construct an object");
+            tracing::warn!(
+                provider,
+                type_str,
+                algo,
+                ?other,
+                "jca chain: the impl class did not construct an object"
+            );
             return Ok(None);
         }
     };
@@ -2302,7 +2317,12 @@ fn seed_direct_native_engine_services() {
     // is reached because `kf_get_instance` falls to `build_real_key_factory`
     // for a name `kf_algo_idx` refuses, and the `Signature` through
     // `signature::dsa_real_spi_class`'s `SIG_HSS_LMS` arm.
-    put_service(SUN, "KeyFactory", "HSS/LMS", "sun.security.provider.HSS$KeyFactoryImpl");
+    put_service(
+        SUN,
+        "KeyFactory",
+        "HSS/LMS",
+        "sun.security.provider.HSS$KeyFactoryImpl",
+    );
     put_service(SUN, "Signature", "HSS/LMS", "sun.security.provider.HSS");
     // `Configuration.JavaLoginConfig`, the JAAS login-configuration provider.
     // `javax.security.auth.login.Configuration.getInstance` is not intercepted
@@ -2511,9 +2531,7 @@ fn seed_direct_native_engine_services() {
                 JCE,
                 "Cipher",
                 &format!("{size}/{mode}/{padding}"),
-                &format!(
-                    "com.sun.crypto.provider.KeyWrapCipher$AES{bits}_{mode}_{padding}"
-                ),
+                &format!("com.sun.crypto.provider.KeyWrapCipher$AES{bits}_{mode}_{padding}"),
             );
         }
     }
@@ -4156,9 +4174,8 @@ fn seed_sunec_services() {
     // by construction, and `every_ecdsa_family_signature_name_maps_to_an_spi_class`
     // pins it.
     for algorithm in crate::jca::signature::ECDSA_FAMILY_SIGNATURE_NAMES {
-        let cls = crate::jca::signature::ecdsa_family_service_class(algorithm).expect(
-            "ECDSA_FAMILY_SIGNATURE_NAMES is exactly ecdsa_family_spi_class's domain",
-        );
+        let cls = crate::jca::signature::ecdsa_family_service_class(algorithm)
+            .expect("ECDSA_FAMILY_SIGNATURE_NAMES is exactly ecdsa_family_spi_class's domain");
         put_service(P, "Signature", algorithm, &cls);
     }
     // `KeyAgreement` — four services this VM has been SERVING all along and
@@ -4419,9 +4436,7 @@ fn seed_sunjce_delegated_cipher_services() {
                 P,
                 "Cipher",
                 &format!("PBEWithHmac{algo_hash}AndAES_{keysize}"),
-                &format!(
-                    "com.sun.crypto.provider.PBES2Core$Hmac{class_hash}AndAES_{keysize}"
-                ),
+                &format!("com.sun.crypto.provider.PBES2Core$Hmac{class_hash}AndAES_{keysize}"),
             );
         }
     }
@@ -4565,7 +4580,10 @@ fn seed_sunjce_pbe_mac_services() {
     }
     for (algo, class) in [
         ("SslMacMD5", "com.sun.crypto.provider.SslMacCore$SslMacMD5"),
-        ("SslMacSHA1", "com.sun.crypto.provider.SslMacCore$SslMacSHA1"),
+        (
+            "SslMacSHA1",
+            "com.sun.crypto.provider.SslMacCore$SslMacSHA1",
+        ),
     ] {
         put_service(P, "Mac", algo, class);
     }
@@ -4698,7 +4716,12 @@ fn seed_algorithm_parameter_generator_services() {
         "DSA",
         "sun.security.provider.DSAParameterGenerator",
     );
-    put_alias("SUN", "AlgorithmParameterGenerator", "1.2.840.10040.4.1", "DSA");
+    put_alias(
+        "SUN",
+        "AlgorithmParameterGenerator",
+        "1.2.840.10040.4.1",
+        "DSA",
+    );
     put_alias(
         "SUN",
         "AlgorithmParameterGenerator",
@@ -6646,9 +6669,7 @@ pub(crate) fn jdk_service_class(
         }
         None => snapshot()
             .into_iter()
-            .find(|(name, _, _)| {
-                is_jdk(name) && get_service_entry(name, type_str, algo).is_some()
-            })
+            .find(|(name, _, _)| is_jdk(name) && get_service_entry(name, type_str, algo).is_some())
             .map(|(name, _, _)| name)?,
     };
     let entry = get_service_entry(&name, type_str, algo)?;

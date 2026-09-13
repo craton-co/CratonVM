@@ -381,9 +381,10 @@ fn brace_delta(line: &str) -> i32 {
             // A char literal holding a brace. Matched narrowly (three bytes,
             // brace in the middle) so a lifetime such as `&'a T` is never
             // mistaken for a quote that needs closing.
-            b'\'' if i + 2 < b.len()
-                && b[i + 2] == b'\''
-                && (b[i + 1] == b'{' || b[i + 1] == b'}') =>
+            b'\''
+                if i + 2 < b.len()
+                    && b[i + 2] == b'\''
+                    && (b[i + 1] == b'{' || b[i + 1] == b'}') =>
             {
                 i += 3;
                 continue;

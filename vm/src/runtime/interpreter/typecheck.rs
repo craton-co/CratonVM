@@ -2078,7 +2078,10 @@ pub(super) fn synthetic_implements(
         match target_class_name {
             "java/util/Collection" | "java/lang/Iterable" => {
                 if !ends("Map")
-                    && (has("List") || has("Set") || has("Queue") || has("Deque")
+                    && (has("List")
+                        || has("Set")
+                        || has("Queue")
+                        || has("Deque")
                         || has("Collection"))
                 {
                     return true;

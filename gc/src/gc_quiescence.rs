@@ -1669,8 +1669,9 @@ fn arm_pinned_guard() {
     });
 }
 
-static JIT_ROOT_PROVENANCES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, String>>> =
-    std::sync::OnceLock::new();
+static JIT_ROOT_PROVENANCES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, String>>,
+> = std::sync::OnceLock::new();
 
 fn jit_root_provenances() -> &'static std::sync::Mutex<std::collections::HashMap<usize, String>> {
     JIT_ROOT_PROVENANCES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -1811,7 +1812,8 @@ static XT_CYCLE_PINNED_JIT_ROOTS: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn xt_cycle_pin_set() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
-    XT_CYCLE_PINNED_JIT_ROOTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    XT_CYCLE_PINNED_JIT_ROOTS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Pin `addrs` for the remainder of this collection.
@@ -2171,7 +2173,6 @@ pub fn publish_xt_helper_window(windows: u64, roots: u64) {
     XT_HW_ROOTS_LAST_CYCLE.fetch_add(roots, Ordering::Relaxed);
 }
 
-
 /// `(passes, taken_over, unclassified, roots, hw_windows, hw_roots)` for the
 /// cycle currently in progress.
 pub fn xt_cycle_coverage() -> (u64, u64, u64, u64, u64, u64) {
@@ -2353,7 +2354,11 @@ mod tests {
         note_allocated_range(0x2000, 0x2800);
 
         assert_eq!(was_vacated(0x2000), None, "chunk start must be forgotten");
-        assert_eq!(was_vacated(0x2100), None, "chunk interior must be forgotten");
+        assert_eq!(
+            was_vacated(0x2100),
+            None,
+            "chunk interior must be forgotten"
+        );
         assert_eq!(
             was_vacated_on(0x3000),
             Some((0xb000, 11)),
@@ -3205,8 +3210,7 @@ static PER_TID_JIT_DEPTH: std::sync::OnceLock<
     >,
 > = std::sync::OnceLock::new();
 
-fn per_tid_jit_depth()
--> &'static std::sync::RwLock<
+fn per_tid_jit_depth() -> &'static std::sync::RwLock<
     std::collections::HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 > {
     PER_TID_JIT_DEPTH.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
@@ -3274,8 +3278,8 @@ static PER_TID_SHADOW_ADDR: std::sync::OnceLock<
     std::sync::RwLock<std::collections::HashMap<u32, (usize, usize, usize)>>,
 > = std::sync::OnceLock::new();
 
-fn per_tid_shadow_addr()
--> &'static std::sync::RwLock<std::collections::HashMap<u32, (usize, usize, usize)>> {
+fn per_tid_shadow_addr(
+) -> &'static std::sync::RwLock<std::collections::HashMap<u32, (usize, usize, usize)>> {
     PER_TID_SHADOW_ADDR.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 

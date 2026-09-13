@@ -1991,8 +1991,7 @@ mod tests {
         let (addr, _) = layout_replace_epoch_guard();
         assert!(!addr.is_null(), "a JIT site has an address to bake");
         assert_ne!(
-            addr,
-            &LAYOUT_REPLACE_EPOCH_IMAGE as *const std::sync::atomic::AtomicU32 as *const u32,
+            addr, &LAYOUT_REPLACE_EPOCH_IMAGE as *const std::sync::atomic::AtomicU32 as *const u32,
             "the guarded counter must be the leaked heap cell, not the `.data` one",
         );
         // JIT code reads it as one aligned 32-bit load; nothing else makes
@@ -2000,7 +1999,10 @@ mod tests {
         assert_eq!(addr as usize % 4, 0, "the counter is 4-byte aligned");
         // And it is STABLE, because compiled code bakes it.
         let (again, _) = layout_replace_epoch_guard();
-        assert_eq!(addr, again, "the baked address may not move under a compile");
+        assert_eq!(
+            addr, again,
+            "the baked address may not move under a compile"
+        );
     }
 
     /// `HIB-DCAST-LATEPHASE.1`: a legacy (non-compact) object whose `shape`
@@ -2746,7 +2748,10 @@ mod tests {
             let gen = layout_generation();
             let mru = with_class_layout_mru(cid, fc, gen, |l| l.body_size);
             let dense = with_class_layout_scan_cached(cid, fc, gen, |l| l.body_size);
-            assert_eq!(mru, dense, "arms disagree for (class_id {cid}, field_count {fc})");
+            assert_eq!(
+                mru, dense,
+                "arms disagree for (class_id {cid}, field_count {fc})"
+            );
             // Twice, so the second call is served from each arm's cache.
             let mru2 = with_class_layout_mru(cid, fc, gen, |l| l.body_size);
             let dense2 = with_class_layout_scan_cached(cid, fc, gen, |l| l.body_size);
@@ -2762,16 +2767,28 @@ mod tests {
         assert_eq!(probe(3, 2), None, "field_count is part of the key");
         // Re-probe the original count: the slot for class 3 was just overwritten
         // by the (3, 2) negative, so this exercises the flap path.
-        assert_eq!(probe(3, 1), Some(32), "a flapped slot must re-resolve, not go stale");
+        assert_eq!(
+            probe(3, 1),
+            Some(32),
+            "a flapped slot must re-resolve, not go stale"
+        );
         // Past the dense table's index bound. `register_class_layout` refuses
         // ids at or above MAX_DENSE_CLASS_LAYOUTS, so the answer is None on
         // both arms — but it must come back, not hang on a 4-billion resize.
         assert!(SCAN_CACHE_MAX < MAX_DENSE_CLASS_LAYOUTS);
-        assert_eq!(probe(SCAN_CACHE_MAX as u32, 1), None, "past the dense bound");
+        assert_eq!(
+            probe(SCAN_CACHE_MAX as u32, 1),
+            None,
+            "past the dense bound"
+        );
         assert_eq!(probe(u32::MAX, 1), None, "AUTOBOX_CLASS_ID has no layout");
         // A registration bumps the generation and must invalidate the table.
         register_class_layout(FIRST_LAYOUT_DOMAIN, 3, one_ref_layout(4096));
-        assert_eq!(probe(3, 1), Some(4096), "a redefine must not serve the old layout");
+        assert_eq!(
+            probe(3, 1),
+            Some(4096),
+            "a redefine must not serve the old layout"
+        );
         clear_class_layouts();
     }
 
@@ -2828,7 +2845,10 @@ mod tests {
             };
             let mru = run(false);
             let dense = run(true);
-            println!("{ws:>11}   {mru:>13.2}   {dense:>13.2}   {:>8.2}x", mru / dense);
+            println!(
+                "{ws:>11}   {mru:>13.2}   {dense:>13.2}   {:>8.2}x",
+                mru / dense
+            );
         }
         clear_class_layouts();
     }

@@ -2277,7 +2277,10 @@ fn make_prepared_value_layout(
         }
     };
     if let Some((size_slot, align_slot, name_slot)) = named {
-        shared.mem.heap.set_field(obj, size_slot, Value::Long(byte_size));
+        shared
+            .mem
+            .heap
+            .set_field(obj, size_slot, Value::Long(byte_size));
         shared
             .mem
             .heap
@@ -2857,7 +2860,6 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         set_static_by_name(field_name, value)
     };
 
-
     match class_name {
         "jdk/internal/misc/UnsafeConstants" => {
             // Inject the platform constants HotSpot would set natively at
@@ -3041,12 +3043,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 // proved that shape round-trips byte-identically to HotSpot.
                 let mirror = super::get_or_create_class_mirror(shared, class_id);
                 let mut latch = 0;
-                latch += set_static_if_zero("MEMORY_ACCESS_WARNED_OFFSET", Value::Long(offset))
-                    as i32;
-                latch += set_static_if_zero(
-                    "MEMORY_ACCESS_WARNED_BASE",
-                    Value::Object(Some(mirror)),
-                ) as i32;
+                latch +=
+                    set_static_if_zero("MEMORY_ACCESS_WARNED_OFFSET", Value::Long(offset)) as i32;
+                latch +=
+                    set_static_if_zero("MEMORY_ACCESS_WARNED_BASE", Value::Object(Some(mirror)))
+                        as i32;
                 note_fixup_outcome(
                     "sun.misc.Unsafe memory-access latch",
                     i64::from(latch),

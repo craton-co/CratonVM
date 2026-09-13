@@ -2066,7 +2066,10 @@ cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
 /// `org.h2.test.store.TestRandomMapOps --Xmx 256m` goes back to
 /// `AssertionError: (1810, null)` in 12-23 s. Clear, it records like the
 /// general path and the workload is clean.
-cached_is_set!(no_door_receiver_record, "CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD");
+cached_is_set!(
+    no_door_receiver_record,
+    "CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD"
+);
 
 /// `CRATONVM_JIT_NO_DOOR_RECV_MEMO=1` -- make the door's receiver recording do
 /// the full `ProfileStore` lookup on EVERY call instead of reusing a memoized
@@ -2097,7 +2100,10 @@ cached_is_set!(invoke_fast_door_opt_in, "CRATONVM_JIT_INVOKE_FAST_DOOR");
 /// per-method invocation counter in place of the sharded profile-store
 /// lock). Off routes every cache hit through the general dispatcher.
 /// Token: `CRATONVM_JIT=-nonvirtual-fast-door`.
-cached_is_set!(no_nonvirtual_fast_door, "CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR");
+cached_is_set!(
+    no_nonvirtual_fast_door,
+    "CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR"
+);
 
 /// `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` -- return a frame's buffers to the
 /// thread pools on every return and build the next callee's frame from
@@ -2121,7 +2127,10 @@ cached_is_set!(no_frame_emplace, "CRATONVM_JIT_NO_FRAME_EMPLACE");
 /// heap `Vec`s. On, the inline-cache entry answers all of that from the
 /// `DescriptorFacts` it was filled with. Token:
 /// `CRATONVM_JIT=-cached-native-facts`.
-cached_is_set!(no_cached_native_facts, "CRATONVM_JIT_NO_CACHED_NATIVE_FACTS");
+cached_is_set!(
+    no_cached_native_facts,
+    "CRATONVM_JIT_NO_CACHED_NATIVE_FACTS"
+);
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --

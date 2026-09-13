@@ -18,7 +18,7 @@
 //! same constructor so they cannot disagree about which addresses are
 //! representable. The `label` field is what tells their warnings apart.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
@@ -84,7 +84,6 @@ pub(crate) fn zgc_start_bits_enabled_by_default() -> bool {
         None => true,
     }
 }
-
 
 /// The membership structure behind [`ZgcRealHeap::registry`], plus its kill
 /// switch.
@@ -471,7 +470,13 @@ impl ZObjectStartsSnapshot {
     /// a proof" note on `ZObjectStartBits`), and a set that is not
     /// address-ordered cannot be partitioned by address anyway.
     #[inline]
-    pub(crate) fn for_each_base_in_words(&self, w0: usize, w1: usize, floor: usize, mut f: impl FnMut(usize)) {
+    pub(crate) fn for_each_base_in_words(
+        &self,
+        w0: usize,
+        w1: usize,
+        floor: usize,
+        mut f: impl FnMut(usize),
+    ) {
         let w1 = w1.min(self.words.len());
         for w in w0..w1 {
             let mut word = self.words[w];
@@ -579,4 +584,3 @@ impl ZObjectStartsSnapshot {
         out
     }
 }
-

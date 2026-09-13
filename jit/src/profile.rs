@@ -2126,12 +2126,19 @@ mod tests {
         let d = cratonvm_jit_api::invoc_key_parts(7, "Aa", "()V");
         let e = cratonvm_jit_api::invoc_key_parts(7, "BB", "()V");
         assert_ne!(a, b);
-        assert_ne!(a, c, "the name/descriptor boundary is part of the fingerprint");
+        assert_ne!(
+            a, c,
+            "the name/descriptor boundary is part of the fingerprint"
+        );
         assert_ne!(d, e);
         assert_eq!((a >> 64) as u32, 7, "the class id stays in the high half");
         let store = ProfileStore::new();
         store.increment_invocation(a);
-        assert_eq!(store.increment_invocation(b), 1, "an overload starts its own count");
+        assert_eq!(
+            store.increment_invocation(b),
+            1,
+            "an overload starts its own count"
+        );
     }
 
     /// `invalidate_class` must sweep *every* shard: because the shard index

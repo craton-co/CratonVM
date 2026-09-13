@@ -2800,10 +2800,9 @@ fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -
     // name.
     let arr = match args.get(1) {
         Some(Value::Object(None)) => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(None),
@@ -5907,9 +5906,7 @@ fn native_heap_byte_buffer_init_array_offset_len(
         // constructor is `invocations: 0` unarmed, because `servlet.rs`'s
         // `wrap` owns that slot and never calls it.
         return Err(RuntimeError::IllegalArgumentException {
-            message: format!(
-                "offset {offset}, length {len}, array length {array_len}"
-            ),
+            message: format!("offset {offset}, length {len}, array length {array_len}"),
         }
         .into());
     }
@@ -7756,7 +7753,6 @@ fn publish_real_system_props(ctx: &mut dyn NativeContext) -> bool {
     ctx.set_static_field_by_name("java/lang/System", "props", Value::Object(Some(props)));
     true
 }
-
 
 /// Publish `java.lang.ClassLoader.scl` — the system class loader static.
 ///
@@ -26693,7 +26689,10 @@ fn native_protection_domain_implies(
     // `new ProtectionDomain(null, null).implies(new AllPermission())` is
     // `false` on HotSpot and was `true` here.
     if let Some(Value::Object(Some(pd))) = args.first() {
-        if matches!(ctx.get_field_by_name(*pd, "staticPermissions"), Value::Int(1)) {
+        if matches!(
+            ctx.get_field_by_name(*pd, "staticPermissions"),
+            Value::Int(1)
+        ) {
             if matches!(ctx.get_field_by_name(*pd, "hasAllPerm"), Value::Int(1)) {
                 return Ok(Some(Value::Int(1)));
             }
@@ -29148,7 +29147,9 @@ fn printstream_encode(ctx: &mut dyn NativeContext, args: &[Value], text: &str) -
                 None | Some("UTF-8") => None,
                 Some(canon) => {
                     let units: Vec<u16> = text.encode_utf16().collect();
-                    Some(cratonvm_native_api::charset::encode_chars_lossy(canon, &units))
+                    Some(cratonvm_native_api::charset::encode_chars_lossy(
+                        canon, &units,
+                    ))
                 }
             }
         }
@@ -35019,13 +35020,13 @@ fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, mut this: ObjectRef, elem: 
     let cap = ctx.array_length(arr);
     if size >= cap {
         let new_cap = (cap * 2).max(16);
-    // GC: the grow path ALLOCATES, and everything it then touches is a Rust
-    // local holding a pre-allocation address — the old array it copies from,
-    // the element it stores, and the receiver it publishes into. Under a
-    // moving collector those go stale; under the Generational non-moving young
-    // sweep an object nothing else roots is ZEROED in place. Root them for the
-    // duration of the grow and re-read each one at its use. See
-    // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
+        // GC: the grow path ALLOCATES, and everything it then touches is a Rust
+        // local holding a pre-allocation address — the old array it copies from,
+        // the element it stores, and the receiver it publishes into. Under a
+        // moving collector those go stale; under the Generational non-moving young
+        // sweep an object nothing else roots is ZEROED in place. Root them for the
+        // duration of the grow and re-read each one at its use. See
+        // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
         let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
         let this_h = scope.root(this);
         let arr_h = scope.root(arr);
@@ -38754,7 +38755,8 @@ fn native_std_charset_ascii(ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
 }
 fn native_std_charset_latin1(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
-        ctx, "ISO-8859-1",
+        ctx,
+        "ISO-8859-1",
     )?))))
 }
 

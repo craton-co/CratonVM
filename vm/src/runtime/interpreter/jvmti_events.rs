@@ -293,7 +293,11 @@ pub(crate) fn install_cached_frame(
     // Only `execute_invokestatic_cached` charges the phase accounting, and
     // `now()` is a relaxed load even when the instrument is off. The other
     // four call sites should not pay for an instrument they do not feed.
-    let ph_t0 = if charge_phases { invoke_phases::now() } else { 0 };
+    let ph_t0 = if charge_phases {
+        invoke_phases::now()
+    } else {
+        0
+    };
     let depth_before = thread.frames.len();
 
     if crate::runtime::env_cache::no_frame_emplace() {
@@ -306,7 +310,11 @@ pub(crate) fn install_cached_frame(
         );
         frame.monitor_on_exit = monitor_obj;
         trace_frame_push(trace_tag, depth_before, &frame);
-        let ph_t1 = if charge_phases { invoke_phases::now() } else { 0 };
+        let ph_t1 = if charge_phases {
+            invoke_phases::now()
+        } else {
+            0
+        };
         // `push_frame_and_fire_entry` harvests the retired slot, so this arm
         // also turns slot reuse off for the general dispatchers — which is
         // exactly the state they were in before this change.
@@ -322,7 +330,11 @@ pub(crate) fn install_cached_frame(
             .frames
             .push_cached_value_reusing(Arc::clone(&cached), args)
     {
-        let ph_t1 = if charge_phases { invoke_phases::now() } else { 0 };
+        let ph_t1 = if charge_phases {
+            invoke_phases::now()
+        } else {
+            0
+        };
         install_tail(shared, thread, monitor_obj, trace_tag, depth_before);
         site_stats::bump(site_stats::INSTALL_REUSE);
         charge_install(charge_phases, ph_t0, ph_t1);
@@ -342,7 +354,11 @@ pub(crate) fn install_cached_frame(
     thread
         .frames
         .emplace_cached_compact(cached, locals, kinds, stack, eff_max_locals);
-    let ph_t1 = if charge_phases { invoke_phases::now() } else { 0 };
+    let ph_t1 = if charge_phases {
+        invoke_phases::now()
+    } else {
+        0
+    };
     install_tail(shared, thread, monitor_obj, trace_tag, depth_before);
     site_stats::bump(site_stats::INSTALL_EMPLACE);
     charge_install(charge_phases, ph_t0, ph_t1);

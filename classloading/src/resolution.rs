@@ -1486,7 +1486,11 @@ pub fn pc_key_enabled() -> bool {
 /// exactly rather than approximating it.
 #[inline]
 fn site_pc(pc: u32) -> u32 {
-    if pc_key_enabled() { pc } else { 0 }
+    if pc_key_enabled() {
+        pc
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1525,7 +1529,11 @@ fn note_invoke_lookup(hit: bool) {
     if !invoke_cache_stats_enabled() {
         return;
     }
-    let c = if hit { &INVOKE_CACHE_HITS } else { &INVOKE_CACHE_MISSES };
+    let c = if hit {
+        &INVOKE_CACHE_HITS
+    } else {
+        &INVOKE_CACHE_MISSES
+    };
     c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -1731,7 +1739,8 @@ impl<JitMethod: Clone> InvokeCache<JitMethod> {
             self.poly_entries.remove(&key);
             return;
         }
-        let matches = |k: &InvokeCacheKey| k.0 == caller_class && k.1 == cp_index && k.2 == is_special;
+        let matches =
+            |k: &InvokeCacheKey| k.0 == caller_class && k.1 == cp_index && k.2 == is_special;
         self.entries.retain(|k, _| !matches(k));
         self.poly_entries.retain(|k, _| !matches(k));
     }
@@ -2509,4 +2518,3 @@ mod tests {
         );
     }
 }
-

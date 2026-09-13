@@ -3050,9 +3050,7 @@ fn load_library_or_throw(
                 return Err(crate::phases_early::throw_jca_exc(
                     ctx,
                     "java/lang/UnsatisfiedLinkError",
-                    &format!(
-                        "Directory separator should not appear in library name: {requested}"
-                    ),
+                    &format!("Directory separator should not appear in library name: {requested}"),
                 ));
             }
         }
@@ -5107,7 +5105,6 @@ pub(crate) fn native_system_init_phase1(
         }
     }
 
-
     /// Give `System.out`/`System.err` the three stream fields the REAL
     /// `PrintStream` bytecode needs.
     ///
@@ -5841,11 +5838,9 @@ pub(crate) fn lookup_define_format_error(
     msg: &str,
 ) -> Option<MethodCallFailed> {
     match typed_define_class_error(class_name, method, msg) {
-        Some(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Linkage(e))) => {
-            Some(MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Linkage(e),
-            ))
-        }
+        Some(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Linkage(e))) => Some(
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Linkage(e)),
+        ),
         // `typed_define_class_error` already re-homes every `ClassFile` variant
         // onto a `Linkage` one (a `ClassFile` variant is UNCATCHABLE), so the
         // arm above is the whole format family.
@@ -6637,7 +6632,8 @@ pub(crate) fn native_classloader_define_class1(
     // parent already has is either an isolating loader doing its job or a
     // delegation that failed, and only the caller chain separates the two.
     if cratonvm_types::flags().loader.dbg_define
-        && cratonvm_types::flags().loader
+        && cratonvm_types::flags()
+            .loader
             .dbg_dupclass_filter
             .as_deref()
             .is_some_and(|f| name.contains(f))

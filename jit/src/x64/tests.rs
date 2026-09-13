@@ -4082,7 +4082,7 @@ fn test_compile_i2f_i2d() {
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     let result = unsafe { compiled.try_call(&[42]).expect("test JIT call") };
     assert_eq!(f32::from_bits(result as u32), 42.0f32); // Cast: JIT ABI convention
-    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+                                                        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe { compiled.try_call(&[-7]).expect("test JIT call") };
     assert_eq!(f32::from_bits(result as u32), -7.0f32); // Cast: JIT ABI convention
 
@@ -4118,7 +4118,7 @@ fn test_compile_i2f_i2d() {
     // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     let result = unsafe { compiled.try_call(&[42]).expect("test JIT call") };
     assert_eq!(f64::from_bits(result as u64), 42.0f64); // Cast: JIT ABI convention
-    // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+                                                        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let result = unsafe { compiled.try_call(&[-100]).expect("test JIT call") };
     assert_eq!(f64::from_bits(result as u64), -100.0f64); // Cast: JIT ABI convention
 }
@@ -9096,7 +9096,7 @@ fn instanceof_inline_fixture(
         0b1, // param_oop_mask: the parameter is a reference
         Vec::new(),
         "T.f:(Ljava/lang/Object;)I", // non-empty ⇒ trusted-oop eligible
-        None, // despec: no VM, so no despeculation verdicts
+        None,                        // despec: no VM, so no despeculation verdicts
         Vec::new(),
         None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
         crate::x64::BackendRequest::default(),
@@ -9116,7 +9116,7 @@ fn fake_typecheck_header(class_id: u32, kind_tags: u8) -> Box<[u64; 8]> {
     );
     let mut words = Box::new([0u64; 8]);
     let base = words.as_mut_ptr() as *mut u8; // Cast: byte view of the header words
-    // SAFETY: `base` addresses 64 owned bytes and both writes are in range.
+                                              // SAFETY: `base` addresses 64 owned bytes and both writes are in range.
     unsafe {
         std::ptr::copy_nonoverlapping(class_id.to_le_bytes().as_ptr(), base, 4);
         *base.add(kind_off) = kind_tags;
@@ -9160,7 +9160,11 @@ fn instanceof_inline_guard_answers_null_and_exact_without_the_helper() {
     // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
     let got = unsafe { compiled.try_call(&[0]).expect("jit call") };
     assert_eq!(got, 0, "null instanceof anything is 0");
-    assert_eq!(HITS.load(Ordering::SeqCst), 0, "null must not reach the helper");
+    assert_eq!(
+        HITS.load(Ordering::SeqCst),
+        0,
+        "null must not reach the helper"
+    );
 
     let exact = fake_typecheck_header(TARGET, 0);
     // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
@@ -9184,7 +9188,11 @@ fn instanceof_inline_guard_answers_null_and_exact_without_the_helper() {
             .expect("jit call")
     };
     assert_eq!(got, 1, "a different class returns the helper's answer");
-    assert_eq!(HITS.load(Ordering::SeqCst), 1, "a different class must call the helper");
+    assert_eq!(
+        HITS.load(Ordering::SeqCst),
+        1,
+        "a different class must call the helper"
+    );
 
     // An ARRAY header carrying the target's id (a reference array records its
     // component's) must not match inline: BUG-JIT-ARRAY-INSTANCEOF-20260726.
@@ -9196,7 +9204,11 @@ fn instanceof_inline_guard_answers_null_and_exact_without_the_helper() {
             .expect("jit call")
     };
     assert_eq!(got, 1, "an array receiver returns the helper's answer");
-    assert_eq!(HITS.load(Ordering::SeqCst), 2, "an array receiver must call the helper");
+    assert_eq!(
+        HITS.load(Ordering::SeqCst),
+        2,
+        "an array receiver must call the helper"
+    );
 }
 
 /// The 1-D primitive-array variant: `o instanceof byte[]` is settled by the
@@ -9242,7 +9254,11 @@ fn instanceof_primitive_array_tag_answers_without_the_helper() {
             .expect("jit call")
     };
     assert_eq!(got, 0, "a tag mismatch returns the helper's answer");
-    assert_eq!(HITS.load(Ordering::SeqCst), 1, "a tag mismatch must call the helper");
+    assert_eq!(
+        HITS.load(Ordering::SeqCst),
+        1,
+        "a tag mismatch must call the helper"
+    );
 }
 
 /// Compile `code` as the method `method_key` names, through the door that
@@ -10486,16 +10502,28 @@ fn test_bytecode_len_invoke() {
     // Verify bytecode length calculation for invoke opcodes
     assert_eq!(bytecode_analysis::step(&[0xb6, 0x00, 0x01], 0), 3); // invokevirtual
     assert_eq!(bytecode_analysis::step(&[0xb7, 0x00, 0x01], 0), 3); // invokespecial
-    assert_eq!(bytecode_analysis::step(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0), 5); // invokeinterface
-                                                                        // Defense-in-depth (same class as the missing-`ldc` desync): the other
-                                                                        // 5-byte ops. invokedynamic is now accepted by `jit_scan` (see the 0xba
-                                                                        // scan/codegen arms); goto_w / jsr_w are still rejected today, but the
-                                                                        // length table must stay correct so a future acceptance can't silently
-                                                                        // desync every PC-stepping walk. Must match the `bytecode_analysis::step`
-                                                                        // twin's `bc_len_five_byte_ops`.
-    assert_eq!(bytecode_analysis::step(&[0xba, 0x00, 0x01, 0x00, 0x00], 0), 5); // invokedynamic
-    assert_eq!(bytecode_analysis::step(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5); // goto_w
-    assert_eq!(bytecode_analysis::step(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5); // jsr_w
+    assert_eq!(
+        bytecode_analysis::step(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0),
+        5
+    ); // invokeinterface
+       // Defense-in-depth (same class as the missing-`ldc` desync): the other
+       // 5-byte ops. invokedynamic is now accepted by `jit_scan` (see the 0xba
+       // scan/codegen arms); goto_w / jsr_w are still rejected today, but the
+       // length table must stay correct so a future acceptance can't silently
+       // desync every PC-stepping walk. Must match the `bytecode_analysis::step`
+       // twin's `bc_len_five_byte_ops`.
+    assert_eq!(
+        bytecode_analysis::step(&[0xba, 0x00, 0x01, 0x00, 0x00], 0),
+        5
+    ); // invokedynamic
+    assert_eq!(
+        bytecode_analysis::step(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0),
+        5
+    ); // goto_w
+    assert_eq!(
+        bytecode_analysis::step(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0),
+        5
+    ); // jsr_w
 }
 
 #[test]
@@ -10509,7 +10537,10 @@ fn test_bytecode_len_wide() {
     // `wide ret <2-byte index>` → 4 bytes (0xa9 = ret).
     assert_eq!(bytecode_analysis::step(&[0xc4, 0xa9, 0x01, 0x00], 0), 4);
     // `wide iinc <2-byte index> <2-byte const>` → 6 bytes (0x84 = iinc).
-    assert_eq!(bytecode_analysis::step(&[0xc4, 0x84, 0x01, 0x00, 0x00, 0x01], 0), 6);
+    assert_eq!(
+        bytecode_analysis::step(&[0xc4, 0x84, 0x01, 0x00, 0x00, 0x01], 0),
+        6
+    );
     // Truncated prefix (no modified-opcode byte): the `pc + 1 < code.len()`
     // bounds check must not panic and falls to the 4-byte form.
     assert_eq!(bytecode_analysis::step(&[0xc4], 0), 4);
@@ -18614,10 +18645,12 @@ fn osr_exit_snapshot_describes_a_reused_slot_that_is_live_at_the_exit() {
     }
     // The artifact-wide half of the contract: no admitted artifact carries an
     // `Unsupported` local in any snapshot.
-    let any_unsupported_local = compiled
-        .deopt_points
-        .iter()
-        .any(|p| p.frame_state.locals.iter().any(|v| matches!(v, FrameValue::Unsupported)));
+    let any_unsupported_local = compiled.deopt_points.iter().any(|p| {
+        p.frame_state
+            .locals
+            .iter()
+            .any(|v| matches!(v, FrameValue::Unsupported))
+    });
     if any_unsupported_local {
         assert!(compiled.osr_exit_policy().is_err());
     }
@@ -18716,20 +18749,20 @@ fn single_pass_baseline_mode_compiles_without_speculative_passes() {
     //  11: aload_0 ; 12: iload_1 ; 13: aaload ; 14: pop
     //  15: iinc 3, 1 ; 18: goto -> 2 ; 21: return
     let code: Vec<u8> = vec![
-        0x03,             // 0: iconst_0
-        0x3e,             // 1: istore_3
-        0x1d,             // 2: iload_3
-        0x1c,             // 3: iload_2
+        0x03, // 0: iconst_0
+        0x3e, // 1: istore_3
+        0x1d, // 2: iload_3
+        0x1c, // 3: iload_2
         0xa2, 0x00, 0x11, // 4: if_icmpge +17 -> 21
-        0x2a,             // 7: aload_0
+        0x2a, // 7: aload_0
         0xc6, 0x00, 0x07, // 8: ifnull +7 -> 15
-        0x2a,             // 11: aload_0
-        0x1b,             // 12: iload_1
-        0x32,             // 13: aaload
-        0x57,             // 14: pop
+        0x2a, // 11: aload_0
+        0x1b, // 12: iload_1
+        0x32, // 13: aaload
+        0x57, // 14: pop
         0x84, 0x03, 0x01, // 15: iinc 3, 1
         0xa7, 0xff, 0xf0, // 18: goto -16 -> 2
-        0xb1,             // 21: return
+        0xb1, // 21: return
         0, 0,
     ];
 
@@ -18827,4 +18860,3 @@ fn single_pass_baseline_mode_compiles_without_speculative_passes() {
     assert!(compiled_compat.code_len() > 0);
     assert!(compiled_baseline.code_len() > 0);
 }
-

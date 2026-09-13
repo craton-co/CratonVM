@@ -51,8 +51,8 @@
 //! cannot tell the two apart except through [`HeapStore::committed_bytes`],
 //! which is the point: nothing else in the crate has to know.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Commit granularity, in bytes.
 ///
@@ -73,15 +73,15 @@ pub const GRANULE: usize = 2 * 1024 * 1024;
 /// change its backing store mid-run.
 fn reserve_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var_os("CRATONVM_GC_RESERVE") {
+    *CACHED.get_or_init(
+        || match cratonvm_types::flags::runtime_var_os("CRATONVM_GC_RESERVE") {
             Some(raw) => {
                 let v = raw.to_string_lossy().trim().to_ascii_lowercase();
                 !matches!(v.as_str(), "0" | "off" | "false" | "no")
             }
             None => true,
-        }
-    })
+        },
+    )
 }
 
 /// Bytes this process has committed across every live heap store. Diagnostics
@@ -1040,9 +1040,17 @@ mod tests {
             return;
         };
         assert!(res.commit_range(0, 1));
-        assert_eq!(res.committed_granules(), 1, "one byte must commit one granule");
+        assert_eq!(
+            res.committed_granules(),
+            1,
+            "one byte must commit one granule"
+        );
         assert!(res.commit_range(0, 1));
-        assert_eq!(res.committed_granules(), 1, "committing twice must not double-charge");
+        assert_eq!(
+            res.committed_granules(),
+            1,
+            "committing twice must not double-charge"
+        );
         // Spanning a boundary takes both.
         assert!(res.commit_range(GRANULE - 8, 16));
         assert_eq!(res.committed_granules(), 2);
@@ -1090,8 +1098,14 @@ mod tests {
         }
         assert_eq!(released, 3 * GRANULE);
         assert_eq!(res.committed_granules(), 5);
-        assert!(res.is_committed(1), "the partial leading granule must survive");
-        assert!(res.is_committed(5), "the partial trailing granule must survive");
+        assert!(
+            res.is_committed(1),
+            "the partial leading granule must survive"
+        );
+        assert!(
+            res.is_committed(5),
+            "the partial trailing granule must survive"
+        );
         assert!(!res.is_committed(2));
         assert!(!res.is_committed(4));
     }

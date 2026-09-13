@@ -202,7 +202,10 @@ impl Strides {
         // For a stored `R x C` matrix, element (i, j) of its transpose is
         // stored element (j, i) at `j*C + i`, so the transpose's row
         // stride is 1 and its column stride is C.
-        Strides { row: 1, col: stored_cols }
+        Strides {
+            row: 1,
+            col: stored_cols,
+        }
     }
 
     /// Pick the layout for an operand.
@@ -427,8 +430,16 @@ mod tests {
     fn cooperative_loads_divide_evenly() {
         let threads = BLOCK_X * BLOCK_Y;
         for (bm, bn) in [(BM_SMALL, BN_SMALL), (BM_LARGE, BN_LARGE)] {
-            assert_eq!((bm * 16) % threads, 0, "A tile {bm} must divide by {threads}");
-            assert_eq!((16 * bn) % threads, 0, "B tile {bn} must divide by {threads}");
+            assert_eq!(
+                (bm * 16) % threads,
+                0,
+                "A tile {bm} must divide by {threads}"
+            );
+            assert_eq!(
+                (16 * bn) % threads,
+                0,
+                "B tile {bn} must divide by {threads}"
+            );
         }
     }
 
@@ -461,8 +472,16 @@ mod tests {
     /// the wrong elements, with no error anywhere.
     #[test]
     fn grid_and_entry_point_agree_on_the_tile() {
-        for (m, n) in [(64, 64), (512, 512), (1024, 1024), (2048, 2048),
-                       (4096, 64), (64, 4096), (1023, 1024), (1024, 1023)] {
+        for (m, n) in [
+            (64, 64),
+            (512, 512),
+            (1024, 1024),
+            (2048, 2048),
+            (4096, 64),
+            (64, 4096),
+            (1023, 1024),
+            (1024, 1023),
+        ] {
             let large = use_large_tile(m, n);
             let tile = if large { BN_LARGE } else { BN_SMALL };
             let cfg = gemm_launch_config(m, n);
@@ -486,7 +505,10 @@ mod tests {
         assert!(use_large_tile(1024, 1024));
         // Exactly at the threshold counts as large.
         assert!(use_large_tile(LARGE_TILE_MIN_EDGE, LARGE_TILE_MIN_EDGE));
-        assert!(!use_large_tile(LARGE_TILE_MIN_EDGE - 1, LARGE_TILE_MIN_EDGE));
+        assert!(!use_large_tile(
+            LARGE_TILE_MIN_EDGE - 1,
+            LARGE_TILE_MIN_EDGE
+        ));
     }
 
     #[test]

@@ -10326,7 +10326,9 @@ mod tests {
             // `register_inner`'s own decision under a category of our
             // choosing, without the re-tag replacing it first.
             real_layout.register_inner(class_name, method_name, descriptor, dummy_native);
-            real_layout.find(class_name, method_name, descriptor).is_some()
+            real_layout
+                .find(class_name, method_name, descriptor)
+                .is_some()
         }
 
         let mut offenders: Vec<String> = Vec::new();

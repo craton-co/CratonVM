@@ -1488,12 +1488,8 @@ pub fn note_class_name(class_id: ClassId, name: &str) {
                 name: name.into(),
                 class_id: class_id.as_u32(),
             }));
-            match slot.compare_exchange(
-                ptr::null_mut(),
-                fresh,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match slot.compare_exchange(ptr::null_mut(), fresh, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => {
                     NAME_INDEX_LIVE.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -1619,7 +1615,11 @@ mod tests {
             Some(first),
             "first writer wins"
         );
-        assert_eq!(after, before + 1, "and the collision is counted, not hidden");
+        assert_eq!(
+            after,
+            before + 1,
+            "and the collision is counted, not hidden"
+        );
     }
 
     // -- Row encoding --------------------------------------------------------

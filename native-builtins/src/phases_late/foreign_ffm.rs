@@ -873,10 +873,7 @@ pub(crate) fn p67_layout_is_little(ctx: &dyn NativeContext, layout: ObjectRef) -
 /// stand-in has no statics to read, and `p67_layout_is_little` already knows
 /// how to read the flag out of slot 0 of one. So a stripped image keeps the
 /// behaviour it had; a real one gets identity.
-fn p67_canonical_byte_order(
-    ctx: &mut dyn NativeContext,
-    little_endian: bool,
-) -> Option<ObjectRef> {
+fn p67_canonical_byte_order(ctx: &mut dyn NativeContext, little_endian: bool) -> Option<ObjectRef> {
     let cid = ctx.ensure_class_initialized("java/nio/ByteOrder").ok()?;
     // `ensure_class_initialized` fabricates a stand-in rather than failing, so
     // an `Ok` is not evidence the image has the class; the static lookup is.
@@ -1427,8 +1424,7 @@ pub(crate) fn p67_segment_check_scope(
             // caller the forwarded reference; every other branch below only
             // reads fields and cannot move anything.
             let pin = ctx.pin_native_root(*segment);
-            let checked =
-                ctx.invoke_virtual_bytecode_only(scope, "checkValidState", "()V", &[]);
+            let checked = ctx.invoke_virtual_bytecode_only(scope, "checkValidState", "()V", &[]);
             *segment = ctx.read_native_pin(pin, *segment);
             ctx.unpin_native_roots(pin);
             checked?;
@@ -1581,7 +1577,11 @@ fn p67_session_acquire(
     if p67_session_modelled(ctx, *session) {
         let count = p67_session_acquires(ctx, *session);
         let slots = p67_session_slots(ctx, *session);
-        ctx.set_field(*session, slots.acquires, Value::Int(count.saturating_add(1)));
+        ctx.set_field(
+            *session,
+            slots.acquires,
+            Value::Int(count.saturating_add(1)),
+        );
     }
     Ok(())
 }
@@ -3429,7 +3429,11 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         arena,
         "ofAuto",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena_kind(ctx, false, false)?)))),
+        |ctx, _args| {
+            Ok(Some(Value::Object(Some(p67_new_arena_kind(
+                ctx, false, false,
+            )?))))
+        },
     );
     r.register(
         arena,
@@ -3454,8 +3458,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "global",
         "()Ljava/lang/foreign/Arena;",
         |ctx, _args| {
-            if let Some(existing) = crate::panama::global_arena_handle()
-                .and_then(|h| ctx.resolve_global_root(h))
+            if let Some(existing) =
+                crate::panama::global_arena_handle().and_then(|h| ctx.resolve_global_root(h))
             {
                 return Ok(Some(Value::Object(Some(existing))));
             }
@@ -3534,10 +3538,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     // it as no registration at all -- which turned a live drift pair into a
     // "stale baseline" failure. `panama.rs`'s allocator loop spells its classes
     // out for the same reason.
-    for arena_cls in [
-        "java/lang/foreign/Arena",
-        "jdk/internal/foreign/ArenaImpl",
-    ] {
+    for arena_cls in ["java/lang/foreign/Arena", "jdk/internal/foreign/ArenaImpl"] {
         r.register(arena_cls, "close", "()V", |ctx, args| {
             let this = obj_arg(args, 0)?;
             // A non-closeable arena refuses BEFORE anything is torn down --
@@ -4532,7 +4533,11 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // carrier F16 removed: that one put the ELEMENT at slot 4, where
             // the walk expects it at slot 2.
             let element_pin = ctx.pin_native_root(element);
-            let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/SequenceLayoutImpl", 5)?;
+            let obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "jdk/internal/foreign/layout/SequenceLayoutImpl",
+                5,
+            )?;
             let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             ctx.set_field(obj, slots.byte_size, Value::Long(total));
             ctx.set_field(obj, slots.byte_alignment, Value::Long(elem_align.max(1)));
@@ -4665,7 +4670,11 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // `p67_layout_object` stamps the VALUE-layout endian flag there.
             // Padding has no payload, so the slot is explicitly null rather
             // than an `Int` that a payload reader could mistake for one.
-            let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/PaddingLayoutImpl", 4)?;
+            let obj = try_alloc_concurrent_synthetic(
+                ctx,
+                "jdk/internal/foreign/layout/PaddingLayoutImpl",
+                4,
+            )?;
             let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             ctx.set_field(obj, slots.byte_size, Value::Long(size));
             // Padding has no alignment constraint of its own — the JDK's
@@ -4784,7 +4793,9 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/MemoryLayout;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, p67_layout_slots(ctx, this).payload)))
+            Ok(Some(
+                ctx.get_field(this, p67_layout_slots(ctx, this).payload),
+            ))
         },
     );
     // `elementCount()` reads the STORED count (slot 4), falling back to the
@@ -4862,12 +4873,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         p67_layout_with_name,
     );
     let seq_impl = "jdk/internal/foreign/layout/SequenceLayoutImpl";
-    r.register(
-        seq_impl,
-        "name",
-        "()Ljava/util/Optional;",
-        p67_layout_name,
-    );
+    r.register(seq_impl, "name", "()Ljava/util/Optional;", p67_layout_name);
     r.register(
         seq_impl,
         "withName",
@@ -4886,7 +4892,9 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/MemoryLayout;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, p67_layout_slots(ctx, this).payload)))
+            Ok(Some(
+                ctx.get_field(this, p67_layout_slots(ctx, this).payload),
+            ))
         },
     );
     r.register(seq_impl, "elementCount", "()J", |ctx, args| {

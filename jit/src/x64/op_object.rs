@@ -27,7 +27,6 @@ impl Compiler {
         _branch_targets: &[bool],
     ) -> WalkStep {
         match op {
-
             // newarray — allocate a new primitive array
             0xbc => {
                 self.flush_scratch_registers();
@@ -87,8 +86,7 @@ impl Compiler {
                     // Scalar-replaced: zero-initialize field slots in the frame
                     self.emit_xor_reg_self(RAX);
                     for i in 0..sr_obj.num_fields {
-                        let field_off =
-                            sr_obj.field_base_offset + (i as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
+                        let field_off = sr_obj.field_base_offset + (i as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
                         self.emit_store_local(field_off, RAX);
                         self.emit_store_local(field_off + 8, RAX);
                     }
@@ -99,53 +97,53 @@ impl Compiler {
                     self.flush_scratch_registers();
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let resolved = self.new_info_idx.get(&pc).map(|&i| self.new_info[i]);
-                    let (_, class_id_raw, num_fields, has_prim_init, has_finalizer) =
-                        match resolved {
-                            Some(info) => info,
-                            None => {
-                                // Not compile-time resolvable: the target
-                                // class was not loaded when this method was
-                                // compiled (the cold `throw new
-                                // SomeException(...)` shape). Emit the
-                                // CP-indexed helper, which resolves +
-                                // initialises + allocates at run time, the
-                                // way the interpreter's 0xbb handler does.
-                                // No compile-time class knowledge exists
-                                // here, so neither the inline TLAB bump nor
-                                // scalar replacement applies — this site is
-                                // always the helper call, which is exactly
-                                // right for a branch that is (by hypothesis)
-                                // cold.
-                                let Some(&i) = self.new_deferred_idx.get(&pc) else {
-                                    return WalkStep::Return( false);
-                                };
-                                let (_, holder_class_id, cp_idx) = self.new_deferred_info[i];
-                                if self.helpers.new_object_cp == 0 || !self.needs_heap {
-                                    return WalkStep::Return( false);
-                                }
-                                self.emit_pre_safepoint_spill();
-                                crate::runtime_lowering::emit_new_object_cp_stub(
-                                    &mut self.buf,
-                                    self.heap_local_offset,
-                                    self.helpers.new_object_cp,
-                                    holder_class_id,
-                                    cp_idx,
-                                    self.helpers.frame_record,
-                                );
-                                // Same post-call contract as the resolved
-                                // arm below: GC-triggering safepoint, then
-                                // the 0/null sentinel guard (the helper
-                                // reports a failed class resolution,
-                                // `<clinit>` failure or OOM by stashing a
-                                // pending exception and returning 0).
-                                self.emit_oop_map_for_safepoint();
-                                self.emit_post_alloc_oom_check();
-                                self.push_from_rax();
-                                self.mark_top_as_oop();
-                                pc += 3;
-                                return WalkStep::Next(pc);
+                    let (_, class_id_raw, num_fields, has_prim_init, has_finalizer) = match resolved
+                    {
+                        Some(info) => info,
+                        None => {
+                            // Not compile-time resolvable: the target
+                            // class was not loaded when this method was
+                            // compiled (the cold `throw new
+                            // SomeException(...)` shape). Emit the
+                            // CP-indexed helper, which resolves +
+                            // initialises + allocates at run time, the
+                            // way the interpreter's 0xbb handler does.
+                            // No compile-time class knowledge exists
+                            // here, so neither the inline TLAB bump nor
+                            // scalar replacement applies — this site is
+                            // always the helper call, which is exactly
+                            // right for a branch that is (by hypothesis)
+                            // cold.
+                            let Some(&i) = self.new_deferred_idx.get(&pc) else {
+                                return WalkStep::Return(false);
+                            };
+                            let (_, holder_class_id, cp_idx) = self.new_deferred_info[i];
+                            if self.helpers.new_object_cp == 0 || !self.needs_heap {
+                                return WalkStep::Return(false);
                             }
-                        };
+                            self.emit_pre_safepoint_spill();
+                            crate::runtime_lowering::emit_new_object_cp_stub(
+                                &mut self.buf,
+                                self.heap_local_offset,
+                                self.helpers.new_object_cp,
+                                holder_class_id,
+                                cp_idx,
+                                self.helpers.frame_record,
+                            );
+                            // Same post-call contract as the resolved
+                            // arm below: GC-triggering safepoint, then
+                            // the 0/null sentinel guard (the helper
+                            // reports a failed class resolution,
+                            // `<clinit>` failure or OOM by stashing a
+                            // pending exception and returning 0).
+                            self.emit_oop_map_for_safepoint();
+                            self.emit_post_alloc_oom_check();
+                            self.push_from_rax();
+                            self.mark_top_as_oop();
+                            pc += 3;
+                            return WalkStep::Next(pc);
+                        }
+                    };
 
                     // HIGH-6 JIT audit (object_allocation/1000 3-5x gap):
                     // emit an inline TLAB bump-pointer fast path when the
@@ -202,18 +200,17 @@ impl Compiler {
                     // call stays, and only the bump is inlined.
                     let skip_helper =
                         helper_is_noop && !cratonvm_types::jit_tlab_registration_required();
-                    let can_inline = !cratonvm_types::flags::runtime_flag_on(
-                        "CRATONVM_JIT_DISABLE_INLINE_NEW",
-                    )
-                        && (helper_is_noop
-                            || cratonvm_types::flags::runtime_flag_on(
-                                "CRATONVM_JIT_ENABLE_INLINE_NEW",
-                            ))
-                        && self.helpers.get_current_thread != 0
-                        && self.helpers.tlab_post_init != 0
-                        && self.helpers.new_object != 0
-                        && total_size <= 256
-                        && self.needs_heap; // need vm_ptr in heap_local slot
+                    let can_inline =
+                        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_DISABLE_INLINE_NEW")
+                            && (helper_is_noop
+                                || cratonvm_types::flags::runtime_flag_on(
+                                    "CRATONVM_JIT_ENABLE_INLINE_NEW",
+                                ))
+                            && self.helpers.get_current_thread != 0
+                            && self.helpers.tlab_post_init != 0
+                            && self.helpers.new_object != 0
+                            && total_size <= 256
+                            && self.needs_heap; // need vm_ptr in heap_local slot
 
                     // Round-8 wave-3: defensive callee-saved spill
                     // before the `new` safepoint (both inline TLAB
@@ -317,11 +314,11 @@ impl Compiler {
                         // the component class at run time and then does
                         // exactly what `jit_anewarray_object` does.
                         let Some(&i) = self.anewarray_deferred_idx.get(&pc) else {
-                            return WalkStep::Return( false); // genuinely unresolvable — bail
+                            return WalkStep::Return(false); // genuinely unresolvable — bail
                         };
                         let (_, holder_class_id, cp_idx) = self.anewarray_deferred_info[i];
                         if self.helpers.anewarray_object_cp == 0 || !self.needs_heap {
-                            return WalkStep::Return( false);
+                            return WalkStep::Return(false);
                         }
                         let count_slot = self.pop_stack();
                         // jit_anewarray_object_cp(vm, holder_class_id, cp_idx, length)
@@ -445,9 +442,7 @@ impl Compiler {
                     .and_then(cratonvm_types::primitive_array_kind_tags_byte)
                     .filter(|_| checkcast_inline_enabled() && operand_is_trusted_oop);
                 let inline_target = target_class_id.filter(|_| {
-                    checkcast_inline_enabled()
-                        && operand_is_trusted_oop
-                        && prim_array_tag.is_none()
+                    checkcast_inline_enabled() && operand_is_trusted_oop && prim_array_tag.is_none()
                 });
                 if checkcast_inline_enabled() {
                     use std::sync::atomic::Ordering::Relaxed;
@@ -465,9 +460,7 @@ impl Compiler {
                     }
                     if inline_target.is_none()
                         && prim_array_tag.is_none()
-                        && cratonvm_types::flags::runtime_flag_on(
-                            "CRATONVM_DBG_CHECKCAST_INLINE",
-                        )
+                        && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_CHECKCAST_INLINE")
                     {
                         eprintln!(
                             "[checkcast-inline] pc={pc} REFUSED target_id={target_class_id:?} have_key={trusted_have_key} marks_exact={trusted_marks_exact} top_is_oop={trusted_top_is_oop} method={}",
@@ -639,8 +632,8 @@ impl Compiler {
                 // in which RAX is the result on every edge into the join.
                 // No counter and no debug flag of its own: the checkcast
                 // counters describe checkcast, and this arm adds no state.
-                let target_class_id = crate::typecheck_target_for_site(name_ptr)
-                    .filter(|&id| id != 0);
+                let target_class_id =
+                    crate::typecheck_target_for_site(name_ptr).filter(|&id| id != 0);
                 // Read BEFORE the pop, as in the checkcast arm.
                 let operand_is_trusted_oop = !self.method_key.is_empty()
                     && self.stack_oop_marks_exact
@@ -654,9 +647,7 @@ impl Compiler {
                     .and_then(cratonvm_types::primitive_array_kind_tags_byte)
                     .filter(|_| checkcast_inline_enabled() && operand_is_trusted_oop);
                 let inline_target = target_class_id.filter(|_| {
-                    checkcast_inline_enabled()
-                        && operand_is_trusted_oop
-                        && prim_array_tag.is_none()
+                    checkcast_inline_enabled() && operand_is_trusted_oop && prim_array_tag.is_none()
                 });
                 let mut null_patches: Vec<usize> = Vec::new();
                 let mut true_patches: Vec<usize> = Vec::new();
@@ -683,8 +674,8 @@ impl Compiler {
                             0x00,
                         ]);
                         slow.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
-                        // CMP DWORD [RAX+class_id_off], target_class_id ;
-                        // JE → `1`. Same `81 B8 disp32 imm32` form as checkcast.
+                                                                    // CMP DWORD [RAX+class_id_off], target_class_id ;
+                                                                    // JE → `1`. Same `81 B8 disp32 imm32` form as checkcast.
                         let cid_off = self.helpers.class_id_offset_in_obj as i32; // Cast: x86-64 disp32
                         self.buf.emit(&[0x81, 0xB8]);
                         self.buf.emit(&cid_off.to_le_bytes());
@@ -770,7 +761,7 @@ impl Compiler {
                 // that would allocate the wrong type.
                 let Some(&(_, site)) = self.multianewarray_info.iter().find(|(p, _)| *p == pc)
                 else {
-                    return WalkStep::Return( false);
+                    return WalkStep::Return(false);
                 };
 
                 // Call jit_multianewarray_2d(heap_ptr, site, dim1, dim2)
@@ -823,7 +814,7 @@ impl Compiler {
                     self.direct_helpers.monitor_exit
                 };
                 if helper == 0 || !self.needs_heap {
-                    return WalkStep::Return( false);
+                    return WalkStep::Return(false);
                 }
                 // Keep the receiver on the abstract stack while publishing
                 // safepoint roots; moving GC can then rewrite its shadow
@@ -836,12 +827,12 @@ impl Compiler {
                     StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
                         let Some(offset) = self.reserve_spill_slots(1, SpillReason::HelperArgs)
                         else {
-                            return WalkStep::Return( false);
+                            return WalkStep::Return(false);
                         };
                         self.emit_store_local(offset, reg);
                         offset
                     }
-                    StackSlot::Xmm(_) => return WalkStep::Return( false),
+                    StackSlot::Xmm(_) => return WalkStep::Return(false),
                 };
                 crate::runtime_lowering::emit_monitor_stub(
                     &mut self.buf,

@@ -27,7 +27,6 @@ impl Compiler {
         _branch_targets: &[bool],
     ) -> WalkStep {
         match op {
-
             // getstatic (0xb2) — a direct load, or the helper
             //
             // HotSpot emits a plain load for a `getstatic`, because both
@@ -84,7 +83,7 @@ impl Compiler {
                     Some(v) => v,
                     None => {
                         if !substitute_unresolved_field_sites() {
-                            return WalkStep::Return( unresolved_field_site(pc, 0xb2));
+                            return WalkStep::Return(unresolved_field_site(pc, 0xb2));
                         }
                         (pc, 0, 0, b'I', false)
                     }
@@ -94,12 +93,8 @@ impl Compiler {
                 // opcode's long bail comment above describes. It emits the
                 // value push, the oop mark and the volatile fence itself,
                 // so the whole helper sequence below is skipped.
-                if self.try_emit_inline_getstatic(
-                    class_id_raw,
-                    field_index,
-                    type_tag,
-                    is_volatile,
-                ) {
+                if self.try_emit_inline_getstatic(class_id_raw, field_index, type_tag, is_volatile)
+                {
                     pc += 3;
                     return WalkStep::Next(pc);
                 }
@@ -183,7 +178,7 @@ impl Compiler {
                     Some(v) => v,
                     None => {
                         if !substitute_unresolved_field_sites() {
-                            return WalkStep::Return( unresolved_field_site(pc, 0xb3));
+                            return WalkStep::Return(unresolved_field_site(pc, 0xb3));
                         }
                         (pc, 0, 0, b'I', false)
                     }
@@ -234,7 +229,7 @@ impl Compiler {
                             Some(v) => v,
                             None => {
                                 if !substitute_unresolved_field_sites() {
-                                    return WalkStep::Return( unresolved_field_site(pc, 0xb4));
+                                    return WalkStep::Return(unresolved_field_site(pc, 0xb4));
                                 }
                                 (pc, 0, b'I')
                             }
@@ -263,9 +258,7 @@ impl Compiler {
                     })
                 {
                     if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE") {
-                        eprintln!(
-                            "[compact-inline] getfield pc={pc} off={c_off} ref={c_is_ref}"
-                        );
+                        eprintln!("[compact-inline] getfield pc={pc} off={c_off} ref={c_is_ref}");
                     }
                     // Compact reference-field layout inline getfield. The
                     // packed byte offset + ref-ness were resolved at compile
@@ -295,7 +288,7 @@ impl Compiler {
                             Some(v) => v,
                             None => {
                                 if !substitute_unresolved_field_sites() {
-                                    return WalkStep::Return( unresolved_field_site(pc, 0xb4));
+                                    return WalkStep::Return(unresolved_field_site(pc, 0xb4));
                                 }
                                 (pc, 0, b'I')
                             }
@@ -317,8 +310,7 @@ impl Compiler {
                     self.flush_scratch_registers();
                     let trusted_have_key = !self.method_key.is_empty();
                     let trusted_marks_exact = self.stack_oop_marks_exact;
-                    let trusted_top_is_oop =
-                        self.stack_oop_marks.last().copied().unwrap_or(false);
+                    let trusted_top_is_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
                     let receiver_is_trusted_oop =
                         trusted_have_key && trusted_marks_exact && trusted_top_is_oop;
                     // WHICH of the three clauses refused, at EMISSION time.
@@ -419,9 +411,7 @@ impl Compiler {
                             }
                             b'Z' => self.emit_movx_r64_mem_disp32(RAX, RAX, cell_off, 8, false),
                             b'B' => self.emit_movx_r64_mem_disp32(RAX, RAX, cell_off, 8, true),
-                            b'C' => {
-                                self.emit_movx_r64_mem_disp32(RAX, RAX, cell_off, 16, false)
-                            }
+                            b'C' => self.emit_movx_r64_mem_disp32(RAX, RAX, cell_off, 16, false),
                             b'S' => self.emit_movx_r64_mem_disp32(RAX, RAX, cell_off, 16, true),
                             _ => {
                                 self.emit_movsxd_r64_mem_disp32(RAX, RAX, cell_off);
@@ -453,9 +443,8 @@ impl Compiler {
                     // default and is what the crash was on.
                     if !raw_mode && (c_is_ref || matches!(type_tag, b'L' | b'[')) {
                         self.buf.emit(&[0x83, 0xB8]); // CMP DWORD [RAX+disp32], imm8
-                        self.buf.emit(
-                            &(legacy_cell_off + FIELD_CELL_TAG_OFFSET as i32).to_le_bytes(),
-                        );
+                        self.buf
+                            .emit(&(legacy_cell_off + FIELD_CELL_TAG_OFFSET as i32).to_le_bytes());
                         self.buf
                             .emit_byte(cratonvm_types::FIELD_CELL_TAG_OBJECT as u8);
                         slow_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
@@ -581,8 +570,7 @@ impl Compiler {
                     // GC_FLAG_COMPACT bit and routing compact receivers to the
                     // compact-aware `jit_getfield` helper.
                     .filter(|_| {
-                        (inline_getfield_enabled()
-                            && !cratonvm_types::compact_ref_fields_enabled())
+                        (inline_getfield_enabled() && !cratonvm_types::compact_ref_fields_enabled())
                             || (guarded_inline_getfield_enabled()
                                 && self.helpers.read_bounds_addr != 0)
                     })
@@ -611,8 +599,8 @@ impl Compiler {
                     let cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
                                                                                    // GUARDED (default) vs RAW (opt-in, compact-off only) —
                                                                                    // see the compact arm above for the mode contract.
-                    let raw_mode = inline_getfield_enabled()
-                        && !cratonvm_types::compact_ref_fields_enabled();
+                    let raw_mode =
+                        inline_getfield_enabled() && !cratonvm_types::compact_ref_fields_enabled();
                     if !raw_mode {
                         self.flush_scratch_registers();
                     }
@@ -832,7 +820,7 @@ impl Compiler {
                             Some(v) => v,
                             None => {
                                 if !substitute_unresolved_field_sites() {
-                                    return WalkStep::Return( unresolved_field_site(pc, 0xb5));
+                                    return WalkStep::Return(unresolved_field_site(pc, 0xb5));
                                 }
                                 (pc, 0, b'I')
                             }
@@ -860,7 +848,7 @@ impl Compiler {
                             Some(v) => v,
                             None => {
                                 if !substitute_unresolved_field_sites() {
-                                    return WalkStep::Return( unresolved_field_site(pc, 0xb5));
+                                    return WalkStep::Return(unresolved_field_site(pc, 0xb5));
                                 }
                                 (pc, 0, b'I')
                             }
@@ -953,23 +941,19 @@ impl Compiler {
                         // pointers, so this inline 16-byte `Value` store is
                         // wrong — bail to the compact-aware
                         // `jit_putfield_object` helper.
-                        if let Some(&(c_off, _)) =
-                            self.compact_field_off.get(&pc).filter(|_| {
-                                // Keep compact reference stores behind the
-                                // same opt-in as legacy inline putfield.
-                                // A stale/misclassified compact receiver
-                                // otherwise lets this bare 8-byte store
-                                // scribble a Value cell during Tomcat's
-                                // repeated webapp start/stop cycles.
-                                inline_putfield_enabled()
-                                    && !narrow_oops_block_inline_fields()
-                                    && cratonvm_types::compact_ref_fields_enabled()
-                                    && self.helpers.region_bounds_addr != 0
-                            })
-                        {
-                            if cratonvm_types::flags::runtime_flag_on(
-                                "CRATONVM_DBG_COMPACT_INLINE",
-                            )
+                        if let Some(&(c_off, _)) = self.compact_field_off.get(&pc).filter(|_| {
+                            // Keep compact reference stores behind the
+                            // same opt-in as legacy inline putfield.
+                            // A stale/misclassified compact receiver
+                            // otherwise lets this bare 8-byte store
+                            // scribble a Value cell during Tomcat's
+                            // repeated webapp start/stop cycles.
+                            inline_putfield_enabled()
+                                && !narrow_oops_block_inline_fields()
+                                && cratonvm_types::compact_ref_fields_enabled()
+                                && self.helpers.region_bounds_addr != 0
+                        }) {
+                            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_COMPACT_INLINE")
                             {
                                 eprintln!("[compact-inline] putfield-ref pc={pc} off={c_off}");
                             }

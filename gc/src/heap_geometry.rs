@@ -289,7 +289,10 @@ mod tests {
         let prev = heap_span(TEST_SLOT);
         publish_heap_span(TEST_SLOT, 0x4000_0000, 0x5000_0000);
         let (lo, hi) = heap_envelope().expect("a published slot makes an envelope");
-        assert!(lo <= 0x4000_0000, "envelope must contain the published base");
+        assert!(
+            lo <= 0x4000_0000,
+            "envelope must contain the published base"
+        );
         assert!(hi >= 0x5000_0000, "envelope must contain the published end");
         assert!(published());
         restore(prev);

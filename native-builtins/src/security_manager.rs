@@ -4110,9 +4110,7 @@ fn wrap_checked_in_privileged_action_exception(
     let thrown_now = ctx.read_native_pin(pin, thrown_now);
     ctx.unpin_native_roots(pin);
     match built {
-        Ok(Some(Value::Object(Some(wrapper)))) => {
-            Err(MethodCallFailed::ExceptionThrown(wrapper))
-        }
+        Ok(Some(Value::Object(Some(wrapper)))) => Err(MethodCallFailed::ExceptionThrown(wrapper)),
         _ => Err(MethodCallFailed::ExceptionThrown(thrown_now)),
     }
 }

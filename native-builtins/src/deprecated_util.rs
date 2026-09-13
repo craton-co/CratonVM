@@ -1785,9 +1785,7 @@ fn native_lnis_read_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let cap = ctx.array_length(buf) as i64;
     if off_i < 0 || len_i < 0 || (len_i as i64) > cap - (off_i as i64) {
         return Err(RuntimeError::IndexOutOfBoundsException {
-            message: Some(format!(
-                "off {off_i}, len {len_i}, buffer length {cap}"
-            )),
+            message: Some(format!("off {off_i}, len {len_i}, buffer length {cap}")),
         }
         .into());
     }

@@ -101,9 +101,11 @@ pub use class_manager::synthetic_stub_field_model;
 pub use class_manager::{
     any_annotation_proxy_defined,
     any_class_redefined,
-    any_duplicate_class_name, class_is_java_lang_system, class_is_java_util,
+    any_duplicate_class_name,
     bump_jit_supersede_epoch,
     class_definition_epoch,
+    class_is_java_lang_system,
+    class_is_java_util,
     drain_pending_class_hooks,
     install_class_file_load_hook,
     install_class_load_hook,

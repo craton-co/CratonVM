@@ -2924,7 +2924,8 @@ fn cipher_init_pbes2_from_spec(
         }
     }
     let password_bytes = extract_key_bytes(ctx, key);
-    let aes_key = crate::phases_early::pbkdf2_derive_for(prf, &password_bytes, &salt, iters, keylen);
+    let aes_key =
+        crate::phases_early::pbkdf2_derive_for(prf, &password_bytes, &salt, iters, keylen);
     let tkey = obj_key(ctx, this);
     with_table_write(|t| {
         let s = t.entry(tkey).or_default();
@@ -4461,7 +4462,10 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                 return Err(crate::phases_early::throw_jca_exc(
                     ctx,
                     "java/security/InvalidAlgorithmParameterException",
-                    &format!("Wrong IV length: must be 16 bytes long, got {}", iv_bytes.len()),
+                    &format!(
+                        "Wrong IV length: must be 16 bytes long, got {}",
+                        iv_bytes.len()
+                    ),
                 ));
             }
             let mut counter = [0u8; 16];
@@ -6390,9 +6394,7 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
         // object argument" says nothing about which one.
         if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some(
-                    "Cannot read the array length because \"iv\" is null".into(),
-                ),
+                message: Some("Cannot read the array length because \"iv\" is null".into()),
             }
             .into());
         }

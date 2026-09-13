@@ -35,9 +35,8 @@ const MAX_LOCAL_HANDLER_CANDIDATES: usize = 4;
 /// site. `CRATONVM_JIT_NO_OSR_REFINED_REF=1` is the kill switch.
 fn osr_refined_ref_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_OSR_REFINED_REF")
-    })
+    *ENABLED
+        .get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_OSR_REFINED_REF"))
 }
 
 fn osr_ambiguous_dead_enabled() -> bool {
@@ -2254,7 +2253,7 @@ impl Compiler {
                 // interpreter frame, so without it the helper could only name
                 // the interpreted CALLER as the method that trapped.
                 let trap_reason_word = (reason as u64) | (u64::from(self.compile_id.id()) << 32); // Cast: reason code is a small non-negative value
-                                                                                             // vm_ptr is in the heap_local (frame slot) — load it first
+                                                                                                  // vm_ptr is in the heap_local (frame slot) — load it first
                 #[cfg(target_os = "windows")]
                 {
                     // Windows x64: arg1=RCX, arg2=RDX, arg3=R8

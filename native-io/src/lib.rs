@@ -2935,10 +2935,9 @@ fn native_fos_write_bytes_ignore_append(
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         Some(Value::Object(None)) => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
         _ => return Ok(None),
     };
@@ -15328,10 +15327,9 @@ fn native_dos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // MEASURED with `apps/probes/L4CensusTail.java`.
     let buf = match args.get(1) {
         Some(Value::Object(None)) => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: None,
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
         }
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -15340,10 +15338,12 @@ fn native_dos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let len_i = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
     let cap = ctx.array_length(buf) as i64;
     if off_i < 0 || len_i < 0 || (len_i as i64) > cap - (off_i as i64) {
-        return Err(cratonvm_types::error::RuntimeError::IndexOutOfBoundsException {
-            message: Some(format!("off {off_i}, len {len_i}, buffer length {cap}")),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::IndexOutOfBoundsException {
+                message: Some(format!("off {off_i}, len {len_i}, buffer length {cap}")),
+            }
+            .into(),
+        );
     }
     let off = off_i as usize;
     let len = len_i as usize;
@@ -26109,18 +26109,12 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     r.register(dc, "write", "([Ljava/nio/ByteBuffer;)J", |ctx, args| {
         let srcs = obj_arg92(args, 1)?;
         let n = ctx.array_length(srcs) as i32;
-        native_dc_write_gathering(
-            ctx,
-            &[args[0], args[1], Value::Int(0), Value::Int(n)],
-        )
+        native_dc_write_gathering(ctx, &[args[0], args[1], Value::Int(0), Value::Int(n)])
     });
     r.register(dc, "read", "([Ljava/nio/ByteBuffer;)J", |ctx, args| {
         let dsts = obj_arg92(args, 1)?;
         let n = ctx.array_length(dsts) as i32;
-        native_dc_read_scattering(
-            ctx,
-            &[args[0], args[1], Value::Int(0), Value::Int(n)],
-        )
+        native_dc_read_scattering(ctx, &[args[0], args[1], Value::Int(0), Value::Int(n)])
     });
 
     // send(ByteBuffer, SocketAddress) → int
@@ -27397,7 +27391,9 @@ fn native_dc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // `Objects.checkFromIndexSize`, the JDK's own precondition.
     if offset < 0 || length < 0 || offset > count - length {
         return Err(RuntimeError::IndexOutOfBoundsException {
-            message: Some(format!("offset {offset}, length {length}, array length {count}")),
+            message: Some(format!(
+                "offset {offset}, length {length}, array length {count}"
+            )),
         }
         .into());
     }
@@ -27466,7 +27462,9 @@ fn native_dc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let count = ctx.array_length(dsts) as i32;
     if offset < 0 || length < 0 || offset > count - length {
         return Err(RuntimeError::IndexOutOfBoundsException {
-            message: Some(format!("offset {offset}, length {length}, array length {count}")),
+            message: Some(format!(
+                "offset {offset}, length {length}, array length {count}"
+            )),
         }
         .into());
     }

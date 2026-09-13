@@ -120,7 +120,12 @@ fn ensure_probe_compiled() -> bool {
         })
         .filter(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("javac"));
-    match Command::new(javac).arg("-d").arg(&dir).arg(&source).output() {
+    match Command::new(javac)
+        .arg("-d")
+        .arg(&dir)
+        .arg(&source)
+        .output()
+    {
         Err(_) => false,
         Ok(out) => {
             assert!(

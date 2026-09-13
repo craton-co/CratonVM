@@ -247,7 +247,10 @@ pub(super) fn execute_instruction(
                             "AIOOBE-LOAD class={cls} method={mth} pc={pc} idx={i} len={alen}"
                         );
                     }
-                    RuntimeError::array_store_fault(i, shared.mem.heap.array_length(array_ref) as i32)
+                    RuntimeError::array_store_fault(
+                        i,
+                        shared.mem.heap.array_length(array_ref) as i32,
+                    )
                 })?;
             if remap_trace_on() && matches!(instruction, Instruction::Aaload) {
                 if let Value::Object(Some(o)) = &value {
@@ -588,7 +591,10 @@ pub(super) fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Long(v))
                 .map_err(|i| {
-                    RuntimeError::array_store_fault(i, shared.mem.heap.array_length(array_ref) as i32)
+                    RuntimeError::array_store_fault(
+                        i,
+                        shared.mem.heap.array_length(array_ref) as i32,
+                    )
                 })?;
             // Phase 10 #2 — see the `Iastore` arm.
             #[cfg(feature = "gpu-offload")]
@@ -644,7 +650,10 @@ pub(super) fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Double(d))
                 .map_err(|i| {
-                    RuntimeError::array_store_fault(i, shared.mem.heap.array_length(array_ref) as i32)
+                    RuntimeError::array_store_fault(
+                        i,
+                        shared.mem.heap.array_length(array_ref) as i32,
+                    )
                 })?;
             // Phase 10 #2 — see the `Iastore` arm.
             #[cfg(feature = "gpu-offload")]
@@ -2115,7 +2124,11 @@ fn monitor_operand_slow(
             // pointers are valid for the duration of the closure call.
             let cls = unsafe { &*cls_ptr };
             let mth = unsafe { &*mth_ptr };
-            let op = if entering { "monitorenter" } else { "monitorexit" };
+            let op = if entering {
+                "monitorenter"
+            } else {
+                "monitorexit"
+            };
             format!("{op} in {cls}.{mth} pc={pc_snap}")
         }
     })
@@ -2905,10 +2918,8 @@ pub(super) fn op_checkcast(
                 // the re-served face — the one this site exists for — keeps
                 // its provenance walk.
                 if reclaimed
-                    || cratonvm_gc::gen_heap::old_freed_lookup_covering(
-                        obj_ref.as_ptr() as usize,
-                    )
-                    .is_some()
+                    || cratonvm_gc::gen_heap::old_freed_lookup_covering(obj_ref.as_ptr() as usize)
+                        .is_some()
                 {
                     crate::memory::reclaim_guard::report_root_slice_provenance(
                         shared,
@@ -3615,7 +3626,16 @@ pub(super) fn op_putfield(
         }
     }
     if crate::runtime::env_cache::any_field_diag() {
-        diag_putfield_consolidated(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field, value)?;
+        diag_putfield_consolidated(
+            shared,
+            thread,
+            frame_idx,
+            current_class_id,
+            *index,
+            obj_ref,
+            &field,
+            value,
+        )?;
     } // end `if any_field_diag()` — consolidated putfield diagnostics
       // T17.Δ.4 — JVMTI FieldModification watchpoint, scoped to this VM.
     if crate::runtime::jvmti::any_field_watchpoint_active() {
@@ -3650,7 +3670,17 @@ pub(super) fn op_putfield(
     // (not tied to a construction-site guess or a GC-move-fragile
     // address watch list). See bug-h2-suite-residual-fail-triage-FIXED.md.
     if crate::runtime::env_cache::dbg_field_watch() {
-        diag_putfield_watch(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field, value, old_value)?;
+        diag_putfield_watch(
+            shared,
+            thread,
+            frame_idx,
+            current_class_id,
+            *index,
+            obj_ref,
+            &field,
+            value,
+            old_value,
+        )?;
     }
     // CRATONVM_DBG_CORRUPT_CELL, the interpreter's own WRITE door.
     // The read doors were instrumented first, and a producer that only
@@ -3874,7 +3904,15 @@ pub(super) fn op_getfield(
     // exactly like its putfield sibling, so the two doors are armed by
     // one variable and cannot drift.
     if straystack_enabled() {
-        diag_getfield_straystack(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field)?;
+        diag_getfield_straystack(
+            shared,
+            thread,
+            frame_idx,
+            current_class_id,
+            *index,
+            obj_ref,
+            &field,
+        )?;
     }
     // Perf: ALL of the per-getfield diagnostic blocks below are gated
     // behind a SINGLE cached "any field diagnostic enabled" branch, so
@@ -3886,7 +3924,15 @@ pub(super) fn op_getfield(
     // only ever reachable when its var is set (and `any_field_diag()` is
     // then `true`). See `env_cache::any_field_diag`.
     if crate::runtime::env_cache::any_field_diag() {
-        diag_getfield_consolidated(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field)?;
+        diag_getfield_consolidated(
+            shared,
+            thread,
+            frame_idx,
+            current_class_id,
+            *index,
+            obj_ref,
+            &field,
+        )?;
     } // end `if any_field_diag()` — consolidated getfield diagnostics
       // Read side of the [PUTFIELD-WATCH] ledger further down: with both
       // halves on one filter a "the constructor stored it but the reader
@@ -3894,7 +3940,15 @@ pub(super) fn op_getfield(
       // guessing which of the two sides is wrong. Same class filter
       // (`CRATONVM_DBG_FIELD_WATCH=<substr>[,<substr>…]`).
     if crate::runtime::env_cache::dbg_field_watch() {
-        diag_getfield_watch(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field)?;
+        diag_getfield_watch(
+            shared,
+            thread,
+            frame_idx,
+            current_class_id,
+            *index,
+            obj_ref,
+            &field,
+        )?;
     }
     // K2 (T10.9.E) — category-2 primitive tag hint.  `ResolvedField`
     // records only is_reference/is_volatile, so we re-read the first
@@ -4396,9 +4450,7 @@ fn watch_receiver_note(shared: &SharedVm, obj_ref: ObjectRef, field_index: usize
         header.num_slots(),
         header.gc_flags(),
         cratonvm_gc::heap::ObjectHeader::kind_tag(
-            header
-                .mark_word
-                .load(std::sync::atomic::Ordering::Relaxed)
+            header.mark_word.load(std::sync::atomic::Ordering::Relaxed)
         ),
         match slot_addr {
             Some(a) => format!("0x{a:x}"),
@@ -4425,7 +4477,13 @@ fn diag_getfield_watch(
     field: &ResolvedField,
 ) -> Result<(), MethodCallFailed> {
     let index = &index;
-    let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);
+    let _ = (
+        frame_idx,
+        thread.thread_id,
+        current_class_id,
+        obj_ref,
+        field.field_index,
+    );
     if crate::runtime::env_cache::dbg_field_watch() {
         let decl_name = shared
             .classes
@@ -4490,7 +4548,13 @@ fn diag_getfield_consolidated(
     field: &ResolvedField,
 ) -> Result<(), MethodCallFailed> {
     let index = &index;
-    let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);
+    let _ = (
+        frame_idx,
+        thread.thread_id,
+        current_class_id,
+        obj_ref,
+        field.field_index,
+    );
     if crate::runtime::env_cache::any_field_diag() {
         if crate::runtime::env_cache::field_addr_dbg() {
             let field_name = resolve_field_name(shared, current_class_id, *index);
@@ -4649,7 +4713,13 @@ fn diag_getfield_straystack(
     field: &ResolvedField,
 ) -> Result<(), MethodCallFailed> {
     let index = &index;
-    let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);
+    let _ = (
+        frame_idx,
+        thread.thread_id,
+        current_class_id,
+        obj_ref,
+        field.field_index,
+    );
     if straystack_enabled() {
         let h = shared.mem.heap.get_header(obj_ref);
         let ns = h.num_slots() as usize;
@@ -4707,7 +4777,13 @@ fn diag_putfield_watch(
     old_value: Value,
 ) -> Result<(), MethodCallFailed> {
     let index = &index;
-    let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);
+    let _ = (
+        frame_idx,
+        thread.thread_id,
+        current_class_id,
+        obj_ref,
+        field.field_index,
+    );
     if crate::runtime::env_cache::dbg_field_watch() {
         let decl_name = shared
             .classes
@@ -4766,7 +4842,13 @@ fn diag_putfield_consolidated(
     value: Value,
 ) -> Result<(), MethodCallFailed> {
     let index = &index;
-    let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);
+    let _ = (
+        frame_idx,
+        thread.thread_id,
+        current_class_id,
+        obj_ref,
+        field.field_index,
+    );
     if crate::runtime::env_cache::any_field_diag() {
         // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
         // fields — object address + resolved slot — to localize a write

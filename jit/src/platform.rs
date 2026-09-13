@@ -52,9 +52,7 @@ pub enum JitError {
 #[cfg(not(target_os = "windows"))]
 #[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 fn last_os_error_code() -> i32 {
-    std::io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(-1)
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
 /// Which `mmap(2)` flag values an operating system uses.
@@ -1386,10 +1384,26 @@ mod tests {
     /// regression for a platform it cannot execute.
     #[test]
     fn map_anonymous_follows_each_os_abi() {
-        assert_eq!(map_anonymous(UnixMmapAbi::Linux), 0x20, "linux <asm-generic/mman-common.h>");
-        assert_eq!(map_anonymous(UnixMmapAbi::LinuxMips), 0x800, "linux <asm/mman.h> on MIPS");
-        assert_eq!(map_anonymous(UnixMmapAbi::Bsd), 0x1000, "Darwin and FreeBSD <sys/mman.h>");
-        assert_eq!(map_anonymous(UnixMmapAbi::Solaris), 0x100, "illumos <sys/mman.h>");
+        assert_eq!(
+            map_anonymous(UnixMmapAbi::Linux),
+            0x20,
+            "linux <asm-generic/mman-common.h>"
+        );
+        assert_eq!(
+            map_anonymous(UnixMmapAbi::LinuxMips),
+            0x800,
+            "linux <asm/mman.h> on MIPS"
+        );
+        assert_eq!(
+            map_anonymous(UnixMmapAbi::Bsd),
+            0x1000,
+            "Darwin and FreeBSD <sys/mman.h>"
+        );
+        assert_eq!(
+            map_anonymous(UnixMmapAbi::Solaris),
+            0x100,
+            "illumos <sys/mman.h>"
+        );
         assert_ne!(
             map_anonymous(UnixMmapAbi::Linux),
             map_anonymous(UnixMmapAbi::Bsd),
@@ -1424,7 +1438,10 @@ mod tests {
         let misaligned = unsafe { ptr.add(1) };
         match make_executable(misaligned, size - 1) {
             Err(JitError::ProtectFailed(code)) => {
-                assert_ne!(code, -1, "the payload must be errno, not mprotect's return value");
+                assert_ne!(
+                    code, -1,
+                    "the payload must be errno, not mprotect's return value"
+                );
                 assert_eq!(code, 22, "a misaligned mprotect is EINVAL");
             }
             other => panic!("a misaligned mprotect must fail, got {other:?}"),
@@ -1452,7 +1469,11 @@ mod tests {
             assert_eq!(JIT_WRITE_DEPTH.with(|d| d.get()), 1);
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        assert_eq!(JIT_WRITE_DEPTH.with(|d| d.get()), 0, "the thread is back in execute mode");
+        assert_eq!(
+            JIT_WRITE_DEPTH.with(|d| d.get()),
+            0,
+            "the thread is back in execute mode"
+        );
         make_executable(ptr, size).expect("make_executable failed");
         // SAFETY: reads in bounds of a readable region.
         unsafe {

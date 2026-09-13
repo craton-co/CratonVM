@@ -59,7 +59,12 @@ pub fn map_path(pid: u32) -> std::path::PathBuf {
 /// Write one map line. Line breaks in `name` are dropped so one region can
 /// never become two lines; spaces are kept, since perf reads the rest of the
 /// line as the symbol.
-pub fn write_line<W: Write>(out: &mut W, start: usize, len: usize, name: &str) -> std::io::Result<()> {
+pub fn write_line<W: Write>(
+    out: &mut W,
+    start: usize,
+    len: usize,
+    name: &str,
+) -> std::io::Result<()> {
     write!(out, "{start:x} {len:x} ")?;
     for piece in name.split(['\n', '\r']) {
         out.write_all(piece.as_bytes())?;
@@ -70,10 +75,7 @@ pub fn write_line<W: Write>(out: &mut W, start: usize, len: usize, name: &str) -
 fn fail(what: std::fmt::Arguments<'_>) {
     if !FAILED.swap(true, Ordering::SeqCst) {
         // `eprintln!` panics when stderr is gone; this path must not.
-        let _ = writeln!(
-            std::io::stderr(),
-            "[cratonvm] perf map disabled: {what}"
-        );
+        let _ = writeln!(std::io::stderr(), "[cratonvm] perf map disabled: {what}");
     }
 }
 
@@ -106,7 +108,10 @@ pub fn record(start: usize, len: usize, name: &str) {
     let result = write_line(writer, start, len, name).and_then(|()| writer.flush());
     if let Err(e) = result {
         *guard = None;
-        fail(format_args!("write to {} failed: {e}", map_path(std::process::id()).display()));
+        fail(format_args!(
+            "write to {} failed: {e}",
+            map_path(std::process::id()).display()
+        ));
     }
 }
 

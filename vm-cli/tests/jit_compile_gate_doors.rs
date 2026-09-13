@@ -581,7 +581,8 @@ fn the_osr_door_takes_no_recursive_class_manager_lock() {
     } else {
         "bin/javac"
     });
-    let Some(classes) = compile_named_probe(&javac, "OsrIntrinsicDoorProbe", OSR_INTRINSIC_PROBE_SRC)
+    let Some(classes) =
+        compile_named_probe(&javac, "OsrIntrinsicDoorProbe", OSR_INTRINSIC_PROBE_SRC)
     else {
         return;
     };

@@ -29,9 +29,7 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{
-    NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry,
-};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 

@@ -710,7 +710,8 @@ impl ZgcRealHeap {
         // refill between the loop and the check. `tlab_reserved_tails()` stays
         // available as the tripwire for a caller that IS at a safepoint.
         if summary.skipped_locked > 0 {
-            self.counters.tlab_retire_skipped_total
+            self.counters
+                .tlab_retire_skipped_total
                 .fetch_add(summary.skipped_locked, Ordering::Relaxed);
         }
         if summary.live_chunks > 0 || summary.slots_pruned > 0 || summary.skipped_locked > 0 {
@@ -906,22 +907,25 @@ impl ZgcRealHeap {
                 // which is the request this rung is competing with. Reserving
                 // one block that size is a real discriminator inside the
                 // starved band rather than a refusal of the whole band.
-                arena.low_free_blocks_at_least(
-                    (want / 8).min(crate::tlab::tlab_max_alloc()),
-                    2,
-                ) >= 2,
+                arena.low_free_blocks_at_least((want / 8).min(crate::tlab::tlab_max_alloc()), 2)
+                    >= 2,
             )
-                .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
+            .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
             // Which RUNG served this refill. Counted at the call site rather
             // than inside `recycled_chunk_size` so the pure function stays
             // pure and testable; the two rungs are separated by the same
             // `want / 8` the function uses.
             if let Some((_, size)) = sized {
                 if size >= want / 8 {
-                    self.counters.tlab_refill_recycled.fetch_add(1, Ordering::Relaxed);
+                    self.counters
+                        .tlab_refill_recycled
+                        .fetch_add(1, Ordering::Relaxed);
                 } else {
-                    self.counters.tlab_refill_starved.fetch_add(1, Ordering::Relaxed);
-                    self.counters.tlab_refill_starved_bytes
+                    self.counters
+                        .tlab_refill_starved
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.counters
+                        .tlab_refill_starved_bytes
                         .fetch_add(size, Ordering::Relaxed);
                 }
             }
@@ -1054,4 +1058,3 @@ impl ZgcRealHeap {
         }
     }
 }
-

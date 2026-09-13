@@ -626,13 +626,15 @@ impl Clone for CachedBytecodeMethod {
             // question.
             intercept_shape_cache: self.intercept_shape_cache.clone(),
             interp_invocations: std::sync::atomic::AtomicU32::new(
-                self.interp_invocations.load(std::sync::atomic::Ordering::Relaxed),
+                self.interp_invocations
+                    .load(std::sync::atomic::Ordering::Relaxed),
             ),
             // Carried forward for the reason `jit_probe_generation` is: the
             // stamp is generation-keyed, so an inherited stale one simply fails
             // `tiering_settled` and the clone asks the manager again.
             tiering_settled: std::sync::atomic::AtomicU32::new(
-                self.tiering_settled.load(std::sync::atomic::Ordering::Relaxed),
+                self.tiering_settled
+                    .load(std::sync::atomic::Ordering::Relaxed),
             ),
             // `NativeCallSite: Clone` snapshots the memo word. Carrying it
             // forward is sound for the same reason `jit_probe_generation`'s
@@ -837,7 +839,11 @@ impl CachedBytecodeMethod {
 /// UTF-8, so the boundary is unambiguous. The class id stays whole in the high
 /// half because `ProfileStore::invalidate_class` sweeps by it.
 #[inline]
-pub fn invoc_key_parts(declaring_class_id: u32, method_name: &str, method_descriptor: &str) -> u128 {
+pub fn invoc_key_parts(
+    declaring_class_id: u32,
+    method_name: &str,
+    method_descriptor: &str,
+) -> u128 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut h = FNV_OFFSET;

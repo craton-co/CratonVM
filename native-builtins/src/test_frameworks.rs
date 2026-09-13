@@ -4911,11 +4911,7 @@ fn native_assertj_lightweight_comparable_assert(
             Some(Value::Object(Some(creator))) => creator,
             _ => return Ok(Some(Value::Object(None))),
         };
-        set_on_assertion(
-            ctx,
-            "assertionErrorCreator",
-            Value::Object(Some(creator)),
-        );
+        set_on_assertion(ctx, "assertionErrorCreator", Value::Object(Some(creator)));
         if class_name == "org/assertj/core/api/GenericComparableAssert" {
             // TreeMap's empty constructor leaves every field at its JVM
             // default except explicit zero/null stores, so a blank object is

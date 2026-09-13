@@ -8531,10 +8531,8 @@ mod tests {
     #[test]
     fn the_jdk_conf_logging_properties_is_read_for_jul_and_skipped_for_jboss() {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "cratonvm-logmanager-conf-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cratonvm-logmanager-conf-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("conf")).unwrap();
         std::fs::write(dir.join("conf/logging.properties"), b".level= INFO\n").unwrap();
         let java_home = dir.to_string_lossy().replace('\\', "/");

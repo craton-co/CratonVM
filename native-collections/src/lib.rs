@@ -26573,8 +26573,7 @@ fn of_reject_duplicates(
     let (base, handles) = pin_value_slice(ctx, elems);
     let mut verdict: Result<(), MethodCallFailed> = Ok(());
     // Earlier indices by `hashCode()`.
-    let mut buckets: std::collections::HashMap<i32, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut buckets: std::collections::HashMap<i32, Vec<usize>> = std::collections::HashMap::new();
     'outer: for i in 0..elems.len() {
         let a = read_pinned_elem(ctx, handles[i], elems[i]);
         let hash = match element_hash_code(ctx, &a) {
@@ -31225,8 +31224,7 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // Asking only same-hash candidates is also the JDK's answer when `equals`
     // and `hashCode` disagree (two `equals` keys with different hashes both
     // survive), which the all-pairs scan got wrong in the other direction.
-    let mut buckets: std::collections::HashMap<i32, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut buckets: std::collections::HashMap<i32, Vec<usize>> = std::collections::HashMap::new();
     for i in 0..elements.len() {
         let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
         let hash = element_hash_code(ctx, &elem)?;
@@ -60296,7 +60294,10 @@ fn chm_segment_for_mut(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let this = ctx.read_native_pin(this_pin, this);
-        if !matches!(ctx.get_field(this, CHM_FIELD_SEGMENTS), Value::Object(Some(_))) {
+        if !matches!(
+            ctx.get_field(this, CHM_FIELD_SEGMENTS),
+            Value::Object(Some(_))
+        ) {
             let built = ctx.read_native_pin(built_pin, built);
             ctx.set_field(this, CHM_FIELD_SEGMENTS, Value::Object(Some(built)));
         }
@@ -74630,12 +74631,13 @@ fn native_cowal_bulk_remove_predicate(
     let arr_pin = ctx.pin_native_root(arr);
     let lock_pin = lock_obj.map(|lo| ctx.pin_native_root(lo));
     let pred_pin = ctx.pin_native_root(pred);
-    let refresh_lock = |ctx: &dyn NativeContext, lock_obj: Option<ObjectRef>| -> Option<ObjectRef> {
-        match (lock_obj, lock_pin) {
-            (Some(lo), Some(h)) => Some(ctx.read_native_pin(h, lo)),
-            _ => lock_obj,
-        }
-    };
+    let refresh_lock =
+        |ctx: &dyn NativeContext, lock_obj: Option<ObjectRef>| -> Option<ObjectRef> {
+            match (lock_obj, lock_pin) {
+                (Some(lo), Some(h)) => Some(ctx.read_native_pin(h, lo)),
+                _ => lock_obj,
+            }
+        };
 
     let mut survivors: Vec<usize> = Vec::with_capacity(n);
     for i in 0..n {
@@ -74761,12 +74763,13 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // collection point, so `base` and `cs` are pinned across it too.
     let this_pin = ctx.pin_native_root(this);
     let lock_pin = lock_obj.map(|lo| ctx.pin_native_root(lo));
-    let refresh_lock = |ctx: &dyn NativeContext, lock_obj: Option<ObjectRef>| -> Option<ObjectRef> {
-        match (lock_obj, lock_pin) {
-            (Some(lo), Some(h)) => Some(ctx.read_native_pin(h, lo)),
-            _ => lock_obj,
-        }
-    };
+    let refresh_lock =
+        |ctx: &dyn NativeContext, lock_obj: Option<ObjectRef>| -> Option<ObjectRef> {
+            match (lock_obj, lock_pin) {
+                (Some(lo), Some(h)) => Some(ctx.read_native_pin(h, lo)),
+                _ => lock_obj,
+            }
+        };
     let cs = ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]);
     let this = ctx.read_native_pin(this_pin, this);
     let lock_obj = refresh_lock(ctx, lock_obj);

@@ -1389,8 +1389,10 @@ pub(super) fn execute_invokevirtual_cached(
                 } else {
                     format!("{receiver:?}")
                 };
-                let cached = thread
-                    .invoke_cache.get(caller_class_id, cp_index, is_special, site_pc as u32);
+                let cached =
+                    thread
+                        .invoke_cache
+                        .get(caller_class_id, cp_index, is_special, site_pc as u32);
                 let cached_info = cached.as_ref().map(|t| format!("{t:?}"));
                 drop(cm);
                 eprintln!(
@@ -1482,9 +1484,12 @@ pub(super) fn execute_invokevirtual_cached(
         }
     }
 
-    let target = match thread
-        .invoke_cache.get(caller_class_id, cp_index, is_special, site_pc as u32)
-    {
+    let target = match thread.invoke_cache.get(
+        caller_class_id,
+        cp_index,
+        is_special,
+        site_pc as u32,
+    ) {
         Some(t) => {
             dbg_invoke_stats_record(0);
             t.clone()
@@ -1615,10 +1620,9 @@ pub(super) fn execute_invokevirtual_cached(
             // JDK bytecode cannot replace, because CratonVM's instances do not
             // carry the layout that bytecode assumes.
             if crate::runtime::redefine_state::hierarchy_was_redefined(shared, cid) {
-                let immune = resolve_method_ref(shared, caller_class_id, cp_index)
-                    .is_ok_and(|(mcn, mn, desc, _)| {
-                        redefine_immune_forced_native(&mcn, &mn, &desc)
-                    });
+                let immune = resolve_method_ref(shared, caller_class_id, cp_index).is_ok_and(
+                    |(mcn, mn, desc, _)| redefine_immune_forced_native(&mcn, &mn, &desc),
+                );
                 if !immune {
                     thread
                         .invoke_cache
@@ -1895,8 +1899,7 @@ pub(super) fn execute_invokevirtual_cached(
                                 .iface_select_sites
                                 .get(caller_class_id, cp_index)
                                 .is_some_and(|&(recv, decl)| {
-                                    recv == actual_class_id
-                                        && decl == cached.declaring_class_id
+                                    recv == actual_class_id && decl == cached.declaring_class_id
                                 });
                         if memo_hit {
                             site_stats::bump(site_stats::IFACE_SELECT_HIT);
@@ -2467,9 +2470,7 @@ pub(super) fn execute_invokevirtual_cached(
                                     // twin: stride-boundary `+= 1` counting deflated
                                     // the manager's hotness view 64x.
                                     let _ = offer_invocation_to_tiered_manager(
-                                        shared,
-                                        &*cached,
-                                        cnt as u64,
+                                        shared, &*cached, cnt as u64,
                                     );
                                 } else if !promotion_barred {
                                     if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
@@ -2735,7 +2736,12 @@ pub(super) fn execute_invokevirtual_cached(
                         site_stats::bump(site_stats::NATFACTS_VIRTUAL);
                         let mut buf = [Value::Uninitialized; MAX_CACHED_NATIVE_ARGS];
                         let n = pop_coerced_invoke_args_virtual_facts(
-                            shared, frame_idx, thread, &facts, num_params_usize, &mut buf,
+                            shared,
+                            frame_idx,
+                            thread,
+                            &facts,
+                            num_params_usize,
+                            &mut buf,
                         )?;
                         invoke_cached_native_callback_leaf_aware(
                             shared,
@@ -3754,9 +3760,13 @@ pub(super) fn populate_virtual_invoke_cache(
                                 receiver_class_id,
                                 target.clone(),
                             );
-                            thread
-                                .invoke_cache
-                                .put(caller_class_id, cp_index, false, site_pc as u32, target);
+                            thread.invoke_cache.put(
+                                caller_class_id,
+                                cp_index,
+                                false,
+                                site_pc as u32,
+                                target,
+                            );
                             return;
                         }
                         break;
@@ -3795,9 +3805,13 @@ pub(super) fn populate_virtual_invoke_cache(
                             receiver_class_id,
                             target.clone(),
                         );
-                        thread
-                            .invoke_cache
-                            .put(caller_class_id, cp_index, false, site_pc as u32, target);
+                        thread.invoke_cache.put(
+                            caller_class_id,
+                            cp_index,
+                            false,
+                            site_pc as u32,
+                            target,
+                        );
                         return;
                     }
                 }
@@ -4343,10 +4357,11 @@ fn record_receiver_memoized(
                 return;
             }
         }
-        let rec = shared
-            .jit
-            .profile_store
-            .receiver_recorder_borrowed(class_id, method_name, descriptor);
+        let rec =
+            shared
+                .jit
+                .profile_store
+                .receiver_recorder_borrowed(class_id, method_name, descriptor);
         rec.record(site_pc, receiver_class_id);
         *slot = Some((class_id, name_ptr, desc_ptr, rec));
     });
@@ -4366,15 +4381,20 @@ pub(super) fn execute_invokevirtual_fast_door(
     use std::sync::atomic::Ordering;
     if crate::classloading::any_class_redefined() {
         crate::runtime::interpreter::invoke_fast::note_virtual_decline("a class was redefined");
-            return None;
+        return None;
     }
     if crate::runtime::env_cache::loader_aware_resolution() && adapt_isin_seen() {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline("loader-aware resolution and adapt-isin seen");
-            return None;
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
+            "loader-aware resolution and adapt-isin seen",
+        );
+        return None;
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
     let (receiver_class_id, cached, gate_generation) =
-        match thread.invoke_cache.get(caller_class_id, cp_index, false, site_pc as u32) {
+        match thread
+            .invoke_cache
+            .get(caller_class_id, cp_index, false, site_pc as u32)
+        {
             Some(CachedInvokeTarget::VirtualBytecode {
                 receiver_class_id,
                 cached,
@@ -4390,15 +4410,11 @@ pub(super) fn execute_invokevirtual_fast_door(
     // A synchronized callee is decided at the push, by `door_monitor_acquire`:
     // this door serves it whenever the monitor is free. See `door_sync_enabled`.
     if cached.is_synchronized && !crate::runtime::interpreter::invoke_fast::door_sync_enabled() {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
-            "callee is SYNCHRONIZED",
-        );
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("callee is SYNCHRONIZED");
         return None;
     }
     if cached.is_static {
-        crate::runtime::interpreter::invoke_fast::note_virtual_decline(
-            "callee is static",
-        );
+        crate::runtime::interpreter::invoke_fast::note_virtual_decline("callee is static");
         return None;
     }
     let num_params = cached.num_params as usize;
@@ -4607,9 +4623,8 @@ pub(super) fn execute_invokevirtual_fast_door(
         && !crate::runtime::env_cache::disable_jit()
         && crate::runtime::env_cache::jit_virtual_tierup()
     {
-        let handler_bearing =
-            !crate::runtime::env_cache::jit_virtual_promote_handler_callee()
-                && !cached.exception_table.is_empty();
+        let handler_bearing = !crate::runtime::env_cache::jit_virtual_promote_handler_callee()
+            && !cached.exception_table.is_empty();
         let nominate_always = crate::runtime::env_cache::jit_virtual_nominate_always();
         // Under the defaults a handler-bearing callee is barred outright and
         // nothing below can change that, so neither the registry memo nor the
@@ -4730,13 +4745,15 @@ pub(super) fn execute_invokevirtual_fast_door(
                             if crate::runtime::env_cache::bg_compile() {
                                 ensure_bg_compiler_started(shared);
                                 let _ = offer_invocation_to_tiered_manager(
-                                    shared,
-                                    &*cached,
-                                    cnt as u64,
+                                    shared, &*cached, cnt as u64,
                                 );
                             } else if !promotion_barred {
-                                let gate = match thread.invoke_cache.get(caller_class_id, cp_index, false, site_pc as u32)
-                                {
+                                let gate = match thread.invoke_cache.get(
+                                    caller_class_id,
+                                    cp_index,
+                                    false,
+                                    site_pc as u32,
+                                ) {
                                     Some(CachedInvokeTarget::VirtualBytecode { gate, .. }) => {
                                         gate.clone()
                                     }
@@ -4821,13 +4838,18 @@ pub(super) fn execute_invokevirtual_fast_door(
     // Verbatim argument transfer: validate every slot against the descriptor
     // first, commit the pop only once all of them are in the representation
     // the callee's locals want.
-    let mut slots = [(CompactValue::null(), b'L'); cratonvm_jit_api::DescriptorFacts::INLINE_PARAMS + 1];
+    let mut slots =
+        [(CompactValue::null(), b'L'); cratonvm_jit_api::DescriptorFacts::INLINE_PARAMS + 1];
     {
         let stack = &thread.frames[frame_idx].stack;
         for i in 0..total_args {
             let depth = total_args - 1 - i;
             let (cv, kind) = stack.peek_with_kind_at(depth);
-            let tag = if i == 0 { b'L' } else { facts.param_tags[i - 1] };
+            let tag = if i == 0 {
+                b'L'
+            } else {
+                facts.param_tags[i - 1]
+            };
             let ok = match tag {
                 b'L' | b'[' => cv.is_object() || cv.is_null(),
                 b'J' => kind == crate::runtime::ValueStack::KIND_MARK_LONG,
@@ -4861,12 +4883,6 @@ pub(super) fn execute_invokevirtual_fast_door(
         }
     };
     Some(Ok(invoke_fast::push_frame_verbatim(
-        shared,
-        thread,
-        frame_idx,
-        cached,
-        &slots,
-        total_args,
-        monitor,
+        shared, thread, frame_idx, cached, &slots, total_args, monitor,
     )))
 }

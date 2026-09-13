@@ -308,10 +308,7 @@ impl EventPool {
     /// `Event::new`, which already has the create path and its own
     /// error mapping, and a pool hit must not pay for `bind_to_thread`.
     pub(crate) fn take(&self) -> Option<cudarc::driver::sys::CUevent> {
-        self.free
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pop()
+        self.free.lock().unwrap_or_else(|p| p.into_inner()).pop()
     }
 
     /// Return a handle, or destroy it if the pool is full.
@@ -481,7 +478,11 @@ impl DeviceContextInner {
     /// # Safety
     /// `ptr` must be a live allocation of at least `len * size_of::<T>()`
     /// bytes owned by this context, and nothing else may free it.
-    unsafe fn slice_from_raw<T>(&self, ptr: cudarc::driver::sys::CUdeviceptr, len: usize) -> CudaSlice<T> {
+    unsafe fn slice_from_raw<T>(
+        &self,
+        ptr: cudarc::driver::sys::CUdeviceptr,
+        len: usize,
+    ) -> CudaSlice<T> {
         // SAFETY: forwarded from the caller's contract above.
         unsafe { self.dev.upgrade_device_ptr::<T>(ptr, len) }
     }
@@ -1142,7 +1143,9 @@ impl<
         if host.is_empty() {
             return Ok(());
         }
-        self.dev.bind_to_thread().map_err(map_err("bind_to_thread"))?;
+        self.dev
+            .bind_to_thread()
+            .map_err(map_err("bind_to_thread"))?;
         let dst = *DevicePtr::device_ptr(&**self.slice());
         // SAFETY: lengths were checked equal above, the context is bound,
         // and the `cuStreamSynchronize` below discharges the borrow of

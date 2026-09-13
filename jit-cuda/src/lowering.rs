@@ -1162,16 +1162,22 @@ mod tests {
                 .unwrap_or_else(|e| panic!("lowering failed for sm_{maj}{min}: {e}"));
             let text = m.render();
             assert!(
-                text.contains(&format!(".version {want_version}
-")),
+                text.contains(&format!(
+                    ".version {want_version}
+"
+                )),
                 "sm_{maj}{min} must render `.version {want_version}`, got:
 {}",
-                text.lines().take(3).collect::<Vec<_>>().join("
-")
+                text.lines().take(3).collect::<Vec<_>>().join(
+                    "
+"
+                )
             );
             assert!(
-                text.contains(&format!(".target sm_{maj}{min}
-")),
+                text.contains(&format!(
+                    ".target sm_{maj}{min}
+"
+                )),
                 "sm_{maj}{min} must render its own target"
             );
         }
@@ -1213,7 +1219,8 @@ mod tests {
         // ── the length is loaded once per array, in the prologue ───────
         for i in 0..3 {
             assert_eq!(
-                text.matches(&format!("ld.param.s32 %r{i}, [p{i}_len]")).count(),
+                text.matches(&format!("ld.param.s32 %r{i}, [p{i}_len]"))
+                    .count(),
                 1,
                 "p{i}_len must be loaded exactly once, in the prologue\n{text}"
             );
@@ -1462,8 +1469,7 @@ mod tests {
             ("f2dKernel", "([F[D)V"),
             ("d2fKernel", "([D[F)V"),
         ] {
-            let (method, cp) =
-                crate::analyzer::load_method_with_pool("GpuArithDifferential", m, d);
+            let (method, cp) = crate::analyzer::load_method_with_pool("GpuArithDifferential", m, d);
             let sig = match crate::analyzer::analyze_with_pool(&method, &cp) {
                 OffloadVerdict::Eligible(s) => s,
                 v => panic!("{m} not eligible: {v:?}"),
@@ -1496,7 +1502,10 @@ mod tests {
         // compare retires an over-large index AND a negative one, which
         // is what lets the per-access checks go. See
         // `Emitter::emit_loop_guard`.
-        assert!(text.contains("setp.ge.u32"), "missing dispatch guard\n{text}");
+        assert!(
+            text.contains("setp.ge.u32"),
+            "missing dispatch guard\n{text}"
+        );
         assert!(text.contains("L_done"));
         // Two int loads, one int store, one int add, all in global mem.
         let n_int_loads = text.matches("ld.global.s32").count();
@@ -1743,7 +1752,10 @@ mod tests {
             1,
             "exactly one atomic, from lane 0\n{text}"
         );
-        assert!(text.contains("%laneid"), "lane 0 is chosen by %laneid\n{text}");
+        assert!(
+            text.contains("%laneid"),
+            "lane 0 is chosen by %laneid\n{text}"
+        );
         // The retired-thread path: the guard branches to the zero label,
         // never straight to `L_done`, and that label feeds the tree.
         assert!(
@@ -1754,7 +1766,10 @@ mod tests {
             !text.contains("bra L_done;\n") || text.matches("bra L_done;").count() == 0,
             "a reduction kernel has no path that skips the warp tree\n{text}"
         );
-        assert!(text.contains("L_reduce_zero:\n    mov.s64"), "zero contribution\n{text}");
+        assert!(
+            text.contains("L_reduce_zero:\n    mov.s64"),
+            "zero contribution\n{text}"
+        );
         assert!(text.contains("L_reduce:"), "join label\n{text}");
 
         // No barrier, and therefore no rule about where a thread may
@@ -1959,8 +1974,13 @@ mod tests {
             "ternary_with_store",
         );
         ptxas_round_trip(
-            &lower_fixture_with_pool_if_converted("EligibleTernary", "shortCircuit", "([F[F[F)V", 200)
-                .render(),
+            &lower_fixture_with_pool_if_converted(
+                "EligibleTernary",
+                "shortCircuit",
+                "([F[F[F)V",
+                200,
+            )
+            .render(),
             "ternary_short_circuit",
         );
         // The one that matters most: the real kernel this whole record is
@@ -2484,8 +2504,8 @@ mod tests {
     /// the arms are short and pure enough to run unconditionally.
     #[test]
     fn a_ternary_lowers_to_selp_with_no_branch() {
-        let text = lower_fixture_if_converted("EligibleTernary", "select", "([F[F[F)V", 200)
-            .render();
+        let text =
+            lower_fixture_if_converted("EligibleTernary", "select", "([F[F[F)V", 200).render();
         assert!(
             text.contains("selp.f32"),
             "expected the ternary to become a select:
@@ -2536,8 +2556,12 @@ mod tests {
     /// blacklist the method and run it on the CPU, with the right answer.
     #[test]
     fn a_short_circuit_condition_is_not_if_converted() {
-        let m =
-            lower_fixture_with_pool_if_converted("EligibleTernary", "shortCircuit", "([F[F[F)V", 200);
+        let m = lower_fixture_with_pool_if_converted(
+            "EligibleTernary",
+            "shortCircuit",
+            "([F[F[F)V",
+            200,
+        );
         let text = m.render();
         assert!(
             text.contains("bra L_body_"),

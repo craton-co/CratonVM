@@ -6111,7 +6111,11 @@ impl IrBuilder {
         let saved_locals = std::mem::replace(&mut self.locals, callee_locals);
         let saved_stack = std::mem::take(&mut self.stack);
         let multi_return = self.splice_multi_return.contains(&base);
-        let ranges = self.splice_block_walks.get(&base).cloned().unwrap_or_default();
+        let ranges = self
+            .splice_block_walks
+            .get(&base)
+            .cloned()
+            .unwrap_or_default();
         // `BlockWalk::reverse_postorder` puts the body's pc 0 (`base`) first.
         let range_end = ranges.first().map_or(end, |&(_, e)| e);
         self.splice.push(SpliceFrame {
@@ -7391,13 +7395,18 @@ impl IrBuilder {
                     else {
                         return ir_build_bail(line!(), base);
                     };
-                    self.loop_headers.extend(walk.headers.iter().map(|&h| base + h));
+                    self.loop_headers
+                        .extend(walk.headers.iter().map(|&h| base + h));
                     self.splice_block_walks.insert(
                         base,
-                        walk.ranges.iter().map(|&(s, e)| (base + s, base + e)).collect(),
+                        walk.ranges
+                            .iter()
+                            .map(|&(s, e)| (base + s, base + e))
+                            .collect(),
                     );
                 } else {
-                    self.loop_headers.extend(body_headers.iter().map(|&h| base + h));
+                    self.loop_headers
+                        .extend(body_headers.iter().map(|&h| base + h));
                 }
 
                 // A body with several `return`s: the walk must NOT leave the
@@ -10063,8 +10072,9 @@ impl IrBuilder {
                 // goes to the default target. Reuses the existing If/Cmp/merge
                 // machinery — no dedicated multi-way node.
                 0xaa | 0xab => {
-                    let (len, default_target, cases) = crate::bytecode_analysis::switch_table(code, code_len, pc)
-                        .map(|t| (t.len, t.default, t.cases))?;
+                    let (len, default_target, cases) =
+                        crate::bytecode_analysis::switch_table(code, code_len, pc)
+                            .map(|t| (t.len, t.default, t.cases))?;
                     let key = self.pop();
                     for (match_val, target) in &cases {
                         let cval = self.iconst(*match_val as i64);
@@ -11324,14 +11334,22 @@ mod scalar_intrinsic_recognizer_tests {
         note_string_access_site(7);
         {
             let scope = IrBuildResultsScope::enter();
-            assert_eq!(scope.site_traps_planted(), 0, "a stale count from an earlier build");
+            assert_eq!(
+                scope.site_traps_planted(),
+                0,
+                "a stale count from an earlier build"
+            );
             assert!(scope.string_access_site_pcs().is_empty());
             SITE_TRAPS_THIS_BUILD.with(|c| c.set(1));
             note_string_access_site(9);
             assert_eq!(scope.site_traps_planted(), 1);
             assert_eq!(scope.string_access_site_pcs(), vec![9]);
         }
-        assert_eq!(site_traps_planted_this_build(), 0, "a bailed build left its count");
+        assert_eq!(
+            site_traps_planted_this_build(),
+            0,
+            "a bailed build left its count"
+        );
         assert!(string_access_site_pcs().is_empty());
     }
 
@@ -12465,7 +12483,10 @@ mod tests {
                 .filter(|h| reachable.contains(h))
                 .collect();
             let rotated = has_rotated_loop_header(&verified, &reachable, &headers, len);
-            (rotated, BlockWalk::reverse_postorder(&verified, &reachable, len))
+            (
+                rotated,
+                BlockWalk::reverse_postorder(&verified, &reachable, len),
+            )
         }
 
         let (rotated, walk) = walk_for(&ROTATED_FOR, 21);
@@ -13347,8 +13368,8 @@ mod tests {
         //  8: goto -4 -> 4
         // 11: aload_1  12: monitorexit  13: return
         let code = [
-            0x2a, 0x59, 0x4c, 0xc2, 0x1c, 0x99, 0x00, 0x06, 0xa7, 0xff, 0xfc, 0x2b, 0xc3, 0xb1,
-            0, 0,
+            0x2a, 0x59, 0x4c, 0xc2, 0x1c, 0x99, 0x00, 0x06, 0xa7, 0xff, 0xfc, 0x2b, 0xc3, 0xb1, 0,
+            0,
         ];
         let graph = IrBuilder::new(3, 3)
             .build(&code, 14)
@@ -13387,7 +13408,9 @@ mod tests {
         //  0: iload_1  1: ifeq +8 -> 9
         //  4: aload_0  5: monitorenter  6: goto +3 -> 9     (holds `a` on this edge)
         //  9: return                                        (join: held vs not held)
-        let code = [0x1b, 0x99, 0x00, 0x08, 0x2a, 0xc2, 0xa7, 0x00, 0x03, 0xb1, 0, 0];
+        let code = [
+            0x1b, 0x99, 0x00, 0x08, 0x2a, 0xc2, 0xa7, 0x00, 0x03, 0xb1, 0, 0,
+        ];
         assert!(IrBuilder::new(2, 2).build(&code, 10).is_none());
         // The control: the same join with the lock released on that edge first
         // (`aload_0; monitorexit` before the goto) builds, which is what shows the
@@ -14194,7 +14217,11 @@ mod tests {
         // Killing the interned node: the next call must not return the dead
         // one. With a live duplicate, the duplicate; with none, a new node.
         b.graph.kill(seven_a);
-        assert_eq!(b.iconst(7), seven_b, "falls back to the surviving duplicate");
+        assert_eq!(
+            b.iconst(7),
+            seven_b,
+            "falls back to the surviving duplicate"
+        );
         assert_eq!(b.iconst(7), seven_b, "and the repaired entry sticks");
         b.graph.kill(five);
         let five_again = b.iconst(5);
@@ -14209,8 +14236,17 @@ mod tests {
                 .position(|n| n.op == Op::Const(v) && n.ty == ty)
                 .map(|i| i as NodeId)
         };
-        for (v, ty) in [(5, IrType::Int), (0, IrType::Int), (7, IrType::Int), (0, IrType::Ref)] {
-            assert_eq!(b.interned_const(v, ty), scan(&b.graph, v, ty), "({v}, {ty:?})");
+        for (v, ty) in [
+            (5, IrType::Int),
+            (0, IrType::Int),
+            (7, IrType::Int),
+            (0, IrType::Ref),
+        ] {
+            assert_eq!(
+                b.interned_const(v, ty),
+                scan(&b.graph, v, ty),
+                "({v}, {ty:?})"
+            );
         }
         assert_eq!(b.interned_const(123, IrType::Int), None);
     }

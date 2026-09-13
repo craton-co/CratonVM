@@ -472,7 +472,9 @@ fn no_published_document_calls_zgc_a_default_off_feature() {
             format!(
                 "`zgc` is NOT a default feature — gc/Cargo.toml [features] says \
                  `{}`. A stock build does not enable it.",
-                default_line.unwrap_or("(no `default = […]` line at all)").trim()
+                default_line
+                    .unwrap_or("(no `default = […]` line at all)")
+                    .trim()
             ),
         )
     };
@@ -689,7 +691,12 @@ fn architecture_per_crate_loc_table_matches_reality() {
         .iter()
         .map(|(name, claimed)| {
             let actual = count_rs_lines(&root.join(name));
-            (deviation_ppm(*claimed, actual), name.clone(), *claimed, actual)
+            (
+                deviation_ppm(*claimed, actual),
+                name.clone(),
+                *claimed,
+                actual,
+            )
         })
         .collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0));
@@ -795,7 +802,12 @@ fn flag_inventory_surface_counts_are_current() {
                      whether the number moved with it"
                 )
             });
-        let cell = line.trim().trim_matches('|').rsplit('|').next().unwrap_or("");
+        let cell = line
+            .trim()
+            .trim_matches('|')
+            .rsplit('|')
+            .next()
+            .unwrap_or("");
         parse_count(cell).unwrap_or_else(|| {
             panic!("the count cell of `{row}` did not parse as a number: {line:?}")
         })

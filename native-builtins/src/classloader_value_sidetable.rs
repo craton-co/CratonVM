@@ -237,8 +237,12 @@ fn native_aclv_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         (Value::Object(Some(a)), Value::Object(Some(b))) => {
             a == b
                 || matches!(
-                    ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z",
-                        &[Value::Object(Some(b))]),
+                    ctx.invoke_virtual(
+                        a,
+                        "equals",
+                        "(Ljava/lang/Object;)Z",
+                        &[Value::Object(Some(b))]
+                    ),
                     Ok(Some(Value::Int(1)))
                 )
         }
@@ -304,8 +308,9 @@ fn native_aclv_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // next `computeIfAbsent` saw a "present" mapping and never recomputed.
     // MEASURED by `apps/probes/JdkInternalSweep.java`.
     if matches!(val, Value::Object(None)) {
-        return Err(cratonvm_types::error::RuntimeError::NullPointerException { message: None }
-            .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+        );
     }
     let entry = rooted_entry(ctx, val);
     let mut t = table().lock();

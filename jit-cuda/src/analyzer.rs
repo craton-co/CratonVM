@@ -1223,9 +1223,7 @@ fn classify(op: u8, hint: AdmissionFlags, prev_op: Option<u8>) -> OpClass {
         // does not cover object allocation or reference-component
         // arrays. Only primitive `newarray` (0xBC) is loosened, and
         // only when the size came from `iload <n>` (see prev_op).
-        0xBC if hint.allocation && is_iload_family(prev_op) => {
-            OpClass::Ok
-        }
+        0xBC if hint.allocation && is_iload_family(prev_op) => OpClass::Ok,
         0xBB | 0xBC | 0xBD | 0xC5 => OpClass::Reject(Reason::Allocation),
         0xBF => OpClass::Reject(Reason::Throw),
         0xC0 | 0xC1 => OpClass::Reject(Reason::TypeCheck),

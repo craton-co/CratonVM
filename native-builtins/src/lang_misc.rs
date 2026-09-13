@@ -5,9 +5,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use cratonvm_native_api::{
-    NativeCallback, NativeContext, NativeHandleScope, NativeMethodRegistry,
-};
+use cratonvm_native_api::{NativeCallback, NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 

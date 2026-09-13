@@ -289,7 +289,10 @@ impl Stream {
     /// and stamping the same slot 18 times per replay is 17 wasted lock
     /// acquisitions.
     pub(crate) fn note_captured_slots(&self, slots: &[crate::LastWriteSlot]) {
-        let mut held = self.captured_slots.lock().unwrap_or_else(|p| p.into_inner());
+        let mut held = self
+            .captured_slots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         for slot in slots {
             if !held.iter().any(|s| std::sync::Arc::ptr_eq(s, slot)) {
                 held.push(slot.clone());
@@ -300,7 +303,12 @@ impl Stream {
     /// Take the slots accumulated since `begin_capture`, for the graph
     /// that is being handed back.
     pub(crate) fn take_captured_slots(&self) -> Vec<crate::LastWriteSlot> {
-        std::mem::take(&mut *self.captured_slots.lock().unwrap_or_else(|p| p.into_inner()))
+        std::mem::take(
+            &mut *self
+                .captured_slots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
     }
 }
 

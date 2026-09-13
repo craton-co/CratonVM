@@ -512,11 +512,9 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             // outside the lookup class's package -- keeps the
             // `IllegalArgumentException` below, which is what the JDK specifies
             // for that case.
-            if let Some(e) = crate::lang_system::lookup_define_format_error(
-                "",
-                "Lookup.defineClass",
-                &msg,
-            ) {
+            if let Some(e) =
+                crate::lang_system::lookup_define_format_error("", "Lookup.defineClass", &msg)
+            {
                 return Err(e);
             }
             Err(RuntimeError::IllegalArgumentException {
@@ -1091,7 +1089,9 @@ mod tests {
             matches!(
                 r,
                 Err(MethodCallFailed::InternalError(
-                    cratonvm_types::error::VmError::Runtime(RuntimeError::NullPointerException { .. })
+                    cratonvm_types::error::VmError::Runtime(
+                        RuntimeError::NullPointerException { .. }
+                    )
                 ))
             ),
             "null bytes must be NullPointerException, got {r:?}"
@@ -1154,7 +1154,9 @@ mod tests {
             matches!(
                 r,
                 Err(MethodCallFailed::InternalError(
-                    cratonvm_types::error::VmError::Runtime(RuntimeError::NullPointerException { .. })
+                    cratonvm_types::error::VmError::Runtime(
+                        RuntimeError::NullPointerException { .. }
+                    )
                 ))
             ),
             "null options must be NullPointerException, got {r:?}"

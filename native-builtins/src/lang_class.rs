@@ -5651,7 +5651,9 @@ fn reflective_value_is_runtime_interfaced(ctx: &dyn NativeContext, arg_cid: Clas
     }
     match ctx.class_name_of_id(arg_cid) {
         Some(n) => {
-            n.contains("$Proxy") || n.ends_with("AnnotationProxy") || ctx.is_class_synthetic_stub(&n)
+            n.contains("$Proxy")
+                || n.ends_with("AnnotationProxy")
+                || ctx.is_class_synthetic_stub(&n)
         }
         None => true,
     }
@@ -14282,7 +14284,10 @@ mod annotation_proxy_cache_unload_tests {
     #[test]
     fn a_live_row_survives_the_purge() {
         const VM: usize = 0xA0A1;
-        seed(VM, &[(11, "Lorg/example/Ann;", A), (12, "Lorg/example/Two;", B)]);
+        seed(
+            VM,
+            &[(11, "Lorg/example/Ann;", A), (12, "Lorg/example/Two;", B)],
+        );
         let dead: rustc_hash::FxHashSet<u32> = [990u32].into_iter().collect();
         let dropped = super::forget_unloaded_annotation_proxies(VM, &dead, &|o| {
             Some(if o.as_ptr() as usize == A { 990 } else { 7 })
@@ -14290,7 +14295,8 @@ mod annotation_proxy_cache_unload_tests {
         assert_eq!(dropped, 1);
         assert_eq!(rows(VM), 1, "the row whose proxy class is alive must stay");
         assert!(super::ANNOTATION_PROXY_CACHE
-            .peek(VM, |t| t.contains_key(&(12u32, "Lorg/example/Two;".to_string())))
+            .peek(VM, |t| t
+                .contains_key(&(12u32, "Lorg/example/Two;".to_string())))
             .unwrap_or(false));
     }
 
@@ -20055,7 +20061,6 @@ fn alloc_package_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
     }
 }
 
-
 /// The single canonical **unnamed** `java.lang.Module` mirror for this VM.
 ///
 /// Every application-classpath class reports the unnamed module from
@@ -20880,16 +20885,10 @@ pub(crate) const HTTP_REDIRECT_CONSTANTS: &[&str] = &["NEVER", "ALWAYS", "NORMAL
 #[cfg(feature = "synthetic-jdk")]
 macro_rules! synthetic_enum_pair {
     ($clinit:ident, $values:ident, $class:expr, $constants:expr) => {
-        pub(crate) fn $clinit(
-            ctx: &mut dyn NativeContext,
-            _args: &[Value],
-        ) -> MethodCallResult {
+        pub(crate) fn $clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
             publish_synthetic_enum_constants(ctx, $class, $constants)
         }
-        pub(crate) fn $values(
-            ctx: &mut dyn NativeContext,
-            _args: &[Value],
-        ) -> MethodCallResult {
+        pub(crate) fn $values(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
             let _ = ctx.ensure_class_initialized($class);
             synthetic_enum_values(ctx, $class, $constants)
         }
@@ -28106,7 +28105,6 @@ Implementation-Title: opensaml-core-api\r\n\
             .remove(&(0, "com.example.memo".to_string()));
     }
 
-
     /// `ClassLoader.getPackages()` and the static `Package.getPackages()` must
     /// stay UNREGISTERED.
     ///
@@ -29201,7 +29199,6 @@ mod protection_domain_layout_tests {
     }
 }
 
-
 #[cfg(test)]
 mod serialization_constructor_accessor_tests {
     use super::*;
@@ -29280,9 +29277,7 @@ mod serialization_constructor_accessor_tests {
         descriptor: &str,
         _args: &[Value],
     ) -> Option<MethodCallResult> {
-        if method_name == "newInstance"
-            && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;"
-        {
+        if method_name == "newInstance" && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;" {
             // A sentinel Int is not a legal `newInstance` return in production;
             // it is used here BECAUSE it cannot be confused with anything the
             // fallthrough path could construct.
@@ -29455,8 +29450,12 @@ mod reflection_factory_caller_visibility_tests {
     fn the_exception_did_not_widen_to_the_whole_package() {
         // A DIFFERENT class in the same two packages is still skipped, which
         // is what "narrow on purpose" means.
-        assert!(is_reflection_internal_frame("jdk/internal/reflect/Reflection"));
-        assert!(is_reflection_internal_frame("sun/reflect/annotation/AnnotationParser"));
+        assert!(is_reflection_internal_frame(
+            "jdk/internal/reflect/Reflection"
+        ));
+        assert!(is_reflection_internal_frame(
+            "sun/reflect/annotation/AnnotationParser"
+        ));
         // ... while the pre-existing MethodUtil carve-out is untouched.
         assert!(!is_reflection_internal_frame("sun/reflect/misc/MethodUtil"));
     }

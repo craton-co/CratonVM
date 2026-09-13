@@ -371,7 +371,11 @@ pub fn jit_state_lines(fault_pc: Option<usize>) -> Vec<String> {
         let recent = crate::jit::helper_guard::jit_helper_recent_panics();
         lines.push(format!(
             "jit: runtime helper panics contained: {contained} (recent: {})",
-            if recent.is_empty() { "unavailable".to_string() } else { recent.join(", ") }
+            if recent.is_empty() {
+                "unavailable".to_string()
+            } else {
+                recent.join(", ")
+            }
         ));
     }
     lines
@@ -1238,10 +1242,8 @@ mod windows_fault {
                         // IMAGE_OPTIONAL_HEADER64.DataDirectory[6] (Debug) is
                         // at NT + 24 + 112 + 6*8.
                         let dd = nt + 24 + 112 + 6 * 8;
-                        let debug_rva =
-                            core::ptr::read_unaligned(dd as *const u32) as usize;
-                        let debug_size =
-                            core::ptr::read_unaligned((dd + 4) as *const u32) as usize;
+                        let debug_rva = core::ptr::read_unaligned(dd as *const u32) as usize;
+                        let debug_size = core::ptr::read_unaligned((dd + 4) as *const u32) as usize;
                         // IMAGE_DEBUG_DIRECTORY is 28 bytes.
                         if debug_rva != 0
                             && debug_size >= 28
@@ -1253,8 +1255,7 @@ mod windows_fault {
                                 // .Type at +12, .SizeOfData at +16,
                                 // .AddressOfRawData at +20.
                                 let ty = core::ptr::read_unaligned((e + 12) as *const u32);
-                                let sz =
-                                    core::ptr::read_unaligned((e + 16) as *const u32) as usize;
+                                let sz = core::ptr::read_unaligned((e + 16) as *const u32) as usize;
                                 let raw =
                                     core::ptr::read_unaligned((e + 20) as *const u32) as usize;
                                 // 2 == IMAGE_DEBUG_TYPE_CODEVIEW. An RSDS
@@ -1264,9 +1265,8 @@ mod windows_fault {
                                     && sz >= 24
                                     && raw != 0
                                     && raw.saturating_add(sz) <= soi
-                                    && core::ptr::read_unaligned(
-                                        (module_base + raw) as *const u32,
-                                    ) == 0x5344_5352
+                                    && core::ptr::read_unaligned((module_base + raw) as *const u32)
+                                        == 0x5344_5352
                                 {
                                     let g = module_base + raw + 4;
                                     let d1 = core::ptr::read_unaligned(g as *const u32);
@@ -1274,8 +1274,7 @@ mod windows_fault {
                                     let d3 = core::ptr::read_unaligned((g + 6) as *const u16);
                                     let d4: [u8; 8] =
                                         core::ptr::read_unaligned((g + 8) as *const [u8; 8]);
-                                    let age =
-                                        core::ptr::read_unaligned((g + 16) as *const u32);
+                                    let age = core::ptr::read_unaligned((g + 16) as *const u32);
                                     let mut guid = String::with_capacity(40);
                                     let _ = write!(guid, "{d1:08X}{d2:04X}{d3:04X}");
                                     for b in d4 {
@@ -1865,7 +1864,10 @@ mod indexed_load_decode_tests {
             .join()
             .unwrap();
 
-        assert!(RAN.load(AtomicOrdering::SeqCst), "the TLS destructor never ran");
+        assert!(
+            RAN.load(AtomicOrdering::SeqCst),
+            "the TLS destructor never ran"
+        );
         #[cfg(any(unix, windows))]
         assert_eq!(
             SEEN.lock().unwrap().as_deref(),
@@ -2907,8 +2909,11 @@ not an address\n",
                         );
                         let n = hex_into_buf(&mut rbuf, moved_to as u64);
                         async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
-                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"
-");
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            b"
+",
+                        );
                     }
                 }
             }
@@ -2955,8 +2960,11 @@ not an address\n",
                 );
                 let n = hex_into_buf(&mut rbuf, total);
                 async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
-                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"
-");
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b"
+",
+                );
             }
         }
 
@@ -3503,8 +3511,9 @@ pub fn current_thread_name() -> Option<String> {
         let mut buf = [0u8; 64];
         // SAFETY: `buf` is a valid, writable buffer of `buf.len()` bytes, and
         // `pthread_getname_np` is documented to NUL-terminate within it.
-        let rc =
-            unsafe { libc::pthread_getname_np(libc::pthread_self(), buf.as_mut_ptr().cast(), buf.len()) };
+        let rc = unsafe {
+            libc::pthread_getname_np(libc::pthread_self(), buf.as_mut_ptr().cast(), buf.len())
+        };
         if rc != 0 {
             return None;
         }

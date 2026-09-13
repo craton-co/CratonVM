@@ -1049,7 +1049,8 @@ pub fn collector_decision_report() -> String {
             // counter here -- and only one of them was actually checked.
             let pz = crate::gc_quiescence::PEER_DEPTH_ZERO_TOTAL.load(Ordering::Relaxed);
             let pz_torn = crate::gc_quiescence::PEER_DEPTH_ZERO_TORN.load(Ordering::Relaxed);
-            let pz_quiet = crate::gc_quiescence::PEER_DEPTH_ZERO_GLOBAL_ZERO.load(Ordering::Relaxed);
+            let pz_quiet =
+                crate::gc_quiescence::PEER_DEPTH_ZERO_GLOBAL_ZERO.load(Ordering::Relaxed);
             s.push('\n');
             s.push_str(&format!(
                 "[GC] peer ledger skipped: peer_depth_zero={pz} \
@@ -1589,9 +1590,9 @@ pub fn record_g1_pause_coverage_reason(reason: Option<usize>) {
 /// Kept for callers that have only the boolean; prefer
 /// [`record_g1_pause_coverage_reason`], which does not throw the reason away.
 pub fn record_g1_pause_coverage(incomplete: bool) {
-    record_g1_pause_coverage_reason(incomplete.then_some(
-        crate::gc_quiescence::incomplete_reason::NONE,
-    ));
+    record_g1_pause_coverage_reason(
+        incomplete.then_some(crate::gc_quiescence::incomplete_reason::NONE),
+    );
 }
 
 /// The non-zero rows of the per-reason census, as `(label, count)`.

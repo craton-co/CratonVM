@@ -201,7 +201,11 @@ mod tests {
         // sweep calls `evict_dead` at the end of EVERY cycle, and most cycles
         // reclaim nothing that was ever hashed.
         evict_dead(&[]);
-        assert_eq!(SEEN.load(Ordering::Relaxed), seen0, "empty batch must not call back");
+        assert_eq!(
+            SEEN.load(Ordering::Relaxed),
+            seen0,
+            "empty batch must not call back"
+        );
         assert_eq!(census(), (r0, e0), "empty batch must not move the census");
 
         evict_dead(&[7, 8]);

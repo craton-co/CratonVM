@@ -530,7 +530,10 @@ impl Compiler {
         if !inline_getstatic_enabled() {
             return false;
         }
-        let Some(base_cell) = self.direct_helpers.resolve_static_base(class_id_raw, field_index) else {
+        let Some(base_cell) = self
+            .direct_helpers
+            .resolve_static_base(class_id_raw, field_index)
+        else {
             return false;
         };
         // Cast: cell byte offset within the class's statics block -> disp32.

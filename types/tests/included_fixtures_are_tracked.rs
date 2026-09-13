@@ -221,10 +221,16 @@ fn the_scanner_finds_literals_and_skips_computed_ones() {
             .is_empty(),
         "a computed path names a build artefact and must be skipped, not guessed at"
     );
-    assert_eq!(resolve("reader/src/class_reader.rs", "../tests/fixtures/x.class").as_deref(),
-        Some("reader/tests/fixtures/x.class"));
+    assert_eq!(
+        resolve("reader/src/class_reader.rs", "../tests/fixtures/x.class").as_deref(),
+        Some("reader/tests/fixtures/x.class")
+    );
     assert_eq!(resolve("a/b/c.rs", "./d.bin").as_deref(), Some("a/b/d.bin"));
-    assert_eq!(resolve("a.rs", "../../x").as_deref(), None, "climbing out must be reported");
+    assert_eq!(
+        resolve("a.rs", "../../x").as_deref(),
+        None,
+        "climbing out must be reported"
+    );
 }
 
 /// The vendored-crate exemption is scoped to a real vendor tree.
@@ -253,8 +259,12 @@ fn the_vendor_exemption_still_has_something_to_exempt() {
 #[test]
 fn the_self_exemption_names_this_file() {
     let path = workspace_root().join(SELF);
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("SELF does not name a readable file ({}): {e}", path.display()));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "SELF does not name a readable file ({}): {e}",
+            path.display()
+        )
+    });
     assert!(
         text.contains("fn the_self_exemption_names_this_file"),
         "SELF points at {} , which is not this file",

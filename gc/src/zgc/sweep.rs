@@ -444,8 +444,7 @@ impl ZgcRealHeap {
             vec![self.sweep_bitmap_range(registered, cfg, marks, 0, words, base, high_floor)]
         };
 
-        let (mut sh, mut spans, mut new_cursor) =
-            Self::join_complement(&mut shards, base, low_end);
+        let (mut sh, mut spans, mut new_cursor) = Self::join_complement(&mut shards, base, low_end);
 
         let skips = self.jit_tlab_skip_regions();
         if !skips.is_empty() {
@@ -714,8 +713,9 @@ impl ZgcRealHeap {
         };
         sh.dead_count += 1;
         if cfg.collect_dead_hashes {
-            let h =
-                cratonvm_types::ObjectHeader::neutral_hash(header.mark_word.load(Ordering::Relaxed));
+            let h = cratonvm_types::ObjectHeader::neutral_hash(
+                header.mark_word.load(Ordering::Relaxed),
+            );
             if h != 0 {
                 sh.dead_hashes.push(h);
             }
@@ -962,4 +962,3 @@ impl ZgcRealHeap {
         }
     }
 }
-

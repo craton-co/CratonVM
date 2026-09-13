@@ -250,7 +250,6 @@ pub fn caller_blocks_jit(shared: &SharedVm, class_id: ClassId, method_index: u16
     verdict
 }
 
-
 /// Convenience wrapper for call sites that resolve their method by
 /// `(class_name, method_name, descriptor)` rather than by index — i.e.
 /// every JIT admission site in `interpreter.rs` (see module docs). Looks
@@ -1183,8 +1182,8 @@ fn resolve_method_ref(cp: &ConstantPool, index: u16) -> Option<(&str, &str, &str
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::offload::input_cache;
     use super::*;
+    use crate::runtime::offload::input_cache;
 
     // ------------------------------------------------------------------
     // `descriptor_could_ever_dispatch` — the screen the compiled dispatch
@@ -1215,10 +1214,7 @@ mod tests {
         // however eligible the body is.
         assert!(!descriptor_could_ever_dispatch("([F[F)F", 1));
         assert!(!descriptor_could_ever_dispatch("([D)D", 1));
-        assert!(!descriptor_could_ever_dispatch(
-            "([I)Ljava/lang/String;",
-            1
-        ));
+        assert!(!descriptor_could_ever_dispatch("([I)Ljava/lang/String;", 1));
     }
 
     #[test]
@@ -1234,10 +1230,7 @@ mod tests {
         // A reference array still counts as an array here: this screen is
         // a necessary condition, and the element-type refusal belongs to
         // the analyzer, which the caller asks next.
-        assert!(descriptor_could_ever_dispatch(
-            "([Ljava/lang/Object;)V",
-            1
-        ));
+        assert!(descriptor_could_ever_dispatch("([Ljava/lang/Object;)V", 1));
     }
 
     #[test]
@@ -1427,7 +1420,7 @@ mod tests {
     // `method_writes_primitive_array` — the JIT half of Phase 10 #2.
     // ------------------------------------------------------------------
 
-        /// The residency cache stands down for the JIT, and stays down.
+    /// The residency cache stands down for the JIT, and stays down.
     ///
     /// AUDIT 2026-09-02. This pins the mechanism behind
     /// [`ArrayWriterPolicy::AllowJit`]: when that policy is selected,

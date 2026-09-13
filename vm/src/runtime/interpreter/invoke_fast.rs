@@ -63,7 +63,8 @@ use super::*;
 /// decides how many local slots each occupies. Sized for the receiver plus the
 /// eight parameters `DescriptorFacts` keeps inline; a longer descriptor is
 /// declined.
-pub(super) type ArgSlots = [(CompactValue, u8); cratonvm_jit_api::DescriptorFacts::INLINE_PARAMS + 1];
+pub(super) type ArgSlots =
+    [(CompactValue, u8); cratonvm_jit_api::DescriptorFacts::INLINE_PARAMS + 1];
 
 /// An empty [`ArgSlots`] to fill.
 #[inline(always)]
@@ -201,13 +202,9 @@ pub(super) fn push_frame_verbatim(
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
-    thread.frames.emplace_cached_compact(
-        cached,
-        parts.0,
-        parts.1,
-        parts.2,
-        parts.3,
-    );
+    thread
+        .frames
+        .emplace_cached_compact(cached, parts.0, parts.1, parts.2, parts.3);
     install_door_monitor(thread, monitor);
     fire_method_entry_after_push(shared.vm_identity, thread);
     CachedCallResult::FramePushed
@@ -395,13 +392,14 @@ pub(super) fn note_invocation_for_tierup(
     // 2^32 calls -- a panic in a debug build, and in release a counter that
     // restarts below the threshold, so a method that was hot enough to be
     // offered every 64 calls silently stops being offered for 500 calls.
-    let cnt = match cached
-        .interp_invocations
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-    {
-        Ok(previous) => previous + 1,
-        Err(saturated) => saturated,
-    };
+    let cnt =
+        match cached
+            .interp_invocations
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        {
+            Ok(previous) => previous + 1,
+            Err(saturated) => saturated,
+        };
     if cnt % INVOCATION_SYNC_EVERY == 0 {
         shared
             .jit
@@ -494,7 +492,11 @@ pub(crate) fn dump_decline_reasons() {
     let total: u64 = rows.iter().map(|r| r.2).sum();
     eprintln!("[invoke-door] declines by reason (total {total}):");
     for (kind, why, n) in rows {
-        let pct = if total == 0 { 0.0 } else { n as f64 * 100.0 / total as f64 };
+        let pct = if total == 0 {
+            0.0
+        } else {
+            n as f64 * 100.0 / total as f64
+        };
         eprintln!("[invoke-door]   {n:>10}  {pct:5.1}%  {kind}: {why}");
     }
 }
@@ -536,7 +538,10 @@ pub(super) fn execute_invokestatic_fast_door(
         decline!("static", MISS, "a class was redefined");
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
-    let cached = match thread.invoke_cache.get(caller_class_id, cp_index, false, site_pc as u32) {
+    let cached = match thread
+        .invoke_cache
+        .get(caller_class_id, cp_index, false, site_pc as u32)
+    {
         Some(CachedInvokeTarget::Bytecode { cached, gate }) => {
             // A redefined target keeps the general path, which re-resolves.
             if gate.generation != 0 {
@@ -649,44 +654,55 @@ pub(super) fn execute_nonvirtual_fast_door(
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
     let (cached, expected_receiver) =
-        match thread.invoke_cache.get(caller_class_id, cp_index, is_special, site_pc as u32) {
-        Some(CachedInvokeTarget::Bytecode { cached, gate }) => {
-            if gate.generation != 0 {
-                decline!("special", MISS, "the target class has been redefined");
+        match thread
+            .invoke_cache
+            .get(caller_class_id, cp_index, is_special, site_pc as u32)
+        {
+            Some(CachedInvokeTarget::Bytecode { cached, gate }) => {
+                if gate.generation != 0 {
+                    decline!("special", MISS, "the target class has been redefined");
+                }
+                (Arc::clone(cached), None)
             }
-            (Arc::clone(cached), None)
-        }
-        Some(CachedInvokeTarget::VirtualBytecode {
-            cached,
-            gate,
-            receiver_class_id,
-        }) if is_special => {
-            if gate.generation != 0 {
-                decline!("special", MISS, "the target class has been redefined");
+            Some(CachedInvokeTarget::VirtualBytecode {
+                cached,
+                gate,
+                receiver_class_id,
+            }) if is_special => {
+                if gate.generation != 0 {
+                    decline!("special", MISS, "the target class has been redefined");
+                }
+                (Arc::clone(cached), Some(*receiver_class_id))
             }
-            (Arc::clone(cached), Some(*receiver_class_id))
-        }
-        // SPLIT BY VARIANT. A single "not plain bytecode" reason covered 77% of
-        // every door decline on a collator workload and named nothing: a
-        // `Native` target is a door that can never serve it, a `VirtualBytecode`
-        // on a NON-special call is a door that declines what the virtual door
-        // should have taken, and a `Jit` target is a callee the general path has
-        // to enter anyway. The three want completely different repairs.
-        Some(CachedInvokeTarget::Native { .. }) => {
-            decline!("special", MISS, "cached target is a registered native")
-        }
-        Some(CachedInvokeTarget::VirtualNative { .. }) => {
-            decline!("special", MISS, "cached target is a virtual registered native")
-        }
-        Some(CachedInvokeTarget::VirtualBytecode { .. }) => {
-            decline!("special", MISS, "cached target is VirtualBytecode on a non-special call")
-        }
-        Some(CachedInvokeTarget::Jit { .. }) => {
-            decline!("special", MISS, "cached target is a compiled body")
-        }
-        Some(_) => decline!("special", MISS, "cached target is not plain bytecode"),
-        None => decline!("special", MISS, "inline cache miss"),
-    };
+            // SPLIT BY VARIANT. A single "not plain bytecode" reason covered 77% of
+            // every door decline on a collator workload and named nothing: a
+            // `Native` target is a door that can never serve it, a `VirtualBytecode`
+            // on a NON-special call is a door that declines what the virtual door
+            // should have taken, and a `Jit` target is a callee the general path has
+            // to enter anyway. The three want completely different repairs.
+            Some(CachedInvokeTarget::Native { .. }) => {
+                decline!("special", MISS, "cached target is a registered native")
+            }
+            Some(CachedInvokeTarget::VirtualNative { .. }) => {
+                decline!(
+                    "special",
+                    MISS,
+                    "cached target is a virtual registered native"
+                )
+            }
+            Some(CachedInvokeTarget::VirtualBytecode { .. }) => {
+                decline!(
+                    "special",
+                    MISS,
+                    "cached target is VirtualBytecode on a non-special call"
+                )
+            }
+            Some(CachedInvokeTarget::Jit { .. }) => {
+                decline!("special", MISS, "cached target is a compiled body")
+            }
+            Some(_) => decline!("special", MISS, "cached target is not plain bytecode"),
+            None => decline!("special", MISS, "inline cache miss"),
+        };
     if cached.is_static {
         decline!("special", MISS, "cached target is static");
     }

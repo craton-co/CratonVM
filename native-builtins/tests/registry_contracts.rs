@@ -919,9 +919,11 @@ fn the_jdk_only_init_phase1_arm_publishes_the_system_props_field() {
         .find(&format!("fn {BODY}("))
         .unwrap_or_else(|| panic!("{BODY} is gone from lib.rs"));
     let end = body[at..]
-        .find("
+        .find(
+            "
 }
-")
+",
+        )
         .map(|rel| at + rel)
         .unwrap_or(body.len());
     assert!(

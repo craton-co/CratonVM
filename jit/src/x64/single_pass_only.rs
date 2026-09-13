@@ -221,7 +221,11 @@ impl SinglePassOnly {
 }
 
 fn induction_var(code: &[u8], header: usize, back_edge: usize) -> Option<usize> {
-    find_induction_variable(code, header, back_edge + bytecode_analysis::step(code, back_edge))
+    find_induction_variable(
+        code,
+        header,
+        back_edge + bytecode_analysis::step(code, back_edge),
+    )
 }
 
 fn no_bce() -> bool {

@@ -294,7 +294,10 @@ mod tests {
     use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess, NativeSystemAccess};
 
     /// Read a `String[]` the mock holds back into Rust.
-    fn names(ctx: &mut crate::test_utils::MockNativeContext, arr: cratonvm_types::ObjectRef) -> Vec<String> {
+    fn names(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        arr: cratonvm_types::ObjectRef,
+    ) -> Vec<String> {
         (0..ctx.array_length(arr))
             .map(|i| match ctx.get_array_element(arr, i) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -378,7 +381,10 @@ mod tests {
     fn the_location_is_the_jrt_url_of_the_packages_module() {
         let mut ctx = mock_ctx();
         ctx.declare_module_package("java/sql", "java.sql");
-        assert_eq!(call_location(&mut ctx, "java/sql").as_deref(), Some("jrt:/java.sql"));
+        assert_eq!(
+            call_location(&mut ctx, "java/sql").as_deref(),
+            Some("jrt:/java.sql")
+        );
         assert_eq!(call_location(&mut ctx, "no/such/pkg"), None);
     }
 

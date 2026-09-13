@@ -438,8 +438,7 @@ pub fn precise_jit_maps_enabled() -> bool {
         // Flipped back to DEFAULT-ON 2026-07-07 (see the doc comment above):
         // the BUG-01 ~6× throughput tax that motivated the d53c0e96 default-off
         // flip is gone on current dev. Opt out with CRATONVM_NO_PRECISE_JIT_MAPS=1.
-        let enabled =
-            !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_PRECISE_JIT_MAPS");
+        let enabled = !cratonvm_types::flags::runtime_flag_on("CRATONVM_NO_PRECISE_JIT_MAPS");
         if !enabled && moving_young_enabled() {
             eprintln!(
                 "[cratonvm] WARN: CRATONVM_NO_PRECISE_JIT_MAPS is set but a moving young \
@@ -5304,7 +5303,8 @@ mod reachability_roots {
         // 1: astore_0        <- handler_pc
         // 2: return
         let code = [0xb1u8, 0x4b, 0xb1];
-        let without = bytecode_analysis::reachable_pcs(&code, code.len(), &[]).expect("statically known CFG");
+        let without =
+            bytecode_analysis::reachable_pcs(&code, code.len(), &[]).expect("statically known CFG");
         assert!(without[0]);
         assert!(!without[1], "nothing branches to a handler body");
         assert!(!without[2]);
@@ -5380,7 +5380,8 @@ mod loop_xform_tests {
         let code = [
             0x1a, 0xac, 0x1a, 0x2b, 0xc7, 0x00, 0x07, 0x03, 0xa7, 0x00, 0x04, 0x04, 0x60, 0xac,
         ];
-        let r = bytecode_analysis::reachable_pcs(&code, code.len(), &[]).expect("statically known control flow");
+        let r = bytecode_analysis::reachable_pcs(&code, code.len(), &[])
+            .expect("statically known control flow");
         assert_eq!(&r[..2], &[true, true], "the live prefix is reachable");
         assert!(
             r[2..code.len()].iter().all(|&b| !b),
@@ -5403,7 +5404,8 @@ mod loop_xform_tests {
         //  7: iconst_1          (reached only by the `ifeq`)
         //  8: ireturn
         let code = [0x1a, 0x99, 0x00, 0x06, 0xa7, 0x00, 0x04, 0x04, 0xac];
-        let r = bytecode_analysis::reachable_pcs(&code, code.len(), &[]).expect("statically known control flow");
+        let r = bytecode_analysis::reachable_pcs(&code, code.len(), &[])
+            .expect("statically known control flow");
         assert_eq!(
             &r[..code.len()],
             &[true, true, false, false, true, false, false, true, true],
@@ -5429,7 +5431,8 @@ mod loop_xform_tests {
         code.extend_from_slice(&23i32.to_be_bytes()); // case 1 -> 26
         code.extend_from_slice(&[0x04, 0xac, 0x05, 0xac, 0x06, 0xac]);
         assert_eq!(code.len(), 30);
-        let r = bytecode_analysis::reachable_pcs(&code, code.len(), &[]).expect("statically known control flow");
+        let r = bytecode_analysis::reachable_pcs(&code, code.len(), &[])
+            .expect("statically known control flow");
         for pc in [0usize, 1, 2, 3, 24, 25, 26, 27, 28, 29] {
             assert!(r[pc], "pc {pc} is on a real path");
         }
@@ -6460,7 +6463,11 @@ mod loop_xform_tests {
             assert_eq!(pc, len, "{name}: the walk overran the fixture");
 
             assert!(matches!(code[sw], 0xaa | 0xab), "{name}: no switch at {sw}");
-            assert_eq!(bytecode_analysis::step(&code, sw), sw_len, "{name}: switch length");
+            assert_eq!(
+                bytecode_analysis::step(&code, sw),
+                sw_len,
+                "{name}: switch length"
+            );
             let mut t: Vec<usize> = Vec::new();
             assert!(
                 bytecode_analysis::explicit_targets(&code, len, sw, &mut t),
@@ -6474,7 +6481,10 @@ mod loop_xform_tests {
                 "{name}"
             );
             assert_eq!(code[back_edge], 0xa7, "{name}: back edge is not a goto");
-            assert!(bytecode_analysis::InsnCfg::build(&code, len).is_some(), "{name}: cfg builds");
+            assert!(
+                bytecode_analysis::InsnCfg::build(&code, len).is_some(),
+                "{name}: cfg builds"
+            );
             assert!(all_backward_edges_are_polled(&code, len), "{name}");
         }
     }
@@ -6822,9 +6832,16 @@ mod loop_xform_tests {
                 plan_loop_unroll(&before, blen, 12, 26, k, &[]).expect("switch before the loop"),
             ] {
                 assert_eq!(&x.code[..12], &before[..12], "{:?} k={k}", x.kind);
-                assert_eq!(bytecode_analysis::step(&x.code, 0), 12, "{:?} k={k}", x.kind);
+                assert_eq!(
+                    bytecode_analysis::step(&x.code, 0),
+                    12,
+                    "{:?} k={k}",
+                    x.kind
+                );
                 let mut t: Vec<usize> = Vec::new();
-                assert!(bytecode_analysis::explicit_targets(&x.code, x.code_len, 0, &mut t));
+                assert!(bytecode_analysis::explicit_targets(
+                    &x.code, x.code_len, 0, &mut t
+                ));
                 assert_eq!(
                     t,
                     vec![12],
@@ -6853,7 +6870,9 @@ mod loop_xform_tests {
                 assert_eq!(bytecode_analysis::step(&x.code, sw), 9, "k={k}");
                 assert_eq!(x.bci_at(sw), Some(19), "k={k}");
                 let mut t: Vec<usize> = Vec::new();
-                assert!(bytecode_analysis::explicit_targets(&x.code, x.code_len, sw, &mut t));
+                assert!(bytecode_analysis::explicit_targets(
+                    &x.code, x.code_len, sw, &mut t
+                ));
                 assert_eq!(
                     t,
                     vec![28 + k * 14],
@@ -6911,7 +6930,12 @@ mod loop_xform_tests {
         let mut retargeted = over.clone();
         retargeted[SWITCH_OVER_DEFAULT_LOW_BYTE] = 0x0a; // +24 (past the loop) -> +10 (the header)
         let mut t: Vec<usize> = Vec::new();
-        assert!(bytecode_analysis::explicit_targets(&retargeted, olen, 6, &mut t));
+        assert!(bytecode_analysis::explicit_targets(
+            &retargeted,
+            olen,
+            6,
+            &mut t
+        ));
         assert_eq!(t, vec![16], "the retarget must name the header");
         for k in 1..=3usize {
             let x = plan_loop_unroll(&retargeted, olen, 16, 27, k, &[])

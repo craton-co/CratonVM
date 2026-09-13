@@ -3203,7 +3203,13 @@ fn check_frem(
     // single-pass tier has lowered both to the fmod helpers since the `0x72 |
     // 0x73` arm landed in `bytecode_walk.rs`, which made the assertion fail on
     // every run; it is now the second leg of the comparison.
-    let twin = cached(&format!("{name}_sp"), descriptor, code, max_locals, num_params);
+    let twin = cached(
+        &format!("{name}_sp"),
+        descriptor,
+        code,
+        max_locals,
+        num_params,
+    );
     let sp = compile_fp_opt(&twin, &helpers, false)
         .unwrap_or_else(|| panic!("{name}: single-pass failed to compile frem/drem"));
     for (args, expected) in cases {
@@ -5612,7 +5618,8 @@ fn compile_getstatic_with(
     })
 }
 
-fn compile_getstatic(    cm: &CachedBytecodeMethod,
+fn compile_getstatic(
+    cm: &CachedBytecodeMethod,
     helpers: &JitRuntimeHelpers,
     optimize: bool,
     statics: &dyn Fn(u16) -> Option<(u32, usize, u8, bool)>,
@@ -5768,8 +5775,10 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             }
         };
         let cm = cached("gsdi", "()I", code, 1, 0);
-        let ir = compile_getstatic_with(&direct_helpers, &cm, &helpers, true, &statics).expect("IR direct getstatic");
-        let sp = compile_getstatic_with(&direct_helpers, &cm, &helpers, false, &statics).expect("single-pass");
+        let ir = compile_getstatic_with(&direct_helpers, &cm, &helpers, true, &statics)
+            .expect("IR direct getstatic");
+        let sp = compile_getstatic_with(&direct_helpers, &cm, &helpers, false, &statics)
+            .expect("single-pass");
         assert!(
             ir.used_ir_backend,
             "cov-01: direct getstatic on the IR tier"
@@ -5801,8 +5810,10 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             }
         };
         let cm = cached("gsdf", "()I", code, 1, 0);
-        let ir = compile_getstatic_with(&direct_helpers, &cm, &helpers, true, &statics).expect("IR fallback getstatic");
-        let sp = compile_getstatic_with(&direct_helpers, &cm, &helpers, false, &statics).expect("single-pass");
+        let ir = compile_getstatic_with(&direct_helpers, &cm, &helpers, true, &statics)
+            .expect("IR fallback getstatic");
+        let sp = compile_getstatic_with(&direct_helpers, &cm, &helpers, false, &statics)
+            .expect("single-pass");
         let expected = 424_242 + 0x1CE;
         assert_eq!(call_with_dummy_context(&ir, &[]) as i32, expected);
         assert_eq!(call_with_dummy_context(&sp, &[]) as i32, expected);
@@ -5821,8 +5832,10 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             }
         };
         let cm = cached("gsdr", "()Ljava/lang/Object;", code, 1, 0);
-        let ir = compile_getstatic_with(&direct_helpers, &cm, &helpers, true, &statics).expect("IR ref getstatic");
-        let sp = compile_getstatic_with(&direct_helpers, &cm, &helpers, false, &statics).expect("single-pass");
+        let ir = compile_getstatic_with(&direct_helpers, &cm, &helpers, true, &statics)
+            .expect("IR ref getstatic");
+        let sp = compile_getstatic_with(&direct_helpers, &cm, &helpers, false, &statics)
+            .expect("single-pass");
         assert!(
             ir.used_ir_backend,
             "cov-01: a reference static on the IR tier"

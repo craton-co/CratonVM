@@ -4682,8 +4682,7 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             let Value::Long(old) = current else {
                 return Ok(Some(Value::Long(0)));
             };
-            if ctx.compare_and_swap_field(obj, idx, current, Value::Long(old.wrapping_add(delta)))
-            {
+            if ctx.compare_and_swap_field(obj, idx, current, Value::Long(old.wrapping_add(delta))) {
                 return Ok(Some(Value::Long(old)));
             }
             if attempt > 0 && attempt % CAS_MAX_RETRIES == 0 {
@@ -5568,9 +5567,7 @@ mod unsafe_arena {
                 self.displace(addr, addr, bytes, outstanding, new_size);
                 return addr;
             }
-            if new_size > bytes.len()
-                && bytes.try_reserve_exact(new_size - bytes.len()).is_err()
-            {
+            if new_size > bytes.len() && bytes.try_reserve_exact(new_size - bytes.len()).is_err() {
                 inner.insert(addr, Arena { bytes, reserved });
                 return 0;
             }
@@ -6008,8 +6005,7 @@ pub fn unsafe_arena_real_ptr(addr: i64) -> Option<(*mut u8, usize)> {
 pub fn unsafe_arena_real_ptr_bounded(addr: i64, want: usize) -> Option<*mut u8> {
     let (ptr, remaining) = unsafe_arena_real_ptr(addr)?;
     if remaining < want {
-        unsafe_arena::SHORT_TRANSLATIONS
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        unsafe_arena::SHORT_TRANSLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             target: "cratonvm::unsafe_arena",
             handle = format!("{addr:#x}"),
@@ -6098,8 +6094,7 @@ pub fn unsafe_arena_translation_stats() -> ArenaTranslationStats {
 pub fn arena_translation_exit_summary(always: bool) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     let s = unsafe_arena_translation_stats();
-    let noteworthy =
-        s.stale_on_realloc != 0 || s.stale_on_free != 0 || s.short_translations != 0;
+    let noteworthy = s.stale_on_realloc != 0 || s.stale_on_free != 0 || s.short_translations != 0;
     if !always && !noteworthy {
         return;
     }
@@ -6366,8 +6361,7 @@ pub(crate) fn native_unsafe_object_field_offset1(
                 if f.is_static {
                     if f.name == field_name {
                         let cname = ctx.class_name_of_id(cid).unwrap_or_default();
-                        let offset =
-                            synthetic_offset_for(&cname, &format!("static:{field_name}"));
+                        let offset = synthetic_offset_for(&cname, &format!("static:{field_name}"));
                         remember_unsafe_static_field_offset(offset, cid, static_idx);
                         return Ok(Some(Value::Long(offset as i64)));
                     }
@@ -6799,7 +6793,11 @@ mod unsafe_arena_real_ptr_tests {
 
         assert!(unsafe_arena_put_byte(b + 1, 0x77));
         assert!(unsafe_arena_put_byte(grown + 1, 0x11));
-        assert_eq!(unsafe_arena_get_byte(b + 1), 0x77, "b must keep its own bytes");
+        assert_eq!(
+            unsafe_arena_get_byte(b + 1),
+            0x77,
+            "b must keep its own bytes"
+        );
         assert_eq!(
             unsafe_arena_get_byte(grown + 1),
             0x11,
@@ -6859,7 +6857,10 @@ mod unsafe_arena_real_ptr_tests {
 
         let retained_before = unsafe_arena_translation_stats().retained_on_realloc;
         let moved = unsafe_arena_try_reallocate(handle, 1 << 20).expect("resize succeeds");
-        assert_ne!(moved, handle, "1 MiB cannot fit the 64 bytes of handle space");
+        assert_ne!(
+            moved, handle,
+            "1 MiB cannot fit the 64 bytes of handle space"
+        );
         assert!(
             unsafe_arena_translation_stats().retained_on_realloc > retained_before,
             "a move under an outstanding pointer must retain the displaced buffer"

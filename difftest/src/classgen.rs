@@ -669,7 +669,10 @@ impl<'cp> Asm<'cp> {
 
     fn check_slot(&mut self, slot: usize, t: &VType) -> bool {
         if slot + t.size() > self.max_locals {
-            self.fail(format!("local {slot} ({t:?}) is outside max_locals {}", self.max_locals));
+            self.fail(format!(
+                "local {slot} ({t:?}) is outside max_locals {}",
+                self.max_locals
+            ));
             return false;
         }
         true
@@ -935,9 +938,7 @@ impl<'cp> Asm<'cp> {
 
     pub fn swap(&mut self) {
         match self.top_cats(2).as_deref() {
-            Some([false, false]) => {
-                self.shuffle(op::SWAP, 2, |v| vec![v[1].clone(), v[0].clone()])
-            }
+            Some([false, false]) => self.shuffle(op::SWAP, 2, |v| vec![v[1].clone(), v[0].clone()]),
             _ => self.fail("swap needs two category-1 values"),
         }
     }
@@ -1263,7 +1264,10 @@ impl<'cp> Asm<'cp> {
         self.switch_padding();
         self.switch_target(pc, default);
         put_u32(&mut self.code, low as u32);
-        put_u32(&mut self.code, (low as i64 + targets.len() as i64 - 1) as i32 as u32);
+        put_u32(
+            &mut self.code,
+            (low as i64 + targets.len() as i64 - 1) as i32 as u32,
+        );
         for &t in targets {
             self.switch_target(pc, t);
         }
@@ -1341,11 +1345,12 @@ impl<'cp> Asm<'cp> {
         if let Some(e) = self.error.take() {
             return Err(e);
         }
-        let label_pc = |labels: &[Option<(usize, Frame)>], l: Label| -> Result<(usize, Frame), String> {
-            labels[l.0]
-                .clone()
-                .ok_or_else(|| format!("label {} used but never bound", l.0))
-        };
+        let label_pc =
+            |labels: &[Option<(usize, Frame)>], l: Label| -> Result<(usize, Frame), String> {
+                labels[l.0]
+                    .clone()
+                    .ok_or_else(|| format!("label {} used but never bound", l.0))
+            };
         for f in &self.fixups {
             let (target, _) = label_pc(&self.labels, f.label)?;
             let delta = target as i64 - f.base as i64;
@@ -1581,9 +1586,7 @@ pub fn check_class_shape(class: &[u8]) -> Result<(), String> {
         let adv = match tag {
             1 => {
                 let len = r.u16(off + 1)?;
-                let s = class
-                    .get(off + 3..off + 3 + len)
-                    .ok_or("truncated utf8")?;
+                let s = class.get(off + 3..off + 3 + len).ok_or("truncated utf8")?;
                 utf8.push((idx, String::from_utf8_lossy(s).into_owned()));
                 3 + len
             }
@@ -1617,7 +1620,9 @@ pub fn check_class_shape(class: &[u8]) -> Result<(), String> {
         for _ in 0..attrs {
             let name = r.u16(off)?;
             let len = r.u32(off + 2)? as usize;
-            let payload = class.get(off + 6..off + 6 + len).ok_or("truncated attribute")?;
+            let payload = class
+                .get(off + 6..off + 6 + len)
+                .ok_or("truncated attribute")?;
             if name_of(name) == Some("Code") {
                 saw_code = true;
                 check_code(payload, major >= 50, &name_of)?;
@@ -1640,7 +1645,10 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     fn u8(&self, o: usize) -> Result<usize, String> {
-        self.b.get(o).map(|&v| v as usize).ok_or_else(|| format!("truncated at {o}"))
+        self.b
+            .get(o)
+            .map(|&v| v as usize)
+            .ok_or_else(|| format!("truncated at {o}"))
     }
     fn u16(&self, o: usize) -> Result<usize, String> {
         Ok((self.u8(o)? << 8) | self.u8(o + 1)?)
@@ -1740,7 +1748,9 @@ fn check_code<'n>(
         let len = r.u32(off + 2)? as usize;
         if name_of(name) == Some("StackMapTable") {
             let s = Reader {
-                b: payload.get(off + 6..off + 6 + len).ok_or("truncated StackMapTable")?,
+                b: payload
+                    .get(off + 6..off + 6 + len)
+                    .ok_or("truncated StackMapTable")?,
             };
             let n = s.u16(0)?;
             let mut p = 2usize;
@@ -1772,7 +1782,10 @@ fn check_code<'n>(
         off += 6 + len;
     }
     if needs_frames {
-        for &t in targets.iter().chain(after_transfer.iter().filter(|&&p| p < code_len)) {
+        for &t in targets
+            .iter()
+            .chain(after_transfer.iter().filter(|&&p| p < code_len))
+        {
             if !frame_pcs.contains(&t) {
                 return Err(format!("pc {t} needs a StackMapTable frame"));
             }
@@ -1798,7 +1811,10 @@ pub fn disassemble(code: &[u8]) -> String {
             break;
         };
         let name = crate::matrix::opcode_name(code[pc]).unwrap_or("?");
-        let operands: Vec<String> = code[pc + 1..pc + len].iter().map(|b| format!("{b:02x}")).collect();
+        let operands: Vec<String> = code[pc + 1..pc + len]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let _ = writeln!(s, "{pc:5}: {name} {}", operands.join(" "));
         pc += len;
     }
@@ -1832,7 +1848,10 @@ mod tests {
             ]
         );
         assert_eq!(r, Some(VType::Long));
-        assert_eq!(parse_method_descriptor("([Ljava/lang/String;)V").unwrap().1, None);
+        assert_eq!(
+            parse_method_descriptor("([Ljava/lang/String;)V").unwrap().1,
+            None
+        );
         assert!(parse_method_descriptor("I)V").is_none());
     }
 
@@ -1941,7 +1960,14 @@ mod tests {
         a.dup2_x2();
         assert_eq!(
             a.stack(),
-            &[VType::Int, VType::Int, VType::Int, VType::Long, VType::Int, VType::Int]
+            &[
+                VType::Int,
+                VType::Int,
+                VType::Int,
+                VType::Long,
+                VType::Int,
+                VType::Int
+            ]
         );
         a.pop2();
         a.simple(op::L2I, &[VType::Long], &[VType::Int]);

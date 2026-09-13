@@ -230,7 +230,10 @@ fn is_oid_text(s: &str) -> bool {
 /// KEYWORD and valued by dotted OID — the direction its javadoc specifies.
 ///
 /// Returns the RDNs in string order (most specific first).
-pub fn parse_dn(input: &str, extra_keywords: Option<&HashMap<String, String>>) -> Result<Vec<Rdn>, ()> {
+pub fn parse_dn(
+    input: &str,
+    extra_keywords: Option<&HashMap<String, String>>,
+) -> Result<Vec<Rdn>, ()> {
     let chars: Vec<char> = input.chars().collect();
     let mut rdns: Vec<Rdn> = Vec::new();
     let mut current: Rdn = Vec::new();
@@ -288,7 +291,11 @@ fn parse_ava(
     if pos >= chars.len() {
         return Err(());
     }
-    let keyword: String = chars[start..pos].iter().collect::<String>().trim().to_string();
+    let keyword: String = chars[start..pos]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string();
     pos += 1; // consume '='
     if keyword.is_empty() {
         return Err(());
@@ -641,11 +648,9 @@ fn render_ava(ava: &Ava, format: Format) -> String {
                 (Some(k), Some((t, _))) if !hexed => {
                     format!("{}={}", k.to_lowercase(), escape_2253(&canonical_text(t)))
                 }
-                (Some(k), _) => format!(
-                    "{}={}",
-                    k.to_lowercase(),
-                    hex_of(&der_of_value(&ava.value))
-                ),
+                (Some(k), _) => {
+                    format!("{}={}", k.to_lowercase(), hex_of(&der_of_value(&ava.value)))
+                }
                 (None, _) => format!("{}={}", ava.oid, hex_of(&der_of_value(&ava.value))),
             }
         }
@@ -845,8 +850,14 @@ mod tests {
             render(&name, Format::Rfc2253),
             "2.5.4.5=#13053132333435,CN=Alice"
         );
-        assert_eq!(render(&name, Format::Rfc1779), "OID.2.5.4.5=12345, CN=Alice");
-        assert_eq!(render(&name, Format::Display), "SERIALNUMBER=12345, CN=Alice");
+        assert_eq!(
+            render(&name, Format::Rfc1779),
+            "OID.2.5.4.5=12345, CN=Alice"
+        );
+        assert_eq!(
+            render(&name, Format::Display),
+            "SERIALNUMBER=12345, CN=Alice"
+        );
     }
 
     #[test]
@@ -867,15 +878,24 @@ mod tests {
         let escaped = dn("CN=\\41lice");
         let plain = dn("CN=Alice");
         assert_eq!(render(&escaped, Format::Rfc2253), "CN=Alice");
-        assert_eq!(hex(&encode_der(&escaped)), "3010310e300c06035504030c05416c696365");
-        assert_eq!(hex(&encode_der(&plain)), "3010310e300c06035504031305416c696365");
+        assert_eq!(
+            hex(&encode_der(&escaped)),
+            "3010310e300c06035504030c05416c696365"
+        );
+        assert_eq!(
+            hex(&encode_der(&plain)),
+            "3010310e300c06035504031305416c696365"
+        );
     }
 
     #[test]
     fn utf8_hex_escapes_join_into_one_character() {
         let name = dn("CN=Ren\\C3\\A9");
         assert_eq!(render(&name, Format::Rfc2253), "CN=Ren\u{e9}");
-        assert_eq!(hex(&encode_der(&name)), "3010310e300c06035504030c0552656ec3a9");
+        assert_eq!(
+            hex(&encode_der(&name)),
+            "3010310e300c06035504030c0552656ec3a9"
+        );
     }
 
     #[test]
@@ -911,7 +931,10 @@ mod tests {
         assert_eq!(render(&name, Format::Rfc2253), "CN=Alice\\ ");
         assert_eq!(render(&name, Format::Rfc1779), "CN=\"Alice \"");
         assert_eq!(render(&name, Format::Canonical), "cn=alice");
-        assert_eq!(hex(&encode_der(&name)), "3011310f300d06035504031306416c69636520");
+        assert_eq!(
+            hex(&encode_der(&name)),
+            "3011310f300d06035504031306416c69636520"
+        );
     }
 
     #[test]
@@ -924,9 +947,24 @@ mod tests {
     #[test]
     fn the_malformed_names_the_jdk_rejects_are_rejected() {
         for bad in [
-            "CN", "=Alice", "CN=Alice,", ",CN=Alice", "CN=Alice,,O=x", "CN=Alice+", "+CN=Alice",
-            "CN=a\\", "CN=#0", "CN=#zz", "CN=#0402", "NoSuchKeyword=x", "1.2.3.=x", "1..2=x",
-            "CN=\"unterminated", "CN=a\\q", "CN=Alice,CN", "   ",
+            "CN",
+            "=Alice",
+            "CN=Alice,",
+            ",CN=Alice",
+            "CN=Alice,,O=x",
+            "CN=Alice+",
+            "+CN=Alice",
+            "CN=a\\",
+            "CN=#0",
+            "CN=#zz",
+            "CN=#0402",
+            "NoSuchKeyword=x",
+            "1.2.3.=x",
+            "1..2=x",
+            "CN=\"unterminated",
+            "CN=a\\q",
+            "CN=Alice,CN",
+            "   ",
         ] {
             assert!(parse_dn(bad, None).is_err(), "should reject {bad:?}");
         }
@@ -954,7 +992,10 @@ mod tests {
         let one = dn("CN=Alice+OU=Eng,O=Example");
         let other = dn("OU=Eng+CN=Alice,O=Example");
         assert_eq!(render(&one, Format::Rfc2253), "CN=Alice+OU=Eng,O=Example");
-        assert_eq!(render(&one, Format::Rfc1779), "CN=Alice + OU=Eng, O=Example");
+        assert_eq!(
+            render(&one, Format::Rfc1779),
+            "CN=Alice + OU=Eng, O=Example"
+        );
         assert_eq!(
             render(&one, Format::Canonical),
             render(&other, Format::Canonical)
@@ -996,6 +1037,9 @@ mod tests {
         let mut correct = HashMap::new();
         correct.insert("MYOID".to_string(), "1.3.6.1.4.1.99999.1".to_string());
         let name = parse_dn("MYOID=x", Some(&correct)).expect("parses");
-        assert_eq!(render(&name, Format::Rfc2253), "1.3.6.1.4.1.99999.1=#130178");
+        assert_eq!(
+            render(&name, Format::Rfc2253),
+            "1.3.6.1.4.1.99999.1=#130178"
+        );
     }
 }

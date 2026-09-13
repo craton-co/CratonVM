@@ -808,8 +808,10 @@ pub(super) fn populate_invoke_cache(
     site_pc: usize,
 ) {
     // Check if already cached
-    if let Some(existing) = thread
-        .invoke_cache.get(caller_class_id, cp_index, is_special, site_pc as u32)
+    if let Some(existing) =
+        thread
+            .invoke_cache
+            .get(caller_class_id, cp_index, is_special, site_pc as u32)
     {
         if crate::runtime::env_cache::dbg_loader_trace() {
             let dbg_relevant = matches!(
@@ -977,9 +979,13 @@ pub(super) fn populate_invoke_cache(
             .shared_resolution
             .get_promoted_invoke(&promoted_key)
         {
-            thread
-                .invoke_cache
-                .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
+            thread.invoke_cache.put(
+                caller_class_id,
+                cp_index,
+                is_special,
+                site_pc as u32,
+                target,
+            );
             return;
         }
     }
@@ -1116,9 +1122,13 @@ pub(super) fn populate_invoke_cache(
                     .classes
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
-                thread
-                    .invoke_cache
-                    .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
+                thread.invoke_cache.put(
+                    caller_class_id,
+                    cp_index,
+                    is_special,
+                    site_pc as u32,
+                    target,
+                );
                 return;
             }
         }
@@ -1134,9 +1144,13 @@ pub(super) fn populate_invoke_cache(
             .classes
             .shared_resolution
             .insert_promoted_invoke(promoted_key, target.clone());
-        thread
-            .invoke_cache
-            .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
+        thread.invoke_cache.put(
+            caller_class_id,
+            cp_index,
+            is_special,
+            site_pc as u32,
+            target,
+        );
         return;
     }
 
@@ -1239,9 +1253,13 @@ pub(super) fn populate_invoke_cache(
                     .classes
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
-                thread
-                    .invoke_cache
-                    .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
+                thread.invoke_cache.put(
+                    caller_class_id,
+                    cp_index,
+                    is_special,
+                    site_pc as u32,
+                    target,
+                );
                 return;
             }
         }
@@ -1269,9 +1287,13 @@ pub(super) fn populate_invoke_cache(
                 .classes
                 .shared_resolution
                 .insert_promoted_invoke(promoted_key, target.clone());
-            thread
-                .invoke_cache
-                .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
+            thread.invoke_cache.put(
+                caller_class_id,
+                cp_index,
+                is_special,
+                site_pc as u32,
+                target,
+            );
         }
         return;
     }
@@ -1323,9 +1345,13 @@ pub(super) fn populate_invoke_cache(
         .classes
         .shared_resolution
         .insert_promoted_invoke(promoted_key, target.clone());
-    thread
-        .invoke_cache
-        .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
+    thread.invoke_cache.put(
+        caller_class_id,
+        cp_index,
+        is_special,
+        site_pc as u32,
+        target,
+    );
 }
 
 #[inline]
@@ -1362,7 +1388,10 @@ pub(super) fn execute_invokestatic_cached(
     // is_special=false since static calls never collide cp_index with
     // invokespecial in the same class (different CP entries semantically).
     let ph_t0 = crate::runtime::interpreter::invoke_phases::now();
-    let target = match thread.invoke_cache.get(caller_class_id, cp_index, false, pc as u32) {
+    let target = match thread
+        .invoke_cache
+        .get(caller_class_id, cp_index, false, pc as u32)
+    {
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
@@ -1662,9 +1691,13 @@ pub(super) fn execute_invokestatic_cached(
                         gate: entry_gate.clone(),
                         supersede_epoch: crate::classloading::jit_supersede_epoch(),
                     };
-                    thread
-                        .invoke_cache
-                        .put(caller_class_id, cp_index, false, pc as u32, jit_target.clone());
+                    thread.invoke_cache.put(
+                        caller_class_id,
+                        cp_index,
+                        false,
+                        pc as u32,
+                        jit_target.clone(),
+                    );
                     if let CachedInvokeTarget::Jit {
                         compiled,
                         num_params,
@@ -2026,10 +2059,8 @@ pub(super) fn resolve_string_field_layout(
         let sb_id = cm.find_bootstrap_class_by_name("java/lang/StringBuilder")?;
         let store = cm.class_store();
         let field = |name: &str, descriptor: &str| {
-            crate::classloading::find_field_recursive_by_descriptor(
-                sb_id, name, descriptor, store,
-            )
-            .map(|(idx, _, _)| idx)
+            crate::classloading::find_field_recursive_by_descriptor(sb_id, name, descriptor, store)
+                .map(|(idx, _, _)| idx)
         };
         cratonvm_jit::StringBuilderFieldLayout::new(
             field("count", "I")?,

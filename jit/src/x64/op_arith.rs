@@ -27,7 +27,6 @@ impl Compiler {
         branch_targets: &[bool],
     ) -> WalkStep {
         match op {
-
             // iadd
             0x60 => {
                 self.pop_to_rcx(); // b
