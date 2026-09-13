@@ -959,6 +959,13 @@ struct Lowerer<'a> {
     /// ([`Lowerer::deopt_block_for_bci`]), which a method near the node cap
     /// paid as nodes × divisions.
     safepoint_bcis: std::collections::HashSet<usize>,
+    /// For each bci, the index of the FIRST `graph.safepoints` entry at that
+    /// bci. That is the entry the by-bci scans
+    /// (`safepoints.iter().position(|s| s.bci == bci)`) found. Read by
+    /// [`Lowerer::resolve_frame_state_for_bci`], which ran that scan once per
+    /// deopt site, and by the per-block OSR entry planner, which ran it once
+    /// per block. See [`Lowerer::first_safepoint_index_by_bci`].
+    safepoint_first_by_bci: HashMap<usize, usize>,
     /// Bytecode indices an `Op::Guard { bci }` is anchored at.
     guard_bcis: std::collections::HashSet<usize>,
     /// Every node a deopt at a bci can fire from, in node-id order: each
@@ -1735,6 +1742,7 @@ impl<'a> Lowerer<'a> {
             spliced_ranges,
             sr_map,
             safepoint_bcis: graph.safepoints.iter().map(|s| s.bci).collect(),
+            safepoint_first_by_bci: Self::first_safepoint_index_by_bci(graph),
             guard_bcis: graph
                 .nodes
                 .iter()
@@ -11608,8 +11616,20 @@ impl<'a> Lowerer<'a> {
         self.resolve_frame_state_for_bci(bci)
     }
 
+    /// For each bci, the index of the first `graph.safepoints` entry at that
+    /// bci. For every bci this is the answer
+    /// `graph.safepoints.iter().position(|s| s.bci == bci)` gives; it is
+    /// built once in [`Lowerer::new`] as [`Lowerer::safepoint_first_by_bci`].
+    fn first_safepoint_index_by_bci(graph: &Graph) -> HashMap<usize, usize> {
+        let mut first: HashMap<usize, usize> = HashMap::with_capacity(graph.safepoints.len());
+        for (idx, sp) in graph.safepoints.iter().enumerate() {
+            first.entry(sp.bci).or_insert(idx);
+        }
+        first
+    }
+
     fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
-        match self.graph.safepoints.iter().position(|s| s.bci == bci) {
+        match self.safepoint_first_by_bci.get(&bci).copied() {
             Some(idx) => self.resolve_frame_state(&self.graph.safepoints[idx], idx),
             None => FrameState {
                 method_key: String::new(),
@@ -12122,7 +12142,11 @@ impl<'a> Lowerer<'a> {
                 refusals.push("block control carries no bci");
                 continue;
             };
-            let Some(sp) = self.graph.safepoints.iter().find(|s| s.bci == bci) else {
+            let Some(sp) = self
+                .safepoint_first_by_bci
+                .get(&bci)
+                .and_then(|&idx| self.graph.safepoints.get(idx))
+            else {
                 refusals.push("no safepoint snapshot at this block start");
                 continue;
             };
@@ -25028,6 +25052,52 @@ mod tests {",
         (combined, CALLER_LEN, sites)
     }
 
+    /// A callee whose loop ECJ rotated, spliced into its caller: built, optimized,
+    /// lowered and run. `f(n) = sumTo(n) + 1`, `sumTo(n) = 0 + 1 + … + (n-1)`.
+    #[test]
+    fn a_spliced_callee_with_a_rotated_loop_runs() {
+        let caller = [0x1a, 0xb8, 0x00, 0x01, 0x04, 0x60, 0xac];
+        // sumTo: 0: s = 0; 2: i = 0; 4: goto 14; 7: s += i; 11: iinc 2, 1;
+        // 14: iload_2; 15: iload_0; 16: if_icmplt 7; 19: iload_1; 20: ireturn
+        let callee = [
+            0x03, 0x3c, 0x03, 0x3d, 0xa7, 0x00, 0x0a, 0x1b, 0x1c, 0x60, 0x3c, 0x84, 0x02, 0x01,
+            0x1c, 0x1a, 0xa1, 0xff, 0xf7, 0x1b, 0xac,
+        ];
+        let mut combined = caller.to_vec();
+        let base = combined.len();
+        combined.extend_from_slice(&callee);
+        combined.extend_from_slice(&[0, 0]);
+        let mut sites = HashMap::new();
+        sites.insert(
+            1,
+            crate::ir::IrInlineSite {
+                base,
+                code_len: callee.len(),
+                num_args: 1,
+                max_locals: 3,
+                arg_local_slots: vec![0],
+                returns_value: true,
+                receiver_is_arg0: false,
+                method_key: "P.sumTo:(I)I".to_string(),
+                class_id: 0,
+            },
+        );
+        let mut builder = IrBuilder::new(1, 1);
+        builder.set_inline_sites(sites);
+        let mut graph = builder
+            .build(&combined, caller.len())
+            .expect("a callee body with a rotated loop must splice");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+        let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("the graph must lower");
+        // SAFETY: the body was compiled by this test for one `int` argument and runs on this thread with no helper calls.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("test JIT call") };
+        assert_eq!(f(0), 1, "an empty loop sums to zero");
+        assert_eq!(f(1), 1);
+        assert_eq!(f(5), 11, "0+1+2+3+4, plus one");
+        assert_eq!(f(100), 4951);
+    }
+
     #[test]
     fn a_spliced_body_may_branch_and_its_phi_carries_a_combined_pc() {
         let (combined, caller_len, sites) = splice_branch_fixture();
@@ -25129,6 +25199,106 @@ mod tests {",
         );
         // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
+    }
+
+    /// `Lowerer::first_safepoint_index_by_bci` gives, for every bci, the answer
+    /// of the by-bci scan it replaced: the FIRST snapshot at that bci. That
+    /// holds when several snapshots share a bci, as an unrolled body's copies
+    /// do, and for a bci with no snapshot at all.
+    #[test]
+    fn the_safepoint_index_names_the_first_snapshot_at_each_bci() {
+        // iconst_0; istore_1; iload_1; ireturn
+        let code = [0x03, 0x3c, 0x1b, 0xac, 0, 0];
+        let mut graph = IrBuilder::new(1, 2).build(&code, 4).expect("builds");
+        for bci in [2usize, 0, 2, 7, 3, 7] {
+            graph.safepoints.push(crate::ir::SafepointSnapshot {
+                bci,
+                locals: Vec::new(),
+                stack: Vec::new(),
+            });
+        }
+        let index = Lowerer::first_safepoint_index_by_bci(&graph);
+        for bci in 0..10usize {
+            assert_eq!(
+                index.get(&bci).copied(),
+                graph.safepoints.iter().position(|s| s.bci == bci),
+                "bci {bci}"
+            );
+        }
+        let distinct: std::collections::HashSet<usize> =
+            graph.safepoints.iter().map(|s| s.bci).collect();
+        assert_eq!(index.len(), distinct.len(), "one entry per distinct bci");
+    }
+
+    // ── Bottom-tested (rotated) loops ────────────────────────────────────
+    //
+    // ECJ, Kotlin and Scala jump forward to a loop's test and branch back to
+    // its body. The IR builder refused every such method until it learned to
+    // walk one in reverse post-order. Each test compiles the shape through the
+    // whole IR pipeline and checks the answer the obvious Java gives. The byte
+    // layouts are annotated beside the same fixtures in `ir.rs`.
+
+    /// `int f(int n) { int s = 0; for (int i = 0; i < n; i++) s += i; return s; }`, ECJ-shaped.
+    #[test]
+    fn a_rotated_for_loop_compiles_via_ir_and_sums() {
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0xa7, 0x00, 0x0a, 0x1b, 0x1c, 0x60, 0x3c, 0x84, 0x02, 0x01,
+            0x1c, 0x1a, 0xa1, 0xff, 0xf7, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 21, 1, 3).expect("a rotated for loop compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        for (n, want) in [(0i64, 0i64), (1, 0), (5, 10), (10, 45), (-3, 0)] {
+            assert_eq!(f(n), want, "f({n})");
+        }
+    }
+
+    /// `int f(int n) { do { n = n - 3; } while (n > 0); return n; }`: the loop
+    /// header is pc 0.
+    #[test]
+    fn a_do_while_at_the_method_entry_compiles_via_ir() {
+        let code = [0x1a, 0x06, 0x64, 0x3b, 0x1a, 0x9d, 0xff, 0xfb, 0x1a, 0xac, 0, 0];
+        let cm = compile_via_ir(&code, 10, 1, 1).expect("a do/while at pc 0 compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") } as i32 as i64;
+        for (n, want) in [(10i64, -2i64), (0, -3), (3, 0), (1, -2), (-5, -8)] {
+            assert_eq!(f(n), want, "f({n})");
+        }
+    }
+
+    /// `int f(int n) { int c = 0; for (int i = 0; i < n; i++) for (int j = 0; j < i; j++) c += j; return c; }`:
+    /// a javac-shaped outer loop around an ECJ-shaped inner one.
+    #[test]
+    fn a_rotated_loop_nested_in_a_javac_loop_compiles_via_ir() {
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x1a, 0x03, 0x3e, 0xa7, 0x00, 0x0a,
+            0x1b, 0x1d, 0x60, 0x3c, 0x84, 0x03, 0x01, 0x1d, 0x1c, 0xa1, 0xff, 0xf7, 0x84, 0x02,
+            0x01, 0xa7, 0xff, 0xe7, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 34, 1, 4).expect("a nested rotated loop compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        // sum over i < n of (0 + 1 + ... + (i - 1))
+        for (n, want) in [(0i64, 0i64), (1, 0), (4, 4), (5, 10), (6, 20)] {
+            assert_eq!(f(n), want, "f({n})");
+        }
+    }
+
+    /// `int f(int n) { int s = 0; for (int i = 0; i < n; i++) { if ((i & 1) == 0) s += i; else s -= 1; } return s; }`,
+    /// ECJ-shaped: a forward if/else join inside a rotated body.
+    #[test]
+    fn a_rotated_loop_with_an_if_else_join_compiles_via_ir() {
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0xa7, 0x00, 0x16, 0x1c, 0x04, 0x7e, 0x9a, 0x00, 0x0a, 0x1b,
+            0x1c, 0x60, 0x3c, 0xa7, 0x00, 0x06, 0x84, 0x01, 0xff, 0x84, 0x02, 0x01, 0x1c, 0x1a,
+            0xa1, 0xff, 0xeb, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 33, 1, 3).expect("a rotated loop with an if/else compiles via IR");
+        // SAFETY: the body was compiled by this test for exactly these argument kinds, and runs on this thread against the test's own live data and helper table.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") } as i32 as i64;
+        for (n, want) in [(0i64, 0i64), (1, 0), (2, -1), (3, 1), (5, 4), (6, 3)] {
+            assert_eq!(f(n), want, "f({n})");
+        }
     }
 
     // do-while: the back-edge is an `if_icmplt` (not a goto), and the loop

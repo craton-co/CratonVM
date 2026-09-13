@@ -87,7 +87,7 @@ the review are the gate that does that.
 | 40 | IR long Cmp uses a 32-bit CMP | FIXED 58bb7cfec |
 | 41 | Every synchronized-block method refused after full emission | FIXED 58bb7cfec |
 | 42 | A lowering refusal publishes an accepted verdict | FIXED 45c07691e |
-| 43 | Bottom-tested loops refuse the IR build | OPEN `ir-builder-refuses-rotated-loops-20260912.md` |
+| 43 | Bottom-tested loops refuse the IR build | PARTIAL 58ede83bd (caller code builds; a rotated loop in a spliced callee body still refuses); `ir-builder-refuses-rotated-loops-20260912.md` |
 | 44 | `ir_compatible` admits opcodes the builder refuses | FIXED f5329cdd5, 9b8cbce45 |
 | 45 | `ir_evidence` entries leak on an IR bail | FIXED add815189 |
 | 46 | IR frame states carry no monitor stack | FIXED 9bb05f4e5; `ir-frame-states-carry-no-monitor-stack-FIXED-20260912.md` |
@@ -144,7 +144,7 @@ the review are the gate that does that.
 | 87 | OSR trampoline cache keyed by address only | FIXED add815189 |
 | 88 | Resume tolerates Unsupported locals on a wrong argument | OPEN `jit-resume-tolerates-unsupported-locals-without-liveness-20260912.md` |
 | 89 | Scheduler places nodes in id order | FIXED 7335f4c73, merge 44f2aedf4 |
-| 90 | Quadratic scheduler and lowering scans | PARTIAL merge 44f2aedf4; `ir-scheduler-and-lowering-remaining-quadratic-scans-20260912.md` |
+| 90 | Quadratic scheduler and lowering scans | FIXED merge 44f2aedf4, e3735e523, 4dea5a91f, 1d08b8eff, 12419fded, b37c73722; `ir-scheduler-and-lowering-remaining-quadratic-scans-FIXED-20260912.md` |
 | 91 | DCE roots omit throwing ops | FIXED 9b8cbce45 |
 | 92 | Unroll refused on any side effect after the loop | FIXED 5092d22aa |
 | 93 | Dead loop machinery costs compile time | FIXED 7335f4c73; unrouted emitter: `vec-emit-vector-loop-emitter-is-not-routed-20260912.md` |
