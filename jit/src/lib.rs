@@ -91,6 +91,9 @@ pub mod bailout;
 // The one bytecode decoder both tiers share: instruction lengths, branch and
 // switch targets, reachability, and an instruction CFG with dominators.
 pub(crate) mod bytecode_analysis;
+// Every input of one method-entry compilation, passed by reference.
+pub mod compile_request;
+pub use compile_request::CompileRequest;
 // The one door every backend entry point must pass through. There are THREE
 // doors (method entry, the eager first-call compile, OSR), and only the first
 // ever asked the admission questions; the other two grew hand-copied subsets
@@ -2682,10 +2685,6 @@ thread_local! {
     /// compile door can tell "this method refused for some unrelated reason"
     /// from "this method refused with handler bodies newly in the image".
     static LOCAL_HANDLERS_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Disarm local handlers for the NEXT compile on this thread. The compile
-    /// door sets it after a failed armed compile and retries once; see
-    /// [`disarm_local_handlers_once`].
-    static LOCAL_HANDLERS_DISARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Did the compile that just ran on this thread put handler bodies in the
@@ -2700,21 +2699,50 @@ pub fn note_local_handlers_armed(armed: bool) {
     LOCAL_HANDLERS_ARMED.with(|c| c.set(armed));
 }
 
-/// Suppress local handlers for the next compile on this thread.
-///
-/// The feature emits handler bodies that were previously dead code, so a
-/// construct the single-pass emitter cannot model inside a `catch` block would
-/// turn a method that compiles today into one that does not — trading a
-/// throughput win for the loss of compilation entirely. The compile door
-/// therefore retries once with this set, which makes the feature unable to cost
-/// any method its artifact: the worst case is one wasted compile.
-pub fn disarm_local_handlers_once() {
-    LOCAL_HANDLERS_DISARMED.with(|c| c.set(true));
+/// Clears the local-handlers-armed flag on creation and again on drop, so the
+/// flag the compile door reads always belongs to the compile inside the scope,
+/// however that compile returned: normally, early, or by unwinding.
+pub(crate) struct LocalHandlersArmedScope(());
+
+impl LocalHandlersArmedScope {
+    pub(crate) fn enter() -> Self {
+        note_local_handlers_armed(false);
+        LocalHandlersArmedScope(())
+    }
 }
 
-/// Take (clear) the one-shot disarm request.
-pub fn take_local_handlers_disarmed() -> bool {
-    LOCAL_HANDLERS_DISARMED.with(std::cell::Cell::take)
+impl Drop for LocalHandlersArmedScope {
+    fn drop(&mut self) {
+        note_local_handlers_armed(false);
+    }
+}
+
+#[cfg(test)]
+mod local_handlers_armed_scope_tests {
+    use super::*;
+
+    #[test]
+    fn the_armed_flag_is_clear_inside_a_new_scope_and_after_it_ends() {
+        note_local_handlers_armed(true);
+        {
+            let _scope = LocalHandlersArmedScope::enter();
+            assert!(!local_handlers_were_armed(), "a stale flag from an earlier compile");
+            note_local_handlers_armed(true);
+            assert!(local_handlers_were_armed());
+        }
+        assert!(!local_handlers_were_armed(), "a compile that bailed left the flag set");
+    }
+
+    #[test]
+    fn an_unwinding_compile_clears_the_armed_flag() {
+        let result = std::panic::catch_unwind(|| {
+            let _scope = LocalHandlersArmedScope::enter();
+            note_local_handlers_armed(true);
+            panic!("compile unwound");
+        });
+        assert!(result.is_err());
+        assert!(!local_handlers_were_armed());
+    }
 }
 
 /// activate-ir-optimizer Front 3.2: guard-surviving scalar replacement
@@ -23812,40 +23840,6 @@ fn note_jit_recursive_compile_cycle(class_name: &str, method_name: &str, descrip
     }
 }
 
-thread_local! {
-    /// Per-compile request flag (same consume-once pattern as
-    /// `x64::set_kernel_reg_homes_request`): the VM caller sets it right
-    /// before `try_compile` when it has PROVEN that the compiling class's
-    /// self-references resolve to the class itself — the class was defined
-    /// by a BUILTIN (bootstrap/extension/application) loader and the
-    /// loader-blind global name lookup maps its name back to its own
-    /// `ClassId`. Under that proof a NON-tail static self-recursive
-    /// invokestatic may be raw-routed to the guarded direct self-CALL
-    /// (`x64.rs` 0xb8 else-arm) instead of carrying dispatch metadata: the
-    /// loader-identity hazard that historically forced the dispatch route
-    /// ("a raw direct entry call ... can invoke a different same-named
-    /// method") cannot arise for a builtin-loaded class, whose registry
-    /// holds exactly one class per name and always resolves a
-    /// self-reference to the already-defined class. Custom (`UserDefined`)
-    /// loaders keep the dispatch route unconditionally.
-    ///
-    /// Motivation (bt18 regression): dispatch-mediated self-recursion pays
-    /// the full helper round trip per level — `jit_invoke_dispatch` +
-    /// `push_entry_full`/`pop_jit_entry` + the `lookup_jit_code_range`
-    /// mutex scan — measured at >60% of the whole BinTreesClassic d=18 run
-    /// (~90M chain pushes; the recursive `bottomUpTree`/`itemCheck` pair
-    /// dispatched once per NODE).
-    static SELF_CALL_IDENTITY_STABLE: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
-/// Set the per-compile self-call identity proof — see
-/// [`SELF_CALL_IDENTITY_STABLE`]. Consumed (reset to `false`) by the next
-/// `try_compile` on this thread, including on its early-bail paths.
-pub fn set_self_call_identity_stable(v: bool) {
-    SELF_CALL_IDENTITY_STABLE.with(|c| c.set(v));
-}
-
 /// Direct JIT-to-JIT calls into recursive compile-cycle participants bypass the
 /// dispatch depth guard. Such targets must stay on the dispatch path.
 #[doc(hidden)]
@@ -25201,200 +25195,14 @@ pub fn try_compile(
     )
 }
 
-/// Full form of [`try_compile`] taking an additional resolver for the JVMS
-/// §6.5 `invokespecial` super-call redirect (`cp_invokespecial_owner_resolver`
-/// below) — used by the VM's own call sites (`try_jit_upgrade_with_gate`,
-/// `callee_compiler`, `try_jit_compile_callee_slow` in
-/// `vm/src/runtime/interpreter.rs`), which have a calling-class identity to
-/// resolve it against. Kept as a separate function (rather than adding the
-/// parameter to `try_compile` itself) so the ~30 existing `try_compile`
-/// call sites in this crate's own test suites need no changes.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub fn try_compile_with_invokespecial_resolver(
-    cached: &CachedBytecodeMethod,
-    cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
-    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, Option<(u32, bool)>)>>,
-    cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
-    cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
-    // JVMS §6.5 `invokespecial` super-call redirect: given an `invokespecial`
-    // (0xb7) call-site's CP index, returns the JVMS-correct class at which
-    // method selection actually begins when that differs from the plain
-    // `cp_invoke_resolver` class name — i.e. a genuine `super.m(...)` whose
-    // constant-pool reference names an ancestor further up than this
-    // method's own direct superclass. `None` (resolver absent, or it
-    // returns `None` for a given site — the overwhelmingly common case)
-    // leaves `class_name` exactly as `cp_invoke_resolver` returned it. See
-    // `classloading::invokespecial_selection_start` for the algorithm.
-    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16, u8) -> Option<String>>,
-    callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    // CRIT-2 / cold-`new` fix — see [`JitNewSite`]. `Resolved` carries
-    // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer);
-    // the two flags feed the inline-TLAB `new` fast path and a resolver that
-    // cannot compute them must report `true, true` so the post-init helper
-    // call stays in place. `Deferred` means "class not loaded yet" and
-    // compiles to the CP-indexed runtime-resolving helper; only `None` (a
-    // malformed site) still bails the compile.
-    cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
-    cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
-    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
-    profile: Option<&profile::MethodProfile>,
-    helpers: &JitRuntimeHelpers,
-    inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
-    // Resolves the field layout of `java/lang/String` for the String
-    // call-site intrinsics. Called at most once per compilation; see
-    // `StringFieldLayout`. `None` (resolver absent, or it returns `None`)
-    // makes String intrinsics bail to normal dispatch.
-    string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
-    // Maps an invoke* constant-pool index to the class id of the call's
-    // *declared* class (the receiver class statically named at the site).
-    // Consumed by the CRC32/CRC32C `update` call-site intrinsics, whose
-    // codegen emits a receiver class-id guard against this constant. `None`
-    // (resolver absent, or it returns `None` for a given site) makes the
-    // CRC32 intrinsic at that site bail to normal dispatch.
-    cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
-    // activate-ir-optimizer (scalar-new wiring): given an `invokespecial`
-    // constant-pool index, returns `true` iff it targets a constructor whose
-    // *construction* is elidable for escape-analysis scalar replacement — a
-    // no-arg `<init>()V` of a direct `java/lang/Object` subclass whose body is
-    // exactly `aload_0; invokespecial Object.<init>()V; return` (no field
-    // initialiser, no escape, no side effect). `None` (the production default
-    // unless the soak flag is set) leaves scalar-replacement of `new` OFF: the
-    // IR builder bails on every `invokespecial`, so allocation-bearing methods
-    // take the single-pass backend exactly as before.
-    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
-    // wire-tiered-manager Step 3: `true` → optimizing IR pipeline (C2);
-    // `false` → single-pass `x64::compile` only (the fast C1 tier). See the
-    // function doc above.
-    optimize: bool,
-    // Gap B (activate-ir-optimizer): `true` lets the IR builder lower an
-    // int-only `invokestatic` in an oop-free method to `Op::Call` (dispatched
-    // via `invoke_dispatch`). `false` (the default) keeps every invoke on
-    // single-pass. Gated default-OFF behind `CRATONVM_JIT_IR_CALL` at the VM
-    // call sites until it soaks.
-    ir_emit_calls: bool,
-    // inc 24 (Gap B): `true` additionally lets the IR builder lower a resolved
-    // non-`<init>` `invokespecial` (private / `super.` / non-virtual instance
-    // call) to `Op::Call`, with the receiver marshalled as arg0 and
-    // `invoke_kind == 1`. `false` (the default) keeps every `invokespecial`
-    // on single-pass (the builder bails). Gated default-OFF behind
-    // `CRATONVM_JIT_IR_CALL_SPECIAL` at the VM call sites until it soaks.
-    ir_emit_special_calls: bool,
-    // inc 25 (category-2 foundation): `true` lets the optimizing IR path take
-    // **long**-using methods (the `method_uses_category2` gate otherwise bails
-    // the whole pipeline on any long/double opcode). Only long is admitted —
-    // double/float and int div/rem still bail (the latter to keep a `long`
-    // off a deopt point, since long deopt-resume is a follow-up). `false` (the
-    // default) preserves the int/ref-only IR path. Gated default-OFF behind
-    // `CRATONVM_JIT_IR_LONG` at the VM call sites until it soaks.
-    ir_emit_long: bool,
-    // inc 26 (Gap B): `true` additionally lets the IR builder lower a resolved
-    // `invokevirtual` (0xb6) / `invokeinterface` (0xb9) to `Op::Call`, with the
-    // receiver marshalled as arg0 and `invoke_kind == 0` (virtual) / `2`
-    // (interface). Dispatch is fully dynamic: the baked `JitInvokeInfo` carries
-    // the static call-site class/name/descriptor and `invoke_dispatch` resolves
-    // the actual target on the receiver's RUNTIME class (no inline cache in the
-    // emitted code — the generic helper does the vtable/itable lookup). `false`
-    // (the default) keeps every virtual/interface invoke on single-pass. Gated
-    // default-OFF behind `CRATONVM_JIT_IR_CALL_VIRTUAL` at the VM call sites
-    // until it soaks.
-    ir_emit_virtual_calls: bool,
-    // inc 30 (double/float XMM value tier): `true` admits a `float`/`double`-using
-    // method to the optimizing IR path (the `method_uses_fp` gate otherwise bails
-    // it to single-pass). The lowerer marshals FP values through XMM
-    // (`addsd`/`cvttsd2si`/…); FP value arithmetic (`fadd`/`dmul`/…), FP
-    // constants (`fconst`/`dconst`), FP-local load/store, and the int/long⇄FP
-    // conversions lower. `frem`/`drem`, FP compares/branches, FP array ops, and
-    // FP params/returns/call-args still bail (their builder arms are absent), as
-    // do int-div-bearing and `ldc2_w`-bearing FP methods (a follow-up). `false`
-    // (the default) preserves the int/long/ref IR path byte-for-byte: no
-    // FP-opcode method is admitted, so the builder never sees an FP opcode. Gated
-    // default-OFF behind `CRATONVM_JIT_IR_FP` at the VM call sites until it soaks.
-    ir_emit_fp: bool,
-    // invokedynamic-uncommon-trap fix: resolves an `invokedynamic` (0xba)
-    // CP index to just its target descriptor string (e.g. via
-    // `NameAndType.descriptor` — no bootstrap/`CallSite` resolution needed).
-    // `jit_scan` is CP-blind and no longer bails on 0xba (it just records the
-    // site); this resolver lets the single-pass backend compute the site's
-    // stack effect (arg count via `count_param_slots`, return type via
-    // `return_type`) so it can lower the instruction to an unconditional jump
-    // to the existing uncommon-trap deopt stub (`DeoptReason::UnreachedCode`)
-    // while keeping the compiler's simulated operand stack consistent for
-    // whatever bytecode follows. `None` (resolver absent, or it returns `None`
-    // for a given site) bails the whole compile — see `try_compile_inner`.
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
-    // PGO-02: maps a receiver CLASS ID (not a CP index - the runtime
-    // identity a guarded speculative inline's receiver class-id check
-    // resolved against) to its class name, so a Monomorphic/Bimorphic
-    // InlinePlan can record a SpeculatedReceiver invalidation dependency
-    // (plan_inline refuses via NoInvalidationDependency without one - the
-    // fail-closed rule in docs/feature-designs/profile-guided-inlining.md).
-    // `None` (resolver absent, or it returns `None` for a given id) refuses
-    // every speculative virtual/interface inline at that site; static/
-    // special DirectBind sites are unaffected (no receiver dependency).
-    class_id_name_resolver: Option<&dyn Fn(u32) -> Option<String>>,
-    // PGO-02 R0: resolves the body a receiver of EXACTLY this class id would
-    // dispatch to at a call site declared `(cp_class, method, descriptor)`.
-    //
-    // Separate from `inline_resolver` because they answer different questions.
-    // `inline_resolver` resolves the CONSTANT-POOL callee, which is the right
-    // answer for `invokestatic`/`invokespecial` and the WRONG one for a
-    // guarded virtual/interface site: the guard admits a runtime class, and
-    // wherever that class overrides the declared method the two bodies differ.
-    // Splicing the constant-pool body behind such a guard is silent wrong code
-    // (see `InlineRequest::receiver_callee_resolver`). `None` — or a `None`
-    // answer — refuses the speculation; it never falls back to the other
-    // resolver.
-    receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
-    // IR-tier inlining: resolve a callee body for `IrBuilder` to SPLICE, under
-    // the optimizing tier's own admission set (`resolve_ir_inline_site` in the
-    // VM). Separate from `inline_resolver` because the two answer different
-    // questions: that one resolves what the single-pass emitter can splice,
-    // which refuses `new`, array access and `arraylength` — the three shapes an
-    // allocating accessor is made of. `None` (no VM in scope, or the gate off)
-    // splices nothing, which is byte-identical to the pre-inlining IR path.
-    ir_inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
-    // JDK-only execution policy for THIS VM's compilations.
-    //
-    // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
-    // (JDK-ONLY-WAVE2 §2 of the wave-2 markers record — the record's §6 is the
-    // JNI table, a different process global). The latch only ever
-    // moved toward strict, so one `JdkOnly` VM silently took the thin
-    // direct-call helpers away from every `Compatible` VM sharing the process
-    // — the hazard contract §2's no-process-globals rule exists to prevent.
-    // Threaded here because the compile path already carries per-VM state and
-    // this is per-VM state; the `JitRuntimeHelpers` table was the wrong home
-    // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
-    // policy bit is not an address).
-    jdk_only: bool,
-    // JDK-ONLY-WAVE2 §4: asks the registry whether a triple is a reviewed
-    // `NativeKind::Intrinsic`, i.e. the §1.4 exception that MAY shadow
-    // concrete bytecode. Returns `false` for `Bridge`, for `SyntheticStub`,
-    // and for a triple the registry has never heard of.
-    //
-    // This is the policy half of the seven thin direct-call ladders below.
-    // Before it existed those ladders were refused wholesale under `JdkOnly`,
-    // which is stricter than the contract: three of the seven are registered
-    // `Intrinsic` and §1.4 permits exactly those.
-    //
-    // `None` refuses everything, which is the pre-2026-08-06 behaviour and the
-    // fail-closed direction — a compile with no way to ask cannot bake a
-    // native in front of real bytes.
-    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
-    // The compiling VM's per-bci de-spec registry (`JitRealm::despec_registry`
-    // on the VM side). Was the process-global `deopt.rs` `DESPEC_SET` until
-    // 2026-09-12, which let one VM's despeculation verdicts strip speculations
-    // from every other VM's compiles. `None` (no VM in scope) consults nothing.
-    despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
-    // Review #80: maps an invoke constant-pool index to the name of the class
-    // that DECLARES the method the site resolves to. It sits beside
-    // `cp_invokespecial_owner_resolver` but asks a different question: that one
-    // answers only when a site binds statically (a private or final owner that
-    // no native screen refuses). This one answers for any resolvable
-    // `Methodref`. Consumed by the ATOMIC_INT / ATOMIC_LONG registration, so a
-    // `Counter extends AtomicInteger` site can reach the intrinsic. `None`
-    // keeps the exact constant-pool class match.
-    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
-) -> Option<CompiledMethod> {
+/// Compile one method through the method-entry door.
+///
+/// Admission, the local-handler retry, bail-listing and the JFR decision
+/// record all live here; every input comes from `req`. The positional
+/// `try_compile` and [`try_compile_with_invokespecial_resolver`] are thin
+/// builders over this for tests and simple callers.
+pub fn try_compile_request(req: &CompileRequest<'_>) -> Option<CompiledMethod> {
+    let cached = req.cached;
     // The admission gate. Four checks and two side effects, all of which used
     // to live inline here and NONE of which the other two backend doors (the
     // eager first-call compile and `compile_osr_artifact`) applied in full —
@@ -25462,7 +25270,10 @@ pub fn try_compile_with_invokespecial_resolver(
     // Stays here rather than in the gate: it is a proof the *caller* of this
     // function deposits for this one compile, and the other two doors neither
     // set nor read it.
-    let self_call_identity_stable = SELF_CALL_IDENTITY_STABLE.with(|c| c.replace(false));
+    let self_call_identity_stable = req.self_call_identity_stable;
+    // Clears the armed flag now and on every exit, so the read below can only
+    // see this compile's answer.
+    let _local_handlers_armed_scope = LocalHandlersArmedScope::enter();
     // The one-shot bail-site clear that used to sit here is `compile_gate::
     // admit`'s job now — same discipline, every door.
     let _compile_stack_guard = JitCompileStackGuard::enter(cached);
@@ -25479,41 +25290,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // sets when it traverses past the cheap resolver checks into
     // `x64::compile`.
     let mut backend_attempted = false;
-    let result = try_compile_inner(
-        cached,
-        cp_class_name_resolver,
-        cp_field_resolver,
-        cp_static_field_resolver,
-        cp_invoke_resolver,
-        cp_invokespecial_owner_resolver,
-        callee_compiler,
-        cp_new_resolver,
-        cp_ldc_resolver,
-        cp_ldc2w_resolver,
-        profile,
-        helpers,
-        inline_resolver,
-        string_layout_resolver,
-        cp_invoke_class_id_resolver,
-        cp_elidable_init_resolver,
-        optimize,
-        ir_emit_calls,
-        ir_emit_special_calls,
-        ir_emit_long,
-        ir_emit_virtual_calls,
-        ir_emit_fp,
-        cp_invokedynamic_descriptor_resolver,
-        class_id_name_resolver,
-        receiver_inline_resolver,
-        ir_inline_resolver,
-        &mut backend_attempted,
-        self_call_identity_stable,
-        &admission,
-        jdk_only,
-        intrinsic_resolver,
-        despec,
-        cp_invoke_declaring_class_resolver,
-    );
+    let result = try_compile_inner(req, &mut backend_attempted, self_call_identity_stable, &admission, false);
 
     // ── The compiled-local-handler safety net ───────────────────────────
     //
@@ -25534,43 +25311,8 @@ pub fn try_compile_with_invokespecial_resolver(
         Some(cm) => Some(cm),
         None if local_handlers_were_armed() => {
             let _ = take_jit_bail_site();
-            disarm_local_handlers_once();
             let mut retry_backend_attempted = false;
-            let retried = try_compile_inner(
-                cached,
-                cp_class_name_resolver,
-                cp_field_resolver,
-                cp_static_field_resolver,
-                cp_invoke_resolver,
-                cp_invokespecial_owner_resolver,
-                callee_compiler,
-                cp_new_resolver,
-                cp_ldc_resolver,
-                cp_ldc2w_resolver,
-                profile,
-                helpers,
-                inline_resolver,
-                string_layout_resolver,
-                cp_invoke_class_id_resolver,
-                cp_elidable_init_resolver,
-                optimize,
-                ir_emit_calls,
-                ir_emit_special_calls,
-                ir_emit_long,
-                ir_emit_virtual_calls,
-                ir_emit_fp,
-                cp_invokedynamic_descriptor_resolver,
-                class_id_name_resolver,
-                receiver_inline_resolver,
-                ir_inline_resolver,
-                &mut retry_backend_attempted,
-                self_call_identity_stable,
-                &admission,
-                jdk_only,
-                intrinsic_resolver,
-                despec,
-                cp_invoke_declaring_class_resolver,
-            );
+            let retried = try_compile_inner(req, &mut retry_backend_attempted, self_call_identity_stable, &admission, true);
             backend_attempted |= retry_backend_attempted;
             if retried.is_some() && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                 eprintln!(
@@ -25585,7 +25327,6 @@ pub fn try_compile_with_invokespecial_resolver(
     // The disarm is one-shot and consumed by the staging site, but a retry that
     // never reached it (an early resolver bail) would leave it set for the next
     // unrelated method on this thread.
-    let _ = take_local_handlers_disarmed();
 
     // Take once and use for all three sinks: the bail-list decision below, the
     // trace line (only when `CRATONVM_DBG_JITC` is on), and the per-method
@@ -25809,6 +25550,235 @@ pub fn try_compile_with_invokespecial_resolver(
         }
     }
     result
+}
+
+/// Full form of [`try_compile`] taking an additional resolver for the JVMS
+/// §6.5 `invokespecial` super-call redirect (`cp_invokespecial_owner_resolver`
+/// below) — used by the VM's own call sites (`try_jit_upgrade_with_gate`,
+/// `callee_compiler`, `try_jit_compile_callee_slow` in
+/// `vm/src/runtime/interpreter.rs`), which have a calling-class identity to
+/// resolve it against. Kept as a separate function (rather than adding the
+/// parameter to `try_compile` itself) so the ~30 existing `try_compile`
+/// call sites in this crate's own test suites need no changes.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub fn try_compile_with_invokespecial_resolver(
+    cached: &CachedBytecodeMethod,
+    cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, Option<(u32, bool)>)>>,
+    cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
+    cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+    // JVMS §6.5 `invokespecial` super-call redirect: given an `invokespecial`
+    // (0xb7) call-site's CP index, returns the JVMS-correct class at which
+    // method selection actually begins when that differs from the plain
+    // `cp_invoke_resolver` class name — i.e. a genuine `super.m(...)` whose
+    // constant-pool reference names an ancestor further up than this
+    // method's own direct superclass. `None` (resolver absent, or it
+    // returns `None` for a given site — the overwhelmingly common case)
+    // leaves `class_name` exactly as `cp_invoke_resolver` returned it. See
+    // `classloading::invokespecial_selection_start` for the algorithm.
+    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16, u8) -> Option<String>>,
+    callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
+    // CRIT-2 / cold-`new` fix — see [`JitNewSite`]. `Resolved` carries
+    // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer);
+    // the two flags feed the inline-TLAB `new` fast path and a resolver that
+    // cannot compute them must report `true, true` so the post-init helper
+    // call stays in place. `Deferred` means "class not loaded yet" and
+    // compiles to the CP-indexed runtime-resolving helper; only `None` (a
+    // malformed site) still bails the compile.
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
+    cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
+    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
+    profile: Option<&profile::MethodProfile>,
+    helpers: &JitRuntimeHelpers,
+    inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
+    // Resolves the field layout of `java/lang/String` for the String
+    // call-site intrinsics. Called at most once per compilation; see
+    // `StringFieldLayout`. `None` (resolver absent, or it returns `None`)
+    // makes String intrinsics bail to normal dispatch.
+    string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
+    // Maps an invoke* constant-pool index to the class id of the call's
+    // *declared* class (the receiver class statically named at the site).
+    // Consumed by the CRC32/CRC32C `update` call-site intrinsics, whose
+    // codegen emits a receiver class-id guard against this constant. `None`
+    // (resolver absent, or it returns `None` for a given site) makes the
+    // CRC32 intrinsic at that site bail to normal dispatch.
+    cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    // activate-ir-optimizer (scalar-new wiring): given an `invokespecial`
+    // constant-pool index, returns `true` iff it targets a constructor whose
+    // *construction* is elidable for escape-analysis scalar replacement — a
+    // no-arg `<init>()V` of a direct `java/lang/Object` subclass whose body is
+    // exactly `aload_0; invokespecial Object.<init>()V; return` (no field
+    // initialiser, no escape, no side effect). `None` (the production default
+    // unless the soak flag is set) leaves scalar-replacement of `new` OFF: the
+    // IR builder bails on every `invokespecial`, so allocation-bearing methods
+    // take the single-pass backend exactly as before.
+    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
+    // wire-tiered-manager Step 3: `true` → optimizing IR pipeline (C2);
+    // `false` → single-pass `x64::compile` only (the fast C1 tier). See the
+    // function doc above.
+    optimize: bool,
+    // Gap B (activate-ir-optimizer): `true` lets the IR builder lower an
+    // int-only `invokestatic` in an oop-free method to `Op::Call` (dispatched
+    // via `invoke_dispatch`). `false` (the default) keeps every invoke on
+    // single-pass. Gated default-OFF behind `CRATONVM_JIT_IR_CALL` at the VM
+    // call sites until it soaks.
+    ir_emit_calls: bool,
+    // inc 24 (Gap B): `true` additionally lets the IR builder lower a resolved
+    // non-`<init>` `invokespecial` (private / `super.` / non-virtual instance
+    // call) to `Op::Call`, with the receiver marshalled as arg0 and
+    // `invoke_kind == 1`. `false` (the default) keeps every `invokespecial`
+    // on single-pass (the builder bails). Gated default-OFF behind
+    // `CRATONVM_JIT_IR_CALL_SPECIAL` at the VM call sites until it soaks.
+    ir_emit_special_calls: bool,
+    // inc 25 (category-2 foundation): `true` lets the optimizing IR path take
+    // **long**-using methods (the `method_uses_category2` gate otherwise bails
+    // the whole pipeline on any long/double opcode). Only long is admitted —
+    // double/float and int div/rem still bail (the latter to keep a `long`
+    // off a deopt point, since long deopt-resume is a follow-up). `false` (the
+    // default) preserves the int/ref-only IR path. Gated default-OFF behind
+    // `CRATONVM_JIT_IR_LONG` at the VM call sites until it soaks.
+    ir_emit_long: bool,
+    // inc 26 (Gap B): `true` additionally lets the IR builder lower a resolved
+    // `invokevirtual` (0xb6) / `invokeinterface` (0xb9) to `Op::Call`, with the
+    // receiver marshalled as arg0 and `invoke_kind == 0` (virtual) / `2`
+    // (interface). Dispatch is fully dynamic: the baked `JitInvokeInfo` carries
+    // the static call-site class/name/descriptor and `invoke_dispatch` resolves
+    // the actual target on the receiver's RUNTIME class (no inline cache in the
+    // emitted code — the generic helper does the vtable/itable lookup). `false`
+    // (the default) keeps every virtual/interface invoke on single-pass. Gated
+    // default-OFF behind `CRATONVM_JIT_IR_CALL_VIRTUAL` at the VM call sites
+    // until it soaks.
+    ir_emit_virtual_calls: bool,
+    // inc 30 (double/float XMM value tier): `true` admits a `float`/`double`-using
+    // method to the optimizing IR path (the `method_uses_fp` gate otherwise bails
+    // it to single-pass). The lowerer marshals FP values through XMM
+    // (`addsd`/`cvttsd2si`/…); FP value arithmetic (`fadd`/`dmul`/…), FP
+    // constants (`fconst`/`dconst`), FP-local load/store, and the int/long⇄FP
+    // conversions lower. `frem`/`drem`, FP compares/branches, FP array ops, and
+    // FP params/returns/call-args still bail (their builder arms are absent), as
+    // do int-div-bearing and `ldc2_w`-bearing FP methods (a follow-up). `false`
+    // (the default) preserves the int/long/ref IR path byte-for-byte: no
+    // FP-opcode method is admitted, so the builder never sees an FP opcode. Gated
+    // default-OFF behind `CRATONVM_JIT_IR_FP` at the VM call sites until it soaks.
+    ir_emit_fp: bool,
+    // invokedynamic-uncommon-trap fix: resolves an `invokedynamic` (0xba)
+    // CP index to just its target descriptor string (e.g. via
+    // `NameAndType.descriptor` — no bootstrap/`CallSite` resolution needed).
+    // `jit_scan` is CP-blind and no longer bails on 0xba (it just records the
+    // site); this resolver lets the single-pass backend compute the site's
+    // stack effect (arg count via `count_param_slots`, return type via
+    // `return_type`) so it can lower the instruction to an unconditional jump
+    // to the existing uncommon-trap deopt stub (`DeoptReason::UnreachedCode`)
+    // while keeping the compiler's simulated operand stack consistent for
+    // whatever bytecode follows. `None` (resolver absent, or it returns `None`
+    // for a given site) bails the whole compile — see `try_compile_inner`.
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
+    // PGO-02: maps a receiver CLASS ID (not a CP index - the runtime
+    // identity a guarded speculative inline's receiver class-id check
+    // resolved against) to its class name, so a Monomorphic/Bimorphic
+    // InlinePlan can record a SpeculatedReceiver invalidation dependency
+    // (plan_inline refuses via NoInvalidationDependency without one - the
+    // fail-closed rule in docs/feature-designs/profile-guided-inlining.md).
+    // `None` (resolver absent, or it returns `None` for a given id) refuses
+    // every speculative virtual/interface inline at that site; static/
+    // special DirectBind sites are unaffected (no receiver dependency).
+    class_id_name_resolver: Option<&dyn Fn(u32) -> Option<String>>,
+    // PGO-02 R0: resolves the body a receiver of EXACTLY this class id would
+    // dispatch to at a call site declared `(cp_class, method, descriptor)`.
+    //
+    // Separate from `inline_resolver` because they answer different questions.
+    // `inline_resolver` resolves the CONSTANT-POOL callee, which is the right
+    // answer for `invokestatic`/`invokespecial` and the WRONG one for a
+    // guarded virtual/interface site: the guard admits a runtime class, and
+    // wherever that class overrides the declared method the two bodies differ.
+    // Splicing the constant-pool body behind such a guard is silent wrong code
+    // (see `InlineRequest::receiver_callee_resolver`). `None` — or a `None`
+    // answer — refuses the speculation; it never falls back to the other
+    // resolver.
+    receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
+    // IR-tier inlining: resolve a callee body for `IrBuilder` to SPLICE, under
+    // the optimizing tier's own admission set (`resolve_ir_inline_site` in the
+    // VM). Separate from `inline_resolver` because the two answer different
+    // questions: that one resolves what the single-pass emitter can splice,
+    // which refuses `new`, array access and `arraylength` — the three shapes an
+    // allocating accessor is made of. `None` (no VM in scope, or the gate off)
+    // splices nothing, which is byte-identical to the pre-inlining IR path.
+    ir_inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
+    // JDK-only execution policy for THIS VM's compilations.
+    //
+    // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
+    // (JDK-ONLY-WAVE2 §2 of the wave-2 markers record — the record's §6 is the
+    // JNI table, a different process global). The latch only ever
+    // moved toward strict, so one `JdkOnly` VM silently took the thin
+    // direct-call helpers away from every `Compatible` VM sharing the process
+    // — the hazard contract §2's no-process-globals rule exists to prevent.
+    // Threaded here because the compile path already carries per-VM state and
+    // this is per-VM state; the `JitRuntimeHelpers` table was the wrong home
+    // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
+    // policy bit is not an address).
+    jdk_only: bool,
+    // JDK-ONLY-WAVE2 §4: asks the registry whether a triple is a reviewed
+    // `NativeKind::Intrinsic`, i.e. the §1.4 exception that MAY shadow
+    // concrete bytecode. Returns `false` for `Bridge`, for `SyntheticStub`,
+    // and for a triple the registry has never heard of.
+    //
+    // This is the policy half of the seven thin direct-call ladders below.
+    // Before it existed those ladders were refused wholesale under `JdkOnly`,
+    // which is stricter than the contract: three of the seven are registered
+    // `Intrinsic` and §1.4 permits exactly those.
+    //
+    // `None` refuses everything, which is the pre-2026-08-06 behaviour and the
+    // fail-closed direction — a compile with no way to ask cannot bake a
+    // native in front of real bytes.
+    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
+    // The compiling VM's per-bci de-spec registry (`JitRealm::despec_registry`
+    // on the VM side). Was the process-global `deopt.rs` `DESPEC_SET` until
+    // 2026-09-12, which let one VM's despeculation verdicts strip speculations
+    // from every other VM's compiles. `None` (no VM in scope) consults nothing.
+    despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
+    // Review #80: maps an invoke constant-pool index to the name of the class
+    // that DECLARES the method the site resolves to. It sits beside
+    // `cp_invokespecial_owner_resolver` but asks a different question: that one
+    // answers only when a site binds statically (a private or final owner that
+    // no native screen refuses). This one answers for any resolvable
+    // `Methodref`. Consumed by the ATOMIC_INT / ATOMIC_LONG registration, so a
+    // `Counter extends AtomicInteger` site can reach the intrinsic. `None`
+    // keeps the exact constant-pool class match.
+    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+) -> Option<CompiledMethod> {
+    try_compile_request(&CompileRequest {
+        cached,
+        cp_class_name_resolver,
+        cp_field_resolver,
+        cp_static_field_resolver,
+        cp_invoke_resolver,
+        cp_invokespecial_owner_resolver,
+        callee_compiler,
+        cp_new_resolver,
+        cp_ldc_resolver,
+        cp_ldc2w_resolver,
+        profile,
+        helpers,
+        inline_resolver,
+        string_layout_resolver,
+        cp_invoke_class_id_resolver,
+        cp_elidable_init_resolver,
+        optimize,
+        ir_emit_calls,
+        ir_emit_special_calls,
+        ir_emit_long,
+        ir_emit_virtual_calls,
+        ir_emit_fp,
+        cp_invokedynamic_descriptor_resolver,
+        class_id_name_resolver,
+        receiver_inline_resolver,
+        ir_inline_resolver,
+        jdk_only,
+        intrinsic_resolver,
+        despec,
+        cp_invoke_declaring_class_resolver,
+        self_call_identity_stable: false,
+    })
 }
 
 // Test-only telemetry for wire-tiered-manager Step 3: how many times the
@@ -26899,117 +26869,47 @@ pub fn last_compile_fell_through_to_single_pass() -> bool {
 
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn try_compile_inner(
-    cached: &CachedBytecodeMethod,
-    cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
-    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, Option<(u32, bool)>)>>,
-    cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
-    cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
-    // See `try_compile_with_invokespecial_resolver`.
-    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16, u8) -> Option<String>>,
-    callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
-    cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
-    cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
-    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
-    profile: Option<&profile::MethodProfile>,
-    helpers: &JitRuntimeHelpers,
-    inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
-    // Resolves `java/lang/String`'s field layout — see `try_compile`.
-    string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
-    // Maps an invoke* CP index to its declared class id — see `try_compile`.
-    cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
-    // Elidable-`<init>` resolver for scalar-replacement of `new` — see
-    // `try_compile`. `None` keeps `new` scalar replacement off.
-    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
-    // wire-tiered-manager Step 3: when `false`, the optimizing IR pipeline is
-    // skipped entirely and compilation falls through to the single-pass
-    // `x64::compile` backend (the fast C1 tier). See `try_compile`.
-    optimize: bool,
-    // Gap B: enable lowering of int-only `invokestatic` in oop-free methods to
-    // `Op::Call`. See `try_compile`. Default-OFF at the VM call sites.
-    ir_emit_calls: bool,
-    // inc 24 (Gap B): additionally lower resolved non-`<init>` `invokespecial`
-    // to `Op::Call`. See `try_compile`. Default-OFF at the VM call sites.
-    ir_emit_special_calls: bool,
-    // inc 25: admit long-using methods to the IR path. See `try_compile`.
-    // Default-OFF at the VM call sites.
-    ir_emit_long: bool,
-    // inc 26 (Gap B): additionally lower resolved `invokevirtual`/
-    // `invokeinterface` to `Op::Call` (dynamic dispatch via the helper). See
-    // `try_compile`. Default-OFF at the VM call sites.
-    ir_emit_virtual_calls: bool,
-    // inc 30: admit a float/double-using method to the IR path (XMM value
-    // tier). See `try_compile`. Default-OFF at the VM call sites.
-    ir_emit_fp: bool,
-    // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
-    // its target descriptor. See `try_compile`.
-    // PGO-02: maps a receiver CLASS ID (not a CP index - the runtime
-    // identity a guarded speculative inline's receiver class-id check
-    // resolved against) to its class name, so a Monomorphic/Bimorphic
-    // InlinePlan can record a SpeculatedReceiver invalidation dependency
-    // (plan_inline refuses via NoInvalidationDependency without one - the
-    // fail-closed rule in docs/feature-designs/profile-guided-inlining.md).
-    // `None` (resolver absent, or it returns `None` for a given id) refuses
-    // every speculative virtual/interface inline at that site; static/
-    // special DirectBind sites are unaffected (no receiver dependency).
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
-    class_id_name_resolver: Option<&dyn Fn(u32) -> Option<String>>,
-    // PGO-02 R0: the body a receiver of exactly this class id dispatches to.
-    // See `try_compile`.
-    receiver_inline_resolver: Option<&dyn Fn(u32, &str, &str, &str) -> Option<InlineSite>>,
-    // IR-tier inlining: resolve a callee body for `IrBuilder` to SPLICE, under
-    // the optimizing tier's own admission set (`resolve_ir_inline_site` in the
-    // VM). Separate from `inline_resolver` because the two answer different
-    // questions: that one resolves what the single-pass emitter can splice,
-    // which refuses `new`, array access and `arraylength` — the three shapes an
-    // allocating accessor is made of. `None` (no VM in scope, or the gate off)
-    // splices nothing, which is byte-identical to the pre-inlining IR path.
-    ir_inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
-    // round-7 fix (bug 1): set to `true` immediately before invoking
-    // the heavy `x64::compile` path so the outer wrapper can tell a
-    // permanent backend bail (worth bail-listing) from an early
-    // transient miss (e.g. resolver returned None, profile not yet
-    // present — worth retrying later).
+    req: &CompileRequest<'_>,
     backend_attempted: &mut bool,
     self_call_identity_stable: bool,
-    // The caller's admission token, threaded through so the single-pass
-    // backend call at the end of this function can require it. See
-    // `x64::compile_with_param_slots`'s first parameter.
     admission: &compile_gate::CompileAdmission,
-    // JDK-only execution policy for THIS VM's compilations.
-    //
-    // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
-    // (JDK-ONLY-WAVE2 §2 of the wave-2 markers record — the record's §6 is the
-    // JNI table, a different process global). The latch only ever
-    // moved toward strict, so one `JdkOnly` VM silently took the thin
-    // direct-call helpers away from every `Compatible` VM sharing the process
-    // — the hazard contract §2's no-process-globals rule exists to prevent.
-    // Threaded here because the compile path already carries per-VM state and
-    // this is per-VM state; the `JitRuntimeHelpers` table was the wrong home
-    // (it is a `#[repr(C)]` ABI of helper ADDRESSES with baked offsets, and a
-    // policy bit is not an address).
-    jdk_only: bool,
-    // JDK-ONLY-WAVE2 §4: asks the registry whether a triple is a reviewed
-    // `NativeKind::Intrinsic`, i.e. the §1.4 exception that MAY shadow
-    // concrete bytecode. Returns `false` for `Bridge`, for `SyntheticStub`,
-    // and for a triple the registry has never heard of.
-    //
-    // This is the policy half of the seven thin direct-call ladders below.
-    // Before it existed those ladders were refused wholesale under `JdkOnly`,
-    // which is stricter than the contract: three of the seven are registered
-    // `Intrinsic` and §1.4 permits exactly those.
-    //
-    // `None` refuses everything, which is the pre-2026-08-06 behaviour and the
-    // fail-closed direction — a compile with no way to ask cannot bake a
-    // native in front of real bytes.
-    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
-    // The compiling VM's per-bci de-spec registry — see the same parameter on
-    // `try_compile_with_invokespecial_resolver`. `None` consults nothing.
-    despec: Option<&std::sync::Arc<crate::deopt::DespecRegistry>>,
-    // Review #80: the declaring class of each invoke's resolved method — see
-    // the same parameter on `try_compile_with_invokespecial_resolver`.
-    cp_invoke_declaring_class_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    // The door's local-handler retry: `true` compiles with handler bodies
+    // suppressed. Replaces the `disarm_local_handlers_once` thread-local.
+    local_handlers_disarmed: bool,
 ) -> Option<CompiledMethod> {
+    let CompileRequest {
+        cached,
+        cp_class_name_resolver,
+        cp_field_resolver,
+        cp_static_field_resolver,
+        cp_invoke_resolver,
+        cp_invokespecial_owner_resolver,
+        callee_compiler,
+        cp_new_resolver,
+        cp_ldc_resolver,
+        cp_ldc2w_resolver,
+        profile,
+        helpers,
+        inline_resolver,
+        string_layout_resolver,
+        cp_invoke_class_id_resolver,
+        cp_elidable_init_resolver,
+        optimize,
+        ir_emit_calls,
+        ir_emit_special_calls,
+        ir_emit_long,
+        ir_emit_virtual_calls,
+        ir_emit_fp,
+        cp_invokedynamic_descriptor_resolver,
+        class_id_name_resolver,
+        receiver_inline_resolver,
+        ir_inline_resolver,
+        jdk_only,
+        intrinsic_resolver,
+        despec,
+        cp_invoke_declaring_class_resolver,
+        self_call_identity_stable: _,
+    } = *req;
     // One compile, one verdict: the fall-through signal describes THIS call.
     reset_ir_fall_through_signal();
     // C2-review P0 "Measure compilation quality": one structured
@@ -29764,12 +29664,15 @@ fn try_compile_inner(
         // (`compiled.spliced_bodies_side_effect_free`), which is where the
         // interpreter reads it — producer and consumer now read one number.
         builder.set_spliced_bodies_pure(ir_spliced_bodies_pure);
+        // Clears the builder's per-build results now and when this compile
+        // leaves the scope, however it leaves.
+        let ir_build_results = ir::IrBuildResultsScope::enter();
         let built = builder.build(ir_combined.as_deref().unwrap_or(code), code_len);
         // Record that this method's optimizing body carries a site trap, so a
         // trap TAKEN at runtime can be told apart from genuinely unreachable
         // code. `build` consumes the builder, so the count comes back through
-        // the same per-build thread-local `reset_string_access_sites` uses.
-        if ir::site_traps_planted_this_build() > 0 {
+        // `ir_build_results`, the scope opened above.
+        if ir_build_results.site_traps_planted() > 0 {
             ir::register_site_trap_method(ir_method_hash);
         }
         drop(metrics_build);
@@ -29806,7 +29709,7 @@ fn try_compile_inner(
         //     below the object header — impossible by construction, and the
         //     `as u32` below is why it is checked rather than assumed.
         if let Some(layout) = resolved_string_layout {
-            let sites = ir::string_access_site_pcs();
+            let sites = ir_build_results.string_access_site_pcs();
             // `CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS=1` is the B arm:
             // without the rows both loads fall back to the checked
             // `jit_getfield` helper, exactly as they did before 2026-09-02,
@@ -33168,7 +33071,7 @@ fn try_compile_inner(
 
             // bt18-regression fix (2026-07-18): NON-tail static self-recursion
             // may ALSO take the raw direct-CALL path — but only under the
-            // caller-supplied identity proof (see `SELF_CALL_IDENTITY_STABLE`:
+            // caller-supplied identity proof (see `CompileRequest::self_call_identity_stable`:
             // builtin-loaded class whose name maps back to its own ClassId,
             // so the historical loader-identity hazard cannot arise) and
             // never for mutual-recursion cycle targets (the dispatch depth
@@ -33511,13 +33414,13 @@ fn try_compile_inner(
     // "propagate" where the real table has a match. `catch_type == 0` is a
     // catch-all and carries the empty name rather than a resolution.
     //
-    // `take_local_handlers_disarmed` is the retry channel: a compile that
+    // `local_handlers_disarmed` is the retry: a compile that
     // refused with handler bodies in the image comes back through here once
     // with them suppressed, so the feature can cost a method throughput but
     // never its artifact.
     let local_handlers_requested = local_handlers_enabled()
         && !cached.exception_table.is_empty()
-        && !take_local_handlers_disarmed();
+        && !local_handlers_disarmed;
     if local_handlers_requested {
         let mut table: Vec<(usize, usize, usize, &'static str)> =
             Vec::with_capacity(cached.exception_table.len());
@@ -36164,7 +36067,7 @@ mod tests {
     /// WITHOUT the caller-supplied identity proof the site must retain
     /// `invoke_dispatch`, so class-loader identity is resolved at dispatch
     /// time (dee2e26f hardening). WITH the proof
-    /// (`set_self_call_identity_stable(true)` — builtin-loaded class whose
+    /// (`CompileRequest::self_call_identity_stable` — builtin-loaded class whose
     /// name maps back to its own ClassId) the site takes the raw guarded
     /// direct self-CALL (bt18-regression fix, 2026-07-18); the flag is
     /// consume-once so the NEXT compile reverts to dispatch.
@@ -36311,31 +36214,11 @@ mod tests {
         // the non-tail site takes the raw guarded direct self-CALL — the
         // stack-guard helper is baked and no invoke_dispatch round trip
         // remains for the recursion.
-        set_self_call_identity_stable(true);
-        let compiled_direct = try_compile(
-            &cached,
-            None,
-            None,
-            None,
-            Some(&resolver),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &helpers,
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            None,
-        )
+        let compiled_direct = try_compile_request(&CompileRequest {
+            cp_invoke_resolver: Some(&resolver),
+            self_call_identity_stable: true,
+            ..CompileRequest::new(&cached, &helpers)
+        })
         .expect("identity-proven self-recursive method must compile");
         let bytes_direct = compiled_direct.code_bytes().to_vec();
         assert!(

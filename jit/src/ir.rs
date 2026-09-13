@@ -5072,6 +5072,39 @@ pub fn site_traps_planted_this_build() -> usize {
     SITE_TRAPS_THIS_BUILD.with(|c| c.get())
 }
 
+/// Clears the IR builder's two per-build result channels -- the planted
+/// site-trap count and the String-access site list -- when it is created and
+/// again when it is dropped. The compile driver holds one across a build and
+/// reads the results through it, so a build that bails, returns early or
+/// unwinds cannot leave its results for the next build on this thread.
+pub struct IrBuildResultsScope(());
+
+impl IrBuildResultsScope {
+    /// Open the scope, clearing both channels.
+    pub fn enter() -> Self {
+        reset_string_access_sites();
+        reset_site_traps_this_build();
+        IrBuildResultsScope(())
+    }
+
+    /// How many site traps the build inside this scope planted.
+    pub fn site_traps_planted(&self) -> usize {
+        site_traps_planted_this_build()
+    }
+
+    /// The pcs at which the build inside this scope expanded a String accessor.
+    pub fn string_access_site_pcs(&self) -> Vec<usize> {
+        string_access_site_pcs()
+    }
+}
+
+impl Drop for IrBuildResultsScope {
+    fn drop(&mut self) {
+        reset_string_access_sites();
+        reset_site_traps_this_build();
+    }
+}
+
 /// Methods whose IR body carries at least one planted site trap, by
 /// `compute_jit_key_hash(class, method, desc, ClassId::new(0))`.
 ///
@@ -11283,6 +11316,23 @@ mod scalar_intrinsic_recognizer_tests {
             0,
             "a stale count would register a method that planted nothing",
         );
+    }
+
+    #[test]
+    fn the_build_results_scope_clears_both_channels_on_entry_and_on_drop() {
+        SITE_TRAPS_THIS_BUILD.with(|c| c.set(2));
+        note_string_access_site(7);
+        {
+            let scope = IrBuildResultsScope::enter();
+            assert_eq!(scope.site_traps_planted(), 0, "a stale count from an earlier build");
+            assert!(scope.string_access_site_pcs().is_empty());
+            SITE_TRAPS_THIS_BUILD.with(|c| c.set(1));
+            note_string_access_site(9);
+            assert_eq!(scope.site_traps_planted(), 1);
+            assert_eq!(scope.string_access_site_pcs(), vec![9]);
+        }
+        assert_eq!(site_traps_planted_this_build(), 0, "a bailed build left its count");
+        assert!(string_access_site_pcs().is_empty());
     }
 
     // RESTORED 2026-09-07. The site-trap tests above were inserted between
