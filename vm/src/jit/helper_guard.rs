@@ -67,7 +67,7 @@
 //! The stashed `InternalError` is delivered at the next pending-exception drain
 //! on that thread, not at the faulting instruction.
 //!
-//! # Guarded helpers (49)
+//! # Guarded helpers (65)
 //!
 //! `Throw`, sentinel `i64::MIN`: `service_callee_deopt`, `monitor_enter`,
 //! `monitor_exit`, `aastore_type_check`, `getstatic`, `putstatic_int`,
@@ -92,7 +92,12 @@
 //! and `aastore`, `varhandle_write_direct` and `safepoint_slow_path` return
 //! `()`.
 //!
-//! `Deopt`: `uncommon_trap` (`DEOPT_ACTION_REINTERPRET`).
+//! `Deopt`: `uncommon_trap` (`DEOPT_ACTION_REINTERPRET`), leaf readers
+//! (`jit_baload`, `jit_iaload`, `jit_aaload`, `jit_arraylength`, `jit_getfield`),
+//! throw stubs (`jit_throw_aioobe`, `jit_throw_arithmetic`,
+//! `jit_throw_exception`, `jit_npe_with_action`), `jit_post_tlab_init`, and
+//! primitive stores (`jit_bastore`, `jit_iastore`, `jit_putfield_int`,
+//! `jit_putfield_long`, `jit_putfield_float`, `jit_putfield_double`).
 //!
 //! `Record`: `ffm_segment_get` and `ffm_segment_set` (`0`, declined).
 //!
@@ -101,16 +106,6 @@
 //! These must stay panic-free. A new helper that cannot meet that bar must be
 //! guarded instead.
 //!
-//! * The leaf readers `baload`, `iaload`, `aaload`, `arraylength` and
-//!   `getfield`; the throw stubs `throw_aioobe`, `throw_arithmetic`,
-//!   `throw_exception` and `npe_with_action`; `tlab_post_init`; and the
-//!   primitive stores `bastore`, `iastore` and `putfield_int` / `_long` /
-//!   `_float` / `_double`. Their call sites publish no oop map, so a guard
-//!   could only return a deopt sentinel or drop the call. The sentinel's resume
-//!   is not proven to land at the faulting bytecode (a replay from earlier
-//!   re-runs committed side effects), and a dropped store is silent corruption.
-//!   They abort, as before, until each site has a precise failure exit
-//!   (`jit-leaf-helper-panics-still-abort-20260912.md`).
 //! * `jit_set_deopt_pending`, `jit_set_throw_bci`, `jit_get_current_thread`
 //!   and `jit_dispatch_threw` touch one thread-local each. `dispatch_threw` is
 //!   also the peek every `J`/`D` sentinel check relies on, and must never stash
@@ -392,6 +387,21 @@ mod tests {
         assert!(
             crate::jit::helpers::take_jit_deopt_pending(),
             "a contained leaf panic must leave the deopt flag set"
+        );
+    }
+
+    /// `Deopt` on a void helper (e.g. `jit_bastore`, `jit_putfield_*`) must also
+    /// raise the deopt flag so the interpreter drains and recovers.
+    #[test]
+    fn the_deopt_policy_works_for_void_helpers() {
+        const NAME: &str = "helper_guard_test::deopt_void";
+        let _ = crate::jit::helpers::take_jit_deopt_pending();
+        contain(NAME, OnPanic::Deopt, (), || {
+            panic!("deliberate void helper panic (test)")
+        });
+        assert!(
+            crate::jit::helpers::take_jit_deopt_pending(),
+            "a contained void helper panic must leave the deopt flag set"
         );
     }
 

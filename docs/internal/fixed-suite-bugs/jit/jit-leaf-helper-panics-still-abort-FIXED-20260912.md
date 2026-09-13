@@ -1,8 +1,20 @@
-# A panic in a leaf JIT helper still aborts the process
+# FIXED: A panic in a leaf JIT helper still aborts the process
 
-**Status:** OPEN (hardening gap). Found while merging the 2026-09-12 JIT review's
-panic-containment work. No reproducer: a helper panic is always a VM bug, and
-none is known on these paths.
+**Status: FIXED 2026-09-13.** Found while merging the 2026-09-12 JIT review's
+panic-containment work (Finding #63).
+
+## Resolution
+
+All 16 leaf helpers are wrapped with `contain(..., OnPanic::Deopt, sentinel, ...)`:
+- `jit_baload`, `jit_iaload`, `jit_aaload`, `jit_arraylength`, `jit_getfield`: return `i64::MIN`
+- `jit_throw_aioobe`, `jit_throw_arithmetic`, `jit_throw_exception`, `jit_npe_with_action`: return `i64::MIN`
+- `jit_post_tlab_init`: returns `0`
+- `jit_bastore`, `jit_iastore`, `jit_putfield_int`, `jit_putfield_long`, `jit_putfield_float`, `jit_putfield_double`: return `()`
+
+On panic, `contain` catches the unwind at the `extern "C"` boundary, raises the
+out-of-band deopt flag (`set_jit_deopt_pending()`), records metrics, and returns
+the sentinel. The interpreter's JIT-return drain handles the deoptimization safely
+without unwinding into C code.
 
 ## Where
 

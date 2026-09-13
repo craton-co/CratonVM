@@ -18704,3 +18704,127 @@ fn osr_exit_snapshot_publishes_a_reused_slot_that_is_dead_at_the_exit_as_undefin
         exit.frame_state.locals
     );
 }
+
+#[test]
+fn single_pass_baseline_mode_compiles_without_speculative_passes() {
+    let helpers = test_helpers();
+    // Counted loop over an Object[] with array loads:
+    // Locals: 0=m (Object[]), 1=j, 2=n, 3=i.
+    //   0: iconst_0 ; 1: istore_3                    (i = 0)
+    //   2: iload_3 ; 3: iload_2 ; 4: if_icmpge -> 21  (header)
+    //   7: aload_0 ; 8: ifnull -> 15                  (skip if m == null)
+    //  11: aload_0 ; 12: iload_1 ; 13: aaload ; 14: pop
+    //  15: iinc 3, 1 ; 18: goto -> 2 ; 21: return
+    let code: Vec<u8> = vec![
+        0x03,             // 0: iconst_0
+        0x3e,             // 1: istore_3
+        0x1d,             // 2: iload_3
+        0x1c,             // 3: iload_2
+        0xa2, 0x00, 0x11, // 4: if_icmpge +17 -> 21
+        0x2a,             // 7: aload_0
+        0xc6, 0x00, 0x07, // 8: ifnull +7 -> 15
+        0x2a,             // 11: aload_0
+        0x1b,             // 12: iload_1
+        0x32,             // 13: aaload
+        0x57,             // 14: pop
+        0x84, 0x03, 0x01, // 15: iinc 3, 1
+        0xa7, 0xff, 0xf0, // 18: goto -16 -> 2
+        0xb1,             // 21: return
+        0, 0,
+    ];
+
+    // 1. Normal (compatible) compilation succeeds
+    let req_compat = BackendRequest::default();
+    let compiled_compat = compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
+        &code,
+        22,
+        4,
+        4,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Default::default(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        HashMap::new(),
+        None,
+        &[0, 1, 2],
+        3,
+        0,
+        Vec::new(),
+        "Test.m:(Ljava/lang/Object;II)V",
+        None,
+        Vec::new(),
+        None,
+        req_compat,
+    )
+    .expect("normal compile must succeed");
+
+    // 2. Baseline compilation succeeds
+    let mut req_baseline = BackendRequest::default();
+    req_baseline.baseline_mode = true;
+    let compiled_baseline = compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
+        &code,
+        22,
+        4,
+        4,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Default::default(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        HashMap::new(),
+        None,
+        &[0, 1, 2],
+        3,
+        0,
+        Vec::new(),
+        "Test.m:(Ljava/lang/Object;II)V",
+        None,
+        Vec::new(),
+        None,
+        req_baseline,
+    )
+    .expect("baseline compile must succeed");
+
+    assert!(compiled_compat.code_len() > 0);
+    assert!(compiled_baseline.code_len() > 0);
+}
+

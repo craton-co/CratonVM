@@ -47,6 +47,10 @@ pub struct BackendRequest {
     /// `[start_pc, end_pc)` of the method's protected ranges. A sibling
     /// tail-call inside one would unwind past its handler, so it is suppressed.
     pub protected_ranges: Vec<(u32, u32)>,
+    /// When true, the single-pass backend compiles as a pure baseline compiler:
+    /// fast, with no speculative passes (EA/scalar replacement, speculative BCE
+    /// loop guards, LICM hoists, loop unrolling, and inlining skipped).
+    pub baseline_mode: bool,
 }
 
 #[cfg(test)]
@@ -64,5 +68,6 @@ mod tests {
         assert!(!request.kernel_reg_homes);
         assert!(!request.kernel_reg_homes_osr);
         assert!(!request.precise_exception_frames);
+        assert!(!request.baseline_mode);
     }
 }

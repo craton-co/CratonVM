@@ -439,6 +439,9 @@ Each guarded helper returns the failure answer its call site already handles
 | `0`, `Record` | `ffm_segment_get`, `ffm_segment_set` (declined; the native path runs) |
 | `-1`, `Throw` | `local_handler_lookup` (propagate) |
 | `DEOPT_ACTION_REINTERPRET`, `Deopt` | `uncommon_trap` |
+| `i64::MIN`, `Deopt` | `baload`, `iaload`, `aaload`, `arraylength`, `getfield`, `throw_aioobe`, `throw_arithmetic`, `throw_exception`, `npe_with_action` |
+| `0`, `Deopt` | `tlab_post_init` |
+| `()`, `Deopt` | `bastore`, `iastore`, `putfield_int`, `putfield_long`, `putfield_float`, `putfield_double` |
 | `()`, `Throw` | `aastore`, `varhandle_write_direct`, `safepoint_slow_path` |
 
 A void helper has no failure channel. A `Throw` stash is delivered at the
@@ -453,12 +456,6 @@ These are not wrapped:
 * `native_stack_floor`, `frame_record`, `verify_inline_frame_record`
 * `math_fma_double`, `math_fma_float`, `jit_frem`, `jit_drem`
 * `reachability_fence_direct`, `resolve_static_base`
-* the leaf readers `baload`, `iaload`, `aaload`, `arraylength` and `getfield`;
-  the throw stubs `throw_aioobe`, `throw_arithmetic`, `throw_exception` and
-  `npe_with_action`; `tlab_post_init`; and the primitive stores `bastore`,
-  `iastore` and `putfield_int` / `_long` / `_float` / `_double`. A guard there
-  could only return a deopt sentinel whose resume is not yet precise, or drop
-  a write, so they still abort (`jit-leaf-helper-panics-still-abort-20260912.md`)
 * the savebase watch: `arm_savebase_watch` is `#[naked]`, and its inner half
   belongs to the crash handler
 

@@ -220,6 +220,14 @@ const ALLOWED: &[(&str, &str)] = &[
         "kind 3: `vm/tests/*` — a JDK for the test harness to shell out to, \
          checked ahead of `JAVA_HOME`",
     ),
+    (
+        "CRATONVM_JIT_BASELINE_FAST",
+        "kind 3: baseline compilation toggle introduced in Finding #68 ratchet",
+    ),
+    (
+        "CRATONVM_JIT_BASELINE_NO_SPEC",
+        "kind 3: alias for CRATONVM_JIT_BASELINE_FAST (Finding #68)",
+    ),
 ];
 
 fn declared() -> BTreeSet<&'static str> {

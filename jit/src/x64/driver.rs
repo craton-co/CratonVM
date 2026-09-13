@@ -431,6 +431,11 @@ pub(super) fn spliced_stack_reserve_path(site: &crate::InlineSite) -> usize {
     own.saturating_add(deepest)
 }
 
+pub(crate) fn baseline_no_spec_enabled() -> bool {
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_BASELINE_FAST")
+        || cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_BASELINE_NO_SPEC")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
     // ── The admission gate, enforced by the type system ───────────────
@@ -651,7 +656,15 @@ pub fn compile_with_param_slots(
         kernel_reg_homes_osr,
         precise_exception_frames,
         protected_ranges,
+        baseline_mode,
     } = backend;
+    let is_baseline = baseline_mode || baseline_no_spec_enabled();
+    let mut inline_sites = inline_sites;
+    let mut inline_guard_variants = inline_guard_variants;
+    if is_baseline {
+        inline_sites.clear();
+        inline_guard_variants.clear();
+    }
     // Open the PC -> inline-chain recording session for this compile. `open()`
     // discards anything an abandoned earlier compile left behind, so it is safe
     // unconditionally and costs one thread-local write. Nothing above this
@@ -692,43 +705,47 @@ pub fn compile_with_param_slots(
     //
     // `None` on every unarmed compile, at the cost of one thread-local
     // `Cell<bool>` load, and the whole path below is then the identity.
-    let loop_xform: Option<LoopXform> = match plan_bytecode_loop_xform(
-        code,
-        code_len,
-        &exception_ranges,
-        &loop_unroll_hints,
-        LoopRewriteShape {
-            deopt_real: crate::deopt_real_enabled(),
-            precise_exception_frames,
-            has_indy: !indy_info.is_empty(),
-            has_inline_sites: !inline_sites.is_empty(),
-        },
-    ) {
-        Ok(x) => {
-            crate::metrics::record_loop_xform_event("loop_xform_applied");
-            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
-                eprintln!(
-                    "[JIT_GEN] bytecode loop rewrite: kind={:?} versioned={} header={} \
-                     body_len={} copies={} code_len {}->{} poll_free={}",
-                    x.kind,
-                    x.versioning.is_some(),
-                    x.header,
-                    x.body_len,
-                    x.copies,
-                    code_len,
-                    x.code_len,
-                    x.poll_free_bytes
-                );
+    let loop_xform: Option<LoopXform> = if is_baseline {
+        None
+    } else {
+        match plan_bytecode_loop_xform(
+            code,
+            code_len,
+            &exception_ranges,
+            &loop_unroll_hints,
+            LoopRewriteShape {
+                deopt_real: crate::deopt_real_enabled(),
+                precise_exception_frames,
+                has_indy: !indy_info.is_empty(),
+                has_inline_sites: !inline_sites.is_empty(),
+            },
+        ) {
+            Ok(x) => {
+                crate::metrics::record_loop_xform_event("loop_xform_applied");
+                if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN") {
+                    eprintln!(
+                        "[JIT_GEN] bytecode loop rewrite: kind={:?} versioned={} header={} \
+                         body_len={} copies={} code_len {}->{} poll_free={}",
+                        x.kind,
+                        x.versioning.is_some(),
+                        x.header,
+                        x.body_len,
+                        x.copies,
+                        code_len,
+                        x.code_len,
+                        x.poll_free_bytes
+                    );
+                }
+                Some(x)
             }
-            Some(x)
-        }
-        Err(refusal) => {
-            if !matches!(refusal, LoopRewriteRefusal::NotArmed)
-                && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN")
-            {
-                eprintln!("[JIT_GEN] bytecode loop rewrite refused: {refusal:?}");
+            Err(refusal) => {
+                if !matches!(refusal, LoopRewriteRefusal::NotArmed)
+                    && cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JIT_GEN")
+                {
+                    eprintln!("[JIT_GEN] bytecode loop rewrite refused: {refusal:?}");
+                }
+                None
             }
-            None
         }
     };
     // Kept for the coordinate change at the end of this function; `code_len`
@@ -1168,7 +1185,7 @@ pub fn compile_with_param_slots(
     // `AttributesImpl.ensureCapacity` witness.
     let bypassable_headers =
         find_bypassable_loop_headers(code, code_len, &loops, &exception_ranges);
-    let hoist_info = if cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_AALOAD_LICM") {
+    let hoist_info = if is_baseline || cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_AALOAD_LICM") {
         Vec::new()
     } else {
         find_loop_hoists(code, code_len, &loops)
@@ -1205,7 +1222,7 @@ pub fn compile_with_param_slots(
     // in the VM, so it needs one, and the bisect it serves must reach the
     // level the change is at (the emission, not the analysis).
     let array_len_hoist_info =
-        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_ARRAYLEN_LICM") {
+        if is_baseline || cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_ARRAYLEN_LICM") {
             Vec::new()
         } else {
             find_array_len_hoists(code, code_len, &loops)
@@ -1243,7 +1260,7 @@ pub fn compile_with_param_slots(
     // loop pre-header. These are pure, non-faulting ALU expressions on
     // loop-invariant locals/constants — see `find_arith_loop_hoists`.
     let arith_hoist_info =
-        if cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_ARITH_LICM") {
+        if is_baseline || cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_ARITH_LICM") {
             Vec::new()
         } else {
             find_arith_loop_hoists(code, code_len, &loops)
@@ -1283,7 +1300,9 @@ pub fn compile_with_param_slots(
     // The receiver seed is derived here rather than passed in — see
     // `null_check_elim::receiver_in_local_zero` for why, and for what the
     // `None` (the two numbers disagree) case protects.
-    let null_check_info = {
+    let null_check_info = if is_baseline {
+        crate::null_check_elim::NullCheckInfo::default()
+    } else {
         let receiver = super::null_check_elim::this_nonnull_enabled()
             && crate::null_check_elim::receiver_in_local_zero(method_key, num_params)
                 .unwrap_or(false);
@@ -1295,7 +1314,7 @@ pub fn compile_with_param_slots(
     // (and SIMD, which also elides per-element checks) so every array access is
     // bounds-checked — to test whether an elided check causes the out-of-bounds
     // array-store heap corruption.
-    let no_bce = cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_BCE");
+    let no_bce = is_baseline || cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_BCE");
     let (bounds_safe_pcs, speculative_bce_guards) = if no_bce {
         (FxHashSet::default(), Vec::new())
     } else {
@@ -1442,7 +1461,7 @@ pub fn compile_with_param_slots(
     // and "the bytecode was already duplicated" must be visible AT the vector
     // rather than two functions away.
     let unroll_loops: Vec<(usize, usize, usize)> =
-        if loop_xform.is_some() || !native_unroller_enabled() {
+        if is_baseline || loop_xform.is_some() || !native_unroller_enabled() {
             Vec::new()
         } else {
             loops
@@ -1502,15 +1521,22 @@ pub fn compile_with_param_slots(
     }
 
     // FP LICM: detect loop-invariant FP loads to hoist
-    let fp_hoist_info = find_fp_loop_hoists(code, code_len, &loops);
+    let fp_hoist_info = if is_baseline {
+        Vec::new()
+    } else {
+        find_fp_loop_hoists(code, code_len, &loops)
+    };
     let fp_hoist_info: Vec<FpLoopHoist> = fp_hoist_info
         .into_iter()
         .filter(|h| !bypassable_headers.contains(&h.loop_header))
         .collect();
 
     // FP strength reduction: detect dmul-by-2.0 → dadd-self inside loops
-    let fp_strength_reduction_pcs =
-        find_fp_strength_reductions(code, code_len, &loops, &ldc2w_info);
+    let fp_strength_reduction_pcs = if is_baseline {
+        FxHashSet::default()
+    } else {
+        find_fp_strength_reductions(code, code_len, &loops, &ldc2w_info)
+    };
 
     // Register allocation: graph-coloring allocator for locals.
     //
@@ -1624,7 +1650,7 @@ pub fn compile_with_param_slots(
     // that bug: single-pass scalar replacement never fired for ordinary
     // allocations at runtime. Gating on `new_info` instead lets it fire (and is
     // what makes the Phase B `VirtualObject` deopt path reachable).
-    let non_escaping_new: std::collections::HashSet<usize> = if new_info.is_empty() {
+    let non_escaping_new: std::collections::HashSet<usize> = if is_baseline || new_info.is_empty() {
         non_escaping_new
     } else {
         let mut invokespecial_shapes: FxHashMap<usize, InvokeSpecialShape> = FxHashMap::default();
@@ -1665,7 +1691,8 @@ pub fn compile_with_param_slots(
     let num_hoists = hoist_info.len();
     let scalar_base = max_locals + (if needs_heap { 1 } else { 0 }) + num_hoists;
     let empty_non_escaping = std::collections::HashSet::new();
-    let non_escaping_for_sr = if precise_exception_frames
+    let non_escaping_for_sr = if is_baseline
+        || precise_exception_frames
         || cratonvm_types::flags::runtime_flag_on("CRATONVM_DISABLE_SCALAR_REPLACEMENT")
     {
         &empty_non_escaping

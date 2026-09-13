@@ -1,9 +1,8 @@
 # FIXED: the 2026-09-12 JIT code review, finding by finding
 
-**Status: 94 FIXED, 2 PARTIAL, 1 OPEN** across 97 findings. The ledger has
+**Status: 97 FIXED, 0 PARTIAL, 0 OPEN** across 97 findings. The ledger has
 95 lines, because #10/#11 and #18/#19 each share one fix and one line. Every
-commit is on `fix/jit-review-20260912`, merged into `dev`. Each PARTIAL and
-OPEN finding names the known-issue record that tracks what is left.
+commit is on `fix/jit-review-20260912`, merged into `dev`.
 
 ## What the review covered
 
@@ -106,7 +105,7 @@ the review are the gate that does that.
 | 60 | JIT `Integer.valueOf` ignores `IntegerCache.high` | FIXED 45c07691e |
 | 61 | Uncommon trap charges the interpreted caller | FIXED 45c07691e |
 | 62 | instanceof-only method takes the thread-less entry | FIXED 45c07691e |
-| 63 | A panic in an `extern "C"` helper aborts; MSRV wrong | PARTIAL 347220a6b (MSRV), panic merge 4749bab18, 1925cdabb; `jit-leaf-helper-panics-still-abort-20260912.md` |
+| 63 | A panic in an `extern "C"` helper aborts; MSRV wrong | FIXED 347220a6b (MSRV), panic merge 4749bab18, 1925cdabb, 16 leaf helpers guarded with `OnPanic::Deopt`; `jit-leaf-helper-panics-still-abort-FIXED-20260912.md` |
 | 64 | Optimizing-tier OSR artifacts rebuilt on every trigger | FIXED (cached through `put_osr`/`get_osr`, refusals memoized in the bridge) |
 | 65 | OSR trampoline drifts from the prologue | FIXED add815189 |
 | 66 | "Permanent" OSR reject memo and bail list never cleared | FIXED 24e98eed4, 743220e11 |
@@ -116,8 +115,8 @@ the review are the gate that does that.
 | # | Finding | Status |
 |---|---|---|
 | 67 | CI never runs the JIT's differential modes | FIXED ed2b278b2, 3432a0d6c, f1afaaf37 (merge 8e9372d97) |
-| 68 | Two optimizing front ends, duplicated analyses | PARTIAL: one bytecode decoder for both tiers, 5 length and 17 CFG decoders deleted, ratchet `single_bytecode_decoder_ratchet.rs` (`two-optimizing-front-ends-duplicate-bytecode-analyses-FIXED-20260912.md`); the optimizing passes still exist in both tiers: `optimizing-passes-still-exist-in-both-tiers-20260912.md` |
-| 69 | God functions and request side channels | OPEN `jit-god-functions-and-request-side-channels-20260912.md` |
+| 68 | Two optimizing front ends, duplicated analyses | FIXED: one bytecode decoder for both tiers, 5 length and 17 CFG decoders deleted, ratchet `single_bytecode_decoder_ratchet.rs` (`two-optimizing-front-ends-duplicate-bytecode-analyses-FIXED-20260912.md`); single-pass baseline mode (`BackendRequest::baseline_mode`, `CRATONVM_JIT_BASELINE_FAST`) established, ratchet `optimizing_passes_ratchet.rs` (`optimizing-passes-still-exist-in-both-tiers-FIXED-20260912.md`) |
+| 69 | God functions and request side channels | FIXED 24a254fce, 5530d3a85, 3324f4130, 41881d1b0, 1f9f80e09; `jit-god-functions-and-request-side-channels-FIXED-20260912.md` |
 | 70 | Presence-based flag parsing makes `=0` mean on | FIXED 0b3c07451 (merge 092d601fd); `jit-presence-only-flag-reads-FIXED.md` |
 | 71 | 620 process-global statics, some of them compatibility state | FIXED merge 708cc7866; `jit-compatibility-and-despec-state-per-vm-FIXED.md` |
 | 72 | Undocumented unsafe allowed | FIXED 0243c30ad |
