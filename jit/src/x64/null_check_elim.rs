@@ -623,7 +623,7 @@ mod receiver_elision_reach_tests {
     ///   compare and fault.
     #[test]
     fn only_the_getfield_arms_consult_the_null_check_dataflow() {
-        let src = include_str!("bytecode_walk.rs");
+        let src = crate::x64::bytecode_walk::WALK_SOURCES;
         // Counted on the call NAME, not on an argument spelling: arm 2's call is
         // wrapped across lines, and an earlier version of this test matched
         // "(code, pc," and silently scored it as one site instead of two.

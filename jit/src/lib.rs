@@ -34588,10 +34588,10 @@ mod tests {
     #[test]
     fn arraycopy_scratch_homes_are_allocated_clear_of_the_operand_homes() {
         let src = std::fs::read_to_string(format!(
-            "{}/src/x64/bytecode_walk.rs",
+            "{}/src/x64/op_invoke.rs",
             env!("CARGO_MANIFEST_DIR")
         ))
-        .expect("read bytecode_walk.rs");
+        .expect("read op_invoke.rs");
 
         let at = src
             .find("let s_src = ")
@@ -34838,10 +34838,10 @@ mod tests {
     #[test]
     fn multianewarray_lowering_passes_the_resolved_site_not_an_element_type() {
         let src = std::fs::read_to_string(format!(
-            "{}/src/x64/bytecode_walk.rs",
+            "{}/src/x64/op_object.rs",
             env!("CARGO_MANIFEST_DIR")
         ))
-        .expect("read bytecode_walk.rs");
+        .expect("read op_object.rs");
 
         let arm = src
             .find("// multianewarray — allocate multi-dimensional array (2D only)")

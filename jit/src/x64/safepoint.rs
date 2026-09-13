@@ -2461,7 +2461,7 @@ mod tests {
     /// map genuinely cannot describe.
     #[test]
     fn the_self_recursive_arm_stages_its_reference_arguments() {
-        let src = include_str!("bytecode_walk.rs");
+        let src = crate::x64::bytecode_walk::WALK_SOURCES;
         let at = src
             .find("let staged_self_args_mark = self.pending_staged_arg_oops.len();")
             .expect("the self-recursive arm must mark the staged-arg buffer");
@@ -2496,7 +2496,7 @@ mod tests {
     /// bare `push`.
     #[test]
     fn the_tail_self_call_form_unstages_before_it_jumps() {
-        let src = include_str!("bytecode_walk.rs");
+        let src = crate::x64::bytecode_walk::WALK_SOURCES;
         let at = src
             .find("let staged_self_args_mark = self.pending_staged_arg_oops.len();")
             .expect("the self-recursive arm must mark the staged-arg buffer");

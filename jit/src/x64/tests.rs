@@ -17535,7 +17535,7 @@ fn single_pass_dispatch_arms() -> std::collections::BTreeSet<u8> {
     let src = include_str!("bytecode_walk.rs");
     // The dispatch loop's own `match op {`. Anchored on the two lines that
     // immediately precede it so a nested `match op {` cannot be picked up.
-    let anchor = "self.dbg_last_op = op;\n            match op {\n";
+    let anchor = "self.dbg_last_op = op;\n            let family = match op {\n";
     let start = src
         .find(anchor)
         .expect("the single-pass dispatch `match op` must be findable")
