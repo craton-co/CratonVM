@@ -22,6 +22,33 @@ impl Compiler {
         code: &[u8],
         code_len: usize,
         op: u8,
+        pc: usize,
+        dead: &mut bool,
+        branch_targets: &[bool],
+    ) -> WalkStep {
+        match op {
+            0xb8 => self.walk_invokestatic(code, code_len, op, pc, dead, branch_targets),
+            0xb6 | 0xb7 | 0xb9 => {
+                self.walk_invoke_instance(code, code_len, op, pc, dead, branch_targets)
+            }
+            0xba => self.walk_invokedynamic(code, code_len, op, pc, dead, branch_targets),
+            _ => {
+                // `compile_bytecode` routed an opcode here that this family
+                // does not lower: a dispatch table bug, refused rather than
+                // emitted.
+                self.fail("singlepass-codegen/walk-family-misdispatch");
+                WalkStep::Return(false)
+            }
+        }
+    }
+
+    /// Lower `invokestatic`: a self-call, a direct call, an inlined body, an intrinsic or the dispatch helper at `pc`.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_invokestatic(
+        &mut self,
+        code: &[u8],
+        code_len: usize,
+        op: u8,
         mut pc: usize,
         _dead: &mut bool,
         branch_targets: &[bool],
@@ -2943,6 +2970,26 @@ impl Compiler {
                 }
                 pc += 3;
             }
+            _ => {
+                self.fail("singlepass-codegen/walk-family-misdispatch");
+                return WalkStep::Return(false);
+            }
+        }
+        WalkStep::Next(pc)
+    }
+
+    /// Lower `invokevirtual`, `invokespecial` and `invokeinterface` at `pc`.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_invoke_instance(
+        &mut self,
+        _code: &[u8],
+        _code_len: usize,
+        op: u8,
+        mut pc: usize,
+        _dead: &mut bool,
+        _branch_targets: &[bool],
+    ) -> WalkStep {
+        match op {
 
             // invokevirtual / invokespecial / invokeinterface — direct call or dispatch helper
             0xb6 | 0xb7 | 0xb9 => {
@@ -6924,6 +6971,26 @@ impl Compiler {
                     pc += 3;
                 }
             }
+            _ => {
+                self.fail("singlepass-codegen/walk-family-misdispatch");
+                return WalkStep::Return(false);
+            }
+        }
+        WalkStep::Next(pc)
+    }
+
+    /// Lower `invokedynamic` at `pc`.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_invokedynamic(
+        &mut self,
+        _code: &[u8],
+        _code_len: usize,
+        op: u8,
+        mut pc: usize,
+        _dead: &mut bool,
+        _branch_targets: &[bool],
+    ) -> WalkStep {
+        match op {
 
             // invokedynamic — unconditional deopt to the interpreter.
             //
@@ -7190,9 +7257,6 @@ impl Compiler {
                 pc += 5;
             }
             _ => {
-                // `compile_bytecode` routed an opcode here that this family
-                // does not lower: a dispatch table bug, refused rather than
-                // emitted.
                 self.fail("singlepass-codegen/walk-family-misdispatch");
                 return WalkStep::Return(false);
             }
