@@ -2,10 +2,10 @@
 #
 # Measured 2026-08-12 (B7). The build output is real and substantial:
 #
-#     C:/craton/apps/keycloak            97 target/classes, 58 target/test-classes
+#     /data/cratonvm/apps/keycloak            97 target/classes, 58 target/test-classes
 #                                        7779 main .class, 2254 test .class,
 #                                        1400 *Test.class
-#     C:/craton/cratonvm/apps/keycloak   83 / 38, 7383 main, 1572 test, 856 *Test
+#     /data/cratonvm/apps/keycloak   83 / 38, 7383 main, 1572 test, 856 *Test
 #
 # So this is NOT the `apps/spring-boot` shape (a `*-suite-runner` directory and
 # no corpus) and it is NOT the H2 decoy shape (a target/classes holding one
@@ -40,10 +40,10 @@ CORPUS_KIND=junit
 CORPUS_CONFIDENCE=blocked
 CORPUS_NOTE="BLOCKED: built (7779 main / 1400 *Test.class) but 114 of 247 dumped classpath entries are evicted .m2 jars, jackson among them. Needs a maven re-resolve, not a path fix."
 
-CORPUS_ROOT_CANDIDATES="C:/craton/apps/keycloak C:/craton/cratonvm/apps/keycloak"
+CORPUS_ROOT_CANDIDATES="/data/cratonvm/apps/keycloak /data/cratonvm/apps/keycloak"
 
 CORPUS_RUNNER_CLASS="SbRunner"
-CORPUS_RUNNER_SRC="C:/craton/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
+CORPUS_RUNNER_SRC="/data/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
 CORPUS_DEFAULT_CLASS=""
 
 KC_CP_DUMP="kc-universal-cp.txt"

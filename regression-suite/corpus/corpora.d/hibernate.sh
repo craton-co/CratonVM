@@ -6,8 +6,8 @@
 #
 #     C:\craton\CratonVM\apps\hibernate-orm\...
 #
-# and there is NO hibernate-orm under C:/craton/cratonvm/apps on this host --
-# only a `hib-suite-runner`. Hibernate exists at C:/craton/apps/hibernate-orm
+# and there is NO hibernate-orm under /data/cratonvm/apps on this host --
+# only a `hib-suite-runner`. Hibernate exists at /data/cratonvm/apps/hibernate-orm
 # and nowhere else. So the file resolves to ~438 non-existent jars. Because
 # `cp_add` skips entries that do not exist, feeding it raw would produce a
 # nearly EMPTY classpath and a run of identical NoClassDefFoundErrors.
@@ -47,10 +47,10 @@ CORPUS_KIND=junit
 CORPUS_CONFIDENCE=blocked
 CORPUS_NOTE="BLOCKED: 183 of 241 classpath entries are evicted gradle-cache jars. Needs a gradle resolve, not a path fix."
 
-CORPUS_ROOT_CANDIDATES="C:/craton/apps/hibernate-orm"
+CORPUS_ROOT_CANDIDATES="/data/cratonvm/apps/hibernate-orm"
 
 CORPUS_RUNNER_CLASS="SbRunner"
-CORPUS_RUNNER_SRC="C:/craton/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
+CORPUS_RUNNER_SRC="/data/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
 CORPUS_DEFAULT_CLASS=""
 
 corpus_is_built() {

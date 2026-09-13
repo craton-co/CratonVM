@@ -12,10 +12,10 @@ CORPUS_KIND=junit
 CORPUS_CONFIDENCE=verified
 CORPUS_NOTE="JUnit arm exercised 2026-08-12 (B7). Use the 18 'AllTests' aggregators as the workload list -- most '*Test' names are non-JUnit SimpleTests and correctly report tests=0. See docs/known-issues/jdk-only/P4A-CORPORA-20260812.md."
 
-CORPUS_ROOT_CANDIDATES="C:/craton/apps/bc-java C:/craton/cratonvm/apps/bc-java"
+CORPUS_ROOT_CANDIDATES="/data/cratonvm/apps/bc-java /data/cratonvm/apps/bc-java"
 
 CORPUS_RUNNER_CLASS="SbRunner"
-CORPUS_RUNNER_SRC="C:/craton/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
+CORPUS_RUNNER_SRC="/data/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
 CORPUS_DEFAULT_CLASS=""
 
 corpus_is_built() {

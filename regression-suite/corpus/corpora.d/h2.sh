@@ -3,8 +3,8 @@
 # THE TWO ROOTS ARE NOT INTERCHANGEABLE, and this is the single most
 # expensive fact in this file:
 #
-#   C:/craton/cratonvm/apps/h2database/h2   BUILT   1114 classes, 687 test-classes
-#   C:/craton/apps/h2database/h2            DECOY   target/classes holds exactly ONE
+#   /data/cratonvm/apps/h2database/h2   BUILT   1114 classes, 687 test-classes
+#   /data/cratonvm/apps/h2database/h2            DECOY   target/classes holds exactly ONE
 #                                                   file, META-INF/versions/21/org/h2/
 #                                                   util/Utils21.class; there is no
 #                                                   org/h2/Driver.class and
@@ -30,7 +30,7 @@ CORPUS_KIND=main
 CORPUS_CONFIDENCE=verified
 CORPUS_NOTE="built classes and dependency jars live in DIFFERENT roots; the classpath unions them"
 
-CORPUS_ROOT_CANDIDATES="C:/craton/cratonvm/apps/h2database/h2 C:/craton/apps/h2database/h2 C:/craton/h2root"
+CORPUS_ROOT_CANDIDATES="/data/cratonvm/apps/h2database/h2 /data/cratonvm/apps/h2database/h2 C:/craton/h2root"
 
 # TestBitStream was dry-run on HotSpot 25 on this host and exits 0. It is also
 # a `unit` test, so it needs no database file and no writable temp state --

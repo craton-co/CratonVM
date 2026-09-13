@@ -1,7 +1,7 @@
 # Spring Framework 7.1.0-SNAPSHOT. Verified built on this host 2026-08-12.
 #
-# Only ONE root has it: C:/craton/cratonvm/apps/spring-framework.
-# C:/craton/apps/spring-framework does not exist. The two corpus trees on this
+# Only ONE root has it: /data/cratonvm/apps/spring-framework.
+# /data/cratonvm/apps/spring-framework does not exist. The two corpus trees on this
 # host are complementary, not mirrored.
 #
 # Layout: a gradle multi-module build. Each module publishes
@@ -71,7 +71,7 @@ CORPUS_KIND=junit
 CORPUS_CONFIDENCE=verified
 CORPUS_NOTE="junit-kind: JUnit 6.1.0 platform launcher, pinned from the gradle cache (see SPRING_TEST_DEPS)"
 
-CORPUS_ROOT_CANDIDATES="C:/craton/cratonvm/apps/spring-framework"
+CORPUS_ROOT_CANDIDATES="/data/cratonvm/apps/spring-framework"
 
 # Spring test classes have no main. They are driven through the JUnit
 # Platform launcher. Rather than write a third copy of that launcher, this
@@ -80,7 +80,7 @@ CORPUS_ROOT_CANDIDATES="C:/craton/cratonvm/apps/spring-framework"
 # check reads (tests=0, or aborted==tests, is a disagreeing precondition and
 # is never scored green).
 CORPUS_RUNNER_CLASS="SbRunner"
-CORPUS_RUNNER_SRC="C:/craton/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
+CORPUS_RUNNER_SRC="/data/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
 
 # Deliberately EMPTY. Spring has thousands of test classes and no obvious
 # canonical one; picking a default here would smuggle in a claim about which

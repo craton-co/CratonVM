@@ -33,10 +33,10 @@ CORPUS_KIND=junit
 CORPUS_CONFIDENCE=partial
 CORPUS_NOTE="JUnit arm exercised 2026-08-12. Its own dependency jars (commons-numbers/rng/statistics) are EVICTED from this host, so only the java.base-only tests link; the rest fail on HotSpot too and score ORACLE-UNUSABLE."
 
-CORPUS_ROOT_CANDIDATES="C:/craton/apps/commons-math C:/craton/cratonvm/apps/commons-math"
+CORPUS_ROOT_CANDIDATES="/data/cratonvm/apps/commons-math /data/cratonvm/apps/commons-math"
 
 CORPUS_RUNNER_CLASS="SbRunner"
-CORPUS_RUNNER_SRC="C:/craton/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
+CORPUS_RUNNER_SRC="/data/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
 CORPUS_DEFAULT_CLASS="org.apache.commons.math4.core.jdkmath.JdkMathTest"
 
 corpus_is_built() {

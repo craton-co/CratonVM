@@ -8,8 +8,8 @@
 #   output/testclasses    1881 .class files   (the test suite)
 #   output/build/lib        35 jars           (catalina.jar, jasper.jar, ecj-4.39.jar, ...)
 #
-# so the classpath composes straight off disk. Only C:/craton/apps/tomcat has
-# this; there is no tomcat under C:/craton/cratonvm/apps (only a
+# so the classpath composes straight off disk. Only /data/cratonvm/apps/tomcat has
+# this; there is no tomcat under /data/cratonvm/apps (only a
 # tomcat-suite-runner, which is a runner, not a corpus -- the presence of a
 # `*-suite-runner` directory says nothing about whether the corpus is built).
 
@@ -18,10 +18,10 @@ CORPUS_KIND=junit
 CORPUS_CONFIDENCE=verified
 CORPUS_NOTE="ant build NOT required; output/ is already populated on this host"
 
-CORPUS_ROOT_CANDIDATES="C:/craton/apps/tomcat"
+CORPUS_ROOT_CANDIDATES="/data/cratonvm/apps/tomcat"
 
 CORPUS_RUNNER_CLASS="SbRunner"
-CORPUS_RUNNER_SRC="C:/craton/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
+CORPUS_RUNNER_SRC="/data/cratonvm/apps/spring-boot/sb-runner/SbRunner.java"
 
 # Left empty on purpose: naming one here would assert an expectation about
 # which Tomcat test is supposed to pass, which this lane has not established.
