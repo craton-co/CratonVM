@@ -2349,6 +2349,35 @@ use cratonvm_types::compat::CompatibilityMode;
 /// stale, which this file has already been caught doing twice -- once by 99
 /// and once by 13, and a stale total misclassifies the NEXT wave's failure.
 ///
+/// # 2026-09-12, L4 wave 6 -- +36 over `java/io/Print*`, and the row count IS the delta
+///
+/// Two tables, one registrar: `RETIRED_SHADOW_L4_PRINTWRITER_TRIPLES` (7) and
+/// `RETIRED_SHADOW_L4_PRINTSTREAM_TRIPLES` (29).
+///
+/// ```text
+///                        no-mgmt   mgmt   syn-jdk   total registrations
+///   OFF (36 rows off)       4168   4195      4168   13590 / 13958 / 13625
+///   ON                      4204   4231      4204   13590 / 13958 / 13625
+/// ```
+///
+/// PAIRED on ONE binary: the OFF column is that same binary run with
+/// `CRATONVM_UNRETIRE_NATIVE_SHADOW="java/io/PrintWriter,java/io/PrintStream"`,
+/// and in that column this test PASSES at the committed baselines. That is
+/// what pins the +36 to this wave rather than to the 156 rows L1's wave 8
+/// landed on these same constants in between.
+///
+/// **+36 against 36 rows, and here the two numbers agree** -- unlike lane 4's
+/// wave 5 directly above, where 27 rows moved 33 registrations because six
+/// triples were registered twice. Nothing in `java/io/Print*` is: `lib.rs`
+/// registers this family first and `register_printstream_fallback_natives` in
+/// `logging_shims.rs` OVERWRITES every one of those slots, so the census sees
+/// one registration per triple with `logging_shims.rs` as `registered_by`.
+/// A second registrar does not always mean a second registration; ask the
+/// census which one owns the slot.
+///
+/// Totals identical in both columns, and identical to what the note above
+/// froze -- no registration was added or removed by this wave.
+///
 /// # 2026-09-12, L1 wave 8 -- +156, third sitting -- control 4012/4039/4012, trial 4168/4195/4168
 ///
 /// `dev` moved again between wave 8's re-measurement and its landing, and a
@@ -2357,7 +2386,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// two deltas added together is arithmetic, not a measurement. The wave's own
 /// delta has been +156 -- exactly its table's row count -- in every arm of
 /// every sitting, with the totals unmoved.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4195;
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4231;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -2808,7 +2837,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 4195;
 /// two deltas added together is arithmetic, not a measurement. The wave's own
 /// delta has been +156 -- exactly its table's row count -- in every arm of
 /// every sitting, with the totals unmoved.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 4168;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 4204;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -3128,7 +3157,7 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 4168;
 /// two deltas added together is arithmetic, not a measurement. The wave's own
 /// delta has been +156 -- exactly its table's row count -- in every arm of
 /// every sitting, with the totals unmoved.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 4168;
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 4204;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

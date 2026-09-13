@@ -116,9 +116,17 @@ waves 3-4+L7 took it to 41,715; lane 4 wave 1 and `file_layout.rs` to 42,429;
 `dev` reached 43,734 on its own and lane 4 wave 2's 137-row table added 902
 more; lane T's table (783 triples after its own carve-out, see the
 throwable-family lane record) brings it to **49,223** on the merge of all of
-the above. **The 5% tolerance on the row below is roughly two waves wide**, so
-expect to re-measure it about every second wave rather than treating a red
-here as a surprise.
+the above; `dev` and lane 4's waves 4-5 carried it to 51,358, and lane 4 wave
+6's two `java/io/Print*` tables make it **51,618** on 2026-09-12. **The 5%
+tolerance on the row below is roughly two waves wide**, so expect to
+re-measure it about every second wave rather than treating a red here as a
+surprise -- wave 6 is the wave that crossed it, by 168 lines, and re-measured
+this row and only this row.
+
+The `jit` row moved the same way and for a different reason, and it is recorded
+so the next re-measure is not mistaken for drift: 269,000 -> ~286,000 over the
+three days to 2026-09-12, which is the IR tier, the JIT review and the deopt
+work, not one lane's table. Re-measured with the command above.
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|

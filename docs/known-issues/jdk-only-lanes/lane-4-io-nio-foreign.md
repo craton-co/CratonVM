@@ -83,6 +83,15 @@ L2 — coordinate.
 
 ## 5. `PrintStream` (29 rows) — do this last, and say so in the commit
 
+> **Taken as wave 6 on 2026-09-12, with `java/io/PrintWriter`'s seven.**
+> Both rules below were followed and both are recorded in §9.21–§9.25.
+> The count: the class carries **31 registrations** — 29 bucket-A rows
+> (retired), one `Intrinsic` (`charset()`, where a table row would be
+> inert), and one declared by **no** supported image
+> (`write(String,int,int)`, where a table row is a `NoSuchMethodError`).
+> §1 said 29 and §9.1 said 30; they were counting different two of
+> those three things.
+
 `System.out` and `System.err` are how **every lane** reads its probes. A
 regression here reads as all nine lanes' probes failing simultaneously, and the
 first instinct will be to blame the harness. Two rules:
@@ -166,7 +175,7 @@ single-dump census and undercounts a class whose rows only one workload reaches.
 | blocked: outside a dial-floor family | 131 |
 | blocked: lane T owns `concrete_receiver.rs:185` | 49 |
 | blocked: `java/nio/file/Files`, armed 4, above the floor | 39 |
-| deferred: `java/io/PrintStream`, its own wave (§5) | 30 |
+| ~~deferred: `java/io/PrintStream`, its own wave (§5)~~ **RETIRED — wave 6**, 29 of the class's 31 registrations (§9.21) | **29** |
 | **backed out by a build** (§9.2; CharBuffer's 17 taken as wave 4, 27 more as wave 5 — all that is left is `FileSystemProvider`'s 4 and the three `ByteArrayInputStream` observers of §9.19) | **7** |
 | blocked: `Path` carrier is stamped with the interface | 11 |
 | reviewed `Intrinsic` | 10 |
@@ -317,10 +326,19 @@ because the dial could not read a clean floor until they were:
 
 ### 9.6 What is left
 
-* **`java/io/PrintStream` (30).** Measured clean in the wave-1 dial screen and
-  deliberately not in the table; §5 requires its own wave and its own commit.
-  Read §9.2 and §9.3 before trusting that screen — and screen it against the
-  corpus, where `System.out` actually lives.
+* ~~**`java/io/PrintStream` (30).**~~ **Taken as wave 6 on 2026-09-12**, with
+  `java/io/PrintWriter`'s seven rows beside it — one registrar,
+  `register_printstream_fallback_natives`, holds both. The advice above was
+  right and was followed: the wave-1 dial screen was not trusted, and the
+  corpus was screened. What this bullet could not say is that the class had
+  **already been adjudicated**, triple by triple, on 2026-08-11, in
+  `docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md` —
+  a document this page never cites. That write-up blocked `PrintStream` on
+  five named things and cleared `PrintWriter` outright, and it was never
+  landed because its author was on Windows, where the `<jdk>/<os>`-keyed gates
+  exit 2. **Before measuring a family from scratch, grep the whole
+  `docs/known-issues/jdk-only/` tree for its class name**; §9.21 is what that
+  grep was worth here.
 * **479 rows no probe in this tree reaches**, minus the 146 wave 2 moved out of
   that bucket in one pass -- see §9.7, which is what "the cheapest half" was
   worth.
@@ -1024,3 +1042,224 @@ After the amendment the wave fires 1 050 flips -- exactly the control's count --
 and names no row of this table.
 
 Measured on linux/x86_64 against JDK 25.
+
+---
+
+### Wave 6 -- 2026-09-12, 36 rows over `java/io/PrintWriter` (7) and `java/io/PrintStream` (29)
+
+`RETIRED_SHADOW_L4_PRINTWRITER_TRIPLES` and
+`RETIRED_SHADOW_L4_PRINTSTREAM_TRIPLES`, two tables under the `java/io/` prefix
+wave 1 already admitted. This is the wave §5 reserved, and §5's reason for
+reserving it is the first thing this section has to answer.
+
+**The blast radius, named as §5 requires.** `System.out` and `System.err` are
+how all nine lanes read their probes, and the failure mode is silent rather
+than loud: real `PrintStream.writeln` catches its own `IOException` and sets
+`trouble = true`, so a stream whose state is not real DISCARDS. A regression
+here reads as every lane's probes going empty at once, with exit code 0, and
+the harness gets the blame. Three things were built against that and all three
+are in the commit: both probes now report through a `FileOutputStream` as well
+as through `System.out` (`L4W6PrintCarrier` is new, `L4PrintStreamSweep` gained
+a second channel); the tables are separate so either half can be disarmed at
+run time; and `the_console_write_path_is_retired_only_by_the_wave_that_measures_it`
+guards `OutputStreamWriter`/`BufferedWriter`/`Writer` across EVERY table in the
+tree, so the next wave cannot take the console path as a by-product of
+something else.
+
+### 9.21 A blocked list can decay in four places at once
+
+`docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md` is the
+authority here and it is a good document: one registrar,
+`register_printstream_fallback_natives`, holding two classes, measured triple
+by triple on 2026-08-11 against HotSpot 25, `PrintWriter` retirable in four
+arms and `PrintStream` blocked on five named things. It was never landed, and
+§2.1 says why in its own first line: **"the blocker is a platform, not a
+question."** The three frozen artefacts are keyed `<jdk-feature>/<os>`, the
+gate scripts derive the OS half from the running host, and on Windows they look
+up `25/windows`, find nothing and exit **2** -- neither a pass nor a fail. This
+wave ran on the Linux host against the JDK 25 image, where that blocker is
+simply absent.
+
+Re-read a month later, the five-item blocked list holds in one place:
+
+| item | 2026-08-11 | 2026-09-12 |
+|---|---|---|
+| 1. `System.out` fabricated: `out`, `charOut`, `textOut`, `closeLock` null | true | `out`/`charOut`/`textOut` are **constructed** by `install_real_stream_fields`; `closeLock` was still null and **is fixed in this commit** |
+| 2. `charset` is the ABSTRACT `Charset` | true | **`sun.nio.cs.UTF_8`, concrete** |
+| 3. `native_printstream_init_outputstream` does not chain to a real ctor | true | **still true, and made irrelevant**: this wave retires BOTH constructors with the methods |
+| 4. `write(String)` is package-private | -- | **`private`**, in all three images; retired with the family either way |
+| 5. `write(String,int,int)` is declared by no image | true | **confirmed on 17, 21 and 25**; held back by name and asserted |
+
+Items 1 and 2 were repaired by someone else, in `lang_system.rs`, in between --
+**the third time this lane has found a family's recorded blocker already fixed
+somewhere else** (§9.4, §9.17). Item 3's repair was never needed, because
+retiring the constructors removes the native that needed it. Item 4 was wrong
+in a detail that did not change its disposition. Only item 5 survived intact,
+and it is the one that says a row must NOT be retired.
+
+### 9.22 The BLOCKED half is the half that fixed things
+
+The wave was built expecting to land `PrintWriter` and to measure
+`PrintStream`. It came out the other way round. One binary, the two halves
+disarmed independently at run time with `CRATONVM_UNRETIRE_NATIVE_SHADOW` --
+which is the whole reason they are two tables and not one:
+
+```text
+  arm (--jdk-only)         L4W6PrintCarrier vs HotSpot 25, of 66 rows
+  neither retired           24 lines differing
+  PrintWriter only          24 lines differing
+  PrintStream only           4 lines differing
+  both                       4 lines differing
+```
+
+`PrintWriter`'s seven rows are verdict-neutral -- which is what 2026-08-11 said
+and is why they can be landed on that evidence, re-measured here. **The
+twenty-nine `PrintStream` rows are worth ten rows of agreement with HotSpot**,
+all of them state on a user-constructed stream: `charOut`, `textOut`, `charset`
+and `closeLock` on receivers built by `new PrintStream(sink)` and
+`new PrintStream(sink, true)` read null, because
+`native_printstream_init_outputstream` writes `out`, `lock` and `autoFlush` and
+stops. Retiring the constructors hands construction back to the JDK and all
+four fields arrive.
+
+That is §4's silent wrong answer with the volume turned all the way down: the
+old receiver still PRINTED correctly, because the shadowing methods read the
+one field the shadowing constructor wrote. Native agreed with native; neither
+agreed with the image. It is the same shape as wave 4's `toString(int,int)` and
+wave 5's `filetime_read_millis` -- **a native that owns both ends of a
+convention agrees with itself whatever the convention is** -- and the third
+time this lane has met it, which is enough to stop calling it a coincidence.
+
+### 9.23 `closeLock` was null because nothing ran an instance initialiser
+
+The last live item on W7-22's blocked list, and the one thing in this commit
+that is not a retirement. `FilterOutputStream.closeLock` is
+`private final Object closeLock = new Object()` -- an INSTANCE INITIALISER.
+`System.out` is allocated and then field-stuffed, so no initialiser ever runs,
+and `install_real_stream_fields` had installed the three fields that have
+visible wiring (`out`, `charOut`, `textOut`) and missed the one that has none.
+
+Measured by reflection against HotSpot 25: `java.lang.Object` there, `null`
+here, on `System.out` and `System.err`, in both modes. It is now built and
+published with the other three, for the reason that function's own comment
+already gave: a half-wired stream is worse than either endpoint.
+
+**A field with no wiring to forget is the one a hand-built carrier forgets.**
+Census, image adjudication and every behavioural probe are blind to it; only
+reflection against the oracle sees it.
+
+### 9.24 A doc comment can be about the function next door
+
+`native_printstream_init_outputstream` is preceded by a doc block that says
+"delegates to `PrintWriter(OutputStream, boolean)`", names JUnit's
+ConsoleLauncher, and states: "Implementation strategy: delegate to the real
+two-arg JDK constructor via `invoke_special` so that the JDK's own
+`out`/`lock`/etc. fields get populated correctly."
+
+The function does no such thing. That paragraph belongs to
+`native_printwriter_init_outputstream`, which sits immediately below it and
+does exactly what the text describes -- an artefact of the pure code move that
+split `logging_shims.rs` out of `lib.rs` (and the move's own header comment,
+"no logic, signature or ordering changes", is telling the truth). The cost is
+that blocked-list item 3 reads as already done to anyone who greps for the
+chain and finds the sentence.
+
+**A doc comment is attached to whatever follows it, not to whatever it is
+about.** After a code move the two can differ, and no gate in this tree can
+see it.
+
+### 9.25 Acceptance
+
+The probe tree was clean on this wave from the first build -- 126 sweep rows,
+0 differing from HotSpot in all six arms, retired and un-retired, strict and
+compatible. §9.3 says exactly what that is worth on its own, so the corpus was
+asked too.
+
+| gate | control (`ebfff4b31`) | wave 6 |
+|---|---|---|
+| `L4PrintStreamSweep`, 126 rows vs HotSpot 25 | 0 differing | **0**, in all six arms |
+| `L4W6PrintCarrier`, 66 rows vs HotSpot 25, `--jdk-only` | 24 lines | **4** |
+| corpus `--jdk-only`, `SUITE=all`, `TIMEOUT=600` | 136 passed, 0 failed | **136 passed, 0 failed — identical vector by vector** |
+| strict report, `java/io/Print*` rows | 32, **every one `native-won`** | 36 listed, **0 `native-won`** |
+| stub ratchet, default / management / synthetic | OFF 4168 / 4195 / 4168 | ON **4204 / 4231 / 4204**, **+36** |
+| ratchet totals | 13590 / 13958 / 13625 | unmoved, both columns |
+| kind-map gate, 25/linux | fires 1125 | fires **1125**, byte-identical row set |
+| census kinds on the family | 38 registrations | **36 `synthetic-stub`**, 1 `intrinsic`, 1 `bridge` |
+| `cargo test -p cratonvm-native-builtins --tests` ×3 | — | 12 targets each: **4340 / 4372 / 4521 passed, 0 failed** |
+| `cargo test -p cratonvm-native-api` | — | 11 targets, **533 passed, 0 failed** |
+
+The OFF column of the ratchet is that same binary with
+`CRATONVM_UNRETIRE_NATIVE_SHADOW="java/io/PrintWriter,java/io/PrintStream"`,
+and in that column the test PASSES at the committed baselines — which is what
+pins the +36 to this wave and not to the 156 rows L1's wave 8 landed on the
+same three constants in between. **+36 against 36 rows**, unlike wave 5's +33
+against 27: `lib.rs` registers this family first and
+`register_printstream_fallback_natives` overwrites every slot, so the census
+sees one registration per triple. A second registrar is not a second
+registration; ask the census which one owns the slot.
+
+**The funnel is 7 of 7 and 28 of 29, and the missing one cannot be closed.**
+`PrintStream.write(Ljava/lang/String;)V` is `private` in all three images and
+is structurally unobservable: in compatible mode its only caller,
+`print(String)`, is itself shadowed so the native is never reached; in strict
+mode the row is retired so there is no counter to bump. It retires on W7-22's
+rule — "it must retire with the family or not at all" — and not on a
+measurement, which is a weaker warrant than every other row here and is said
+so rather than rounded up.
+
+**Two gates fired on this wave and both were right.**
+`no_new_class_is_both_minted_and_retired` (lane 6, landed the same day) caught
+`java/io/PrintStream` newly meeting its precondition: a native allocates it and
+this wave retires onto it. The narrowing that gate asks for was run before
+baselining — the only non-parameter, non-zero declared initialiser in the whole
+hierarchy is `FilterOutputStream.closeLock`, **no retired method reads it**
+(`PrintStream.close()` overrides `FilterOutputStream.close()` and synchronizes
+on `this`), and the second mint site never lets the object reach Java.
+Precondition met, hazard not. And `architecture_per_crate_loc_table_matches_reality`
+went red on `native-api`: claimed 49 000, threshold 51 450, **51 358 without
+this wave and 51 618 with it** — the 260 lines of table and account are what
+crossed it, so that row was re-measured and only that row. `jit` is stale in
+the same table at 5.11% with zero lines added to `jit/` here, and is left
+alone: re-measuring a crate you did not move folds another lane's drift into
+your commit, which is the same refusal made about the kind-map baseline.
+
+**One dev-red is skipped rather than fixed.**
+`buffer_session::tests::only_a_served_class_is_claimed` fails only under
+parallel execution — its sibling `overflow_degrades_to_unserved` deliberately
+fills a shared process-global table, so the other's `note_served` finds no
+free slot and silently no-ops. Alone it passes; `--test-threads=1` passes both;
+parallel fails. It landed in `9b7df29bb` and belongs to that lane. It matters
+here only because `cargo test --tests` is fail-fast ACROSS TARGETS: red in the
+`--lib` target skipped the other eleven in two of the three arms, which is how
+a foreign failure hides yours. The counts above are from a re-run with that one
+test skipped.
+
+
+**One vacuous run, caught by the clock.** The first corpus attempt invoked
+`run.sh` with `sh` rather than `bash`, which broke on `BASH_SOURCE`; the script
+then refused to resolve its root and both arms produced **zero** vectors. The
+comparison of two empty sets printed "IDENTICAL to the control, vector by
+vector" and returned in seconds. The harness now refuses to call an empty
+control a pass. It is the third instrument in this campaign to pass by matching
+nothing.
+
+### 9.26 What is left after this wave
+
+* **`java/nio/file/Path` (11) and `java/nio/file/spi/FileSystemProvider` (9)**
+  -- unchanged, and still the measured order: Path first, and it needs
+  `concrete_receiver::alloc_concrete` and `mirror_class_registrations`
+  together. Lane T owns `concrete_receiver.rs:185`.
+* **`sun/nio/ch/` (308)** -- package verdict upheld, not beaten.
+* **`jdk/internal/foreign` segment/arena/session (70)** -- a decision on record
+  says they must not be retired at all.
+* **The three `java/io/ByteArrayInputStream` `BaisEvent` observers** (§9.19) --
+  correct rows, unretirable until the observation moves to a stream the HTTP
+  layer owns.
+* **`System.out.out` is a `FileOutputStream` where HotSpot has a
+  `BufferedOutputStream`** -- the last two rows this wave's carrier probe still
+  differs on, in both modes, and NOT a correctness defect: the writes land, they
+  are simply unbuffered. Changing it moves when output reaches the terminal for
+  every lane at once, so it is its own decision with its own measurement, not a
+  tail-end fix on a retirement commit.
+* **Rows no probe in this tree invokes** -- the largest bucket, and still a
+  statement about the instrument rather than about the rows.

@@ -26546,9 +26546,16 @@ fn of_element_text(ctx: &mut dyn NativeContext, v: Value) -> String {
 ///
 /// Equality is `values_equal_deep`, which ends in the RECEIVER's `equals` — the
 /// same predicate `make_set_of`'s `native_map_put` uses, so the check and the
-/// build can never disagree about what counts as a duplicate. Quadratic, and
-/// deliberately so: every `of` overload the JDK declares takes at most ten
-/// arguments, and the array form is the only unbounded one.
+/// build can never disagree about what counts as a duplicate. It is asked only
+/// of earlier elements with the same Java `hashCode()`, which is also the only
+/// place `ImmutableCollections.SetN`/`MapN` look for one.
+///
+/// This used to compare every pair, on the reasoning that every `of` overload
+/// takes at most ten arguments. The array form does not, and it is on a hot
+/// path: `CLDRLocaleProviderAdapter.createLanguageTagSet` hands `Set.of` all
+/// 1152 CLDR language tags, so the first `Calendar.getInstance` per locale paid
+/// ~660 000 comparisons (MEASURED 2026-09-12: 199 ms for `Set.of` of 1101
+/// strings, HotSpot 0 ms).
 fn of_reject_duplicates(
     ctx: &mut dyn NativeContext,
     elems: &[Value],
@@ -26565,8 +26572,22 @@ fn of_reject_duplicates(
     // asking an unrelated `java.lang.Object` whether it equals itself.
     let (base, handles) = pin_value_slice(ctx, elems);
     let mut verdict: Result<(), MethodCallFailed> = Ok(());
-    'outer: for i in 1..elems.len() {
-        for j in 0..i {
+    // Earlier indices by `hashCode()`.
+    let mut buckets: std::collections::HashMap<i32, Vec<usize>> =
+        std::collections::HashMap::new();
+    'outer: for i in 0..elems.len() {
+        let a = read_pinned_elem(ctx, handles[i], elems[i]);
+        let hash = match element_hash_code(ctx, &a) {
+            Ok(h) => h,
+            Err(e) => {
+                verdict = Err(e);
+                break 'outer;
+            }
+        };
+        let earlier = buckets.entry(hash).or_default();
+        let candidates = earlier.clone();
+        earlier.push(i);
+        for j in candidates {
             let a = read_pinned_elem(ctx, handles[i], elems[i]);
             let b = read_pinned_elem(ctx, handles[j], elems[j]);
             match values_equal_deep(ctx, &a, &b) {
@@ -31191,25 +31212,40 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let (_, elem_handles) = pin_value_slice(ctx, &elements);
     let mut unique: Vec<Value> = Vec::new();
     let mut unique_handles: Vec<usize> = Vec::new();
+    // Survivor indices into `unique`, keyed by the survivor's Java `hashCode()`.
+    //
+    // `Stream.distinct()` is specified by the `HashSet` it builds: a later
+    // element is a duplicate only when an earlier one has the SAME hash and
+    // `equals` it. This used to ask `equals` of every survivor so far, which is
+    // `n(n-1)/2` Java calls for `n` distinct elements. MEASURED 2026-09-12:
+    // `LocaleServiceProvider.isSupportedLocale` runs a `distinct()` over the
+    // 1152 CLDR language tags, so the first `Calendar.getInstance` per locale
+    // took 1.5 s against HotSpot's 11 ms — long enough that Tomcat's
+    // `TestAccessLogValve` timed out waiting for a `%{begin:...SSS}t` line.
+    // Asking only same-hash candidates is also the JDK's answer when `equals`
+    // and `hashCode` disagree (two `equals` keys with different hashes both
+    // survive), which the all-pairs scan got wrong in the other direction.
+    let mut buckets: std::collections::HashMap<i32, Vec<usize>> =
+        std::collections::HashMap::new();
     for i in 0..elements.len() {
-        // `Stream.distinct()` dedups via the element's `equals`/`hashCode`
-        // (it builds a `HashSet`). `values_equal` only recognises identity,
-        // String, enum, and unboxed primitives — for any other two distinct
-        // object instances it returns false, so value classes/records with a
-        // real `equals` override (`ResourcePatternHint`, `UUID`, user records)
-        // were never deduped and `distinct()` over-counted (Spring AOT
-        // `ResourceHintsAttributes` emitted 8 globs where HotSpot collapses to
-        // 5). Use `list_element_matches`, which takes the cheap structural
-        // check first and then falls back to the seen element's real Java
-        // `equals` — exactly as already done for `List.contains`/`indexOf` and
-        // `Collectors.groupingBy` keys.
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let hash = element_hash_code(ctx, &elem)?;
+        // `values_equal` alone only recognises identity, String, enum and
+        // unboxed primitives, so value classes/records with a real `equals`
+        // override (`ResourcePatternHint`, `UUID`, user records) were never
+        // deduped (Spring AOT `ResourceHintsAttributes` emitted 8 globs where
+        // HotSpot collapses to 5). `list_element_matches` takes that cheap
+        // structural check first and then falls back to Java `equals`, with the
+        // NEW element as receiver — `HashMap.putVal`'s `key.equals(k)`.
         let mut dup = false;
-        for (u_idx, u) in unique.iter().enumerate() {
-            let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-            let u = read_pinned_elem(ctx, unique_handles[u_idx], *u);
-            if list_element_matches(ctx, &elem, &u)? {
-                dup = true;
-                break;
+        if let Some(candidates) = buckets.get(&hash) {
+            for &u_idx in candidates {
+                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                let u = read_pinned_elem(ctx, unique_handles[u_idx], unique[u_idx]);
+                if list_element_matches(ctx, &u, &elem)? {
+                    dup = true;
+                    break;
+                }
             }
         }
         if !dup {
@@ -31219,6 +31255,7 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             } else {
                 unique_handles.push(usize::MAX);
             }
+            buckets.entry(hash).or_default().push(unique.len());
             unique.push(elem);
         }
     }
@@ -60207,9 +60244,15 @@ fn chm_segment_for_mut(
         ctx.get_field(this, CHM_FIELD_SEGMENTS),
         Value::Object(Some(_))
     ) {
-        // A segments array exists but this bucket is empty -- that is a real
-        // absence, not an uninitialised receiver, so leave it alone.
-        return None;
+        // The array exists NOW -- but the `chm_segment_for` above may have read
+        // the field before another thread's first insert installed it. That is
+        // not "this bucket is empty": a published array never holds a null
+        // segment. This used to `return None`, which every caller reads as "no
+        // segment": `put` silently did nothing and `computeIfAbsent` returned
+        // null. It was the residual of the lazy-install race below -- 6/2000
+        // bad rounds after the install itself was serialised, 0/3000 once the
+        // segments were installed before the threads started. Look again.
+        return chm_segment_for(&*ctx, this, hash);
     }
     // `CHM_DEFAULT_INIT_SEGMENTS`, not `CHM_DEFAULT_SEGMENTS`: this is the
     // shape `native_chm_init_default` used to build eagerly, and since that
@@ -60224,24 +60267,84 @@ fn chm_segment_for_mut(
     // sums the live segment arrays (4 * 4 = 16) and `chm_initial_table`
     // reports 16 for an unrecorded receiver, and `chm_reorder_by_virtual_bucket`
     // reads both.
+    //
+    // PUBLISHED BY CAS, not by a store. Unlike the constructors and
+    // `readObject`, this runs on a map other threads can already see, and two
+    // first inserts can both find the field null. With a plain store each
+    // built its own array and the later store won: the earlier thread had
+    // already reserved its key in a segment of the LOSING array, so its commit
+    // re-read the winner, found no reservation, took "a racing mutator
+    // replaced our marker", and `computeIfAbsent` returned null -- the value
+    // was never stored anywhere. MEASURED 2026-09-12: Tomcat's
+    // `TimeBucketCounterBase.increment` (`map.computeIfAbsent(key, v -> new
+    // AtomicInteger()).incrementAndGet()`, four client threads on a fresh map)
+    // threw NullPointerException on a client's first request in 3 of 12
+    // `RateLimitStallProbe` runs, which is `TestRateLimitFilter`'s
+    // `expected:<200> but was:<0>`. A `put` racing the same way lost its entry.
+    //
+    // The install is a check-and-store under `CHM_SEGMENTS_INSTALL`. The
+    // critical section is two field accesses and never allocates, so no thread
+    // can reach a safepoint while holding it, and each map takes it once in its
+    // life. Serialising the install took the failure rate from 1070/2000 rounds
+    // to 6/2000; the rest was the early `return None` above, which answered "no
+    // segment" when the install landed between this function's two reads.
     let this_pin = ctx.pin_native_root(this);
-    chm_init_segments(ctx, this, CHM_DEFAULT_INIT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
+    let built = chm_build_segments(ctx, CHM_DEFAULT_INIT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
+    let built_pin = ctx.pin_native_root(built);
+    {
+        let _install = CHM_SEGMENTS_INSTALL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let this = ctx.read_native_pin(this_pin, this);
+        if !matches!(ctx.get_field(this, CHM_FIELD_SEGMENTS), Value::Object(Some(_))) {
+            let built = ctx.read_native_pin(built_pin, built);
+            ctx.set_field(this, CHM_FIELD_SEGMENTS, Value::Object(Some(built)));
+        }
+        // Otherwise another thread installed first: its array is the map, and
+        // ours -- which holds nothing -- is garbage.
+    }
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     chm_segment_for(&*ctx, this, hash)
 }
 
+/// Serialises the lazy segments install of [`chm_segment_for_mut`]. One lock
+/// for every map: it is held for a field read and a field store, and a map
+/// takes it once.
+static CHM_SEGMENTS_INSTALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Build and install a segments array on a receiver no other thread can see
+/// yet (a constructor, `readObject`, a native-built map). A map that is
+/// already shared must go through [`chm_segment_for_mut`], which publishes
+/// with a CAS.
 fn chm_init_segments(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     num_segments: usize,
     cap_per_segment: usize,
 ) {
-    // cceres5: the 2N+1 allocations below can each trigger a moving GC;
-    // `this`, the segments array, and each fresh `seg` were carried raw
-    // across them (stale-`this` final store / stale-array element stores).
-    // Pin + re-read.
     let this_pin = ctx.pin_native_root(this);
+    let segments = chm_build_segments(ctx, num_segments, cap_per_segment);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, CHM_FIELD_SEGMENTS, Value::Object(Some(segments)));
+    ctx.unpin_native_roots(this_pin);
+    // NOTE: the segment count/mask is intentionally NOT persisted to a field.
+    // Slot 1 of a real-JDK ConcurrentHashMap is reference-typed, so an `Int`
+    // write there is descriptor-coerced to `Object(None)` and lost. Readers
+    // (`chm_segment_for`, `chm_all_segments`) derive the mask/count from the
+    // segments array length, which is always a power of two.
+}
+
+/// A fresh, empty segments array: `num_segments` segments of
+/// `cap_per_segment` buckets each. Not installed anywhere.
+fn chm_build_segments(
+    ctx: &mut dyn NativeContext,
+    num_segments: usize,
+    cap_per_segment: usize,
+) -> ObjectRef {
+    // cceres5: the 2N+1 allocations below can each trigger a moving GC; the
+    // segments array and each fresh `seg` were carried raw across them
+    // (stale-array element stores). Pin + re-read.
     let segments = alloc_ref_array(ctx, num_segments);
     let segments_pin = ctx.pin_native_root(segments);
     for i in 0..num_segments {
@@ -60257,15 +60360,9 @@ fn chm_init_segments(
         let _ = ctx.set_array_element(segments, i, Value::Object(Some(seg)));
         ctx.unpin_native_roots(seg_pin);
     }
-    let this = ctx.read_native_pin(this_pin, this);
     let segments = ctx.read_native_pin(segments_pin, segments);
-    ctx.set_field(this, CHM_FIELD_SEGMENTS, Value::Object(Some(segments)));
-    ctx.unpin_native_roots(this_pin);
-    // NOTE: the segment count/mask is intentionally NOT persisted to a field.
-    // Slot 1 of a real-JDK ConcurrentHashMap is reference-typed, so an `Int`
-    // write there is descriptor-coerced to `Object(None)` and lost. Readers
-    // (`chm_segment_for`, `chm_all_segments`) derive the mask/count from the
-    // segments array length, which is always a power of two.
+    ctx.unpin_native_roots(segments_pin);
+    segments
 }
 
 /// `ConcurrentHashMap.writeObject(ObjectOutputStream)`.

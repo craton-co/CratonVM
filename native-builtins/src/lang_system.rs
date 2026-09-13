@@ -5228,16 +5228,34 @@ pub(crate) fn native_system_init_phase1(
             )
             .ok()?;
 
-            // Publish only once all three exist: a half-wired stream (an `out`
+            // `FilterOutputStream.closeLock` is `private final Object closeLock
+            // = new Object()` -- an INSTANCE INITIALISER, and this stream was
+            // allocated rather than constructed, so no initialiser ever ran.
+            // The other three fields above had to be installed by hand for the
+            // same reason; this one was missed because it has no wiring to
+            // forget, only an initialiser that did not happen. MEASURED
+            // 2026-09-12 by reflection against HotSpot 25: `java.lang.Object`
+            // there, `null` here, on `System.out` and `System.err`, in both
+            // modes. It is the last live item on the blocked list W7-22 §3
+            // wrote for retiring `java/io/PrintStream`.
+            let lock = match ctx.new_object("java/lang/Object") {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => return None,
+            };
+            let lock_pin = ctx.pin_native_root(lock);
+
+            // Publish only once all FOUR exist: a half-wired stream (an `out`
             // with no `textOut`) would turn today's silent discard into an NPE
             // inside `writeln`, which is worse than either endpoint.
             let stream_now = ctx.read_native_pin(stream_pin, stream);
             let fos_now = ctx.read_native_pin(fos_pin, fos);
             let osw_now = ctx.read_native_pin(osw_pin, osw);
             let bw_now = ctx.read_native_pin(bw_pin, bw);
+            let lock_now = ctx.read_native_pin(lock_pin, lock);
             ctx.set_field_by_name(stream_now, "out", Value::Object(Some(fos_now)));
             ctx.set_field_by_name(stream_now, "charOut", Value::Object(Some(osw_now)));
             ctx.set_field_by_name(stream_now, "textOut", Value::Object(Some(bw_now)));
+            ctx.set_field_by_name(stream_now, "closeLock", Value::Object(Some(lock_now)));
             Some(())
         })();
         let _ = built;

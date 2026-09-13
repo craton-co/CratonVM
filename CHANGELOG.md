@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-12 the frame-deopt `SavedRegisters` region is two halves, and G1 was pinning a megabyte for both
+
+`FrameLayout::region_name` buckets every word past the blind spill as
+`outgoing-args-or-deopt-regs`. That name is two storage classes: the
+uninitialised outgoing-argument reserve, and the 256-byte `SavedRegisters`
+region the deopt stub spills the whole register file into. On H2
+`TestValueMemory` under `-XX:+UseG1GC --Xmx 2g` the reserve was **36** of the
+bucket's 2888 conservative-root refusals. The other **2852 were
+`SavedRegisters`**, and each one vetoed its object out of the movable partition,
+so G1 held the megabyte-granular region that object sat in.
+
+The two halves are now published as their own ranges and get OPPOSITE treatment,
+each checkable in one function (`deopt::try_resolve_value`):
+
+* the **GPR half** is REWRITTEN — `FrameValue::RegisterRef` reads `regs.gpr` and
+  yields an `Object`, so the deopt stub genuinely resumes from these words and a
+  moved reference left stale there is reconstructed into an interpreter frame at
+  its pre-move address. A correctness completion, not only a pin optimisation:
+  it was safe before only because the pin prevented the move;
+* the **XMM half** is LET GO of — `regs.xmm` is touched from exactly two arms,
+  `XmmFloat` and `XmmDouble`, tagged `Float` and `Double`. No reference is ever
+  recovered from it, so a word there needs no rewrite and its object needs no
+  pin. Published movable with no rewriter, on the dead-word arm of the partition
+  `band_slot_is_verifiable` already spends.
+
+And the consumer, because the producer alone does nothing:
+`CRATONVM_GC_G1_MOVABLE_PINS` is now **default ON**. It shipped off on
+2026-09-09 having measured itself worth 1 pin in 34; with the `SavedRegisters`
+half partitioned it drops **6 of 7**. Four arms of one binary, run concurrently
+so this host's load applies to all of them equally, show that neither half is
+worth anything alone:
+
+```text
+  neither                   4 rows over threshold   sum 91988
+  the pin filter alone      4                       sum 91042
+  the remap widening alone  3                       sum 91790
+  both                      0                       sum 59357
+```
+
+Two batteries, each sequential and alternating so any host drift lands on both
+arms, the second run after merging `dev` and rebuilding both — because a merge
+that touches none of your files can still move your numbers. Rows over
+threshold **4.67 -> 1.83** then **4.50 -> 1.89**; sum of all forty rows
+**93136 -> 80170** then **92535 -> 80457**. Two trees thirty-seven commits apart
+agree to within 1 % on both columns. The floor for scale, with no conservative
+JIT roots at all (`CRATONVM_DBG_NO_JIT_ROOT_SCAN=1`, unsound): sum 57621.
+
+Those batteries also carry an observation they were not built to make and which
+is therefore reported rather than claimed: pooled, the unmodified binary
+SIGSEGV'd **10 of 22 runs** on this workload and the fixed one **1 of 22**
+(Fisher's exact p ~ 0.003). `remap_one_frame_register_images` rewrites an
+admitted region's moved references whether or not the conservative scan rooted
+the word, so before this change a reference in the deopt GPR image that
+`is_object_address` happened to reject was neither pinned nor rewritten — which
+would explain it. Note what the second battery corrected: the first read 6-to-0
+and would have supported "eliminates". It is a reduction. Confirming the cause
+needs a crash-focused battery; the detail is on the interior-cursor page.
+
+`probes/TvmProbe.java` is added as the instrument — a standalone port of
+`org.h2.test.unit.TestValueMemory`, whose `TestBase` superclass is not published
+to Maven Central, calibrated against HotSpot 25 reading `Type 0 = 488`.
+
+Two known-issues pages retire with this, both by measurement rather than by
+assertion:
+[`docs/internal/fixed-bugs/h2-testvaluememory-g1-conservative-jit-roots-RESOLVED-20260912.md`](docs/internal/fixed-bugs/h2-testvaluememory-g1-conservative-jit-roots-RESOLVED-20260912.md)
+and
+[`docs/internal/fixed-suite-bugs/gc/zgc-residue-licence-relocates-under-a-conservative-root-RESOLVED-20260912.md`](docs/internal/fixed-suite-bugs/gc/zgc-residue-licence-relocates-under-a-conservative-root-RESOLVED-20260912.md).
+What survives the first is a different mechanism and gets its own page:
+[`docs/known-issues/gc/g1-pins-a-region-for-an-interior-array-cursor-20260912.md`](docs/known-issues/gc/g1-pins-a-region-for-an-interior-array-cursor-20260912.md).
+
 ### 2026-09-12 `Properties` built a 144-byte bucket array that no `Properties` method reads
 
 `java.util.Properties` keeps its entries in three places, and the inherited
@@ -488,7 +558,7 @@ attributed: it is conservative JIT-frame root retention, and `--nojit` reads
 976-977 on every arm. That also turned up a failure nobody had run for — the same class
 fails under `-XX:+UseG1GC`, identically on the binary before this work, because
 G1's conservative roots retain at region granularity; split out as
-`docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+`docs/internal/fixed-bugs/h2-testvaluememory-g1-conservative-jit-roots-RESOLVED-20260912.md`
 rather than folded in here. Full write-up:
 [`docs/internal/fixed-bugs/h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908.md`](docs/internal/fixed-bugs/h2-testvaluememory-system-gc-retained-every-empty-object-FIXED-20260908.md).
 
