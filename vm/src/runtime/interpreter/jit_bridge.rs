@@ -410,6 +410,66 @@ fn narrow_int_return(ret_type: u8, raw: i64) -> i32 {
     }
 }
 
+/// Review #80: the name of the class that DECLARES the method the `Methodref`
+/// at `cp_idx` in `holder`'s constant pool resolves to. It backs the
+/// `cp_invoke_declaring_class_resolver` each
+/// `try_compile_with_invokespecial_resolver` door hands the JIT, which admits a
+/// `Counter extends AtomicInteger` site to the `Atomic*` intrinsics only when
+/// this names the JDK class.
+///
+/// The constant-pool class is resolved in `holder`'s loader, and the method is
+/// found with `find_method_recursive`, the walk `try_jit_compile_callee_slow`
+/// uses to find a callee's declaring class. An `InterfaceMethodref` is not
+/// answered: the intrinsics this feeds are class methods.
+///
+/// Takes its own class-manager read, like the other resolver closures handed
+/// to `try_compile_with_invokespecial_resolver`. It must NOT be called from
+/// `compile_osr_artifact`'s invoke loop, which already holds the guard; that
+/// door resolves through `cm_lock` instead.
+fn cp_method_ref_declaring_class_name(
+    shared: &SharedVm,
+    holder: ClassId,
+    cp_idx: u16,
+) -> Option<String> {
+    let cm = shared.classes.class_manager.read();
+    let class = cm.get_class(holder)?;
+    let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+        Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+            ..
+        }) => (*class_index, *name_and_type_index),
+        _ => return None,
+    };
+    let target_class = class.constant_pool.get_class_name(class_idx)?;
+    let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+    site_class_and_declaring_class_name(&cm, holder, target_class, method_name, descriptor)
+        .map(|(_, declaring_class)| declaring_class)
+}
+
+/// For an invoke site in `holder` that names `cp_class`, returns two things.
+/// The first is the id of `cp_class` resolved in `holder`'s loader, which is
+/// the class an exact receiver guard compares against. The second is the name
+/// of the class that declares `name descriptor` as resolved from `cp_class`.
+///
+/// Reads through a class-manager guard the caller already holds and takes no
+/// lock of its own. That is what lets `compile_osr_artifact`'s invoke loop,
+/// which holds `cm_lock` for its whole body, ask it without a recursive read.
+fn site_class_and_declaring_class_name(
+    cm: &crate::classloading::ClassManager,
+    holder: ClassId,
+    cp_class: &str,
+    name: &str,
+    descriptor: &str,
+) -> Option<(u32, String)> {
+    let cp_class_id = cm.find_class_by_name_for_class(cp_class, holder)?;
+    let store = cm.class_store();
+    let (_, declaring_id) =
+        crate::classloading::find_method_recursive(cp_class_id, name, descriptor, store)?;
+    let declaring_class = store.get(declaring_id)?.name.to_string();
+    Some((cp_class_id.as_u32(), declaring_class))
+}
+
 pub(super) fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -620,6 +680,7 @@ pub(super) fn compile_osr_artifact(
             // with the CURRENT epoch, which the install barrier then accepted.
             // Holding the token from here is what closes it.
             let admission = match cratonvm_jit::compile_gate::admit(
+                class_id,
                 &class_name,
                 &method_name,
                 &method_descriptor,
@@ -644,6 +705,7 @@ pub(super) fn compile_osr_artifact(
                             method_name,
                             method_descriptor,
                             cratonvm_jit::jit_bail_reason_for(
+                                class_id,
                                 &class_name,
                                 &method_name,
                                 &method_descriptor,
@@ -661,6 +723,7 @@ pub(super) fn compile_osr_artifact(
             // can only reach it again — 256 times over ten H2 `nioMemLZF:`
             // operations before this memo existed. See `mark_osr_entry_rejected`.
             if crate::jit::is_osr_entry_rejected(
+                class_id,
                 &class_name,
                 &method_name,
                 &method_descriptor,
@@ -691,7 +754,12 @@ pub(super) fn compile_osr_artifact(
                             class_name, method_name, method_descriptor,
                         );
                     }
-                    crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                    crate::jit::mark_jit_bail_listed(
+                        class_id,
+                        &class_name,
+                        &method_name,
+                        &method_descriptor,
+                    );
                     return None;
                 }
             };
@@ -922,7 +990,12 @@ pub(super) fn compile_osr_artifact(
                             class_name, method_name, method_descriptor
                         );
                     }
-                    crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                    crate::jit::mark_jit_bail_listed(
+                        class_id,
+                        &class_name,
+                        &method_name,
+                        &method_descriptor,
+                    );
                     return None;
                 }
                 // Name the ONE site that blocks the method, the way the
@@ -947,7 +1020,12 @@ pub(super) fn compile_osr_artifact(
                             pc, op, class_name, method_name, method_descriptor
                         );
                     }
-                    crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                    crate::jit::mark_jit_bail_listed(
+                        class_id,
+                        &class_name,
+                        &method_name,
+                        &method_descriptor,
+                    );
                     return None;
                 }
             }
@@ -2041,18 +2119,43 @@ pub(super) fn compile_osr_artifact(
                     // the_osr_door_takes_no_recursive_class_manager_lock` is the
                     // guard that now names the families rather than waiting for
                     // one to turn up in an unrelated probe.
+                    //
+                    // Review #80: a site naming a SUBCLASS (`Counter extends
+                    // AtomicInteger`) matches only through the class that
+                    // declares the resolved method, and only for a method `final`
+                    // in the JDK. Its guard is the subclass's own id, so any
+                    // other receiver class falls back. Both answers come off
+                    // `cm_lock` too (`site_class_and_declaring_class_name`).
                     if invoke_kind == 0
-                        && target_class == "java/util/concurrent/atomic/AtomicInteger"
+                        && cratonvm_jit::atomic_intrinsic_site_may_match(
+                            "java/util/concurrent/atomic/AtomicInteger",
+                            &target_class,
+                            &mn,
+                            &desc,
+                        )
                     {
-                        let atomic_cid = cm_lock
-                            .find_bootstrap_class_by_name(
-                                "java/util/concurrent/atomic/AtomicInteger",
-                            )
-                            .map(|id| id.as_u32());
-                        if let Some((entry, num_params, ret, guard_class_id)) =
-                            atomic_cid.and_then(|cid| {
-                                cratonvm_jit::try_resolve_atomic_intrinsic(
+                        let atomic_site: Option<(u32, Option<String>)> =
+                            if target_class == "java/util/concurrent/atomic/AtomicInteger" {
+                                cm_lock
+                                    .find_bootstrap_class_by_name(
+                                        "java/util/concurrent/atomic/AtomicInteger",
+                                    )
+                                    .map(|id| (id.as_u32(), None))
+                            } else {
+                                site_class_and_declaring_class_name(
+                                    &cm_lock,
+                                    class_id,
                                     &target_class,
+                                    &mn,
+                                    &desc,
+                                )
+                                .map(|(cid, declaring_class)| (cid, Some(declaring_class)))
+                            };
+                        if let Some((entry, num_params, ret, guard_class_id)) =
+                            atomic_site.and_then(|(cid, declaring_class)| {
+                                cratonvm_jit::try_resolve_atomic_intrinsic_for_site(
+                                    &target_class,
+                                    declaring_class.as_deref(),
                                     &mn,
                                     &desc,
                                     cid,
@@ -2086,17 +2189,40 @@ pub(super) fn compile_osr_artifact(
                     // loop. `HashedWheelTimer`'s worker is that shape, and its
                     // `pendingTimeouts` is an `AtomicLong` incremented once per
                     // scheduled timeout and decremented once per expiry.
-                    if invoke_kind == 0 && target_class == "java/util/concurrent/atomic/AtomicLong"
+                    // Subclass sites match through the declaring class, on the
+                    // AtomicInteger arm's terms (which excludes `longValue()`).
+                    if invoke_kind == 0
+                        && cratonvm_jit::atomic_intrinsic_site_may_match(
+                            "java/util/concurrent/atomic/AtomicLong",
+                            &target_class,
+                            &mn,
+                            &desc,
+                        )
                     {
                         // Through `cm_lock` — see the AtomicInteger arm above for
                         // why a fresh `.read()` here is a recursive acquisition.
-                        let atomic_long_cid = cm_lock
-                            .find_bootstrap_class_by_name("java/util/concurrent/atomic/AtomicLong")
-                            .map(|id| id.as_u32());
-                        if let Some((entry, num_params, ret, guard_class_id)) = atomic_long_cid
-                            .and_then(|cid| {
-                                cratonvm_jit::try_resolve_atomic_long_intrinsic(
+                        let atomic_long_site: Option<(u32, Option<String>)> =
+                            if target_class == "java/util/concurrent/atomic/AtomicLong" {
+                                cm_lock
+                                    .find_bootstrap_class_by_name(
+                                        "java/util/concurrent/atomic/AtomicLong",
+                                    )
+                                    .map(|id| (id.as_u32(), None))
+                            } else {
+                                site_class_and_declaring_class_name(
+                                    &cm_lock,
+                                    class_id,
                                     &target_class,
+                                    &mn,
+                                    &desc,
+                                )
+                                .map(|(cid, declaring_class)| (cid, Some(declaring_class)))
+                            };
+                        if let Some((entry, num_params, ret, guard_class_id)) = atomic_long_site
+                            .and_then(|(cid, declaring_class)| {
+                                cratonvm_jit::try_resolve_atomic_long_intrinsic_for_site(
+                                    &target_class,
+                                    declaring_class.as_deref(),
                                     &mn,
                                     &desc,
                                     cid,
@@ -3301,6 +3427,7 @@ pub(super) fn compile_osr_artifact(
                 // osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md,
                 // which took a six-arm shape bisect to find for exactly this reason.
                 crate::jit::mark_jit_bail_listed_with_site(
+                    class_id,
                     &class_name,
                     &method_name,
                     &method_descriptor,
@@ -3383,6 +3510,7 @@ pub(super) fn compile_osr_artifact(
     if !osr_reused && !compiled.can_osr_enter(entry_pc) {
         cratonvm_jit::metrics::record_osr_event("osr_refused_entry");
         crate::jit::mark_osr_entry_rejected(
+            class_id,
             &class_name,
             &method_name,
             &method_descriptor,
@@ -4068,6 +4196,7 @@ pub(super) fn try_osr(
                 // `_by`: a refusal that depends on compile-time state expires
                 // when that state is flushed, instead of standing for good.
                 crate::jit::mark_osr_entry_rejected_by(
+                    class_id,
                     &class_name,
                     &method_name,
                     &method_descriptor,
@@ -6115,6 +6244,11 @@ pub(super) fn compile_optimizing_artifact(
                 .as_u32(),
         )
     };
+    // Review #80: the class that DECLARES each invoke's resolved method, for
+    // the `Atomic*` intrinsics' subclass sites.
+    let invoke_declaring_class_resolver = |cp_idx: u16| -> Option<String> {
+        cp_method_ref_declaring_class_name(shared, class_id, cp_idx)
+    };
 
     let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
         let cm = shared.classes.class_manager.read();
@@ -6658,6 +6792,10 @@ pub(super) fn compile_optimizing_artifact(
                     .as_u32(),
             )
         };
+        // Review #80: the declaring class of each invoke's resolved method.
+        let c_invoke_declaring_class_resolver = |cp_idx: u16| -> Option<String> {
+            cp_method_ref_declaring_class_name(shared, callee_cid, cp_idx)
+        };
 
         let c_ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
             let cm = shared.classes.class_manager.read();
@@ -6790,6 +6928,7 @@ pub(super) fn compile_optimizing_artifact(
             Some(&intrinsic_resolver),
             // This VM's per-bci de-spec registry.
             Some(&shared.jit.despec_registry),
+            Some(&c_invoke_declaring_class_resolver),
         )?;
         let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
         let needs_ctx = compiled.needs_context();
@@ -7028,6 +7167,7 @@ pub(super) fn compile_optimizing_artifact(
         Some(&intrinsic_resolver),
         // This VM's per-bci de-spec registry.
         Some(&shared.jit.despec_registry),
+        Some(&invoke_declaring_class_resolver),
     )?;
     Some(compiled)
 }
@@ -7048,6 +7188,7 @@ pub(super) fn try_jit_upgrade_with_gate(
         Ok(target) => target,
         Err(payload) => {
             note_contained_mutator_compile_panic(
+                cached.declaring_class_id,
                 &cached.class_name,
                 &cached.method_name,
                 &cached.method_descriptor,
@@ -7124,6 +7265,7 @@ fn try_jit_upgrade_with_gate_uncontained(
     // method that meant tens of thousands of full gate evaluations per
     // suite run while `try_compile` would bail instantly anyway.
     if crate::jit::is_jit_bail_listed(
+        cached.declaring_class_id,
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -7206,6 +7348,7 @@ fn try_jit_upgrade_with_gate_uncontained(
             // early `is_jit_bail_listed` check at the top of this function
             // short-circuits every future retry.
             crate::jit::mark_jit_bail_listed(
+                cached.declaring_class_id,
                 &cached.class_name,
                 &cached.method_name,
                 &cached.method_descriptor,
@@ -7521,7 +7664,22 @@ pub fn try_jit_compile_callee(
     }) {
         Ok(compiled) => compiled,
         Err(payload) => {
-            note_contained_mutator_compile_panic(class_name, method_name, descriptor, &*payload);
+            // The verdict store is keyed per loaded class; resolve the name the
+            // way the probe in `try_jit_compile_callee_uncontained` does. Only
+            // on this (rare) panic arm, with no class-manager guard held.
+            let class_id = shared
+                .classes
+                .class_manager
+                .read()
+                .get_loaded_class_id(class_name)
+                .unwrap_or(ClassId::new(0));
+            note_contained_mutator_compile_panic(
+                class_id,
+                class_name,
+                method_name,
+                descriptor,
+                &*payload,
+            );
             None
         }
     }
@@ -7531,13 +7689,14 @@ pub fn try_jit_compile_callee(
 /// asks for it again, count it under the workers' `worker_panic` scheduling
 /// event, and warn once per process.
 fn note_contained_mutator_compile_panic(
+    class_id: ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     payload: &(dyn std::any::Any + Send),
 ) {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    cratonvm_jit::mark_jit_bail_listed(class_name, method_name, descriptor);
+    cratonvm_jit::mark_jit_bail_listed(class_id, class_name, method_name, descriptor);
     cratonvm_jit::metrics::record_scheduling_event(cratonvm_jit::metrics::SCHEDULING_EVENTS[6]);
     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
@@ -7564,15 +7723,42 @@ fn try_jit_compile_callee_uncontained(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
+    // `try_jit_compile_callee` is `&str`-only (called from both the
+    // interpreter, which has a precise `ClassId`, and raw JIT-ABI
+    // dispatch helpers keyed only by `JitInvokeInfo`'s static strings —
+    // see `JitKey::declaring_class_id`'s doc comment). Resolving the
+    // class globally by name here preserves this function's existing
+    // (pre-existing, not loader-aware) probe/publish behavior; it does
+    // not newly introduce the multi-loader-same-name collision this
+    // session fixed at the interpreter's own dispatch-side cache
+    // consultation (`execute_invoke_kind` / `execute_invokestatic_cached`
+    // / `try_jit_upgrade_with_gate`), which is what a same-named class
+    // loaded by a user `ClassLoader` actually dispatches through.
+    //
+    // Resolved once, up front, because the bail-list below is kept per loaded
+    // class too. `try_jit_compile_callee_slow` records its verdicts under the
+    // class the name resolves to uniquely, and whenever such a class exists
+    // this lookup names the same one.
+    let probe_class_id = shared
+        .classes
+        .class_manager
+        .read()
+        .get_loaded_class_id(class_name)
+        .unwrap_or(ClassId::new(0));
     // RBC.4 — short-circuit permanently-uncompilable methods before the
     // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
-    if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
+    if crate::jit::is_jit_bail_listed(probe_class_id, class_name, method_name, descriptor) {
         if callee_probe_dbg() {
             // Carry the recorded refusal site into the tally key: "bail-listed"
             // alone says only that some earlier compile said no, and the
             // whole point of the tally is to name what has to be fixed.
-            let why = cratonvm_jit::jit_bail_reason_for(class_name, method_name, descriptor)
-                .unwrap_or_else(|| "reason-not-recorded".to_string());
+            let why = cratonvm_jit::jit_bail_reason_for(
+                probe_class_id,
+                class_name,
+                method_name,
+                descriptor,
+            )
+            .unwrap_or_else(|| "reason-not-recorded".to_string());
             callee_probe_note(
                 &format!("BAIL-LISTED[{why}]"),
                 class_name,
@@ -7600,23 +7786,7 @@ fn try_jit_compile_callee_uncontained(
     // the previous `Arc::from` per name was three wasted heap allocations
     // on every dispatch-helper call.
     {
-        // `try_jit_compile_callee` is `&str`-only (called from both the
-        // interpreter, which has a precise `ClassId`, and raw JIT-ABI
-        // dispatch helpers keyed only by `JitInvokeInfo`'s static strings —
-        // see `JitKey::declaring_class_id`'s doc comment). Resolving the
-        // class globally by name here preserves this function's existing
-        // (pre-existing, not loader-aware) probe/publish behavior; it does
-        // not newly introduce the multi-loader-same-name collision this
-        // session fixed at the interpreter's own dispatch-side cache
-        // consultation (`execute_invoke_kind` / `execute_invokestatic_cached`
-        // / `try_jit_upgrade_with_gate`), which is what a same-named class
-        // loaded by a user `ClassLoader` actually dispatches through.
-        let probe_class_id = shared
-            .classes
-            .class_manager
-            .read()
-            .get_loaded_class_id(class_name)
-            .unwrap_or(ClassId::new(0));
+        // `probe_class_id` was resolved at the top of this function.
         // No `class_was_redefined` gate: `redefine_class` calls
         // `jit_cache.clear_all()`, so any entry still present in the cache was
         // necessarily compiled AFTER the most recent redefinition of any
@@ -7943,6 +8113,18 @@ pub(super) fn try_jit_compile_callee_slow(
     // `eager-callee-chain`: a top-level compile starts with a fresh transitive
     // callee-compile budget; a nested one inherits the outer compile's.
     eager_callee_chain_enter_top_level();
+    // Compile verdicts are kept per loaded class. The two refusals below fire
+    // before this function resolves the receiver class, so they look its
+    // identity up only when they fire, with no class-manager guard held. It
+    // is the same unique resolution `callee_class_id` gets further down.
+    let receiver_class_id_for_verdicts = || {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .find_unique_class_by_name(class_name)
+            .unwrap_or(ClassId::new(0))
+    };
     // RFJP.1 (RETIRED, lever-only) — refuse a method whose declaring class
     // transitively extends `java/util/concurrent/ForkJoinTask`. Inert unless
     // `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1`. This is the exit that reported
@@ -7950,6 +8132,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // UniCompose.tryFire` and `$UniRelay.tryFire`.
     if is_fjp_subclass_blocklisted(shared, class_name, None) {
         cratonvm_jit::record_compile_refusal(
+            receiver_class_id_for_verdicts(),
             class_name,
             method_name,
             descriptor,
@@ -7979,6 +8162,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // `SpringRepositoriesExtensionTests` hang).
     if registered_native_will_run(shared, class_name, method_name, descriptor) {
         cratonvm_jit::record_compile_refusal(
+            receiver_class_id_for_verdicts(),
             class_name,
             method_name,
             descriptor,
@@ -7994,7 +8178,9 @@ pub(super) fn try_jit_compile_callee_slow(
             // The receiver's class may simply not be loaded yet — a later
             // attempt can succeed, so this `None` must not be cached.
             *cache_negative = false;
+            // No loaded class to key the reason by: `ClassId(0)`.
             cratonvm_jit::record_compile_refusal(
+                ClassId::new(0),
                 class_name,
                 method_name,
                 descriptor,
@@ -8013,6 +8199,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // Direct dispatcher compilation also bypasses interpreter frame creation.
     if method.is_synchronized() && !allow_synchronized_wrapped_entry {
         cratonvm_jit::record_compile_refusal(
+            callee_class_id,
             class_name,
             method_name,
             descriptor,
@@ -8073,8 +8260,9 @@ pub(super) fn try_jit_compile_callee_slow(
         }
     }
     if scan_refuses {
-        crate::jit::mark_jit_bail_listed(class_name, method_name, descriptor);
+        crate::jit::mark_jit_bail_listed(callee_class_id, class_name, method_name, descriptor);
         cratonvm_jit::record_compile_refusal(
+            callee_class_id,
             class_name,
             method_name,
             descriptor,
@@ -8111,6 +8299,7 @@ pub(super) fn try_jit_compile_callee_slow(
             // function should succeed and start caching the fast entry.
             *cache_negative = false;
             cratonvm_jit::record_compile_refusal(
+                callee_class_id,
                 class_name,
                 method_name,
                 descriptor,
@@ -8136,6 +8325,7 @@ pub(super) fn try_jit_compile_callee_slow(
             .is_some()
     {
         cratonvm_jit::record_compile_refusal(
+            callee_class_id,
             class_name,
             method_name,
             descriptor,
@@ -8195,6 +8385,7 @@ pub(super) fn try_jit_compile_callee_slow(
             &cached.method_descriptor,
         ) {
             cratonvm_jit::record_compile_refusal(
+                callee_class_id,
                 class_name,
                 method_name,
                 descriptor,
@@ -8225,6 +8416,7 @@ pub(super) fn try_jit_compile_callee_slow(
             }) => *name_and_type_index,
             _ => {
                 cratonvm_jit::record_compile_refusal(
+                    callee_class_id,
                     class_name,
                     method_name,
                     descriptor,
@@ -8471,6 +8663,11 @@ pub(super) fn try_jit_compile_callee_slow(
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
         Some(cm.find_class_by_name_for_class(target_class, cid)?.as_u32())
+    };
+    // Review #80: the declaring class of each invoke's resolved method, for the
+    // `Atomic*` intrinsics' subclass sites.
+    let invoke_declaring_class_resolver = |cp_idx: u16| -> Option<String> {
+        cp_method_ref_declaring_class_name(shared, cid, cp_idx)
     };
     let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
         let cm = shared.classes.class_manager.read();
@@ -8914,6 +9111,7 @@ pub(super) fn try_jit_compile_callee_slow(
         Some(&intrinsic_resolver),
         // This VM's per-bci de-spec registry.
         Some(&shared.jit.despec_registry),
+        Some(&invoke_declaring_class_resolver),
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
@@ -9550,6 +9748,9 @@ pub(super) fn background_compile_task(
     // loop header it emits, so the compile itself is entry-pc-independent.
     if let Some(osr_bci) = task.osr_bci {
         let start = std::time::Instant::now();
+        // The class the compile's verdicts are recorded under: the key's id,
+        // or the one `fetch_osr_compile_inputs` resolves when the key has none.
+        let mut verdict_class_id = task.method_key.class_id;
         let published = if let Some((class_id, padded, max_locals)) = fetch_osr_compile_inputs(
             &shared,
             task.method_key.class_id,
@@ -9557,6 +9758,7 @@ pub(super) fn background_compile_task(
             &task.method_key.method_name,
             &task.method_key.descriptor,
         ) {
+            verdict_class_id = class_id;
             compile_osr_artifact(
                 &shared,
                 class_id,
@@ -9591,6 +9793,7 @@ pub(super) fn background_compile_task(
             // cannot change by bail-listing the method. Only then is OSR denied,
             // and that denial still expires when the install epoch moves.
             let permanent = cratonvm_jit::is_jit_bail_listed(
+                verdict_class_id,
                 &task.method_key.class_name,
                 &task.method_key.method_name,
                 &task.method_key.descriptor,
@@ -9612,6 +9815,7 @@ pub(super) fn background_compile_task(
                 eprintln!(
                     "[cratonvm-jitc]   …and the bail this method last recorded: {}",
                     cratonvm_jit::jit_bail_reason_for(
+                        verdict_class_id,
                         &task.method_key.class_name,
                         &task.method_key.method_name,
                         &task.method_key.descriptor,
@@ -9904,6 +10108,7 @@ pub(super) fn background_compile_task(
                 task.method_key.descriptor.clone(),
             ))
             || cratonvm_jit::is_jit_bail_listed(
+                task.method_key.class_id,
                 &task.method_key.class_name,
                 &task.method_key.method_name,
                 &task.method_key.descriptor,

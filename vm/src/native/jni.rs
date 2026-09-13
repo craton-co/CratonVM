@@ -4674,7 +4674,7 @@ extern "C" fn jni_define_class(
         // a redefinition is honoured rather than served stale.
         if let Some(n) = class_name.as_deref() {
             let _ = shared.jit.jit_cache.write().invalidate_for_class(n);
-            shared.jit.tiered_manager.on_class_redefined(n);
+            shared.jit.tiered_manager.on_class_redefined(cid, n);
         }
         Some(class_id_to_jclass(cid))
     })

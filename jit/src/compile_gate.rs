@@ -714,7 +714,12 @@ fn jit_disabled() -> bool {
 /// Ask the gate whether `door` may compile this method now.
 ///
 /// On `Ok` the returned token must be held for the whole compilation.
+///
+/// `class_id` is the declaring class's identity: the bail-list is kept per
+/// loaded class, so a same-named class in another loader is not refused on
+/// this one's verdict.
 pub fn admit(
+    class_id: cratonvm_types::ClassId,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
@@ -734,7 +739,7 @@ pub fn admit(
 
     let refusal = if jit_disabled() {
         Some(CompileRefusal::JitDisabled)
-    } else if crate::is_jit_bail_listed(class_name, method_name, descriptor) {
+    } else if crate::is_jit_bail_listed(class_id, class_name, method_name, descriptor) {
         crate::note_jit_bail_shortcircuit();
         Some(CompileRefusal::PermanentlyBailListed)
     } else if crate::jit_force_interpret(class_name, method_name) {
@@ -908,6 +913,10 @@ pub(crate) fn reset_for_test() {
 mod tests {
     use super::*;
 
+    /// The bail-list is per loaded class; these tests use id-less keys and unique
+    /// names instead.
+    const NO_ID: cratonvm_types::ClassId = cratonvm_types::ClassId::new(0);
+
     /// A name no production class can collide with, so these tests can mark the
     /// bail-list without perturbing another test in the same binary.
     fn unique(tag: &str) -> String {
@@ -936,7 +945,7 @@ mod tests {
         let _guard = COUNTER_LOCK.lock();
         assert!(!admission_is_open());
         let cls = unique("scope");
-        let a = admit(&cls, "m", "()V", CompileDoor::Osr).expect("clean method admits");
+        let a = admit(NO_ID, &cls, "m", "()V", CompileDoor::Osr).expect("clean method admits");
         assert!(admission_is_open());
         assert_eq!(a.door(), CompileDoor::Osr);
         drop(a);
@@ -949,10 +958,10 @@ mod tests {
     #[test]
     fn admissions_nest() {
         let _guard = COUNTER_LOCK.lock();
-        let outer =
-            admit(&unique("nest-outer"), "m", "()V", CompileDoor::MethodEntry).expect("admits");
-        let inner =
-            admit(&unique("nest-inner"), "m", "()V", CompileDoor::MethodEntry).expect("admits");
+        let outer = admit(NO_ID, &unique("nest-outer"), "m", "()V", CompileDoor::MethodEntry)
+            .expect("admits");
+        let inner = admit(NO_ID, &unique("nest-inner"), "m", "()V", CompileDoor::MethodEntry)
+            .expect("admits");
         drop(inner);
         assert!(
             admission_is_open(),
@@ -968,10 +977,10 @@ mod tests {
     fn a_bail_listed_method_is_refused_at_every_door() {
         let _guard = COUNTER_LOCK.lock();
         let cls = unique("bail-listed");
-        crate::mark_jit_bail_listed(&cls, "m", "()V");
+        crate::mark_jit_bail_listed(NO_ID, &cls, "m", "()V");
         for door in CompileDoor::ALL {
             assert_eq!(
-                admit(&cls, "m", "()V", door).err(),
+                admit(NO_ID, &cls, "m", "()V", door).err(),
                 Some(CompileRefusal::PermanentlyBailListed),
                 "{} must honour the bail-list",
                 door.label()
@@ -996,7 +1005,7 @@ mod tests {
     fn admissions_are_counted_per_door() {
         let _guard = COUNTER_LOCK.lock();
         let before = admissions(CompileDoor::Osr);
-        let _a = admit(&unique("counted"), "m", "()V", CompileDoor::Osr).expect("admits");
+        let _a = admit(NO_ID, &unique("counted"), "m", "()V", CompileDoor::Osr).expect("admits");
         assert_eq!(admissions(CompileDoor::Osr), before + 1);
     }
 
@@ -1014,7 +1023,7 @@ mod tests {
             before + 1,
             "a backend entry with no admission open must be counted"
         );
-        let _a = admit(&unique("witness"), "m", "()V", CompileDoor::Osr).expect("admits");
+        let _a = admit(NO_ID, &unique("witness"), "m", "()V", CompileDoor::Osr).expect("admits");
         note_backend_entry();
         assert_eq!(
             ungated_backend_entries(),
@@ -1059,7 +1068,7 @@ mod tests {
     #[test]
     fn a_fresh_admission_has_not_declared_a_direct_call_policy() {
         let _guard = COUNTER_LOCK.lock();
-        let a = admit(&unique("undeclared"), "m", "()V", CompileDoor::Osr).expect("admits");
+        let a = admit(NO_ID, &unique("undeclared"), "m", "()V", CompileDoor::Osr).expect("admits");
         assert_eq!(a.direct_call_policy(), None);
         a.declare_direct_call_policy(DirectCallPolicy::JdkOnly);
         assert_eq!(a.direct_call_policy(), Some(DirectCallPolicy::JdkOnly));
@@ -1074,7 +1083,7 @@ mod tests {
     #[test]
     fn the_direct_bind_rule_refuses_exactly_one_cell() {
         let _guard = COUNTER_LOCK.lock();
-        let a = admit(&unique("rule"), "m", "()V", CompileDoor::Osr).expect("admits");
+        let a = admit(NO_ID, &unique("rule"), "m", "()V", CompileDoor::Osr).expect("admits");
 
         // Undeclared admits both, deliberately — see `admits_direct_bind`.
         assert!(a.admits_direct_bind(|| true));
@@ -1126,7 +1135,8 @@ mod tests {
         let _guard = COUNTER_LOCK.lock();
         let before = undeclared_direct_bind_rows(CompileDoor::Osr);
 
-        let a = admit(&unique("rows-undeclared"), "m", "()V", CompileDoor::Osr).expect("admits");
+        let a = admit(NO_ID, &unique("rows-undeclared"), "m", "()V", CompileDoor::Osr)
+            .expect("admits");
         note_direct_binds(&a, 7);
         assert_eq!(
             undeclared_direct_bind_rows(CompileDoor::Osr),
@@ -1144,7 +1154,7 @@ mod tests {
 
         // A compile with no direct calls must not move it either way.
         note_direct_binds(&a, 0);
-        let b = admit(&unique("rows-empty"), "m", "()V", CompileDoor::Osr).expect("admits");
+        let b = admit(NO_ID, &unique("rows-empty"), "m", "()V", CompileDoor::Osr).expect("admits");
         note_direct_binds(&b, 0);
         assert_eq!(undeclared_direct_bind_rows(CompileDoor::Osr), before + 7);
     }
@@ -1201,7 +1211,7 @@ mod tests {
         let before_not = string_pin_not_asked(CompileDoor::Osr);
 
         // A door that holds an admission and never puts the question.
-        drop(admit(&unique("pin-silent"), "m", "()V", CompileDoor::Osr).expect("admits"));
+        drop(admit(NO_ID, &unique("pin-silent"), "m", "()V", CompileDoor::Osr).expect("admits"));
         assert_eq!(string_pin_asked(CompileDoor::Osr), before_asked);
         assert_eq!(
             string_pin_not_asked(CompileDoor::Osr),
@@ -1213,7 +1223,7 @@ mod tests {
         // `invokevirtual`/`invokeinterface` could ever have been intrinsified —
         // so this asserts the ASKING, which is the fact the census was missing,
         // without depending on any env var or on a resolved String layout.
-        let a = admit(&unique("pin-asks"), "m", "()V", CompileDoor::Osr).expect("admits");
+        let a = admit(NO_ID, &unique("pin-asks"), "m", "()V", CompileDoor::Osr).expect("admits");
         assert!(!a.string_intrinsic_pin_was_asked());
         assert!(!a.string_intrinsic_pin_declines(&[], None, None));
         assert!(a.string_intrinsic_pin_was_asked());

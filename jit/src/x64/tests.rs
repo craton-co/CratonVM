@@ -18506,3 +18506,181 @@ fn review_xmm_save_slots_tile_the_save_area() {
         }
     }
 }
+
+/// Review #88: an OSR-exit snapshot of a slot reused as two kinds is described
+/// by LIVENESS AT THE EXIT BCI, not by the whole-method classifier.
+///
+/// Slot 1 holds an `int`, then a reference, and the loop header at pc 8 reads
+/// the reference. The slot is live there, so the published snapshot must name
+/// its value: a reference home. `Unsupported` is acceptable only if the artifact
+/// then refuses OSR entry at admission (`osr_exit_policy`), which is decided
+/// before the body runs. What must never happen is the live slot being published
+/// `Undefined`, or an `Unsupported` local in an artifact that still admits entry:
+/// the exit-time transfer leaves an `Unsupported` local at the interpreter's
+/// stale value.
+#[test]
+fn osr_exit_snapshot_describes_a_reused_slot_that_is_live_at_the_exit() {
+    use crate::deopt::{DeoptReason, FrameValue};
+    #[rustfmt::skip]
+    let code: Vec<u8> = vec![
+        0x08,             // 0:  iconst_5
+        0x3c,             // 1:  istore_1        slot 1 holds an int
+        0x1b,             // 2:  iload_1
+        0x57,             // 3:  pop
+        0x01,             // 4:  aconst_null
+        0x4c,             // 5:  astore_1        slot 1 now holds a reference
+        0x03,             // 6:  iconst_0
+        0x3b,             // 7:  istore_0
+        0x2b,             // 8:  aload_1         <- loop header: reads slot 1
+        0x57,             // 9:  pop
+        0x84, 0x00, 0x01, // 10: iinc 0, 1
+        0x1a,             // 13: iload_0
+        0x10, 0x0a,       // 14: bipush 10
+        0xa1, 0xff, 0xf8, // 16: if_icmplt -8 -> 8
+        0xb1,             // 19: return
+        0, 0,
+    ];
+    let code_len = 20;
+    assert_eq!(
+        super::classify_local_kinds(&code, code_len, 2)[1],
+        super::LocalKind::Ambiguous,
+        "precondition: the whole-method classifier cannot type slot 1"
+    );
+    let helpers = test_helpers();
+    let compiled = compile(
+        &code,
+        code_len,
+        0,
+        2,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None,
+    )
+    .expect("test JIT compile");
+
+    if !crate::deopt_real_enabled() {
+        // `CRATONVM_DEOPT_REAL=0` publishes no OSR-exit snapshot at all.
+        assert!(compiled.osr_exit_points.is_empty());
+        return;
+    }
+    let exit = compiled
+        .deopt_points
+        .iter()
+        .find(|p| p.bci == 8 && p.reason == DeoptReason::OsrExit)
+        .expect("the loop header at pc 8 publishes an OSR-exit snapshot");
+    match &exit.frame_state.locals[1] {
+        FrameValue::StackSlotRef(_) | FrameValue::RegisterRef(_) => {}
+        FrameValue::Unsupported => assert!(
+            compiled.osr_exit_policy().is_err(),
+            "a live slot published Unsupported must make the exit non-resumable at compile time"
+        ),
+        other => panic!("slot 1 is a live reference at the exit bci, published as {other:?}"),
+    }
+    // The artifact-wide half of the contract: no admitted artifact carries an
+    // `Unsupported` local in any snapshot.
+    let any_unsupported_local = compiled
+        .deopt_points
+        .iter()
+        .any(|p| p.frame_state.locals.iter().any(|v| matches!(v, FrameValue::Unsupported)));
+    if any_unsupported_local {
+        assert!(compiled.osr_exit_policy().is_err());
+    }
+}
+
+/// Review #88, the tolerated half: the same int/reference reuse, but at the loop
+/// header (pc 6) slot 1 is DEAD. The loop never reads it and the code after the
+/// loop stores an `int` before reading. The snapshot publishes `Undefined` for
+/// it, which the exit-time transfer maps to an inert value, and the slot does not
+/// make the exit unresumable.
+#[test]
+fn osr_exit_snapshot_publishes_a_reused_slot_that_is_dead_at_the_exit_as_undefined() {
+    use crate::deopt::{DeoptReason, FrameValue};
+    #[rustfmt::skip]
+    let code: Vec<u8> = vec![
+        0x01,             // 0:  aconst_null
+        0x4c,             // 1:  astore_1        slot 1 holds a reference
+        0x2b,             // 2:  aload_1
+        0x57,             // 3:  pop
+        0x03,             // 4:  iconst_0
+        0x3b,             // 5:  istore_0
+        0x84, 0x00, 0x01, // 6:  iinc 0, 1       <- loop header: slot 1 not read
+        0x1a,             // 9:  iload_0
+        0x10, 0x0a,       // 10: bipush 10
+        0xa1, 0xff, 0xfa, // 12: if_icmplt -6 -> 6
+        0x06,             // 15: iconst_3
+        0x3c,             // 16: istore_1        re-stored as an int before any read
+        0x1b,             // 17: iload_1
+        0x57,             // 18: pop
+        0xb1,             // 19: return
+        0, 0,
+    ];
+    let code_len = 20;
+    assert_eq!(
+        super::classify_local_kinds(&code, code_len, 2)[1],
+        super::LocalKind::Ambiguous,
+        "precondition: the whole-method classifier cannot type slot 1"
+    );
+    let helpers = test_helpers();
+    let compiled = compile(
+        &code,
+        code_len,
+        0,
+        2,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None,
+    )
+    .expect("test JIT compile");
+
+    if !crate::deopt_real_enabled() {
+        assert!(compiled.osr_exit_points.is_empty());
+        return;
+    }
+    let exit = compiled
+        .deopt_points
+        .iter()
+        .find(|p| p.bci == 6 && p.reason == DeoptReason::OsrExit)
+        .expect("the loop header at pc 6 publishes an OSR-exit snapshot");
+    assert_eq!(
+        exit.frame_state.locals[1],
+        FrameValue::Undefined,
+        "a slot dead at the exit bci is published Undefined, whatever its whole-method kind"
+    );
+    assert!(
+        crate::deopt::first_unresumable_local(&exit.frame_state).is_none(),
+        "the dead reused slot must not make the exit unresumable: {:?}",
+        exit.frame_state.locals
+    );
+}

@@ -169,8 +169,17 @@ fn inherited_callee_is_not_bail_listed_through_subclass() {
         &vm.shared, SUB, ACCESSOR.0, ACCESSOR.1, true,
     );
 
+    // The bail-list is kept per loaded class: ask it about the subclass the
+    // gate resolved the name to.
+    let sub_id = vm
+        .shared
+        .classes
+        .class_manager
+        .read()
+        .find_unique_class_by_name(SUB)
+        .unwrap_or_else(|| panic!("{SUB} not loaded"));
     assert!(
-        !cratonvm_jit::is_jit_bail_listed(SUB, ACCESSOR.0, ACCESSOR.1),
+        !cratonvm_jit::is_jit_bail_listed(sub_id, SUB, ACCESSOR.0, ACCESSOR.1),
         "inherited accessor was bail-listed when resolved through the subclass — \
          the gate is reading its bytecode against the wrong constant pool again"
     );
