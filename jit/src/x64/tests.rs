@@ -1029,10 +1029,11 @@ fn live_monitor_ops_execute_direct_runtime_stubs() {
 
     ENTER_CALLS.store(0, Ordering::SeqCst);
     EXIT_CALLS.store(0, Ordering::SeqCst);
-    crate::set_monitor_direct_fns(
-        monitor_enter_stub as *const () as usize,
-        monitor_exit_stub as *const () as usize,
-    );
+    let direct_helpers = crate::DirectHelperTable {
+        monitor_enter: monitor_enter_stub as *const () as usize,
+        monitor_exit: monitor_exit_stub as *const () as usize,
+        ..crate::DirectHelperTable::EMPTY
+    };
 
     // static int locked(Object o) {
     //     monitorenter(o); monitorexit(o); return 7;
@@ -1049,7 +1050,12 @@ fn live_monitor_ops_execute_direct_runtime_stubs() {
         0xac, // ireturn
         0x00, 0x00,
     ];
-    let compiled = compile(
+    let compiled = compile_with_request(
+        BackendRequest {
+            direct_helpers,
+            ..BackendRequest::default()
+        },
+        Vec::new(), // compact_field_info
         &code,
         7,
         1,
@@ -1162,7 +1168,8 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         method_key,
         None, // despec: no VM
         Vec::new(),
-        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
+        crate::x64::BackendRequest::default(),
     )?;
     compiled
         .oop_maps
@@ -5055,8 +5062,9 @@ fn every_single_pass_compact_field_site_guards_its_baked_offset() {
         std::sync::atomic::AtomicUsize::new(0),
     ];
     helpers.read_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
-    set_pending_compact_field_info(vec![(1, 0, false)]);
-    let get = compile(
+    let get = compile_with_request(
+        BackendRequest::default(),
+        vec![(1, 0, false)],
         &get_code,
         5,
         1,
@@ -5103,8 +5111,9 @@ fn every_single_pass_compact_field_site_guards_its_baked_offset() {
     ];
     let mut set_helpers = test_helpers();
     set_helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
-    set_pending_compact_field_info(vec![(2, 0, true)]);
-    let set = compile(
+    let set = compile_with_request(
+        BackendRequest::default(),
+        vec![(2, 0, true)],
         &set_code,
         6,
         2,
@@ -5251,12 +5260,9 @@ fn a_reference_getfield_does_not_read_a_non_reference_cell_as_a_pointer() {
 /// arm emits the two-load direct form and leaves NO call to `jit_getstatic`
 /// behind; a site the resolver declines keeps the helper.
 ///
-/// Both directions are asserted from ONE registration on purpose:
-/// `set_static_base_resolver` deliberately latches its context for the life of
-/// the process (a second VM must never re-point it at its own statics), so the
-/// test resolver instead answers for exactly one `(class, field)` pair and
-/// declines everything else — which also keeps it inert for any other test in
-/// this binary that compiles a `getstatic`.
+/// Both directions are asserted from one table: the test resolver answers for
+/// exactly one `(class, field)` pair and declines everything else. The table
+/// travels on this test's own compiles, so no other test sees it.
 #[test]
 fn test_getstatic_inline_direct_load_and_fallback() {
     use std::sync::atomic::AtomicPtr;
@@ -5288,7 +5294,11 @@ fn test_getstatic_inline_direct_load_and_fallback() {
         // Cast: the address the backend bakes as an immediate.
         cell as *const AtomicPtr<Value> as usize
     });
-    set_static_base_resolver(test_resolver as *const () as usize, cell_addr);
+    let direct_helpers = crate::DirectHelperTable {
+        static_base_resolver: test_resolver as *const () as usize,
+        static_base_resolver_ctx: cell_addr,
+        ..crate::DirectHelperTable::EMPTY
+    };
 
     // getstatic #1 ; ireturn
     let code: Vec<u8> = vec![0xb2, 0x00, 0x01, 0xac, 0, 0];
@@ -5297,7 +5307,12 @@ fn test_getstatic_inline_direct_load_and_fallback() {
     helpers.getstatic = marker_getstatic as *const () as usize;
 
     let build = |field_index: usize| {
-        compile(
+        compile_with_request(
+            BackendRequest {
+                direct_helpers,
+                ..BackendRequest::default()
+            },
+            Vec::new(), // compact_field_info
             &code,
             code_len,
             1,
@@ -6058,8 +6073,9 @@ fn inline_ref_putfield_fast_path_is_gated_on_published_region_bounds() {
     helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
 
     // Compact layout for the site: pc 2, body offset 0, reference field.
-    set_pending_compact_field_info(vec![(2, 0, true)]);
-    let compiled = compile(
+    let compiled = compile_with_request(
+        BackendRequest::default(),
+        vec![(2, 0, true)],
         &code,
         code_len,
         2,
@@ -6255,7 +6271,8 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             "T.setRef:(Ljava/lang/Object;)V", // non-empty ⇒ trusted-oop eligible
             None,                             // despec: no VM
             Vec::new(),
-            None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+            None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
+            crate::x64::BackendRequest::default(),
         )
         .expect("reference putfield must compile")
     };
@@ -9081,7 +9098,8 @@ fn instanceof_inline_fixture(
         "T.f:(Ljava/lang/Object;)I", // non-empty ⇒ trusted-oop eligible
         None, // despec: no VM, so no despeculation verdicts
         Vec::new(),
-        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
+        crate::x64::BackendRequest::default(),
     )
     .expect("instanceof must compile")
 }
@@ -9275,7 +9293,8 @@ fn keyed_int_method(
         method_key,
         None, // despec: no VM, so no despeculation verdicts
         Vec::new(),
-        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
+        crate::x64::BackendRequest::default(),
     )
     .expect("int method must compile")
 }
@@ -10465,35 +10484,35 @@ fn test_compile_invoke_with_args() {
 #[test]
 fn test_bytecode_len_invoke() {
     // Verify bytecode length calculation for invoke opcodes
-    assert_eq!(bytecode_len_at(&[0xb6, 0x00, 0x01], 0), 3); // invokevirtual
-    assert_eq!(bytecode_len_at(&[0xb7, 0x00, 0x01], 0), 3); // invokespecial
-    assert_eq!(bytecode_len_at(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0), 5); // invokeinterface
+    assert_eq!(bytecode_analysis::step(&[0xb6, 0x00, 0x01], 0), 3); // invokevirtual
+    assert_eq!(bytecode_analysis::step(&[0xb7, 0x00, 0x01], 0), 3); // invokespecial
+    assert_eq!(bytecode_analysis::step(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0), 5); // invokeinterface
                                                                         // Defense-in-depth (same class as the missing-`ldc` desync): the other
                                                                         // 5-byte ops. invokedynamic is now accepted by `jit_scan` (see the 0xba
                                                                         // scan/codegen arms); goto_w / jsr_w are still rejected today, but the
                                                                         // length table must stay correct so a future acceptance can't silently
-                                                                        // desync every PC-stepping walk. Must match the regalloc.rs `bc_len`
+                                                                        // desync every PC-stepping walk. Must match the `bytecode_analysis::step`
                                                                         // twin's `bc_len_five_byte_ops`.
-    assert_eq!(bytecode_len_at(&[0xba, 0x00, 0x01, 0x00, 0x00], 0), 5); // invokedynamic
-    assert_eq!(bytecode_len_at(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5); // goto_w
-    assert_eq!(bytecode_len_at(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5); // jsr_w
+    assert_eq!(bytecode_analysis::step(&[0xba, 0x00, 0x01, 0x00, 0x00], 0), 5); // invokedynamic
+    assert_eq!(bytecode_analysis::step(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5); // goto_w
+    assert_eq!(bytecode_analysis::step(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5); // jsr_w
 }
 
 #[test]
 fn test_bytecode_len_wide() {
     // wide (0xc4) prefix — JVMS §6.5. Must stay in lockstep with
-    // regalloc.rs::bc_len's 0xc4 arm.
+    // `bytecode_analysis::step`'s 0xc4 arm.
     // `wide iload <2-byte index>` → 4 bytes (0x15 = iload).
-    assert_eq!(bytecode_len_at(&[0xc4, 0x15, 0x01, 0x00], 0), 4);
+    assert_eq!(bytecode_analysis::step(&[0xc4, 0x15, 0x01, 0x00], 0), 4);
     // `wide istore <2-byte index>` → 4 bytes (0x36 = istore).
-    assert_eq!(bytecode_len_at(&[0xc4, 0x36, 0x01, 0x00], 0), 4);
+    assert_eq!(bytecode_analysis::step(&[0xc4, 0x36, 0x01, 0x00], 0), 4);
     // `wide ret <2-byte index>` → 4 bytes (0xa9 = ret).
-    assert_eq!(bytecode_len_at(&[0xc4, 0xa9, 0x01, 0x00], 0), 4);
+    assert_eq!(bytecode_analysis::step(&[0xc4, 0xa9, 0x01, 0x00], 0), 4);
     // `wide iinc <2-byte index> <2-byte const>` → 6 bytes (0x84 = iinc).
-    assert_eq!(bytecode_len_at(&[0xc4, 0x84, 0x01, 0x00, 0x00, 0x01], 0), 6);
+    assert_eq!(bytecode_analysis::step(&[0xc4, 0x84, 0x01, 0x00, 0x00, 0x01], 0), 6);
     // Truncated prefix (no modified-opcode byte): the `pc + 1 < code.len()`
     // bounds check must not panic and falls to the 4-byte form.
-    assert_eq!(bytecode_len_at(&[0xc4], 0), 4);
+    assert_eq!(bytecode_analysis::step(&[0xc4], 0), 4);
 }
 
 #[test]
@@ -10836,7 +10855,7 @@ fn test_detect_int_array_sum_pattern() {
     assert_eq!(back_edge, 22);
 
     // Find induction variable
-    let back_edge_end = back_edge + bytecode_len_at(&code, back_edge);
+    let back_edge_end = back_edge + bytecode_analysis::step(&code, back_edge);
     let iv = find_induction_variable(&code, header, back_edge_end);
     assert_eq!(iv, Some(4), "Induction variable should be local 4 (i)");
 
@@ -11064,7 +11083,7 @@ fn test_detect_int_array_element_wise_rejects_non_elementwise() {
     let loops = detect_loops(&code, code_len);
     // Either no loop is detected or the pattern doesn't match — both are fine.
     for &(header, back_edge) in &loops {
-        let back_end = back_edge + bytecode_len_at(&code, back_edge);
+        let back_end = back_edge + bytecode_analysis::step(&code, back_edge);
         if let Some(iv) = find_induction_variable(&code, header, back_end) {
             assert!(
                 detect_int_array_element_wise(&code, header, back_edge, iv).is_none(),
@@ -17516,7 +17535,7 @@ fn single_pass_dispatch_arms() -> std::collections::BTreeSet<u8> {
     let src = include_str!("bytecode_walk.rs");
     // The dispatch loop's own `match op {`. Anchored on the two lines that
     // immediately precede it so a nested `match op {` cannot be picked up.
-    let anchor = "self.dbg_last_op = op;\n            match op {\n";
+    let anchor = "self.dbg_last_op = op;\n            let family = match op {\n";
     let start = src
         .find(anchor)
         .expect("the single-pass dispatch `match op` must be findable")
@@ -18008,8 +18027,9 @@ fn the_gated_ref_store_writes_both_cell_shapes_without_a_helper_call() {
     helpers.ref_store_post_young_floor = 0;
     helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
 
-    set_pending_compact_field_info(vec![(2, 0, true)]);
-    let compiled = compile(
+    let compiled = compile_with_request(
+        BackendRequest::default(),
+        vec![(2, 0, true)],
         &code,
         6,
         2,

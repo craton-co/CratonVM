@@ -5781,7 +5781,7 @@ mod tests {
         // …and it materializes back to a single `Const`, with no operand
         // anywhere in the graph holding the placeholder.
         let mut g = probe_graph();
-        let mat = build_affine(&mut g, seven.root, seven.k, seven.c, IrType::Int)
+        let mat = build_affine(&mut g, &mut ConstIntern::new(), seven.root, seven.k, seven.c, IrType::Int)
             .expect("a rootless form with k == 0 is exactly a constant");
         assert_eq!(g.nodes[mat as usize].op, Op::Const(7));
         assert!(
@@ -5792,7 +5792,7 @@ mod tests {
         // A non-zero `k` with no root is not a representable value: refuse,
         // rather than emit `Mul(nodes[u32::MAX], k)`.
         assert!(
-            build_affine(&mut g, None, 3, 0, IrType::Int).is_none(),
+            build_affine(&mut g, &mut ConstIntern::new(), None, 3, 0, IrType::Int).is_none(),
             "a rootless form with k != 0 has nothing to multiply"
         );
     }

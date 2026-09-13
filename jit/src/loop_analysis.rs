@@ -115,30 +115,12 @@ pub struct InvariantLoad {
 pub fn detect_loops(code: &[u8], code_len: usize) -> Vec<LoopInfo> {
     use std::collections::BTreeMap;
     let mut by_header: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    let mut pc = 0;
-    while pc < code_len {
-        let op = code[pc];
-        let len = inst_len_at(code, pc);
-        match op {
-            // goto / conditional branches: signed i16 offset at pc+1..=pc+2.
-            0xa7 | 0x99..=0xa6 | 0xc6 | 0xc7 => {
-                if pc + 2 < code_len {
-                    // JVM branch offsets are big-endian signed i16.
-                    // Use `from_be_bytes` to avoid the debug overflow
-                    // panic that `(byte_hi as i16) << 8` triggers when
-                    // the high bit is set.
-                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                    let target_opt = pc.checked_add_signed(offset as isize);
-                    if let Some(target) = target_opt {
-                        if target < code_len && target <= pc {
-                            by_header.entry(target).or_default().push(pc);
-                        }
-                    }
-                }
-            }
-            _ => {}
+    // Only the 16-bit `goto` / `if*` / `ifnull` back edges: `body_end` below
+    // assumes a three-byte branch.
+    for (target, src) in bytecode_analysis::back_edges(code, code_len) {
+        if matches!(code[src], 0xa7 | 0x99..=0xa6 | 0xc6 | 0xc7) {
+            by_header.entry(target).or_default().push(src);
         }
-        pc += len;
     }
     by_header
         .into_iter()
@@ -182,7 +164,7 @@ pub fn find_invariant_loads(loop_info: &LoopInfo, code: &[u8]) -> Vec<InvariantL
     let mut prev_local: Option<u16> = None;
     while pc < end {
         let op = code[pc];
-        let len = inst_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         match op {
             // aload_0..aload_3 → local index = op - 0x2a
             0x2a..=0x2d => {
@@ -284,126 +266,9 @@ fn modified_locals_in_range(code: &[u8], start: usize, end: usize) -> u64 {
             }
             _ => {}
         }
-        pc += inst_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     modified
-}
-
-/// Bytecode instruction length in bytes for the opcode at `pc`.
-///
-/// Returns 1 for genuinely-unknown opcodes so the linear scanner
-/// cannot underflow; this may slightly overcount loop bodies for
-/// esoteric ops, which only loses hoisting opportunities (never
-/// produces incorrect ones).
-///
-/// The variable-length `tableswitch`/`lookupswitch` instructions are
-/// decoded precisely (padding + payload). Returning the wrong length
-/// for them is a genuine correctness bug: any caller that advances
-/// `pc += inst_len_at(..)` would land in the middle of the switch
-/// operand bytes and decode padding / jump offsets as opcodes,
-/// desyncing the whole scan for the remainder of the method.
-fn inst_len_at(code: &[u8], pc: usize) -> usize {
-    if pc >= code.len() {
-        return 1;
-    }
-    match code[pc] {
-        // 2-byte: bipush, ldc, [ifsda]load, [ifsda]store, newarray
-        0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xbc => 2,
-        // 3-byte: sipush, ldc_w/ldc2_w, branches, getfield/static,
-        // putfield/static, invokestatic/special/virtual, new,
-        // anewarray, checkcast, instanceof, iinc.
-        0x11
-        | 0x13
-        | 0x14
-        | 0x84
-        | 0x99..=0xa6
-        | 0xa7
-        | 0xb2..=0xb8
-        | 0xbb
-        | 0xbd
-        | 0xc0
-        | 0xc1
-        | 0xc6
-        | 0xc7 => 3,
-        // 5-byte: invokedynamic / invokeinterface / multianewarray
-        0xb9 | 0xba => 5,
-        0xc5 => 4,
-        // goto_w / jsr_w: 1 opcode + 4-byte offset.
-        0xc8 | 0xc9 => 5,
-        // tableswitch (0xaa): 1 opcode byte, then 0..=3 padding bytes
-        // aligning the next byte to a 4-byte boundary *relative to the
-        // start of the code array* (the method's first bytecode is
-        // offset 0), then defaultbyte (4) + low (4) + high (4), then
-        // (high - low + 1) jump offsets of 4 bytes each.
-        0xaa => {
-            // First operand byte sits at the next 4-aligned offset.
-            let base = (pc + 1 + 3) & !3;
-            // Need low at base+4..base+8 and high at base+8..base+12.
-            let high_end = base + 12;
-            if high_end > code.len() {
-                // Truncated/garbage — fall back to a 1-byte step so
-                // the scan terminates safely rather than reading OOB.
-                return 1;
-            }
-            let low = i32::from_be_bytes([
-                code[base + 4],
-                code[base + 5],
-                code[base + 6],
-                code[base + 7],
-            ]);
-            let high = i32::from_be_bytes([
-                code[base + 8],
-                code[base + 9],
-                code[base + 10],
-                code[base + 11],
-            ]);
-            // n = high - low + 1 entries. Guard against malformed
-            // (high < low) tables that would make n negative.
-            let n = (high as i64) - (low as i64) + 1;
-            if n < 0 {
-                return 1;
-            }
-            // total = (base - pc) header skip + 12 (default/low/high)
-            //         + n * 4 jump offsets.
-            (base - pc) + 12 + (n as usize) * 4
-        }
-        // lookupswitch (0xab): 1 opcode byte, then 0..=3 padding bytes
-        // aligning to a 4-byte boundary (same rule as tableswitch),
-        // then defaultbyte (4) + npairs (4), then npairs match/offset
-        // pairs of 8 bytes each.
-        0xab => {
-            let base = (pc + 1 + 3) & !3;
-            // Need npairs at base+4..base+8.
-            let npairs_end = base + 8;
-            if npairs_end > code.len() {
-                return 1;
-            }
-            let npairs = i32::from_be_bytes([
-                code[base + 4],
-                code[base + 5],
-                code[base + 6],
-                code[base + 7],
-            ]);
-            if npairs < 0 {
-                return 1;
-            }
-            // total = (base - pc) header skip + 8 (default/npairs)
-            //         + npairs * 8 (match/offset pairs).
-            (base - pc) + 8 + (npairs as usize) * 8
-        }
-        // wide-prefixed instruction; nominal 4 bytes for most
-        // (3-byte payload follows), 6 for iinc.
-        0xc4 => {
-            if pc + 1 < code.len() && code[pc + 1] == 0x84 {
-                6
-            } else {
-                4
-            }
-        }
-        // All other opcodes are 1 byte (arithmetic, stack manip,
-        // returns, monitor, etc.).
-        _ => 1,
-    }
 }
 
 // ===========================================================================
@@ -420,6 +285,7 @@ fn inst_len_at(code: &[u8], pc: usize) -> usize {
 // analysis-only; see the module "Status" note.
 // ===========================================================================
 
+use crate::bytecode_analysis;
 use crate::scev::{AffineIv, BoundSource, CountedLoop, ExitCmp, IntRange, LoopForm, Stride};
 
 /// Which `Math` reduction an `invokestatic` inside a bound expression is.
@@ -676,7 +542,7 @@ pub fn find_iv_stride(code: &[u8], start: usize, end: usize, iv: usize) -> Optio
             }
         }
         prev = [Some(pc), prev[0], prev[1]];
-        pc += inst_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     if count == 1 {
         found
@@ -747,7 +613,7 @@ pub fn modified_locals_strict(code: &[u8], start: usize, end: usize) -> Option<u
                 return None;
             }
         }
-        pc += inst_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     Some(m)
 }
@@ -770,7 +636,7 @@ pub fn body_is_heap_stable(code: &[u8], start: usize, end: usize) -> bool {
             0xc2 | 0xc3 => return false,
             _ => {}
         }
-        pc += inst_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     true
 }
@@ -785,15 +651,15 @@ fn branch_targets(code: &[u8], code_len: usize) -> Option<Vec<usize>> {
         match code[pc] {
             0xaa | 0xab | 0xa8 | 0xa9 | 0xc8 | 0xc9 => return None,
             op if matches!(op, 0x99..=0xa7 | 0xc6 | 0xc7) && pc + 2 < code_len => {
-                let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                let target = pc as i32 + off;
-                if target >= 0 && (target as usize) < code_len {
-                    targets.push(target as usize);
+                if let Some(target) = bytecode_analysis::offset_branch_target(&code[..code_len], pc)
+                    .filter(|&t| t < code_len)
+                {
+                    targets.push(target);
                 }
             }
             _ => {}
         }
-        pc += inst_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     Some(targets)
 }
@@ -844,7 +710,7 @@ pub fn constant_iv_init(
             store = Some((pc, prev));
         }
         prev = Some(pc);
-        pc += inst_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     let (store_pc, push_pc) = match (count, store) {
         (1, Some((s, Some(p)))) => (s, p),
@@ -888,7 +754,7 @@ pub fn constant_iv_init(
                     return None;
                 }
             }
-            q += inst_len_at(code, q);
+            q += bytecode_analysis::step(code, q);
         }
     }
     const_push_value(code, push_pc, code_len)
@@ -908,70 +774,26 @@ fn loop_has_other_exit(
     exit_pc: usize,
     back_edge_pc: usize,
 ) -> bool {
-    let outside = |pc: usize, rel: i64| {
-        let target = pc as i64 + rel;
-        target < header_pc as i64 || target >= end as i64
-    };
-    let read_i32 = |at: usize| -> Option<i64> {
-        let b = code.get(at..at + 4)?;
-        Some(i64::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]])))
-    };
+    let inside = |t: usize| t >= header_pc && t < end;
     let mut pc = header_pc;
     while pc < end {
         let op = code[pc];
         if pc != exit_pc && pc != back_edge_pc {
             match op {
-                0x99..=0xa7 | 0xc6 | 0xc7 => {
-                    let Some(b) = code.get(pc + 1..pc + 3) else {
-                        return true;
-                    };
-                    if outside(pc, i64::from(i16::from_be_bytes([b[0], b[1]]))) {
+                0x99..=0xa7 | 0xc6 | 0xc7 | 0xc8 => {
+                    if !bytecode_analysis::offset_branch_target(code, pc).is_some_and(inside) {
                         return true;
                     }
                 }
-                0xc8 => match read_i32(pc + 1) {
-                    Some(rel) if !outside(pc, rel) => {}
+                0xaa | 0xab => match bytecode_analysis::switch_table(code, code.len(), pc) {
+                    Some(table) if table.targets().all(inside) => {}
                     _ => return true,
                 },
-                0xaa | 0xab => {
-                    let base = pc + 1 + (4 - (pc + 1) % 4) % 4;
-                    let Some(default) = read_i32(base) else {
-                        return true;
-                    };
-                    if outside(pc, default) {
-                        return true;
-                    }
-                    let offsets: Vec<usize> = if op == 0xaa {
-                        let (Some(lo), Some(hi)) = (read_i32(base + 4), read_i32(base + 8)) else {
-                            return true;
-                        };
-                        if hi < lo || (hi - lo) as usize >= code.len() {
-                            return true;
-                        }
-                        (0..(hi - lo + 1) as usize)
-                            .map(|i| base + 12 + 4 * i)
-                            .collect()
-                    } else {
-                        let Some(n) = read_i32(base + 4) else {
-                            return true;
-                        };
-                        if n < 0 || n as usize > code.len() {
-                            return true;
-                        }
-                        (0..n as usize).map(|i| base + 12 + 8 * i).collect()
-                    };
-                    for at in offsets {
-                        match read_i32(at) {
-                            Some(rel) if !outside(pc, rel) => {}
-                            _ => return true,
-                        }
-                    }
-                }
                 0xa8 | 0xa9 | 0xc9 | 0xac..=0xb1 | 0xbf => return true,
                 _ => {}
             }
         }
-        pc += inst_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     false
 }
@@ -1021,7 +843,7 @@ pub fn analyze_counted_loop_at(
     if header_pc >= code_len || back_edge_pc >= code_len {
         return None;
     }
-    let end = (back_edge_pc + inst_len_at(code, back_edge_pc)).min(code_len);
+    let end = (back_edge_pc + bytecode_analysis::step(code, back_edge_pc)).min(code_len);
     if header_pc >= end {
         return None;
     }
@@ -1096,7 +918,7 @@ pub fn analyze_counted_loop_at(
                 }
             }
         }
-        pc += inst_len_at(code, pc);
+        pc += bytecode_analysis::step(code, pc);
     }
     None
 }
@@ -1237,13 +1059,13 @@ mod tests {
         assert_eq!(code.len(), 28);
         // Length of the tableswitch at PC 1 must carry the scanner to
         // PC 28 (end of code): 28 - 1 = 27.
-        assert_eq!(inst_len_at(&code, 1), 27);
+        assert_eq!(bytecode_analysis::step(&code, 1), 27);
         // And a linear scan from PC 0 lands exactly on the end, never
         // mis-decoding a padding/offset byte as an opcode.
         let mut pc = 0;
         let mut steps = 0;
         while pc < code.len() {
-            pc += inst_len_at(&code, pc);
+            pc += bytecode_analysis::step(&code, pc);
             steps += 1;
             assert!(steps < 100, "scan failed to terminate (desync)");
         }
@@ -1272,7 +1094,7 @@ mod tests {
         code.extend_from_slice(&2i32.to_be_bytes()); // PC 20..24 match[1]
         code.extend_from_slice(&0i32.to_be_bytes()); // PC 24..28 offset[1]
         assert_eq!(code.len(), 28);
-        assert_eq!(inst_len_at(&code, 0), 28);
+        assert_eq!(bytecode_analysis::step(&code, 0), 28);
     }
 
     #[test]
@@ -1280,12 +1102,12 @@ mod tests {
         // A bare tableswitch opcode with no room for the header must
         // not read out of bounds; it falls back to a 1-byte step.
         let code: Vec<u8> = vec![0xaa, 0x00, 0x00];
-        assert_eq!(inst_len_at(&code, 0), 1);
+        assert_eq!(bytecode_analysis::step(&code, 0), 1);
         // Likewise a malformed lookupswitch with negative npairs.
         let mut bad: Vec<u8> = vec![0xab, 0x00, 0x00, 0x00];
         bad.extend_from_slice(&0i32.to_be_bytes()); // default
         bad.extend_from_slice(&(-5i32).to_be_bytes()); // npairs < 0
-        assert_eq!(inst_len_at(&bad, 0), 1);
+        assert_eq!(bytecode_analysis::step(&bad, 0), 1);
     }
 
     // -- counted-loop recognition ------------------------------------------

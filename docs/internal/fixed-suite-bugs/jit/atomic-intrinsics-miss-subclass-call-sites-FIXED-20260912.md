@@ -117,16 +117,26 @@ before.
 
 ## Not covered by this fix
 
-- **The final-devirt rewrite.** `try_compile_inner` rewrites an
-  `invokevirtual` of a `final` method to a static bind (`invoke_kind = 1`),
-  which skips the intrinsic gate. `site_yields_to_call_site_intrinsic` does
-  not consult the Atomic matchers. What keeps Atomic sites, exact or subclass,
-  at `invoke_kind == 0` today is the native screen in
-  `invokevirtual_site_final_owner`: the RMW methods have registered natives.
-  A method of this family with no registered native, or
-  `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN=0`, would pin the site to a static
-  bind. That is pre-existing, and it affects exact-class sites equally.
-- **The IR tier.** `ir::try_ir_unbox_intrinsic` still matches only the exact
-  class triples.
-- **No end-to-end probe.** Nothing yet runs a `Counter extends AtomicInteger`
-  loop and asserts the `ATOMIC_INTRINSIC_SITES` count.
+Both gaps this section used to list are closed too.
+
+- **The final-devirt rewrite now yields to the Atomic ladders.**
+  `try_compile_inner` rewrites an `invokevirtual` of a `final` method to a
+  static bind (`invoke_kind = 1`), which skips the intrinsic gate. Before, only
+  the native screen in `invokevirtual_site_final_owner` kept Atomic sites at
+  `invoke_kind == 0`, because the RMW methods have registered natives. A method
+  of the family with no native, or `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN=0`,
+  would have been pinned to a static bind. The yield now also asks
+  `site_yields_to_atomic_intrinsic`, which calls
+  `atomic_intrinsic_for_invoke_site` exactly as the registration does, for both
+  families, exact and subclass sites alike.
+- **The IR tier matches subclass sites.** `ir_unbox_match_class` hands
+  `ir::try_ir_unbox_intrinsic` the JDK class name for a subclass site whose
+  method the declaring-class resolver places in the JDK class, `final` there.
+  The site's own class id stays the layout source and the guard. The lowered
+  `Op::Unbox` compares the receiver's class id exactly, so any other receiver
+  deopts.
+
+Tests: `the_final_devirt_rewrite_yields_to_an_atomic_subclass_site` and
+`ir_unbox_sites_of_an_atomic_subclass_match_as_the_jdk_class` (`jit/src/lib.rs`).
+No VM-level probe runs a `Counter extends AtomicInteger` loop; the registration,
+yield and IR match are each covered at the unit level.

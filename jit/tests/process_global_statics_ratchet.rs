@@ -73,7 +73,10 @@ use std::path::{Path, PathBuf};
 // test fixtures merged alongside this ratchet, not process state: the
 // `HITS` marker-helper counters and the `FLAG` byte in the instanceof and
 // return-narrowing tests (`ir_lower.rs` and `x64/tests.rs` test modules).
-const BASELINE: usize = 747;
+// 2026-09-12: 747 -> 717. The per-compile request (`CompileRequest`) retired
+// the self-call-identity and local-handler thread-locals, and the direct-call
+// helper cells became the per-compile `DirectHelperTable`.
+const BASELINE: usize = 717;
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {

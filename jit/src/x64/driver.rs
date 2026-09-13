@@ -11,95 +11,15 @@
 //! — correct only for all-category-1 parameter lists, which is why it is a test
 //! and AOT entry rather than the one `try_compile` uses.
 //!
-//! The thread-locals here are the staging channel for metadata that would
-//! otherwise have to thread through an already-enormous argument list. Each is
-//! *taken* (cleared) at the entry that consumes it, so a compile that bails out
-//! cannot leak its staging into the next method compiled on the same worker.
+//! Per-method requests travel on [`BackendRequest`], a value passed to the
+//! call, so a compile that bails out cannot leak one into the next method
+//! compiled on the same worker.
 
 use super::*;
 
 // ---------------------------------------------------------------------------
 // Public compilation entry point
 // ---------------------------------------------------------------------------
-
-thread_local! {
-    /// Compact reference-field layout: per-pc `(byte_offset, is_ref)` for the
-    /// next `compile()` call, set by the interpreter's execute / OSR compile
-    /// paths (which use the `compile` wrapper, not `compile_with_param_slots`
-    /// directly) so their getfield/putfield get inline compact codegen. Taken
-    /// (cleared) by the wrapper. Empty for every other caller (tests, AOT) →
-    /// legacy/helper field path. Same-thread, synchronous compile, no nesting.
-    static PENDING_COMPACT_FIELD_INFO: std::cell::RefCell<Vec<(usize, u32, bool)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    static PENDING_VERIFIED_MAX_STACK: std::cell::RefCell<Option<usize>> =
-        const { std::cell::RefCell::new(None) };
-    /// `(start_pc, end_pc, handler_pc)` of this method's exception table,
-    /// staged for the next `compile_with_param_slots` on this thread and
-    /// consumed (taken) at its entry, so a compile that bails out cannot leak
-    /// them into the next method compiled on this worker. Empty for every
-    /// caller that does not stage them (tests, AOT, the legacy `compile`
-    /// wrapper, OSR artifacts) and for every handler-free method — byte
-    /// identical codegen there. See `find_bypassable_loop_headers`.
-    static PENDING_EXCEPTION_RANGES: std::cell::RefCell<Vec<(usize, usize, usize)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// `(start_pc, end_pc, handler_pc, catch type name)` of this method's
-    /// exception table, staged for the next `compile_with_param_slots` on this
-    /// thread and consumed at its entry.
-    ///
-    /// The same table as `PENDING_EXCEPTION_RANGES` plus the one thing a
-    /// compiled `catch` needs and a liveness analysis does not: WHICH
-    /// throwables each entry takes. An EMPTY name is `catch_type == 0`, the
-    /// catch-all. Empty vector ⇒ no local handlers, byte-identical codegen.
-    static PENDING_LOCAL_HANDLER_TABLE: std::cell::RefCell<
-        Vec<(usize, usize, usize, &'static str)>,
-    > = const { std::cell::RefCell::new(Vec::new()) };
-    /// The compiling method's declaring class id, staged beside the table
-    /// above: a catch-type NAME is not a class identity, and this is the loader
-    /// context it resolves through at runtime.
-    static PENDING_LOCAL_HANDLER_CLASS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-/// Stage the compact-field-info for the next [`compile`] call on this thread.
-/// Call immediately before `compile`; the wrapper takes (clears) it.
-pub fn set_pending_compact_field_info(info: Vec<(usize, u32, bool)>) {
-    PENDING_COMPACT_FIELD_INFO.with(|c| *c.borrow_mut() = info);
-}
-
-/// Stage the reader/verifier max_stack for the next x64 compile on this thread.
-/// Synthetic callers that do not stage it keep using the local estimator.
-pub(crate) fn set_pending_verified_max_stack(max_stack: usize) {
-    PENDING_VERIFIED_MAX_STACK.with(|c| *c.borrow_mut() = Some(max_stack));
-}
-
-/// Stage this method's exception table as `(start_pc, end_pc, handler_pc)` for
-/// the next x64 compile on this thread. Call immediately before
-/// `compile_with_param_slots`; it takes (clears) them. Consumed only by
-/// `find_bypassable_loop_headers`, to treat a handler that can be entered from
-/// outside a loop as an external entry into that loop's header.
-///
-/// `pub` (not `pub(crate)`) since 2026-08-17: the interpreter's
-/// `compile_osr_artifact` stages it too, as one of the three requests the
-/// RBC.6b lift needs. See that door's comment.
-pub fn set_pending_exception_ranges(ranges: Vec<(usize, usize, usize)>) {
-    PENDING_EXCEPTION_RANGES.with(|c| *c.borrow_mut() = ranges);
-}
-
-/// Stage this method's exception table WITH catch types, so the backend can
-/// emit its own `catch` blocks and enter them from compiled code.
-///
-/// `(start_pc, end_pc, handler_pc, catch type name)`; an empty name is a
-/// catch-all (`catch_type == 0`). The names must outlive the compiled code —
-/// callers pass process-wide interned strings, the same ones `checkcast` sites
-/// use. One-shot, taken at backend entry like every other staged request, so a
-/// front-end bail cannot leak one method's handlers into the next compile on
-/// this worker thread. Staging nothing is the pre-feature behaviour.
-pub fn set_pending_local_handler_table(
-    table: Vec<(usize, usize, usize, &'static str)>,
-    declaring_class_id: u32,
-) {
-    PENDING_LOCAL_HANDLER_TABLE.with(|c| *c.borrow_mut() = table);
-    PENDING_LOCAL_HANDLER_CLASS.with(|c| c.set(declaring_class_id));
-}
 
 /// RAII scope for one compile's PC -> inline-chain recording session.
 ///
@@ -207,6 +127,64 @@ pub fn compile(
     inline_sites: HashMap<usize, crate::InlineSite>,
     string_layout: Option<crate::StringFieldLayout>,
 ) -> Option<CompiledMethod> {
+    compile_with_request(
+        BackendRequest::default(),
+        Vec::new(), // compact_field_info
+        code,
+        code_len,
+        num_params,
+        max_locals,
+        needs_heap,
+        multianewarray_info,
+        field_info,
+        typecheck_info,
+        static_field_info,
+        new_info,
+        anewarray_info,
+        invoke_info,
+        direct_calls,
+        mic_slots,
+        pic_slots,
+        ldc_info,
+        ldc2w_info,
+        branch_hints,
+        loop_unroll_hints,
+        helpers,
+        non_escaping_new,
+        inline_sites,
+        string_layout,
+    )
+}
+
+/// [`compile`] with the VM's direct-call helper table wired.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_request(
+    backend: BackendRequest,
+    compact_field_info: Vec<(usize, u32, bool)>,
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    max_locals: usize,
+    needs_heap: bool,
+    multianewarray_info: Vec<(usize, i64)>,
+    field_info: Vec<(usize, usize, u8)>,
+    typecheck_info: Vec<(usize, *const u8, usize)>,
+    static_field_info: Vec<(usize, u32, usize, u8, bool)>,
+    new_info: Vec<(usize, u32, usize, bool, bool)>,
+    anewarray_info: Vec<(usize, u32)>,
+    invoke_info: Vec<(usize, *const JitInvokeInfo)>,
+    direct_calls: Vec<(usize, crate::JitDirectCall)>,
+    mic_slots: Vec<(usize, *const crate::JitMICSlot)>,
+    pic_slots: Vec<(usize, *const crate::JitPICSlot)>,
+    ldc_info: Vec<(usize, i64)>,
+    ldc2w_info: Vec<(usize, i64)>,
+    branch_hints: HashMap<usize, bool>,
+    loop_unroll_hints: HashMap<usize, usize>,
+    helpers: &JitRuntimeHelpers,
+    non_escaping_new: std::collections::HashSet<usize>,
+    inline_sites: HashMap<usize, crate::InlineSite>,
+    string_layout: Option<crate::StringFieldLayout>,
+) -> Option<CompiledMethod> {
     // This wrapper does NOT take an admission token, and that is deliberate.
     //
     // It is the legacy test entry point — its "arg index == JVM slot"
@@ -264,15 +242,16 @@ pub fn compile(
         &[],
         0,
         0, // param_oop_mask: legacy/test path seeds no oop params (conservative)
-        // Compact field info staged by the caller (interpreter execute/OSR);
-        // empty for tests/AOT → legacy/helper field path.
-        PENDING_COMPACT_FIELD_INFO.with(|c| std::mem::take(&mut *c.borrow_mut())),
+        // The caller's compact field layout; empty from `compile`, which keeps
+        // the legacy/helper field path.
+        compact_field_info,
         "",         // method_key: legacy/test wrapper disables the per-bci de-spec consult
         None,       // despec: no VM, so no per-VM de-spec registry to consult
         Vec::new(), // indy_info: legacy/test wrapper passes no invokedynamic sites
         // elidable_init_pcs: no constant pool here, so nothing is PROVEN empty
         // and nothing may be elided. See the parameter's doc.
         None,
+        backend,
     )
 }
 
@@ -346,7 +325,7 @@ pub(super) fn gc_inert_selfrec_candidate(
         if !allowed {
             return false;
         }
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 || pc.saturating_add(len) > code_len {
             return false;
         }
@@ -599,6 +578,9 @@ pub fn compile_with_param_slots(
     // pcs that are absent from this set, so copies simply keep their `<init>`
     // calls — an optimisation left on the table, never a miscompile.
     elidable_init_pcs: Option<std::collections::HashSet<usize>>,
+    // The VM's thin direct-call helper addresses for this compile.
+    // Everything else this compile is asked to do; see `BackendRequest`.
+    backend: BackendRequest,
 ) -> Option<CompiledMethod> {
     // Cost of a discarded lowering, for the code-buffer bail below. Reading a
     // monotonic clock once per compile is noise next to the compile itself.
@@ -657,28 +639,21 @@ pub fn compile_with_param_slots(
         &pic_slots,
         &indy_info,
     );
-    let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
-    // One-shot like every other staged request below: take it here so an early
-    // bail cannot leak this method's handler ranges into an unrelated later
-    // compile on this worker thread.
-    let exception_ranges: Vec<(usize, usize, usize)> =
-        PENDING_EXCEPTION_RANGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    // Same one-shot discipline. Taken unconditionally — even when the feature
-    // is off — so a staged table can never survive into a later compile.
-    let staged_local_handlers: Vec<(usize, usize, usize, &'static str)> =
-        PENDING_LOCAL_HANDLER_TABLE.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    let staged_local_handler_class = PENDING_LOCAL_HANDLER_CLASS.with(|c| c.replace(0));
-    // Consume the pure-kernel GPR local-homes request FIRST so an early bail
-    // below can never leak it into an unrelated later compile on this thread.
-    let kernel_reg_homes_requested = KERNEL_REG_HOMES_REQUEST.with(|c| c.take());
-    // A handler-local request is one-shot too, so a compile bailout cannot
-    // accidentally arm the next unrelated method on this worker thread.
-    let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
-    // Open the PC -> inline-chain recording session for this compile, with the
-    // one-shot `take`s above and for the same reason they are here: everything
-    // staged on this thread is claimed BEFORE any bail can leak it into the
-    // next method compiled on this worker. `open()` additionally discards
-    // anything an abandoned earlier compile left behind, so it is safe
+    // The request is a value, destructured once here; nothing in it can outlive
+    // this call.
+    let BackendRequest {
+        direct_helpers,
+        verified_max_stack,
+        exception_ranges,
+        local_handler_table: staged_local_handlers,
+        local_handler_class: staged_local_handler_class,
+        kernel_reg_homes: kernel_reg_homes_requested,
+        kernel_reg_homes_osr,
+        precise_exception_frames,
+        protected_ranges,
+    } = backend;
+    // Open the PC -> inline-chain recording session for this compile. `open()`
+    // discards anything an abandoned earlier compile left behind, so it is safe
     // unconditionally and costs one thread-local write. Nothing above this
     // point emits a byte of code, and nothing above it returns.
     //
@@ -688,26 +663,16 @@ pub fn compile_with_param_slots(
     let _inline_frame_session = InlineFrameSession::open();
     if crate::rbc6_emit_dbg() {
         eprintln!(
-            "[rbc6-emit] driver took precise_exception_frames={precise_exception_frames}              exception_ranges={} protected_ranges_pending={}",
+            "[rbc6-emit] driver took precise_exception_frames={precise_exception_frames} exception_ranges={} protected_ranges={}",
             exception_ranges.len(),
-            PROTECTED_RANGES_REQUEST.with(|c| {
-                let v = c.take();
-                let n = v.as_ref().map(|r| r.len()).unwrap_or(0);
-                c.set(v);
-                n
-            }),
+            protected_ranges.len(),
         );
     }
-    // Same one-shot discipline as the flag above.
-    let protected_ranges = PROTECTED_RANGES_REQUEST
-        .with(|c| c.take())
-        .unwrap_or_default();
     // OSR-tier request (perf/halfgap-20260717): same purity conditions below,
     // but the published artifact KEEPS its OSR entries — the trampoline's
     // register-seeded entry contract is exactly what the assignments
-    // describe. See `set_kernel_reg_homes_osr_request`.
-    let kernel_reg_homes_osr_requested =
-        KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.take()) && kernel_reg_osr_enabled();
+    // describe. See `BackendRequest::kernel_reg_homes_osr`.
+    let kernel_reg_homes_osr_requested = kernel_reg_homes_osr && kernel_reg_osr_enabled();
 
     // ── Bytecode loop rewriter (opt-in; see `set_bytecode_loop_rewriter_armed`)
     //
@@ -1359,7 +1324,7 @@ pub fn compile_with_param_slots(
             .iter()
             .filter(|(header, _)| !bypassable_headers.contains(header))
             .filter_map(|&(header, back_edge)| {
-                let loop_end = back_edge + bytecode_len_at(code, back_edge);
+                let loop_end = back_edge + bytecode_analysis::step(code, back_edge);
                 let iv = find_induction_variable(code, header, loop_end)?;
                 detect_matrix_dot_loop(code, header, back_edge, iv)
             })
@@ -1383,7 +1348,7 @@ pub fn compile_with_param_slots(
     let simd_loops = if has_avx2() && !no_bce {
         let mut simd = Vec::new();
         for &(header, back_edge) in &loops {
-            let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
+            let back_edge_end = back_edge + bytecode_analysis::step(code, back_edge);
             if let Some(iv) = find_induction_variable(code, header, back_edge_end) {
                 if let Some(info) = detect_int_array_sum(code, header, back_edge, iv) {
                     simd.push(info);
@@ -1413,7 +1378,7 @@ pub fn compile_with_param_slots(
     let simd_element_wise_loops = {
         let mut ewise = Vec::new();
         for &(header, back_edge) in &loops {
-            let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
+            let back_edge_end = back_edge + bytecode_analysis::step(code, back_edge);
             if let Some(iv) = find_induction_variable(code, header, back_edge_end) {
                 if let Some(info) = detect_int_array_element_wise(code, header, back_edge, iv) {
                     ewise.push(info);
@@ -1736,7 +1701,7 @@ pub fn compile_with_param_slots(
     // metadata for them). When one exists, reserve the floor frame slot so
     // each such site can do the two-instruction `CMP RSP, [rbp - floor]`
     // instead of a `self_call_stack_guard` helper CALL per recursion level.
-    // The walk uses `bytecode_len_at`; a desync past a variable-length switch
+    // The walk uses `bytecode_analysis::step`; a desync past a variable-length switch
     // can at worst set the flag spuriously, which only reserves an unused
     // slot + one prologue helper call (never unsound).
     let reserve_stack_floor = needs_heap
@@ -1754,7 +1719,7 @@ pub fn compile_with_param_slots(
                     found = true;
                     break;
                 }
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
             found
         };
@@ -1789,6 +1754,7 @@ pub fn compile_with_param_slots(
         !indy_info.is_empty(),
         protected_ranges,
     );
+    compiler.direct_helpers = direct_helpers;
     KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
     // ── Compiled local exception handlers ────────────────────────────────
     //
@@ -2833,7 +2799,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // call; the two must not drift, or an artifact would advertise a trap it
     // does not have (or, far worse, hide one it does).
     cm.has_indy_trap = {
-        let bridge_entry = crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
+        let bridge_entry = direct_helpers.indy_bridge;
         compiler
             .indy_info
             .iter()
@@ -3221,7 +3187,7 @@ pub(super) fn estimate_max_stack(code: &[u8], code_len: usize) -> usize {
         // (incl. switch pad/offset tables) as phantom opcodes; a phantom
         // return zeroed `depth` and could UNDER-estimate the frame's operand
         // stack (the CM-FASTMATH length-table desync family).
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 {
             break;
         }

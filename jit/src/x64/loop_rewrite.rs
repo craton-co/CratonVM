@@ -152,7 +152,7 @@ pub(super) fn native_unroller_enabled() -> bool {
 /// Rather than re-derive those facts here, this asks the bytecode-level
 /// rewriter [`plan_loop_unroll`], whose admission test is exactly that list,
 /// proved with real dominators over an instruction-granularity CFG
-/// (`MethodCfg`) instead of the "any backward branch is a loop" heuristic used
+/// (`bytecode_analysis::InsnCfg`) instead of the "any backward branch is a loop" heuristic used
 /// elsewhere in this backend, and re-checked on its own output. The rewritten
 /// bytes are discarded — only the verdict is used, so the emitter still sees
 /// the caller's bytecode and nothing needs re-keying. See

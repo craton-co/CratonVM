@@ -157,7 +157,7 @@ struct IndyInfo {
 /// this is the tag that says which.
 ///
 /// The codegen carries exactly one `usize` per indy site (the fifth element of
-/// `indy_info`) and calls exactly one entry (`cratonvm_jit::INDY_BRIDGE_FN`),
+/// `indy_info`) and calls exactly one entry (`cratonvm_jit::DirectHelperTable::indy_bridge`),
 /// so the discriminator has to live in the pointed-to metadata rather than in
 /// the call sequence. Both site structs are `#[repr(C)]` with this `u32` as
 /// their first field, and [`jit_indy_site_kind`] is the only reader.

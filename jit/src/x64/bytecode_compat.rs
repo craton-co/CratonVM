@@ -436,7 +436,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             // `OSR-recompile reason=no-cached-artifact` repeating forever.
             //
             // Every downstream consumer was already built for this and says so
-            // in its own comment: `bytecode_len_at` and regalloc's `bc_len`
+            // in its own comment: `bytecode_analysis::step` and `bytecode_analysis::step`
             // twin size it 4/6 "as defense-in-depth ... if any is ever
             // accepted", `find_reference_locals` reads its `aload`/`astore`
             // forms, `classify_local_kinds` has tests for all three shapes, and

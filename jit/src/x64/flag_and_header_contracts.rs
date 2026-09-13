@@ -43,6 +43,13 @@ fn backend_sources() -> String {
     [
         include_str!("../x64.rs"),
         include_str!("bytecode_walk.rs"),
+        include_str!("op_local_stack.rs"),
+        include_str!("op_array.rs"),
+        include_str!("op_arith.rs"),
+        include_str!("op_control.rs"),
+        include_str!("op_field.rs"),
+        include_str!("op_invoke.rs"),
+        include_str!("op_object.rs"),
         include_str!("emit.rs"),
         include_str!("operand_stack.rs"),
         include_str!("frames.rs"),
@@ -189,9 +196,16 @@ fn rel8_patch_out_of_range_bails_instead_of_truncating() {
 /// Needles are assembled at runtime so this test's own text does not match.
 #[test]
 fn rel8_displacement_patches_all_go_through_the_range_checked_helper() {
-    let sources: [(&str, &str); 9] = [
+    let sources: [(&str, &str); 16] = [
         ("x64.rs", include_str!("../x64.rs")),
         ("x64/bytecode_walk.rs", include_str!("bytecode_walk.rs")),
+        ("x64/op_local_stack.rs", include_str!("op_local_stack.rs")),
+        ("x64/op_array.rs", include_str!("op_array.rs")),
+        ("x64/op_arith.rs", include_str!("op_arith.rs")),
+        ("x64/op_control.rs", include_str!("op_control.rs")),
+        ("x64/op_field.rs", include_str!("op_field.rs")),
+        ("x64/op_invoke.rs", include_str!("op_invoke.rs")),
+        ("x64/op_object.rs", include_str!("op_object.rs")),
         ("x64/emit.rs", include_str!("emit.rs")),
         ("x64/arith.rs", include_str!("arith.rs")),
         ("x64/frames.rs", include_str!("frames.rs")),
@@ -532,7 +546,7 @@ fn the_inline_allocator_writes_the_mark_word_unconditionally() {
 /// could only ever observe the unpublished default.
 #[test]
 fn dropping_the_post_init_helper_asks_the_collector_first() {
-    let src = include_str!("bytecode_walk.rs");
+    let src = crate::x64::bytecode_walk::WALK_SOURCES;
     let start = src
         .find("let skip_helper =")
         .expect("the `new` arm must still decide whether to skip the post-init helper");

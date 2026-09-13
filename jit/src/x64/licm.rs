@@ -163,7 +163,7 @@ pub(super) fn find_array_len_hoists(
     let mut claimed_pcs: Vec<usize> = Vec::new();
 
     for &(header, back_edge) in &sorted_loops {
-        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        let loop_end = back_edge + bytecode_analysis::step(code, back_edge);
         if loop_end > code_len || header >= loop_end {
             continue;
         }
@@ -178,7 +178,7 @@ pub(super) fn find_array_len_hoists(
                 unmodelled = true;
                 break;
             }
-            let l = bytecode_len_at(code, scan);
+            let l = bytecode_analysis::step(code, scan);
             if l == 0 {
                 unmodelled = true;
                 break;
@@ -195,12 +195,12 @@ pub(super) fn find_array_len_hoists(
         let mut pc = header;
         while pc < loop_end && pc < code_len {
             if claimed_pcs.contains(&pc) {
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
                 continue;
             }
             let Some((array_local, seq_end)) = match_invariant_arraylength(code, pc, code_len)
             else {
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
                 continue;
             };
             // `find_modified_locals` saturates every local index at bit 63, so
@@ -236,7 +236,7 @@ pub(super) fn find_array_len_hoists(
                 }
                 pc = seq_end;
             } else {
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
         }
     }
@@ -287,7 +287,7 @@ fn straight_line_prefix_of_header(
         if !pure_push {
             return false;
         }
-        let l = bytecode_len_at(code, pc);
+        let l = bytecode_analysis::step(code, pc);
         if l == 0 {
             return false;
         }
@@ -306,7 +306,7 @@ fn branch_target_pcs(code: &[u8], start: usize, end: usize) -> Vec<usize> {
     let mut pc = start;
     while pc < end {
         let op = code[pc];
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 {
             break;
         }
@@ -338,7 +338,7 @@ fn branch_target_pcs(code: &[u8], start: usize, end: usize) -> Vec<usize> {
             }
             // tableswitch / lookupswitch: every target is a branch target, and
             // decoding their variable-length payloads here would duplicate
-            // `bytecode_len_at`. Treat the whole span as entered rather than
+            // `bytecode_analysis::step`. Treat the whole span as entered rather than
             // half-decode them -- a switch in the body is rare and losing the
             // hoist there costs nothing anyone can measure.
             0xaa | 0xab => {
@@ -366,146 +366,6 @@ pub(super) struct FpLoopHoist {
     pub(super) local_idx: usize,
     /// true = double (dload), false = float (fload).
     pub(super) is_double: bool,
-}
-
-/// Get the byte length of a bytecode instruction at `pc`.
-pub(crate) fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
-    match code[pc] {
-        // 2-byte: bipush(0x10), ldc(0x12), iload..aload(0x15..0x19),
-        // istore..astore(0x36..0x3a), ret(0xa9), newarray(0xbc).
-        // `ldc` (0x12) was previously absent and fell through to the `_ => 1`
-        // arm — a 1-byte under-count that misaligned every PC-stepping consumer
-        // (branch-target precompute, DCE, OSR/unroll). When an `ldc` sat
-        // immediately before a branch (e.g. `ldc 65536; if_icmpge exit` — the
-        // standard `for (i; i<CONST; …)` header), the scan skipped the branch,
-        // never marked its exit target, DCE-killed that target, and left the
-        // loop-exit `if_icmpge` unpatched (rel32=0) → the loop overran its bound
-        // (BC SPHINCS-256 Horst.horst_sign AIOOBE).
-        0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
-        // 3-byte: sipush(0x11), ldc_w(0x13), ldc2_w(0x14), iinc(0x84), jsr(0xa8),
-        // the if_* family, field/invoke ops, etc. ldc_w/ldc2_w were also absent.
-        0x11
-        | 0x13
-        | 0x14
-        | 0x84
-        | 0xa8
-        | 0x99..=0xa6
-        | 0xa7
-        | 0xb2
-        | 0xb3
-        | 0xb4
-        | 0xb5
-        | 0xb6
-        | 0xb7
-        | 0xb8
-        | 0xbd
-        | 0xc0
-        | 0xc1
-        | 0xc6
-        | 0xc7 => 3,
-        0xbb => 3, // new
-        0xc5 => 4,
-        // 5-byte instructions. invokeinterface (0xb9: opcode, cp_hi, cp_lo,
-        // count, 0) and invokedynamic (0xba: opcode, cp_hi, cp_lo, 0, 0) are
-        // both reachable in a compiled method today (`jit_scan` accepts
-        // both). The wide-offset branches goto_w (0xc8) / jsr_w (0xc9:
-        // opcode + 4-byte signed offset) are still rejected by `jit_scan`
-        // (catch-all → `None`), so no compiled method contains them — but,
-        // like `wide` (0xc4) below, the length table must stay correct as
-        // defense-in-depth so every PC-stepping consumer (branch-target
-        // precompute, DCE, OSR/unroll, instruction-start map, oop-map dataflow)
-        // stays in lockstep if any is ever accepted. A missing entry
-        // under-counts by 4 bytes and misaligns the walk — the same class of
-        // bug as the previously-absent `ldc`. Keep the regalloc.rs `bc_len`
-        // twin in sync.
-        0xb9 | 0xba | 0xc8 | 0xc9 => 5,
-        // wide (0xc4) — prefix modifies the following opcode to use a 2-byte
-        // local index. JVMS §6.5 wide: `wide <opcode> <indexbyte1> <indexbyte2>`
-        // is 4 bytes for the load/store/ret family, and `wide iinc <index>
-        // <const>` is 6 bytes (extra 2-byte signed constant). The modified
-        // opcode is the byte at `pc + 1`: only `iinc` (0x84) takes the 6-byte
-        // form. NOT latent, whatever this comment used to say: `jit_scan`
-        // accepts the widened load/store and `iinc` forms
-        // (`x64/bytecode_compat.rs`), so compiled methods DO contain `wide` and
-        // every PC-stepping consumer of this table is load-bearing rather than
-        // defensive. Keep the regalloc.rs `bc_len` twin in sync.
-        0xc4 => {
-            if pc + 1 < code.len() && code[pc + 1] == 0x84 {
-                6 // wide iinc
-            } else {
-                4 // wide <load/store/ret>
-            }
-        }
-        // tableswitch — variable length
-        0xaa => {
-            let mut p = pc + 1;
-            while p % 4 != 0 {
-                p += 1;
-            }
-            // Truncated header: a tableswitch placed near the end of `code` may
-            // not carry the full 12-byte default/low/high header. Reading it
-            // would index past `code_len` and panic. Return a length that
-            // consumes the rest of `code` so any walker that uses this helper
-            // terminates without an OOB read; the main compile loop's own
-            // `pc + 12 > code_len` guard then rejects the method.
-            if p + 12 > code.len() {
-                return code.len() - pc;
-            }
-            let low = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
-            let high = i32::from_be_bytes([code[p + 8], code[p + 9], code[p + 10], code[p + 11]]);
-            // Checked `high - low + 1`: raw i32 arithmetic overflows on
-            // attacker-controlled bounds. Such methods are already rejected by
-            // `jit_scan`; if one ever reaches here, fall back to a zero count
-            // (header-only length) rather than overflowing the address math.
-            let count = checked_tableswitch_count(low, high).unwrap_or(0);
-            (p + 12 + count * 4) - pc
-        }
-        // lookupswitch — variable length
-        0xab => {
-            let mut p = pc + 1;
-            while p % 4 != 0 {
-                p += 1;
-            }
-            // Truncated header (see tableswitch above): bail to a remainder
-            // length rather than reading the 8-byte default/npairs header OOB.
-            if p + 8 > code.len() {
-                return code.len() - pc;
-            }
-            // A negative `npairs` (crafted bytecode) cast straight to usize would
-            // become an enormous value and overflow the address math below; clamp
-            // to 0 so the length stays sane (the main loop rejects such methods).
-            let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]])
-                .max(0) as usize; // Widening: always safe
-            (p + 8 + npairs * 8) - pc
-        }
-        _ => 1,
-    }
-}
-
-/// array_receiver_local soundness fix — build a bitmap of valid instruction
-/// START offsets for `code[..code_len]`.
-///
-/// Backward scans (e.g. reading `code[pc - 1]` and guessing the opcode) are
-/// unsound: a multi-byte instruction's trailing OPERAND byte can collide with
-/// a real opcode value, so a naive "previous byte" decode mis-identifies the
-/// instruction. The only reliable way to know whether a given offset is an
-/// instruction boundary is to walk FORWARD from PC 0 stepping by
-/// [`bytecode_len_at`] (the same walk used by [`compute_branch_targets`] and
-/// the oop-map dataflow). `starts[k]` is `true` iff `k` is the first byte of
-/// some instruction reached by that linear walk.
-///
-/// Callers use this to *validate* a candidate instruction position before
-/// trusting a backward-derived decode; when the candidate is not a real
-/// instruction start the caller must fall back to the conservative path.
-pub(super) fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
-    let mut starts = vec![false; code_len];
-    let mut pc = 0usize;
-    while pc < code_len {
-        starts[pc] = true;
-        let len = bytecode_len_at(code, pc).max(1); // never advance 0 → no infinite loop
-        pc += len;
-    }
-    starts
 }
 
 /// EC-SCALAR-SOUNDNESS (bc math-ec JIT miscompile fix) — compute the set of
@@ -2128,108 +1988,6 @@ pub(super) fn shadow_watch() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_flag_on("CRATONVM_SHADOW_WATCH"))
 }
 
-/// Process-global pointer to the VM-side `jit_arm_savebase_watch(addr)` helper,
-/// registered at VM init. Baked as an absolute call target by the prologue when
-/// `CRATONVM_SHADOW_WATCH` is set. Avoids a `JitRuntimeHelpers` ABI change.
-pub static ARM_SAVEBASE_WATCH_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Register the savebase watchpoint arm-helper (called once from the VM).
-pub fn set_arm_savebase_watch_fn(addr: usize) {
-    ARM_SAVEBASE_WATCH_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Process-global pointer to the VM-side `jit_disarm_savebase_watch()` helper.
-pub static DISARM_SAVEBASE_WATCH_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Register the savebase watchpoint disarm-helper (called once from the VM).
-pub fn set_disarm_savebase_watch_fn(addr: usize) {
-    DISARM_SAVEBASE_WATCH_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Process-global pointer to the VM-side `jit_resolve_static_base` resolver
-/// (`extern "C" fn(vm_ptr, class_id, field_index) -> i64`), registered at VM
-/// init. Called by the backend **while compiling**, never from generated code,
-/// so — like the savebase pair above — it avoids a `JitRuntimeHelpers` ABI
-/// change entirely.
-pub static STATIC_BASE_RESOLVER_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// The `SharedVm` pointer passed back to [`STATIC_BASE_RESOLVER_FN`]. Latched
-/// to the FIRST VM that registers.
-pub static STATIC_BASE_RESOLVER_CTX: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Set once a SECOND VM registers a different context, and never cleared.
-///
-/// `ClassId`s are per-VM, so resolving VM A's `(class_id, field_index)` against
-/// VM B's statics would bake the address of an unrelated class's slot into VM
-/// A's code — the same cross-VM aliasing that made the process-global
-/// `system_class_id` atomic and the unqualified `class_init_memo` wrong (see
-/// `vm-jit-cache-keying.md`). There is no correct answer to give once two
-/// VMs share the process, so the mechanism turns itself off for BOTH and every
-/// static read goes back to the helper: slower, never wrong.
-static STATIC_BASE_RESOLVER_POISONED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Register the compile-time static-slot resolver (called once per VM).
-pub fn set_static_base_resolver(addr: usize, vm_ctx: usize) {
-    use std::sync::atomic::Ordering;
-    if addr == 0 || vm_ctx == 0 {
-        return;
-    }
-    // Store the function BEFORE claiming the context: a reader that observes a
-    // non-zero context must never then read a zero function pointer.
-    STATIC_BASE_RESOLVER_FN.store(addr, Ordering::Release);
-    if let Err(prev) =
-        STATIC_BASE_RESOLVER_CTX.compare_exchange(0, vm_ctx, Ordering::AcqRel, Ordering::Acquire)
-    {
-        if prev != vm_ctx {
-            STATIC_BASE_RESOLVER_POISONED.store(true, Ordering::Release);
-        }
-    }
-}
-
-/// Ask the VM where a static field's storage base pointer lives.
-///
-/// `None` = "not inlineable, keep the helper": no VM registered, two VMs
-/// registered, or the VM itself declined (class not initialized, the class is
-/// `java/lang/System`, nothing published, index switched off).
-pub fn resolve_static_base(class_id_raw: u32, field_index: usize) -> Option<usize> {
-    use std::sync::atomic::Ordering;
-    if STATIC_BASE_RESOLVER_POISONED.load(Ordering::Acquire) {
-        return None;
-    }
-    let ctx = STATIC_BASE_RESOLVER_CTX.load(Ordering::Acquire);
-    if ctx == 0 {
-        return None;
-    }
-    let raw = STATIC_BASE_RESOLVER_FN.load(Ordering::Acquire);
-    if raw == 0 {
-        return None;
-    }
-    // SAFETY: the only writer of these two words is `set_static_base_resolver`,
-    // which the VM calls with `jit_resolve_static_base` and its own `SharedVm`
-    // pointer; the function is `extern "C" fn(i64, i64, i64) -> i64` and the
-    // `SharedVm` outlives every compilation.
-    let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = unsafe { std::mem::transmute(raw) };
-    // Cast: `usize`/`u32` inputs to the C ABI's i64 parameters.
-    //
-    // SAFETY: `f` and `ctx` were published together by
-    // `set_static_base_resolver` and read back under `Acquire`, so the pointer
-    // matches the signature transmuted above and `ctx` is the `SharedVm` that
-    // resolver expects. Both outlive every compilation.
-    let addr = unsafe { f(ctx as i64, class_id_raw as i64, field_index as i64) };
-    if addr == 0 {
-        None
-    } else {
-        // Cast: back to an address; `0` is the sentinel, everything else is a
-        // real (positive, user-space) pointer.
-        Some(addr as u64 as usize)
-    }
-}
-
 /// Default-ON inline (helper-free) compiled `getstatic`.
 ///
 /// Every `getstatic` in compiled code used to `CALL jit_getstatic` — ~35 ns
@@ -3188,7 +2946,7 @@ pub fn callee_saved_gpr_local_homes_enabled() -> bool {
 ///    the original arguments, never reading JIT frame local slots.
 ///
 /// Requested per-compile by `try_compile` (method-entry only) via
-/// [`set_kernel_reg_homes_request`]; OSR compiles (`compile_osr_artifact`)
+/// [`BackendRequest::kernel_reg_homes`]; OSR compiles (`compile_osr_artifact`)
 /// and the legacy [`compile`] test wrapper never set it.
 pub fn kernel_reg_locals_enabled() -> bool {
     use std::sync::OnceLock;
@@ -3203,90 +2961,8 @@ pub fn kernel_reg_locals_enabled() -> bool {
     })
 }
 
-thread_local! {
-    /// Per-compile request flag for the pure-kernel GPR local homes (see
-    /// [`kernel_reg_locals_enabled`]). Set by the method-entry compile path
-    /// immediately before calling [`compile_with_param_slots`]; consumed
-    /// (taken) at its entry so it can never leak into a later compile on the
-    /// same thread.
-    pub(super) static KERNEL_REG_HOMES_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Request pure-kernel GPR local homes for the NEXT `compile_with_param_slots`
-/// call on this thread (method-entry compiles only — never OSR).
-pub fn set_kernel_reg_homes_request(on: bool) {
-    KERNEL_REG_HOMES_REQUEST.with(|c| c.set(on));
-}
-
-thread_local! {
-    /// One-shot request from the bytecode front-end: this method has an
-    /// exception handler that reads locals beyond its incoming parameters, so
-    /// post-invoke exceptions must retain a precise frame until handler entry.
-    pub(super) static PRECISE_EXCEPTION_FRAME_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Request precise exceptional-frame capture for the next method compile.
-pub fn set_precise_exception_frame_request(on: bool) {
-    PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.set(on));
-}
-
-thread_local! {
-    /// One-shot `[start_pc, end_pc)` list of the next method's exception-table
-    /// protected ranges, published by the bytecode front-end.
-    ///
-    /// The backend is otherwise entirely exception-table-blind, and that is
-    /// fine for every lowering that RETURNS to this frame: the shared exception
-    /// stub re-enters the interpreter at the throwing bci and the method's own
-    /// handler table takes over from there. It is NOT fine for the sibling
-    /// tail-call, which tears this frame down and `JMP`s into the callee, so an
-    /// exception the callee raises unwinds straight past a handler that was
-    /// supposed to catch it. See `pc_is_protected`.
-    pub(super) static PROTECTED_RANGES_REQUEST: std::cell::Cell<Option<Vec<(u32, u32)>>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Publish the next method compile's exception-table protected ranges.
-/// One-shot, like [`set_precise_exception_frame_request`], so a bailed compile
-/// cannot leak its ranges into the next unrelated method on this worker thread.
-pub fn set_protected_ranges_request(ranges: Vec<(u32, u32)>) {
-    PROTECTED_RANGES_REQUEST.with(|c| {
-        c.set(if ranges.is_empty() {
-            None
-        } else {
-            Some(ranges)
-        })
-    });
-}
-
-thread_local! {
-    /// OSR-tier sibling of [`KERNEL_REG_HOMES_REQUEST`] — set (only) by the
-    /// interpreter's `compile_osr_artifact` (perf/halfgap-20260717).
-    pub(super) static KERNEL_REG_HOMES_OSR_REQUEST: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
-/// Request pure-kernel GPR local homes for the NEXT OSR-artifact compile on
-/// this thread (perf/halfgap-20260717).
-///
-/// The original kernel-homes rollout vetoed OSR bodies wholesale ("publishes
-/// NO OSR entries") as blanket caution while the feature soaked on the
-/// method-entry tier. The machinery for a register-homed OSR ENTRY has
-/// always existed, though: the OSR trampoline seeds each interpreter local
-/// into `osr_local_assignments[i]`'s register (that is the normal
-/// graph-coloring entry contract), and with kernel homes those assignments
-/// ARE the kernel's callee-saved homes (reference locals are masked back to
-/// frame homes, so GC visibility is unchanged). A pure-kernel body accepted
-/// by the same call/field/alloc/typecheck/spec-BCE-free conditions has no
-/// in-body transition that could observe a stale frame slot. This matters
-/// because once-invoked benchmark-style kernels (`benchArithmetic`,
-/// `matmul`) live their entire life inside the OSR artifact and previously
-/// ran memory-homed. Opt out with `CRATONVM_JIT_KERNEL_REG_OSR=0`.
-pub fn set_kernel_reg_homes_osr_request(on: bool) {
-    KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.set(on));
-}
-
 /// `CRATONVM_JIT_KERNEL_REG_OSR` gate (default **ON**, opt out with `=0`) —
-/// see [`set_kernel_reg_homes_osr_request`].
+/// see [`BackendRequest::kernel_reg_homes_osr`].
 ///
 /// The original 2026-07-18 experiment predated constant long-division
 /// lowering, so Arithmetic was division-bound and register homes had no
@@ -3323,264 +2999,6 @@ pub(super) fn slot_mirror_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_SLOT_MIRROR"))
-}
-
-pub(super) fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
-    let mut targets = vec![false; code_len];
-    let mut pc = 0usize;
-    while pc < code_len {
-        let op = code[pc];
-        match op {
-            // Conditional branches + goto + jsr: 2-byte signed offset from `pc`.
-            0x99..=0xA8 | 0xC6 | 0xC7 => {
-                if pc + 2 < code_len {
-                    // Cast: signed offset to isize for pointer/index arithmetic
-                    let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
-                    // Cast: signed offset to isize for pointer/index arithmetic
-                    let t = pc as isize + off;
-                    // Cast: non-negative index/count to usize
-                    if t >= 0 && (t as usize) < code_len {
-                        // Cast: non-negative index/count to usize
-                        targets[t as usize] = true;
-                    }
-                }
-                pc += 3;
-            }
-            // goto_w / jsr_w: 4-byte signed offset from `pc`.
-            0xC8 | 0xC9 => {
-                if pc + 4 < code_len {
-                    let off = i32::from_be_bytes([
-                        code[pc + 1],
-                        code[pc + 2],
-                        code[pc + 3],
-                        code[pc + 4],
-                        // Cast: signed offset to isize for pointer/index arithmetic
-                    ]) as isize;
-                    // Cast: signed offset to isize for pointer/index arithmetic
-                    let t = pc as isize + off;
-                    // Cast: non-negative index/count to usize
-                    if t >= 0 && (t as usize) < code_len {
-                        // Cast: non-negative index/count to usize
-                        targets[t as usize] = true;
-                    }
-                }
-                pc += 5;
-            }
-            // tableswitch: default + (high-low+1) offsets, all relative to `pc`.
-            0xAA => {
-                let mut p = pc + 1;
-                while p % 4 != 0 {
-                    p += 1;
-                }
-                if p + 12 > code_len {
-                    break;
-                }
-                let read_off = |code: &[u8], at: usize| -> isize {
-                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
-                        // Cast: signed offset to isize for pointer/index arithmetic
-                        as isize
-                };
-                let mark = |targets: &mut Vec<bool>, off: isize| {
-                    // Cast: signed offset to isize for pointer/index arithmetic
-                    let t = pc as isize + off;
-                    // Cast: non-negative index/count to usize
-                    if t >= 0 && (t as usize) < code_len {
-                        // Cast: non-negative index/count to usize
-                        targets[t as usize] = true;
-                    }
-                };
-                mark(&mut targets, read_off(code, p)); // default
-                                                       // Cast: value to i32 (encoding immediate/displacement)
-                let low = read_off(code, p + 4) as i32;
-                // Cast: value to i32 (encoding immediate/displacement)
-                let high = read_off(code, p + 8) as i32;
-                let count = checked_tableswitch_count(low, high).unwrap_or(0);
-                let mut jp = p + 12;
-                for _ in 0..count {
-                    if jp + 4 > code_len {
-                        break;
-                    }
-                    mark(&mut targets, read_off(code, jp));
-                    jp += 4;
-                }
-                pc += bytecode_len_at(code, pc);
-            }
-            // lookupswitch: default + npairs (match, offset) pairs.
-            0xAB => {
-                let mut p = pc + 1;
-                while p % 4 != 0 {
-                    p += 1;
-                }
-                if p + 8 > code_len {
-                    break;
-                }
-                let read_off = |code: &[u8], at: usize| -> isize {
-                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
-                        // Cast: signed offset to isize for pointer/index arithmetic
-                        as isize
-                };
-                let mark = |targets: &mut Vec<bool>, off: isize| {
-                    // Cast: signed offset to isize for pointer/index arithmetic
-                    let t = pc as isize + off;
-                    // Cast: non-negative index/count to usize
-                    if t >= 0 && (t as usize) < code_len {
-                        // Cast: non-negative index/count to usize
-                        targets[t as usize] = true;
-                    }
-                };
-                mark(&mut targets, read_off(code, p)); // default
-                let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]).max(0)
-                        // Cast: non-negative index/count to usize
-                        as usize;
-                let mut jp = p + 8;
-                for _ in 0..npairs {
-                    if jp + 8 > code_len {
-                        break;
-                    }
-                    // pair is (match:i32, offset:i32); offset at jp+4.
-                    mark(&mut targets, read_off(code, jp + 4));
-                    jp += 8;
-                }
-                pc += bytecode_len_at(code, pc);
-            }
-            _ => {
-                pc += bytecode_len_at(code, pc);
-            }
-        }
-    }
-    targets
-}
-
-/// Stage 2 (precise oop maps) — enumerate the control-flow successors of the
-/// instruction at `pc` (normal flow only; exception-handler edges are not
-/// available to the JIT and are handled conservatively by leaving handler-only
-/// PCs `unreached`). Mirrors the branch/switch decoding in
-/// [`compute_branch_targets`] and the per-opcode length in [`bytecode_len_at`].
-pub(super) fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -> Vec<usize> {
-    let op = code[pc];
-    let fallthrough = pc + bytecode_len_at(code, pc);
-    let read_i16 = |at: usize| -> isize {
-        if at + 1 < code_len {
-            // Cast: signed offset to isize for pointer/index arithmetic
-            i16::from_be_bytes([code[at], code[at + 1]]) as isize
-        } else {
-            0
-        }
-    };
-    let read_i32 = |at: usize| -> isize {
-        if at + 3 < code_len {
-            // Cast: signed offset to isize for pointer/index arithmetic
-            i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
-        } else {
-            0
-        }
-    };
-    let target = |off: isize| -> Option<usize> {
-        // Cast: signed offset to isize for pointer/index arithmetic
-        let t = pc as isize + off;
-        // Cast: non-negative index/count to usize
-        if t >= 0 && (t as usize) < code_len {
-            // Cast: non-negative index/count to usize
-            Some(t as usize)
-        } else {
-            None
-        }
-    };
-    match op {
-        // ireturn/lreturn/freturn/dreturn/areturn/return, athrow, ret:
-        // no normal successor.
-        0xAC..=0xB1 | 0xBF | 0xA9 => Vec::new(),
-        // goto / goto_w: unconditional, target only.
-        0xA7 => target(read_i16(pc + 1)).into_iter().collect(),
-        0xC8 => target(read_i32(pc + 1)).into_iter().collect(),
-        // jsr / jsr_w: target + fall-through (return address pushed).
-        0xA8 => {
-            let mut v: Vec<usize> = target(read_i16(pc + 1)).into_iter().collect();
-            if fallthrough < code_len {
-                v.push(fallthrough);
-            }
-            v
-        }
-        0xC9 => {
-            let mut v: Vec<usize> = target(read_i32(pc + 1)).into_iter().collect();
-            if fallthrough < code_len {
-                v.push(fallthrough);
-            }
-            v
-        }
-        // Conditional branches (if<cond>, if_icmp<cond>, if_acmp<cond>) and
-        // ifnull/ifnonnull: target + fall-through.
-        0x99..=0xA6 | 0xC6 | 0xC7 => {
-            let mut v: Vec<usize> = target(read_i16(pc + 1)).into_iter().collect();
-            if fallthrough < code_len {
-                v.push(fallthrough);
-            }
-            v
-        }
-        // tableswitch: default + each table entry; no fall-through.
-        0xAA => {
-            let mut p = pc + 1;
-            while p % 4 != 0 {
-                p += 1;
-            }
-            let mut v = Vec::new();
-            if p + 12 <= code_len {
-                if let Some(t) = target(read_i32(p)) {
-                    v.push(t);
-                }
-                // Cast: value to i32 (encoding immediate/displacement)
-                let low = read_i32(p + 4) as i32;
-                // Cast: value to i32 (encoding immediate/displacement)
-                let high = read_i32(p + 8) as i32;
-                let count = checked_tableswitch_count(low, high).unwrap_or(0);
-                let mut jp = p + 12;
-                for _ in 0..count {
-                    if jp + 4 > code_len {
-                        break;
-                    }
-                    if let Some(t) = target(read_i32(jp)) {
-                        v.push(t);
-                    }
-                    jp += 4;
-                }
-            }
-            v
-        }
-        // lookupswitch: default + each pair offset; no fall-through.
-        0xAB => {
-            let mut p = pc + 1;
-            while p % 4 != 0 {
-                p += 1;
-            }
-            let mut v = Vec::new();
-            if p + 8 <= code_len {
-                if let Some(t) = target(read_i32(p)) {
-                    v.push(t);
-                }
-                // Cast: non-negative index/count to usize
-                let npairs = read_i32(p + 4).max(0) as usize;
-                let mut jp = p + 8;
-                for _ in 0..npairs {
-                    if jp + 8 > code_len {
-                        break;
-                    }
-                    if let Some(t) = target(read_i32(jp + 4)) {
-                        v.push(t);
-                    }
-                    jp += 8;
-                }
-            }
-            v
-        }
-        // Everything else: fall-through only.
-        _ => {
-            if fallthrough < code_len {
-                vec![fallthrough]
-            } else {
-                Vec::new()
-            }
-        }
-    }
 }
 
 /// Stage 2 (precise oop maps) — transfer function for the per-local "must be
@@ -3833,7 +3251,7 @@ fn compute_local_oop_masks_window(
             break;
         }
         let out = oop_dataflow_transfer(code, pc, in_mask[pc], max_locals, base);
-        for succ in oop_dataflow_successors(code, code_len, pc) {
+        for succ in bytecode_analysis::lenient_successors(code, code_len, pc) {
             if succ >= code_len {
                 continue;
             }
@@ -3940,7 +3358,7 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
                 has_dup2 = true;
                 break;
             }
-            p += bytecode_len_at(code, p);
+            p += bytecode_analysis::step(code, p);
         }
     }
     if !has_dup2 {
@@ -4384,11 +3802,11 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // switches — pop the int key; rest invariant.
             0xaa => {
                 pop!();
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
             0xab => {
                 pop!();
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
 
             // --- field / method ops: the width effect depends on the CP
@@ -4403,7 +3821,7 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // FORM-2 dup2 (e.g. `lload; dup2`, `ladd; dup2`).
             0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xba => {
                 widths.clear();
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
 
             // new / checkcast / instanceof / monitor / nop / iinc / arrays.
@@ -4450,7 +3868,7 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // dup2 defaults to FORM-1 = codegen behavior) without rejecting.
             _ => {
                 widths.clear();
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
             }
         }
     }
@@ -4694,217 +4112,6 @@ pub(super) fn poll_bearing_opcode(op: u8) -> bool {
     matches!(op, 0x99..=0xa7 | 0xaa | 0xab | 0xc6 | 0xc7)
 }
 
-/// `true` when an opcode's fall-through successor exists (i.e. control can
-/// reach the next instruction in linear order).
-pub(super) fn opcode_falls_through(op: u8) -> bool {
-    !matches!(op, 0xa7 | 0xa9 | 0xaa | 0xab | 0xac..=0xb1 | 0xbf | 0xc8)
-}
-
-/// Decode the explicit branch targets of the instruction at `pc` into `out`
-/// (the fall-through successor is NOT included).
-///
-/// Returns `false` — meaning *refuse* — when the successor set is not
-/// statically known (`jsr`/`jsr_w`/`ret`) or the encoding is malformed or
-/// points outside `[0, code_len)`. Callers must treat `false` as opaque, not
-/// as "no targets": guessing here is how a transform loses an edge.
-pub(super) fn branch_targets_at(
-    code: &[u8],
-    pc: usize,
-    code_len: usize,
-    out: &mut Vec<usize>,
-) -> bool {
-    if code_len > code.len() || pc >= code_len {
-        return false;
-    }
-    // Cast: pc/target to isize for signed branch-displacement arithmetic.
-    let push_t = |off: isize, out: &mut Vec<usize>| -> bool {
-        let t = pc as isize + off;
-        if t < 0 || t as usize >= code_len {
-            return false;
-        }
-        out.push(t as usize); // Cast: non-negative index to usize
-        true
-    };
-    match code[pc] {
-        // `jsr`/`jsr_w` push a return address that a `ret` later consumes out
-        // of a local: neither end of that pair has statically known
-        // successors here.
-        0xa8 | 0xa9 | 0xc9 => false,
-        0x99..=0xa7 | 0xc6 | 0xc7 => {
-            if pc + 2 >= code_len {
-                return false;
-            }
-            // Cast: signed branch displacement to isize
-            let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
-            push_t(off, out)
-        }
-        0xc8 => {
-            if pc + 4 >= code_len {
-                return false;
-            }
-            let off = i32::from_be_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]])
-                    // Cast: signed branch displacement to isize
-                    as isize;
-            push_t(off, out)
-        }
-        0xaa => {
-            let mut p = pc + 1;
-            while p % 4 != 0 {
-                p += 1;
-            }
-            if p + 12 > code_len {
-                return false;
-            }
-            let rd = |at: usize| -> isize {
-                // Cast: signed branch displacement to isize
-                i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
-            };
-            if !push_t(rd(p), &mut *out) {
-                return false;
-            }
-            // Cast: table bound to i32
-            let low = rd(p + 4) as i32;
-            // Cast: table bound to i32
-            let high = rd(p + 8) as i32;
-            let count = match checked_tableswitch_count(low, high) {
-                Some(c) => c,
-                None => return false,
-            };
-            let mut jp = p + 12;
-            for _ in 0..count {
-                if jp + 4 > code_len {
-                    return false;
-                }
-                if !push_t(rd(jp), &mut *out) {
-                    return false;
-                }
-                jp += 4;
-            }
-            true
-        }
-        0xab => {
-            let mut p = pc + 1;
-            while p % 4 != 0 {
-                p += 1;
-            }
-            if p + 8 > code_len {
-                return false;
-            }
-            let rd = |at: usize| -> isize {
-                // Cast: signed branch displacement to isize
-                i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
-            };
-            if !push_t(rd(p), &mut *out) {
-                return false;
-            }
-            let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
-            if npairs < 0 {
-                return false;
-            }
-            // Cast: non-negative count to usize
-            let npairs = npairs as usize;
-            let mut jp = p + 8;
-            for _ in 0..npairs {
-                if jp + 8 > code_len {
-                    return false;
-                }
-                // A pair is (match:i32, offset:i32); the offset is at jp + 4.
-                if !push_t(rd(jp + 4), &mut *out) {
-                    return false;
-                }
-                jp += 8;
-            }
-            true
-        }
-        _ => true,
-    }
-}
-
-/// Bytecode PCs reachable from the method entry along ORDINARY control flow —
-/// fall-through plus explicit branch/switch edges.
-///
-/// Exception-table handler entries are deliberately NOT roots. The x86-64
-/// backend has no in-method handler dispatch: an implicit exception leaves
-/// through the `i64::MIN` sentinel and `athrow` lowers to the same, so a
-/// compiled body is only ever resumed at one of its own handlers by the
-/// interpreter (`route_jit_signal_exception` / `run_jit_callee_handler` both
-/// rebuild an interpreter frame for it). Every handler body is therefore dead
-/// code in the emitted image, and this map says so.
-///
-/// The optimizing tier settled the same question first and for the same
-/// reason: `ir::IrBuilder::build` skips every PC outside
-/// `ir::normally_reachable_pcs`, which is this walk over the verifier's CFG.
-/// Walking handler bodies there produced orphan nodes; walking them here
-/// produced a revived merge with no operand stack. Two tiers, one contract.
-///
-/// Returns `None` — "refuse, do not guess" — when any instruction's successor
-/// set is not statically known (`jsr` / `ret` / `jsr_w`) or an encoding is
-/// malformed. Callers must then keep whatever conservative behaviour they had.
-///
-/// Sized `code_len + 1` to match the emitter's own `branch_targets` map, so the
-/// two are indexed by the same `pc`.
-pub(super) fn compute_reachable_pcs(code: &[u8], code_len: usize) -> Option<Vec<bool>> {
-    compute_reachable_pcs_with_roots(code, code_len, &[])
-}
-
-/// [`compute_reachable_pcs`] with extra entry points.
-///
-/// The only producer of extras is compiled local exception handlers: an
-/// exception edge is a real predecessor that no branch instruction names, so a
-/// handler body reachable ONLY that way is invisible to the walk above and
-/// stays dead. Passing its `handler_pc` as a root makes the block — and
-/// everything it reaches — live code, which is exactly the change from "a
-/// handler body is dead code in the emitted image" to "this method runs its own
-/// `catch`". An empty slice is byte-for-byte [`compute_reachable_pcs`].
-pub(super) fn compute_reachable_pcs_with_roots(
-    code: &[u8],
-    code_len: usize,
-    extra_roots: &[usize],
-) -> Option<Vec<bool>> {
-    if code_len > code.len() {
-        return None;
-    }
-    let mut reachable = vec![false; code_len + 1];
-    if code_len == 0 {
-        return Some(reachable);
-    }
-    reachable[0] = true;
-    let mut work = vec![0usize];
-    for &root in extra_roots {
-        if root < code_len && !reachable[root] {
-            reachable[root] = true;
-            work.push(root);
-        }
-    }
-    let mut targets: Vec<usize> = Vec::new();
-    while let Some(pc) = work.pop() {
-        // A branch INTO the middle of an instruction decodes garbage from here
-        // on. That cannot corrupt what the emitter reads (it only ever indexes
-        // this map at real instruction boundaries) and the walk stays bounded
-        // by `code_len`; such a method is rejected afterwards by
-        // `patch_branches`, which finds the target has no native offset.
-        let len = bytecode_len_at(code, pc).max(1);
-        targets.clear();
-        if !branch_targets_at(code, pc, code_len, &mut targets) {
-            return None;
-        }
-        for &t in &targets {
-            if !reachable[t] {
-                reachable[t] = true;
-                work.push(t);
-            }
-        }
-        if opcode_falls_through(code[pc]) {
-            let next = pc + len;
-            if next < code_len && !reachable[next] {
-                reachable[next] = true;
-                work.push(next);
-            }
-        }
-    }
-    Some(reachable)
-}
-
 /// `true` when the emitter will emit a cooperative safepoint poll at `pc`.
 #[allow(dead_code)]
 pub(super) fn emits_safepoint_poll_at(code: &[u8], pc: usize, code_len: usize) -> bool {
@@ -4916,7 +4123,7 @@ pub(super) fn emits_safepoint_poll_at(code: &[u8], pc: usize, code_len: usize) -
         return false;
     }
     let mut targets: Vec<usize> = Vec::new();
-    if !branch_targets_at(code, pc, code_len, &mut targets) {
+    if !bytecode_analysis::explicit_targets(code, code_len, pc, &mut targets) {
         return false;
     }
     targets.iter().any(|&t| t <= pc)
@@ -4937,262 +4144,19 @@ pub(super) fn all_backward_edges_are_polled(code: &[u8], code_len: usize) -> boo
     let mut pc = 0usize;
     while pc < code_len {
         targets.clear();
-        if !branch_targets_at(code, pc, code_len, &mut targets) {
+        if !bytecode_analysis::explicit_targets(code, code_len, pc, &mut targets) {
             return false;
         }
         if targets.iter().any(|&t| t <= pc) && !poll_bearing_opcode(code[pc]) {
             return false;
         }
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 {
             return false;
         }
         pc += len;
     }
     true
-}
-
-/// Sentinel for "no such node" / "unreachable" in [`MethodCfg`].
-const CFG_NONE: usize = usize::MAX;
-
-/// Instruction-granularity control-flow graph of one method, with immediate
-/// dominators.
-///
-/// Built only to answer the questions a loop transform must not guess at: is
-/// this region single-entry, is the loop reducible, is every instruction in
-/// it reachable. Nodes are instruction start PCs in ascending order; node `0`
-/// is the method entry.
-#[allow(dead_code)]
-pub(super) struct MethodCfg {
-    /// Instruction start PCs, ascending. Node `i` is `pcs[i]`.
-    pcs: Vec<usize>,
-    /// `pc` → node index, [`CFG_NONE`] when `pc` is not an instruction start.
-    idx_of: Vec<usize>,
-    /// Reverse-post-order number, [`CFG_NONE`] when unreachable from entry.
-    rpo_num: Vec<usize>,
-    /// Immediate dominator node index, [`CFG_NONE`] when unknown/unreachable.
-    idom: Vec<usize>,
-}
-
-/// Cooper/Harvey/Kennedy `intersect`: walk two dominator-tree paths up until
-/// they meet. Returns [`CFG_NONE`] if either chain is incomplete — the caller
-/// then leaves the dominator unknown, which every query treats as "does not
-/// dominate" (conservative: it can only cause a refusal).
-fn dom_intersect(idom: &[usize], rpo_num: &[usize], a0: usize, b0: usize) -> usize {
-    let (mut a, mut b) = (a0, b0);
-    let limit = idom.len().saturating_mul(2).saturating_add(8);
-    let mut steps = 0usize;
-    while a != b {
-        steps += 1;
-        if steps > limit || a >= rpo_num.len() || b >= rpo_num.len() {
-            return CFG_NONE;
-        }
-        let (ra, rb) = (rpo_num[a], rpo_num[b]);
-        if ra == CFG_NONE || rb == CFG_NONE {
-            return CFG_NONE;
-        }
-        // Reverse-post-order numbers are unique, so `a != b` implies
-        // `ra != rb` and each step strictly decreases `max(ra, rb)`.
-        if ra > rb {
-            let na = idom[a];
-            if na == CFG_NONE || na == a {
-                return CFG_NONE;
-            }
-            a = na;
-        } else {
-            let nb = idom[b];
-            if nb == CFG_NONE || nb == b {
-                return CFG_NONE;
-            }
-            b = nb;
-        }
-    }
-    a
-}
-
-#[allow(dead_code)]
-impl MethodCfg {
-    /// Build the CFG, or `None` when the bytecode cannot be walked exactly
-    /// (a length-table desync), a branch target is not an instruction
-    /// boundary, control flow is opaque (`jsr`/`ret`), or the dominator
-    /// fixpoint did not settle. Every `None` is a refusal.
-    pub(super) fn build(code: &[u8], code_len: usize) -> Option<MethodCfg> {
-        if code_len == 0 || code_len > code.len() {
-            return None;
-        }
-        // Instruction starts, from the same forward walk every other
-        // PC-stepping consumer uses (see `instruction_start_map`).
-        let mut pcs: Vec<usize> = Vec::new();
-        let mut idx_of: Vec<usize> = vec![CFG_NONE; code_len + 1];
-        let mut pc = 0usize;
-        while pc < code_len {
-            idx_of[pc] = pcs.len();
-            pcs.push(pc);
-            let len = bytecode_len_at(code, pc);
-            if len == 0 {
-                return None;
-            }
-            pc += len;
-        }
-        if pc != code_len {
-            // The walk stepped past the end: the length table and this code
-            // disagree, so nothing below can be trusted.
-            return None;
-        }
-
-        let n = pcs.len();
-        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut targets: Vec<usize> = Vec::new();
-        for i in 0..n {
-            let at = pcs[i];
-            targets.clear();
-            if !branch_targets_at(code, at, code_len, &mut targets) {
-                return None;
-            }
-            for &t in &targets {
-                let ti = idx_of[t];
-                if ti == CFG_NONE {
-                    return None; // target lands mid-instruction
-                }
-                succs[i].push(ti);
-            }
-            if opcode_falls_through(code[at]) {
-                let nxt = at + bytecode_len_at(code, at);
-                if nxt < code_len {
-                    let ni = idx_of[nxt];
-                    if ni == CFG_NONE {
-                        return None;
-                    }
-                    succs[i].push(ni);
-                }
-            }
-        }
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for i in 0..n {
-            for &s in &succs[i] {
-                preds[s].push(i);
-            }
-        }
-
-        // Reverse post-order from the entry node, iteratively (no recursion:
-        // a deep method must not blow the compiler thread's stack).
-        let mut visited = vec![false; n];
-        let mut post: Vec<usize> = Vec::with_capacity(n);
-        let mut stack: Vec<(usize, usize)> = Vec::new();
-        visited[0] = true;
-        stack.push((0, 0));
-        while let Some((node, ci)) = stack.pop() {
-            if ci < succs[node].len() {
-                stack.push((node, ci + 1));
-                let s = succs[node][ci];
-                if !visited[s] {
-                    visited[s] = true;
-                    stack.push((s, 0));
-                }
-            } else {
-                post.push(node);
-            }
-        }
-        let mut rpo_num = vec![CFG_NONE; n];
-        let mut order: Vec<usize> = Vec::with_capacity(post.len());
-        for (k, &node) in post.iter().rev().enumerate() {
-            rpo_num[node] = k;
-            order.push(node);
-        }
-        if order.first().copied() != Some(0) {
-            return None; // entry must be first in reverse post-order
-        }
-
-        // Cooper/Harvey/Kennedy iterative dominators. Capped so a malformed
-        // graph refuses instead of spinning on the JIT thread.
-        let mut idom = vec![CFG_NONE; n];
-        idom[0] = 0;
-        let mut settled = false;
-        for _ in 0..(n + 2) {
-            let mut changed = false;
-            for &b in order.iter().skip(1) {
-                let mut new_idom = CFG_NONE;
-                for &p in &preds[b] {
-                    if rpo_num[p] == CFG_NONE || idom[p] == CFG_NONE {
-                        continue; // unreachable or not yet processed
-                    }
-                    new_idom = if new_idom == CFG_NONE {
-                        p
-                    } else {
-                        dom_intersect(&idom, &rpo_num, p, new_idom)
-                    };
-                    if new_idom == CFG_NONE {
-                        break;
-                    }
-                }
-                if new_idom != CFG_NONE && idom[b] != new_idom {
-                    idom[b] = new_idom;
-                    changed = true;
-                }
-            }
-            if !changed {
-                settled = true;
-                break;
-            }
-        }
-        if !settled {
-            return None;
-        }
-
-        Some(MethodCfg {
-            pcs,
-            idx_of,
-            rpo_num,
-            idom,
-        })
-    }
-
-    /// Instruction start PCs, ascending.
-    pub(super) fn nodes(&self) -> &[usize] {
-        &self.pcs
-    }
-
-    /// Node index for an instruction start PC.
-    pub(super) fn node_of(&self, pc: usize) -> Option<usize> {
-        match self.idx_of.get(pc).copied() {
-            Some(i) if i != CFG_NONE => Some(i),
-            _ => None,
-        }
-    }
-
-    /// `true` when `node` is reachable from method entry.
-    pub(super) fn is_reachable(&self, node: usize) -> bool {
-        self.rpo_num.get(node).copied().unwrap_or(CFG_NONE) != CFG_NONE
-    }
-
-    /// `true` when `a` dominates `b` (every path from entry to `b` passes
-    /// through `a`). Unknown/unreachable answers `false`, so a caller that
-    /// requires domination refuses rather than assuming it.
-    pub(super) fn dominates(&self, a: usize, b: usize) -> bool {
-        if a >= self.idom.len() || b >= self.idom.len() {
-            return false;
-        }
-        if !self.is_reachable(a) || !self.is_reachable(b) {
-            return false;
-        }
-        let mut cur = b;
-        let mut steps = 0usize;
-        let limit = self.idom.len() + 8;
-        loop {
-            if cur == a {
-                return true;
-            }
-            steps += 1;
-            if steps > limit {
-                return false;
-            }
-            let nxt = self.idom[cur];
-            if nxt == CFG_NONE || nxt == cur {
-                return false; // reached the entry without meeting `a`
-            }
-            cur = nxt;
-        }
-    }
 }
 
 /// Which loop transform produced a [`LoopXform`]. See the section header for
@@ -5872,7 +4836,7 @@ fn encode_preheader_guard(guard: &PreheaderGuard) -> Result<Vec<u8>, LoopXformRe
 /// at the shifted PC instead of assuming a uniform shift.
 ///
 /// Transcribed from the `let mut p = pc + 1; while p % 4 != 0 { p += 1 }`
-/// walks in [`bytecode_len_at`] and [`branch_targets_at`] — keep the three in
+/// walks in [`bytecode_analysis::step`] and [`bytecode_analysis::explicit_targets`] — keep the three in
 /// step, and note that all three measure from index 0 of the `code` slice,
 /// i.e. the slice must start at the method's first bytecode.
 #[allow(dead_code)]
@@ -5950,7 +4914,7 @@ fn rewrite_loop_copies(
     };
 
     // ── Structural admission ──────────────────────────────────────────
-    let cfg = MethodCfg::build(code, code_len).ok_or(R::OpaqueControlFlow)?;
+    let cfg = bytecode_analysis::InsnCfg::build(code, code_len).ok_or(R::OpaqueControlFlow)?;
     let hnode = cfg.node_of(header).ok_or(R::BadShape)?;
     if cfg.node_of(back_edge).is_none() {
         return Err(R::BadShape);
@@ -5987,7 +4951,7 @@ fn rewrite_loop_copies(
             // refusal (`ExternalEntry`, below) and is not admitted by this
             // arm passing.
             targets.clear();
-            if !branch_targets_at(code, at, code_len, &mut targets) {
+            if !bytecode_analysis::explicit_targets(code, code_len, at, &mut targets) {
                 return Err(R::OpaqueControlFlow);
             }
             for &t in &targets {
@@ -5999,7 +4963,7 @@ fn rewrite_loop_copies(
                 }
             }
         }
-        // `jsr`/`ret`/`jsr_w` already fail `MethodCfg::build`; `goto_w` does
+        // `jsr`/`ret`/`jsr_w` already fail `bytecode_analysis::InsnCfg::build`; `goto_w` does
         // not, and it is the one backward branch the emitter never polls, so
         // it must not survive into a method we are about to duplicate code
         // in. Refuse the whole method rather than reason about where it is.
@@ -6011,7 +4975,7 @@ fn rewrite_loop_copies(
     // Single-entry, and no branch to the back edge itself.
     for &at in cfg.nodes() {
         targets.clear();
-        if !branch_targets_at(code, at, code_len, &mut targets) {
+        if !bytecode_analysis::explicit_targets(code, code_len, at, &mut targets) {
             return Err(R::OpaqueControlFlow);
         }
         let src_inside = at >= header && at < back_edge_end;
@@ -6048,7 +5012,7 @@ fn rewrite_loop_copies(
             continue;
         }
         targets.clear();
-        if !branch_targets_at(code, at, code_len, &mut targets) {
+        if !bytecode_analysis::explicit_targets(code, code_len, at, &mut targets) {
             return Err(R::OpaqueControlFlow);
         }
         for &t in &targets {
@@ -6156,7 +5120,7 @@ fn rewrite_loop_copies(
     for &(out_base, from, to, region) in &spans {
         let mut pc = from;
         while pc < to {
-            let len = bytecode_len_at(code, pc);
+            let len = bytecode_analysis::step(code, pc);
             if len == 0 {
                 return Err(R::BadShape);
             }
@@ -6255,7 +5219,7 @@ fn rewrite_loop_copies(
     //
     // The output must walk exactly, keep every branch target on an
     // instruction boundary, and stay buildable as a CFG.
-    if MethodCfg::build(&out, out_len).is_none() {
+    if bytecode_analysis::InsnCfg::build(&out, out_len).is_none() {
         return Err(R::BadShape);
     }
     // Every backward branch sits at a poll-bearing opcode ⇒ every cycle in
@@ -6340,12 +5304,12 @@ mod reachability_roots {
         // 1: astore_0        <- handler_pc
         // 2: return
         let code = [0xb1u8, 0x4b, 0xb1];
-        let without = compute_reachable_pcs(&code, code.len()).expect("statically known CFG");
+        let without = bytecode_analysis::reachable_pcs(&code, code.len(), &[]).expect("statically known CFG");
         assert!(without[0]);
         assert!(!without[1], "nothing branches to a handler body");
         assert!(!without[2]);
 
-        let with = compute_reachable_pcs_with_roots(&code, code.len(), &[1])
+        let with = bytecode_analysis::reachable_pcs(&code, code.len(), &[1])
             .expect("statically known CFG");
         assert!(with[0]);
         assert!(with[1], "the handler root makes its own block live");
@@ -6360,8 +5324,8 @@ mod reachability_roots {
         // 0: iconst_0  1: ifeq +4 (->5)  4: return  5: return
         let code = [0x03u8, 0x99, 0x00, 0x04, 0xb1, 0xb1];
         assert_eq!(
-            compute_reachable_pcs(&code, code.len()),
-            compute_reachable_pcs_with_roots(&code, code.len(), &[]),
+            bytecode_analysis::reachable_pcs(&code, code.len(), &[]),
+            bytecode_analysis::reachable_pcs(&code, code.len(), &[]),
         );
     }
 }
@@ -6416,7 +5380,7 @@ mod loop_xform_tests {
         let code = [
             0x1a, 0xac, 0x1a, 0x2b, 0xc7, 0x00, 0x07, 0x03, 0xa7, 0x00, 0x04, 0x04, 0x60, 0xac,
         ];
-        let r = compute_reachable_pcs(&code, code.len()).expect("statically known control flow");
+        let r = bytecode_analysis::reachable_pcs(&code, code.len(), &[]).expect("statically known control flow");
         assert_eq!(&r[..2], &[true, true], "the live prefix is reachable");
         assert!(
             r[2..code.len()].iter().all(|&b| !b),
@@ -6425,7 +5389,7 @@ mod loop_xform_tests {
 
         // The emitter's own question answers differently for the two merges,
         // which is exactly why it could not be used for this.
-        let targets = compute_branch_targets(&code, code.len());
+        let targets = bytecode_analysis::branch_target_map(&code, code.len());
         assert!(targets[11] && targets[12]);
     }
 
@@ -6439,7 +5403,7 @@ mod loop_xform_tests {
         //  7: iconst_1          (reached only by the `ifeq`)
         //  8: ireturn
         let code = [0x1a, 0x99, 0x00, 0x06, 0xa7, 0x00, 0x04, 0x04, 0xac];
-        let r = compute_reachable_pcs(&code, code.len()).expect("statically known control flow");
+        let r = bytecode_analysis::reachable_pcs(&code, code.len(), &[]).expect("statically known control flow");
         assert_eq!(
             &r[..code.len()],
             &[true, true, false, false, true, false, false, true, true],
@@ -6465,7 +5429,7 @@ mod loop_xform_tests {
         code.extend_from_slice(&23i32.to_be_bytes()); // case 1 -> 26
         code.extend_from_slice(&[0x04, 0xac, 0x05, 0xac, 0x06, 0xac]);
         assert_eq!(code.len(), 30);
-        let r = compute_reachable_pcs(&code, code.len()).expect("statically known control flow");
+        let r = bytecode_analysis::reachable_pcs(&code, code.len(), &[]).expect("statically known control flow");
         for pc in [0usize, 1, 2, 3, 24, 25, 26, 27, 28, 29] {
             assert!(r[pc], "pc {pc} is on a real path");
         }
@@ -6480,9 +5444,9 @@ mod loop_xform_tests {
     #[test]
     fn opaque_control_flow_refuses_rather_than_guessing() {
         let jsr = [0xa8, 0x00, 0x03, 0xac]; // jsr +3; ireturn
-        assert!(compute_reachable_pcs(&jsr, jsr.len()).is_none());
+        assert!(bytecode_analysis::reachable_pcs(&jsr, jsr.len(), &[]).is_none());
         let ret = [0xa9, 0x01]; // ret 1
-        assert!(compute_reachable_pcs(&ret, ret.len()).is_none());
+        assert!(bytecode_analysis::reachable_pcs(&ret, ret.len(), &[]).is_none());
     }
 
     /// Target PC of the 2-byte-offset branch at `pc`, or its fall-through.
@@ -6736,13 +5700,13 @@ mod loop_xform_tests {
         while pc < code_len {
             targets.clear();
             assert!(
-                branch_targets_at(code, pc, code_len, &mut targets),
+                bytecode_analysis::explicit_targets(code, code_len, pc, &mut targets),
                 "opaque control flow at {pc}"
             );
             if targets.iter().any(|&t| t <= pc) {
                 out.push(pc);
             }
-            pc += bytecode_len_at(code, pc);
+            pc += bytecode_analysis::step(code, pc);
         }
         out
     }
@@ -7051,13 +6015,13 @@ mod loop_xform_tests {
         );
         // …and the dominator machinery agrees on why: the header does not
         // dominate the other entry block.
-        let cfg = MethodCfg::build(&code, len).expect("cfg builds");
+        let cfg = bytecode_analysis::InsnCfg::build(&code, len).expect("cfg builds");
         let h = cfg.node_of(7).expect("header node");
         let l2 = cfg.node_of(13).expect("L2 node");
         assert!(!cfg.dominates(h, l2));
         // A reducible loop's header does dominate its region.
         let a = shape_a();
-        let acfg = MethodCfg::build(&a, a.len()).expect("cfg builds");
+        let acfg = bytecode_analysis::InsnCfg::build(&a, a.len()).expect("cfg builds");
         let ah = acfg.node_of(4).expect("header node");
         for &pc in acfg.nodes() {
             if (4..21).contains(&pc) {
@@ -7073,7 +6037,7 @@ mod loop_xform_tests {
         let len = code.len();
         // The outer loop is single-entry and its header dominates the whole
         // region, so only the inner reducibility test can reject this.
-        let cfg = MethodCfg::build(&code, len).expect("cfg builds");
+        let cfg = bytecode_analysis::InsnCfg::build(&code, len).expect("cfg builds");
         let h = cfg.node_of(2).expect("outer header");
         for &pc in cfg.nodes() {
             if (2..33).contains(&pc) {
@@ -7131,7 +6095,7 @@ mod loop_xform_tests {
     fn deopt_into_a_transformed_loop_resolves_its_locals() {
         let code = shape_a();
         let len = code.len();
-        let orig_starts = instruction_start_map(&code, len);
+        let orig_starts = bytecode_analysis::instruction_starts(&code, len);
         for k in 1..=3usize {
             for x in [
                 plan_loop_peel(&code, len, 4, 18, k, &[]).expect("peel"),
@@ -7140,7 +6104,7 @@ mod loop_xform_tests {
                 // Provenance is TOTAL: every output byte names an original
                 // bci, so no output PC can deopt into a hole.
                 assert!(x.provenance_is_total());
-                let out_starts = instruction_start_map(&x.code, x.code_len);
+                let out_starts = bytecode_analysis::instruction_starts(&x.code, x.code_len);
                 for (p, &is_start) in out_starts.iter().enumerate() {
                     if !is_start {
                         continue;
@@ -7485,21 +6449,21 @@ mod loop_xform_tests {
             ),
         ] {
             let len = code.len();
-            let starts = instruction_start_map(&code, len);
+            let starts = bytecode_analysis::instruction_starts(&code, len);
             let mut pc = 0usize;
             while pc < len {
                 assert!(starts[pc], "{name}: {pc} is not an instruction start");
-                let l = bytecode_len_at(&code, pc);
+                let l = bytecode_analysis::step(&code, pc);
                 assert!(l > 0, "{name}: zero-length instruction at {pc}");
                 pc += l;
             }
             assert_eq!(pc, len, "{name}: the walk overran the fixture");
 
             assert!(matches!(code[sw], 0xaa | 0xab), "{name}: no switch at {sw}");
-            assert_eq!(bytecode_len_at(&code, sw), sw_len, "{name}: switch length");
+            assert_eq!(bytecode_analysis::step(&code, sw), sw_len, "{name}: switch length");
             let mut t: Vec<usize> = Vec::new();
             assert!(
-                branch_targets_at(&code, sw, len, &mut t),
+                bytecode_analysis::explicit_targets(&code, len, sw, &mut t),
                 "{name}: switch does not decode"
             );
             assert_eq!(t, sw_targets, "{name}: switch targets");
@@ -7510,7 +6474,7 @@ mod loop_xform_tests {
                 "{name}"
             );
             assert_eq!(code[back_edge], 0xa7, "{name}: back edge is not a goto");
-            assert!(MethodCfg::build(&code, len).is_some(), "{name}: cfg builds");
+            assert!(bytecode_analysis::InsnCfg::build(&code, len).is_some(), "{name}: cfg builds");
             assert!(all_backward_edges_are_polled(&code, len), "{name}");
         }
     }
@@ -7530,7 +6494,7 @@ mod loop_xform_tests {
         let mut admitted_total = 0usize;
         for (name, code, header, back_edge) in admissible_fixtures() {
             let len = code.len();
-            let orig_starts = instruction_start_map(&code, len);
+            let orig_starts = bytecode_analysis::instruction_starts(&code, len);
             let mut admitted_here = 0usize;
             for k in 1..=LOOP_XFORM_MAX_COPIES {
                 for planned in [
@@ -7557,7 +6521,7 @@ mod loop_xform_tests {
                     // 2. THE PROPERTY: every output pc that begins an
                     //    instruction resolves, and resolves to a bci that
                     //    begins an instruction in the ORIGINAL.
-                    let out_starts = instruction_start_map(&x.code, x.code_len);
+                    let out_starts = bytecode_analysis::instruction_starts(&x.code, x.code_len);
                     for (p, &is_start) in out_starts.iter().enumerate() {
                         if !is_start {
                             continue;
@@ -7584,11 +6548,11 @@ mod loop_xform_tests {
                         let bci = x.bci_at(pc).unwrap_or(usize::MAX);
                         assert!(bci < len, "{what}: pc {pc} has no provenance");
                         assert_eq!(x.code[pc], code[bci], "{what}: pc {pc} vs bci {bci}");
-                        let l = bytecode_len_at(&x.code, pc);
+                        let l = bytecode_analysis::step(&x.code, pc);
                         assert!(l > 0, "{what}: zero-length instruction at {pc}");
                         assert_eq!(
                             l,
-                            bytecode_len_at(&code, bci),
+                            bytecode_analysis::step(&code, bci),
                             "{what}: pc {pc} and bci {bci} disagree on length"
                         );
                         for d in 0..l {
@@ -7858,9 +6822,9 @@ mod loop_xform_tests {
                 plan_loop_unroll(&before, blen, 12, 26, k, &[]).expect("switch before the loop"),
             ] {
                 assert_eq!(&x.code[..12], &before[..12], "{:?} k={k}", x.kind);
-                assert_eq!(bytecode_len_at(&x.code, 0), 12, "{:?} k={k}", x.kind);
+                assert_eq!(bytecode_analysis::step(&x.code, 0), 12, "{:?} k={k}", x.kind);
                 let mut t: Vec<usize> = Vec::new();
-                assert!(branch_targets_at(&x.code, 0, x.code_len, &mut t));
+                assert!(bytecode_analysis::explicit_targets(&x.code, x.code_len, 0, &mut t));
                 assert_eq!(
                     t,
                     vec![12],
@@ -7886,10 +6850,10 @@ mod loop_xform_tests {
                 let sw = 19 + k * 14;
                 assert_eq!(switch_pad(sw), switch_pad(19), "k={k}");
                 assert_eq!(x.code[sw], 0xab, "k={k}");
-                assert_eq!(bytecode_len_at(&x.code, sw), 9, "k={k}");
+                assert_eq!(bytecode_analysis::step(&x.code, sw), 9, "k={k}");
                 assert_eq!(x.bci_at(sw), Some(19), "k={k}");
                 let mut t: Vec<usize> = Vec::new();
-                assert!(branch_targets_at(&x.code, sw, x.code_len, &mut t));
+                assert!(bytecode_analysis::explicit_targets(&x.code, x.code_len, sw, &mut t));
                 assert_eq!(
                     t,
                     vec![28 + k * 14],
@@ -7947,7 +6911,7 @@ mod loop_xform_tests {
         let mut retargeted = over.clone();
         retargeted[SWITCH_OVER_DEFAULT_LOW_BYTE] = 0x0a; // +24 (past the loop) -> +10 (the header)
         let mut t: Vec<usize> = Vec::new();
-        assert!(branch_targets_at(&retargeted, 6, olen, &mut t));
+        assert!(bytecode_analysis::explicit_targets(&retargeted, olen, 6, &mut t));
         assert_eq!(t, vec![16], "the retarget must name the header");
         for k in 1..=3usize {
             let x = plan_loop_unroll(&retargeted, olen, 16, 27, k, &[])
@@ -8109,7 +7073,7 @@ mod loop_xform_tests {
                     }
                     _ => 1,
                 };
-                pc += bytecode_len_at(&bytes, pc);
+                pc += bytecode_analysis::step(&bytes, pc);
             }
             assert_eq!(
                 pc,
@@ -8306,7 +7270,7 @@ mod loop_xform_tests {
                 // …and so does every other bci in the region: entering a
                 // transformed copy would skip the guard, which is the whole
                 // point of having one.
-                let mut pc = header + bytecode_len_at(&code, header);
+                let mut pc = header + bytecode_analysis::step(&code, header);
                 while pc < back_edge + 3 {
                     let entry = x.osr_entry_pc(pc).expect("bci is in range");
                     assert_eq!(
@@ -8320,7 +7284,7 @@ mod loop_xform_tests {
                         entry >= v.fallback_base,
                         "{kind:?} k={k} bci={pc}: OSR entered a guarded copy"
                     );
-                    pc += bytecode_len_at(&code, pc);
+                    pc += bytecode_analysis::step(&code, pc);
                 }
                 // No OSR entry anywhere in the method resolves into the guard.
                 let (gfrom, gto) = x.guard_span().expect("versioned");

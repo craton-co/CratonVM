@@ -3182,9 +3182,8 @@ fn frem_helpers() -> JitRuntimeHelpers {
 }
 
 /// Compile an FP-remainder method through the IR pipeline ONLY and assert
-/// IR == host (Rust float `%`). Single-pass bails `frem`/`drem`, so there is no
-/// IR-vs-single-pass leg; the assert that single-pass returns `None` pins that
-/// assumption (a future single-pass `frem` should switch this to `check_fp`).
+/// IR == single-pass == host (Rust float `%`). Both tiers lower `frem`/`drem`
+/// to a call to the `jit_frem`/`jit_drem` fmod helpers.
 fn check_frem(
     name: &str,
     descriptor: &str,
@@ -3194,37 +3193,37 @@ fn check_frem(
     cases: &[(Vec<i64>, i32)],
 ) {
     let helpers = frem_helpers();
-    // Compile the IR body FIRST: a single-pass attempt bails (no frem arm) and
-    // adds the method to the shared permanent bail-list (`mark_jit_bail_listed`),
-    // which would then short-circuit this IR compile to `None`. So the
-    // single-pass-bails check below runs on a DISTINCTLY-named twin method.
+    // The IR body is compiled first and the single-pass body on a
+    // distinctly-named twin, so a bail-list entry one tier might leave
+    // (`mark_jit_bail_listed`) cannot short-circuit the other tier's compile.
     let cm = cached(name, descriptor, code.clone(), max_locals, num_params);
     let ir = compile_fp_opt(&cm, &helpers, true)
         .unwrap_or_else(|| panic!("{name}: IR (FP) failed to compile frem/drem — gate/builder?"));
-    // Pin the "single-pass bails frem/drem" assumption (a future single-pass
-    // frem arm should switch this test to `check_fp`). Separate name so the
-    // bail-list entry it creates can't shadow `cm` above.
-    let twin = cached(
-        &format!("{name}_spbail"),
-        descriptor,
-        code,
-        max_locals,
-        num_params,
-    );
-    assert!(
-        compile_fp_opt(&twin, &helpers, false).is_none(),
-        "{name}: single-pass unexpectedly compiled frem/drem — switch this test to check_fp",
-    );
+    // 2026-09-12: this asserted that single-pass BAILS on frem/drem. The
+    // single-pass tier has lowered both to the fmod helpers since the `0x72 |
+    // 0x73` arm landed in `bytecode_walk.rs`, which made the assertion fail on
+    // every run; it is now the second leg of the comparison.
+    let twin = cached(&format!("{name}_sp"), descriptor, code, max_locals, num_params);
+    let sp = compile_fp_opt(&twin, &helpers, false)
+        .unwrap_or_else(|| panic!("{name}: single-pass failed to compile frem/drem"));
     for (args, expected) in cases {
-        // SAFETY: IR-produced body from valid FP bytecode with an int signature;
-        // the i64-arg/i64-ret ABI matches try_call and only frem/drem (wired
-        // above) is reachable.
+        // SAFETY: both bodies were produced by the JIT from valid FP bytecode
+        // with an int signature; the i64-arg/i64-ret ABI matches try_call and
+        // only frem/drem (wired above) is reachable.
         let r_ir = unsafe { ir.try_call(args) }
             .unwrap_or_else(|e| panic!("{name}: IR call {args:?}: {e:?}"));
+        // SAFETY: as above.
+        let r_sp = unsafe { sp.try_call(args) }
+            .unwrap_or_else(|e| panic!("{name}: single-pass call {args:?}: {e:?}"));
         assert_eq!(
             r_ir as i32, *expected,
             "{name}: IR vs host DIVERGE for {args:?}: IR={}, host={expected}",
             r_ir as i32,
+        );
+        assert_eq!(
+            r_sp as i32, *expected,
+            "{name}: single-pass vs host DIVERGE for {args:?}: single-pass={}, host={expected}",
+            r_sp as i32,
         );
     }
 }
@@ -5595,8 +5594,25 @@ fn string_ldc_with_the_helper_unwired_stays_on_single_pass() {
 
 /// [`compile_opt`] plus a `cp_static_field_resolver`, so the IR builder can
 /// lower `getstatic`.
-fn compile_getstatic(
+/// [`compile_getstatic`] with a direct-helper table on the request, for the
+/// tests that give the backends a static-base resolver.
+fn compile_getstatic_with(
+    direct_helpers: &cratonvm_jit::DirectHelperTable,
     cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    statics: &dyn Fn(u16) -> Option<(u32, usize, u8, bool)>,
+) -> Option<CompiledMethod> {
+    routing_not_policy();
+    cratonvm_jit::try_compile_request(&cratonvm_jit::CompileRequest {
+        cp_static_field_resolver: Some(statics),
+        optimize,
+        direct_helpers,
+        ..cratonvm_jit::CompileRequest::new(cm, helpers)
+    })
+}
+
+fn compile_getstatic(    cm: &CachedBytecodeMethod,
     helpers: &JitRuntimeHelpers,
     optimize: bool,
     statics: &dyn Fn(u16) -> Option<(u32, usize, u8, bool)>,
@@ -5696,22 +5712,12 @@ fn ir_vs_singlepass_getstatic_direct_load() {
     // `FIELD_CELL_PAYLOAD{32,64}_OFFSET` biases the two encodings use.
     //
     // The resolver answers for exactly one class id and declines everything
-    // else, so it stays inert for every other test in this binary — the same
-    // discipline `x64::tests::test_getstatic_inline_direct_load_and_fallback`
-    // uses, and necessary for the same reason: `set_static_base_resolver`
-    // latches its context for the life of the process.
+    // else. It travels on this test's own compile requests, so no other test
+    // in this binary sees it.
     use cratonvm_types::Value;
     use std::sync::atomic::AtomicPtr;
 
     /// Stands in for `jit_resolve_static_base`; `ctx` IS the base-pointer cell.
-    ///
-    /// **One registration for this whole binary.** A second
-    /// `set_static_base_resolver` with a different context does not replace this
-    /// one — it POISONS the resolver, and every direct site silently reverts to
-    /// the helper. (Learned the expensive way: a separate wide-static test with
-    /// its own block made this one's rung 1 return the marker value.) So the
-    /// wide and floating-point widths are rungs of THIS test, sharing this
-    /// block, rather than a sibling with a block of its own.
     unsafe extern "C" fn test_resolver(ctx: i64, class_id: i64, field_index: i64) -> i64 {
         if class_id == 0x1CE && (1..=5).contains(&field_index) {
             ctx
@@ -5743,7 +5749,11 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             Box::leak(Box::new(AtomicPtr::new(block.as_mut_ptr())));
         cell as *const AtomicPtr<Value> as usize
     });
-    cratonvm_jit::x64::set_static_base_resolver(test_resolver as *const () as usize, cell_addr);
+    let direct_helpers = cratonvm_jit::DirectHelperTable {
+        static_base_resolver: test_resolver as *const () as usize,
+        static_base_resolver_ctx: cell_addr,
+        ..cratonvm_jit::DirectHelperTable::EMPTY
+    };
 
     let mut helpers = dummy_helpers();
     helpers.getstatic = marker_getstatic as *const () as usize;
@@ -5758,8 +5768,8 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             }
         };
         let cm = cached("gsdi", "()I", code, 1, 0);
-        let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR direct getstatic");
-        let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
+        let ir = compile_getstatic_with(&direct_helpers, &cm, &helpers, true, &statics).expect("IR direct getstatic");
+        let sp = compile_getstatic_with(&direct_helpers, &cm, &helpers, false, &statics).expect("single-pass");
         assert!(
             ir.used_ir_backend,
             "cov-01: direct getstatic on the IR tier"
@@ -5791,8 +5801,8 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             }
         };
         let cm = cached("gsdf", "()I", code, 1, 0);
-        let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR fallback getstatic");
-        let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
+        let ir = compile_getstatic_with(&direct_helpers, &cm, &helpers, true, &statics).expect("IR fallback getstatic");
+        let sp = compile_getstatic_with(&direct_helpers, &cm, &helpers, false, &statics).expect("single-pass");
         let expected = 424_242 + 0x1CE;
         assert_eq!(call_with_dummy_context(&ir, &[]) as i32, expected);
         assert_eq!(call_with_dummy_context(&sp, &[]) as i32, expected);
@@ -5811,8 +5821,8 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             }
         };
         let cm = cached("gsdr", "()Ljava/lang/Object;", code, 1, 0);
-        let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR ref getstatic");
-        let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
+        let ir = compile_getstatic_with(&direct_helpers, &cm, &helpers, true, &statics).expect("IR ref getstatic");
+        let sp = compile_getstatic_with(&direct_helpers, &cm, &helpers, false, &statics).expect("single-pass");
         assert!(
             ir.used_ir_backend,
             "cov-01: a reference static on the IR tier"
@@ -5848,9 +5858,9 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             }
         };
         let cm = cached("gsdw", desc, code, 2, 0);
-        let ir = compile_wide_getstatic(&cm, &helpers, true, &statics)
+        let ir = compile_wide_getstatic_with(&direct_helpers, &cm, &helpers, true, &statics)
             .unwrap_or_else(|| panic!("IR direct `{}` static", tag as char));
-        let sp = compile_wide_getstatic(&cm, &helpers, false, &statics)
+        let sp = compile_wide_getstatic_with(&direct_helpers, &cm, &helpers, false, &statics)
             .unwrap_or_else(|| panic!("single-pass direct `{}` static", tag as char));
         assert!(
             ir.used_ir_backend,
@@ -5961,6 +5971,25 @@ unsafe extern "C" fn wide_value_getstatic(_vm: i64, _class_id: i64, field_index:
 /// failed-`<clinit>` sentinel. Its own function, so nothing else can perturb it.
 unsafe extern "C" fn long_min_getstatic(_vm: i64, _class_id: i64, _field_index: i64) -> i64 {
     i64::MIN
+}
+
+/// [`compile_wide_getstatic`] with a direct-helper table on the request.
+fn compile_wide_getstatic_with(
+    direct_helpers: &cratonvm_jit::DirectHelperTable,
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    statics: &dyn Fn(u16) -> Option<(u32, usize, u8, bool)>,
+) -> Option<CompiledMethod> {
+    routing_not_policy();
+    cratonvm_jit::try_compile_request(&cratonvm_jit::CompileRequest {
+        cp_static_field_resolver: Some(statics),
+        optimize,
+        ir_emit_long: true,
+        ir_emit_fp: true,
+        direct_helpers,
+        ..cratonvm_jit::CompileRequest::new(cm, helpers)
+    })
 }
 
 /// [`compile_getstatic`] with the long and FP value tiers on, which is what a
@@ -6490,6 +6519,10 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
         }
     };
     let compile = |elidable: &dyn Fn(u16) -> bool, helpers: &JitRuntimeHelpers| {
+        // Without this the C1->C2 acceptance gate refuses this small IR body
+        // whenever no earlier test in the binary has already switched it off,
+        // and the test fails on its own (see `routing_not_policy`).
+        routing_not_policy();
         try_compile(
             &cm,
             None,
@@ -6544,7 +6577,12 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
         // the only evidence in the test that the elision happened at all, and
         // an assertion accepting either answer would pass on a build where the
         // flag had silently stopped working.
-        let elided = cratonvm_jit::scalar_deopt_enabled() && cratonvm_jit::deopt_real_enabled();
+        //
+        // 2026-09-12: the recipe that licenses the elision is emitted whenever
+        // precise resume is on (`scalar_deopt_descriptor_available` is exactly
+        // `deopt_real_enabled`, default ON); `CRATONVM_SCALAR_DEOPT` no longer
+        // gates it (`allocation-elision-never-fires-by-default-FIXED-20260912.md`).
+        let elided = cratonvm_jit::deopt_real_enabled();
         assert_eq!(
             ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
             if elided { 0 } else { i + 1 },

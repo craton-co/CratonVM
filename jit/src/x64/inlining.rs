@@ -1856,7 +1856,7 @@ impl Compiler {
         // bailed ALL branches to stop a value-merge slot desync (the
         // `iconst_1; goto L; iconst_0; L: ireturn` diamond); this restores the
         // provably-safe subset (e.g. `x>=0?x:-x`) while still bailing diamonds.
-        let callee_branch_targets = compute_branch_targets(callee_code, callee_len);
+        let callee_branch_targets = bytecode_analysis::branch_target_map(callee_code, callee_len);
         // True after an instruction that does NOT fall through (goto/return/
         // athrow) so the merge-point check can distinguish a dead fall-through
         // (stale slots — safe to reset) from a live value-merge (must bail).

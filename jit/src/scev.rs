@@ -245,7 +245,7 @@ pub fn analyze_induction_variables(
                     pc += 6;
                 }
                 _ => {
-                    pc += bytecode_len(code, pc, code_len);
+                    pc += crate::bytecode_analysis::step(code, pc);
                 }
             }
         }
@@ -340,7 +340,7 @@ fn analyze_loop_exit(
                     (None, Some(val), next_pc + 3)
                 }
                 _ => {
-                    pc += bytecode_len(code, pc, code_len);
+                    pc += crate::bytecode_analysis::step(code, pc);
                     continue;
                 }
             };
@@ -355,118 +355,9 @@ fn analyze_loop_exit(
                 }
             }
         }
-        pc += bytecode_len(code, pc, code_len);
+        pc += crate::bytecode_analysis::step(code, pc);
     }
     (None, None, None, None)
-}
-
-/// Compute the byte length of the instruction at `pc`.
-pub fn bytecode_len(code: &[u8], pc: usize, code_len: usize) -> usize {
-    if pc >= code_len {
-        return 1;
-    }
-    match code[pc] {
-        0x00..=0x0F => 1,
-        0x10 => 2,
-        0x11 => 3,
-        0x12 => 2,
-        0x13 | 0x14 => 3,
-        0x15..=0x19 => 2,
-        0x1A..=0x35 => 1,
-        0x36..=0x3A => 2,
-        0x3B..=0x56 => 1,
-        0x57..=0x5F => 1,
-        0x60..=0x83 => 1,
-        0x84 => 3,
-        0x85..=0x93 => 1,
-        0x94..=0x98 => 1,
-        0x99..=0xA6 => 3,
-        0xA7 => 3,
-        0xA8 => 3,
-        0xA9 => 2,
-        // HIGH security fix: bound switch table size against adversarial
-        // overflow (see `x64::checked_tableswitch_count`). On overflow / cap
-        // exceeded we return 1 — a safe PC advance; the JIT entry point
-        // re-validates and bails the whole compile.
-        0xAA => {
-            let pad = (4 - ((pc + 1) % 4)) % 4;
-            let table = pc + 1 + pad;
-            if table + 12 > code_len {
-                return 1;
-            }
-            let low = i32::from_be_bytes([
-                code[table + 4],
-                code[table + 5],
-                code[table + 6],
-                code[table + 7],
-            ]);
-            let high = i32::from_be_bytes([
-                code[table + 8],
-                code[table + 9],
-                code[table + 10],
-                code[table + 11],
-            ]);
-            let n = match crate::x64::checked_tableswitch_count(low, high) {
-                Some(c) => c,
-                None => return 1,
-            };
-            match n.checked_mul(4).and_then(|x| x.checked_add(1 + pad + 12)) {
-                Some(len) => len,
-                None => 1,
-            }
-        }
-        0xAB => {
-            let pad = (4 - ((pc + 1) % 4)) % 4;
-            let table = pc + 1 + pad;
-            if table + 8 > code_len {
-                return 1;
-            }
-            // Read as i32 first to detect negative values explicitly; the
-            // historical `u32` cast silently accepted huge "negative"
-            // npairs and let them propagate into address arithmetic.
-            let npairs_raw = i32::from_be_bytes([
-                code[table + 4],
-                code[table + 5],
-                code[table + 6],
-                code[table + 7],
-            ]);
-            let npairs = match crate::x64::checked_lookupswitch_npairs(npairs_raw) {
-                Some(n) => n,
-                None => return 1,
-            };
-            match npairs
-                .checked_mul(8)
-                .and_then(|x| x.checked_add(1 + pad + 8))
-            {
-                Some(len) => len,
-                None => 1,
-            }
-        }
-        0xAC..=0xB1 => 1,
-        0xB2..=0xB8 => 3,
-        0xB9 => 5,
-        0xBA => 5,
-        0xBB => 3,
-        0xBC => 2,
-        0xBD => 3,
-        0xBE..=0xBF => 1,
-        0xC0..=0xC1 => 3,
-        0xC2..=0xC3 => 1,
-        0xC4 => {
-            if pc + 1 >= code_len {
-                return 1;
-            }
-            if code[pc + 1] == 0x84 {
-                6
-            } else {
-                4
-            }
-        }
-        0xC5 => 4,
-        0xC6 | 0xC7 => 3,
-        0xC8 | 0xC9 => 5,
-        _ => 1,
-    }
 }
 
 // ===========================================================================
@@ -2213,7 +2104,7 @@ mod tests {
         let mut code = vec![0u8; 256];
         for op in 0..=0xFF_u8 {
             code[0] = op;
-            let len = bytecode_len(&code, 0, code.len());
+            let len = crate::bytecode_analysis::step(&code, 0);
             assert!(len >= 1, "opcode 0x{op:02X} returned len 0");
         }
     }

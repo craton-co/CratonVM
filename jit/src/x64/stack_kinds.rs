@@ -222,7 +222,7 @@ pub(crate) fn analyze(code: &[u8], code_len: usize, inputs: &StackKindInputs<'_>
         map.at.insert(pc, state.clone());
 
         let op = code[pc];
-        let len = bytecode_len_at(code, pc);
+        let len = bytecode_analysis::step(code, pc);
         if len == 0 {
             continue;
         }
@@ -282,27 +282,27 @@ pub(crate) fn analyze(code: &[u8], code_len: usize, inputs: &StackKindInputs<'_>
             // Unconditional transfers and terminators: no fall-through.
             0xa7 => {
                 // goto
-                if let Some(t) = branch_target(code, pc, 2) {
+                if let Some(t) = bytecode_analysis::offset_branch_target(code, pc) {
                     publish(t, &after, &mut in_state, &mut poisoned, &mut work);
                 }
             }
             0xc8 => {
                 // goto_w
-                if let Some(t) = branch_target_wide(code, pc) {
+                if let Some(t) = bytecode_analysis::offset_branch_target(code, pc) {
                     publish(t, &after, &mut in_state, &mut poisoned, &mut work);
                 }
             }
             0xac..=0xb1 | 0xbf => {} // returns / athrow — path ends
             // Conditional branches: both edges.
             0x99..=0xa6 | 0xc6 | 0xc7 => {
-                if let Some(t) = branch_target(code, pc, 2) {
+                if let Some(t) = bytecode_analysis::offset_branch_target(code, pc) {
                     publish(t, &after, &mut in_state, &mut poisoned, &mut work);
                 }
                 publish(next, &after, &mut in_state, &mut poisoned, &mut work);
             }
             // Switches: every target plus default, no fall-through.
             0xaa | 0xab => {
-                for t in switch_targets(code, pc, op, code_len) {
+                for t in bytecode_analysis::switch_targets_lenient(code, code_len, pc) {
                     publish(t, &after, &mut in_state, &mut poisoned, &mut work);
                 }
             }
@@ -321,82 +321,14 @@ pub(crate) fn analyze(code: &[u8], code_len: usize, inputs: &StackKindInputs<'_>
     map
 }
 
-/// Successors used only for poison propagation (a superset is fine there).
+/// Successors used only for poison propagation (a superset is fine there):
+/// [`bytecode_analysis::lenient_successors`], plus `ret`'s textual
+/// fall-through, which this walk has always poisoned.
 fn successors(code: &[u8], pc: usize, op: u8, len: usize, code_len: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    match op {
-        0xa7 => out.extend(branch_target(code, pc, 2)),
-        0xc8 => out.extend(branch_target_wide(code, pc)),
-        0xac..=0xb1 | 0xbf => {}
-        0x99..=0xa6 | 0xc6 | 0xc7 => {
-            out.extend(branch_target(code, pc, 2));
-            out.push(pc + len);
-        }
-        0xaa | 0xab => out.extend(switch_targets(code, pc, op, code_len)),
-        _ => out.push(pc + len),
+    let mut out = bytecode_analysis::lenient_successors(code, code_len, pc);
+    if op == 0xa9 {
+        out.push(pc + len);
     }
-    out
-}
-
-fn branch_target(code: &[u8], pc: usize, off_at: usize) -> Option<usize> {
-    let hi = *code.get(pc + off_at - 1)?;
-    let lo = *code.get(pc + off_at)?;
-    let off = i16::from_be_bytes([hi, lo]) as i32; // Widening: always safe
-    pc.checked_add_signed(off as isize) // Cast: branch offset for pc arithmetic
-}
-
-fn branch_target_wide(code: &[u8], pc: usize) -> Option<usize> {
-    let b = code.get(pc + 1..pc + 5)?;
-    let off = i32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-    pc.checked_add_signed(off as isize) // Cast: branch offset for pc arithmetic
-}
-
-fn switch_targets(code: &[u8], pc: usize, op: u8, code_len: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut p = pc + 1;
-    while p % 4 != 0 {
-        p += 1;
-    }
-    let read_i32 = |at: usize| -> Option<i32> {
-        let b = code.get(at..at + 4)?;
-        Some(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    };
-    let Some(default) = read_i32(p) else {
-        return out;
-    };
-    if let Some(t) = pc.checked_add_signed(default as isize) {
-        // Cast: switch offset for pc arithmetic
-        out.push(t);
-    }
-    if op == 0xaa {
-        let (Some(low), Some(high)) = (read_i32(p + 4), read_i32(p + 8)) else {
-            return out;
-        };
-        let n = (high as i64 - low as i64 + 1).max(0) as usize; // Widening then clamp
-        for k in 0..n {
-            let Some(off) = read_i32(p + 12 + k * 4) else {
-                break;
-            };
-            if let Some(t) = pc.checked_add_signed(off as isize) {
-                // Cast: switch offset for pc arithmetic
-                out.push(t);
-            }
-        }
-    } else {
-        let Some(npairs) = read_i32(p + 4) else {
-            return out;
-        };
-        for k in 0..npairs.max(0) as usize {
-            let Some(off) = read_i32(p + 12 + k * 8) else {
-                break;
-            };
-            if let Some(t) = pc.checked_add_signed(off as isize) {
-                // Cast: switch offset for pc arithmetic
-                out.push(t);
-            }
-        }
-    }
-    out.retain(|&t| t < code_len);
     out
 }
 

@@ -51,6 +51,7 @@
 //! [rbp - (N+1)*8 .. ] = operand stack spill area
 //! ```
 
+pub(crate) use crate::bytecode_analysis;
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo};
 use cratonvm_jit_api::JitRuntimeHelpers;
 // JEP 358 (helpful NPE) inline-codegen path: the canonical operation-kind
@@ -149,6 +150,8 @@ pub use bytecode_compat::*;
 // declared visibility, so nothing here became more public than it was.
 mod licm;
 pub use licm::*;
+mod backend_request;
+pub use backend_request::BackendRequest;
 pub(crate) mod stack_kinds;
 // ---------------------------------------------------------------------------
 // HIGH-1 / Fix 1 — null-check elimination helper
@@ -205,6 +208,13 @@ pub use driver::*;
 mod loop_rewrite;
 pub use loop_rewrite::*;
 pub mod bytecode_walk;
+mod op_local_stack;
+mod op_array;
+mod op_arith;
+mod op_control;
+mod op_field;
+mod op_invoke;
+mod op_object;
 /// Test-only view of the E27-1 N2b compile-time needle screen.
 ///
 /// The screen decides which `String.indexOf(int)` sites the backend will
@@ -577,7 +587,7 @@ struct Compiler {
 
     /// `[start_pc, end_pc)` ranges covered by this method's exception table.
     /// Empty when the method has no handlers. Consulted only by
-    /// [`Compiler::pc_is_protected`]; see `PROTECTED_RANGES_REQUEST`.
+    /// [`Compiler::pc_is_protected`]; see `BackendRequest::protected_ranges`.
     protected_ranges: Vec<(u32, u32)>,
     /// This method's exception table as `(start_pc, end_pc, handler_pc, catch
     /// type name)`, non-empty exactly when compiled local handlers are ARMED
@@ -971,6 +981,8 @@ struct Compiler {
     ldc_fp_pcs: FxHashSet<usize>,
     /// Runtime helper function pointers for JIT callbacks.
     helpers: JitRuntimeHelpers,
+    /// The VM's thin direct-call helper addresses for this compile.
+    pub(crate) direct_helpers: crate::DirectHelperTable,
     /// Expected simulated-stack depth at each forward branch target.
     /// Used to fix up the stack when dead code becomes live at a merge point.
     branch_target_stack_depth: FxHashMap<usize, usize>,
@@ -3001,6 +3013,7 @@ impl Compiler {
             failed_site: None,
             unresolved_branch_target: None,
             helpers,
+            direct_helpers: crate::DirectHelperTable::EMPTY,
             scratch_xmm_in_use: 0,
             fp_hoist_info: Vec::new(),
             _fp_hoist_offsets: Vec::new(),

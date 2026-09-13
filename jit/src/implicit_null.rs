@@ -91,6 +91,23 @@
 //! not land in the first page, and a PC that is not the exact instruction we
 //! registered is not ours.
 //!
+//! # Hazard 4 — nothing is installed to recover the fault
+//!
+//! An elided check is only half of the mechanism: the other half is a
+//! process-wide fault handler (a Windows vectored exception handler, or the
+//! Unix `SIGSEGV` action) that calls [`recover`]. The VM installs one from
+//! `install_hardware_fault_handler`, which `vm-cli` and `libcratonvm` call at
+//! startup. An embedding that never calls it — every `vm/tests` integration
+//! binary, where the test-harness shim that installs it is `cfg(test)`-only —
+//! used to get elided checks all the same. A null receiver then faulted with
+//! no handler at all, and a Java `NullPointerException` killed the process
+//! with `STATUS_ACCESS_VIOLATION` and no report
+//! (`implicit-null-checks-crash-a-process-with-no-fault-handler-FIXED-20260912.md`).
+//!
+//! So elision is gated on [`active`], not on [`enabled`] alone: the handler's
+//! installer calls [`note_fault_handler_installed`], and until it has, every
+//! site keeps its explicit check.
+//!
 //! # What the compiler must guarantee, and does
 //!
 //! The registered PC has to be an instruction that (a) faults whenever the
@@ -102,7 +119,7 @@
 //! to the interpreter, so the fail-closed direction never leaves unguarded
 //! code running.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Faults at or above this address are never an implicit null check. One page
 /// covers a null receiver plus any field offset the compiler will fold into
@@ -125,10 +142,15 @@ static RECOVER_PC: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
 /// Monotonic high-water mark. Never decreases — see hazard 2.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-static REGISTERED: AtomicUsize = AtomicUsize::new(0);
-static RETIRED: AtomicUsize = AtomicUsize::new(0);
-static RECOVERED: AtomicUsize = AtomicUsize::new(0);
-static DECLINED: AtomicUsize = AtomicUsize::new(0);
+/// `[registered, retired, recovered, declined]`, indexed by the `C_*` consts.
+/// One array rather than four statics: they are read together by [`counts`].
+static COUNTERS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+const C_REGISTERED: usize = 0;
+const C_RETIRED: usize = 1;
+const C_RECOVERED: usize = 2;
+const C_DECLINED: usize = 3;
+/// Set once a fault handler that calls [`recover`] is installed. See hazard 4.
+static FAULT_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Is the implicit null check enabled? **Default ON** since 2026-09-02; opt
 /// out with `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0`.
@@ -166,6 +188,25 @@ pub fn enabled() -> bool {
     })
 }
 
+/// Record that a process-wide fault handler which calls [`recover`] is
+/// installed. Called by the VM's hardware-fault installers; never reset,
+/// because neither installer ever removes its handler.
+pub fn note_fault_handler_installed() {
+    FAULT_HANDLER_INSTALLED.store(true, Ordering::Release);
+}
+
+/// Has [`note_fault_handler_installed`] been called in this process?
+pub fn fault_handler_installed() -> bool {
+    FAULT_HANDLER_INSTALLED.load(Ordering::Acquire)
+}
+
+/// May the compiler elide a check now? [`enabled`] AND a recovering fault
+/// handler installed (hazard 4). A compile that runs before the handler
+/// exists emits explicit checks, which is the behaviour of the off arm.
+pub fn active() -> bool {
+    enabled() && fault_handler_installed()
+}
+
 /// Register one site. `false` means the table is full and the caller must emit
 /// an explicit check instead.
 ///
@@ -178,12 +219,12 @@ pub fn register(fault_pc: usize, recover_pc: usize) -> bool {
     }
     let i = NEXT.fetch_add(1, Ordering::Relaxed);
     if i >= CAP {
-        DECLINED.fetch_add(1, Ordering::Relaxed);
+        COUNTERS[C_DECLINED].fetch_add(1, Ordering::Relaxed);
         return false;
     }
     RECOVER_PC[i].store(recover_pc, Ordering::Relaxed);
     FAULT_PC[i].store(fault_pc, Ordering::Release);
-    REGISTERED.fetch_add(1, Ordering::Relaxed);
+    COUNTERS[C_REGISTERED].fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -198,7 +239,7 @@ pub fn unregister_range(base: usize, len: usize) {
     for slot in FAULT_PC.iter().take(hi) {
         let pc = slot.load(Ordering::Relaxed);
         if pc >= base && pc < end && slot.swap(0, Ordering::Release) != 0 {
-            RETIRED.fetch_add(1, Ordering::Relaxed);
+            COUNTERS[C_RETIRED].fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -217,7 +258,7 @@ pub fn recover(fault_pc: usize, fault_addr: usize) -> Option<usize> {
         if FAULT_PC[i].load(Ordering::Acquire) == fault_pc {
             let target = RECOVER_PC[i].load(Ordering::Relaxed);
             if target != 0 {
-                RECOVERED.fetch_add(1, Ordering::Relaxed);
+                COUNTERS[C_RECOVERED].fetch_add(1, Ordering::Relaxed);
                 return Some(target);
             }
         }
@@ -234,16 +275,34 @@ pub fn recover(fault_pc: usize, fault_addr: usize) -> Option<usize> {
 /// feature has quietly stopped applying.
 pub fn counts() -> (usize, usize, usize, usize) {
     (
-        REGISTERED.load(Ordering::Relaxed),
-        RETIRED.load(Ordering::Relaxed),
-        RECOVERED.load(Ordering::Relaxed),
-        DECLINED.load(Ordering::Relaxed),
+        COUNTERS[C_REGISTERED].load(Ordering::Relaxed),
+        COUNTERS[C_RETIRED].load(Ordering::Relaxed),
+        COUNTERS[C_RECOVERED].load(Ordering::Relaxed),
+        COUNTERS[C_DECLINED].load(Ordering::Relaxed),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hazard 4: the flag alone must not elide a check. `active` also needs a
+    /// recovering fault handler, which only the VM's installers note.
+    #[test]
+    fn elision_needs_a_recovering_fault_handler_as_well_as_the_flag() {
+        if !enabled() {
+            assert!(!active(), "the kill switch turns elision off whatever else holds");
+            return;
+        }
+        // Process-wide: another test may already have stood in for the
+        // installer, in which case only the second half can be checked.
+        if !fault_handler_installed() {
+            assert!(!active(), "no handler installed, so no elision");
+        }
+        note_fault_handler_installed();
+        assert!(fault_handler_installed());
+        assert!(active(), "flag on and a handler installed: elide");
+    }
 
     /// A registered site round-trips, and only for a null-page address.
     #[test]

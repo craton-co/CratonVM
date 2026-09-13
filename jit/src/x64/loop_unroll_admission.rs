@@ -359,9 +359,9 @@ fn a_transformed_pc_is_never_an_interpreter_bci() {
                      the opcode",
                     x.kind
                 );
-                let out_len = bytecode_len_at(&x.code, pc);
+                let out_len = bytecode_analysis::step(&x.code, pc);
                 assert!(out_len > 0);
-                assert_eq!(out_len, bytecode_len_at(&code, bci));
+                assert_eq!(out_len, bytecode_analysis::step(&code, bci));
                 if bci != pc {
                     saw_divergence = true;
                 }
@@ -396,7 +396,7 @@ fn osr_entry_lands_on_the_steady_state_copy_not_a_peeled_prefix() {
         let mut pc = header;
         while pc < back_edge {
             v.push(pc);
-            pc += bytecode_len_at(&code, pc);
+            pc += bytecode_analysis::step(&code, pc);
         }
         v
     };
@@ -627,6 +627,10 @@ fn every_unrolled_copy_of_an_implicit_null_check_is_registered() {
         // nothing registers and both arms are 0, which would pass vacuously.
         return;
     }
+    // Elision also needs a recovering fault handler (hazard 4 in
+    // `implicit_null`). This test only compiles and reads metadata, it never
+    // executes a null receiver, so stand in for the VM's installer.
+    crate::implicit_null::note_fault_handler_installed();
     let code = shape_pointer_walk_loop();
     // pc -> (field index, type tag): 11 is `v` (int), 17 is `next` (ref).
     let field_info = vec![(11usize, 0usize, b'I'), (17usize, 1usize, b'L')];
@@ -691,6 +695,7 @@ fn every_unrolled_copy_of_an_implicit_null_check_is_registered() {
                     None, // despec: fixture has no VM
                     Vec::new(),
                     None,
+                    crate::x64::BackendRequest::default(),
                 )
                 .expect("the pointer-walk fixture compiles")
             },
@@ -1406,6 +1411,7 @@ fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
         vec![(19, 0, b'I', Vec::new(), 0)],
         // elidable_init_pcs: fixture resolves no constant pool.
         None,
+        crate::x64::BackendRequest::default(),
     )
 }
 
@@ -1643,7 +1649,7 @@ fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
     let mut walked: Vec<usize> = Vec::new();
     while bci <= 16 {
         walked.push(bci);
-        bci += bytecode_len_at(&code, bci);
+        bci += bytecode_analysis::step(&code, bci);
     }
     assert_eq!(bci, 19, "the walk must land past the back edge");
     let mut listed: Vec<usize> = ENTERABLE

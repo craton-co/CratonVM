@@ -530,7 +530,7 @@ impl Compiler {
         if !inline_getstatic_enabled() {
             return false;
         }
-        let Some(base_cell) = resolve_static_base(class_id_raw, field_index) else {
+        let Some(base_cell) = self.direct_helpers.resolve_static_base(class_id_raw, field_index) else {
             return false;
         };
         // Cast: cell byte offset within the class's statics block -> disp32.
@@ -709,7 +709,7 @@ impl Compiler {
         // make the guarantee conditional — the verification would catch a
         // wrong answer, but as a failed compile on a live workload rather than
         // as a decision made here.
-        if implicit_ok && crate::implicit_null::enabled() {
+        if implicit_ok && crate::implicit_null::active() {
             self.implicit_null_pending.push((self.buf.pos(), bc_pc));
             super::null_check_elim::note_receiver_null_check_implicit(arm);
             return Vec::new();

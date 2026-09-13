@@ -398,7 +398,7 @@ pub(super) fn find_arith_loop_hoists(
     sorted_loops.sort_by_key(|&(h, b)| std::cmp::Reverse(b.saturating_sub(h)));
 
     for &(header, back_edge) in &sorted_loops {
-        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        let loop_end = back_edge + bytecode_analysis::step(code, back_edge);
         if loop_end > code_len {
             continue;
         }
@@ -417,7 +417,7 @@ pub(super) fn find_arith_loop_hoists(
                 has_invoke = true;
                 break;
             }
-            scan += bytecode_len_at(code, scan);
+            scan += bytecode_analysis::step(code, scan);
         }
         if has_invoke {
             continue;
@@ -427,7 +427,7 @@ pub(super) fn find_arith_loop_hoists(
         let mut pc = header;
         while pc < loop_end && pc < code_len {
             if claimed.contains(&pc) {
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
                 continue;
             }
             if let Some((steps, seq_end)) = match_invariant_iarith(code, pc, modified, code_len) {
@@ -438,7 +438,7 @@ pub(super) fn find_arith_loop_hoists(
                     let mut q = pc;
                     while q < seq_end {
                         claimed.insert(q);
-                        q += bytecode_len_at(code, q);
+                        q += bytecode_analysis::step(code, q);
                     }
                     hoists.push(ArithLoopHoist {
                         loop_header: header,
@@ -451,7 +451,7 @@ pub(super) fn find_arith_loop_hoists(
                     continue;
                 }
             }
-            pc += bytecode_len_at(code, pc);
+            pc += bytecode_analysis::step(code, pc);
         }
     }
 
@@ -478,7 +478,7 @@ pub(super) fn find_fp_loop_hoists(
     sorted_loops.sort_by_key(|&(h, b)| std::cmp::Reverse(b.saturating_sub(h)));
 
     for &(header, back_edge) in &sorted_loops {
-        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        let loop_end = back_edge + bytecode_analysis::step(code, back_edge);
         if loop_end > code_len {
             continue;
         }
@@ -488,7 +488,7 @@ pub(super) fn find_fp_loop_hoists(
         let mut pc = header;
         while pc < loop_end && pc < code_len {
             if hoisted_pcs.contains(&pc) {
-                pc += bytecode_len_at(code, pc);
+                pc += bytecode_analysis::step(code, pc);
                 continue;
             }
 
@@ -502,7 +502,7 @@ pub(super) fn find_fp_loop_hoists(
                 // dload (wide)
                 0x18 if pc + 1 < code_len => (code[pc + 1] as usize, true), // Widening: always safe
                 _ => {
-                    pc += bytecode_len_at(code, pc);
+                    pc += bytecode_analysis::step(code, pc);
                     continue;
                 }
             };
@@ -526,7 +526,7 @@ pub(super) fn find_fp_loop_hoists(
                 hoisted_pcs.insert(pc);
             }
 
-            pc += bytecode_len_at(code, pc);
+            pc += bytecode_analysis::step(code, pc);
         }
     }
 
@@ -551,7 +551,7 @@ pub(super) fn find_fp_strength_reductions(
     let ldc_map: FxHashMap<usize, i64> = ldc2w_info.iter().copied().collect();
 
     for &(header, back_edge) in loops {
-        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        let loop_end = back_edge + bytecode_analysis::step(code, back_edge);
         let mut pc = header;
         while pc < loop_end && pc < code_len {
             // Pattern: ldc2_w <idx>, dmul
@@ -566,7 +566,7 @@ pub(super) fn find_fp_strength_reductions(
             // Pattern: dmul right after a dload (X), ldc2_w 2.0
             // i.e., dload X; ldc2_w 2.0; dmul — already covered above.
             // Also check: ldc2_w 2.0 earlier, then dload, then dmul (commutative)
-            pc += bytecode_len_at(code, pc);
+            pc += bytecode_analysis::step(code, pc);
         }
     }
 

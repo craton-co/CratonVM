@@ -612,18 +612,41 @@ pub fn frame_state_is_resumable(fs: &FrameState) -> bool {
     true
 }
 
+/// Entries in each register file the deopt stub spills
+/// ([`SavedRegisters::gpr`] and [`SavedRegisters::xmm`]).
+const SPILLED_REGISTER_FILE_LEN: usize = 16;
+
+/// `true` when `v` names a register (transitively, through virtual-object
+/// fields) outside the files the deopt stub spills. [`try_resolve_value`]
+/// would report such a value as `RegisterFileIndexOutOfRange` at exit time
+/// and it would resume as `Unsupported`. Refusing it where resumability is
+/// decided makes that exit-time fallback unreachable for an admitted frame
+/// (review #88).
+fn names_unspilled_register(v: &FrameValue) -> bool {
+    match v {
+        FrameValue::Register(r) | FrameValue::RegisterLong(r) | FrameValue::RegisterRef(r) => {
+            usize::from(*r) >= SPILLED_REGISTER_FILE_LEN
+        }
+        FrameValue::XmmFloat(n) | FrameValue::XmmDouble(n) => {
+            usize::from(*n) >= SPILLED_REGISTER_FILE_LEN
+        }
+        FrameValue::VirtualObject(state) => state.field_values.iter().any(names_unspilled_register),
+        _ => false,
+    }
+}
+
 /// `true` when `v` cannot be turned into an interpreter value: either it is
-/// itself unreconstructable, or it is a virtual object one of whose fields
-/// (transitively, without crossing a `VirtualObjectRef` edge) names a value an
-/// optimization deleted.
+/// itself unreconstructable, it names a register the deopt stub does not
+/// spill, or it is a virtual object one of whose fields (transitively, without
+/// crossing a `VirtualObjectRef` edge) names a value an optimization deleted.
 fn value_blocks_resume(v: &FrameValue) -> bool {
     match v {
         FrameValue::Unsupported | FrameValue::MaterializationRequired(_) => true,
-        FrameValue::VirtualObject(state) => state
-            .field_values
-            .iter()
-            .any(contains_materialization_required),
-        _ => false,
+        FrameValue::VirtualObject(state) => {
+            state.field_values.iter().any(contains_materialization_required)
+                || names_unspilled_register(v)
+        }
+        other => names_unspilled_register(other),
     }
 }
 
@@ -8136,6 +8159,43 @@ mod frame_state_interning_tests {
         // …and the real handle is untouched by any of it.
         assert_eq!(it.locals_len(real), 4);
         assert_eq!(it.stats().states, 1);
+    }
+
+    /// A register number past the 16-entry files the deopt stub spills cannot
+    /// be read at exit (`try_resolve_value` reports it and the value resumes as
+    /// `Unsupported`), so resumability refuses it up front (review #88).
+    #[test]
+    fn a_register_past_the_spilled_files_blocks_the_resume() {
+        assert_eq!(SavedRegisters::default().gpr.len(), SPILLED_REGISTER_FILE_LEN);
+        assert_eq!(SavedRegisters::default().xmm.len(), SPILLED_REGISTER_FILE_LEN);
+        let fs = |v: FrameValue| FrameState {
+            method_key: String::from("T.m()V"),
+            bci: 0,
+            locals: vec![FrameValue::Int(1), v],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        for ok in [
+            FrameValue::Register(15),
+            FrameValue::RegisterLong(0),
+            FrameValue::RegisterRef(3),
+            FrameValue::XmmFloat(15),
+            FrameValue::XmmDouble(7),
+        ] {
+            assert_eq!(first_unresumable_slot(&fs(ok.clone())), None, "{ok:?}");
+        }
+        for bad in [
+            FrameValue::Register(16),
+            FrameValue::RegisterLong(17),
+            FrameValue::RegisterRef(255),
+            FrameValue::XmmFloat(16),
+            FrameValue::XmmDouble(32),
+        ] {
+            let msg = first_unresumable_slot(&fs(bad.clone()))
+                .expect("an unspilled register blocks the resume");
+            assert!(msg.contains("local 1"), "{bad:?}: {msg}");
+        }
     }
 
     /// The unresumable-frame refusal has to name the slot: an `Unsupported`
