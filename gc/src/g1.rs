@@ -19526,8 +19526,10 @@ impl G1Collector {
             }
             let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
+                let prov = crate::gc_quiescence::lookup_jit_root_provenance(addr)
+                    .unwrap_or_else(|| "none".into());
                 tracing::warn!(
-                    "[g1] root is not an object (#{n}): addr=0x{addr:x} {} — pinning region \
+                    "[g1] root is not an object (#{n}): addr=0x{addr:x} prov=[{prov}] {} — pinning region \
                      {idx} instead of evacuating it.",
                     self.describe_rejected_address(regions, addr),
                 );

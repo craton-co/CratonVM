@@ -1669,11 +1669,35 @@ fn arm_pinned_guard() {
     });
 }
 
+static JIT_ROOT_PROVENANCES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, String>>> =
+    std::sync::OnceLock::new();
+
+fn jit_root_provenances() -> &'static std::sync::Mutex<std::collections::HashMap<usize, String>> {
+    JIT_ROOT_PROVENANCES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn record_jit_root_provenance(addr: usize, prov: String) {
+    if let Ok(mut map) = jit_root_provenances().lock() {
+        map.insert(addr, prov);
+    }
+}
+
+pub fn lookup_jit_root_provenance(addr: usize) -> Option<String> {
+    jit_root_provenances().lock().ok()?.get(&addr).cloned()
+}
+
+pub fn clear_jit_root_provenances() {
+    if let Ok(mut map) = jit_root_provenances().lock() {
+        map.clear();
+    }
+}
+
 /// Clear the CALLING thread's conservative-pinned-JIT-root entry. Called by
 /// the VM's root gatherer (initiator) at the start of every collection,
 /// before its own JIT-frame scan republishes. Other threads' entries are
 /// left intact — they are owned by those threads' deposits.
 pub fn clear_pinned_jit_roots() {
+    clear_jit_root_provenances();
     if let Ok(mut map) = pinned_jit_map().lock() {
         map.remove(&std::thread::current().id());
     }

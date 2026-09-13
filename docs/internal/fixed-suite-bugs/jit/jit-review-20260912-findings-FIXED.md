@@ -145,7 +145,7 @@ the review are the gate that does that.
 | 90 | Quadratic scheduler and lowering scans | FIXED merge 44f2aedf4, e3735e523, 4dea5a91f, 1d08b8eff, 12419fded, b37c73722; `ir-scheduler-and-lowering-remaining-quadratic-scans-FIXED-20260912.md` |
 | 91 | DCE roots omit throwing ops | FIXED 9b8cbce45 |
 | 92 | Unroll refused on any side effect after the loop | FIXED 5092d22aa |
-| 93 | Dead loop machinery costs compile time | FIXED 7335f4c73; unrouted emitter: `vec-emit-vector-loop-emitter-is-not-routed-20260912.md` |
+| 93 | Dead loop machinery costs compile time | FIXED 7335f4c73; unrouted emitter: `vec-emit-vector-loop-emitter-is-not-routed-CLOSED-20260912.md` |
 | 94 | `handler_has_unsafe_local_read` does not decode wide | FIXED 9b8cbce45 |
 | 95 | Dead tiering APIs; receiver table freezes | FIXED f960bed8f |
 | 96 | One compile thread serves C1 behind C2 and OSR | FIXED f960bed8f (two lanes) |

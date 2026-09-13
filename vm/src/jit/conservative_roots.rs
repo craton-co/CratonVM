@@ -9369,13 +9369,13 @@ fn scan_active_oop_map_at_rbp(
     let Some(map) = cm.find_oop_map_for_safepoint_id(safepoint_id) else {
         return;
     };
-    scan_oop_slots(rbp, &map.frame_slot_offsets, heap, out);
+    scan_oop_slots(rbp, &map.frame_slot_offsets, &cm.method_label, heap, out);
 }
 
 /// Read each oop slot listed in `slot_offsets` (positive byte distances below
 /// `rbp`), validate via `heap.is_object_address`, and push any hit into `out`.
 /// Used by [`scan_one_frame_precise`].
-fn scan_oop_slots(rbp: usize, slot_offsets: &[i16], heap: &VmHeap, out: &mut Vec<ObjectRef>) {
+fn scan_oop_slots(rbp: usize, slot_offsets: &[i16], method_label: &str, heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     for &offset in slot_offsets {
         // x64 map entries are positive distances from RBP to slots in the
         // downward-growing local/spill area: `off` means `[rbp - off]`.
@@ -9395,10 +9395,15 @@ fn scan_oop_slots(rbp: usize, slot_offsets: &[i16], heap: &VmHeap, out: &mut Vec
         // calling thread's own stack region.
         let qword = unsafe { (addr as *const usize).read() };
         if let Some(obj) = heap.is_object_address(qword) {
+            cratonvm_gc::gc_quiescence::record_jit_root_provenance(
+                qword,
+                format!("scan_oop_slots method={method_label} off={offset}"),
+            );
             out.push(obj);
         }
     }
 }
+
 
 /// Scan a single JIT frame's spill region.
 ///
@@ -9455,6 +9460,10 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
             }
         }
         if let Some(obj) = heap.is_object_address(qword) {
+            cratonvm_gc::gc_quiescence::record_jit_root_provenance(
+                qword,
+                format!("scan_one_frame addr=0x{addr:x}"),
+            );
             out.push(obj);
         }
     }
@@ -9540,6 +9549,18 @@ fn scan_one_frame_filtered(
             addr += 8;
             continue;
         }
+        // The deopt `SavedRegisters` XMM image never holds object references.
+        // `deopt::try_resolve_value` only yields an `Object` from
+        // `FrameValue::RegisterRef`, which reads `regs.gpr`, not `regs.xmm`.
+        // Scanning these slots is what produced the `prov=[deopt-saved-xmm-image]`
+        // interior-pointer false roots that forced G1 to pin entire Eden/Survivor
+        // regions. `publish_unrewritable_band_roots` already classifies them via
+        // `add_movable_jit_root` (no rewriter needed because nothing reads them as
+        // references); align here so we do not emit them as conservative roots at all.
+        if layout.is_deopt_saved_xmm_image(off) {
+            addr += 8;
+            continue;
+        }
         if spill_slot_is_dead_above_cursor(layout, off, live_hi) {
             DEADSPILL_WORDS_EXCLUDED.fetch_add(1, Ordering::Relaxed);
             note_excluded_band_word(addr, off, layout, heap, "dead-spill");
@@ -9575,6 +9596,15 @@ fn scan_one_frame_filtered(
             }
         }
         if let Some(obj) = heap.is_object_address(qword) {
+            cratonvm_gc::gc_quiescence::record_jit_root_provenance(
+                qword,
+                format!(
+                    "method={} off={} region={}",
+                    cm.method_label,
+                    off,
+                    layout.region_name(off)
+                ),
+            );
             out.push(obj);
         }
     }
