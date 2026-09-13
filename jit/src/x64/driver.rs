@@ -207,6 +207,62 @@ pub fn compile(
     inline_sites: HashMap<usize, crate::InlineSite>,
     string_layout: Option<crate::StringFieldLayout>,
 ) -> Option<CompiledMethod> {
+    compile_with_direct_helpers(
+        &crate::DirectHelperTable::EMPTY,
+        code,
+        code_len,
+        num_params,
+        max_locals,
+        needs_heap,
+        multianewarray_info,
+        field_info,
+        typecheck_info,
+        static_field_info,
+        new_info,
+        anewarray_info,
+        invoke_info,
+        direct_calls,
+        mic_slots,
+        pic_slots,
+        ldc_info,
+        ldc2w_info,
+        branch_hints,
+        loop_unroll_hints,
+        helpers,
+        non_escaping_new,
+        inline_sites,
+        string_layout,
+    )
+}
+
+/// [`compile`] with the VM's direct-call helper table wired.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_direct_helpers(
+    direct_helpers: &crate::DirectHelperTable,
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    max_locals: usize,
+    needs_heap: bool,
+    multianewarray_info: Vec<(usize, i64)>,
+    field_info: Vec<(usize, usize, u8)>,
+    typecheck_info: Vec<(usize, *const u8, usize)>,
+    static_field_info: Vec<(usize, u32, usize, u8, bool)>,
+    new_info: Vec<(usize, u32, usize, bool, bool)>,
+    anewarray_info: Vec<(usize, u32)>,
+    invoke_info: Vec<(usize, *const JitInvokeInfo)>,
+    direct_calls: Vec<(usize, crate::JitDirectCall)>,
+    mic_slots: Vec<(usize, *const crate::JitMICSlot)>,
+    pic_slots: Vec<(usize, *const crate::JitPICSlot)>,
+    ldc_info: Vec<(usize, i64)>,
+    ldc2w_info: Vec<(usize, i64)>,
+    branch_hints: HashMap<usize, bool>,
+    loop_unroll_hints: HashMap<usize, usize>,
+    helpers: &JitRuntimeHelpers,
+    non_escaping_new: std::collections::HashSet<usize>,
+    inline_sites: HashMap<usize, crate::InlineSite>,
+    string_layout: Option<crate::StringFieldLayout>,
+) -> Option<CompiledMethod> {
     // This wrapper does NOT take an admission token, and that is deliberate.
     //
     // It is the legacy test entry point — its "arg index == JVM slot"
@@ -273,6 +329,7 @@ pub fn compile(
         // elidable_init_pcs: no constant pool here, so nothing is PROVEN empty
         // and nothing may be elided. See the parameter's doc.
         None,
+        direct_helpers,
     )
 }
 
@@ -599,6 +656,8 @@ pub fn compile_with_param_slots(
     // pcs that are absent from this set, so copies simply keep their `<init>`
     // calls — an optimisation left on the table, never a miscompile.
     elidable_init_pcs: Option<std::collections::HashSet<usize>>,
+    // The VM's thin direct-call helper addresses for this compile.
+    direct_helpers: &crate::DirectHelperTable,
 ) -> Option<CompiledMethod> {
     // Cost of a discarded lowering, for the code-buffer bail below. Reading a
     // monotonic clock once per compile is noise next to the compile itself.
@@ -1789,6 +1848,7 @@ pub fn compile_with_param_slots(
         !indy_info.is_empty(),
         protected_ranges,
     );
+    compiler.direct_helpers = *direct_helpers;
     KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
     // ── Compiled local exception handlers ────────────────────────────────
     //
@@ -2833,7 +2893,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // call; the two must not drift, or an artifact would advertise a trap it
     // does not have (or, far worse, hide one it does).
     cm.has_indy_trap = {
-        let bridge_entry = crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
+        let bridge_entry = direct_helpers.indy_bridge;
         compiler
             .indy_info
             .iter()

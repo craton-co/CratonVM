@@ -695,6 +695,7 @@ fn every_unrolled_copy_of_an_implicit_null_check_is_registered() {
                     None, // despec: fixture has no VM
                     Vec::new(),
                     None,
+                    &crate::DirectHelperTable::EMPTY,
                 )
                 .expect("the pointer-walk fixture compiles")
             },
@@ -1410,6 +1411,7 @@ fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
         vec![(19, 0, b'I', Vec::new(), 0)],
         // elidable_init_pcs: fixture resolves no constant pool.
         None,
+        &crate::DirectHelperTable::EMPTY,
     )
 }
 

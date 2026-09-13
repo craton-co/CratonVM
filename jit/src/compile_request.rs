@@ -240,6 +240,9 @@ pub struct CompileRequest<'a> {
     /// Replaces the `set_self_call_identity_stable` thread-local, which a
     /// caller set before the call and the door consumed.
     pub self_call_identity_stable: bool,
+    /// The VM's thin direct-call helper addresses for this compile. Replaces
+    /// the 24 process-wide `*_DIRECT_FN` cells.
+    pub direct_helpers: &'a crate::DirectHelperTable,
 }
 
 impl<'a> CompileRequest<'a> {
@@ -278,6 +281,7 @@ impl<'a> CompileRequest<'a> {
             despec: None,
             cp_invoke_declaring_class_resolver: None,
             self_call_identity_stable: false,
+            direct_helpers: &crate::DirectHelperTable::EMPTY,
         }
     }
 }

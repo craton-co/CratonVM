@@ -13458,7 +13458,7 @@ impl Compiler {
                     // both. Every other bootstrap kind still falls through to
                     // the trap.
                     let bridge_entry =
-                        crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
+                        self.direct_helpers.indy_bridge;
                     if bridge_site != 0 && bridge_entry != 0 && ret_type != b'V' {
                         if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_JITC") {
                             eprintln!("[cratonvm-jitc] indy bridge pc={} args={}", pc, arg_slots);
@@ -14666,9 +14666,9 @@ impl Compiler {
                     // could elide a lock on an unrelated escaping receiver.
                     // Only the exact per-PC proof above may remove the lock.
                     let helper = if op == 0xC2 {
-                        crate::MONITOR_ENTER_DIRECT_FN.load(std::sync::atomic::Ordering::Acquire)
+                        self.direct_helpers.monitor_enter
                     } else {
-                        crate::MONITOR_EXIT_DIRECT_FN.load(std::sync::atomic::Ordering::Acquire)
+                        self.direct_helpers.monitor_exit
                     };
                     if helper == 0 || !self.needs_heap {
                         return false;

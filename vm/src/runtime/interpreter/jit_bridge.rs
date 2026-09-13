@@ -1898,6 +1898,7 @@ pub(super) fn compile_osr_artifact(
                         && ((mn == "put" && desc == "(IB)Ljava/nio/ByteBuffer;")
                             || (mn == "get" && desc == "(I)B"))
                         && !cratonvm_jit::nio_byte_element_bind_refused(
+                            &crate::jit::helpers::direct_helper_table(),
                             osr_receiver_profile.as_ref(),
                             pc,
                             mn == "put",
@@ -3411,6 +3412,7 @@ pub(super) fn compile_osr_artifact(
                 Some(&shared.jit.despec_registry),
                 indy_info,
                 Some(elidable_init_pcs),
+                &crate::jit::helpers::direct_helper_table(),
             );
             let Some(mut cm) = cm else {
                 // RBC.2 — a backend bail here is just as permanent as one in
@@ -6925,6 +6927,7 @@ pub(super) fn compile_optimizing_artifact(
                 despec: Some(&shared.jit.despec_registry),
                 cp_invoke_declaring_class_resolver: Some(&c_invoke_declaring_class_resolver),
                 self_call_identity_stable: self_call_identity,
+                direct_helpers: &crate::jit::helpers::direct_helper_table(),
             })?;
         let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
         let needs_ctx = compiled.needs_context();
@@ -7160,6 +7163,7 @@ pub(super) fn compile_optimizing_artifact(
             despec: Some(&shared.jit.despec_registry),
             cp_invoke_declaring_class_resolver: Some(&invoke_declaring_class_resolver),
             self_call_identity_stable: self_call_identity,
+            direct_helpers: &crate::jit::helpers::direct_helper_table(),
         })?;
     Some(compiled)
 }
@@ -9100,6 +9104,7 @@ pub(super) fn try_jit_compile_callee_slow(
             despec: Some(&shared.jit.despec_registry),
             cp_invoke_declaring_class_resolver: Some(&invoke_declaring_class_resolver),
             self_call_identity_stable: self_call_identity,
+            direct_helpers: &crate::jit::helpers::direct_helper_table(),
         })?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(

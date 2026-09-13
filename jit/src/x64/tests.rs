@@ -1029,10 +1029,11 @@ fn live_monitor_ops_execute_direct_runtime_stubs() {
 
     ENTER_CALLS.store(0, Ordering::SeqCst);
     EXIT_CALLS.store(0, Ordering::SeqCst);
-    crate::set_monitor_direct_fns(
-        monitor_enter_stub as *const () as usize,
-        monitor_exit_stub as *const () as usize,
-    );
+    let direct_helpers = crate::DirectHelperTable {
+        monitor_enter: monitor_enter_stub as *const () as usize,
+        monitor_exit: monitor_exit_stub as *const () as usize,
+        ..crate::DirectHelperTable::EMPTY
+    };
 
     // static int locked(Object o) {
     //     monitorenter(o); monitorexit(o); return 7;
@@ -1049,7 +1050,8 @@ fn live_monitor_ops_execute_direct_runtime_stubs() {
         0xac, // ireturn
         0x00, 0x00,
     ];
-    let compiled = compile(
+    let compiled = compile_with_direct_helpers(
+        &direct_helpers,
         &code,
         7,
         1,
@@ -1162,7 +1164,8 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         method_key,
         None, // despec: no VM
         Vec::new(),
-        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
+        &crate::DirectHelperTable::EMPTY,
     )?;
     compiled
         .oop_maps
@@ -6255,7 +6258,8 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             "T.setRef:(Ljava/lang/Object;)V", // non-empty ⇒ trusted-oop eligible
             None,                             // despec: no VM
             Vec::new(),
-            None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+            None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
+            &crate::DirectHelperTable::EMPTY,
         )
         .expect("reference putfield must compile")
     };
@@ -9081,7 +9085,8 @@ fn instanceof_inline_fixture(
         "T.f:(Ljava/lang/Object;)I", // non-empty ⇒ trusted-oop eligible
         None, // despec: no VM, so no despeculation verdicts
         Vec::new(),
-        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
+        &crate::DirectHelperTable::EMPTY,
     )
     .expect("instanceof must compile")
 }
@@ -9275,7 +9280,8 @@ fn keyed_int_method(
         method_key,
         None, // despec: no VM, so no despeculation verdicts
         Vec::new(),
-        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty,
+        &crate::DirectHelperTable::EMPTY,
     )
     .expect("int method must compile")
 }

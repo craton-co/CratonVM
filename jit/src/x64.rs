@@ -972,6 +972,8 @@ struct Compiler {
     ldc_fp_pcs: FxHashSet<usize>,
     /// Runtime helper function pointers for JIT callbacks.
     helpers: JitRuntimeHelpers,
+    /// The VM's thin direct-call helper addresses for this compile.
+    pub(crate) direct_helpers: crate::DirectHelperTable,
     /// Expected simulated-stack depth at each forward branch target.
     /// Used to fix up the stack when dead code becomes live at a merge point.
     branch_target_stack_depth: FxHashMap<usize, usize>,
@@ -3002,6 +3004,7 @@ impl Compiler {
             failed_site: None,
             unresolved_branch_target: None,
             helpers,
+            direct_helpers: crate::DirectHelperTable::EMPTY,
             scratch_xmm_in_use: 0,
             fp_hoist_info: Vec::new(),
             _fp_hoist_offsets: Vec::new(),

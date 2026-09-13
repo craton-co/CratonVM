@@ -27677,52 +27677,6 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     // VM's life. The latch and its setter were deleted on 2026-09-12; see
     // `jit-compatibility-and-despec-state-per-vm-FIXED.md`.
 
-    // `Integer.valueOf(I)` / `Integer.intValue()` thin direct-call helpers —
-    // same no-ABI-change registration pattern as the savebase watch helpers
-    // above. See `jit_integer_value_of_direct` / `jit_integer_int_value_direct`
-    // and the recognition in `jit::try_compile`.
-    //
-    // Every helper in this block is a **VM-side reimplementation of a
-    // registered native** that the JIT bakes straight into the emitted `CALL`.
-    // Under `JdkOnly` that is `NativeShadowsBytecode` by construction (§1 rule
-    // 4: concrete bytecode wins).
-    //
-    // H20-1 — WHAT THIS PARAGRAPH USED TO SAY, AND WHY IT WAS DELETED.
-    //
-    // Until 2026-08-21 it continued: "…so they are not registered at all. Belt
-    // and braces: `jit::direct_native_helper` already refuses to *bind* a
-    // non-zero address once the policy is latched, and leaving the address at
-    // `0` makes that refusal unreachable rather than merely correct."
-    //
-    // Fifteen lines below, the registration block says "Registered
-    // UNCONDITIONALLY as of 2026-08-06 (JDK-ONLY-WAVE2 §2)". Both sentences
-    // have been in this function, contradicting each other, since that commit.
-    // `H12-1` found and rewrote the OTHER copy of the same stale claim (the
-    // thin-helper module block ~7 000 lines up); this one it did not see. Two
-    // copies of one deleted premise is the shape of
-    // `a-premise-in-a-comment-is-not-a-compile-time-link`: the commit that
-    // removed the fact could not be made to visit either sentence that
-    // depended on it.
-    //
-    // The refusal that IS real is `jit::direct_native_helper`, at ONE of the
-    // three compile doors, plus the callee-side backstop `H12-1` landed in the
-    // helper bodies. `admit_direct_native_entry` above is the bind-time source
-    // the other two doors must switch to; O1/O2 in the H20-1 record.
-    //
-    // Deliberately NOT skipped under `JdkOnly`:
-    //  * `set_indy_bridge_fn` — an `invokedynamic` *bootstrap*
-    //    bridge, not a native-method dispatch. The interpreter reaches the same
-    //    bridge for the same sites, so gating it would move the call without
-    //    changing the policy answer, while perturbing
-    //    `CompiledMethod::has_indy_trap` (an OSR-correctness input).
-    //  * `set_monitor_direct_fns` — VM monitor services, not registered
-    //    natives. Not a dispatch site.
-    // Both exclusions match `jit/src/lib.rs`'s own JDK-ONLY-NOTE items 5 and 6.
-    cratonvm_jit::set_indy_bridge_fn(jit_indy_bridge as *const () as usize);
-    cratonvm_jit::set_monitor_direct_fns(
-        jit_monitor_enter as *const () as usize,
-        jit_monitor_exit as *const () as usize,
-    );
     // Registered UNCONDITIONALLY as of 2026-08-06 (JDK-ONLY-WAVE2 §2). These
     // are process-invariant Rust `fn` addresses — the same code whatever a
     // given VM's policy is — so withholding them was never per-VM protection,
@@ -27732,27 +27686,6 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     // them too. Binding is now decided per compilation from the threaded
     // policy, which is the only place that knows whose compile it is.
     {
-        cratonvm_jit::set_integer_value_of_direct_fn(
-            jit_integer_value_of_direct as *const () as usize,
-        );
-        cratonvm_jit::set_integer_int_value_direct_fn(
-            jit_integer_int_value_direct as *const () as usize,
-        );
-        cratonvm_jit::set_long_value_of_direct_fn(jit_long_value_of_direct as *const () as usize);
-        cratonvm_jit::set_long_long_value_direct_fn(
-            jit_long_long_value_direct as *const () as usize,
-        );
-        cratonvm_jit::set_hashmap_put_direct_fn(jit_hashmap_put_direct as *const () as usize);
-        cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
-        cratonvm_jit::set_string_latin1_lower_direct_fn(
-            jit_string_latin1_to_lower_direct as *const () as usize,
-        );
-        cratonvm_jit::set_concurrent_hashmap_get_direct_fn(
-            jit_concurrent_hashmap_get_direct as *const () as usize,
-        );
-        cratonvm_jit::set_thread_current_thread_direct_fn(
-            jit_thread_current_thread_direct as *const () as usize,
-        );
         // §4 census, declared at the wiring point rather than paid per call.
         // Every helper wired immediately above reaches its native without a
         // `NativeMethodId`, so `record_invocation` never fires for it and those
@@ -27766,45 +27699,6 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         if let Some(shared) = vm_for_helpers {
             mark_direct_call_helper_natives_incomplete(shared);
         }
-        cratonvm_jit::set_preconditions_check_index_direct_fn(
-            jit_preconditions_check_index_direct as *const () as usize,
-        );
-        cratonvm_jit::set_nio_bytebuffer_byte_direct_fns(
-            jit_dbb_put_byte_direct as *const () as usize,
-            jit_dbb_get_byte_direct as *const () as usize,
-        );
-        // The predicate the OPTIMIZING door's bind is gated on. The JIT crate
-        // does not depend on `native-io`, so it cannot ask the served-class
-        // table directly; publishing the function pointer keeps the planner's
-        // "will the helper serve this receiver?" and the helper's own prologue
-        // reading the SAME table, which is the property that makes the bind
-        // gate meaningful rather than a guess.
-        cratonvm_jit::set_nio_byte_element_served_class_fn(
-            cratonvm_native_io::direct_buffer::elem_fastpath::class_is_served as *const () as usize,
-        );
-        // `Buffer.session()` and the served-class table its fast path is
-        // screened against — published as a pair, because the helper without
-        // the predicate would answer for every receiver, which is precisely
-        // the unsound version.
-        cratonvm_jit::set_buffer_session_direct_fn(
-            jit_buffer_session_direct as *const () as usize,
-        );
-        cratonvm_jit::set_buffer_session_served_class_fn(
-            cratonvm_native_builtins::buffer_session::class_is_served as *const () as usize,
-        );
-        cratonvm_jit::set_md_update_byte_direct_fn(jit_md_update_byte_direct as *const () as usize);
-        cratonvm_jit::set_reachability_fence_direct_fn(
-            jit_reachability_fence_direct as *const () as usize,
-        );
-        // The 32 `VarHandle` read-mode slots. Published as one array so a slot
-        // can never be wired to the WRONG monomorphisation: the order here is
-        // `varhandle_read_helper_slot`'s order by construction, not by a
-        // hand-kept list of `set_*` calls in the right sequence.
-        cratonvm_jit::set_varhandle_read_direct_fns(&varhandle_read_direct_fns());
-        // Same contract, one table over: the write slots are in
-        // `varhandle_write_helper_slot`'s order by construction.
-        cratonvm_jit::set_varhandle_write_direct_fns(&varhandle_write_direct_fns());
-        cratonvm_jit::set_varhandle_cas_direct_fns(&varhandle_cas_direct_fns());
     }
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) = vm_for_helpers
@@ -28057,6 +27951,96 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     }
     helpers
 }
+
+/// The VM's thin direct-call helper addresses, as the table each compile
+/// carries (`cratonvm_jit::DirectHelperTable`). Process-invariant Rust `fn`
+/// addresses; whether a given compilation may BIND one is still decided per
+/// compilation, from the threaded JDK-only policy.
+pub(crate) fn direct_helper_table() -> cratonvm_jit::DirectHelperTable {
+    cratonvm_jit::DirectHelperTable {
+        integer_value_of: jit_integer_value_of_direct as *const () as usize,
+        integer_int_value: jit_integer_int_value_direct as *const () as usize,
+        long_value_of: jit_long_value_of_direct as *const () as usize,
+        long_long_value: jit_long_long_value_direct as *const () as usize,
+        hashmap_put: jit_hashmap_put_direct as *const () as usize,
+        hashmap_get: jit_hashmap_get_direct as *const () as usize,
+        string_latin1_lower: jit_string_latin1_to_lower_direct as *const () as usize,
+        concurrent_hashmap_get: jit_concurrent_hashmap_get_direct as *const () as usize,
+        nio_bytebuffer_put_byte: jit_dbb_put_byte_direct as *const () as usize,
+        nio_bytebuffer_get_byte: jit_dbb_get_byte_direct as *const () as usize,
+        // `Buffer.session()` and the served-class table its fast path is
+        // screened against — published as a pair, because the helper without
+        // the predicate would answer for every receiver, which is precisely
+        // the unsound version.
+        buffer_session: jit_buffer_session_direct as *const () as usize,
+        buffer_session_served_class: cratonvm_native_builtins::buffer_session::class_is_served as *const () as usize,
+        // The predicate the OPTIMIZING door's bind is gated on. The JIT crate
+        // does not depend on `native-io`, so it cannot ask the served-class
+        // table directly; publishing the function pointer keeps the planner's
+        // "will the helper serve this receiver?" and the helper's own prologue
+        // reading the SAME table, which is the property that makes the bind
+        // gate meaningful rather than a guess.
+        nio_byte_element_served_class: cratonvm_native_io::direct_buffer::elem_fastpath::class_is_served as *const () as usize,
+        md_update_byte: jit_md_update_byte_direct as *const () as usize,
+        thread_current_thread: jit_thread_current_thread_direct as *const () as usize,
+        monitor_enter: jit_monitor_enter as *const () as usize,
+        monitor_exit: jit_monitor_exit as *const () as usize,
+        preconditions_check_index: jit_preconditions_check_index_direct as *const () as usize,
+        reachability_fence: jit_reachability_fence_direct as *const () as usize,
+        // `Integer.valueOf(I)` / `Integer.intValue()` thin direct-call helpers —
+        // same no-ABI-change registration pattern as the savebase watch helpers
+        // above. See `jit_integer_value_of_direct` / `jit_integer_int_value_direct`
+        // and the recognition in `jit::try_compile`.
+        //
+        // Every helper in this block is a **VM-side reimplementation of a
+        // registered native** that the JIT bakes straight into the emitted `CALL`.
+        // Under `JdkOnly` that is `NativeShadowsBytecode` by construction (§1 rule
+        // 4: concrete bytecode wins).
+        //
+        // H20-1 — WHAT THIS PARAGRAPH USED TO SAY, AND WHY IT WAS DELETED.
+        //
+        // Until 2026-08-21 it continued: "…so they are not registered at all. Belt
+        // and braces: `jit::direct_native_helper` already refuses to *bind* a
+        // non-zero address once the policy is latched, and leaving the address at
+        // `0` makes that refusal unreachable rather than merely correct."
+        //
+        // Fifteen lines below, the registration block says "Registered
+        // UNCONDITIONALLY as of 2026-08-06 (JDK-ONLY-WAVE2 §2)". Both sentences
+        // have been in this function, contradicting each other, since that commit.
+        // `H12-1` found and rewrote the OTHER copy of the same stale claim (the
+        // thin-helper module block ~7 000 lines up); this one it did not see. Two
+        // copies of one deleted premise is the shape of
+        // `a-premise-in-a-comment-is-not-a-compile-time-link`: the commit that
+        // removed the fact could not be made to visit either sentence that
+        // depended on it.
+        //
+        // The refusal that IS real is `jit::direct_native_helper`, at ONE of the
+        // three compile doors, plus the callee-side backstop `H12-1` landed in the
+        // helper bodies. `admit_direct_native_entry` above is the bind-time source
+        // the other two doors must switch to; O1/O2 in the H20-1 record.
+        //
+        // Deliberately NOT skipped under `JdkOnly`:
+        //  * `set_indy_bridge_fn` — an `invokedynamic` *bootstrap*
+        //    bridge, not a native-method dispatch. The interpreter reaches the same
+        //    bridge for the same sites, so gating it would move the call without
+        //    changing the policy answer, while perturbing
+        //    `CompiledMethod::has_indy_trap` (an OSR-correctness input).
+        //  * `set_monitor_direct_fns` — VM monitor services, not registered
+        //    natives. Not a dispatch site.
+        // Both exclusions match `jit/src/lib.rs`'s own JDK-ONLY-NOTE items 5 and 6.
+        indy_bridge: jit_indy_bridge as *const () as usize,
+        // The 32 `VarHandle` read-mode slots. Published as one array so a slot
+        // can never be wired to the WRONG monomorphisation: the order here is
+        // `varhandle_read_helper_slot`'s order by construction, not by a
+        // hand-kept list of `set_*` calls in the right sequence.
+        varhandle_read: varhandle_read_direct_fns(),
+        // Same contract, one table over: the write slots are in
+        // `varhandle_write_helper_slot`'s order by construction.
+        varhandle_write: varhandle_write_direct_fns(),
+        varhandle_cas: varhandle_cas_direct_fns(),
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Helper-slot signature checks (`docs/jit/helper-abi.md` §4)
@@ -29732,4 +29716,28 @@ unsafe fn jit_ffm_segment_set_body(seg: i64, index: i64, kind: i64, value: i64) 
     }
     cratonvm_native_builtins::ffm_fast::note_fast_consult(true);
     1
+}
+
+#[cfg(test)]
+mod direct_helper_table_tests {
+    use super::*;
+
+    #[test]
+    fn every_direct_helper_is_wired_and_the_long_and_integer_helpers_are_distinct() {
+        let t = direct_helper_table();
+        assert_ne!(t.long_value_of, t.integer_value_of, "Long.valueOf is wired to Integer.valueOf's helper");
+        assert_ne!(t.long_long_value, t.integer_int_value, "Long.longValue is wired to Integer.intValue's helper");
+        assert_ne!(t.long_value_of, t.long_long_value, "both Long helpers hold one address");
+        assert_ne!(t.monitor_enter, t.monitor_exit);
+        for (name, addr) in [
+            ("integer_value_of", t.integer_value_of),
+            ("thread_current_thread", t.thread_current_thread),
+            ("indy_bridge", t.indy_bridge),
+            ("monitor_enter", t.monitor_enter),
+            ("nio_byte_element_served_class", t.nio_byte_element_served_class),
+        ] {
+            assert_ne!(addr, 0, "{name} is not wired");
+        }
+        assert!(t.varhandle_read.iter().chain(&t.varhandle_write).chain(&t.varhandle_cas).all(|&a| a != 0));
+    }
 }

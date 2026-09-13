@@ -94,6 +94,9 @@ pub(crate) mod bytecode_analysis;
 // Every input of one method-entry compilation, passed by reference.
 pub mod compile_request;
 pub use compile_request::CompileRequest;
+// The VM's thin direct-call helper addresses for one compile.
+pub mod direct_helpers;
+pub use direct_helpers::DirectHelperTable;
 // The one door every backend entry point must pass through. There are THREE
 // doors (method entry, the eager first-call compile, OSR), and only the first
 // ever asked the admission questions; the other two grew hand-copied subsets
@@ -11688,14 +11691,13 @@ fn record_jdk_only_ic_native_refusal() {
 /// code, so the policy read costs nothing measurable.
 #[inline]
 fn direct_native_helper(
-    cell: &std::sync::atomic::AtomicUsize,
+    entry: usize,
     jdk_only: bool,
     intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
     class: &str,
     method: &str,
     descriptor: &str,
 ) -> usize {
-    let entry = cell.load(std::sync::atomic::Ordering::Relaxed);
     if entry != 0 && jdk_only {
         // JDK-ONLY-WAVE2 §4. The question is no longer "is this one of seven
         // hard-coded triples" — the seven are still how the RECOGNITION picks
@@ -11757,7 +11759,7 @@ fn direct_native_helper(
 /// its implementing class.
 #[inline]
 fn direct_native_helper_for_impl(
-    cell: &std::sync::atomic::AtomicUsize,
+    entry: usize,
     jdk_only: bool,
     intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
     site_class: &str,
@@ -11766,7 +11768,7 @@ fn direct_native_helper_for_impl(
     descriptor: &str,
 ) -> usize {
     let entry = direct_native_helper(
-        cell,
+        entry,
         jdk_only,
         intrinsic_resolver,
         site_class,
@@ -11875,73 +11877,6 @@ fn direct_native_helper_for_impl(
 //     See H20-1.
 // ---------------------------------------------------------------------------
 
-/// Process-global pointer to the VM-side
-/// `jit_integer_value_of_direct(vm_ptr, value) -> i64` thin helper,
-/// registered once at VM init (`build_helpers`). Avoids a
-/// `JitRuntimeHelpers` ABI change (same pattern as
-/// `x64::ARM_SAVEBASE_WATCH_FN`). `0` = not wired → the recognition below
-/// is skipped and `Integer.valueOf` sites use the generic dispatch helper.
-///
-/// Why: `invokestatic Integer.valueOf(I)` is statically bound and its
-/// callee is a registered native, so the generic `jit_invoke_dispatch`
-/// round trip (info decode, per-call thread-local cache probes, argument
-/// buffer build, safe-native-call wrapper) is pure fixed overhead on one
-/// of the hottest autoboxing paths (three `valueOf` calls per
-/// `HashMap<Integer,Integer>` put+get pair). A direct `CALL` to the thin
-/// helper keeps the exact allocation, `-128..=127` identity-cache, and
-/// pending-return rooting semantics while skipping the dispatch machinery.
-pub static INTEGER_VALUE_OF_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Register the `Integer.valueOf` thin direct-call helper (called once from
-/// the VM's `build_helpers`).
-pub fn set_integer_value_of_direct_fn(addr: usize) {
-    INTEGER_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Process-lifetime bridge for `invokedynamic` sites lowered by the
-/// single-pass backend rather than trapped. It stays outside the stable
-/// helper-table ABI because the address is installed once at VM start, not per
-/// compiled artifact.
-///
-/// ONE cell for BOTH bridged kinds — `StringConcatFactory` and, since
-/// 2026-08-23, `LambdaMetafactory`. The site metadata carries a `kind` tag the
-/// VM-side entry reads (`invokedynamic::jit_indy_site_kind`), so the call
-/// sequence and this cell stay single.
-pub static INDY_BRIDGE_FN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Register the `invokedynamic` bridge (called once from the VM's
-/// `build_helpers`).
-pub fn set_indy_bridge_fn(addr: usize) {
-    INDY_BRIDGE_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// `Integer.intValue()` sibling of [`INTEGER_VALUE_OF_DIRECT_FN`].
-/// `java/lang/Integer` is `final`, so an `invokevirtual` site whose
-/// constant-pool class is exactly `Integer` is statically monomorphic and
-/// can take the plain (guard-free) virtual direct-call path; the thin
-/// helper handles the null-receiver NPE itself.
-pub static INTEGER_INT_VALUE_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Exact-HashMap `put`/`get` thin direct-call helpers
-/// (perf/halfgap-20260717). `java/util/HashMap` is NOT final, so these
-/// register guard-free (`guard_class_id: 0`) and the helpers themselves
-/// verify the receiver's EXACT class, falling back to the full generic
-/// dispatcher for subclasses (LinkedHashMap at a HashMap-declared site),
-/// non-Integer keys, materialized maps, and redefine windows. The fast
-/// path is the Integer-overlay probe with no `safe_native_call` wrapper —
-/// the same wrapper-free contract as `INTEGER_INT_VALUE_DIRECT_FN`.
-pub static HASHMAP_PUT_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-pub static HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-/// Static `StringLatin1.toLowerCase` helper for the compact-string hot path.
-pub static STRING_LATIN1_LOWER_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-pub static CONCURRENT_HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 // ---------------------------------------------------------------------------
 // `ByteBuffer.put(int,byte)` / `ByteBuffer.get(int)` thin direct-call binds.
 //
@@ -11970,11 +11905,6 @@ pub static CONCURRENT_HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
 // has not already served with the modelled layout -- including every
 // `HeapByteBuffer` -- so a polymorphic site keeps today's behaviour on every
 // receiver the fast path was not proven for.
-pub static NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-pub static NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// Sites bound to the two `ByteBuffer` single-byte helpers at the SINGLE-PASS
 /// door.
 pub static NIO_BYTE_ELEMENT_SITES: std::sync::atomic::AtomicU64 =
@@ -12041,61 +11971,6 @@ pub fn nio_byte_element_sites_ir() -> u64 {
     NIO_BYTE_ELEMENT_SITES_IR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub fn set_nio_bytebuffer_byte_direct_fns(put: usize, get: usize) {
-    NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN.store(put, std::sync::atomic::Ordering::Relaxed);
-    NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN.store(get, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// `java/nio/Buffer.session()Ljdk/internal/foreign/MemorySessionImpl;` thin
-/// direct-call helper. `0` = not wired.
-///
-/// # The census that named it
-///
-/// `--dump-native-registry` over `probes/OnlyHeapGetInt.java` — 200 000
-/// `HeapByteBuffer.getInt(int)` calls and nothing else — divides exactly:
-///
-/// ```text
-/// 200000  java/nio/HeapByteBuffer.session()Ljdk/internal/foreign/MemorySessionImpl;  [bridge]
-/// 200000  jdk/internal/misc/ScopedMemoryAccess.getIntUnaligned(...)I                 [synthetic-stub]
-/// ```
-///
-/// One `session()` crossing per multi-byte accessor, and its registered body
-/// is `Ok(Some(Value::Object(None)))` — a constant null. That is the same
-/// shape as `Reference.reachabilityFence`, whose own doc says of an equally
-/// empty body that *"paying ~160 ns of generic native funnel for that is pure
-/// loss"*, and which was given a thin helper for exactly this reason.
-pub static BUFFER_SESSION_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_buffer_session_direct_fn(addr: usize) {
-    BUFFER_SESSION_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// `fn(class_id: u32) -> bool` — "has the `session()` shim actually run for a
-/// receiver of this class?"
-///
-/// Published by `build_helpers` from `cratonvm_native_builtins::
-/// buffer_session::class_is_served`, because this crate depends on neither
-/// `native-builtins` nor `native-io` and must not.
-pub static BUFFER_SESSION_SERVED_CLASS_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_buffer_session_served_class_fn(addr: usize) {
-    BUFFER_SESSION_SERVED_CLASS_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Would the `session()` shim answer for a receiver of `class_id`?
-pub fn buffer_session_class_is_served(class_id: u32) -> bool {
-    let raw = BUFFER_SESSION_SERVED_CLASS_FN.load(std::sync::atomic::Ordering::Relaxed);
-    if raw == 0 || class_id == 0 {
-        return false;
-    }
-    // SAFETY: the cell holds a pointer published by `build_helpers` from a
-    // `fn(u32) -> bool` item with process lifetime, and is written only there.
-    let f: fn(u32) -> bool = unsafe { std::mem::transmute(raw) };
-    f(class_id)
-}
-
 /// `CRATONVM_JIT_BUFFER_SESSION_DIRECT=0` — send every `Buffer.session()` site
 /// back through the generic native funnel. Default ON.
 pub fn buffer_session_direct_enabled() -> bool {
@@ -12152,39 +12027,6 @@ pub fn is_buffer_session_site(name: &str, descriptor: &str) -> bool {
     name == "session" && descriptor == "()Ljdk/internal/foreign/MemorySessionImpl;"
 }
 
-/// `fn(class_id: u32, write: bool) -> bool` — "has the `ByteBuffer` element
-/// funnel actually served a receiver of this class with the modelled layout?"
-///
-/// This crate cannot call `cratonvm_native_io::direct_buffer::elem_fastpath::
-/// class_is_served` directly (it does not depend on `native-io`, and must not:
-/// the JIT sits below the native layer), so the VM publishes the predicate as a
-/// pointer in `build_helpers`, exactly as it publishes the helper entries above.
-/// `0` = not wired, which every caller must read as "cannot prove served".
-pub static NIO_BYTE_ELEMENT_SERVED_CLASS_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_nio_byte_element_served_class_fn(addr: usize) {
-    NIO_BYTE_ELEMENT_SERVED_CLASS_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Would the thin `ByteBuffer` element helper SERVE a receiver of `class_id`?
-///
-/// Answers `false` whenever it cannot prove `true` — an unwired predicate, a
-/// class id of 0, a class the funnel has not served. Every caller uses it to
-/// decide whether to bind a fast path, so the conservative answer costs a
-/// missed bind and never a wrong one.
-pub fn nio_byte_element_class_is_served(class_id: u32, write: bool) -> bool {
-    let raw = NIO_BYTE_ELEMENT_SERVED_CLASS_FN.load(std::sync::atomic::Ordering::Relaxed);
-    if raw == 0 || class_id == 0 {
-        return false;
-    }
-    // SAFETY: the cell holds a pointer published by `build_helpers` from a
-    // `fn(u32, bool) -> bool` item with process lifetime, and is only ever
-    // written there.
-    let f: fn(u32, bool) -> bool = unsafe { std::mem::transmute(raw) };
-    f(class_id, write)
-}
-
 /// Sites where a `ByteBuffer` element bind was refused because the site's own
 /// profile says its receiver is one the helper cannot serve.
 pub static NIO_BYTE_ELEMENT_SITES_REFUSED: std::sync::atomic::AtomicU64 =
@@ -12222,6 +12064,7 @@ pub fn nio_byte_element_sites_refused() -> u64 {
 /// the same table the helper's own prologue consults before it agrees to
 /// answer — so planner and helper cannot disagree about who gets served.
 pub fn nio_byte_element_bind_refused(
+    direct_helpers: &DirectHelperTable,
     profile: Option<&profile::MethodProfile>,
     pc: usize,
     write: bool,
@@ -12230,7 +12073,7 @@ pub fn nio_byte_element_bind_refused(
     let dominant = profile
         .and_then(|prof| prof.receivers.get(&pc))
         .and_then(|counts| profile::dominant_receiver(counts, 80));
-    let served = dominant.is_some_and(|d| nio_byte_element_class_is_served(d, write));
+    let served = dominant.is_some_and(|d| direct_helpers.nio_byte_element_class_is_served(d, write));
     // `CRATONVM_DBG_JITC=1` — the three inputs of this decision, per door.
     // Added because the counters alone cannot tell "no profile yet" from
     // "profiled and served": both read as a bind, and only one of them is
@@ -12251,18 +12094,6 @@ pub fn nio_byte_element_bind_refused(
     true
 }
 
-/// `MessageDigest.update(byte)` thin direct-call bind.
-///
-/// The third rung of the same census. `testHugeDecompress` feeds SHA-256 a byte
-/// at a time 536 million times (268 M on the compress side, 268 M more through
-/// `ByteProcessor.process` on the decompress side) at 216 ns/call against
-/// HotSpot's 8.6 ns. `update` is FINAL on `MessageDigest`, so a provider's
-/// subclass cannot override it and the helper has to check the receiver itself
-/// — it serves only the exact class this VM's own `getInstance` builds, and
-/// declines everything else to the funnel, which forwards to `engineUpdate`.
-pub static MD_UPDATE_BYTE_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// Sites bound to [`MD_UPDATE_BYTE_DIRECT_FN`].
 pub static MD_UPDATE_BYTE_SITES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -12271,10 +12102,6 @@ pub static MD_UPDATE_BYTE_SITES: std::sync::atomic::AtomicU64 =
 /// census [`nio_byte_element_sites`] exists for.
 pub fn md_update_byte_sites() -> u64 {
     MD_UPDATE_BYTE_SITES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub fn set_md_update_byte_direct_fn(addr: usize) {
-    MD_UPDATE_BYTE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER=0` — send every
@@ -12308,21 +12135,6 @@ pub fn nio_byte_direct_helpers_enabled() -> bool {
             })
             .unwrap_or(true)
     })
-}
-
-/// Register the exact-HashMap thin direct-call helpers (called once from the
-/// VM's `build_helpers`).
-pub fn set_hashmap_put_direct_fn(addr: usize) {
-    HASHMAP_PUT_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-pub fn set_hashmap_get_direct_fn(addr: usize) {
-    HASHMAP_GET_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-pub fn set_string_latin1_lower_direct_fn(addr: usize) {
-    STRING_LATIN1_LOWER_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-pub fn set_concurrent_hashmap_get_direct_fn(addr: usize) {
-    CONCURRENT_HASHMAP_GET_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Call sites bound to one of the three COLLECTION thin direct helpers, per
@@ -12420,58 +12232,6 @@ pub fn note_long_long_value_direct_site() {
     LONG_LONG_VALUE_DIRECT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Register the `Integer.intValue` thin direct-call helper (called once from
-/// the VM's `build_helpers`).
-pub fn set_integer_int_value_direct_fn(addr: usize) {
-    INTEGER_INT_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// `Long.valueOf(J)` / `Long.longValue()` twins of the two `Integer` cells
-/// above. `0` = not wired → the recognition is skipped and the sites use the
-/// generic dispatch helper.
-///
-/// **Why the twin was missing, and what it cost.** `Integer.valueOf`/`intValue`
-/// have had thin binds since 2026-07; `Long.valueOf`/`longValue` are registered
-/// natives on exactly the same terms (`lang_math.rs::register_wrapper_natives`:
-/// a 256-entry `-128..=127` identity cache and a field-0 read) and were not.
-/// Measured on ONE binary, same run, `probes/BoxRungRate.java`:
-///
-/// | rung | HotSpot 25 | CratonVM |
-/// |---|---:|---:|
-/// | `Integer.valueOf` alone | 1.9 ns | 153 ns |
-/// | `Long.valueOf` alone | 2.6 ns | **296 ns** |
-/// | `Integer.valueOf` + `intValue` | 0.24 ns | 151 ns |
-/// | `Long.valueOf` + `longValue` | 0.26 ns | **503 ns** |
-///
-/// The `Integer` PAIR costs the same as `Integer.valueOf` ALONE — `intValue`'s
-/// bind makes the unbox free. The `Long` pair costs `valueOf` plus another
-/// ~207 ns, which is `longValue()` paying the generic funnel. The arms differ
-/// only in which `*_DIRECT_FN` cell exists.
-///
-/// Censused with `--dump-native-registry` on `probes/HwtScaleProbe.java` (the
-/// `HashedWheelTimerTest.testExecutionOnTime` workload): `Long.valueOf` 99 496 +
-/// `Long.longValue` 100 000 calls for 100 000 expired timer tasks — one box and
-/// one unbox each, because the queue under test is a `BlockingQueue<Long>`.
-/// `Long` boxing is the `Integer` case's equal on every `Map<Long, …>`, every
-/// row identifier that reaches a collection, and every `AtomicLong` readout that
-/// is stored rather than consumed.
-pub static LONG_VALUE_OF_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-pub static LONG_LONG_VALUE_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Register the `Long.valueOf` thin direct-call helper (called once from the
-/// VM's `build_helpers`).
-pub fn set_long_value_of_direct_fn(addr: usize) {
-    LONG_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Register the `Long.longValue` thin direct-call helper (called once from the
-/// VM's `build_helpers`).
-pub fn set_long_long_value_direct_fn(addr: usize) {
-    LONG_LONG_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS=0` — stop binding `Long.valueOf` /
 /// `Long.longValue` to their thin direct helpers and send both back through the
 /// generic native funnel. Default ON.
@@ -12508,70 +12268,6 @@ pub fn long_box_direct_helper_sites() -> (u64, u64) {
         LONG_LONG_VALUE_SITES.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
-
-/// `VarHandle` READ-mode thin direct-call helper cells, one per
-/// (access mode, primitive return kind) pair — see
-/// [`varhandle_read_helper_slot`] for the index. `0` = not wired, and the
-/// recognition is skipped so the site uses the generic dispatch helper.
-///
-/// **Why this one.** `--dump-native-registry` on `NettyZipBombPhases snappy 4`
-/// (`HttpContentDecompressorTest`'s wall) counts **21 368 822**
-/// `java/lang/invoke/VarHandle.get` calls out of 26 673 142 native calls total
-/// — ~5.1 per output byte. `DataCompressionHttp2Test` censuses the same
-/// signature at 5 356 015 of 18 371 699 (29 %). Both are netty 4.2's reference
-/// count check: `AbstractByteBuf`'s checked accessors call `ensureAccessible()`
-/// -> `RefCnt.isLiveNonVolatile`, which is `(int) VH.get(instance)` on an
-/// ordinary `int` instance field.
-///
-/// A VM-side fast path for exactly this shape already exists
-/// (`vm/src/jit/helpers.rs::try_varhandle_instance_field_read`, keyed on the
-/// handle's identity hash), and it saves the field resolution and the boxing
-/// round trip — but it sits INSIDE `jit_invoke_dispatch`, so every call still
-/// pays the SATB flush, the reference-argument forwarding, the site-key
-/// revalidation and two thread-local map probes before reaching it. That is
-/// the per-call floor `Preconditions.checkIndex` and
-/// `Reference.reachabilityFence` were taken off for 143 -> 23 ns.
-///
-/// **Scope: primitive returns, and reference returns in two classified kinds.**
-/// Reference returns were out of scope until 2026-09-01, on the argument that
-/// the generic path applies `unbox_poly_return_checked`, whose W6-1 rule turns
-/// *a boxed primitive reaching a non-`Object` reference return* into a
-/// `WrongMethodTypeException` — and that rule reads the CALL SITE's own
-/// descriptor, which a thin helper does not have (a baked direct call has no
-/// `JitInvokeInfo`), so the synthetic call site these helpers fall back through
-/// carries an erased `(Ljava/lang/Object;)X` descriptor, indistinguishable from
-/// the real one for a primitive `X` and NOT for a reference one.
-///
-/// That argument was right about the erased descriptor and wrong about the
-/// conclusion, because it priced only the COLD arm. Two facts settle it:
-///
-/// * the FAST arm cannot lose W6-1. `varhandle_instance_field_read_bits`
-///   refuses unless the variable's own kind agrees with the site's — a
-///   reference site over a PRIMITIVE variable, which is W6-1's entire fire
-///   set, is declined there. The identical refusal already governs
-///   `try_varhandle_instance_field_read`, the funnel's copy of this read,
-///   which has served reference returns since it was written and returns raw
-///   bits WITHOUT reaching `unbox_poly_return_checked` at all. So compiled
-///   code's reference reads are already outside W6-1 today; binding them
-///   changes their cost, not their semantics;
-/// * the COLD arm keeps W6-1 by CLASSIFYING the site at compile time instead
-///   of carrying its descriptor. A boxed primitive is assignable to exactly
-///   fourteen reference types — `java/lang/Object`, the five shared wrapper
-///   supertypes and the eight wrappers themselves. So a reference site is one
-///   of three things, and only the third would need the descriptor it cannot
-///   have: `Ljava/lang/Object;` ([`VARHANDLE_READ_KIND_REF_OBJECT`]), where
-///   the erased stand-in IS the real descriptor and W6-1 can never fire; one
-///   of the other thirteen ([`VARHANDLE_BOX_ACCEPTING_RETURNS`]), where the
-///   answer depends on WHICH wrapper arrived, so the site is not bound at all;
-///   and anything else ([`VARHANDLE_READ_KIND_REF_STRICT`]), where NO boxed
-///   primitive is assignable, so "the cold arm produced a box" is a W6-1 fire
-///   with no further information needed — which is what
-///   `varhandle_read_direct_impl` checks and raises on.
-///
-/// `RJdkHandles`' `String bogus = (String) vi.get(h)` over an `int` field is a
-/// `REF_STRICT` site, and the vector that holds this honest.
-pub static VARHANDLE_READ_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE_READ_SLOTS] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; VARHANDLE_READ_SLOTS];
 
 /// The `VarHandle` access modes served by [`VARHANDLE_READ_DIRECT_FNS`], in
 /// slot-major order. All four are plain reads of the variable; the VM's
@@ -12760,16 +12456,6 @@ fn is_single_object_descriptor(s: &str) -> bool {
     s.len() >= 3 && s.ends_with(';') && !s[1..s.len() - 1].contains(';')
 }
 
-/// Register the `VarHandle` read-mode thin direct-call helpers (called once
-/// from the VM's `build_helpers`). The array is indexed by
-/// [`varhandle_read_helper_slot`]; a `0` entry means that slot is not served
-/// and the sites that would use it keep the generic dispatch helper.
-pub fn set_varhandle_read_direct_fns(addrs: &[usize; VARHANDLE_READ_SLOTS]) {
-    for (cell, addr) in VARHANDLE_READ_DIRECT_FNS.iter().zip(addrs.iter()) {
-        cell.store(*addr, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS=0` — stop binding `VarHandle`
 /// read modes to their thin direct helpers and send every one back through the
 /// generic native funnel (where `try_varhandle_instance_field_read` still
@@ -12825,11 +12511,6 @@ pub fn varhandle_read_direct_helpers_enabled() -> bool {
 // exceed ARG_REGS". A fifth argument lands on the stack on Win64 and in
 // `ARG_REGS[4]` on SysV, and neither door needed a line changed for it.
 // ---------------------------------------------------------------------------
-
-/// Thin direct-call helper per (write mode, value kind), or `0` for a slot that
-/// is not served. Indexed by [`varhandle_write_helper_slot`].
-pub static VARHANDLE_WRITE_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE_WRITE_SLOTS] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; VARHANDLE_WRITE_SLOTS];
 
 /// The `VarHandle` write access modes served by [`VARHANDLE_WRITE_DIRECT_FNS`],
 /// in slot-major order.
@@ -12901,14 +12582,6 @@ pub fn varhandle_write_helper_slot(method: &str, descriptor: &str) -> Option<usi
     Some(mode * VARHANDLE_WRITE_KINDS.len() + kind_idx)
 }
 
-/// Register the `VarHandle` write-mode thin direct-call helpers (called once
-/// from the VM's `build_helpers`), indexed by [`varhandle_write_helper_slot`].
-pub fn set_varhandle_write_direct_fns(addrs: &[usize; VARHANDLE_WRITE_SLOTS]) {
-    for (cell, addr) in VARHANDLE_WRITE_DIRECT_FNS.iter().zip(addrs.iter()) {
-        cell.store(*addr, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS=0` — send every `VarHandle`
 /// write back through the generic native funnel. Default ON.
 ///
@@ -12967,11 +12640,6 @@ pub fn varhandle_write_direct_helper_sites() -> (u64, u64) {
 // publish as a handoff root, and `expected`/`new` travel INWARD in registers
 // the compiled caller's own frame already describes.
 // ---------------------------------------------------------------------------
-
-/// Thin direct-call helper per value kind, or `0` for a slot that is not
-/// served. Indexed by [`varhandle_cas_helper_slot`].
-pub static VARHANDLE_CAS_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE_CAS_SLOTS] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; VARHANDLE_CAS_SLOTS];
 
 /// The value kinds served, in slot order — the same nine the write bind takes,
 /// and for the same reason `L` is among them.
@@ -13056,14 +12724,6 @@ fn split_one_cas_operand(s: &str) -> Option<(u8, &str)> {
         }
         c if VARHANDLE_CAS_KINDS.contains(c) => Some((*c, &s[1..])),
         _ => None,
-    }
-}
-
-/// Register the `VarHandle` CAS thin direct-call helpers (called once from the
-/// VM's `build_helpers`), indexed by [`varhandle_cas_helper_slot`].
-pub fn set_varhandle_cas_direct_fns(addrs: &[usize; VARHANDLE_CAS_SLOTS]) {
-    for (cell, addr) in VARHANDLE_CAS_DIRECT_FNS.iter().zip(addrs.iter()) {
-        cell.store(*addr, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -13272,35 +12932,6 @@ pub fn varhandle_read_direct_helper_sites() -> (u64, u64) {
         VARHANDLE_READ_SITES_SINGLEPASS.load(std::sync::atomic::Ordering::Relaxed),
         VARHANDLE_READ_SITES_OSR.load(std::sync::atomic::Ordering::Relaxed),
     )
-}
-
-/// `Thread.currentThread()` thin direct-call helper — the JIT half of the
-/// funnel bypass the interpreter already has.
-///
-/// The interpreter answers `Thread.currentThread()` inline from the thread's
-/// own `java_thread_obj` mirror (see `InterpIntrinsic::ThreadCurrentThread`),
-/// which took it from 306 ns to 136 ns under `--nojit`. **With the JIT on that
-/// fix is inert**: compiled code never consults the interpreter's inline
-/// cache, and an `invokestatic` whose callee is a registered native has no
-/// compiled body to bind, so every call fell through `jit_invoke_dispatch` to
-/// `vm_exec::invoke_or_native` — a by-name resolution *plus* the native funnel,
-/// measured at ~400 ns/call
-/// (`native-call-funnel-per-call-floor-item2-20260805.md`).
-///
-/// The JDK leans on it constantly: **two calls per uncontended
-/// `ReentrantLock.lock()`/`unlock()` pair**, censused with
-/// `--dump-native-registry` (`probes/LockNativeCensusProbe.java`), plus every
-/// AQS ownership check and thread-local lookup.
-///
-/// `0` = not wired → the recognition below is skipped and the site keeps the
-/// generic dispatch helper, exactly like every other `*_DIRECT_FN`.
-pub static THREAD_CURRENT_THREAD_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Register the `Thread.currentThread` thin direct-call helper (called once
-/// from the VM's `build_helpers`).
-pub fn set_thread_current_thread_direct_fn(addr: usize) {
-    THREAD_CURRENT_THREAD_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// How many `Thread.currentThread()` call sites the compiler has bound to the
@@ -13519,46 +13150,6 @@ pub fn thread_current_thread_bound_sites() -> (u64, u64, u64) {
         THREAD_CURRENT_THREAD_SITES_IR.load(std::sync::atomic::Ordering::Relaxed),
         THREAD_CURRENT_THREAD_SITES_OSR.load(std::sync::atomic::Ordering::Relaxed),
     )
-}
-
-/// Direct thin-lock monitor helpers registered by the VM at bootstrap.
-///
-/// They stay outside `JitRuntimeHelpers` to avoid expanding that stable
-/// cross-crate ABI for process-lifetime addresses. Generated code reaches
-/// them through `runtime_lowering::emit_monitor_stub`.
-pub static MONITOR_ENTER_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-pub static MONITOR_EXIT_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_monitor_direct_fns(enter: usize, exit: usize) {
-    MONITOR_ENTER_DIRECT_FN.store(enter, std::sync::atomic::Ordering::Release);
-    MONITOR_EXIT_DIRECT_FN.store(exit, std::sync::atomic::Ordering::Release);
-}
-
-/// `jdk/internal/util/Preconditions.checkIndex(II[BiFunction])I` thin
-/// direct-call helper. Top of the `--dump-native-registry` invocation census on
-/// `probes/NioAccessorRate.java`: 4 000 000 calls for 800 000 `ByteBuffer`
-/// accessor operations, ahead of the store itself. `0` = not wired.
-pub static PRECONDITIONS_CHECK_INDEX_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Register the `Preconditions.checkIndex` thin direct-call helper (called once
-/// from `build_helpers`).
-pub fn set_preconditions_check_index_direct_fn(addr: usize) {
-    PRECONDITIONS_CHECK_INDEX_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// `java/lang/ref/Reference.reachabilityFence(Object)V` thin direct-call
-/// helper. Second on the same census (3 200 000 calls), and its registered
-/// native does nothing but be opaque about its argument. `0` = not wired.
-pub static REACHABILITY_FENCE_DIRECT_FN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Register the `Reference.reachabilityFence` thin direct-call helper (called
-/// once from `build_helpers`).
-pub fn set_reachability_fence_direct_fn(addr: usize) {
-    REACHABILITY_FENCE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `CRATONVM_JIT='-census-direct-helpers'` — stop binding
@@ -25778,6 +25369,7 @@ pub fn try_compile_with_invokespecial_resolver(
         despec,
         cp_invoke_declaring_class_resolver,
         self_call_identity_stable: false,
+        direct_helpers: &DirectHelperTable::EMPTY,
     })
 }
 
@@ -26909,6 +26501,7 @@ fn try_compile_inner(
         despec,
         cp_invoke_declaring_class_resolver,
         self_call_identity_stable: _,
+        direct_helpers,
     } = *req;
     // One compile, one verdict: the fall-through signal describes THIS call.
     reset_ir_fall_through_signal();
@@ -28839,7 +28432,7 @@ fn try_compile_inner(
                                 && desc == "()Ljava/lang/Thread;"
                             {
                                 let entry = direct_native_helper(
-                                    &THREAD_CURRENT_THREAD_DIRECT_FN,
+                                    direct_helpers.thread_current_thread,
                                     jdk_only,
                                     intrinsic_resolver,
                                     direct_class,
@@ -28877,7 +28470,7 @@ fn try_compile_inner(
                                 && desc == "(IILjava/util/function/BiFunction;)I"
                             {
                                 let entry = direct_native_helper(
-                                    &PRECONDITIONS_CHECK_INDEX_DIRECT_FN,
+                                    direct_helpers.preconditions_check_index,
                                     jdk_only,
                                     intrinsic_resolver,
                                     direct_class,
@@ -28899,7 +28492,7 @@ fn try_compile_inner(
                                 && desc == "(Ljava/lang/Object;)V"
                             {
                                 let entry = direct_native_helper(
-                                    &REACHABILITY_FENCE_DIRECT_FN,
+                                    direct_helpers.reachability_fence,
                                     jdk_only,
                                     intrinsic_resolver,
                                     direct_class,
@@ -28936,7 +28529,7 @@ fn try_compile_inner(
                                 && desc == "(J)Ljava/lang/Long;"
                             {
                                 let entry = direct_native_helper(
-                                    &LONG_VALUE_OF_DIRECT_FN,
+                                    direct_helpers.long_value_of,
                                     jdk_only,
                                     intrinsic_resolver,
                                     direct_class,
@@ -28994,7 +28587,7 @@ fn try_compile_inner(
                                 && desc == "()I"
                             {
                                 let entry = direct_native_helper(
-                                    &INTEGER_INT_VALUE_DIRECT_FN,
+                                    direct_helpers.integer_int_value,
                                     jdk_only,
                                     intrinsic_resolver,
                                     direct_class,
@@ -29118,7 +28711,7 @@ fn try_compile_inner(
                             && is_buffer_session_site(&mn, &desc)
                         {
                             let entry =
-                                BUFFER_SESSION_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                                direct_helpers.buffer_session;
                             if entry != 0 {
                                 direct_target = Some((entry, true));
                                 direct_target_is_thin_helper = true;
@@ -29133,7 +28726,7 @@ fn try_compile_inner(
                             && cn == "java/nio/ByteBuffer"
                             && ((mn == "put" && desc == "(IB)Ljava/nio/ByteBuffer;")
                                 || (mn == "get" && desc == "(I)B"))
-                            && !nio_byte_element_bind_refused(profile, pc, mn == "put", "ir")
+                            && !nio_byte_element_bind_refused(direct_helpers, profile, pc, mn == "put", "ir")
                         {
                             let is_put = mn == "put";
                             // `direct_native_helper_for_impl`, not
@@ -29145,9 +28738,9 @@ fn try_compile_inner(
                             // single-pass door.
                             let entry = direct_native_helper_for_impl(
                                 if is_put {
-                                    &NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN
+                                    direct_helpers.nio_bytebuffer_put_byte
                                 } else {
-                                    &NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN
+                                    direct_helpers.nio_bytebuffer_get_byte
                                 },
                                 jdk_only,
                                 intrinsic_resolver,
@@ -31263,7 +30856,7 @@ fn try_compile_inner(
                 && descriptor == "()I"
             {
                 let entry = direct_native_helper(
-                    &INTEGER_INT_VALUE_DIRECT_FN,
+                    direct_helpers.integer_int_value,
                     jdk_only,
                     intrinsic_resolver,
                     &class_name,
@@ -31600,7 +31193,7 @@ fn try_compile_inner(
                         // this bind into a §1.4 violation that only compiled
                         // frames can observe.
                         let entry = direct_native_helper(
-                            &STRING_LATIN1_LOWER_DIRECT_FN,
+                            direct_helpers.string_latin1_lower,
                             jdk_only,
                             intrinsic_resolver,
                             &class_name,
@@ -31639,7 +31232,7 @@ fn try_compile_inner(
                         // JDK-ONLY-WAVE2: see the marker on the
                         // `StringLatin1.toLowerCase` bind above — same list.
                         let entry = direct_native_helper(
-                            &THREAD_CURRENT_THREAD_DIRECT_FN,
+                            direct_helpers.thread_current_thread,
                             jdk_only,
                             intrinsic_resolver,
                             &class_name,
@@ -31688,7 +31281,7 @@ fn try_compile_inner(
                         && descriptor == "(IILjava/util/function/BiFunction;)I"
                     {
                         let entry = direct_native_helper(
-                            &PRECONDITIONS_CHECK_INDEX_DIRECT_FN,
+                            direct_helpers.preconditions_check_index,
                             jdk_only,
                             intrinsic_resolver,
                             &class_name,
@@ -31721,7 +31314,7 @@ fn try_compile_inner(
                         && descriptor == "(Ljava/lang/Object;)V"
                     {
                         let entry = direct_native_helper(
-                            &REACHABILITY_FENCE_DIRECT_FN,
+                            direct_helpers.reachability_fence,
                             jdk_only,
                             intrinsic_resolver,
                             &class_name,
@@ -31755,7 +31348,7 @@ fn try_compile_inner(
                         // JDK-ONLY-WAVE2: see the marker on the
                         // `StringLatin1.toLowerCase` bind above — same list.
                         let entry = direct_native_helper(
-                            &INTEGER_VALUE_OF_DIRECT_FN,
+                            direct_helpers.integer_value_of,
                             jdk_only,
                             intrinsic_resolver,
                             &class_name,
@@ -31798,7 +31391,7 @@ fn try_compile_inner(
                         // JDK-ONLY-WAVE2: see the marker on the
                         // `StringLatin1.toLowerCase` bind above — same list.
                         let entry = direct_native_helper(
-                            &LONG_VALUE_OF_DIRECT_FN,
+                            direct_helpers.long_value_of,
                             jdk_only,
                             intrinsic_resolver,
                             &class_name,
@@ -32182,7 +31775,7 @@ fn try_compile_inner(
                     // JDK-ONLY-WAVE2: see the marker on the
                     // `StringLatin1.toLowerCase` bind above — same list.
                     let entry = direct_native_helper(
-                        &INTEGER_INT_VALUE_DIRECT_FN,
+                        direct_helpers.integer_int_value,
                         jdk_only,
                         intrinsic_resolver,
                         &class_name,
@@ -32239,7 +31832,7 @@ fn try_compile_inner(
                         // `JdkOnly` this bind is refused — deliberately, and on
                         // the same terms as `HashMap.get`.
                         let entry = direct_native_helper(
-                            &VARHANDLE_READ_DIRECT_FNS[slot],
+                            direct_helpers.varhandle_read[slot],
                             jdk_only,
                             intrinsic_resolver,
                             &class_name,
@@ -32300,7 +31893,7 @@ fn try_compile_inner(
                         // refused, deliberately and on the same terms as the
                         // read bind.
                         let entry = direct_native_helper(
-                            &VARHANDLE_WRITE_DIRECT_FNS[slot],
+                            direct_helpers.varhandle_write[slot],
                             jdk_only,
                             intrinsic_resolver,
                             &class_name,
@@ -32353,7 +31946,7 @@ fn try_compile_inner(
                         // `NativeKind::Bridge`, so under `JdkOnly` this bind is
                         // refused on the same terms as the read and write ones.
                         let entry = direct_native_helper(
-                            &VARHANDLE_CAS_DIRECT_FNS[slot],
+                            direct_helpers.varhandle_cas[slot],
                             jdk_only,
                             intrinsic_resolver,
                             &class_name,
@@ -32395,7 +31988,7 @@ fn try_compile_inner(
                     // JDK-ONLY-WAVE2: see the marker on the
                     // `StringLatin1.toLowerCase` bind above — same list.
                     let entry = direct_native_helper(
-                        &LONG_LONG_VALUE_DIRECT_FN,
+                        direct_helpers.long_long_value,
                         jdk_only,
                         intrinsic_resolver,
                         &class_name,
@@ -32458,7 +32051,7 @@ fn try_compile_inner(
                     && invoke_kind == 0
                     && is_buffer_session_site(&method_name, &descriptor)
                 {
-                    let entry = BUFFER_SESSION_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    let entry = direct_helpers.buffer_session;
                     if entry != 0 {
                         BUFFER_SESSION_SITES_SP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         direct_calls.push((
@@ -32480,7 +32073,7 @@ fn try_compile_inner(
                     && class_name == "java/nio/ByteBuffer"
                     && ((method_name == "put" && descriptor == "(IB)Ljava/nio/ByteBuffer;")
                         || (method_name == "get" && descriptor == "(I)B"))
-                    && !nio_byte_element_bind_refused(
+                    && !nio_byte_element_bind_refused(direct_helpers, 
                         profile,
                         pc,
                         method_name == "put",
@@ -32490,9 +32083,9 @@ fn try_compile_inner(
                     let is_put = method_name == "put";
                     let entry = direct_native_helper_for_impl(
                         if is_put {
-                            &NIO_BYTEBUFFER_PUT_BYTE_DIRECT_FN
+                            direct_helpers.nio_bytebuffer_put_byte
                         } else {
-                            &NIO_BYTEBUFFER_GET_BYTE_DIRECT_FN
+                            direct_helpers.nio_bytebuffer_get_byte
                         },
                         jdk_only,
                         intrinsic_resolver,
@@ -32537,7 +32130,7 @@ fn try_compile_inner(
                     && descriptor == "(B)V"
                 {
                     let entry = direct_native_helper(
-                        &MD_UPDATE_BYTE_DIRECT_FN,
+                        direct_helpers.md_update_byte,
                         jdk_only,
                         intrinsic_resolver,
                         &class_name,
@@ -32573,7 +32166,7 @@ fn try_compile_inner(
                     // Both rows must be admitted — see
                     // `direct_native_helper_for_impl`.
                     let entry = direct_native_helper_for_impl(
-                        &CONCURRENT_HASHMAP_GET_DIRECT_FN,
+                        direct_helpers.concurrent_hashmap_get,
                         jdk_only,
                         intrinsic_resolver,
                         &class_name,
@@ -32648,7 +32241,7 @@ fn try_compile_inner(
                         // same helper as `get` so the two stay one rule.
                         Some((
                             direct_native_helper_for_impl(
-                                &HASHMAP_PUT_DIRECT_FN,
+                                direct_helpers.hashmap_put,
                                 jdk_only,
                                 intrinsic_resolver,
                                 &class_name,
@@ -32670,7 +32263,7 @@ fn try_compile_inner(
                         // `java/util/HashMap`. Both rows must be admitted.
                         Some((
                             direct_native_helper_for_impl(
-                                &HASHMAP_GET_DIRECT_FN,
+                                direct_helpers.hashmap_get,
                                 jdk_only,
                                 intrinsic_resolver,
                                 &class_name,
@@ -33548,6 +33141,7 @@ fn try_compile_inner(
         despec,
         indy_info,
         elidable_init_pcs,
+        direct_helpers,
     )?;
     drop(metrics_single_pass);
 
@@ -34459,46 +34053,6 @@ mod code_buffer_retry_tests {
 mod long_box_direct_bind_tests {
     use super::*;
 
-    /// The two `Long` cells must be DISTINCT from each other and from the two
-    /// `Integer` cells they are modelled on.
-    ///
-    /// This is not paranoia about copy-paste for its own sake: the whole bind
-    /// is a triple-to-helper-address map, and the failure mode of getting it
-    /// wrong is not a compile error — it is `Long.longValue()` calling
-    /// `jit_integer_int_value_direct`, which reads field 0 and returns whatever
-    /// `Value::Int` arm it finds, silently truncating every `long` above 2^31
-    /// in compiled code only. A pointer-equality check is the only thing that
-    /// catches that before a workload does.
-    #[test]
-    fn the_long_helper_cells_are_not_the_integer_ones() {
-        set_integer_value_of_direct_fn(0x1000);
-        set_integer_int_value_direct_fn(0x2000);
-        set_long_value_of_direct_fn(0x3000);
-        set_long_long_value_direct_fn(0x4000);
-
-        let iv = INTEGER_VALUE_OF_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
-        let ii = INTEGER_INT_VALUE_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
-        let lv = LONG_VALUE_OF_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
-        let ll = LONG_LONG_VALUE_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
-
-        assert_eq!((iv, ii, lv, ll), (0x1000, 0x2000, 0x3000, 0x4000));
-        assert_ne!(lv, iv, "Long.valueOf is wired to Integer.valueOf's helper");
-        assert_ne!(
-            ll, ii,
-            "Long.longValue is wired to Integer.intValue's helper"
-        );
-        assert_ne!(lv, ll, "both Long cells hold one address");
-
-        // Leave the cells as `build_helpers` would find them: not wired. `0` is
-        // the established "use the generic dispatch helper" sentinel, so a test
-        // that ran before a real VM in the same process cannot leave a fake
-        // address behind for a compile to bake into a `CALL`.
-        set_integer_value_of_direct_fn(0);
-        set_integer_int_value_direct_fn(0);
-        set_long_value_of_direct_fn(0);
-        set_long_long_value_direct_fn(0);
-    }
-
     /// The site counters start at zero and are independent, so a run that
     /// reports `Long.valueOf=0 Long.longValue=N` is reporting two facts and not
     /// one number twice. `the field site cache shipped default-OFF for 13 days`
@@ -34824,23 +34378,12 @@ mod varhandle_read_direct_bind_tests {
     #[test]
     fn the_slots_are_registered_in_recognition_order() {
         let addrs: [usize; VARHANDLE_READ_SLOTS] = std::array::from_fn(|i| 0x1000 + i * 0x10);
-        set_varhandle_read_direct_fns(&addrs);
+        let table = DirectHelperTable { varhandle_read: addrs, ..DirectHelperTable::EMPTY };
         for (_, desc, name) in canonical_descriptors() {
             let slot = varhandle_read_helper_slot(name, &desc).unwrap();
-            assert_eq!(
-                VARHANDLE_READ_DIRECT_FNS[slot].load(std::sync::atomic::Ordering::Relaxed),
-                addrs[slot],
-                "{name}{desc} -> slot {slot}",
-            );
+            assert_eq!(table.varhandle_read[slot], addrs[slot], "{name}{desc} -> slot {slot}");
         }
-        // Leave the cells as `build_helpers` would find them — `0` is the
-        // "use the generic dispatch helper" sentinel, and a fake address left
-        // behind here would be baked into a `CALL` by a later compile in the
-        // same test binary.
-        set_varhandle_read_direct_fns(&[0; VARHANDLE_READ_SLOTS]);
-        assert!(VARHANDLE_READ_DIRECT_FNS
-            .iter()
-            .all(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 0));
+        assert!(DirectHelperTable::EMPTY.varhandle_read.iter().all(|&a| a == 0));
     }
 
     /// The two door counters are separate, so `VarHandle.read=N/0` reports two
@@ -35703,11 +35246,10 @@ mod tests {
     /// independent by construction and a test can simply ask for both.
     #[test]
     fn direct_native_helper_answers_per_vm_not_per_process() {
-        static CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         // A registered helper address. `build_helpers` now publishes these
         // unconditionally; whether they may be BOUND is the policy question
         // below, and it is asked per compilation.
-        CELL.store(0xdead_beef, std::sync::atomic::Ordering::Relaxed);
+        let entry: usize = 0xdead_beef;
 
         // No resolver: strict refuses and records. This is also the §4
         // fail-closed case — a compile with no way to ask the registry cannot
@@ -35715,7 +35257,7 @@ mod tests {
         let before = jdk_only_direct_native_refusals();
         assert_eq!(
             direct_native_helper(
-                &CELL,
+                entry,
                 true,
                 None,
                 "java/lang/Integer",
@@ -35735,7 +35277,7 @@ mod tests {
         // failed, because the strict answer poisoned the process.
         assert_eq!(
             direct_native_helper(
-                &CELL,
+                entry,
                 false,
                 None,
                 "java/lang/Integer",
@@ -35747,9 +35289,9 @@ mod tests {
         );
 
         // And the unset sentinel is still the unset sentinel in both modes.
-        CELL.store(0, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(direct_native_helper(&CELL, false, None, "c", "m", "()V"), 0);
-        assert_eq!(direct_native_helper(&CELL, true, None, "c", "m", "()V"), 0);
+        let entry: usize = 0;
+        assert_eq!(direct_native_helper(entry, false, None, "c", "m", "()V"), 0);
+        assert_eq!(direct_native_helper(entry, true, None, "c", "m", "()V"), 0);
     }
 
     /// JDK-ONLY-WAVE2 §4: under `JdkOnly` the bind decision is the registry's
@@ -35763,8 +35305,7 @@ mod tests {
     /// are registered `Intrinsic`.
     #[test]
     fn direct_native_helper_asks_the_registry_not_a_name_list() {
-        static CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        CELL.store(0xfeed_face, std::sync::atomic::Ordering::Relaxed);
+        let entry: usize = 0xfeed_face;
 
         let intrinsic = |_c: &str, _m: &str, _d: &str| true;
         let bridge = |_c: &str, _m: &str, _d: &str| false;
@@ -35772,7 +35313,7 @@ mod tests {
         // Intrinsic: §1.4's reviewed exception, so it binds even under strict.
         assert_eq!(
             direct_native_helper(
-                &CELL,
+                entry,
                 true,
                 Some(&intrinsic),
                 "java/lang/Integer",
@@ -35788,7 +35329,7 @@ mod tests {
         let before = jdk_only_direct_native_refusals();
         assert_eq!(
             direct_native_helper(
-                &CELL,
+                entry,
                 true,
                 Some(&bridge),
                 "java/util/HashMap",
@@ -35804,7 +35345,7 @@ mod tests {
         // only consulted on the strict arm.
         assert_eq!(
             direct_native_helper(
-                &CELL,
+                entry,
                 false,
                 Some(&bridge),
                 "java/util/HashMap",
@@ -35840,8 +35381,7 @@ mod tests {
     /// closes that, and the last block here is the executable statement of it.
     #[test]
     fn strict_mode_refuses_every_collection_direct_helper() {
-        static CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        CELL.store(0x0c0f_fee0, std::sync::atomic::Ordering::Relaxed);
+        let entry: usize = 0x0c0f_fee0;
 
         // What the registry says today for the four triples the collection
         // ladders name. Source: scripts/baselines/jdk-only-kind-map-25-linux.tsv
@@ -35883,7 +35423,7 @@ mod tests {
             let before = jdk_only_direct_native_refusals();
             assert_eq!(
                 direct_native_helper(
-                    &CELL,
+                    entry,
                     true,
                     Some(&as_measured_today),
                     class,
@@ -35905,7 +35445,7 @@ mod tests {
             // exactly zero.
             assert_eq!(
                 direct_native_helper(
-                    &CELL,
+                    entry,
                     false,
                     Some(&as_measured_today),
                     class,
@@ -35925,7 +35465,7 @@ mod tests {
         let before = jdk_only_direct_native_refusals();
         assert_eq!(
             direct_native_helper_for_impl(
-                &CELL,
+                entry,
                 true,
                 Some(&interface_only_intrinsic),
                 "java/util/Map",
@@ -35949,7 +35489,7 @@ mod tests {
         };
         assert_eq!(
             direct_native_helper_for_impl(
-                &CELL,
+                entry,
                 true,
                 Some(&both_intrinsic),
                 "java/util/Map",
@@ -35974,7 +35514,7 @@ mod tests {
         };
         assert_eq!(
             direct_native_helper_for_impl(
-                &CELL,
+                entry,
                 true,
                 Some(&counting),
                 "java/util/HashMap",
