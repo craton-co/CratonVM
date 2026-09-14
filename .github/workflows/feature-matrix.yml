@@ -96,7 +96,7 @@ jobs:
       configs: ${{ steps.build-matrix.outputs.configs }}
       count: ${{ steps.build-matrix.outputs.count }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -222,7 +222,7 @@ jobs:
       matrix:
         cfg: ${{ fromJSON(needs.enumerate.outputs.configs) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

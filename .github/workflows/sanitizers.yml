@@ -59,7 +59,7 @@ jobs:
     continue-on-error: true
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `-Zbuild-std` recompiles core/alloc/std WITH instrumentation. Without
       # it, the precompiled std is uninstrumented and every allocation that
@@ -157,7 +157,7 @@ jobs:
     continue-on-error: true
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install nightly Rust
         uses: dtolnay/rust-toolchain@nightly
@@ -242,7 +242,7 @@ jobs:
     continue-on-error: true
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install nightly Rust
         uses: dtolnay/rust-toolchain@nightly

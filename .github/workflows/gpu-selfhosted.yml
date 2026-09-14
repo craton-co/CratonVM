@@ -44,7 +44,7 @@ jobs:
     runs-on: [self-hosted, gpu]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Mirrors build-gpu-driver.bat: real cudarc bindings, isolated target
       # dir so this never collides with a CPU-only build on the same box.

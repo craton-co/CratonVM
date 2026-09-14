@@ -36,7 +36,7 @@ jobs:
     # cargo invocations + criterion's profiling run.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust + llvm-tools-preview
         uses: dtolnay/rust-toolchain@master

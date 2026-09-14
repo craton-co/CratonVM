@@ -84,7 +84,7 @@ jobs:
         # other's findings -- Miri stops the whole run on the first such error.
         crate: [cratonvm-reader, cratonvm-types]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
