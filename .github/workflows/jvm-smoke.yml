@@ -79,7 +79,7 @@ jobs:
         run: cargo build --release -p cratonvm-cli
 
       - name: Archive cratonvm binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cratonvm-binary
           path: target/release/cratonvm
@@ -188,7 +188,7 @@ jobs:
 
       - name: Upload failure artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.item }}-failure
           path: |

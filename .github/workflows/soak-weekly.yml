@@ -1,4 +1,4 @@
-﻿name: Soak weekly (WP8.7 placeholder for WP8.1)
+name: Soak weekly (WP8.7 placeholder for WP8.1)
 
 # WP8.7 created this stub. The real 24h soak harness lands in WP8.1
 # (docs/wildfly-ejbca-roadmap.md §11): one S2 app under 10 ops/s for 24h
@@ -70,7 +70,7 @@ jobs:
 
       - name: Upload artefacts on drift
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-weekly-keycloak16
           path: |

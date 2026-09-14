@@ -199,7 +199,7 @@ jobs:
           printf '%s' "$configs" | jq -r '.[] | "  \(.name)  ->  cargo check --workspace --all-targets \(.args)"'
 
       - name: Upload the enumerated matrix
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: feature-matrix-configs
           path: |

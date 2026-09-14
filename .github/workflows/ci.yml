@@ -1068,7 +1068,7 @@ jobs:
           ls -l dist
 
       - name: Upload libcratonvm artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libcratonvm-${{ runner.os }}
           path: dist/
@@ -1168,7 +1168,7 @@ jobs:
       # if-no-files-found: warn, not error — the generate step legitimately
       # produces no matrix on the exit-3 bootstrap path above.
       - name: Upload the coverage matrix
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: opcode-coverage-matrix
           path: target/coverage-matrix.json
@@ -1819,7 +1819,7 @@ jobs:
 
       - name: Upload strict-corpus transcripts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jdk-only-strict-probes-${{ matrix.os }}-jdk${{ matrix.java }}
           path: target/jdk-only-strict-probes/logs/
@@ -1867,7 +1867,7 @@ jobs:
       # directory dump.
       - name: Upload JDK-only audit artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jdk-only-audit-${{ matrix.os }}-jdk${{ matrix.java }}
           path: |

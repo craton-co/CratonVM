@@ -1,4 +1,4 @@
-﻿name: Forcing-function nightly smoke (WP8.7)
+name: Forcing-function nightly smoke (WP8.7)
 
 # WP8.7 — nightly matrix over the S2 forcing-function apps
 # (Keycloak 16/26, EJBCA, Tomcat 10, Jetty 12, Quarkus 3, Spring Boot 3,
@@ -94,7 +94,7 @@ jobs:
 
       - name: Upload artefacts on drift
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: forcing-function-smoke-${{ matrix.app }}
           path: |

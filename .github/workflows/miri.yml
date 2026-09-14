@@ -155,7 +155,7 @@ jobs:
 
       - name: Upload Miri logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: miri-extended-${{ matrix.crate }}
           path: target/miri-extended/
