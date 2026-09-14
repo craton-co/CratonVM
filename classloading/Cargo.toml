@@ -105,7 +105,7 @@ tempfile = "3"
 # turn on the ecdsa crate's `der` module, and `EncodePublicKey` lives in
 # `spki`; pull both here (test builds only — no production binary impact).
 # Versions match the production p256/p384 0.13 axis (ecdsa 0.16 / spki 0.7).
-ecdsa = { version = "0.16", features = ["der"] }
+ecdsa = { version = "0.17", features = ["der"] }
 spki = { version = "0.7", features = ["alloc"] }
 # `EncodePublicKey::to_public_key_der` for `PublicKey<C>` is gated on
 # elliptic-curve's `alloc` + `pkcs8` features; force them on for test builds.
