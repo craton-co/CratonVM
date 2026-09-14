@@ -74,7 +74,7 @@ regex = "1"
 # `.schemaValidation` splits on `(?<!\G\S+)\s` (a negative look-behind whose
 # `\G\S+` body is unbounded). 0.18 added variable-length look-behind support and
 # produces split results identical to the reference JDK for that pattern.
-fancy-regex = "0.18"
+fancy-regex = "0.19"
 parking_lot.workspace = true
 # WP4.2: VarHandle metadata side-table.
 rustc-hash.workspace = true
