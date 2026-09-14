@@ -82,7 +82,7 @@ jobs:
           shared-key: jit-differential-nightly
 
       - name: Set up JDK 25 (build and boot image)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '25'
@@ -136,7 +136,7 @@ jobs:
           shared-key: jit-differential-nightly
 
       - name: Set up JDK 25 (javac for the corpus, build and boot image)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '25'

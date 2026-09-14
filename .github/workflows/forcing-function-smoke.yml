@@ -1,4 +1,4 @@
-﻿name: Forcing-function nightly smoke (WP8.7)
+name: Forcing-function nightly smoke (WP8.7)
 
 # WP8.7 — nightly matrix over the S2 forcing-function apps
 # (Keycloak 16/26, EJBCA, Tomcat 10, Jetty 12, Quarkus 3, Spring Boot 3,
@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: 'temurin'
           java-version: '21'
