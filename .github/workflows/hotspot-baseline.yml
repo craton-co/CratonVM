@@ -97,7 +97,7 @@ jobs:
             --threshold 2.0
 
       - name: Create PR with refreshed baseline
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           commit-message: 'Capture HotSpot C2 baseline'
           title: 'Refresh HotSpot C2 baseline (T10.8.2)'
