@@ -1,0 +1,157 @@
+[package]
+name = "cratonvm-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Command-line launcher for the CratonVM"
+readme = "README.md"
+# Committed compiled Java fixtures used by the tests/cli_*.rs integration
+# tests. Excluded from the published package so `cargo package` does not
+# ship opaque .class bytecode. The test .rs sources live directly under
+# tests/ and are unaffected.
+exclude = [
+    "tests/resources/**",
+    "**/*.class",
+]
+
+[[bin]]
+name = "cratonvm"
+path = "src/main.rs"
+
+# Optional second bin built as `java[.exe]`, gated behind the
+# `java-bin-alias` cargo feature. Off by default so `cargo install
+# cratonvm-cli` does NOT drop a `java` binary into `~/.cargo/bin/`
+# that would shadow the system JDK launcher — a hard blocker for safe
+# crates.io distribution. Opt in with:
+#
+#     cargo build --release -p cratonvm-cli --features java-bin-alias
+#
+# Same launcher as `cratonvm`; the `java[.exe]` name is required by
+# Maven Surefire's `<jvm>` / `-Djvm=` validation (path must end with
+# `java` / `java.exe`), which is why the alias exists at all.
+[[bin]]
+name = "java"
+path = "src/main.rs"
+required-features = ["java-bin-alias"]
+
+[dependencies]
+cratonvm-vm = { path = "../vm", version = "0.3.0" }
+# Direct dep so vm-cli's pre-exit hook can call
+# `tiered::dump_method_stats_to_stderr` (CRATONVM_DBG_JIT_METHOD_STATS=1)
+# without routing through cratonvm-vm.
+cratonvm-jit = { path = "../jit", version = "0.3.0" }
+# Direct dep so the pre-exit hook can dump the class-definition census
+# (`CRATONVM_DBG=define-census`) beside the other self-gated tallies.
+cratonvm-classloading = { path = "../classloading", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+# Direct dep so the T19.H1 watchdog can print the selector census
+# (`nio_selector::dump_selector_state_to_stderr`) beside the thread dumps, for a
+# stall whose reactor is alive and selecting. Same pattern as the
+# `cratonvm-jit` / `cratonvm-classloading` hook deps above.
+cratonvm-native-io = { path = "../native-io", version = "0.3.0" }
+# Direct dep so `main()` can expand the ten grouped `CRATONVM_*` variables into
+# the per-knob keys before anything reads one. See `cratonvm_types::flag_groups`.
+cratonvm-types = { path = "../types", version = "0.3.0" }
+# Direct dep so vm-cli can install the pre-`std::process::exit` hook on
+# `native_system_exit` via `lang_system::set_pre_exit_hook` (installed at the
+# top of `run()`) — dumps the dispatch_trace ring before silent System.exit
+# calls so the last Java method is visible in stderr for diagnosis.
+cratonvm-native-builtins = { path = "../native-builtins", version = "0.3.0" }
+# Direct dep (rather than reaching through `cratonvm_vm::jfr`) so the launcher
+# owns the process-level phase boundaries: `phase::mark_process_start` beside
+# `expand_process_env`, the `vm_startup` / `java_execution` / `vm_shutdown`
+# spans in `run()`, and the shutdown report in `maybe_dump_shutdown_reports`.
+# See `docs/observability/phase-accounting.md` §10.2-§10.5.
+cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+# Round-7 cross-cutting Fix 2: mimalloc as the global allocator. The default
+# system allocator on Windows is HeapAlloc, which is dramatically slower than
+# mimalloc on the VM's tiny-object workload (Value, ObjectRef, frame locals,
+# Strings, parking_lot internal nodes). Opt-in via the `mimalloc` feature so
+# platforms without working mimalloc support (musl, exotic targets) can
+# fall back to the system allocator.
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+# GPU offload is an opt-in feature. Without `--features gpu` the
+# entire crate compiles to byte-identical output as before the GPU
+# work landed: no `cuda-bridge` link, no `--gpu*` CLI flags, no GPU
+# code paths. See docs/gpu/cuda-oxide-evaluation.md.
+[dependencies.cuda-bridge]
+path = "../cuda-bridge"
+version = "0.3.0"
+optional = true
+package = "cratonvm-cuda-bridge"
+
+[features]
+# `zgc` is in the default set as of 2026-08-10 — the launcher's default
+# collector IS ZGC now, so the feature is no longer opt-in. See
+# `vm/src/config.rs`'s `VmConfig::default` and `docs/gc-tuning.md`.
+default = ["mimalloc", "zgc"]
+# Round-7 cross-cutting Fix 2: opt-in global allocator. Enabled by default
+# because the gains on Windows are large and there is no downside on Linux
+# or macOS, but kept as a feature so musl / exotic targets can disable it
+# with `--no-default-features`.
+mimalloc = ["dep:mimalloc"]
+# Opt-in second binary named `java[.exe]` (same source as `cratonvm`).
+# Off by default to avoid shadowing the system JDK launcher when users
+# run `cargo install cratonvm-cli`. Enable when you need Maven Surefire
+# `-Djvm=...` compatibility (see the `[[bin]] name = "java"` block above
+# and `scripts/sync-maven-java-shim.ps1`).
+java-bin-alias = []
+# Synthetic JDK mode (Rust stubs in place of real JDK bytecode).
+synthetic-jdk = ["cratonvm-vm/synthetic-jdk"]
+# Memory-backed ZGC-real collector, selected at runtime with `-XX:+UseZGC`
+# (see `cratonvm_vm::config::parse_gc_algorithm`). Plain pass-through to
+# `cratonvm-vm/zgc`, which forwards to `cratonvm-gc/zgc`.
+#
+# It is in `default` (line 94) as of 2026-08-10, so the command below is now a
+# no-op rather than the only way to get a ZGC-capable launcher:
+#
+#     cargo build --release -p cratonvm-cli --features zgc
+#
+# The reverse is the one that changes anything now:
+#
+#     cargo build --release -p cratonvm-cli --no-default-features --features mimalloc
+#
+# It exists so that command works at all. Before it, the only way to reach the
+# collector from this crate was `--features cratonvm-vm/zgc`, and no CI job
+# built THIS binary either way: the feature also gates a `GcAlgorithm` variant
+# and a `parse_gc_algorithm` match arm, so those paths vanish from a default
+# build. That is how `ZgcRealHeap::with_capacity()` silently stopped compiling
+# when its three sibling collectors gained a `layout_domain` field on
+# 2026-08-05 (E0063, found 2026-08-07). ci.yml's `experimental-features` job
+# now builds this target under this feature.
+zgc = ["cratonvm-vm/zgc"]
+# Expose --gpu* flags and link cuda-bridge in stub mode. Probing the
+# device returns DeviceError::NoDriver but the CLI surface exists.
+gpu = ["dep:cuda-bridge", "cratonvm-vm/gpu-offload"]
+# As above, plus the real CUDA driver bindings via cudarc.
+gpu-driver = ["gpu", "cuda-bridge/cuda"]
+# As `gpu-driver`, but on NVlabs' `cuda-core` (the host runtime that
+# cuda-oxide is built on) instead of cudarc. Mutually exclusive with
+# `gpu-driver`: cuda-bridge refuses both backends with a `compile_error!`.
+# Linux only for now -- `cuda-core` 0.3.1 does not compile on
+# Windows/MSVC; see docs/known-issues/gpu/cuda-core-msvc-enum-signedness.md.
+gpu-driver-oxide = ["gpu", "cuda-bridge/cuda-oxide"]
+
+# End-to-end integration tests under `tests/cli_*.rs` build the binary via
+# `env!("CARGO_BIN_EXE_cratonvm")`, copy committed `.class` fixtures from
+# `tests/resources/` into a per-test temp directory (via `tempfile`), and
+# assemble synthetic JARs on the fly (via the workspace-pinned `zip` crate).
+# Neither dep is in the regular dependency set — they only live in tests.
+[dev-dependencies]
+tempfile = "3"
+zip.workspace = true
+
+[lints]
+workspace = true

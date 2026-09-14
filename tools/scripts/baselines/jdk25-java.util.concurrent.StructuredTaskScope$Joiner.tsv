@@ -1,0 +1,27 @@
+# jdk-baseline	2
+# kind	class
+# name	java.util.concurrent.StructuredTaskScope$Joiner
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/util/concurrent/StructuredTaskScope$Joiner.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	8
+# protected-methods	0
+# declared-methods	8
+# declared-fields	0
+# rows	11
+# columns	kind	name	descriptor	flags
+CLASS	java.util.concurrent.StructuredTaskScope$Joiner		public,interface,abstract
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	allSuccessfulOrThrow	()Ljava/util/concurrent/StructuredTaskScope$Joiner;	public,static
+METHOD	allUntil	(Ljava/util/function/Predicate;)Ljava/util/concurrent/StructuredTaskScope$Joiner;	public,static
+METHOD	anySuccessfulResultOrThrow	()Ljava/util/concurrent/StructuredTaskScope$Joiner;	public,static
+METHOD	awaitAll	()Ljava/util/concurrent/StructuredTaskScope$Joiner;	public,static
+METHOD	awaitAllSuccessfulOrThrow	()Ljava/util/concurrent/StructuredTaskScope$Joiner;	public,static
+METHOD	onComplete	(Ljava/util/concurrent/StructuredTaskScope$Subtask;)Z	public
+METHOD	onFork	(Ljava/util/concurrent/StructuredTaskScope$Subtask;)Z	public
+METHOD	result	()Ljava/lang/Object;	public,abstract

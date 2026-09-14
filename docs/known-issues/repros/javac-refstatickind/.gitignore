@@ -1,0 +1,6 @@
+out/
+jcout/
+jcout2/
+loopout*/
+*.class
+*.log

@@ -1,0 +1,31 @@
+# CratonBench perf-gate baselines — Azure EPYC bench host (16 vCPU), taskset
+# pinned, -Xmx8g, fresh process per phase, median of N reps.
+#
+# status: anchored    = measured under the documented acceptance methodology,
+#                       with a linked evidence doc; changing it requires a new
+#                       evidence doc (see README "Performance gate").
+#         provisional = best-of measurement 2026-07-24 pending re-anchor after
+#                       the open bt18 dev regression is root-caused; may be
+#                       re-anchored with a normal PR justification.
+#         placeholder = NOT MEASURED on this host. This value is the
+#                       machine-readable marker read by
+#                       regression-suite/perf/reliability-gate.sh: a row with
+#                       this status (or with an empty/zero/non-numeric
+#                       baseline_ms, or an empty checksum) is REFUSED as a
+#                       regression threshold — the gate exits 11 rather than
+#                       print a verdict against a number nobody measured.
+#                       See baselines/README.md for why, and
+#                       docs/benchmarking/methodology.md for how to record a
+#                       real one. As of 2026-07-31 no row below is a
+#                       placeholder: every row has a non-zero baseline and a
+#                       reference checksum. None of them has yet been
+#                       re-measured under the reliability gate.
+#
+# phase	baseline_ms	checksum	status	evidence
+arithmetic	3976	5000000003999999995	provisional	pure-kernel OSR reg-homes default-on + R8/R9 operand cache, median-of-7 3976ms (checksum-verified), 2026-07-30
+fib	4450	701408733	provisional	pair-1 best 4417, 2026-07-24
+sieve	2700	9592	provisional	cratonbench-sieve-half-gap-20260730.md — guarded byte-array loop lowerings, 9-round interleaved median 2567ms on THIS host (was 5794 with CRATONVM_JIT_BULK_BYTE_LOOPS=0, i.e. the old 5800 figure reproduces). Measured at load ~5.5, so 2700 is deliberately loose; the gate only ever runs below load 2.0, where it is faster still. Re-anchor on a quiet host.
+matrix	5700	173943680	provisional	pair-1 best 5630, 2026-07-24
+hashmap	1800	1549999915000000	provisional	dense-overlay sequence derivation + per-object fixed taxes; median-of-5 interleaved against HotSpot on cpu 15 at load 3.4-3.8 was 1780ms, gate's own run 1767ms. hashmap-half-gap-20260730.md, 2026-07-30. Load 3.4-3.8 is above the gate's own --max-load 2, so this is a slightly loose ceiling; tighten on a quiet host. Replaces 4300, which no longer bounds anything.
+stringregex	165	5000050000	provisional	pair-1 best 158, 2026-07-24
+bintrees	1550	68332206	anchored	bt18-inline-tlab-regression-20260724.md (re-anchor: +4 explicit header zero-stores per `new` close the refill-zeroing assumption, ~+2% vs binarytrees-half-gap-20260718.md's 1468)

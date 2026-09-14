@@ -1,0 +1,38 @@
+# jdk-baseline	2
+# kind	class
+# name	java.util.AbstractCollection
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/util/AbstractCollection.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	14
+# protected-methods	0
+# declared-methods	16
+# declared-fields	0
+# rows	22
+# columns	kind	name	descriptor	flags
+CLASS	java.util.AbstractCollection		public,abstract
+EXTENDS	java.lang.Object		
+IMPLEMENTS	java.util.Collection		
+SUPERTYPE	java.lang.Iterable		
+SUPERTYPE	java.lang.Object		
+SUPERTYPE	java.util.Collection		
+METHOD	<init>	()V	protected
+METHOD	add	(Ljava/lang/Object;)Z	public
+METHOD	addAll	(Ljava/util/Collection;)Z	public
+METHOD	clear	()V	public
+METHOD	contains	(Ljava/lang/Object;)Z	public
+METHOD	containsAll	(Ljava/util/Collection;)Z	public
+METHOD	finishToArray	([Ljava/lang/Object;Ljava/util/Iterator;)[Ljava/lang/Object;	private,static
+METHOD	isEmpty	()Z	public
+METHOD	iterator	()Ljava/util/Iterator;	public,abstract
+METHOD	remove	(Ljava/lang/Object;)Z	public
+METHOD	removeAll	(Ljava/util/Collection;)Z	public
+METHOD	retainAll	(Ljava/util/Collection;)Z	public
+METHOD	size	()I	public,abstract
+METHOD	toArray	()[Ljava/lang/Object;	public
+METHOD	toArray	([Ljava/lang/Object;)[Ljava/lang/Object;	public
+METHOD	toString	()Ljava/lang/String;	public

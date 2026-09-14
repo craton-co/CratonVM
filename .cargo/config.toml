@@ -1,0 +1,27 @@
+# Round-7 cross-cutting Fix 5: workspace-wide rustc/linker config.
+#
+# Target a sane x86_64 baseline: SSE2 (mandatory in the AMD64 ABI), SSE4.2
+# (CRC32 / string-search hardware instructions LLVM auto-vectorises into),
+# and PCLMUL (carryless multiply, used by aes-gcm and zip CRC paths). These
+# have been universal on x86_64 desktop/server CPUs since 2011 (Nehalem,
+# Bulldozer) and lifting the baseline lets rustc emit SSE4.2-tier code by
+# default instead of pessimistically targeting the original Pentium 4
+# x86-64-v1 baseline.
+#
+# AVX2 is widespread but not universal (skipped). For developer machines,
+# override with `RUSTFLAGS="-C target-cpu=native"` to opt into AVX2/AVX-512
+# / BMI2 / etc.
+
+[build]
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+sse4.2,+pclmulqdq"]
+
+# The launcher spawns the real entry point on a dedicated `main-vm` thread
+# (see `vm-cli/src/main.rs`), but the launcher's OWN thread still runs
+# initialisation (panic-hook install, env parsing) before that spawn — so
+# the link-time stack reservation needs enough headroom for short-lived
+# pre-spawn work plus any panic-unwind handler called on the launcher
+# thread. 16 MiB on Windows is overkill but cheap (reserved, not committed).
+[target.'cfg(target_os = "windows")']
+rustflags = ["-C", "link-arg=/STACK:16777216"]

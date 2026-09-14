@@ -1,0 +1,190 @@
+# JCK (Java Compatibility Kit) conformance test runner.
+#
+# This workflow is gated on the JCK_HOME secret -- it only runs when the JCK
+# binaries have been downloaded under an OCTLA (or TCK Community) license and
+# made available as a CI artifact or secret path.
+#
+# To enable:
+#   1. Obtain a JCK license (see docs/legal.md).
+#   2. Download the JCK bundle and upload it as a CI artifact or configure
+#      the JCK_HOME secret to point to the extracted directory.
+#   3. The workflow will activate automatically on push/PR.
+
+name: JCK Conformance
+
+on:
+  # Manual trigger -- primary way to run until JCK is fully automated.
+  workflow_dispatch:
+    inputs:
+      jck_modules:
+        description: >
+          Comma-separated JCK module prefixes to test (e.g. api/java_lang,api/java_util).
+          Leave blank to run all discovered modules.
+        required: false
+        default: ''
+      fail_threshold:
+        description: >
+          Maximum number of allowed failures before the job is marked red.
+          Set to -1 to always pass (capture-only mode).
+        required: false
+        default: '-1'
+
+  # Also run on pushes to main when JCK is available.
+  push:
+    branches: [main]
+
+  pull_request:
+    branches: [main]
+
+# Only run if JCK_HOME is configured.
+# GitHub Actions doesn't support conditional workflow-level skips natively,
+# so we check inside the job and exit early if not configured.
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-feature=+sse4.2,+pclmulqdq -D warnings"
+
+jobs:
+  jck-conformance:
+    name: JCK conformance tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check JCK availability
+        id: jck-check
+        run: |
+          if [ -z "${{ secrets.JCK_HOME }}" ] && [ -z "${{ vars.JCK_HOME }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::JCK_HOME not configured -- skipping conformance tests."
+            echo "See docs/legal.md for JCK license instructions."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "JCK_HOME is configured; proceeding with conformance tests."
+          fi
+
+      - name: Checkout
+        if: steps.jck-check.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        if: steps.jck-check.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        if: steps.jck-check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-jck-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-jck-
+            ${{ runner.os }}-cargo-
+
+      - name: Setup JDK
+        if: steps.jck-check.outputs.skip != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: Build CratonVM
+        if: steps.jck-check.outputs.skip != 'true'
+        run: cargo build --release -p cratonvm-cli
+
+      - name: Configure JCK environment
+        if: steps.jck-check.outputs.skip != 'true'
+        run: |
+          # JCK_HOME from secret or variable
+          export JCK_HOME="${{ secrets.JCK_HOME }}${{ vars.JCK_HOME }}"
+          echo "JCK_HOME=${JCK_HOME}" >> "$GITHUB_ENV"
+
+          # Path to the CratonVM binary
+          echo "CRATONVM_BIN=$(pwd)/target/release/cratonvm" >> "$GITHUB_ENV"
+
+          # Optional: restrict to specific modules
+          if [ -n "${{ github.event.inputs.jck_modules }}" ]; then
+            echo "JCK_MODULES=${{ github.event.inputs.jck_modules }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run JCK harness
+        if: steps.jck-check.outputs.skip != 'true'
+        run: |
+          cargo test --release -p cratonvm-vm --test jck_harness -- \
+            --ignored --nocapture 2>&1 | tee jck-output.log
+
+      - name: Run JCK conformance gate
+        if: steps.jck-check.outputs.skip != 'true'
+        run: |
+          THRESHOLD="${{ github.event.inputs.fail_threshold }}"
+          if [ "${THRESHOLD}" = "-1" ]; then
+            echo "Capture-only mode: not enforcing failure threshold."
+          else
+            export DIVERGENCE_THRESHOLD="${THRESHOLD}"
+            cargo test --release -p cratonvm-vm --test jck_conformance -- \
+              --ignored --nocapture
+          fi
+
+      - name: Upload failure report
+        if: steps.jck-check.outputs.skip != 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jck-failures
+          path: bench/jck-failures.json
+          if-no-files-found: ignore
+
+      - name: Upload test log
+        if: steps.jck-check.outputs.skip != 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jck-output-log
+          path: jck-output.log
+          if-no-files-found: ignore
+
+  # Differential testing -- runs a subset of classes through both CratonVM
+  # and HotSpot to detect behavioral divergences.
+  differential:
+    name: Differential tests (CratonVM vs HotSpot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-diff-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-diff-
+            ${{ runner.os }}-cargo-
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: Run differential tests
+        run: |
+          cargo test --release -p cratonvm-vm --test differential -- \
+            --ignored --nocapture 2>&1 | tee differential-output.log
+
+      - name: Upload divergence report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential-divergences
+          path: bench/differential-divergences.json
+          if-no-files-found: ignore
