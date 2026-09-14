@@ -1,0 +1,315 @@
+# Sanitizer legs: AddressSanitizer, UndefinedBehaviorSanitizer, ThreadSanitizer.
+#
+# WHY THIS EXISTS
+# ---------------
+# This is a JVM written in Rust, but almost none of the interesting code is
+# "safe Rust". Object headers are hand-laid-out bytes, the GC rewrites live
+# pointers under a stop-the-world protocol, the JIT writes executable memory,
+# and the native shims dereference pointers handed in by Java code. `cargo
+# test` exercises all of it and reports only the errors that happen to produce
+# a wrong answer or a crash on the test machine. A use-after-free that happens
+# to read plausible bytes, or a data race that happens not to interleave, is
+# invisible to it.
+#
+# ci.yml has a Miri job scoped to `cratonvm-types::heap_types` -- that covers
+# core representation invariants under an interpreter and cannot run the FFI or
+# executable-memory paths at all. These legs are the complementary half: real
+# execution, real threads, real allocator, with runtime instrumentation.
+#
+# NON-BLOCKING AND SCHEDULED, NOT PER-PUSH
+#   * `continue-on-error: true` on every job: sanitizer builds use `-Zbuild-std`
+#     on nightly, so they break for reasons that have nothing to do with this
+#     repository (a nightly regression, a std ICE). A gate that a nightly bump
+#     can turn red is a gate that gets ignored.
+#   * Nightly cron + `workflow_dispatch`, not push/PR: an ASan run rebuilds the
+#     entire standard library and then runs the workspace suite at ~2x slowdown;
+#     TSan is worse (5-15x). That cost per PR would be indefensible; once a day,
+#     and on demand before touching GC or JIT memory management, is the right
+#     cadence.
+#
+# READ scripts/evidence/asan-suppressions.txt BEFORE TRUSTING A GREEN RUN.
+# It documents the structural limit these legs cannot cross: JIT-generated
+# machine code is produced at run time and is therefore NOT instrumented by
+# LLVM. A green ASan run says the interpreter, reader, GC bookkeeping and
+# native/FFI surface are clean on the paths the tests exercise. It does not say
+# the VM is memory-safe, and nobody should quote it as though it did.
+
+name: Sanitizers
+
+on:
+  schedule:
+    # 03:23 UTC daily. Offset from performance.yml's 04:17 slot so the two
+    # never contend for runners.
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Sanitizer output is only useful with symbols and unmangled frames.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------
+  # AddressSanitizer: out-of-bounds, use-after-free, double-free, plus LSan
+  # leak detection (LSan is on by default inside ASan on Linux).
+  # ---------------------------------------------------------------------
+  asan:
+    name: ASan (workspace)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # `-Zbuild-std` recompiles core/alloc/std WITH instrumentation. Without
+      # it, the precompiled std is uninstrumented and every allocation that
+      # crosses a std boundary becomes a blind spot -- which for a VM whose hot
+      # structures are `Vec`/`HashMap` is most of them. It needs `rust-src`.
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sanitizers
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: cargo test under ASan
+        shell: bash
+        env:
+          RUSTFLAGS: '-Zsanitizer=address -C force-frame-pointers=yes'
+          # `detect_stack_use_after_return` finds the class of bug that a VM
+          # with hand-rolled frame handling is most exposed to.
+          ASAN_OPTIONS: 'detect_stack_use_after_return=1:detect_leaks=1:abort_on_error=0:print_stacktrace=1'
+          LSAN_OPTIONS: 'suppressions=scripts/evidence/asan-suppressions.txt:print_suppressions=1'
+        run: |
+          set +e
+          mkdir -p target/sanitizers
+          # `--target` is mandatory with `-Zbuild-std`: without it cargo would
+          # apply RUSTFLAGS to build scripts and proc macros too, and those run
+          # on an uninstrumented host runtime.
+          cargo +nightly test -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            --workspace \
+            2>&1 | tee target/sanitizers/asan.log
+          rc=${PIPESTATUS[0]}
+          echo "asan exit status: $rc" | tee -a target/sanitizers/asan.log
+          # If this fails inside mimalloc, narrow the leg with
+          # `--exclude cratonvm-cli` (see asan-suppressions.txt) -- mimalloc and
+          # ASan both interpose malloc and must not be linked together.
+
+      - name: Summarise ASan findings
+        if: always()
+        shell: bash
+        run: |
+          log=target/sanitizers/asan.log
+          {
+            echo "ASan summary for ${GITHUB_SHA:-unknown}"
+            echo "ERROR: AddressSanitizer  -> $(grep -c 'ERROR: AddressSanitizer' "$log" 2>/dev/null || echo 0)"
+            echo "ERROR: LeakSanitizer     -> $(grep -c 'ERROR: LeakSanitizer' "$log" 2>/dev/null || echo 0)"
+            echo "suppressions used        -> $(grep -c 'suppression' "$log" 2>/dev/null || echo 0)"
+            echo ""
+            echo "REMINDER: JIT-generated code is not instrumented; a clean run"
+            echo "does not cover any JIT-compiled execution path. See"
+            echo "scripts/evidence/asan-suppressions.txt."
+          } | tee target/sanitizers/asan-summary.txt
+
+      - name: Upload ASan logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-asan
+          path: |
+            target/sanitizers/asan.log
+            target/sanitizers/asan-summary.txt
+            scripts/evidence/asan-suppressions.txt
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------
+  # UndefinedBehaviorSanitizer.
+  #
+  # HONEST CAVEAT, READ THIS BEFORE INTERPRETING THE RESULT: rustc's
+  # `-Zsanitizer=` list is target-dependent and `undefined` is NOT universally
+  # accepted -- rustc's own UB story is `-Zub-checks` and debug assertions,
+  # while `-fsanitize=undefined` is a C/C++ facility. This job therefore runs
+  # BOTH and records both outcomes rather than pretending one of them is the
+  # answer:
+  #
+  #   step 1  `-Zsanitizer=undefined` as specified. If the nightly in use
+  #           rejects it, the rejection is recorded in the log and the run
+  #           continues -- it is a fact about the toolchain, not a failure.
+  #   step 2  `-Zub-checks=yes -C debug-assertions=on`, which is always
+  #           available and catches the library-level UB preconditions
+  #           (unaligned/null `ptr::read`, invalid `NonNull`, out-of-bounds
+  #           `get_unchecked`, bad `assume_init`) that this codebase actually
+  #           reaches through its `unsafe` blocks.
+  # ---------------------------------------------------------------------
+  ubsan:
+    name: UBSan / UB checks (workspace)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sanitizers
+          save-if: false
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: cargo test under -Zsanitizer=undefined (may be unsupported)
+        shell: bash
+        env:
+          RUSTFLAGS: '-Zsanitizer=undefined -C force-frame-pointers=yes'
+          UBSAN_OPTIONS: 'print_stacktrace=1:halt_on_error=0'
+        run: |
+          set +e
+          mkdir -p target/sanitizers
+          cargo +nightly test -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            --workspace \
+            2>&1 | tee target/sanitizers/ubsan.log
+          rc=${PIPESTATUS[0]}
+          echo "ubsan exit status: $rc" | tee -a target/sanitizers/ubsan.log
+          if grep -q -E 'is not supported|unknown sanitizer|invalid value.*sanitizer' target/sanitizers/ubsan.log; then
+            echo "NOTE: this nightly does not accept -Zsanitizer=undefined for this target." \
+              | tee -a target/sanitizers/ubsan.log
+            echo "The -Zub-checks step below is the load-bearing UB signal for this run." \
+              | tee -a target/sanitizers/ubsan.log
+          fi
+
+      - name: cargo test under -Zub-checks (always available)
+        shell: bash
+        env:
+          RUSTFLAGS: '-Zub-checks=yes -C debug-assertions=on'
+        run: |
+          set +e
+          cargo +nightly test --workspace \
+            2>&1 | tee target/sanitizers/ub-checks.log
+          rc=${PIPESTATUS[0]}
+          echo "ub-checks exit status: $rc" | tee -a target/sanitizers/ub-checks.log
+
+      - name: Upload UBSan logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-ubsan
+          path: |
+            target/sanitizers/ubsan.log
+            target/sanitizers/ub-checks.log
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------
+  # ThreadSanitizer, scoped to the concurrency-carrying crates.
+  #
+  # NOT the whole workspace, for two reasons:
+  #   * TSan costs 5-15x runtime and ~5-10x memory; a full workspace run does
+  #     not finish inside a hosted runner's limits.
+  #   * TSan cannot see synchronisation it does not understand. This VM's
+  #     stop-the-world protocol, safepoint polls and JIT-emitted barriers are
+  #     partly implemented in generated code and raw atomics-plus-fences, so
+  #     TSan will report false positives on paths whose happens-before edge it
+  #     cannot observe. Restricting to the four crates whose synchronisation IS
+  #     ordinary Rust (locks, atomics, channels) keeps the signal-to-noise
+  #     ratio usable.
+  #
+  # types        interner, lock-order enforcement, metadata/loader pins
+  # classloading loader parent chains and define-class races
+  # gc           collector phase transitions and root scanning
+  # vm           thread state, safepoints, the STW blocking-region protocol
+  # ---------------------------------------------------------------------
+  tsan:
+    name: TSan (types, classloading, gc, vm)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sanitizers
+          save-if: false
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: cargo test under TSan
+        shell: bash
+        env:
+          RUSTFLAGS: '-Zsanitizer=thread -C force-frame-pointers=yes'
+          # `history_size` raised because the VM's stacks are deep (interpreter
+          # dispatch + native shim + runtime helper) and the default ring buffer
+          # loses the other-thread stack that makes a report actionable.
+          TSAN_OPTIONS: 'halt_on_error=0:history_size=7:second_deadlock_stack=1'
+          # Single-threaded test harness: TSan's own shadow-memory bookkeeping
+          # plus N test threads competing for the same runner is how these runs
+          # OOM rather than report.
+          RUST_TEST_THREADS: '1'
+        run: |
+          set +e
+          mkdir -p target/sanitizers
+          cargo +nightly test -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            -p cratonvm-types \
+            -p cratonvm-classloading \
+            -p cratonvm-gc \
+            -p cratonvm-vm \
+            --lib \
+            2>&1 | tee target/sanitizers/tsan.log
+          rc=${PIPESTATUS[0]}
+          echo "tsan exit status: $rc" | tee -a target/sanitizers/tsan.log
+
+      - name: Summarise TSan findings
+        if: always()
+        shell: bash
+        run: |
+          log=target/sanitizers/tsan.log
+          {
+            echo "TSan summary for ${GITHUB_SHA:-unknown}"
+            echo "data race         -> $(grep -c 'WARNING: ThreadSanitizer: data race' "$log" 2>/dev/null || echo 0)"
+            echo "lock-order-inversion -> $(grep -c 'lock-order-inversion' "$log" 2>/dev/null || echo 0)"
+            echo "thread leak       -> $(grep -c 'thread leak' "$log" 2>/dev/null || echo 0)"
+            echo ""
+            echo "Triage note: a report whose two stacks are separated by a"
+            echo "safepoint transition or a JIT-emitted barrier is very likely a"
+            echo "false positive -- TSan cannot see those happens-before edges."
+            echo "Confirm against the lock-order model in types/src/lock_order.rs"
+            echo "before filing."
+          } | tee target/sanitizers/tsan-summary.txt
+
+      - name: Upload TSan logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-tsan
+          path: |
+            target/sanitizers/tsan.log
+            target/sanitizers/tsan-summary.txt
+          if-no-files-found: warn

@@ -1,0 +1,107 @@
+﻿name: Forcing-function nightly smoke (WP8.7)
+
+# WP8.7 — nightly matrix over the S2 forcing-function apps
+# (Keycloak 16/26, EJBCA, Tomcat 10, Jetty 12, Quarkus 3, Spring Boot 3,
+# Maven 3.9, Gradle 8, Kafka 3, Cassandra 5).
+#
+# Each matrix slot:
+#   1. checkout
+#   2. set up JDK 21 + Rust stable (with cache)
+#   3. cargo build --release -p cratonvm-cli
+#   4. bash bench/<app>/stage.sh
+#   5. bash bench/<app>/run-under-cratonvm.sh   (10-minute timeout)
+#   6. bash bench/<app>/diff-baseline.sh
+# Drift against bench/<app>/bench-baseline.json fails the slot.
+#
+# Relationship to ejbca-smoke.yml (WP0.5):
+#   ejbca-smoke.yml stays in place — it is the per-PR fast smoke for the
+#   wildfly/cesecore-common subset and runs on push/PR. forcing-function-
+#   smoke.yml is the broader nightly drift detector for the whole S2 list.
+#   Both consume schema-v1 baselines.
+
+on:
+  schedule:
+    # 06:00 UTC nightly — matches WP8.7 budget (~1h per slot).
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'bench/**'
+      - '.github/workflows/forcing-function-smoke.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  smoke:
+    name: smoke (${{ matrix.app }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - keycloak16
+          - keycloak26
+          - ejbca
+          - tomcat10
+          - jetty12
+          - quarkus3
+          - springboot3
+          - maven
+          - gradle
+          - kafka
+          - cassandra
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: forcing-function-smoke
+
+      - name: Build cratonvm (release)
+        run: cargo build --release -p cratonvm-cli
+
+      - name: Install jq (for diff-baseline.sh robust parsing)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Stage ${{ matrix.app }}
+        run: bash bench/${{ matrix.app }}/stage.sh
+
+      - name: Run ${{ matrix.app }} under cratonvm
+        run: bash bench/${{ matrix.app }}/run-under-cratonvm.sh
+        env:
+          # 10-minute per-app timeout (per WP8.7). Matrix-level timeout-minutes
+          # above gives slack for build + cache.
+          TIMEOUT_SEC: '600'
+
+      - name: Diff against baseline
+        id: diff
+        run: bash bench/${{ matrix.app }}/diff-baseline.sh
+
+      - name: Upload artefacts on drift
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forcing-function-smoke-${{ matrix.app }}
+          path: |
+            bench/${{ matrix.app }}/last-run.stdout.log
+            bench/${{ matrix.app }}/last-run.stderr.log
+            bench/${{ matrix.app }}/last-run.rc
+            bench/${{ matrix.app }}/last-run.meta.json
+            bench/${{ matrix.app }}/staged/compile.log
+          retention-days: 14
+          if-no-files-found: ignore

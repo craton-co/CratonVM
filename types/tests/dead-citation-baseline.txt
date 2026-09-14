@@ -1,0 +1,109 @@
+# Citations to documentation pages that do not exist anywhere under docs/.
+#
+# A RATCHET, not a permission slip: `no_new_citation_names_a_page_that_exists_
+# nowhere` fails on any citation missing from this list, and ALSO fails when a
+# line here has become resolvable. The list can only shrink.
+#
+# To pay one down: write the page it names, repoint the comment at a page that
+# exists, or delete the link — then delete the line.
+#
+# Format: <rust source, workspace-relative> <cited path>
+# Regenerate: CRATONVM_REGEN_DEAD_CITATION_BASELINE=1 cargo test -p cratonvm-types
+#             --test doc_citation_paths   (regenerating always fails; re-run after)
+classloading/src/class_manager.rs docs/architecture/vm-metadata-handles.md
+classloading/src/class_manager.rs docs/jvm-no-synthetic-stubs.md
+gc/src/vm_heap.rs docs/known-issues/tomcat/26-defaultinstancemanager-classunload-offbyone.md
+gc/src/zgc.rs docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md
+jit-api/src/lib.rs docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md
+jit/src/deopt.rs docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md
+jit/src/escape_analysis.rs docs/known-issues/jit/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-20260827.md
+jit/src/lib.rs docs/known-issues/jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md
+jit/src/lib.rs docs/known-issues/jit/arrays-sort-long-osr-miscompile-20260803.md
+jit/src/lib.rs docs/known-issues/jit/scalar-deopt-elision-returns-the-object-in-the-differential-harness-20260827.md
+jit/src/lib.rs docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md
+jit/src/profile.rs docs/lock-order.md
+jit/src/tiered.rs docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md
+jit/src/x64.rs docs/known-issues/jit/deopt-real-off-null-entry-sigsegv-20260803.md
+jit/src/x64/arrays.rs docs/known-issues/jit-bce-multi-array-oob-store-20260711.md
+jit/src/x64/bce.rs docs/known-issues/jit-bce-multi-array-oob-store-20260711.md
+jit/src/x64/bytecode_walk.rs docs/known-issues/netty/httpheader-validationutiltest-exhaustive-loop-timeout-20260816.md
+jit/src/x64/driver.rs docs/known-issues/jit-bce-multi-array-oob-store-20260711.md
+jit/src/x64/osr.rs docs/known-issues/jit/arrays-sort-long-osr-miscompile-20260803.md
+jit/src/x64/tests.rs docs/known-issues/jit-bce-multi-array-oob-store-20260711.md
+native-api/src/registry.rs docs/jdk-only-runtime-services.md
+native-api/src/registry.rs docs/known-issues/jdk-only/L18-function-identity-not-synthetic.md
+native-api/tests/shadowed_registration_detection.rs docs/known-issues/jdk-only/W6-4-duplicate-registration-gate.md
+native-builtins/src/atomic_updater.rs docs/known-issues/jdk-only/APP-READINESS-20260812.md
+native-builtins/src/classloader.rs docs/known-issues/keycloak/test-classserver-invalidpackage-classnotfound-not-thrown.md
+native-builtins/src/classloader_real.rs docs/known-issues/keycloak/test-classserver-invalidpackage-classnotfound-not-thrown.md
+native-builtins/src/generics.rs docs/known-issues/springboot/embedded-tomcat-loopback-self-connect-silent-hang-20260719.md
+native-builtins/src/infinispan_local.rs docs/known-issues/keycloak-model-netty-reflective-setaccessible-disabled.md
+native-builtins/src/infinispan_local.rs docs/known-issues/springboot/cacheautoconfigurationtests-infinispan-null-cachemanager-residual.md
+native-builtins/src/jmx.rs docs/jvm-no-synthetic-stubs.md
+native-builtins/src/keystore.rs docs/known-issues/http-server-cluster-residuals.md
+native-builtins/src/keystore.rs docs/known-issues/vm/pkcs12-setentry-secretkeyentry-is-a-silent-noop-20260805.md
+native-builtins/src/lang_class.rs docs/known-issues/springboot/netty-compositebytebuf-clinit-reads-unpooled-empty-buffer-null-20260731.md
+native-builtins/src/lang_math.rs docs/known-issues/h2/bug-h2-testgetgeneratedkeys-corrupt-value-cell-hib-cv-32-family.md
+native-builtins/src/lang_reflect.rs docs/known-issues/jdk-only/L1-reflect-setaccessible-invoke.md
+native-builtins/src/lang_string.rs docs/known-issues/jdk-only/W2-7-fabricated-success-where-the-spec-mandates-failure.md
+native-builtins/src/lang_string.rs docs/known-issues/jdk-only/W7-32-round-2-differential-run.md
+native-builtins/src/lang_string.rs docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md
+native-builtins/src/lib.rs docs/known-issues/http-server-cluster-residuals.md
+native-builtins/src/lib.rs docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md
+native-builtins/src/lib.rs docs/known-issues/netty/pcap-write-handler-three-residuals-20260812.md
+native-builtins/src/net_phase_e.rs docs/known-issues/jdk-only/the-abstract-httpserver-instance-20260902.md
+native-builtins/src/net_phase_e.rs docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md
+native-builtins/src/phases_early.rs docs/known-issues/gc/unpinned-native-locals-candidate-audit-20260824.md
+native-builtins/src/phases_early.rs docs/known-issues/http-server-cluster-residuals.md
+native-builtins/src/phases_late.rs docs/known-issues/jdk-only/W5-2-two-silently-skipped-process-checks.md
+native-builtins/src/phases_late/concurrent.rs docs/known-issues/jdk-only/W7-11-strict-baseline-remeasured.md
+native-builtins/src/phases_late/nio_file.rs docs/known-issues/h2-suite-bugs/bug-h2-files-setposixfilepermissions-unsupported.md
+native-builtins/src/phases_late/nio_file.rs docs/known-issues/h2/bug-filechannel-map-anon-memory-growth.md
+native-builtins/src/phases_late/nio_file.rs docs/known-issues/springboot/files-createsymboliclink-unsupported-20260731.md
+native-builtins/src/phases_late/reflect_invoke.rs docs/known-issues/jdk-only/W6-1-varhandle-vartype-coordinatetypes.md
+native-builtins/src/shared_secrets_bridge.rs docs/known-issues/keycloak-arquillian-system1-defineclass-nosuchmethod.md
+native-builtins/src/shared_secrets_bridge.rs docs/known-issues/keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md
+native-builtins/src/stack_walker.rs docs/known-issues/netty/investigate-batch-12.md
+native-builtins/src/system_bootstrap.rs docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md
+native-builtins/src/t27_tls.rs docs/known-issues/netty/ec-pkcs8-v1-server-identity-rejected-20260812.md
+native-builtins/src/tzdb.rs docs/known-issues/jdk-only/W7-92-system-timezone-answers-utc.md
+native-builtins/tests/duplicate_registration_gate.rs docs/known-issues/jdk-only/W6-4-duplicate-registration-gate.md
+native-collections/src/lib.rs docs/known-issues/jdk-only/G8-1-...md
+native-collections/src/lib.rs docs/known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md
+native-collections/src/lib.rs docs/known-issues/keycloak-16-stream-onclose-and-laziness.md
+native-io/src/lib.rs docs/known-issues/filewriter-newbufferedwriter-synthetic-data-loss.md
+native-io/src/net.rs docs/known-issues/springboot/serversocketchannel-binds-loopback-for-the-wildcard-and-drops-so-reuseaddr-20260810.md
+native-io/src/process.rs docs/known-issues/jdk-only/W3-6-processimpl-missing-natives.md
+native-io/src/process.rs docs/known-issues/jdk-only/W5-2-two-silently-skipped-process-checks.md
+reader/src/class_file_version.rs docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md
+reader/src/class_reader_error.rs docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md
+types/src/error.rs docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md
+types/src/flag_groups.rs docs/known-issues/jit/math-floormod-long-int-returns-minus-one-20260805.md
+types/src/flag_groups.rs docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md
+types/src/lock_order.rs docs/lock-order.md
+vm-cli/src/main.rs docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md
+vm-cli/src/main.rs docs/known-issues/jit/math-floormod-long-int-returns-minus-one-20260805.md
+vm-cli/src/main.rs docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md
+vm/src/config.rs docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md
+vm/src/jit/conservative_roots.rs docs/known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md
+vm/src/jit/helpers.rs docs/known-issues/hibernate/hib-reactive-3gc-run-regressions-20260820.md
+vm/src/jit/helpers.rs docs/known-issues/jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md
+vm/src/jit/helpers.rs docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md
+vm/src/runtime/interpreter.rs docs/bc-jit-ban-investigation.md
+vm/src/runtime/interpreter.rs docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md
+vm/src/runtime/interpreter.rs docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md
+vm/src/runtime/interpreter/deopt_resume.rs docs/feature-designs/deopt-osr-steps789-handoff.md
+vm/src/runtime/interpreter/jit_bridge.rs docs/known-issues/hibernate/hib-reactive-3gc-run-regressions-20260820.md
+vm/src/runtime/interpreter/jit_bridge.rs docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md
+vm/src/runtime/interpreter/jit_bridge.rs docs/known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md
+vm/src/runtime/interpreter/native_override.rs docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md
+vm/src/runtime/interpreter/tests.rs docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md
+vm/src/runtime/offload.rs docs/known-issues/gpu/submission-registry-has-no-drain-20260902.md
+vm/src/vm/vm_exec.rs docs/jdk-only-runtime-services.md
+vm/src/vm/vm_exec.rs docs/known-issues/springboot/g1-fullsuite-regression-20260808.md
+vm/src/vm/vm_exec.rs docs/known-issues/vm/compact-layout-registry-is-process-global-20260805.md
+vm/src/vm/vm_init.rs docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md
+vm/src/vm/vm_init.rs docs/lock-order.md
+vm/src/vm/vm_util.rs docs/known-issues/springboot/netty-compositebytebuf-clinit-reads-unpooled-empty-buffer-null-20260731.md
+vm/tests/no_test_only_public_api.rs docs/known-issues/gpu/submission-registry-has-no-drain-20260902.md
+vm/tests/tier1_tests.rs docs/stub-census.md

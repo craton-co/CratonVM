@@ -1,0 +1,41 @@
+# regression-suite/known-flaky.txt — vectors MEASURED to be non-deterministic.
+#
+# WHAT THIS IS FOR, AND THE ONE THING IT MUST NOT BECOME
+#
+# An instrument that baselines a SET of failing vectors (today:
+# scripts/jdk-only-blast-radius.sh) is one flaky vector away from being
+# ignored. A vector that fails 25% of the time moves a set-keyed cell roughly
+# three runs in eight by chance alone, so the gate reports REGRESSION and
+# REPAIRED on work nobody did, and people learn to scroll past it. `G89-1` is
+# the standing instance: a ratchet red in blocking CI for five days that
+# "adjudicated nothing".
+#
+# So this file exists to let a gate say "I know about this one" instead of
+# crying wolf. **It is NOT a way to make a failure go away.** Three rules keep
+# it from becoming one:
+#
+#   1. **A row needs a MEASURED rate, not an impression.** "It's flaky" is how
+#      a real regression gets filed here and forgotten. Run the vector alone,
+#      N times, on one binary, and write down the fraction:
+#         ONLY=<Vector> CV=... JDK=... bash regression-suite/run.sh
+#   2. **A row needs a RECORD.** Somewhere a human can read what was measured
+#      and what is still unknown. A rate with no record is an anonymous excuse.
+#   3. **A consumer must PRINT what it quarantined, never silently drop it**,
+#      and must shout if a quarantined vector stops being flaky — a vector
+#      that now fails in EVERY arm is not flaky any more, and quarantine has
+#      turned into a blindfold. The sweep implements both.
+#
+# This file does NOT change regression-suite/run.sh's own pass/fail counting.
+# Every published denominator stays exactly what it was; only instruments that
+# opt in read this list. Moving the suite's headline numbers to accommodate a
+# flake is the cure being worse than the disease.
+#
+# FORMAT — one row per vector, whitespace separated:
+#   <vector>  <observed-rate>  <date>  <record>
+#
+# (No rows. `RTreeRangeGc` was quarantined here at 3/12 on 2026-08-22 and
+#  removed the same day: its three defects are fixed and it passes 25/25 on the
+#  default collector and 25/25 under --jdk-only on one binary. Removing a row
+#  cannot move the blast-radius baseline, which is keyed on the SET of FAILING
+#  vectors per prefix -- a vector that passes contributes to no set either way.
+#  See WORKER-1-NOTE-1's RESOLVED section.)

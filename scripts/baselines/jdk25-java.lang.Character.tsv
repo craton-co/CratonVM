@@ -1,0 +1,204 @@
+# jdk-baseline	2
+# kind	class
+# name	java.lang.Character
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/lang/Character.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	96
+# protected-methods	0
+# declared-methods	104
+# declared-fields	74
+# rows	188
+# columns	kind	name	descriptor	flags
+CLASS	java.lang.Character		public,final
+EXTENDS	java.lang.Object		
+IMPLEMENTS	java.io.Serializable		
+IMPLEMENTS	java.lang.Comparable		
+IMPLEMENTS	java.lang.constant.Constable		
+SUPERTYPE	java.io.Serializable		
+SUPERTYPE	java.lang.Comparable		
+SUPERTYPE	java.lang.Object		
+SUPERTYPE	java.lang.constant.Constable		
+METHOD	<clinit>	()V	static
+METHOD	<init>	(C)V	public
+METHOD	charCount	(I)I	public,static
+METHOD	charValue	()C	public
+METHOD	codePointAt	(Ljava/lang/CharSequence;I)I	public,static
+METHOD	codePointAt	([CI)I	public,static
+METHOD	codePointAt	([CII)I	public,static
+METHOD	codePointAtImpl	([CII)I	static
+METHOD	codePointBefore	(Ljava/lang/CharSequence;I)I	public,static
+METHOD	codePointBefore	([CI)I	public,static
+METHOD	codePointBefore	([CII)I	public,static
+METHOD	codePointBeforeImpl	([CII)I	static
+METHOD	codePointCount	(Ljava/lang/CharSequence;II)I	public,static
+METHOD	codePointCount	([CII)I	public,static
+METHOD	codePointCountImpl	([CII)I	static
+METHOD	codePointOf	(Ljava/lang/String;)I	public,static
+METHOD	compare	(CC)I	public,static
+METHOD	compareTo	(Ljava/lang/Character;)I	public
+METHOD	compareTo	(Ljava/lang/Object;)I	public,bridge,synthetic
+METHOD	describeConstable	()Ljava/util/Optional;	public
+METHOD	digit	(CI)I	public,static
+METHOD	digit	(II)I	public,static
+METHOD	equals	(Ljava/lang/Object;)Z	public
+METHOD	forDigit	(II)C	public,static
+METHOD	getDirectionality	(C)B	public,static
+METHOD	getDirectionality	(I)B	public,static
+METHOD	getName	(I)Ljava/lang/String;	public,static
+METHOD	getNumericValue	(C)I	public,static
+METHOD	getNumericValue	(I)I	public,static
+METHOD	getType	(C)I	public,static
+METHOD	getType	(I)I	public,static
+METHOD	hashCode	()I	public
+METHOD	hashCode	(C)I	public,static
+METHOD	highSurrogate	(I)C	public,static
+METHOD	isAlphabetic	(I)Z	public,static
+METHOD	isBmpCodePoint	(I)Z	public,static
+METHOD	isDefined	(C)Z	public,static
+METHOD	isDefined	(I)Z	public,static
+METHOD	isDigit	(C)Z	public,static
+METHOD	isDigit	(I)Z	public,static
+METHOD	isEmoji	(I)Z	public,static
+METHOD	isEmojiComponent	(I)Z	public,static
+METHOD	isEmojiModifier	(I)Z	public,static
+METHOD	isEmojiModifierBase	(I)Z	public,static
+METHOD	isEmojiPresentation	(I)Z	public,static
+METHOD	isExtendedPictographic	(I)Z	public,static
+METHOD	isHighSurrogate	(C)Z	public,static
+METHOD	isISOControl	(C)Z	public,static
+METHOD	isISOControl	(I)Z	public,static
+METHOD	isIdentifierIgnorable	(C)Z	public,static
+METHOD	isIdentifierIgnorable	(I)Z	public,static
+METHOD	isIdeographic	(I)Z	public,static
+METHOD	isJavaIdentifierPart	(C)Z	public,static
+METHOD	isJavaIdentifierPart	(I)Z	public,static
+METHOD	isJavaIdentifierStart	(C)Z	public,static
+METHOD	isJavaIdentifierStart	(I)Z	public,static
+METHOD	isJavaLetter	(C)Z	public,static
+METHOD	isJavaLetterOrDigit	(C)Z	public,static
+METHOD	isLetter	(C)Z	public,static
+METHOD	isLetter	(I)Z	public,static
+METHOD	isLetterOrDigit	(C)Z	public,static
+METHOD	isLetterOrDigit	(I)Z	public,static
+METHOD	isLowSurrogate	(C)Z	public,static
+METHOD	isLowerCase	(C)Z	public,static
+METHOD	isLowerCase	(I)Z	public,static
+METHOD	isMirrored	(C)Z	public,static
+METHOD	isMirrored	(I)Z	public,static
+METHOD	isSpace	(C)Z	public,static
+METHOD	isSpaceChar	(C)Z	public,static
+METHOD	isSpaceChar	(I)Z	public,static
+METHOD	isSupplementaryCodePoint	(I)Z	public,static
+METHOD	isSurrogate	(C)Z	public,static
+METHOD	isSurrogatePair	(CC)Z	public,static
+METHOD	isTitleCase	(C)Z	public,static
+METHOD	isTitleCase	(I)Z	public,static
+METHOD	isUnicodeIdentifierPart	(C)Z	public,static
+METHOD	isUnicodeIdentifierPart	(I)Z	public,static
+METHOD	isUnicodeIdentifierStart	(C)Z	public,static
+METHOD	isUnicodeIdentifierStart	(I)Z	public,static
+METHOD	isUpperCase	(C)Z	public,static
+METHOD	isUpperCase	(I)Z	public,static
+METHOD	isValidCodePoint	(I)Z	public,static
+METHOD	isWhitespace	(C)Z	public,static
+METHOD	isWhitespace	(I)Z	public,static
+METHOD	lowSurrogate	(I)C	public,static
+METHOD	offsetByCodePoints	(Ljava/lang/CharSequence;II)I	public,static
+METHOD	offsetByCodePoints	([CIIII)I	public,static
+METHOD	offsetByCodePointsImpl	([CIIII)I	static
+METHOD	reverseBytes	(C)C	public,static
+METHOD	toChars	(I)[C	public,static
+METHOD	toChars	(I[CI)I	public,static
+METHOD	toCodePoint	(CC)I	public,static
+METHOD	toLowerCase	(C)C	public,static
+METHOD	toLowerCase	(I)I	public,static
+METHOD	toString	()Ljava/lang/String;	public
+METHOD	toString	(C)Ljava/lang/String;	public,static
+METHOD	toString	(I)Ljava/lang/String;	public,static
+METHOD	toSurrogates	(I[CI)V	static
+METHOD	toTitleCase	(C)C	public,static
+METHOD	toTitleCase	(I)I	public,static
+METHOD	toUpperCase	(C)C	public,static
+METHOD	toUpperCase	(I)I	public,static
+METHOD	toUpperCaseCharArray	(I)[C	static
+METHOD	toUpperCaseEx	(I)I	static
+METHOD	valueOf	(C)Ljava/lang/Character;	public,static
+FIELD	$assertionsDisabled	Z	static,final,synthetic
+FIELD	BYTES	I	public,static,final
+FIELD	COMBINING_SPACING_MARK	B	public,static,final
+FIELD	CONNECTOR_PUNCTUATION	B	public,static,final
+FIELD	CONTROL	B	public,static,final
+FIELD	CURRENCY_SYMBOL	B	public,static,final
+FIELD	DASH_PUNCTUATION	B	public,static,final
+FIELD	DECIMAL_DIGIT_NUMBER	B	public,static,final
+FIELD	DIRECTIONALITY_ARABIC_NUMBER	B	public,static,final
+FIELD	DIRECTIONALITY_BOUNDARY_NEUTRAL	B	public,static,final
+FIELD	DIRECTIONALITY_COMMON_NUMBER_SEPARATOR	B	public,static,final
+FIELD	DIRECTIONALITY_EUROPEAN_NUMBER	B	public,static,final
+FIELD	DIRECTIONALITY_EUROPEAN_NUMBER_SEPARATOR	B	public,static,final
+FIELD	DIRECTIONALITY_EUROPEAN_NUMBER_TERMINATOR	B	public,static,final
+FIELD	DIRECTIONALITY_FIRST_STRONG_ISOLATE	B	public,static,final
+FIELD	DIRECTIONALITY_LEFT_TO_RIGHT	B	public,static,final
+FIELD	DIRECTIONALITY_LEFT_TO_RIGHT_EMBEDDING	B	public,static,final
+FIELD	DIRECTIONALITY_LEFT_TO_RIGHT_ISOLATE	B	public,static,final
+FIELD	DIRECTIONALITY_LEFT_TO_RIGHT_OVERRIDE	B	public,static,final
+FIELD	DIRECTIONALITY_NONSPACING_MARK	B	public,static,final
+FIELD	DIRECTIONALITY_OTHER_NEUTRALS	B	public,static,final
+FIELD	DIRECTIONALITY_PARAGRAPH_SEPARATOR	B	public,static,final
+FIELD	DIRECTIONALITY_POP_DIRECTIONAL_FORMAT	B	public,static,final
+FIELD	DIRECTIONALITY_POP_DIRECTIONAL_ISOLATE	B	public,static,final
+FIELD	DIRECTIONALITY_RIGHT_TO_LEFT	B	public,static,final
+FIELD	DIRECTIONALITY_RIGHT_TO_LEFT_ARABIC	B	public,static,final
+FIELD	DIRECTIONALITY_RIGHT_TO_LEFT_EMBEDDING	B	public,static,final
+FIELD	DIRECTIONALITY_RIGHT_TO_LEFT_ISOLATE	B	public,static,final
+FIELD	DIRECTIONALITY_RIGHT_TO_LEFT_OVERRIDE	B	public,static,final
+FIELD	DIRECTIONALITY_SEGMENT_SEPARATOR	B	public,static,final
+FIELD	DIRECTIONALITY_UNDEFINED	B	public,static,final
+FIELD	DIRECTIONALITY_WHITESPACE	B	public,static,final
+FIELD	ENCLOSING_MARK	B	public,static,final
+FIELD	END_PUNCTUATION	B	public,static,final
+FIELD	ERROR	I	static,final
+FIELD	FINAL_QUOTE_PUNCTUATION	B	public,static,final
+FIELD	FORMAT	B	public,static,final
+FIELD	INITIAL_QUOTE_PUNCTUATION	B	public,static,final
+FIELD	LETTER_NUMBER	B	public,static,final
+FIELD	LINE_SEPARATOR	B	public,static,final
+FIELD	LOWERCASE_LETTER	B	public,static,final
+FIELD	MATH_SYMBOL	B	public,static,final
+FIELD	MAX_CODE_POINT	I	public,static,final
+FIELD	MAX_HIGH_SURROGATE	C	public,static,final
+FIELD	MAX_LOW_SURROGATE	C	public,static,final
+FIELD	MAX_RADIX	I	public,static,final
+FIELD	MAX_SURROGATE	C	public,static,final
+FIELD	MAX_VALUE	C	public,static,final
+FIELD	MIN_CODE_POINT	I	public,static,final
+FIELD	MIN_HIGH_SURROGATE	C	public,static,final
+FIELD	MIN_LOW_SURROGATE	C	public,static,final
+FIELD	MIN_RADIX	I	public,static,final
+FIELD	MIN_SUPPLEMENTARY_CODE_POINT	I	public,static,final
+FIELD	MIN_SURROGATE	C	public,static,final
+FIELD	MIN_VALUE	C	public,static,final
+FIELD	MODIFIER_LETTER	B	public,static,final
+FIELD	MODIFIER_SYMBOL	B	public,static,final
+FIELD	NON_SPACING_MARK	B	public,static,final
+FIELD	OTHER_LETTER	B	public,static,final
+FIELD	OTHER_NUMBER	B	public,static,final
+FIELD	OTHER_PUNCTUATION	B	public,static,final
+FIELD	OTHER_SYMBOL	B	public,static,final
+FIELD	PARAGRAPH_SEPARATOR	B	public,static,final
+FIELD	PRIVATE_USE	B	public,static,final
+FIELD	SIZE	I	public,static,final
+FIELD	SPACE_SEPARATOR	B	public,static,final
+FIELD	START_PUNCTUATION	B	public,static,final
+FIELD	SURROGATE	B	public,static,final
+FIELD	TITLECASE_LETTER	B	public,static,final
+FIELD	TYPE	Ljava/lang/Class;	public,static,final
+FIELD	UNASSIGNED	B	public,static,final
+FIELD	UPPERCASE_LETTER	B	public,static,final
+FIELD	serialVersionUID	J	private,static,final
+FIELD	value	C	private,final

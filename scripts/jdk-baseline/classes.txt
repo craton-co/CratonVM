@@ -1,0 +1,75 @@
+# The population of scripts/baselines/jdk25-*.tsv.
+#
+# One entry per line. A bare fully-qualified BINARY name (nested classes use
+# `$`) is a class; `module <name>` is a module descriptor. `#` comments and
+# blank lines are ignored. Order here does not matter — the generator sorts.
+#
+# Every entry below is here because a guard in this tree asserts something about
+# that class against a population it transcribed from its own registrar. The
+# trailing comment is the sweep row from
+# docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md that
+# needs it, and the denominator that sweep measured. Adding a class here without
+# naming the guard it serves grows the baseline set without closing anything.
+
+# --- E25 sweep rows with a measured external denominator -------------------
+javax.net.ssl.SSLParameters                      # row 2   — 13 of 31 (tls.rs:4485)
+java.security.KeyStore                           # row 10  — ~13 of 30 (tls.rs:4518)
+java.lang.management.RuntimeMXBean               # row 7   — 13 of 17 (jmx.rs:7010)
+java.lang.management.ManagementFactory           # row 8   — 7 of 25 (jmx.rs:7601)
+jdk.internal.access.SharedSecrets                # rows 4-6 — 15 of 30 getJava*Access
+java.util.concurrent.SubmissionPublisher         # row 20  — 4 of 11 (phases_late.rs:8989)
+java.util.concurrent.SynchronousQueue            # row 21  — 5 of 17 (phases_late.rs:9304)
+jdk.internal.reflect.ReflectionFactory           # row 22  — 4 of 18 (lib.rs:4957)
+jdk.internal.misc.CDS                            # row 3   — hand list of 22 (cds.rs:1321)
+java.math.BigInteger                             # row 19  — 5 intrinsics (biginteger_intrinsics.rs:1024)
+java.util.concurrent.StructuredTaskScope         # row 16  — JEP 505 (jdk25_concurrency.rs:5113)
+java.util.concurrent.StructuredTaskScope$Joiner  # row 16  — "Joiner: 7"
+java.util.concurrent.StructuredTaskScope$Subtask # row 16  — CLS_SUBTASK
+# NOT `StructuredTaskScope$Config`. `s52_total_registration_count`'s own comment
+# says "Config: 6" and `CLS_CONFIG` spells `$Config`, but no JDK ever shipped
+# that name -- the generator refused it with "NOT IN THE RUNTIME IMAGE", which
+# is the first automated confirmation of what
+# docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md recorded by
+# hand. The real nested type is `$Configuration`, below.
+java.util.concurrent.StructuredTaskScope$Configuration
+module java.base                                 # row 13  — JAVA_BASE_EXPORTS 14 vs 58
+
+# --- classes this lane was asked to baseline outright ----------------------
+javax.crypto.Mac                                 # E25 §1 — the seventeenth method
+java.lang.Character                              # E17-1 — "the fifteen unregistered"
+java.util.Base64                                 # E14-1 / E5-1 — the fabricated receiver
+java.util.Base64$Encoder
+java.util.Base64$Decoder
+java.lang.ModuleLayer                            # E16-R11 — the p59 ModuleLayer twin
+java.lang.Module                                 # E4-R11 — boot-layer fix
+java.lang.module.ModuleDescriptor
+javax.net.ssl.SSLSession                         # E12-1 / E22-1 — the null session
+javax.net.ssl.SSLSocket
+
+# --- the second class each of rows 3 and 22 registers on (E41) -------------
+# E37 §7.1 called row 3 "half convertible" because only one of the two classes
+# `register_cds_natives` targets was baselined, and row 22 asserts two triples
+# on `sun/reflect/ReflectionFactory` as well as two on the `jdk.internal`
+# twin. Both of these ARE in the JDK 25 image, so both are one line each.
+#
+# `sun.management.CDSMetrics` is deliberately NOT here and never will be: the
+# jrt walk in E41 §3 reports it NOT IN IMAGE on openjdk 25.0.3+9, exactly as
+# the generator reported `StructuredTaskScope$Config`. `register_cds_natives`
+# makes six registrations on it plus a seventh returning it from
+# `ManagementFactoryHelper.getCDSMetrics()`, a method the real
+# `ManagementFactoryHelper` (baselined below) does not declare. A class the
+# generator refuses to write is a class no guard can be converted against, and
+# that refusal IS the finding.
+sun.reflect.ReflectionFactory                    # row 22  — the jdk.unsupported twin (lib.rs:4957)
+sun.management.ManagementFactoryHelper           # row 3   — the getCDSMetrics() owner (cds.rs:1321)
+
+# --- supertypes that carry the members the guards above look for -----------
+# `javap -public` never lists an inherited member, so a guard reading only the
+# leaf baseline reads an inherited method as absent. These four are the direct
+# supertypes whose members the SynchronousQueue / SSLSocket / SubmissionPublisher
+# guards actually reach. The SUPERTYPE rows in each leaf baseline name the rest.
+java.util.AbstractQueue
+java.util.AbstractCollection
+java.util.concurrent.BlockingQueue
+java.net.Socket
+java.util.concurrent.Flow$Publisher

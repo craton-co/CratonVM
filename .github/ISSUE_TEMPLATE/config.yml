@@ -1,0 +1,30 @@
+# Issue-template configuration for the craton-co/cratonvm repository.
+#
+# Disabling blank issues forces contributors through one of the structured
+# templates in this directory (bug_report.md, feature_request.md, and the
+# jdk-only.yml issue form), which keeps triage costs down. Contact links
+# surface non-issue channels — security reports must go through SECURITY.md,
+# not the public tracker.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security Vulnerability Report
+    url: https://github.com/craton-co/cratonvm/security/advisories/new
+    about: >-
+      Please do NOT file security issues in the public tracker. Use GitHub
+      Security Advisories for private disclosure. See SECURITY.md for the
+      full disclosure policy.
+  - name: Security Policy (SECURITY.md)
+    url: https://github.com/craton-co/cratonvm/blob/main/SECURITY.md
+    about: >-
+      Read the project security policy, hardening guidance, and supported
+      versions before reporting a vulnerability.
+  - name: Question or Discussion
+    url: https://github.com/craton-co/cratonvm/discussions
+    about: >-
+      For usage questions, design discussion, and "how do I…?" please use
+      GitHub Discussions instead of opening an issue.
+  - name: Commercial Support
+    url: https://github.com/craton-co/cratonvm/blob/main/SUPPORT.md
+    about: >-
+      For paid support, prioritized fixes, or consulting, see SUPPORT.md.

@@ -1,0 +1,234 @@
+# class	method	descriptor	kind	registered_by	gated_because
+com/sun/jmx/mbeanserver/MappedMXBeanType	getMappedMXBeanType	(Ljava/lang/reflect/Type;)Lcom/sun/jmx/mbeanserver/MappedMXBeanType;	synthetic-stub	native-builtins/src/jmx_openmbean.rs:1372	kind=synthetic-stub
+com/sun/jmx/mbeanserver/OpenConverter	toConverter	(Ljava/lang/reflect/Type;)Lcom/sun/jmx/mbeanserver/OpenConverter;	synthetic-stub	native-builtins/src/jmx_openmbean.rs:1361	kind=synthetic-stub
+com/sun/net/httpserver/HttpExchange$ResponseBody	close	()V	synthetic-stub	native-builtins/src/net_phase_e.rs:16914	kind=synthetic-stub
+com/sun/net/httpserver/HttpExchange$ResponseBody	flush	()V	synthetic-stub	native-builtins/src/net_phase_e.rs:16913	kind=synthetic-stub
+com/sun/net/httpserver/HttpExchange$ResponseBody	write	(I)V	synthetic-stub	native-builtins/src/net_phase_e.rs:16883	kind=synthetic-stub
+com/sun/net/httpserver/HttpExchange$ResponseBody	write	([B)V	synthetic-stub	native-builtins/src/net_phase_e.rs:16858	kind=synthetic-stub
+com/sun/net/httpserver/HttpExchange$ResponseBody	write	([BII)V	synthetic-stub	native-builtins/src/net_phase_e.rs:16825	kind=synthetic-stub
+java/lang/Compiler	command	(Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/deprecated_lang.rs:441	kind=synthetic-stub
+java/lang/Compiler	compileClass	(Ljava/lang/Class;)Z	synthetic-stub	native-builtins/src/deprecated_lang.rs:427	kind=synthetic-stub
+java/lang/Compiler	compileClasses	(Ljava/lang/String;)Z	synthetic-stub	native-builtins/src/deprecated_lang.rs:433	kind=synthetic-stub
+java/lang/Compiler	disable	()V	synthetic-stub	native-builtins/src/deprecated_lang.rs:440	kind=synthetic-stub
+java/lang/Compiler	enable	()V	synthetic-stub	native-builtins/src/deprecated_lang.rs:439	kind=synthetic-stub
+java/lang/Object	accumulator	()Ljava/util/function/BiConsumer;	bridge	native-collections/src/lib.rs:21373	pinned by a contract test
+java/lang/Object	combiner	()Ljava/util/function/BinaryOperator;	bridge	native-collections/src/lib.rs:21385	pinned by a contract test
+java/lang/Object	finisher	()Ljava/util/function/Function;	bridge	native-collections/src/lib.rs:21379	pinned by a contract test
+java/lang/Object	registerNatives	()V	bridge	native-builtins/src/lib.rs:9956	pinned by a contract test
+java/lang/Object	supplier	()Ljava/util/function/Supplier;	bridge	native-collections/src/lib.rs:21367	pinned by a contract test
+java/lang/StackStreamFactory$AbstractStackWalker	callStackWalk	(JIII[Ljava/lang/Object;[Ljava/lang/Class;)Ljava/lang/Object;	bridge	native-builtins/src/lang_stackwalker.rs:666	pinned by a contract test
+java/lang/StackTraceElement	initStackTraceElements	([Ljava/lang/StackTraceElement;Ljava/lang/Throwable;)V	bridge	native-builtins/src/lib.rs:16810	pinned by a contract test
+java/lang/System	runFinalizersOnExit	(Z)V	bridge	native-builtins/src/deprecated_lang.rs:407	pinned by a contract test
+java/lang/System$1	isCarrierThreadLocalPresent	(Ljdk/internal/misc/CarrierThreadLocal;)Z	bridge	native-builtins/src/shared_secrets_bridge.rs:1313	pinned by a contract test
+java/lang/Thread	destroy	()V	bridge	native-builtins/src/deprecated_lang.rs:382	pinned by a contract test
+java/lang/Thread	resume0	()V	bridge	native-builtins/src/deprecated_lang.rs:379	pinned by a contract test
+java/lang/Thread	stop0	(Ljava/lang/Object;)V	bridge	native-builtins/src/lib.rs:13654	pinned by a contract test
+java/lang/Thread	stop0	(Ljava/lang/Object;)V	bridge	native-builtins/src/deprecated_lang.rs:369	pinned by a contract test
+java/lang/Thread	suspend0	()V	bridge	native-builtins/src/deprecated_lang.rs:378	pinned by a contract test
+java/lang/foreign/DowncallHandle	invoke	([Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/phases_late/foreign_ffm.rs:2883	kind=synthetic-stub
+java/lang/foreign/DowncallHandle	invokeBasic	([Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/phases_late/foreign_ffm.rs:2895	kind=synthetic-stub
+java/lang/foreign/DowncallHandle	invokeExact	([Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/phases_late/foreign_ffm.rs:2889	kind=synthetic-stub
+java/lang/foreign/DowncallHandle	type	()Ljava/lang/invoke/MethodType;	synthetic-stub	native-builtins/src/phases_late/foreign_ffm.rs:2901	kind=synthetic-stub
+java/lang/invoke/MethodHandleImpl$1	makeClassValueMap	()Ljava/util/Map;	bridge	native-builtins/src/shared_secrets_bridge.rs:1625	pinned by a contract test
+java/lang/reflect/Proxy$Dispatch	invokeProxy	(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;	bridge	native-builtins/src/reflect_annotations.rs:2838	pinned by a contract test
+java/lang/reflect/Proxy$Instance	<init>	(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V	bridge	native-builtins/src/reflect_annotations.rs:2824	class in no supported image
+java/lang/reflect/Proxy$Instance	getProxyInterfacesNative	()[Ljava/lang/Class;	bridge	native-builtins/src/reflect_annotations.rs:2806	pinned by a contract test
+java/net/InetAddress$1	getHostFromNameService	(Ljava/net/InetAddress;Z)Ljava/lang/String;	bridge	native-builtins/src/shared_secrets_bridge.rs:2013	pinned by a contract test
+java/net/InetAddressImplFactory	isIPv4Available	()Z	synthetic-stub	native-builtins/src/inet_address.rs:654	kind=synthetic-stub
+java/net/InetAddressImplFactory	isIPv6Supported	()Z	synthetic-stub	native-builtins/src/inet_address.rs:648	kind=synthetic-stub
+java/net/PlainServerSocketImpl	init	()V	synthetic-stub	native-builtins/src/plain_socket.rs:998	kind=synthetic-stub
+java/net/PlainServerSocketImpl	initProto	()V	synthetic-stub	native-builtins/src/plain_socket.rs:997	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketAccept	(Ljava/net/SocketImpl;)V	synthetic-stub	native-builtins/src/plain_socket.rs:923	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketAvailable	()I	synthetic-stub	native-builtins/src/plain_socket.rs:990	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketBind	(Ljava/net/InetAddress;I)V	synthetic-stub	native-builtins/src/plain_socket.rs:919	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketClose0	()V	synthetic-stub	native-builtins/src/plain_socket.rs:931	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketClose0	(Z)V	synthetic-stub	native-builtins/src/plain_socket.rs:930	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketConnect	(Ljava/net/InetAddress;II)V	synthetic-stub	native-builtins/src/plain_socket.rs:912	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketCreate	(Z)V	synthetic-stub	native-builtins/src/plain_socket.rs:907	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketCreate	(ZZ)V	synthetic-stub	native-builtins/src/plain_socket.rs:910	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketGetOption	(I)I	synthetic-stub	native-builtins/src/plain_socket.rs:969	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketGetOption	(ILjava/lang/Object;)I	synthetic-stub	native-builtins/src/plain_socket.rs:970	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketListen	(I)V	synthetic-stub	native-builtins/src/plain_socket.rs:921	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketSendUrgentData	(I)V	synthetic-stub	native-builtins/src/plain_socket.rs:992	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketSetOption	(ILjava/lang/Object;)V	synthetic-stub	native-builtins/src/plain_socket.rs:962	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketSetOption	(IZLjava/lang/Object;)V	synthetic-stub	native-builtins/src/plain_socket.rs:935	kind=synthetic-stub
+java/net/PlainServerSocketImpl	socketShutdown	(I)V	synthetic-stub	native-builtins/src/plain_socket.rs:933	kind=synthetic-stub
+java/net/PlainSocketImpl	init	()V	synthetic-stub	native-builtins/src/plain_socket.rs:998	kind=synthetic-stub
+java/net/PlainSocketImpl	initProto	()V	synthetic-stub	native-builtins/src/plain_socket.rs:997	kind=synthetic-stub
+java/net/PlainSocketImpl	socketAccept	(Ljava/net/SocketImpl;)V	synthetic-stub	native-builtins/src/plain_socket.rs:923	kind=synthetic-stub
+java/net/PlainSocketImpl	socketAvailable	()I	synthetic-stub	native-builtins/src/plain_socket.rs:990	kind=synthetic-stub
+java/net/PlainSocketImpl	socketBind	(Ljava/net/InetAddress;I)V	synthetic-stub	native-builtins/src/plain_socket.rs:919	kind=synthetic-stub
+java/net/PlainSocketImpl	socketClose0	()V	synthetic-stub	native-builtins/src/plain_socket.rs:931	kind=synthetic-stub
+java/net/PlainSocketImpl	socketClose0	(Z)V	synthetic-stub	native-builtins/src/plain_socket.rs:930	kind=synthetic-stub
+java/net/PlainSocketImpl	socketConnect	(Ljava/net/InetAddress;II)V	synthetic-stub	native-builtins/src/plain_socket.rs:912	kind=synthetic-stub
+java/net/PlainSocketImpl	socketCreate	(Z)V	synthetic-stub	native-builtins/src/plain_socket.rs:907	kind=synthetic-stub
+java/net/PlainSocketImpl	socketCreate	(ZZ)V	synthetic-stub	native-builtins/src/plain_socket.rs:910	kind=synthetic-stub
+java/net/PlainSocketImpl	socketGetOption	(I)I	synthetic-stub	native-builtins/src/plain_socket.rs:969	kind=synthetic-stub
+java/net/PlainSocketImpl	socketGetOption	(ILjava/lang/Object;)I	synthetic-stub	native-builtins/src/plain_socket.rs:970	kind=synthetic-stub
+java/net/PlainSocketImpl	socketListen	(I)V	synthetic-stub	native-builtins/src/plain_socket.rs:921	kind=synthetic-stub
+java/net/PlainSocketImpl	socketSendUrgentData	(I)V	synthetic-stub	native-builtins/src/plain_socket.rs:992	kind=synthetic-stub
+java/net/PlainSocketImpl	socketSetOption	(ILjava/lang/Object;)V	synthetic-stub	native-builtins/src/plain_socket.rs:962	kind=synthetic-stub
+java/net/PlainSocketImpl	socketSetOption	(IZLjava/lang/Object;)V	synthetic-stub	native-builtins/src/plain_socket.rs:935	kind=synthetic-stub
+java/net/PlainSocketImpl	socketShutdown	(I)V	synthetic-stub	native-builtins/src/plain_socket.rs:933	kind=synthetic-stub
+java/nio/Buffer$2	getBufferPool	()Ljava/lang/management/BufferPoolMXBean;	bridge	native-builtins/src/shared_secrets_bridge.rs:2253	pinned by a contract test
+java/nio/HeapByteBuffer	<init>	([BIILjdk/internal/access/foreign/MemorySegmentProxy;)V	bridge	native-builtins/src/messaging_shims.rs:2044	pinned by a contract test
+java/nio/file/Paths	get	(Ljava/lang/String;)Ljava/nio/file/Path;	bridge	native-io/src/lib.rs:11235	pinned by a contract test
+java/rmi/activation/Activatable	<init>	()V	synthetic-stub	native-builtins/src/deprecated_internal.rs:390	kind=synthetic-stub
+java/rmi/activation/Activatable	<init>	()V	synthetic-stub	native-builtins/src/deprecated_internal.rs:390	kind=synthetic-stub
+java/rmi/activation/Activatable	exportObject	(Ljava/rmi/Remote;Ljava/rmi/activation/ActivationID;I)Ljava/rmi/Remote;	synthetic-stub	native-builtins/src/deprecated_internal.rs:407	kind=synthetic-stub
+java/rmi/activation/Activatable	exportObject	(Ljava/rmi/Remote;Ljava/rmi/activation/ActivationID;I)Ljava/rmi/Remote;	synthetic-stub	native-builtins/src/deprecated_internal.rs:407	kind=synthetic-stub
+java/rmi/activation/Activatable	register	(Ljava/rmi/activation/ActivationDesc;)Ljava/rmi/activation/ActivationID;	synthetic-stub	native-builtins/src/deprecated_internal.rs:399	kind=synthetic-stub
+java/rmi/activation/Activatable	register	(Ljava/rmi/activation/ActivationDesc;)Ljava/rmi/activation/ActivationID;	synthetic-stub	native-builtins/src/deprecated_internal.rs:399	kind=synthetic-stub
+java/rmi/activation/ActivationGroup	<init>	()V	synthetic-stub	native-builtins/src/deprecated_internal.rs:435	kind=synthetic-stub
+java/rmi/activation/ActivationGroup	<init>	()V	synthetic-stub	native-builtins/src/deprecated_internal.rs:435	kind=synthetic-stub
+java/rmi/activation/ActivationGroup	getSystem	()Ljava/rmi/activation/ActivationSystem;	synthetic-stub	native-builtins/src/deprecated_internal.rs:422	kind=synthetic-stub
+java/rmi/activation/ActivationGroup	getSystem	()Ljava/rmi/activation/ActivationSystem;	synthetic-stub	native-builtins/src/deprecated_internal.rs:422	kind=synthetic-stub
+java/security/AccessController$1	doIntersectionPrivilege	(Ljava/security/PrivilegedAction;Ljava/security/AccessControlContext;Ljava/security/AccessControlContext;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:2446	kind=synthetic-stub
+java/security/AccessController$1	getProtectDomains	(Ljava/security/AccessControlContext;)[Ljava/security/ProtectionDomain;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:2452	kind=synthetic-stub
+java/security/Provider	parseLegacyPut	(Ljava/lang/String;Ljava/lang/String;)V	bridge	native-builtins/src/jca/provider_chain.rs:3192	pinned by a contract test
+java/security/Provider$EngineDescription	<clinit>	()V	bridge	native-builtins/src/jca/provider_chain.rs:3129	pinned by a contract test
+java/security/Provider$ServiceKey	<clinit>	()V	bridge	native-builtins/src/jca/provider_chain.rs:3123	pinned by a contract test
+java/util/ArrayDeque$Itr	remove	()V	synthetic-stub	native-collections/src/lib.rs:35669	kind=synthetic-stub
+java/util/Comparator$Native	compare	(Ljava/lang/Object;Ljava/lang/Object;)I	synthetic-stub	native-collections/src/lib.rs:28257	kind=synthetic-stub
+java/util/Comparator$Native	writeReplace	()Ljava/lang/Object;	synthetic-stub	native-collections/src/lib.rs:28266	kind=synthetic-stub
+java/util/Enumeration$Impl	hasNext	()Z	synthetic-stub	native-builtins/src/classloader.rs:5981	kind=synthetic-stub
+java/util/Enumeration$Impl	next	()Ljava/lang/Object;	synthetic-stub	native-builtins/src/classloader.rs:5991	kind=synthetic-stub
+java/util/HashMap$Entry	equals	(Ljava/lang/Object;)Z	synthetic-stub	native-collections/src/lib.rs:15567	kind=synthetic-stub
+java/util/HashMap$Entry	getKey	()Ljava/lang/Object;	synthetic-stub	native-collections/src/lib.rs:15553	kind=synthetic-stub
+java/util/HashMap$Entry	getValue	()Ljava/lang/Object;	synthetic-stub	native-collections/src/lib.rs:15554	kind=synthetic-stub
+java/util/HashMap$Entry	hashCode	()I	synthetic-stub	native-collections/src/lib.rs:15566	kind=synthetic-stub
+java/util/HashMap$Entry	setValue	(Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-collections/src/lib.rs:15560	kind=synthetic-stub
+java/util/IteratorEnumeration	hasMoreElements	()Z	synthetic-stub	native-builtins/src/keystore.rs:2013	kind=synthetic-stub
+java/util/IteratorEnumeration	nextElement	()Ljava/lang/Object;	synthetic-stub	native-builtins/src/keystore.rs:2030	kind=synthetic-stub
+java/util/ServiceLoader$Itr	hasNext	()Z	synthetic-stub	native-builtins/src/streams.rs:74	kind=synthetic-stub
+java/util/ServiceLoader$Itr	next	()Ljava/lang/Object;	synthetic-stub	native-builtins/src/streams.rs:75	kind=synthetic-stub
+java/util/TreeMap$KeyItr	hasNext	()Z	synthetic-stub	native-collections/src/lib.rs:41412	kind=synthetic-stub
+java/util/TreeMap$KeyItr	next	()Ljava/lang/Object;	synthetic-stub	native-collections/src/lib.rs:41413	kind=synthetic-stub
+java/util/concurrent/CompletedFuture	get	()Ljava/lang/Object;	synthetic-stub	native-io/src/lib.rs:17308	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl	addAndGet	(Ljava/lang/Object;I)I	synthetic-stub	native-builtins/src/atomic_updater.rs:1133	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl	decrementAndGet	(Ljava/lang/Object;)I	synthetic-stub	native-builtins/src/atomic_updater.rs:1113	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl	getAndAdd	(Ljava/lang/Object;I)I	synthetic-stub	native-builtins/src/atomic_updater.rs:1101	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl	getAndDecrement	(Ljava/lang/Object;)I	synthetic-stub	native-builtins/src/atomic_updater.rs:1127	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl	getAndIncrement	(Ljava/lang/Object;)I	synthetic-stub	native-builtins/src/atomic_updater.rs:1121	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl	getAndSet	(Ljava/lang/Object;I)I	synthetic-stub	native-builtins/src/atomic_updater.rs:1095	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl	lazySet	(Ljava/lang/Object;I)V	synthetic-stub	native-builtins/src/atomic_updater.rs:1077	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl	weakCompareAndSet	(Ljava/lang/Object;II)Z	synthetic-stub	native-builtins/src/atomic_updater.rs:1089	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl	decrementAndGet	(Ljava/lang/Object;)J	synthetic-stub	native-builtins/src/atomic_updater.rs:1265	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl	getAndAdd	(Ljava/lang/Object;J)J	synthetic-stub	native-builtins/src/atomic_updater.rs:1230	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl	getAndDecrement	(Ljava/lang/Object;)J	synthetic-stub	native-builtins/src/atomic_updater.rs:1247	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl	getAndIncrement	(Ljava/lang/Object;)J	synthetic-stub	native-builtins/src/atomic_updater.rs:1241	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl	getAndSet	(Ljava/lang/Object;J)J	synthetic-stub	native-builtins/src/atomic_updater.rs:1224	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl	incrementAndGet	(Ljava/lang/Object;)J	synthetic-stub	native-builtins/src/atomic_updater.rs:1259	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl	lazySet	(Ljava/lang/Object;J)V	synthetic-stub	native-builtins/src/atomic_updater.rs:1206	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl	weakCompareAndSet	(Ljava/lang/Object;JJ)Z	synthetic-stub	native-builtins/src/atomic_updater.rs:1218	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl	getAndSet	(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/atomic_updater.rs:1017	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl	getAndUpdate	(Ljava/lang/Object;Ljava/util/function/UnaryOperator;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/atomic_updater.rs:1023	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl	lazySet	(Ljava/lang/Object;Ljava/lang/Object;)V	synthetic-stub	native-builtins/src/atomic_updater.rs:999	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl	updateAndGet	(Ljava/lang/Object;Ljava/util/function/UnaryOperator;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/atomic_updater.rs:1029	kind=synthetic-stub
+java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl	weakCompareAndSet	(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z	synthetic-stub	native-builtins/src/atomic_updater.rs:1011	kind=synthetic-stub
+java/util/concurrent/locks/StampedLock	isLocked	()Z	synthetic-stub	native-builtins/src/util_concurrent_ext.rs:6040	kind=synthetic-stub
+java/util/concurrent/locks/StampedLock	isLocked	()Z	synthetic-stub	native-builtins/src/util_concurrent_ext.rs:6040	kind=synthetic-stub
+java/util/concurrent/locks/StampedLock	isLocked	()Z	synthetic-stub	native-builtins/src/util_concurrent_ext.rs:6040	kind=synthetic-stub
+java/util/function/Function$Identity	andThen	(Ljava/util/function/Function;)Ljava/util/function/Function;	synthetic-stub	native-builtins/src/lib.rs:38194	kind=synthetic-stub
+java/util/function/Function$Identity	apply	(Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/phases_late/streams.rs:2937	kind=synthetic-stub
+java/util/function/Function$Identity	apply	(Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/lib.rs:38188	kind=synthetic-stub
+java/util/function/Function$Identity	compose	(Ljava/util/function/Function;)Ljava/util/function/Function;	synthetic-stub	native-builtins/src/lib.rs:38200	kind=synthetic-stub
+java/util/logging/LogManager$StringEnumeration	nextElement	()Ljava/lang/Object;	synthetic-stub	native-builtins/src/logmanager.rs:6302	kind=synthetic-stub
+java/util/stream/Stream	sequential	()Ljava/util/stream/Stream;	bridge	native-builtins/src/streams.rs:185	pinned by a contract test
+java/util/zip/ZipFile$1	entryLocalNameEncoding	(Ljava/util/zip/ZipEntry;)Z	bridge	native-builtins/src/shared_secrets_bridge.rs:2533	pinned by a contract test
+javax/management/openmbean/TabularDataSupport	put	(Ljavax/management/openmbean/CompositeData;)Ljavax/management/openmbean/CompositeData;	bridge	native-builtins/src/jmx_openmbean.rs:1660	pinned by a contract test
+javax/net/ssl/SSLSocketInputStream	available	()I	synthetic-stub	native-builtins/src/phases_late/ssl_security.rs:3384	kind=synthetic-stub
+javax/net/ssl/SSLSocketInputStream	close	()V	synthetic-stub	native-builtins/src/phases_late/ssl_security.rs:3430	kind=synthetic-stub
+javax/net/ssl/SSLSocketInputStream	read	()I	synthetic-stub	native-builtins/src/phases_late/ssl_security.rs:3271	kind=synthetic-stub
+javax/net/ssl/SSLSocketInputStream	read	([BII)I	synthetic-stub	native-builtins/src/phases_late/ssl_security.rs:3321	kind=synthetic-stub
+javax/net/ssl/SSLSocketOutputStream	close	()V	synthetic-stub	native-builtins/src/phases_late/ssl_security.rs:3557	kind=synthetic-stub
+javax/net/ssl/SSLSocketOutputStream	flush	()V	synthetic-stub	native-builtins/src/phases_late/ssl_security.rs:3554	kind=synthetic-stub
+javax/net/ssl/SSLSocketOutputStream	write	(I)V	synthetic-stub	native-builtins/src/phases_late/ssl_security.rs:3434	kind=synthetic-stub
+javax/net/ssl/SSLSocketOutputStream	write	([BII)V	synthetic-stub	native-builtins/src/phases_late/ssl_security.rs:3465	kind=synthetic-stub
+jdk/internal/loader/URLClassPath	getURLs	(Z)[Ljava/net/URL;	bridge	native-builtins/src/classloader.rs:5825	pinned by a contract test
+jdk/internal/misc/SharedSecrets	getJavaIOAccess	()Ljdk/internal/access/JavaIOAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaIOFileDescriptorAccess	()Ljdk/internal/access/JavaIOFileDescriptorAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaIORandomAccessFileAccess	()Ljdk/internal/access/JavaIORandomAccessFileAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaLangAccess	()Ljdk/internal/access/JavaLangAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaLangInvokeAccess	()Ljdk/internal/access/JavaLangInvokeAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaLangRefAccess	()Ljdk/internal/access/JavaLangRefAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaLangReflectAccess	()Ljdk/internal/access/JavaLangReflectAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaNetHttpCookieAccess	()Ljdk/internal/access/JavaNetHttpCookieAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaNetInetAddressAccess	()Ljdk/internal/access/JavaNetInetAddressAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaNetUriAccess	()Ljdk/internal/access/JavaNetUriAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaNioAccess	()Ljdk/internal/access/JavaNioAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaSecurityAccess	()Ljdk/internal/access/JavaSecurityAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaUtilJarAccess	()Ljdk/internal/access/JavaUtilJarAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaUtilResourceBundleAccess	()Ljdk/internal/access/JavaUtilResourceBundleAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/misc/SharedSecrets	getJavaUtilZipFileAccess	()Ljdk/internal/access/JavaUtilZipFileAccess;	synthetic-stub	native-builtins/src/shared_secrets_bridge.rs:235	kind=synthetic-stub
+jdk/internal/net/http/Http1HeaderParser	parse	([B)Z	bridge	native-builtins/src/http_client.rs:1725	pinned by a contract test
+jdk/internal/ref/DirectBufferDeallocator	run	()V	synthetic-stub	native-builtins/src/servlet.rs:6604	kind=synthetic-stub
+jdk/internal/util/Preconditions	checkFromIndexSize	(III)I	bridge	native-builtins/src/preconditions.rs:431	pinned by a contract test
+jdk/internal/util/Preconditions	checkFromToIndex	(III)I	bridge	native-builtins/src/preconditions.rs:430	pinned by a contract test
+jdk/internal/util/Preconditions	checkIndex	(II)I	bridge	native-builtins/src/preconditions.rs:429	pinned by a contract test
+sun/instrument/InstrumentationImpl	<init>	(JLjava/lang/String;ZZ)V	bridge	vm/src/runtime/instrument.rs:2396	pinned by a contract test
+sun/management/OperatingSystemImpl	getCommittedVirtualMemorySize0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub
+sun/management/OperatingSystemImpl	getFreePhysicalMemorySize0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub
+sun/management/OperatingSystemImpl	getFreeSwapSpaceSize0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub
+sun/management/OperatingSystemImpl	getMaxFileDescriptorCount0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub
+sun/management/OperatingSystemImpl	getOpenFileDescriptorCount0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub
+sun/management/OperatingSystemImpl	getProcessCpuLoad0	()D	synthetic-stub	native-builtins/src/jmx.rs:3013	kind=synthetic-stub
+sun/management/OperatingSystemImpl	getProcessCpuTime0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub
+sun/management/OperatingSystemImpl	getSystemCpuLoad0	()D	synthetic-stub	native-builtins/src/jmx.rs:3013	kind=synthetic-stub
+sun/management/OperatingSystemImpl	getTotalPhysicalMemorySize0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub
+sun/management/OperatingSystemImpl	getTotalSwapSpaceSize0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub
+sun/misc/URLClassPath	<clinit>	()V	synthetic-stub	native-builtins/src/classloader.rs:5820	kind=synthetic-stub
+sun/misc/URLClassPath	addURL	(Ljava/net/URL;)V	synthetic-stub	native-builtins/src/lib.rs:18460	kind=synthetic-stub
+sun/misc/URLClassPath	closeLoaders	()Ljava/util/List;	synthetic-stub	native-builtins/src/classloader.rs:5827	kind=synthetic-stub
+sun/misc/URLClassPath	closeLoaders	()V	synthetic-stub	native-builtins/src/classloader.rs:5833	kind=synthetic-stub
+sun/misc/URLClassPath	findResource	(Ljava/lang/String;)Ljava/net/URL;	synthetic-stub	native-builtins/src/classloader.rs:5837	kind=synthetic-stub
+sun/misc/URLClassPath	findResource	(Ljava/lang/String;Z)Ljava/net/URL;	synthetic-stub	native-builtins/src/classloader.rs:5843	kind=synthetic-stub
+sun/misc/URLClassPath	getURLs	()[Ljava/net/URL;	synthetic-stub	native-builtins/src/classloader.rs:5824	kind=synthetic-stub
+sun/misc/URLClassPath	getURLs	(Z)[Ljava/net/URL;	synthetic-stub	native-builtins/src/classloader.rs:5825	kind=synthetic-stub
+sun/misc/Unsafe	defineClass	(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;	bridge	native-builtins/src/deprecated_internal.rs:473	pinned by a contract test
+sun/misc/Unsafe	defineClass	(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;	bridge	native-builtins/src/deprecated_internal.rs:473	pinned by a contract test
+sun/nio/ch/FileChannelImpl	map0	(IJJZ)J	bridge	native-io/src/file_channel.rs:1096	pinned by a contract test
+sun/nio/ch/FileChannelImpl	unmap0	(JJ)I	bridge	native-io/src/file_channel.rs:1098	pinned by a contract test
+sun/nio/ch/WindowsFileDispatcherImpl	allocationGranularity0	()J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	available0	(Ljava/io/FileDescriptor;)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	close0	(Ljava/io/FileDescriptor;)V	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	duplicateHandle	(J)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	force0	(Ljava/io/FileDescriptor;Z)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	init0	()V	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	isOther0	(Ljava/io/FileDescriptor;)Z	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	lock0	(Ljava/io/FileDescriptor;ZJJZ)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	map0	(Ljava/io/FileDescriptor;IJJ)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	map0	(Ljava/io/FileDescriptor;IJJZ)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	maxDirectTransferSize0	()I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	preClose0	(Ljava/io/FileDescriptor;)V	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	pread0	(Ljava/io/FileDescriptor;JIJ)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	pwrite0	(Ljava/io/FileDescriptor;JIJ)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	read0	(Ljava/io/FileDescriptor;JI)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	readv0	(Ljava/io/FileDescriptor;JI)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	release0	(Ljava/io/FileDescriptor;JJ)V	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	seek0	(Ljava/io/FileDescriptor;J)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	setDirect0	(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	size0	(Ljava/io/FileDescriptor;)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	transferFrom0	(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;JJ)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	transferFrom0	(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;JJZ)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	transferTo0	(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	transferTo0	(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;Z)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	truncate0	(Ljava/io/FileDescriptor;J)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	unmap0	(JJ)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	write0	(Ljava/io/FileDescriptor;JI)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	write0	(Ljava/io/FileDescriptor;JIZ)I	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	writev0	(Ljava/io/FileDescriptor;JI)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/ch/WindowsFileDispatcherImpl	writev0	(Ljava/io/FileDescriptor;JIZ)J	synthetic-stub	native-io/src/nio_native.rs:1145	kind=synthetic-stub
+sun/nio/fs/UnixWatchService	cancel0	(I)V	synthetic-stub	native-io/src/watch.rs:770	kind=synthetic-stub
+sun/nio/fs/UnixWatchService	close0	()V	synthetic-stub	native-io/src/watch.rs:771	kind=synthetic-stub
+sun/nio/fs/UnixWatchService	init0	()V	synthetic-stub	native-io/src/watch.rs:761	kind=synthetic-stub
+sun/nio/fs/UnixWatchService	poll0	(J)I	synthetic-stub	native-io/src/watch.rs:769	kind=synthetic-stub
+sun/nio/fs/UnixWatchService	pollEventKinds0	(I)[I	synthetic-stub	native-io/src/watch.rs:773	kind=synthetic-stub
+sun/nio/fs/UnixWatchService	pollEventNames0	(I)[Ljava/lang/String;	synthetic-stub	native-io/src/watch.rs:774	kind=synthetic-stub
+sun/nio/fs/UnixWatchService	register0	(Ljava/lang/String;I)I	synthetic-stub	native-io/src/watch.rs:762	kind=synthetic-stub
+sun/nio/fs/UnixWatchService	reset0	(I)Z	synthetic-stub	native-io/src/watch.rs:772	kind=synthetic-stub
+sun/nio/fs/UnixWatchService	take0	()I	synthetic-stub	native-io/src/watch.rs:768	kind=synthetic-stub
+sun/reflect/Reflection	getCallerClass	()Ljava/lang/Class;	synthetic-stub	native-builtins/src/deprecated_internal.rs:930	kind=synthetic-stub
+sun/reflect/Reflection	getCallerClass	()Ljava/lang/Class;	synthetic-stub	native-builtins/src/deprecated_internal.rs:930	kind=synthetic-stub
+sun/reflect/Reflection	getCallerClass	(I)Ljava/lang/Class;	synthetic-stub	native-builtins/src/deprecated_internal.rs:877	kind=synthetic-stub
+sun/reflect/Reflection	getCallerClass	(I)Ljava/lang/Class;	synthetic-stub	native-builtins/src/deprecated_internal.rs:877	kind=synthetic-stub

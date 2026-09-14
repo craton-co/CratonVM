@@ -1,0 +1,82 @@
+﻿name: Soak weekly (WP8.7 placeholder for WP8.1)
+
+# WP8.7 created this stub. The real 24h soak harness lands in WP8.1
+# (docs/wildfly-ejbca-roadmap.md §11): one S2 app under 10 ops/s for 24h
+# with heap-growth and GC-pause graphs. Until WP8.1 wires the loader and
+# the metrics-capture Rust plumbing, this workflow only re-runs the
+# Keycloak 16 smoke for ~30 seconds as a "we know the harness still
+# launches" canary — *not* a soak.
+#
+# WP8.1 will:
+#   * replace the smoke step below with a sustained-load driver
+#     (likely a tiny Java client looping HTTP / Kafka producer / etc.)
+#   * add memory-graph + GC-pause emission via vm/instrumentation
+#   * raise timeout-minutes from 10 to ~1450 (24h + slack)
+#   * gate on heap-growth ≤ 2× initial, GC pause p99 < 50ms.
+# When that lands, this header comment + the 'Run smoke (placeholder)'
+# step both go.
+
+on:
+  schedule:
+    # Weekly Sunday 04:00 UTC. Off-peak; doesn't collide with nightly.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  soak:
+    name: Weekly soak (placeholder)
+    runs-on: ubuntu-latest
+    # 30s smoke fits in 10min easily; WP8.1 will raise this.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: soak-weekly
+
+      - name: Build cratonvm (release)
+        run: cargo build --release -p cratonvm-cli
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # Placeholder: just re-run the keycloak16 smoke. Replaced by WP8.1.
+      - name: Stage keycloak16 (placeholder soak target)
+        run: bash bench/keycloak16/stage.sh
+
+      - name: Run smoke (placeholder, 30s budget)
+        env:
+          TIMEOUT_SEC: '30'
+        run: bash bench/keycloak16/run-under-cratonvm.sh
+
+      - name: Diff against baseline
+        run: bash bench/keycloak16/diff-baseline.sh
+
+      - name: Upload artefacts on drift
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-weekly-keycloak16
+          path: |
+            bench/keycloak16/last-run.stdout.log
+            bench/keycloak16/last-run.stderr.log
+            bench/keycloak16/last-run.rc
+            bench/keycloak16/last-run.meta.json
+          retention-days: 14
+          if-no-files-found: ignore

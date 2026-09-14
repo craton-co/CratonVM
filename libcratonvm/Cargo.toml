@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2026 Craton Software Company
+
+[package]
+name = "libcratonvm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "C-ABI shared library for embedding CratonVM (JNI Invocation API + flat C API)"
+readme = "README.md"
+# Opt-in cbindgen header regeneration (no-op unless CRATONVM_REGEN_HEADER is set);
+# see build.rs. cbindgen is intentionally NOT a Cargo dependency so the default
+# build graph / Cargo.lock are untouched and offline builds are unaffected.
+build = "build.rs"
+
+[lib]
+# The whole point of this crate: produce a `libcratonvm.so` / `cratonvm.dll`
+# (cdylib) that a C host can dlopen/link as a `libjvm` substitute, plus a
+# `.a`/`.lib` (staticlib) for static linking, plus an `rlib` so Rust tests and
+# downstream Rust crates can depend on it normally.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+# Keep libcratonvm publishable: cratonvm-vm's default feature set includes
+# `awt`, which pulls the unpublished cratonvm-native-awt crate, so we take
+# `default-features = false` and re-add what we want by hand. This list is
+# deliberately NOT "the VM defaults" — the VM's default set is `awt` +
+# `management`, and the three experiments below are additions on top of it that
+# the shipped .so/.dll has always carried. Left as-is on purpose: what a
+# distributed binary artifact contains is a release decision, not a naming
+# cleanup. Revisit alongside the 0.4 removal of the deprecated feature aliases.
+[dependencies.cratonvm-vm]
+path = "../vm"
+version = "0.3.0"
+default-features = false
+features = [
+    # Default-on in cratonvm-vm and required by `ManagementFactory`; it must be
+    # listed explicitly because `default-features = false` drops it.
+    "management",
+    "experimental-serialization",
+    "experimental-aot",
+    "experimental-debug",
+]
+
+[dev-dependencies]
+# Test-only. The JDK-mode fixtures point `CRATONVM_JAVA_HOME` at a synthesised
+# tree; it is a *declared* CratonVM flag, so it has to be overridden on the
+# `cratonvm-types` snapshot (`flags::override_thread`) rather than in `environ`,
+# which `config_from_args` would not re-read. See
+# libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md.
+# Dev-only, so the cdylib's own dependency graph is unchanged.
+cratonvm-types = { path = "../types", version = "0.3.0" }
+
+[lints]
+workspace = true
