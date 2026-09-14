@@ -1,0 +1,468 @@
+# jdk-baseline	2
+# kind	module
+# name	java.base
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	ModuleLayer.boot().findModule("java.base").getDescriptor()
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# unqualified-exports	58
+# rows	455
+# columns	kind	name	target	flags
+EXPORTS	com.sun.crypto.provider	jdk.crypto.cryptoki	qualified
+EXPORTS	com.sun.security.ntlm	java.security.sasl	qualified
+EXPORTS	java.io		
+EXPORTS	java.lang		
+EXPORTS	java.lang.annotation		
+EXPORTS	java.lang.classfile		
+EXPORTS	java.lang.classfile.attribute		
+EXPORTS	java.lang.classfile.constantpool		
+EXPORTS	java.lang.classfile.instruction		
+EXPORTS	java.lang.constant		
+EXPORTS	java.lang.foreign		
+EXPORTS	java.lang.invoke		
+EXPORTS	java.lang.module		
+EXPORTS	java.lang.ref		
+EXPORTS	java.lang.reflect		
+EXPORTS	java.lang.runtime		
+EXPORTS	java.math		
+EXPORTS	java.net		
+EXPORTS	java.net.spi		
+EXPORTS	java.nio		
+EXPORTS	java.nio.channels		
+EXPORTS	java.nio.channels.spi		
+EXPORTS	java.nio.charset		
+EXPORTS	java.nio.charset.spi		
+EXPORTS	java.nio.file		
+EXPORTS	java.nio.file.attribute		
+EXPORTS	java.nio.file.spi		
+EXPORTS	java.security		
+EXPORTS	java.security.cert		
+EXPORTS	java.security.interfaces		
+EXPORTS	java.security.spec		
+EXPORTS	java.text		
+EXPORTS	java.text.spi		
+EXPORTS	java.time		
+EXPORTS	java.time.chrono		
+EXPORTS	java.time.format		
+EXPORTS	java.time.temporal		
+EXPORTS	java.time.zone		
+EXPORTS	java.util		
+EXPORTS	java.util.concurrent		
+EXPORTS	java.util.concurrent.atomic		
+EXPORTS	java.util.concurrent.locks		
+EXPORTS	java.util.function		
+EXPORTS	java.util.jar		
+EXPORTS	java.util.random		
+EXPORTS	java.util.regex		
+EXPORTS	java.util.spi		
+EXPORTS	java.util.stream		
+EXPORTS	java.util.zip		
+EXPORTS	javax.crypto		
+EXPORTS	javax.crypto.interfaces		
+EXPORTS	javax.crypto.spec		
+EXPORTS	javax.net		
+EXPORTS	javax.net.ssl		
+EXPORTS	javax.security.auth		
+EXPORTS	javax.security.auth.callback		
+EXPORTS	javax.security.auth.login		
+EXPORTS	javax.security.auth.spi		
+EXPORTS	javax.security.auth.x500		
+EXPORTS	javax.security.cert		
+EXPORTS	jdk.internal	jdk.incubator.vector	qualified
+EXPORTS	jdk.internal.access	java.desktop	qualified
+EXPORTS	jdk.internal.access	java.logging	qualified
+EXPORTS	jdk.internal.access	java.management	qualified
+EXPORTS	jdk.internal.access	java.rmi	qualified
+EXPORTS	jdk.internal.access	jdk.charsets	qualified
+EXPORTS	jdk.internal.access	jdk.crypto.cryptoki	qualified
+EXPORTS	jdk.internal.access	jdk.jartool	qualified
+EXPORTS	jdk.internal.access	jdk.jfr	qualified
+EXPORTS	jdk.internal.access	jdk.jlink	qualified
+EXPORTS	jdk.internal.access	jdk.management	qualified
+EXPORTS	jdk.internal.access	jdk.net	qualified
+EXPORTS	jdk.internal.access	jdk.sctp	qualified
+EXPORTS	jdk.internal.classfile.components	jdk.jfr	qualified
+EXPORTS	jdk.internal.event	jdk.jfr	qualified
+EXPORTS	jdk.internal.foreign	jdk.incubator.vector	qualified
+EXPORTS	jdk.internal.io	jdk.internal.le	qualified
+EXPORTS	jdk.internal.io	jdk.jshell	qualified
+EXPORTS	jdk.internal.javac	java.compiler	qualified
+EXPORTS	jdk.internal.javac	java.desktop	qualified
+EXPORTS	jdk.internal.javac	jdk.compiler	qualified
+EXPORTS	jdk.internal.javac	jdk.incubator.vector	qualified
+EXPORTS	jdk.internal.javac	jdk.jartool	qualified
+EXPORTS	jdk.internal.javac	jdk.jdeps	qualified
+EXPORTS	jdk.internal.javac	jdk.jfr	qualified
+EXPORTS	jdk.internal.javac	jdk.jlink	qualified
+EXPORTS	jdk.internal.javac	jdk.jshell	qualified
+EXPORTS	jdk.internal.jimage	jdk.jlink	qualified
+EXPORTS	jdk.internal.jimage.decompressor	jdk.jlink	qualified
+EXPORTS	jdk.internal.jmod	jdk.compiler	qualified
+EXPORTS	jdk.internal.jmod	jdk.jlink	qualified
+EXPORTS	jdk.internal.loader	java.instrument	qualified
+EXPORTS	jdk.internal.loader	java.logging	qualified
+EXPORTS	jdk.internal.loader	java.naming	qualified
+EXPORTS	jdk.internal.logger	java.logging	qualified
+EXPORTS	jdk.internal.misc	java.desktop	qualified
+EXPORTS	jdk.internal.misc	java.logging	qualified
+EXPORTS	jdk.internal.misc	java.management	qualified
+EXPORTS	jdk.internal.misc	java.naming	qualified
+EXPORTS	jdk.internal.misc	java.net.http	qualified
+EXPORTS	jdk.internal.misc	java.rmi	qualified
+EXPORTS	jdk.internal.misc	java.security.jgss	qualified
+EXPORTS	jdk.internal.misc	jdk.attach	qualified
+EXPORTS	jdk.internal.misc	jdk.charsets	qualified
+EXPORTS	jdk.internal.misc	jdk.compiler	qualified
+EXPORTS	jdk.internal.misc	jdk.crypto.cryptoki	qualified
+EXPORTS	jdk.internal.misc	jdk.graal.compiler	qualified
+EXPORTS	jdk.internal.misc	jdk.incubator.vector	qualified
+EXPORTS	jdk.internal.misc	jdk.internal.vm.ci	qualified
+EXPORTS	jdk.internal.misc	jdk.jfr	qualified
+EXPORTS	jdk.internal.misc	jdk.jshell	qualified
+EXPORTS	jdk.internal.misc	jdk.nio.mapmode	qualified
+EXPORTS	jdk.internal.misc	jdk.unsupported	qualified
+EXPORTS	jdk.internal.module	java.instrument	qualified
+EXPORTS	jdk.internal.module	java.management.rmi	qualified
+EXPORTS	jdk.internal.module	jdk.compiler	qualified
+EXPORTS	jdk.internal.module	jdk.jartool	qualified
+EXPORTS	jdk.internal.module	jdk.jfr	qualified
+EXPORTS	jdk.internal.module	jdk.jlink	qualified
+EXPORTS	jdk.internal.module	jdk.jpackage	qualified
+EXPORTS	jdk.internal.org.xml.sax	jdk.jfr	qualified
+EXPORTS	jdk.internal.org.xml.sax.helpers	jdk.jfr	qualified
+EXPORTS	jdk.internal.perf	java.management	qualified
+EXPORTS	jdk.internal.perf	jdk.internal.jvmstat	qualified
+EXPORTS	jdk.internal.perf	jdk.management.agent	qualified
+EXPORTS	jdk.internal.platform	jdk.jfr	qualified
+EXPORTS	jdk.internal.platform	jdk.management	qualified
+EXPORTS	jdk.internal.ref	java.desktop	qualified
+EXPORTS	jdk.internal.ref	java.net.http	qualified
+EXPORTS	jdk.internal.ref	jdk.naming.dns	qualified
+EXPORTS	jdk.internal.reflect	java.logging	qualified
+EXPORTS	jdk.internal.reflect	java.sql	qualified
+EXPORTS	jdk.internal.reflect	java.sql.rowset	qualified
+EXPORTS	jdk.internal.reflect	jdk.dynalink	qualified
+EXPORTS	jdk.internal.reflect	jdk.internal.vm.ci	qualified
+EXPORTS	jdk.internal.reflect	jdk.unsupported	qualified
+EXPORTS	jdk.internal.util	java.desktop	qualified
+EXPORTS	jdk.internal.util	java.naming	qualified
+EXPORTS	jdk.internal.util	java.net.http	qualified
+EXPORTS	jdk.internal.util	java.prefs	qualified
+EXPORTS	jdk.internal.util	java.rmi	qualified
+EXPORTS	jdk.internal.util	java.security.jgss	qualified
+EXPORTS	jdk.internal.util	java.smartcardio	qualified
+EXPORTS	jdk.internal.util	jdk.charsets	qualified
+EXPORTS	jdk.internal.util	jdk.httpserver	qualified
+EXPORTS	jdk.internal.util	jdk.incubator.vector	qualified
+EXPORTS	jdk.internal.util	jdk.internal.vm.ci	qualified
+EXPORTS	jdk.internal.util	jdk.jlink	qualified
+EXPORTS	jdk.internal.util	jdk.jpackage	qualified
+EXPORTS	jdk.internal.util	jdk.net	qualified
+EXPORTS	jdk.internal.util.xml	jdk.jfr	qualified
+EXPORTS	jdk.internal.util.xml.impl	jdk.jfr	qualified
+EXPORTS	jdk.internal.vm	java.management	qualified
+EXPORTS	jdk.internal.vm	jdk.internal.jvmstat	qualified
+EXPORTS	jdk.internal.vm	jdk.internal.vm.ci	qualified
+EXPORTS	jdk.internal.vm	jdk.jfr	qualified
+EXPORTS	jdk.internal.vm	jdk.management	qualified
+EXPORTS	jdk.internal.vm	jdk.management.agent	qualified
+EXPORTS	jdk.internal.vm.annotation	java.instrument	qualified
+EXPORTS	jdk.internal.vm.annotation	jdk.incubator.vector	qualified
+EXPORTS	jdk.internal.vm.annotation	jdk.internal.vm.ci	qualified
+EXPORTS	jdk.internal.vm.annotation	jdk.jfr	qualified
+EXPORTS	jdk.internal.vm.annotation	jdk.unsupported	qualified
+EXPORTS	jdk.internal.vm.vector	jdk.incubator.vector	qualified
+EXPORTS	sun.invoke.util	jdk.compiler	qualified
+EXPORTS	sun.net	java.net.http	qualified
+EXPORTS	sun.net	jdk.naming.dns	qualified
+EXPORTS	sun.net.dns	java.security.jgss	qualified
+EXPORTS	sun.net.dns	jdk.naming.dns	qualified
+EXPORTS	sun.net.ext	jdk.net	qualified
+EXPORTS	sun.net.util	java.net.http	qualified
+EXPORTS	sun.net.util	jdk.jconsole	qualified
+EXPORTS	sun.net.util	jdk.sctp	qualified
+EXPORTS	sun.net.www	java.net.http	qualified
+EXPORTS	sun.net.www	jdk.jartool	qualified
+EXPORTS	sun.net.www.protocol.http	java.security.jgss	qualified
+EXPORTS	sun.nio.ch	java.management	qualified
+EXPORTS	sun.nio.ch	jdk.crypto.cryptoki	qualified
+EXPORTS	sun.nio.ch	jdk.net	qualified
+EXPORTS	sun.nio.ch	jdk.sctp	qualified
+EXPORTS	sun.nio.cs	jdk.charsets	qualified
+EXPORTS	sun.nio.fs	jdk.net	qualified
+EXPORTS	sun.reflect.annotation	jdk.compiler	qualified
+EXPORTS	sun.reflect.generics.reflectiveObjects	java.desktop	qualified
+EXPORTS	sun.reflect.misc	java.desktop	qualified
+EXPORTS	sun.reflect.misc	java.management	qualified
+EXPORTS	sun.security.internal.interfaces	jdk.crypto.cryptoki	qualified
+EXPORTS	sun.security.internal.spec	jdk.crypto.cryptoki	qualified
+EXPORTS	sun.security.internal.spec	jdk.crypto.mscapi	qualified
+EXPORTS	sun.security.jca	java.smartcardio	qualified
+EXPORTS	sun.security.jca	jdk.crypto.cryptoki	qualified
+EXPORTS	sun.security.jca	jdk.naming.dns	qualified
+EXPORTS	sun.security.pkcs	jdk.jartool	qualified
+EXPORTS	sun.security.provider	java.security.jgss	qualified
+EXPORTS	sun.security.provider	jdk.crypto.cryptoki	qualified
+EXPORTS	sun.security.provider	jdk.security.auth	qualified
+EXPORTS	sun.security.provider.certpath	java.naming	qualified
+EXPORTS	sun.security.provider.certpath	jdk.jartool	qualified
+EXPORTS	sun.security.rsa	jdk.crypto.cryptoki	qualified
+EXPORTS	sun.security.rsa	jdk.crypto.mscapi	qualified
+EXPORTS	sun.security.timestamp	jdk.jartool	qualified
+EXPORTS	sun.security.tools	jdk.jartool	qualified
+EXPORTS	sun.security.util	java.naming	qualified
+EXPORTS	sun.security.util	java.security.jgss	qualified
+EXPORTS	sun.security.util	java.security.sasl	qualified
+EXPORTS	sun.security.util	java.smartcardio	qualified
+EXPORTS	sun.security.util	java.xml.crypto	qualified
+EXPORTS	sun.security.util	jdk.crypto.cryptoki	qualified
+EXPORTS	sun.security.util	jdk.crypto.mscapi	qualified
+EXPORTS	sun.security.util	jdk.jartool	qualified
+EXPORTS	sun.security.util	jdk.security.auth	qualified
+EXPORTS	sun.security.util	jdk.security.jgss	qualified
+EXPORTS	sun.security.validator	jdk.jartool	qualified
+EXPORTS	sun.security.x509	jdk.crypto.cryptoki	qualified
+EXPORTS	sun.security.x509	jdk.jartool	qualified
+EXPORTS	sun.util.cldr	jdk.jlink	qualified
+EXPORTS	sun.util.locale.provider	java.desktop	qualified
+EXPORTS	sun.util.locale.provider	jdk.jlink	qualified
+EXPORTS	sun.util.locale.provider	jdk.localedata	qualified
+EXPORTS	sun.util.logging	java.desktop	qualified
+EXPORTS	sun.util.logging	java.logging	qualified
+EXPORTS	sun.util.logging	java.prefs	qualified
+EXPORTS	sun.util.resources	jdk.localedata	qualified
+PACKAGE	com.sun.crypto.provider		
+PACKAGE	com.sun.security.ntlm		
+PACKAGE	java.io		
+PACKAGE	java.lang		
+PACKAGE	java.lang.annotation		
+PACKAGE	java.lang.classfile		
+PACKAGE	java.lang.classfile.attribute		
+PACKAGE	java.lang.classfile.constantpool		
+PACKAGE	java.lang.classfile.instruction		
+PACKAGE	java.lang.constant		
+PACKAGE	java.lang.foreign		
+PACKAGE	java.lang.invoke		
+PACKAGE	java.lang.module		
+PACKAGE	java.lang.ref		
+PACKAGE	java.lang.reflect		
+PACKAGE	java.lang.runtime		
+PACKAGE	java.math		
+PACKAGE	java.net		
+PACKAGE	java.net.spi		
+PACKAGE	java.nio		
+PACKAGE	java.nio.channels		
+PACKAGE	java.nio.channels.spi		
+PACKAGE	java.nio.charset		
+PACKAGE	java.nio.charset.spi		
+PACKAGE	java.nio.file		
+PACKAGE	java.nio.file.attribute		
+PACKAGE	java.nio.file.spi		
+PACKAGE	java.security		
+PACKAGE	java.security.cert		
+PACKAGE	java.security.interfaces		
+PACKAGE	java.security.spec		
+PACKAGE	java.text		
+PACKAGE	java.text.spi		
+PACKAGE	java.time		
+PACKAGE	java.time.chrono		
+PACKAGE	java.time.format		
+PACKAGE	java.time.temporal		
+PACKAGE	java.time.zone		
+PACKAGE	java.util		
+PACKAGE	java.util.concurrent		
+PACKAGE	java.util.concurrent.atomic		
+PACKAGE	java.util.concurrent.locks		
+PACKAGE	java.util.function		
+PACKAGE	java.util.jar		
+PACKAGE	java.util.random		
+PACKAGE	java.util.regex		
+PACKAGE	java.util.spi		
+PACKAGE	java.util.stream		
+PACKAGE	java.util.zip		
+PACKAGE	javax.crypto		
+PACKAGE	javax.crypto.interfaces		
+PACKAGE	javax.crypto.spec		
+PACKAGE	javax.net		
+PACKAGE	javax.net.ssl		
+PACKAGE	javax.security.auth		
+PACKAGE	javax.security.auth.callback		
+PACKAGE	javax.security.auth.login		
+PACKAGE	javax.security.auth.spi		
+PACKAGE	javax.security.auth.x500		
+PACKAGE	javax.security.cert		
+PACKAGE	jdk.internal		
+PACKAGE	jdk.internal.access		
+PACKAGE	jdk.internal.access.foreign		
+PACKAGE	jdk.internal.classfile.components		
+PACKAGE	jdk.internal.classfile.impl		
+PACKAGE	jdk.internal.classfile.impl.verifier		
+PACKAGE	jdk.internal.constant		
+PACKAGE	jdk.internal.event		
+PACKAGE	jdk.internal.foreign		
+PACKAGE	jdk.internal.foreign.abi		
+PACKAGE	jdk.internal.foreign.abi.aarch64		
+PACKAGE	jdk.internal.foreign.abi.aarch64.linux		
+PACKAGE	jdk.internal.foreign.abi.aarch64.macos		
+PACKAGE	jdk.internal.foreign.abi.aarch64.windows		
+PACKAGE	jdk.internal.foreign.abi.fallback		
+PACKAGE	jdk.internal.foreign.abi.ppc64		
+PACKAGE	jdk.internal.foreign.abi.ppc64.aix		
+PACKAGE	jdk.internal.foreign.abi.ppc64.linux		
+PACKAGE	jdk.internal.foreign.abi.riscv64		
+PACKAGE	jdk.internal.foreign.abi.riscv64.linux		
+PACKAGE	jdk.internal.foreign.abi.s390		
+PACKAGE	jdk.internal.foreign.abi.s390.linux		
+PACKAGE	jdk.internal.foreign.abi.x64		
+PACKAGE	jdk.internal.foreign.abi.x64.sysv		
+PACKAGE	jdk.internal.foreign.abi.x64.windows		
+PACKAGE	jdk.internal.foreign.layout		
+PACKAGE	jdk.internal.icu.impl		
+PACKAGE	jdk.internal.icu.impl.data.icudt76b		
+PACKAGE	jdk.internal.icu.lang		
+PACKAGE	jdk.internal.icu.text		
+PACKAGE	jdk.internal.icu.util		
+PACKAGE	jdk.internal.invoke		
+PACKAGE	jdk.internal.io		
+PACKAGE	jdk.internal.javac		
+PACKAGE	jdk.internal.jimage		
+PACKAGE	jdk.internal.jimage.decompressor		
+PACKAGE	jdk.internal.jmod		
+PACKAGE	jdk.internal.jrtfs		
+PACKAGE	jdk.internal.lang.stable		
+PACKAGE	jdk.internal.loader		
+PACKAGE	jdk.internal.logger		
+PACKAGE	jdk.internal.math		
+PACKAGE	jdk.internal.misc		
+PACKAGE	jdk.internal.module		
+PACKAGE	jdk.internal.org.xml.sax		
+PACKAGE	jdk.internal.org.xml.sax.helpers		
+PACKAGE	jdk.internal.perf		
+PACKAGE	jdk.internal.platform		
+PACKAGE	jdk.internal.random		
+PACKAGE	jdk.internal.ref		
+PACKAGE	jdk.internal.reflect		
+PACKAGE	jdk.internal.util		
+PACKAGE	jdk.internal.util.random		
+PACKAGE	jdk.internal.util.regex		
+PACKAGE	jdk.internal.util.xml		
+PACKAGE	jdk.internal.util.xml.impl		
+PACKAGE	jdk.internal.vm		
+PACKAGE	jdk.internal.vm.annotation		
+PACKAGE	jdk.internal.vm.vector		
+PACKAGE	sun.invoke.empty		
+PACKAGE	sun.invoke.util		
+PACKAGE	sun.io		
+PACKAGE	sun.launcher		
+PACKAGE	sun.launcher.resources		
+PACKAGE	sun.net		
+PACKAGE	sun.net.dns		
+PACKAGE	sun.net.ext		
+PACKAGE	sun.net.ftp		
+PACKAGE	sun.net.ftp.impl		
+PACKAGE	sun.net.idn		
+PACKAGE	sun.net.sdp		
+PACKAGE	sun.net.smtp		
+PACKAGE	sun.net.spi		
+PACKAGE	sun.net.util		
+PACKAGE	sun.net.www		
+PACKAGE	sun.net.www.content.text		
+PACKAGE	sun.net.www.http		
+PACKAGE	sun.net.www.protocol.file		
+PACKAGE	sun.net.www.protocol.ftp		
+PACKAGE	sun.net.www.protocol.http		
+PACKAGE	sun.net.www.protocol.http.ntlm		
+PACKAGE	sun.net.www.protocol.https		
+PACKAGE	sun.net.www.protocol.jar		
+PACKAGE	sun.net.www.protocol.jmod		
+PACKAGE	sun.net.www.protocol.jrt		
+PACKAGE	sun.net.www.protocol.mailto		
+PACKAGE	sun.nio		
+PACKAGE	sun.nio.ch		
+PACKAGE	sun.nio.cs		
+PACKAGE	sun.nio.fs		
+PACKAGE	sun.reflect.annotation		
+PACKAGE	sun.reflect.generics.factory		
+PACKAGE	sun.reflect.generics.parser		
+PACKAGE	sun.reflect.generics.reflectiveObjects		
+PACKAGE	sun.reflect.generics.repository		
+PACKAGE	sun.reflect.generics.scope		
+PACKAGE	sun.reflect.generics.tree		
+PACKAGE	sun.reflect.generics.visitor		
+PACKAGE	sun.reflect.misc		
+PACKAGE	sun.security.ec		
+PACKAGE	sun.security.ec.ed		
+PACKAGE	sun.security.ec.point		
+PACKAGE	sun.security.internal.interfaces		
+PACKAGE	sun.security.internal.spec		
+PACKAGE	sun.security.jca		
+PACKAGE	sun.security.pkcs		
+PACKAGE	sun.security.pkcs10		
+PACKAGE	sun.security.pkcs12		
+PACKAGE	sun.security.provider		
+PACKAGE	sun.security.provider.certpath		
+PACKAGE	sun.security.provider.certpath.ssl		
+PACKAGE	sun.security.rsa		
+PACKAGE	sun.security.ssl		
+PACKAGE	sun.security.timestamp		
+PACKAGE	sun.security.tools		
+PACKAGE	sun.security.tools.keytool		
+PACKAGE	sun.security.tools.keytool.resources		
+PACKAGE	sun.security.util		
+PACKAGE	sun.security.util.math		
+PACKAGE	sun.security.util.math.intpoly		
+PACKAGE	sun.security.util.resources		
+PACKAGE	sun.security.validator		
+PACKAGE	sun.security.x509		
+PACKAGE	sun.text		
+PACKAGE	sun.text.resources		
+PACKAGE	sun.text.resources.cldr		
+PACKAGE	sun.text.spi		
+PACKAGE	sun.util		
+PACKAGE	sun.util.calendar		
+PACKAGE	sun.util.cldr		
+PACKAGE	sun.util.locale		
+PACKAGE	sun.util.locale.provider		
+PACKAGE	sun.util.logging		
+PACKAGE	sun.util.resources		
+PACKAGE	sun.util.resources.cldr		
+PACKAGE	sun.util.spi		
+PROVIDES	java.nio.file.spi.FileSystemProvider	jdk.internal.jrtfs.JrtFileSystemProvider	
+USES	java.lang.System$LoggerFinder		
+USES	java.net.ContentHandlerFactory		
+USES	java.net.spi.InetAddressResolverProvider		
+USES	java.net.spi.URLStreamHandlerProvider		
+USES	java.nio.channels.spi.AsynchronousChannelProvider		
+USES	java.nio.channels.spi.SelectorProvider		
+USES	java.nio.charset.spi.CharsetProvider		
+USES	java.nio.file.spi.FileSystemProvider		
+USES	java.nio.file.spi.FileTypeDetector		
+USES	java.security.Provider		
+USES	java.text.spi.BreakIteratorProvider		
+USES	java.text.spi.CollatorProvider		
+USES	java.text.spi.DateFormatProvider		
+USES	java.text.spi.DateFormatSymbolsProvider		
+USES	java.text.spi.DecimalFormatSymbolsProvider		
+USES	java.text.spi.NumberFormatProvider		
+USES	java.time.chrono.AbstractChronology		
+USES	java.time.chrono.Chronology		
+USES	java.time.zone.ZoneRulesProvider		
+USES	java.util.spi.CalendarDataProvider		
+USES	java.util.spi.CalendarNameProvider		
+USES	java.util.spi.CurrencyNameProvider		
+USES	java.util.spi.LocaleNameProvider		
+USES	java.util.spi.ResourceBundleControlProvider		
+USES	java.util.spi.ResourceBundleProvider		
+USES	java.util.spi.TimeZoneNameProvider		
+USES	java.util.spi.ToolProvider		
+USES	javax.security.auth.spi.LoginModule		
+USES	jdk.internal.io.JdkConsoleProvider		
+USES	jdk.internal.logger.DefaultLoggerFinder		
+USES	sun.text.spi.JavaTimeDateTimePatternProvider		
+USES	sun.util.locale.provider.LocaleDataMetaInfo		
+USES	sun.util.resources.LocaleData$CommonResourceBundleProvider		
+USES	sun.util.resources.LocaleData$SupplementaryResourceBundleProvider		
+USES	sun.util.spi.CalendarProvider		

@@ -1,0 +1,61 @@
+[package]
+name = "cratonvm-native-awt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AWT/Swing/Java2D native peer implementation for CratonVM"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+# Round-7 cross-cutting Fix 3: cap trace!/debug! at compile time in release.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
+parking_lot.workspace = true
+bitflags = "2"
+rustc-hash.workspace = true
+image_crate = { package = "image", version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# fontdue is pure Rust — used by the X11 and Cocoa backends for glyph
+# rasterization. Declared at the top level so it is available on all
+# target platforms that need it (Linux, macOS). The Windows backend uses
+# DirectWrite and does not pull this dep.
+fontdue = "0.9"
+
+# Platform-specific windowing backends
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_DirectWrite",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = "0.2"
+objc2-app-kit = { version = "0.2", features = ["NSWindow", "NSView", "NSEvent", "NSGraphicsContext", "NSImage", "NSPasteboard", "NSApplication", "NSFont", "NSColor", "NSTextField", "NSButton", "NSMenu", "NSAttributedString"] }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

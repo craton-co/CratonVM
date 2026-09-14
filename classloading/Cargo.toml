@@ -1,0 +1,115 @@
+[package]
+name = "cratonvm-classloading"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Class loading subsystem for CratonVM"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Committed compiled Java fixtures under tests/fixtures/ are intentionally
+# packaged so the redefine/security integration tests exercise the same bytes
+# from a cargo package copy as they do from the workspace checkout.
+
+# The no-real-JDK build. This crate has no natives of its own; the feature
+# exists because `synthetic_stub_fields` must describe a DIFFERENT layout in
+# that build for the four `java.io` Reader/Writer classes, whose only writers
+# (`native_isr_init` and friends, in `cratonvm-native-io`) are gated on it. See
+# `shadow_layout::reader_writer_models_match_the_build`, which asserts both
+# arms, and the model table's own comment for why the split is the honest
+# spelling rather than one model that is wrong in one of the two builds.
+#
+# Declared here so the `#[cfg(feature = "synthetic-jdk")]` arms are not inert:
+# an undeclared feature name compiles to `false` with only an `unexpected cfg
+# condition value` WARNING, which is exactly the shape of an arm that ships
+# doing nothing.
+[features]
+synthetic-jdk = []
+
+[dependencies]
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
+cratonvm-native-builtins-crypto = { path = "../native-builtins-crypto", version = "0.3.0" }
+# Phase accounting (`docs/observability/phase-accounting.md` §10.2): the
+# `Category::ClassLoad` / `Category::Verification` spans in `class_manager.rs`
+# and `verifier.rs` need `cratonvm_jfr::phase`. Acyclic by inspection:
+# `cratonvm-jfr` depends on `cratonvm-types` and nothing else in the workspace
+# (and has no `[dev-dependencies]` at all), and `cratonvm-types` depends on no
+# workspace crate.
+cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
+tracing.workspace = true
+parking_lot.workspace = true
+zip.workspace = true
+rustc-hash.workspace = true
+memmap2 = "0.9"
+# Round 8 audit fix (CRIT): hashbrown provides stable `raw_entry_mut` API used
+# by `LinkResolver::get` to probe the `(ClassId, Arc<str>, Arc<str>)` cache by
+# `(ClassId, &str, &str)` without paying two Arc clones per hit. std's
+# `raw_entry_mut` is still nightly-only.
+hashbrown = "0.14"
+# Task #1/#40 — real JAR signature + trust-store verification (jar_signer.rs).
+# Both crates are ALREADY in the workspace `Cargo.lock` (pulled in by
+# `native-builtins`): `sha2` 0.10.9 and `p12` 0.6.3. Declaring them here as
+# direct deps adds no new external fetch.
+#
+# `sha2` supplies the SHA-384 / SHA-512 digests used by modern jarsigner
+# `.SF` bindings and by RSA PKCS#1 v1.5 DigestInfo verification. SHA-1 /
+# SHA-256 remain the in-module implementations (kept for the legacy paths
+# already exercised by this file's tests).
+sha2 = "0.10"
+# `p12` parses PKCS#12 / PFX trust stores (CertBag extraction) so a
+# `*.p12` / `*.pfx` `javax.net.ssl.trustStore` yields real trust anchors.
+# JKS is hand-rolled in-module (the format is fully open).
+p12 = "0.6"
+
+# FEAT(jar-signer): real ECDSA / DSA signer-block verification + RFC 5280
+# certification-path validation.  All RustCrypto, pure-Rust (no OpenSSL),
+# audited, and already on the `der = 0.7` / `spki = 0.7` / `signature = 2`
+# axis that the workspace lock pins (via `native-builtins`), so they slot
+# in without churning unrelated transitive versions.
+#
+# * `x509-cert` — RFC 5280 Certificate / TBSCertificate / extension parsing
+#   (BasicConstraints, KeyUsage, ExtendedKeyUsage) for path validation.
+# * `ecdsa` + `p256` + `p384` — ECDSA P-256 / P-384 signature verification
+#   over the CMS SignedAttributes and over each X.509 chain link's TBS.
+# * `dsa` — DSA (DSS) signature verification for legacy `*.DSA` signer
+#   blocks and DSA-signed chain links.
+# * `const-oid` — typed OID constants shared with `x509-cert`.
+# * `der` — DER decoding of ECDSA `SEQUENCE { r, s }` signatures and of
+#   the EC / DSA AlgorithmIdentifier parameters in the SPKI.
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+# `pkcs8` feature gives `VerifyingKey::from_public_key_der` (SPKI decoding);
+# `ecdsa` feature pulls `ecdsa-core` with `der` (DER `r,s` signatures) +
+# the verifying path.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+dsa = "0.6"
+const-oid = { version = "0.9", default-features = false }
+der = { version = "0.7", default-features = false, features = ["oid"] }
+
+[dev-dependencies]
+# Used by `tests/wp_security_robustness.rs` to materialise synthetic JARs
+# and `.class` fixtures into a tempdir for the classloading hardening
+# tests (zip-slip, zip-bomb, bad magic, two-loader isolation, circular
+# hierarchy, redefine rollback).
+tempfile = "3"
+# Test-only: the jar-signer round-trip tests sign with ECDSA and DER-encode
+# the (r,s) signature + the SPKI public key. `p256`'s `ecdsa` feature does not
+# turn on the ecdsa crate's `der` module, and `EncodePublicKey` lives in
+# `spki`; pull both here (test builds only — no production binary impact).
+# Versions match the production p256/p384 0.13 axis (ecdsa 0.16 / spki 0.7).
+ecdsa = { version = "0.16", features = ["der"] }
+spki = { version = "0.7", features = ["alloc"] }
+# `EncodePublicKey::to_public_key_der` for `PublicKey<C>` is gated on
+# elliptic-curve's `alloc` + `pkcs8` features; force them on for test builds.
+elliptic-curve = { version = "0.13", features = ["alloc", "pkcs8", "sec1"] }
+
+[lints]
+workspace = true

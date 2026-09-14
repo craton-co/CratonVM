@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2026 Craton Software Company
+#
+# Run the flag-surface guards before a push reaches a shared branch.
+#
+# # Why a hook, when CI already runs this
+#
+# `.github/workflows/ci.yml`'s `cargo test --workspace` covers these tests, and
+# it has never been the problem. The problem is *when* it runs: this repository
+# is worked in dozens of local worktrees whose branches are merged into `dev`
+# and pushed directly, so CI is a post-hoc detector — it can report red, it
+# cannot prevent it. Four undeclared `CRATONVM_*` flags reached `dev` on
+# 2026-08-11 alone, each found downstream by whoever branched next.
+#
+# The window this closes is exactly the one CI cannot: between "the change is
+# committed" and "the change is on a branch someone else builds from".
+#
+# # Why these tests and not more
+#
+# Everything here is cheap and deterministic — no VM boots, no fixtures, no
+# network. Warm, the three test targets take about 1.8 s together, which is the
+# whole reason this is viable as a push-time gate. A hook that costs minutes
+# gets `--no-verify`d permanently and is worse than no hook, so the scope is
+# deliberately the flag surface and nothing else. It is not a substitute for
+# running the tests your change actually touches.
+#
+# # Escape hatches, in order of preference
+#
+#   git push --no-verify              # skip every hook, once
+#   CRATONVM_SKIP_FLAG_HOOK=1 git push  # skip just this check, once
+#
+# The second exists so a push can skip *this* gate without also skipping any
+# other hook a future change adds.
+#
+# # Install
+#
+#   git config core.hooksPath .githooks
+#
+# `core.hooksPath` is local configuration and cannot be committed, so this is
+# opt-in per clone by design — see docs/contributing/flag-surface-hook.md.
+set -uo pipefail
+
+if [ -n "${CRATONVM_SKIP_FLAG_HOOK:-}" ]; then
+  echo "pre-push: flag-surface guard skipped (CRATONVM_SKIP_FLAG_HOOK)" >&2
+  exit 0
+fi
+
+# A delete-only push (`git push origin --delete <branch>`) has nothing to
+# check: git feeds the hook a local ref of all zeros for each deletion. Reading
+# stdin also matters for its own sake — a hook that leaves it unread can make
+# git report a broken pipe on large pushes.
+zero='0000000000000000000000000000000000000000'
+have_update=0
+while read -r _local_ref local_oid _remote_ref _remote_oid; do
+  if [ "$local_oid" != "$zero" ]; then
+    have_update=1
+  fi
+done
+if [ "$have_update" -eq 0 ]; then
+  exit 0
+fi
+
+# Resolve the repository even when the hook runs from a worktree or a
+# subdirectory: `--show-toplevel` is the working tree's root, which is where
+# the Cargo workspace lives.
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT" || exit 1
+
+CARGO_BIN="${CARGO:-$(command -v cargo 2>/dev/null || true)}"
+if [ -z "$CARGO_BIN" ] && [ -x "$HOME/.cargo/bin/cargo" ]; then
+  CARGO_BIN="$HOME/.cargo/bin/cargo"
+fi
+if [ -z "$CARGO_BIN" ]; then
+  # Refusing to push because cargo is missing would be worse than the problem:
+  # a docs-only push from a machine without a toolchain is legitimate. Say so
+  # rather than passing silently, which would read as "checked, fine".
+  echo "pre-push: cargo not found — flag-surface guard NOT run" >&2
+  exit 0
+fi
+
+# Two invocations, not one. The three integration targets check the surface
+# against the code and the docs; `flag_groups`'s own unit tests check the
+# INVENTORY table's internal invariants - that a row expands to something, that
+# `off_word` only appears on a default-ON knob with no opt-out key, and that no
+# legacy variable is claimed by two tokens.
+#
+# Those live in the types crate's LIB, so the target list below never ran them,
+# and the class went uncaught: on 2026-09-04 three `CRATONVM_XT_*` rows named
+# the same variable as BOTH `on_key` and `off_key` and reached `dev`, holding
+# two lib tests red until someone tripped over them downstream.
+#
+# Folding `--lib` into the one invocation would run the WHOLE types lib -
+# measured 24 s against the ~2 s the three targets cost, which is exactly the
+# number that gets a hook `--no-verify`d permanently. Filtered to `flag_groups`
+# in its own invocation it is ~1 s warm.
+echo "pre-push: checking the CRATONVM_* flag surface..." >&2
+if "$CARGO_BIN" test -q -p cratonvm-types \
+     --test flag_declaration_guard \
+     --test flag_docs_generated \
+     --test flag_surface \
+   && "$CARGO_BIN" test -q -p cratonvm-types --lib flag_groups; then
+  exit 0
+fi
+
+cat >&2 <<'EOF'
+
+pre-push: the CRATONVM_* flag surface is out of step with the code.
+
+An undeclared flag is served by a live `getenv` rather than by the latched
+`VmFlags` snapshot, so `CRATONVM_<GROUP>=token` cannot reach it and
+`flags::with_thread_overrides` cannot arrange it in a test — a flag-dependent
+test then silently measures whatever the developer's environment happens to
+say. That is why this is a gate and not a lint.
+
+To fix, in order:
+
+  1. types/src/flag_groups.rs   — add an `E { .. }` row to INVENTORY.
+                                  Token stated positively, lower-case,
+                                  hyphenated. A knob spelled only
+                                  `CRATONVM_X_NO_Y` gets `off_key` and no
+                                  `on_key`.
+  2. the read site              — if it uses `std::env::var`, move it onto the
+                                  crate's snapshot accessor (`nbflags()`,
+                                  `gc_flags()`, ...) and add the typed field to
+                                  types/src/flags.rs. If it already uses
+                                  `flags::runtime_var[_os]`, step 1 is the
+                                  whole fix: that function serves declared
+                                  names from the snapshot on its own.
+  3. types/tests/flag-surface.txt — add the name, keeping the file sorted.
+  4. regenerate BOTH docs, do not hand-edit them:
+         python tools/flag-census/render-inventory.py .
+         bash   tools/flag-census/render-tokens.sh
+     (render-inventory refuses to run if step 3 was skipped.)
+
+Then re-run:
+
+  cargo test -p cratonvm-types
+
+If this push genuinely should not be gated on it:
+
+  CRATONVM_SKIP_FLAG_HOOK=1 git push ...     # skip this check
+  git push --no-verify ...                   # skip every hook
+
+EOF
+exit 1

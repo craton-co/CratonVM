@@ -1,0 +1,42 @@
+[package]
+name = "cratonvm-native-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native method API for CratonVM — NativeContext trait and registry"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# When enabled, exposes `test_mock::MockNativeContext` to downstream crates so
+# they can drive `NativeContext` trait default impls without standing up a
+# full VM. Auto-enabled inside this crate under `#[cfg(test)]`.
+test-mock = []
+
+[dependencies]
+cratonvm-types = { path = "../types", version = "0.3.0" }
+parking_lot.workspace = true
+socket2 = { version = "0.5", features = ["all"] }
+native-tls = "0.2"
+rustc-hash.workspace = true
+libc = "0.2"
+# Legacy / CJK multi-byte charset transcoding (Shift_JIS, EUC-JP/KR, Big5,
+# GBK/GB18030, ISO-2022-JP, …). The hand-written codecs in `charset.rs` only
+# cover the single-byte / Unicode families; encoding_rs (the Gecko/Servo
+# Encoding Standard implementation) backs the multi-byte ones.
+encoding_rs = "0.8"
+# `layout_alias` reports its census on the same channel the funnel-only detector
+# used, so a consumer's filter is unchanged by the move out of `native-builtins`.
+# The workspace pin carries `release_max_level_info`, which keeps `warn!`
+# compiled in release — a census that vanished from the build people actually
+# run would be worse than no census.
+tracing.workspace = true
+
+[lints]
+workspace = true

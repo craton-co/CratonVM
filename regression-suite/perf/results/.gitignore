@@ -1,0 +1,20 @@
+# run-cratonbench-gate.sh writes one directory per run here:
+#
+#   results/v<schema>/<utc>-<host>-<revision>/
+#       manifest.tsv / manifest.json     environment + provenance
+#       samples.tsv  / samples.json      EVERY raw sample, never only the summary
+#       summary.tsv  / summary.json      p50/p90/p99/min/max/CV per phase
+#       reliability-{pre,post}flight.*   the gate's verdict on the measurement
+#
+# Those are local measurement artifacts, not source, and a `git add -A` on this
+# Windows checkout will happily sweep hundreds of them into a commit. They are
+# ignored by default.
+#
+# To publish a run as evidence (an anchored baseline, a retraction, a half-gap
+# writeup), add it deliberately:
+#
+#   git add -f regression-suite/perf/results/v1/<run-id>
+#
+# and reference the run_id from the evidence document, so the numbers in the
+# document can be re-derived from the samples rather than believed.
+v*/
