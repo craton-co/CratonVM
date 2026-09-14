@@ -1,0 +1,4 @@
+# Deliberately names a class that does not exist, so RJdkServices can assert
+# that ServiceLoader raises ServiceConfigurationError instead of fabricating a
+# provider. Do not "fix" this entry.
+RJdkServices$NoSuchProviderClass

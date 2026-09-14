@@ -1,0 +1,33 @@
+[package]
+name = "cratonvm-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared types for the CratonVM project"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["jvm", "java", "bytecode", "types"]
+categories = ["data-structures", "encoding"]
+
+[dependencies]
+thiserror.workspace = true
+# AUDIT 2026-05-16 (CRIT-P1/P2): StringPool moved from `Mutex<HashSet>` + default
+# SipHash to `parking_lot::RwLock<FxHashMap<Arc<str>, ()>>`. Reads no longer
+# serialize on the global Mutex, and FxHash is ~3-5x faster than SipHash for the
+# short ASCII strings (class names, descriptors) that dominate class loading.
+parking_lot.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+# Property-based testing for round-trip invariants of the Value /
+# CompactValue codecs (`encode_value` ↔ `decode_value`, `from_value` ↔
+# `to_value`). Lightweight, no proc-macro deps; pinned to a recent 1.x
+# release for stability.
+proptest = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,208 @@
+# FOUR gates were RED on pristine `dev` — three from one refactor (OPEN), one from GPU work (FIXED)
+
+**Status: OPEN, MEASURED, NOT THIS BRANCH'S.** 2026-08-22.
+
+## What is failing
+
+`cargo test -p cratonvm-native-builtins --test registrar_drift` on a detached
+worktree at **pristine `origin/dev` = `a7c22ddc1`**, carrying none of
+`claude/jdk-only-mode-handoff-09b48c`:
+
+```text
+test the_drift_scanner_is_not_vacuous ................... FAILED
+test the_two_gates_agree_on_the_synthetic_only_population  FAILED
+test the_drift_baseline_has_no_stale_rows ............... FAILED
+```
+
+Identical numbers on the integration branch, which is how the attribution was
+settled rather than argued:
+
+```text
+1027 register sites could not be resolved and are NOT the proven-benign
+`arity<4` receivers (ceiling 1000, measured 950 on 2026-08-17).
+Breakdown: {"arity<4": 499, "expression": 13, "format!": 18,
+            "no-enclosing-fn": 16, "no-registry-owner": 14,
+            "unbound-identifier": 966}
+
+register_pe2_string_marshaling_on: synthetic-only HERE, absent from
+tests/registrar_reachability.rs's closure
+(defined at native-builtins/src/panama.rs:6478)
+```
+
+The third one, the two stale `MemorySegment` pairs, **is already fixed** on the
+integration branch by re-taking `DRIFT_TRIPLES` (`getUtf8String(J)` and
+`reinterpret(J)`, both collapsed onto `register_p67_foreign_memory`). Only the
+two above are outstanding.
+
+## One refactor causes both
+
+`native-builtins/src/panama.rs:6472`:
+
+```rust
+fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
+    for ms in [PE_SEGMENT_INTERFACE, CRATON_SEGMENT_CLASS] {
+        register_pe2_string_marshaling_on(r, ms);
+    }
+}
+
+fn register_pe2_string_marshaling_on(r: &mut NativeMethodRegistry, ms: &str) {
+    r.register(ms, "getUtf8String", "(J)Ljava/lang/String;", ...)
+```
+
+The class is now the parameter `ms`, not a literal. That is exactly the
+**class-parameterised registrar** the vacuity control names as a form drift can
+hide inside, and it explains both failures at once:
+
+* every `r.register(ms, …)` in the new helper lands in `unbound-identifier`,
+  which is 966 of the 1027 and pushes the blind region past its 1000 ceiling;
+* one scanner follows the call into the helper and the other does not, so
+  `register_pe2_string_marshaling_on` is synthetic-only to one gate and unknown
+  to the other;
+* and it reads as a NEWLY ORPHANED pass to a third gate in the sibling file,
+  `registrar_reachability.rs::no_registrar_silently_orphaned_into_the_synthetic_arm`:
+
+  ```text
+  1 registration pass(es) became synthetic-only:
+      register_pe2_string_marshaling_on
+          defined at native-builtins/src/panama.rs:6478
+          called from register_pe2_string_marshaling @ panama.rs:6472
+  ```
+
+  That gate exists for the case where a pass HAD a shipping call site and lost
+  it — "the `register_pe_panama` shape: one call site, inside
+  `register_synthetic_overrides`, and two modes running different code with
+  every test on the wrong one". Here it is a new name rather than a lost call
+  site, but the gate cannot tell those apart, which is the third symptom of the
+  same missing resolver form.
+
+**Provenance, checked rather than inferred:** this branch never touches
+`panama.rs` (`git log origin/dev..HEAD -- native-builtins/src/panama.rs` is
+empty), and `register_pe2_string_marshaling_on` arrives with `aecae7e51`
+*fix(ffm): every synthetic MemorySegment carried the INTERFACE as its class*.
+
+## A FOURTH, unrelated: two GPU flags are read but declared nowhere
+
+`cargo test -p cratonvm-types` → `flag_declaration_guard::
+every_cratonvm_literal_is_declared_or_explicitly_exempt`:
+
+```text
+2 CRATONVM_* variable(s) are read by code but declared nowhere.
+  CRATONVM_GPU_APPROX_MATH     first read at jit-cuda/src/analyzer.rs:245
+  CRATONVM_GPU_TIME_DISPATCH   first read at native-builtins/src/craton_gpu.rs:2517
+```
+
+Also dev's, also measured rather than inferred: `CRATONVM_GPU_APPROX_MATH`
+appears three times in `origin/dev:jit-cuda/src/analyzer.rs`, and
+`8b813b8dd` *perf(gpu): GPULlama3 on the GPU at 1.76x HotSpot* is an ancestor
+of `origin/dev`. This branch touches neither file.
+
+**Why it matters beyond a red board**, in the guard's own words: an undeclared
+flag is served by a live `getenv` rather than the latched `VmFlags` snapshot, so
+`CRATONVM_<GROUP>=token` cannot reach it and `with_thread_overrides` cannot
+arrange it in a test — "which is how a flag-dependent test ends up silently
+measuring the developer's ambient environment". Two GPU knobs are currently in
+that state.
+
+**FIXED 2026-08-23 (`521a5856c`).** The earlier draft of this section declined
+it on the grounds that minting a token is the GPU lane's semantics. That was
+over-cautious: the file already contained the precedent — `CRATONVM_GPU_DUMP_PTX`
+and `CRATONVM_GPU_TRACE_BYTES` are `Group::DBG` rows with an `on_key` and no
+`off_key` — so the shape needed no judgement, only the group:
+
+```text
+Group::JIT  gpu-approx-math     a codegen option; its own doc comment says it
+                                admits Math.exp and nothing else
+Group::DBG  gpu-time-dispatch   timing instrumentation
+```
+
+**Declaring alone would have been a half-fix, and the guard's own text is why.**
+Both sites read `std::env::var` DIRECTLY, so a declaration turns the gate green
+while `CRATONVM_JIT=gpu-approx-math` still cannot reach the flag and
+`with_thread_overrides` still cannot arrange it — the gate satisfied and the
+property it exists for still absent. Both reads now go through
+`flags::runtime_var`. No behaviour change: each site already cached in a
+`OnceLock` on first read, so latched and live are the same value by
+construction.
+
+`flag-surface.txt` updated; both generated docs regenerated with their own
+generators (909 rows / 898 declared, 882 tokens) rather than hand-edited.
+
+The three above stay OPEN for a reason that does NOT apply here: they need the
+resolver taught a new form, which changes the gate every lane is judged by,
+while its subject is still being edited on another branch.
+
+## Do not fix it by raising the ceiling
+
+The control says so itself, and the reason is the point: *"If a change needs to
+grow it, the honest move is to teach the resolver the new form, not to raise
+this number."* The 1027 is **the size of the region where drift is invisible to
+`no_new_mode_drift`** — the assertion cannot see drift arriving through these
+forms either, and all it claims is that the hiding place has not grown. Raising
+it to 1030 would buy a green board and enlarge the blind spot in the same edit.
+
+The resolver needs to learn one form: a registrar called in a `for` loop over a
+literal array of class-name constants registers, for each `r.register(param, …)`
+in its body, the cross product of that array with those triples.
+`register_pe2_string_marshaling`'s two-element array is the whole worked example.
+
+## Why this record and not a patch
+
+`fix/panama-segment-class-identity-20260822` is still moving — `a7c22ddc1` is
+its **round 2** merge — and the refactor is that lane's. Teaching the resolver a
+new form is a change to the gate every lane is judged by, made while its subject
+is still being edited. Recorded with the attribution measured so the owning lane
+can act on a fact rather than a guess.
+
+**What is safe to conclude meanwhile:** `no_new_mode_drift` is weaker than its
+green suggests, by an amount that grew on 2026-08-22 and is now unbounded by its
+own ceiling.
+
+---
+
+## 2026-09-10 — a SECOND instance of `the_drift_baseline_has_no_stale_rows`, with a different cause
+
+Still OPEN, still not the reporting branch's. Found by lane 2 of the nine-lane
+campaign, whose acceptance run went red on this one test with 4263 of 4264
+passing.
+
+```text
+  BASELINE_TOTAL_DRIFT   1224 in the tree, 1223 regenerated
+  BASELINE_TOTAL_PAIRS   1357 in the tree, 1356 regenerated
+  the single stale row:  ("java/lang/Class", "getModule", "()Ljava/lang/Module;")
+```
+
+**The cause is `register` becoming `register_with_kind`.** The scanner counts
+`register(` call sites, and lane 0 re-tagged `Class.getModule` as a reviewed
+`Intrinsic` — `native-builtins/src/lib.rs:12878` now reads
+`registry.register_with_kind("java/lang/Class", "getModule", ...)`. That is a
+correct and documented lane-0 action
+([`../jdk-only-lanes/lane-0-integration-and-gates.md`](../jdk-only-lanes/lane-0-integration-and-gates.md) §7),
+and it silently invalidated one baseline row.
+
+So this file's headline generalises: **a source-scanning drift gate goes stale
+on any edit that changes the SHAPE of a registration**, not only on the
+class-parameterised refactor of §1. A helper refactor hides rows; a kind re-tag
+removes one. Both read as the baseline being wrong.
+
+### The attribution, which cost one command rather than a bisect
+
+The gate is a pure function of the tree it reads at RUNTIME, so one prebuilt
+test binary scores any revision — no rebuild:
+
+```text
+  git stash push -- <the three source files this branch changed>
+  target/debug/deps/registrar_drift-a7573acec3fc41b0 the_drift_baseline_has_no_stale_rows
+  -> FAILED, identically
+  git stash pop
+```
+
+`git diff origin/dev` was empty for `registrar_drift.rs` and for every file that
+registers `getModule`, which is the same proof from the other side.
+
+**Not fixed here on purpose.** The stale row is lane 0's, the retirement it
+records is lane 0's, and lane 0 §4 keeps shared gate cells with their owner
+precisely so that two lanes do not re-freeze one ratchet from two trees. The
+movement is a single row with a stated cause, which is exactly what the gate's
+own paste-ready output asks for — *"say in the record WHICH rows moved and why.
+A re-take with no explanation is how a ratchet becomes a rubber stamp"* — so
+lane 0 can re-take it in one edit.

@@ -1,0 +1,29 @@
+[package]
+name = "cratonvm-jit-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "JIT compiler API types for CratonVM"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+
+[features]
+default = []
+# Expose the GpuLowering trait for future pluggable PTX backends. The
+# active workspace GPU path uses cratonvm-jit-cuda directly today, and
+# the CPU JIT does not link this off-by-default feature.
+gpu-lowering = []
+
+[lints]
+workspace = true

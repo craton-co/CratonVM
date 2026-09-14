@@ -1,0 +1,219 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2026 Craton Software Company
+#
+# Root .gitignore for the CratonVM repository.
+
+# =============================================================================
+# Internal Documentation & External Suites
+# =============================================================================
+# External third-party application checkouts, test suites, and sub-runners
+apps/
+
+# Internal company documentation, design postmortems, and resolved issue notes
+docs/internal/
+
+# =============================================================================
+# Rust & Cargo Build Artifacts
+# =============================================================================
+# Cargo build outputs (root workspace and standalone sub-crates)
+target/
+**/target/
+
+# Cargo backup files
+**/*.rs.bk
+
+# Standalone fuzz target locks and runner artifacts
+Cargo.lock.fuzz
+fuzz/artifacts/
+
+# Cargo timings and diagnostic output
+cargo-timings/
+
+# =============================================================================
+# Native & CUDA Compilation Artifacts
+# =============================================================================
+# Object and library files from C/C++/CUDA bridges
+*.o
+*.obj
+*.so
+*.so.*
+*.dylib
+*.dll
+*.a
+*.lib
+
+# CUDA compilation targets
+*.ptx
+!vm/src/runtime/kernels/*.ptx
+*.cubin
+*.fatbin
+*.optix
+
+# CMake build products
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+compile_commands.json
+
+# =============================================================================
+# Java & JVM Build Products & Diagnostics
+# =============================================================================
+# Standard Java compilation directories
+build/
+build-modules/
+bin/
+out/
+
+# Java class files (ignoring build products while preserving committed test fixtures)
+*.class
+!**/tests/**
+!**/fixtures/**
+!tools/test_classes/**
+!regression-suite/resources/**
+
+# Java archives (unless committed test fixtures)
+*.jar
+*.war
+*.ear
+!**/tests/**/*.jar
+!**/fixtures/**/*.jar
+
+# JVM crash logs and replay data
+hs_err_pid*.log
+replay_pid*.log
+
+# Java Flight Recorder (JFR) profiling sessions
+*.jfr
+!**/tests/**/*.jfr
+!**/fixtures/**/*.jfr
+
+# Transient test harness probes and report outputs
+.release-probe.*
+.jdk-only-reports.*
+difftest/corpus-opcodes/
+difftest/coverage-matrix.json
+
+# =============================================================================
+# Profiling, Benchmarks & Code Coverage
+# =============================================================================
+# LLVM / Rust source-based coverage and PGO profiles
+*.profraw
+*.profdata
+
+# Code coverage reports
+coverage/
+cobertura.xml
+lcov.info
+tarpaulin-report.*
+
+# Profiling and flamegraph data
+perf.data
+perf.data.old
+callgrind.out.*
+flamegraph.svg
+flamegraph.*
+criterion/
+
+# =============================================================================
+# Python & Scripting Artifacts
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+
+# =============================================================================
+# Secrets, Credentials & Local Environment
+# =============================================================================
+# Local environment variables
+.env
+.env.*
+!.env.example
+
+# Private keys, certificates, keystores, and credentials
+*.pem
+*.key
+!native-builtins/src/t27_certs/*.key
+*.keystore
+*.p12
+*.pfx
+id_rsa*
+credentials.json
+token.json
+
+# =============================================================================
+# Crash Dumps & System Logs
+# =============================================================================
+core
+core.*
+*.dmp
+*.log
+
+# =============================================================================
+# IDEs & Editor Configurations
+# =============================================================================
+# JetBrains / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Visual Studio Code
+.vscode/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.sln.docstates
+
+# Eclipse
+.project
+.classpath
+.settings/
+
+# General editor backups and swap files
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+*.temp
+\#*\#
+.#*
+
+# =============================================================================
+# Operating System Artifacts
+# =============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.fuse_hidden*
+
+# =============================================================================
+# AI Assistants & Local Scratch
+# =============================================================================
+.claude/
+.gemini/
+.cursor/
+.windsurf/
+scratch/
+tmp/

@@ -1,0 +1,23 @@
+# Default owners for all files
+* @craton-co/cratonvm-maintainers
+
+# Crate-specific ownership
+/reader/ @craton-co/cratonvm-maintainers
+/types/ @craton-co/cratonvm-maintainers
+/native-api/ @craton-co/cratonvm-maintainers
+/native-builtins/ @craton-co/cratonvm-maintainers
+/native-collections/ @craton-co/cratonvm-maintainers
+/native-io/ @craton-co/cratonvm-maintainers
+/jit-api/ @craton-co/cratonvm-maintainers
+/jit/ @craton-co/cratonvm-maintainers
+/classloading/ @craton-co/cratonvm-maintainers
+/gc/ @craton-co/cratonvm-maintainers
+/jfr/ @craton-co/cratonvm-maintainers
+/vm/ @craton-co/cratonvm-maintainers
+/vm-cli/ @craton-co/cratonvm-maintainers
+
+# Documentation
+/docs/ @craton-co/cratonvm-maintainers
+
+# CI and infrastructure
+/.github/ @craton-co/cratonvm-maintainers

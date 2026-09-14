@@ -1,0 +1,229 @@
+[package]
+name = "cratonvm-native-builtins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Java core native methods for CratonVM (java.lang.*)"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# Default build is synthetic-stub-free: real bytecode runs, or a clear
+# unimplemented error is thrown. See docs/synthetic-vs-real-explained.md.
+default = []
+# Propagated to `cratonvm-classloading` because the two halves of the java.io
+# Reader/Writer split must agree: this crate's `bw_synthetic_fd` reads slot 0
+# only under this feature, and `synthetic_stub_fields` must be naming that slot
+# `_vm0` in the same build. Enabling one without the other is a model that says
+# `writeBuffer` while a native parks an fd there.
+synthetic-jdk = ["cratonvm-classloading/synthetic-jdk"]
+# Compatibility shims that are intentionally default-off. Declaring these keeps
+# source cfgs and downstream feature requests visible to Cargo's check-cfg.
+app-stubs = []
+legacy-synthetic-crypto = []
+synthetic-quarkus-arc = []
+# NEW-13: a no-op. The native-tls backed javax.net.ssl implementation is
+# always compiled and registered, so this gates nothing. Declared only so
+# downstream feature requests and `check-cfg` keep resolving. Slated for
+# removal in 0.4. `experimental-tls` is the pre-2026-07-30 name, kept as a
+# back-compat alias — it wrongly implied TLS was feature-gated.
+deprecated-noop-tls = []
+experimental-tls = ["deprecated-noop-tls"]
+# `sun.management` (java.lang.management backing) + `javax.management` (JMX)
+# natives — the `jmx` / `jmx_openmbean` modules. Named `experimental-jmx`
+# until 2026-07-30, which was wrong twice: the surface is not an experiment
+# (cratonvm-vm enables it by default because `ManagementFactory` needs it),
+# and it is not confined to JMX. The old name stays as a back-compat alias
+# and is slated for removal in 0.4.
+management = []
+experimental-jmx = ["management"]
+experimental-serialization = []
+experimental-aot = []
+# Phase 3 — Java-side GPU surface (craton.gpu.internal.Native shims).
+# When off, native-builtins emits no GPU code; the registrar is a no-op.
+gpu-offload = []
+
+[dependencies]
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+cratonvm-native-builtins-crypto = { path = "../native-builtins-crypto", version = "0.3.0" }
+cratonvm-native-builtins-security = { path = "../native-builtins-security", version = "0.3.0" }
+cratonvm-native-io = { path = "../native-io", version = "0.3.0" }
+cratonvm-native-collections = { path = "../native-collections", version = "0.3.0" }
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+indexmap = "2"
+regex = "1"
+# Fallback regex engine for Java patterns that use features the `regex` crate
+# does not support: lookaround `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`,
+# atomic groups `(?>...)`, backreferences `\1`, possessive quantifiers `?+`,
+# `*+`, `++`. Encountered in log4j2 `PropertySource$Util.<clinit>` whose
+# `PREFIX_PATTERN` uses `(?=AsyncLogger(Config)?\.)`. We try `regex` first
+# (fast, DFA) and only fall back to `fancy-regex` (NFA + backtracking) when
+# the simpler engine rejects the pattern.
+#
+# Pinned to >=0.14: fancy-regex 0.13 only supports *constant-size* look-behind
+# and rejects variable-length look-behind ("Look-behind assertion without
+# constant size"). Java's `java.util.regex` allows variable-length look-behind,
+# and real workloads use it — Hazelcast's `AbstractXmlConfigHelper`
+# `.schemaValidation` splits on `(?<!\G\S+)\s` (a negative look-behind whose
+# `\G\S+` body is unbounded). 0.18 added variable-length look-behind support and
+# produces split results identical to the reference JDK for that pattern.
+fancy-regex = "0.18"
+parking_lot.workspace = true
+# WP4.2: VarHandle metadata side-table.
+rustc-hash.workspace = true
+# Round-7 cross-cutting Fix 3: cap trace!/debug! at compile time in release.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
+native-tls = "0.2"
+# T2.7: rustls provides server-side TLS (SSLServerSocket) with SNI dispatch,
+# ALPN negotiation, and TLS 1.3 session resumption — features that native-tls
+# 0.2 does not expose. We use `ring` as the crypto provider to avoid pulling
+# aws-lc-sys's C toolchain dependencies on Windows.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+# T2.7.4: real system trust store enumeration for X509TrustManager.getAcceptedIssuers
+rustls-native-certs = "0.8"
+# `column_decltype` gates `Statement::columns()` / `Column::decl_type()` — the
+# only way to read a result column's DECLARED SQLite type. Without it
+# ResultSetMetaData.getColumnType/getColumnTypeName have no data to work from
+# and report a hardcoded VARCHAR/TEXT for every column of every result set.
+# The feature is a pure cfg flag in rusqlite (`column_decltype = []`) — it adds
+# no transitive dependency and no C code.
+rusqlite = { version = "0.31", features = ["bundled", "column_decltype"] }
+# Zipkin verifies the exact bytes from the JDK's GZIPOutputStream, so its
+# Deflater path needs stock zlib rather than merely standards-compliant DEFLATE.
+# `zlib-rs` differs for the large JSON payload; the `zlib` feature below unifies
+# with static `libz-sys` and matches the JDK's encoding choices.
+flate2 = { version = "1", features = ["zlib"] }
+# The real GZIPOutputStream bridge requires stock-zlib's deterministic
+# DEFLATE stream, not merely a standards-compatible stream: Spring Boot's
+# Zipkin sender verifies the exact bytes produced by HotSpot.
+libz-sys = { version = "1.1.29", features = ["static"] }
+# Kafka third-party compression JNI shims (compression_native.rs): the Apache
+# Kafka record codecs use snappy-java (`org.xerial.snappy.SnappyNative`, block
+# format) and zstd-jni (`com.github.luben.zstd.*`, streaming format). We back
+# the snappy block natives with the pure-Rust `snap` crate and the zstd
+# streaming natives with `zstd` (bundled libzstd, byte-compatible with
+# zstd-jni's libzstd, so frames written by one decode with the other). Both
+# mirror the established `flate2`-backed Inflater/Deflater approach in
+# `zip_real.rs`.
+snap = "1"
+zstd = "0.13"
+# lz4-java (the `at.yawk.lz4` fork Kafka bundles) exposes `net.jpountz.lz4.LZ4JNI`
+# over the canonical LZ4 *block* format. `lz4_flex`'s raw `compress_into`/
+# `decompress_into` are byte-compatible with liblz4's block format (no size
+# prefix), so blocks framed by Kafka's pure-Java `KafkaLZ4Block*Stream` round
+# trip. Pure Rust — no extra C toolchain dependency.
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+# lz4-java also bundles xxHash (`net.jpountz.xxhash.XXHashJNI`) for the LZ4
+# frame's block/content checksums; `KafkaLZ4Block*Stream` hashes every block
+# with XXH32. `twox-hash` is a reference-compatible pure-Rust xxHash32/64.
+twox-hash = "1.6"
+# Round-12 follow-up to round-8 cross-cutting Bug 3: now on workspace 2.x
+# alongside `native-io`. The migration from 0.6 → 2.x switched every
+# `start_file` call site to `SimpleFileOptions` (the un-generic write
+# options type that 2.x exposes from `zip::write`); read paths
+# (`ZipArchive::new`, `by_name`, `ZipError`) are API-compatible.
+zip.workspace = true
+socket2 = { version = "0.5", features = ["all"] }
+# libc is used unconditionally for the NIO Selector poll path: on Unix it
+# exposes `poll(2)`, on Windows it exposes `WSAPoll` through the same API
+# surface, so a single call site handles both platforms (NEW-3).
+libc = "0.2"
+filetime = "0.2"
+# NEW-18: libffi for portable, ABI-correct dynamic FFI dispatch.
+# Handles arbitrary arities, mixed int/float register classification,
+# variadic calls, struct-by-value, and closure (upcall) stubs across
+# SysV (Linux/macOS) and Win64 ABIs.
+libffi = "3.2"
+# T2.6 — real crypto backends (RustCrypto family). These replace the
+# hand-rolled software primitives used under the legacy synthetic path
+# with audited, constant-time implementations.
+sha3 = "0.10"
+# SHA-2 family (notably SHA-224, which the hand-rolled `crypto_impl` SHA-256
+# code does not cover) for `MessageDigest.getInstance("SHA-224")`.
+sha2 = "0.10"
+# Auditable big-integer modular arithmetic for the byte-identical SunEC P-256
+# Montgomery field-multiply intrinsic (sunec_intpoly.rs). Reuses the
+# num-integer/num-traits already in the tree.
+num-bigint = "0.4"
+# Coarse native EC scalar-multiply for the SunEC point engine (sunec_point.rs,
+# default-on under route_ec_to_real). Bypasses the ~14 s one-time per-curve
+# generator-table precompute. P-256/384/521 (RustCrypto 0.13 family, aligned
+# elliptic-curve version).
+aes-gcm = "0.10"
+aes = "0.8"
+argon2 = "0.5.3"
+cbc = { version = "0.1", features = ["std"] }
+hmac = "0.12"
+subtle = "2"
+ctr = "0.9"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# T3.3: Real Unicode normalization (NFC, NFD, NFKC, NFKD) for java.text.Normalizer
+unicode-normalization = "0.1"
+# RA.4: streaming XML parser for JBoss Modules module.xml. `quick-xml` is a
+# pure-Rust, zero-alloc-friendly parser — no C toolchain dependencies.
+quick-xml = "0.31"
+# WP5.2: real PKCS#12 parsing for sun.security.pkcs12.PKCS12KeyStore. The p12
+# crate provides PFX/SafeBag/CertBag DER parsing and PBE-decrypt of shrouded
+# private-key bags — the surface real-JDK exposes.
+p12 = "0.6"
+# kcfull #12 (truststore): the `p12` crate parses every PKCS#12 layer with
+# yasna::parse_der (strict DER), which rejects the JDK's per-bag attribute SET
+# because the JDK does not DER-sort it (friendlyName before the Oracle
+# trustedKeyUsage attribute). SunJSSE reads it leniently. We re-run the SafeBag
+# walk in BER mode, so we need yasna directly (already in the tree via p12,
+# pinned to the same 0.5).
+yasna = "0.5"
+# WP5.2: SHA-1 needed for the JKS keystore HMAC integrity tag (a non-standard
+# `SHA1(password_utf16be || "Mighty Aphrodite" || body)` construction — not a
+# real HMAC). Pulled transitively by `p12` already, declared here so direct use
+# is explicit. The `compress` feature of zip uses sha1 too.
+sha1 = "0.10"
+# WP5.5 / WP5.6: HTTP/1.1 status-line + header parser. Pure-Rust, no_std-friendly,
+# zero-allocation parser. Used by `http_client.rs` and `http_url_connection.rs`
+# to drive the response head in JDK 11+ `java.net.http.HttpClient` and the
+# legacy `sun.net.www.protocol.http.HttpURLConnection` paths.
+httparse = "1.8"
+thiserror.workspace = true
+# T19_H10: real `Class.getPackage()` reads the source jar's manifest via the
+# launcher's ClassPath::read_jar_manifest API. Was previously a dev-dep but
+# the production code path needs it at runtime.
+cratonvm-classloading = { path = "../classloading", version = "0.3.0" }
+
+[dev-dependencies]
+cratonvm-native-api = { path = "../native-api", version = "0.3.0", features = ["test-mock"] }
+# Used by AOT + GraalVM tests for per-test tempdir isolation so
+# parallel runs cannot cross-contaminate on-disk state.
+tempfile = "3"
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Only the legacy DSA server fallback needs OpenSSL's per-context security
+# policy API. Keeping it Unix-scoped preserves the Windows dependency graph.
+openssl = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# The Windows half of the same need OpenSSL answers on Unix: the peer's FULL
+# certificate chain, which `native_tls` cannot hand out on any backend.
+#
+# This is NOT a new dependency. `schannel` is already in `Cargo.lock` at this
+# version because native-tls IS this crate on Windows -- its `imp/schannel.rs`
+# is a ~60-line wrapper over the same `SchannelCred` + `tls_stream::Builder`
+# used here. Naming it directly buys the one thing the wrapper does not
+# re-export: the remote certificate's attached store
+# (`CertContext::cert_store`), which is where SChannel puts the intermediates
+# the peer sent. The Windows dependency GRAPH is unchanged; only this crate's
+# view of it is.
+schannel = "0.1"

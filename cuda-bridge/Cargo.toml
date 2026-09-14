@@ -1,0 +1,76 @@
+[package]
+name = "cratonvm-cuda-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Thin CUDA Driver API bridge for CratonVM GPU offload"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["cuda", "ffi", "gpu", "nvidia"]
+categories = ["api-bindings", "external-ffi-bindings"]
+# Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.
+publish = false
+
+[dependencies]
+thiserror = { workspace = true }
+# For `gpu_event_census`: the per-launch driver-call counters are written
+# here and printed on the VM's exit path in another crate, and this is the
+# crate both of them already depend on. Same arrangement as
+# `cratonvm_types::cell_census`.
+cratonvm-types = { path = "../types", version = "0.3.0" }
+bytemuck = "1.16"
+# `critical.rs` names the holder of a leaked GPU critical-section token at
+# `error` level and reports an expired collector wait at `warn` level. Both
+# are defect signals that must be visible without anyone asking for a
+# report, which is the same argument every other crate in the workspace
+# makes for taking the workspace `tracing` pin.
+tracing = { workspace = true }
+
+# cudarc is optional: when the `cuda` feature is off, the crate
+# exposes the same surface but every entry point returns
+# `DeviceError::NoDriver`. This lets the rest of the workspace
+# build and test on machines without a CUDA toolkit.
+[dependencies.cudarc]
+version = "0.13"
+default-features = false
+features = ["driver", "cuda-12060"]
+optional = true
+
+# The second, opt-in driver backend: NVlabs' `cuda-core`, the host
+# runtime that cuda-oxide (NVIDIA's Rust-to-PTX compiler) is built on.
+# Same role as cudarc, different vendor -- see `backend_oxide.rs`.
+#
+# NOTE: `cuda-core` 0.3.1 does not compile on Windows/MSVC; the enums
+# bind signed there. Linux only until that is fixed upstream.
+[dependencies.cuda-core]
+version = "0.3.1"
+optional = true
+
+[features]
+# NOTE: `default = []` means a plain `cargo build`/`cargo check` only
+# compiles `backend_stub.rs`. The real `backend_cuda.rs` is ONLY built
+# behind the `cuda` feature below, so it can silently rot against cudarc
+# API changes. CI MUST run `cargo check -p cratonvm-cuda-bridge --features cuda`
+# to keep the real backend honest — see `.github/workflows/cuda-bridge.yml`.
+default = []
+# Compile against a real libcuda / nvcuda.dll via cudarc.
+cuda = ["dep:cudarc", "gpu-driver"]
+# Compile against a real libcuda via NVlabs' `cuda-core` instead.
+# Mutually exclusive with `cuda`: both provide the `backend` module, and
+# `lib.rs` refuses the combination with a `compile_error!`.
+cuda-oxide = ["dep:cuda-core", "gpu-driver"]
+# Internal marker: "some real driver backend is compiled in". Set by
+# `cuda` and `cuda-oxide`, never selected directly. Code that only asks
+# "is there a device?" tests THIS, so adding a third backend does not
+# mean auditing every `cfg(feature = "cuda")` in the crate again.
+gpu-driver = []
+# Reserved for driver-backed integration jobs; today this is an alias
+# for `cuda` because this crate has no local kernel-launching GPU tests.
+gpu-it = ["cuda"]
+
+[lints]
+workspace = true
