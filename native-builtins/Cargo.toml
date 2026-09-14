@@ -125,7 +125,7 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 # lz4-java also bundles xxHash (`net.jpountz.xxhash.XXHashJNI`) for the LZ4
 # frame's block/content checksums; `KafkaLZ4Block*Stream` hashes every block
 # with XXH32. `twox-hash` is a reference-compatible pure-Rust xxHash32/64.
-twox-hash = "1.6"
+twox-hash = "2.1"
 # Round-12 follow-up to round-8 cross-cutting Bug 3: now on workspace 2.x
 # alongside `native-io`. The migration from 0.6 → 2.x switched every
 # `start_file` call site to `SimpleFileOptions` (the un-generic write
