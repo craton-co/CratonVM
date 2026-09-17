@@ -5662,6 +5662,20 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
         "()[B",
         crate::native_is_read_all_bytes,
     );
+    // Same gap as readAllBytes just above: `InputStream.transferTo` is
+    // registered generically on `java/io/InputStream` (native-io/src/lib.rs),
+    // but the synthetic process pipe stream's class chain never reaches it
+    // via normal VM virtual dispatch. Surfaced as `NoSuchMethodError:
+    // 'long cratonvm.synthetic.ProcessPipeInputStream.transferTo(java.io.OutputStream)'`
+    // from background stream-drain threads (e.g. Quarkus's
+    // `ForkedJvmEnvironment` reading a forked JVM's stdout/stderr pipes).
+    // See docs/known-issues/quarkus/process-pipe-input-stream-transfer-to.md.
+    registry.register(
+        SYNTHETIC_PROCESS_INPUT_STREAM,
+        "transferTo",
+        "(Ljava/io/OutputStream;)J",
+        crate::native_is_transfer_to,
+    );
     registry.set_category(__synthetic_cat);
 
     // ProcessBuilder.start — route through the real spawn path. This is the

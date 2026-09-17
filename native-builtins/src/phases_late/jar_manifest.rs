@@ -1889,6 +1889,36 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
 /// than iterating — `by_name` on a `zip::ZipArchive` uses its already-parsed
 /// central-directory name index, so this stays cheap even on jars with
 /// thousands of entries.
+/// Cap on how many distinct jars' `ARCHIVES` entries (each a live
+/// `zip::ZipArchive<File>`, i.e. one held-open OS file descriptor) this
+/// process keeps around at once. `ARCHIVES` used to grow without bound —
+/// fine for a normal single-application JVM, which touches a small,
+/// bounded set of jars, but a batch test harness that runs many classes
+/// per process (`CratonRunner <class>...`) can call `getInputStream`/
+/// `getEntry` against thousands of DISTINCT jars over the process's life
+/// (every `ServiceLoader.load()` reads `META-INF/services/*` out of every
+/// jar on the classpath), so the never-evicted cache eventually exhausted
+/// the process's file descriptor table (`EMFILE`, "Too many open files")
+/// after roughly `ulimit -n` distinct jars were ever touched — surfacing
+/// as unrelated-looking crashes (`ServiceConfigurationError`,
+/// `FileNotFoundException`) partway through a multi-class batch run, not
+/// as an OOM or an obvious leak. Bounding this cache and evicting the
+/// oldest entry once it is full trades a re-parse of that jar's central
+/// directory on its next touch for never exhausting the descriptor table.
+/// Overridable via `CRATONVM_JAR_ARCHIVE_CACHE_CAP` for hosts with a much
+/// higher or lower `ulimit -n`.
+fn max_open_jar_archives() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("CRATONVM_JAR_ARCHIVE_CACHE_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(256)
+    })
+}
+
 pub(crate) fn jar_entry_bytes_cached(
     path: &str,
     entry_name: &str,
@@ -1900,9 +1930,14 @@ pub(crate) fn jar_entry_bytes_cached(
     // Keep the parsed central directory alive across distinct entries. The
     // signed-JAR parity test drains every entry, so reopening ZipArchive per
     // cache miss makes archive traversal quadratic in the entry count.
+    // Bounded (see `max_open_jar_archives`) so this cache cannot exhaust the
+    // process's file descriptor table on a workload that touches many
+    // distinct jars; `ARCHIVE_ORDER` records insertion order for FIFO
+    // eviction once it fills up.
     static ARCHIVES: OnceLock<
         Mutex<std::collections::HashMap<String, Arc<Mutex<zip::ZipArchive<std::fs::File>>>>>,
     > = OnceLock::new();
+    static ARCHIVE_ORDER: OnceLock<Mutex<std::collections::VecDeque<String>>> = OnceLock::new();
     if path.is_empty() || entry_name.is_empty() {
         return None;
     }
@@ -1930,10 +1965,27 @@ pub(crate) fn jar_entry_bytes_cached(
         let file = std::fs::File::open(path).ok()?;
         let opened = Arc::new(Mutex::new(zip::ZipArchive::new(file).ok()?));
         let mut archives = archives.lock().unwrap_or_else(|e| e.into_inner());
-        archives
-            .entry(archive_key)
+        let result = archives
+            .entry(archive_key.clone())
             .or_insert_with(|| opened.clone())
-            .clone()
+            .clone();
+        // Only the thread that actually won the insert (not a racer that hit
+        // the `or_insert_with` closure's already-present branch) records the
+        // key and drives eviction, so a concurrent open of the same jar never
+        // double-counts it in `ARCHIVE_ORDER`.
+        if Arc::ptr_eq(&result, &opened) {
+            let order = ARCHIVE_ORDER.get_or_init(|| Mutex::new(std::collections::VecDeque::new()));
+            let mut order = order.lock().unwrap_or_else(|e| e.into_inner());
+            order.push_back(archive_key);
+            let cap = max_open_jar_archives();
+            while archives.len() > cap {
+                let Some(oldest) = order.pop_front() else {
+                    break;
+                };
+                archives.remove(&oldest);
+            }
+        }
+        result
     };
     let mut archive = archive.lock().unwrap_or_else(|e| e.into_inner());
     let mut entry = archive.by_name(entry_name).ok()?;
