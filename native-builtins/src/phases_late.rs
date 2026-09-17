@@ -480,6 +480,35 @@ fn cm_lookup_registered(
     result
 }
 
+/// TEMP DIAGNOSTIC (CRATONVM_DBG_CMCTX) — render a `MethodCallFailed` with the
+/// actual Java exception class + message when it's an `ExceptionThrown`,
+/// instead of the opaque `ObjectRef` a bare `{:?}` would print.
+fn dbg_describe_failure(ctx: &mut dyn NativeContext, e: &MethodCallFailed) -> String {
+    if let MethodCallFailed::ExceptionThrown(exc_ref) = e {
+        let cid = ctx.class_id_of_object(*exc_ref);
+        let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+        let msg = match ctx.invoke_virtual(*exc_ref, "getMessage", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            other => format!("<getMessage() -> {other:?}>"),
+        };
+        let cause = match ctx.invoke_virtual(*exc_ref, "getCause", "()Ljava/lang/Throwable;", &[]) {
+            Ok(Some(Value::Object(Some(c)))) => {
+                let ccid = ctx.class_id_of_object(c);
+                let ccname = ctx.class_name_of_id(ccid).unwrap_or_default();
+                let cmsg = match ctx.invoke_virtual(c, "getMessage", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                    other => format!("<getMessage() -> {other:?}>"),
+                };
+                format!(" caused by {ccname}: {cmsg}")
+            }
+            _ => String::new(),
+        };
+        format!("ExceptionThrown({cname}: {msg}){cause}")
+    } else {
+        format!("{e:?}")
+    }
+}
+
 /// `SmallRyeConfig.getConfigMapping(Class, String)` — register the mapping with
 /// the live config (if not already) and return the real `$$CMImpl`.
 fn native_smallrye_get_config_mapping(
@@ -609,19 +638,32 @@ fn cm_construct_via_context(
     let this_pin = ctx.pin_native_root(this);
     let cls_pin = ctx.pin_native_root(cls);
     let prefix_pin = pinned_object_value(ctx, prefix);
+    let dbg = std::env::var("CRATONVM_DBG_CMCTX").is_ok();
     let result = (|| {
         let builder = match ctx.new_object("io/smallrye/config/SmallRyeConfigBuilder") {
             Ok(Some(Value::Object(Some(o)))) => o,
-            _ => return None,
+            other => {
+                if dbg {
+                    eprintln!("[CMCTX] new_object(SmallRyeConfigBuilder) -> {other:?}");
+                }
+                return None;
+            }
         };
         let builder_pin = ctx.pin_native_root(builder);
-        ctx.invoke(
+        if let Err(e) = ctx.invoke(
             "io/smallrye/config/SmallRyeConfigBuilder",
             "<init>",
             "()V",
             &[Value::Object(Some(builder))],
-        )
-        .ok()?;
+        ) {
+            if dbg {
+                eprintln!(
+                    "[CMCTX] SmallRyeConfigBuilder.<init> -> {}",
+                    dbg_describe_failure(ctx, &e)
+                );
+            }
+            return None;
+        }
         // Register the mapping in the builder (computes its @WithDefault values).
         let cls_cur = ctx.read_native_pin(cls_pin, cls);
         let prefix_cur = read_pinned_object_value(ctx, prefix_pin, prefix);
@@ -632,16 +674,34 @@ fn cm_construct_via_context(
             &[Value::Object(Some(cls_cur)), prefix_cur],
         ) {
             Ok(Some(Value::Object(Some(o)))) => o,
-            _ => return None,
+            Err(e) => {
+                if dbg {
+                    eprintln!(
+                        "[CMCTX] ConfigClass.configClass -> {}",
+                        dbg_describe_failure(ctx, &e)
+                    );
+                }
+                return None;
+            }
+            other => {
+                if dbg {
+                    eprintln!("[CMCTX] ConfigClass.configClass -> unexpected {other:?}");
+                }
+                return None;
+            }
         };
         let builder_cur = ctx.read_native_pin(builder_pin, builder);
-        ctx.invoke_virtual(
+        if let Err(e) = ctx.invoke_virtual(
             builder_cur,
             "withMapping",
             "(Lio/smallrye/config/ConfigMappings$ConfigClass;)Lio/smallrye/config/SmallRyeConfigBuilder;",
             &[Value::Object(Some(config_class))],
-        )
-        .ok()?;
+        ) {
+            if dbg {
+                eprintln!("[CMCTX] builder.withMapping -> {}", dbg_describe_failure(ctx, &e));
+            }
+            return None;
+        }
         // Merge the mapping's default values into the live config's default source so
         // `getValue` sees them while building the impl (mapConfiguration step 2).
         let this_cur = ctx.read_native_pin(this_pin, this);
@@ -673,17 +733,27 @@ fn cm_construct_via_context(
             &[],
         ) {
             Ok(Some(Value::Object(Some(o)))) => o,
-            _ => return None,
+            other => {
+                if dbg {
+                    eprintln!("[CMCTX] builder.getMappingsBuilder -> {other:?}");
+                }
+                return None;
+            }
         };
         let mb_pin = ctx.pin_native_root(mb);
         let context = match ctx.new_object("io/smallrye/config/ConfigMappingContext") {
             Ok(Some(Value::Object(Some(o)))) => o,
-            _ => return None,
+            other => {
+                if dbg {
+                    eprintln!("[CMCTX] new_object(ConfigMappingContext) -> {other:?}");
+                }
+                return None;
+            }
         };
         let context_pin = ctx.pin_native_root(context);
         let this_cur = ctx.read_native_pin(this_pin, this);
         let mb_cur = ctx.read_native_pin(mb_pin, mb);
-        ctx.invoke(
+        if let Err(e) = ctx.invoke(
             "io/smallrye/config/ConfigMappingContext",
             "<init>",
             "(Lio/smallrye/config/SmallRyeConfig;Lio/smallrye/config/SmallRyeConfigBuilder$MappingBuilder;)V",
@@ -692,8 +762,12 @@ fn cm_construct_via_context(
                 Value::Object(Some(this_cur)),
                 Value::Object(Some(mb_cur)),
             ],
-        )
-        .ok()?;
+        ) {
+            if dbg {
+                eprintln!("[CMCTX] ConfigMappingContext.<init> -> {}", dbg_describe_failure(ctx, &e));
+            }
+            return None;
+        }
         let cls_cur = ctx.read_native_pin(cls_pin, cls);
         let context_cur = ctx.read_native_pin(context_pin, context);
         match ctx.invoke(
@@ -706,7 +780,23 @@ fn cm_construct_via_context(
             ],
         ) {
             Ok(Some(Value::Object(Some(o)))) => Some(Value::Object(Some(o))),
-            _ => None,
+            Err(e) => {
+                if dbg {
+                    eprintln!(
+                        "[CMCTX] ConfigMappingLoader.configMappingObject -> {}",
+                        dbg_describe_failure(ctx, &e)
+                    );
+                }
+                None
+            }
+            other => {
+                if dbg {
+                    eprintln!(
+                        "[CMCTX] ConfigMappingLoader.configMappingObject -> unexpected {other:?}"
+                    );
+                }
+                None
+            }
         }
     })();
     ctx.unpin_native_roots(this_pin);
@@ -737,6 +827,26 @@ fn cm_fallback_alloc(ctx: &mut dyn NativeContext, cls: ObjectRef) -> MethodCallR
 /// JUnit test discovery — the identical failure class as the 2-arg Gap 6 bug,
 /// just reached through the 1-arg overload this fallback never covered).
 fn config_mapping_prefix(ctx: &mut dyn NativeContext, cls: ObjectRef) -> Value {
+    // Mirrors `ConfigMappingHandler$Handlers$ConfigMappingInterfaceHandler
+    // .getPrefix`, the default handler `ConfigMappingHandler$Handlers.find`
+    // falls back to for a plain interface:
+    //   ConfigMapping ann = cls.getAnnotation(ConfigMapping.class);
+    //   return ann != null ? ann.prefix() : "";
+    // The empty string — NOT null — is the real default. A `@ConfigGroup`
+    // interface used directly as a config-mapping root (no `@ConfigMapping`
+    // annotation at all, e.g. `OidcClientCommonConfig` in
+    // `OidcClientCommonConfigBuilder.CredentialsBuilder
+    // .getConfigBuilderWithDefaults`) has no annotation to read, and this
+    // used to fall through every `_ => ...` arm below to `Object(None)`
+    // (null). That null then reached `ConfigMappings$ConfigClass`'s
+    // constructor as its `path` argument, which null-checks it via
+    // `Assert.checkNotNullParam` and threw `IllegalArgumentException:
+    // Parameter 'path' may not be null` — silently caught by
+    // `cm_construct_via_context`'s `_ => None`, which then fell to
+    // `cm_fallback_alloc`'s bare synthetic-of-the-interface shim (no method
+    // bodies), so the FIRST call on it — any accessor, e.g.
+    // `OidcCommonConfig.authServerUrl()` — threw AbstractMethodError. See
+    // docs/known-issues/quarkus/oidc-common-config-auth-server-url-abstract-method.md.
     // Pin across the forName invoke below — a moving young GC there would
     // relocate `cls` (native stale-local family).
     let cls_pin = ctx.pin_native_root(cls);
@@ -750,7 +860,7 @@ fn config_mapping_prefix(ctx: &mut dyn NativeContext, cls: ObjectRef) -> Value {
         Ok(Some(Value::Object(Some(c)))) => c,
         _ => {
             ctx.unpin_native_roots(cls_pin);
-            return Value::Object(None);
+            return Value::Object(Some(ctx.create_string("")));
         }
     };
     let cls = ctx.read_native_pin(cls_pin, cls);
@@ -762,11 +872,11 @@ fn config_mapping_prefix(ctx: &mut dyn NativeContext, cls: ObjectRef) -> Value {
         &[Value::Object(Some(ann_cls))],
     ) {
         Ok(Some(Value::Object(Some(a)))) => a,
-        _ => return Value::Object(None),
+        _ => return Value::Object(Some(ctx.create_string(""))),
     };
     match ctx.invoke_virtual(ann, "prefix", "()Ljava/lang/String;", &[]) {
         Ok(Some(v @ Value::Object(Some(_)))) => v,
-        _ => Value::Object(None),
+        _ => Value::Object(Some(ctx.create_string(""))),
     }
 }
 fn class_mirror_by_name(ctx: &mut dyn NativeContext, name: &str) -> Option<ObjectRef> {

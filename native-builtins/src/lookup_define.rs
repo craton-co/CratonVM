@@ -978,6 +978,119 @@ pub fn get_class_data(cid: cratonvm_types::ClassId) -> Option<ObjectRef> {
 }
 
 // ---------------------------------------------------------------------------
+// 4. Lookup.findClass(String) → Class<?>
+// ---------------------------------------------------------------------------
+//
+// JDK 25 `java.lang.invoke.MethodHandles$Lookup.findClass` is pure Java:
+//
+//     Class<?> targetClass = Class.forName(targetName, false, lookupClass().getClassLoader());
+//     return accessClass(targetClass);
+//
+// but `MethodHandles$Lookup` is a VM-fabricated synthetic object here (see
+// the module doc above), not the real JDK class file, so there is no
+// bytecode body for the interpreter to run — `findClass` was never wired to
+// anything and dispatch found no method at all. See
+// `docs/known-issues/quarkus/method-handles-lookup-find-class.md`
+// (`ClassLoadingChainAnalyzerTest.analyzeFindsClassesLoadedViaMethodHandlesFindClass`).
+//
+// Reimplemented natively by delegating to the SAME `loader.loadClass(name)`
+// routing `Class.forName(name, boolean, ClassLoader)` already uses
+// (`native_class_for_name`) — this is what makes the call observable to a
+// caller's own `ClassLoader.loadClass` override (e.g. a recording
+// classloader), exactly as real bytecode calling through `Class.forName`
+// would be.
+fn lk_find_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this_lookup = obj_arg(args, 0)?;
+    let name_arg = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    // `lookupClass().getClassLoader()` — resolve the actual ClassLoader
+    // object (or null == bootstrap), exactly as `Class.getClassLoader()`
+    // would, so routing below observes the same loader identity/override
+    // bytecode a real `Class.forName(name, false, loader)` would.
+    let loader_value = match ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF) {
+        Value::Object(Some(mirror)) => {
+            match crate::lang_class::native_class_get_class_loader(
+                ctx,
+                &[Value::Object(Some(mirror))],
+            )? {
+                Some(v) => v,
+                None => Value::Object(None),
+            }
+        }
+        // Public/anonymous lookup with no lookup class set — treat as the
+        // bootstrap loader, matching `Object.class.getClassLoader()` (the
+        // JDK's `publicLookup()` lookup class).
+        _ => Value::Object(None),
+    };
+    if std::env::var("CRATONVM_DBG_FINDCLASS").is_ok() {
+        let lookup_name = lookup_class_name(ctx, this_lookup);
+        let loader_desc = match loader_value {
+            Value::Object(Some(l)) => {
+                let lc = ctx.class_id_of_object(l);
+                format!("{}@{l:?}", ctx.class_name_of_id(lc).unwrap_or_default())
+            }
+            _ => "null".to_string(),
+        };
+        let recorded = match ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF) {
+            Value::Object(Some(mirror)) => {
+                crate::lang_class::mirror_class_id(ctx, mirror).map(|cid| {
+                    (
+                        cid.as_u32(),
+                        crate::classloader::defining_loader_for(ctx.vm_identity(), cid.as_u32()),
+                    )
+                })
+            }
+            _ => None,
+        };
+        eprintln!(
+            "[FINDCLASS-DBG] lookup_class={lookup_name:?} loader={loader_desc} recorded_defining_loader={recorded:?}"
+        );
+    }
+
+    // Delegate to the same machinery backing `Class.forName(name, boolean,
+    // ClassLoader)`. Argument layout per JDK 25
+    // `Class.forName0(name, initialize, loader, caller)`; `initialize=false`
+    // matches `findClass`'s contract (resolve/link only, never run
+    // `<clinit>`) and an explicit loader value (possibly `Object(None)` for
+    // the bootstrap loader) at index 2 routes through the loader-aware path
+    // rather than the caller-sensitive one-arg fallback.
+    let forname_args = [name_arg, Value::Int(0), loader_value];
+    let target = crate::lang_class::native_class_for_name(ctx, &forname_args)?;
+    let target_mirror = match target {
+        Some(Value::Object(Some(m))) => m,
+        _ => return Ok(target),
+    };
+
+    // `accessClass` — a public target is always reachable; a non-public
+    // target additionally requires the lookup class and target to share a
+    // runtime package, approximating the PACKAGE lookup mode every
+    // full-power `MethodHandles.lookup()` caller carries.
+    if !crate::lang_class::mirror_is_public(ctx, target_mirror) {
+        let lookup_name = lookup_class_name(ctx, this_lookup);
+        let target_name = crate::lang_class::mirror_class_id(ctx, target_mirror)
+            .and_then(|cid| ctx.class_name_of_id(cid));
+        let same_package = match (&lookup_name, &target_name) {
+            (Some(l), Some(t)) => l.rfind('/').map(|i| &l[..i]) == t.rfind('/').map(|i| &t[..i]),
+            _ => false,
+        };
+        if !same_package {
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalAccessException {
+                    message: format!(
+                        "class {} cannot access class {}",
+                        lookup_name.unwrap_or_default().replace('/', "."),
+                        target_name.unwrap_or_default().replace('/', ".")
+                    ),
+                }
+                .into(),
+            );
+        }
+    }
+
+    Ok(Some(Value::Object(Some(target_mirror))))
+}
+
+// ---------------------------------------------------------------------------
 // Registration entry point
 // ---------------------------------------------------------------------------
 
@@ -1014,6 +1127,14 @@ pub fn register_lookup_define_class(r: &mut NativeMethodRegistry) {
         "defineHiddenClassWithClassData",
         "([BLjava/lang/Object;Z[Ljava/lang/invoke/MethodHandles$Lookup$ClassOption;)Ljava/lang/invoke/MethodHandles$Lookup;",
         lk_define_hidden_class_with_class_data,
+    );
+
+    // Lookup.findClass(String)Ljava/lang/Class;
+    r.register(
+        lk,
+        "findClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        lk_find_class,
     );
 }
 

@@ -6664,6 +6664,205 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         );
     }
 
+    // `SecureDirectoryStream<Path>` — the extended interface
+    // `sun/nio/fs/UnixSecureDirectoryStream` (the ONLY `DIR_STREAM_IMPLS`
+    // entry that implements it) declares. Real bytecode for these methods
+    // reads the private `dfd`/`ds` fields a REAL `UnixPath`-backed instance
+    // has (an open directory fd, an internal `UnixDirectoryStream`); our
+    // minted object carries none of that, only the 3-slot materialised
+    // listing `DIR_STREAM_SLOTS` describes. Real bytecode's own
+    // `getName(Path)` helper tries to unwrap the argument as a
+    // `sun.nio.fs.UnixPath` and throws `ProviderMismatchException` against
+    // our synthetic Path, which the JDK itself would never construct.
+    //
+    // `io.quarkus.bootstrap.util.IoUtils.recursiveDeleteSecure` — used by
+    // EVERY Quarkus test/bootstrap path that tears down a temp dir,
+    // including `ForkedJvmEnvironment.close()`
+    // (`ClassLoadingChainAnalyzerTest`'s forked-JVM harness) — casts every
+    // `Files.newDirectoryStream(dir)` result to `SecureDirectoryStream` and
+    // drives exactly these four methods, so ANY temp-dir cleanup through it
+    // hit this `ProviderMismatchException` before ever reaching `close()`'s
+    // caller. Implemented here by resolving the entry against the stream's
+    // OWN directory (derived from any already-materialised sibling Path,
+    // all of which share the same parent) and delegating to the working
+    // `Files` natives, the same way `FileSystemProvider.delete` above
+    // delegates rather than re-implementing.
+    let sds = "sun/nio/fs/UnixSecureDirectoryStream";
+
+    fn sds_own_dir(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+        let ds_base = dir_stream_base(ctx, this);
+        let arr = match ctx.get_field(this, ds_base) {
+            Value::Object(Some(a)) => a,
+            _ => return None,
+        };
+        if ctx.array_length(arr) == 0 {
+            return None;
+        }
+        let first = match ctx.get_array_element(arr, 0) {
+            Value::Object(Some(p)) => p,
+            _ => return None,
+        };
+        let entry = p57_read_path(ctx, first);
+        entry.rfind('/').map(|i| entry[..i].to_string())
+    }
+
+    fn sds_resolve_entry(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        entry_obj: ObjectRef,
+    ) -> Option<ObjectRef> {
+        let dir = sds_own_dir(ctx, this)?;
+        let name = p57_read_path(ctx, entry_obj);
+        // The entry may already be one of the fully-qualified Paths this
+        // stream's own `iterator()` handed out (`Path p` in
+        // `recursiveDeleteSecure`'s for-each, passed straight through
+        // without `getFileName()`), or a bare relative name
+        // (`p.getFileName()`, what `recursiveDeleteSecure` actually passes).
+        // Only join when it is not already rooted under this directory.
+        let resolved = if name.starts_with(&dir) {
+            name
+        } else {
+            format!("{dir}/{name}")
+        };
+        p57_alloc_path(ctx, &resolved).ok()
+    }
+
+    r.register(
+        sds,
+        "getFileAttributeView",
+        "(Ljava/lang/Object;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/FileAttributeView;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let entry_obj = match obj_arg(args, 1) {
+                Ok(p) => p,
+                Err(_) => return Ok(Some(Value::Object(None))),
+            };
+            let view_name = obj_arg(args, 2)
+                .ok()
+                .and_then(|m| crate::lang_class::mirror_class_name(ctx, m))
+                .unwrap_or_default();
+            let is_dos = view_name.ends_with("DosFileAttributeView");
+            let is_basic = view_name.ends_with("BasicFileAttributeView")
+                || view_name.ends_with("/FileAttributeView")
+                || view_name == "java/nio/file/attribute/FileAttributeView";
+            let is_posix = !cfg!(windows)
+                && (view_name.ends_with("PosixFileAttributeView")
+                    || view_name.ends_with("FileOwnerAttributeView"));
+            if !(is_dos || is_basic || is_posix) {
+                return Ok(Some(Value::Object(None)));
+            }
+            let vclass = if is_dos {
+                "java/nio/file/attribute/DosFileAttributeView"
+            } else if is_posix {
+                "java/nio/file/attribute/PosixFileAttributeView"
+            } else {
+                "java/nio/file/attribute/BasicFileAttributeView"
+            };
+            let this_pin = ctx.pin_native_root(this);
+            let entry_pin = ctx.pin_native_root(entry_obj);
+            let resolved = sds_resolve_entry(ctx, this, entry_obj);
+            ctx.unpin_native_roots(entry_pin);
+            ctx.unpin_native_roots(this_pin);
+            let resolved = match resolved {
+                Some(p) => p,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            let resolved_pin = ctx.pin_native_root(resolved);
+            let view = try_alloc_concurrent_synthetic(ctx, vclass, 1)?;
+            let resolved = ctx.read_native_pin(resolved_pin, resolved);
+            ctx.set_field(view, 0, Value::Object(Some(resolved)));
+            ctx.unpin_native_roots(resolved_pin);
+            Ok(Some(Value::Object(Some(view))))
+        },
+    );
+
+    r.register(sds, "deleteFile", "(Ljava/lang/Object;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let entry_obj = obj_arg(args, 1)?;
+        let this_pin = ctx.pin_native_root(this);
+        let entry_pin = ctx.pin_native_root(entry_obj);
+        let resolved = sds_resolve_entry(ctx, this, entry_obj);
+        ctx.unpin_native_roots(entry_pin);
+        ctx.unpin_native_roots(this_pin);
+        let resolved = match resolved {
+            Some(p) => p,
+            None => {
+                return Err(RuntimeError::NoSuchFileException {
+                    path: String::new(),
+                }
+                .into())
+            }
+        };
+        ctx.invoke(
+            "java/nio/file/Files",
+            "delete",
+            "(Ljava/nio/file/Path;)V",
+            &[Value::Object(Some(resolved))],
+        )?;
+        Ok(None)
+    });
+
+    r.register(
+        sds,
+        "deleteDirectory",
+        "(Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let entry_obj = obj_arg(args, 1)?;
+            let this_pin = ctx.pin_native_root(this);
+            let entry_pin = ctx.pin_native_root(entry_obj);
+            let resolved = sds_resolve_entry(ctx, this, entry_obj);
+            ctx.unpin_native_roots(entry_pin);
+            ctx.unpin_native_roots(this_pin);
+            let resolved = match resolved {
+                Some(p) => p,
+                None => {
+                    return Err(RuntimeError::NoSuchFileException {
+                        path: String::new(),
+                    }
+                    .into())
+                }
+            };
+            ctx.invoke(
+                "java/nio/file/Files",
+                "delete",
+                "(Ljava/nio/file/Path;)V",
+                &[Value::Object(Some(resolved))],
+            )?;
+            Ok(None)
+        },
+    );
+
+    r.register(
+        sds,
+        "newDirectoryStream",
+        "(Ljava/lang/Object;[Ljava/nio/file/LinkOption;)Ljava/nio/file/SecureDirectoryStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let entry_obj = obj_arg(args, 1)?;
+            let this_pin = ctx.pin_native_root(this);
+            let entry_pin = ctx.pin_native_root(entry_obj);
+            let resolved = sds_resolve_entry(ctx, this, entry_obj);
+            ctx.unpin_native_roots(entry_pin);
+            ctx.unpin_native_roots(this_pin);
+            let resolved = match resolved {
+                Some(p) => p,
+                None => {
+                    return Err(RuntimeError::NoSuchFileException {
+                        path: String::new(),
+                    }
+                    .into())
+                }
+            };
+            ctx.invoke(
+                "java/nio/file/Files",
+                "newDirectoryStream",
+                "(Ljava/nio/file/Path;)Ljava/nio/file/DirectoryStream;",
+                &[Value::Object(Some(resolved))],
+            )
+        },
+    );
+
     // createSymbolicLink / createLink / readSymbolicLink.
     //
     // `Files.createSymbolicLink(link, target, attrs)` is ordinary (non-native)
