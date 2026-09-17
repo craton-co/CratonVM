@@ -25,7 +25,7 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 use zip::extra_fields::ExtraField;
@@ -35,10 +35,14 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
+/// A parsed archive, shared across every open `JarFile`/`ZipFile` handle for
+/// the same underlying path (see [`shared_archive_cache`]).
+type SharedArchive = Arc<Mutex<zip::ZipArchive<File>>>;
+
 /// Owned jar state per open handle.
 struct JarState {
     path: PathBuf,
-    archive: zip::ZipArchive<File>,
+    archive: SharedArchive,
     /// Lookup cache: name → entry index inside the archive. Rebuilt on
     /// first access to avoid paying the cost for jars that only read
     /// one manifest entry.
@@ -46,6 +50,32 @@ struct JarState {
     /// Per-index central-directory metadata, filled lazily. See
     /// [`entry_meta_at`] for why this exists and what it costs without it.
     meta: Vec<MetaSlot>,
+}
+
+/// Path → live archive, weakly held so a path's entry disappears on its own
+/// once every `JarFile`/`ZipFile` handle referencing it has closed (or been
+/// dropped by GC) rather than needing an explicit eviction pass.
+///
+/// Before this cache existed, every `new JarFile(path)` / `new
+/// ZipFile(path)` — even a repeat open of a path already open elsewhere —
+/// called `File::open` and kept the result in `jar_table()` until its own
+/// `close()`. A single JVM process normally opens a bounded, small set of
+/// jars this way, but a batch test harness that runs many classes per
+/// process (`CratonRunner <class>...`) touches thousands of DISTINCT jars
+/// over the process's life (`ServiceLoader.load()` reads
+/// `META-INF/services/*` out of every jar on the classpath, once per
+/// session), each one a real OS file descriptor that never came back —
+/// `EMFILE`/"Too many open files" once `ulimit -n` distinct jars had ever
+/// been touched, surfacing as unrelated-looking crashes
+/// (`ServiceConfigurationError`, `FileNotFoundException`) partway through a
+/// multi-class run rather than as an obvious leak. Real JDK does not have
+/// this failure mode because its own native zip source cache (`zsrc`)
+/// de-duplicates by path exactly this way. `open_and_register` below is the
+/// one place that populates this cache.
+fn shared_archive_cache() -> &'static Mutex<HashMap<PathBuf, Weak<Mutex<zip::ZipArchive<File>>>>> {
+    static T: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<zip::ZipArchive<File>>>>>> =
+        OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The central-directory facts a `ZipEntry` is built from. Every field here
@@ -410,19 +440,49 @@ fn open_and_register(
             }));
         }
     };
-    let file = File::open(&validated_path).map_err(|e| {
-        MethodCallFailed::InternalError(VmError::Internal {
-            message: format!("JarFile: cannot open `{path_str}`: {e}"),
-        })
-    })?;
-    let archive = zip::ZipArchive::new(file).map_err(|e| {
-        MethodCallFailed::InternalError(VmError::Internal {
-            message: format!("JarFile: `{path_str}` is not a valid zip: {e}"),
-        })
-    })?;
-    let meta = vec![MetaSlot::Unread; archive.len()];
+    let path_key = PathBuf::from(&validated_path);
+    // Reuse a still-live archive for this exact path if one exists, so
+    // repeat opens (a batch harness re-scanning the same classpath jar from
+    // many sessions, or plain application code doing `new
+    // JarFile(samePath)` twice) share one OS file descriptor instead of
+    // each minting a fresh one that never gets closed until ITS OWN
+    // `close()`. See `shared_archive_cache`'s doc comment.
+    let cached = shared_archive_cache().lock().get(&path_key).and_then(Weak::upgrade);
+    let archive: SharedArchive = if let Some(archive) = cached {
+        archive
+    } else {
+        // Open/parse outside the cache lock: central-directory parsing can
+        // be slow and a concurrent first opener of a different path must
+        // not block on it.
+        let file = File::open(&validated_path).map_err(|e| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("JarFile: cannot open `{path_str}`: {e}"),
+            })
+        })?;
+        let opened: SharedArchive = Arc::new(Mutex::new(zip::ZipArchive::new(file).map_err(
+            |e| {
+                MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("JarFile: `{path_str}` is not a valid zip: {e}"),
+                })
+            },
+        )?));
+        let mut cache = shared_archive_cache().lock();
+        // A concurrent opener of the SAME path may have won the race and
+        // already published a live archive; prefer that one so the two
+        // callers end up sharing a single descriptor rather than each
+        // keeping their own.
+        match cache.get(&path_key).and_then(Weak::upgrade) {
+            Some(existing) => existing,
+            None => {
+                cache.insert(path_key.clone(), Arc::downgrade(&opened));
+                opened
+            }
+        }
+    };
+    let len = archive.lock().len();
+    let meta = vec![MetaSlot::Unread; len];
     let state = JarState {
-        path: PathBuf::from(&validated_path),
+        path: path_key,
         archive,
         name_index: None,
         meta,
@@ -465,10 +525,12 @@ fn ensure_name_index(state: &mut JarState) -> &HashMap<String, usize> {
         // decompressor) for every entry just to grab the name. `file_names`
         // walks the already-parsed central directory in O(n) and yields
         // `&str` slices into the archive's metadata — no I/O, no inflate.
-        let mut idx: HashMap<String, usize> = HashMap::with_capacity(state.archive.len());
-        for (i, name) in state.archive.file_names().enumerate() {
+        let archive = state.archive.lock();
+        let mut idx: HashMap<String, usize> = HashMap::with_capacity(archive.len());
+        for (i, name) in archive.file_names().enumerate() {
             idx.insert(name.to_string(), i);
         }
+        drop(archive);
         state.name_index = Some(idx);
     }
     state
@@ -516,16 +578,16 @@ fn entry_meta_at(state: &mut JarState, idx: usize) -> Option<ZipEntryMeta> {
         // An archive whose length outran the slot vector (cannot happen for
         // the handles we build, but the index is caller-supplied): grow
         // rather than panic.
-        state
-            .meta
-            .resize(state.archive.len().max(idx + 1), MetaSlot::Unread);
+        let len = state.archive.lock().len();
+        state.meta.resize(len.max(idx + 1), MetaSlot::Unread);
     }
     match &state.meta[idx] {
         MetaSlot::Ready(meta) => return Some(meta.clone()),
         MetaSlot::Unreadable => return None,
         MetaSlot::Unread => {}
     }
-    let slot = match state.archive.by_index_raw(idx) {
+    let mut archive = state.archive.lock();
+    let slot = match archive.by_index_raw(idx) {
         Ok(entry) => MetaSlot::Ready(ZipEntryMeta {
             name: entry.name().to_string(),
             // Round-9 HIGH: do NOT collapse non-Deflate methods to
@@ -879,10 +941,13 @@ fn native_jarfile_get_input_stream(
             Some(i) => *i,
             None => {
                 // Lazy fill — same O(n) `file_names` path as `getEntry`.
-                let mut idx: HashMap<String, usize> = HashMap::with_capacity(state.archive.len());
-                for (i, n) in state.archive.file_names().enumerate() {
+                let archive_guard = state.archive.lock();
+                let mut idx: HashMap<String, usize> =
+                    HashMap::with_capacity(archive_guard.len());
+                for (i, n) in archive_guard.file_names().enumerate() {
                     idx.insert(n.to_string(), i);
                 }
+                drop(archive_guard);
                 let got = idx.get(&name).copied();
                 state.name_index = Some(idx);
                 match got {
@@ -891,7 +956,8 @@ fn native_jarfile_get_input_stream(
                 }
             }
         };
-        let mut zf = state.archive.by_index(idx).map_err(|e| {
+        let mut archive = state.archive.lock();
+        let mut zf = archive.by_index(idx).map_err(|e| {
             MethodCallFailed::InternalError(VmError::Internal {
                 message: format!("JarFile.getInputStream({name}): by_index({idx}) failed: {e}"),
             })
@@ -1071,7 +1137,7 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         // `TomcatServletWebServerFactoryTests` — is pure cache reads.
         // An entry whose record will not read is skipped here exactly as the
         // old `if let Ok(f)` skipped it.
-        let n = state.archive.len();
+        let n = state.archive.lock().len();
         let mut v = Vec::with_capacity(n);
         for i in 0..n {
             if let Some(meta) = entry_meta_at(state, i) {
@@ -1194,10 +1260,12 @@ fn native_jarfile_get_manifest(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         // `file_names()` scan on every call. Build the index once (same as
         // `getEntry`/`getInputStream`), then do a hashed lookup.
         if state.name_index.is_none() {
-            let mut idx: HashMap<String, usize> = HashMap::with_capacity(state.archive.len());
-            for (i, n) in state.archive.file_names().enumerate() {
+            let archive_guard = state.archive.lock();
+            let mut idx: HashMap<String, usize> = HashMap::with_capacity(archive_guard.len());
+            for (i, n) in archive_guard.file_names().enumerate() {
                 idx.insert(n.to_string(), i);
             }
+            drop(archive_guard);
             state.name_index = Some(idx);
         }
         // `name_index` is keyed by exact entry name; the manifest is stored
@@ -1214,7 +1282,8 @@ fn native_jarfile_get_manifest(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         let Some(idx) = idx_opt else {
             return Ok(Some(Value::Object(None)));
         };
-        let mut zf = state.archive.by_index(idx).map_err(|e| {
+        let mut archive = state.archive.lock();
+        let mut zf = archive.by_index(idx).map_err(|e| {
             MethodCallFailed::InternalError(VmError::Internal {
                 message: format!("manifest read by_index({idx}): {e}"),
             })
@@ -1315,7 +1384,7 @@ fn native_jarfile_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let n = {
         let table = jar_table().lock();
         match table.get(&handle) {
-            Some(s) => s.archive.len() as i32,
+            Some(s) => s.archive.lock().len() as i32,
             None => 0,
         }
     };
@@ -1335,7 +1404,7 @@ fn native_jarfile_get_comment(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let comment = {
         let table = jar_table().lock();
         match table.get(&handle) {
-            Some(s) => s.archive.comment().to_vec(),
+            Some(s) => s.archive.lock().comment().to_vec(),
             None => return Ok(Some(Value::Object(None))),
         }
     };
