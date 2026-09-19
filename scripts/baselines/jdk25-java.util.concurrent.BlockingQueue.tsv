@@ -1,0 +1,34 @@
+# jdk-baseline	2
+# kind	class
+# name	java.util.concurrent.BlockingQueue
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/util/concurrent/BlockingQueue.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	11
+# protected-methods	0
+# declared-methods	11
+# declared-fields	0
+# rows	18
+# columns	kind	name	descriptor	flags
+CLASS	java.util.concurrent.BlockingQueue		public,interface,abstract
+EXTENDS	java.lang.Object		
+IMPLEMENTS	java.util.Queue		
+SUPERTYPE	java.lang.Iterable		
+SUPERTYPE	java.lang.Object		
+SUPERTYPE	java.util.Collection		
+SUPERTYPE	java.util.Queue		
+METHOD	add	(Ljava/lang/Object;)Z	public,abstract
+METHOD	contains	(Ljava/lang/Object;)Z	public,abstract
+METHOD	drainTo	(Ljava/util/Collection;)I	public,abstract
+METHOD	drainTo	(Ljava/util/Collection;I)I	public,abstract
+METHOD	offer	(Ljava/lang/Object;)Z	public,abstract
+METHOD	offer	(Ljava/lang/Object;JLjava/util/concurrent/TimeUnit;)Z	public,abstract
+METHOD	poll	(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;	public,abstract
+METHOD	put	(Ljava/lang/Object;)V	public,abstract
+METHOD	remainingCapacity	()I	public,abstract
+METHOD	remove	(Ljava/lang/Object;)Z	public,abstract
+METHOD	take	()Ljava/lang/Object;	public,abstract

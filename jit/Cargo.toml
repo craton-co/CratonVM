@@ -1,0 +1,43 @@
+[package]
+name = "cratonvm-jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "x86-64 JIT compiler for CratonVM"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+arc-swap = "1.7"
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
+# Phase accounting (`docs/observability/phase-accounting.md` §10.2): the
+# `Category::Compilation` span in `try_compile_inner` needs `cratonvm_jfr::phase`.
+# Acyclic by inspection: `cratonvm-jfr` depends on `cratonvm-types` and nothing
+# else in the workspace (and has no `[dev-dependencies]` at all), and
+# `cratonvm-types` depends on no workspace crate. The `cratonvm-gc` edge below
+# is `[dev-dependencies]`-only and is unaffected.
+cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
+parking_lot.workspace = true
+rustc-hash.workspace = true
+tracing.workspace = true
+
+[features]
+vm-tests = []
+
+[dev-dependencies]
+cratonvm-gc = { path = "../gc", version = "0.3.0" }
+# Used by the ir_vs_singlepass differential harness to build CachedBytecodeMethod
+# (its declaring_class_id is a cratonvm_types::ClassId). `cratonvm-types` is also
+# a normal dependency, but integration tests only see dev-dependencies directly.
+cratonvm-types = { path = "../types", version = "0.3.0" }
+
+[lints]
+workspace = true

@@ -1,0 +1,1959 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Formatting is its OWN job, and that placement is the whole point.
+  #
+  # It used to be the FIRST step of `build-and-test`, ahead of `Build`,
+  # `Clippy --workspace --all-targets` and `Test`. GitHub Actions runs a job's
+  # steps in order and skips every later step once one fails, so a red
+  # formatting check took the correctness gates with it — silently, because the
+  # job's failure annotation names the step that failed and nothing else.
+  #
+  # This workspace is not rustfmt-clean and has not been for a long time:
+  # `cargo fmt --all --check` reports 2442 diffs across 2358 sites at
+  # `1ec856c2c` (measured 2026-08-07). So that first step failed on EVERY push,
+  # and `cargo clippy --workspace --all-targets` — the gate that compiles test
+  # targets — had not run on `dev` in that whole window.
+  #
+  # That is exactly how `084098bce` landed with five `#[test]` functions in
+  # `native-builtins/src/jboss_jdkspecific.rs` applying `?` to a `Result` while
+  # declaring `-> ()`. `cargo build --release` was fine, so nothing local
+  # caught it either. It is the third crate in that family after native-io and
+  # native-collections, and the comments further down this file describe the
+  # same failure mode costing this repository 1,522 tests once already — the
+  # gates written in response were correct and simply unreachable.
+  #
+  # Splitting the job does not weaken the formatting signal: a fmt failure
+  # still fails CI, as its own red job. It just stops it from standing in front
+  # of "does the code compile" and "do the tests pass". Making the tree
+  # rustfmt-clean is a separate (and much larger) decision; this change is what
+  # makes the existing gates report until someone takes it.
+  # A whole-tree `cargo fmt --all --check` fails on every push (thousands of
+  # pre-existing diffs), so it carries no signal: a job that is always red is a
+  # job nobody reads. Reformatting the tree in one sweep is also not free —
+  # rustfmt reformats a file's entire `mod` tree, so a blanket run would produce
+  # an unreviewable diff across the whole workspace and bury every in-flight
+  # branch in conflicts.
+  #
+  # This checks only the Rust files the push/PR actually touches, which is the
+  # part the author can act on. New code lands formatted, the backlog shrinks as
+  # files are edited, and the job goes green the moment a branch is clean —
+  # unlike `--all`, which cannot go green until someone takes the whole-tree
+  # decision.
+  #
+  # `rustfmt --check --edition 2021` is used directly rather than `cargo fmt`
+  # because cargo has no per-file mode. Deleted files are filtered out.
+  # IS THE FORMATTING THIS DIFF IS RESPONSIBLE FOR CORRECT?
+  #
+  # Not "is every changed file formatted?", which is what this job asked until
+  # 2026-09-06 and which it failed on 33 of the 60 preceding non-merge commits.
+  # 171 of the repository's 978 tracked `.rs` files are not rustfmt-clean, and
+  # they are the most-edited ones (`gc/src/lib.rs` 258 hunks, `vm/src/lib.rs`
+  # 177, `vm/src/runtime/interpreter.rs` 81), so the job was red on roughly half
+  # of all pushes for formatting the push did not introduce. A gate that is red
+  # on inherited debt half the time trains readers to ignore it — and this is
+  # the job whose non-zero exit ALSO means "your file no longer parses", which
+  # is precisely what must not be ignored.
+  #
+  # `tools/check_changed_rust_formatting.py` runs the same
+  # `rustfmt --check --edition 2021` over the same changed files and then keeps
+  # only the hunks that overlap lines the diff actually touched. Two `rustfmt`
+  # behaviours make that a script rather than three lines of `bash`, and the
+  # tool's header documents both: it follows `mod` declarations (so a hunk can
+  # be reported in a file the diff never opened), and its non-zero exit has two
+  # unrelated meanings (a parse failure is reported separately and always
+  # fails).
+  #
+  # Inherited hunks are COUNTED AND PRINTED, not dropped: the debt stays visible
+  # in every run, it just stops being charged to whoever touched the file next.
+  # `the-fmt-ci-job-was-red-on-half-of-all-pushes-RESOLVED-20260906.md` (in
+  # the internal tree) has the census and the options for paying it down.
+  fmt:
+    name: Formatting (changed lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting of the lines this diff touched
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+            # First push to a new branch reports an all-zero "before".
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              base="$(git rev-parse "$head^" 2>/dev/null || echo "$head")"
+            fi
+          fi
+          python3 tools/check_changed_rust_formatting.py "$base" "$head"
+
+  # DOES EVERY .rs FILE THIS DIFF TOUCHED STILL PARSE?
+  #
+  # `native-builtins/tests/stub_ratchet.rs` HAD NOT PARSED SINCE MERGE
+  # `26e4b5db4`, which spliced two versions of one failure message and kept both
+  # argument lists. The whole `--test stub_ratchet` binary went with it, and that
+  # gate is the cited evidence for the P0 *Residual synthetic native set* row.
+  # It was blocking CI in both configurations and `origin/dev` still carried the
+  # break days later. With `G89-1`'s finding that the same gate had been RED
+  # since 2026-08-14, it adjudicated nothing for six days and then adjudicated
+  # nothing at all. (`H3-1`; `docs/known-issues/jdk-only/HANDOFF-20260820.md` §3.)
+  #
+  # WHY THIS IS NOT A DUPLICATE OF THE `fmt` JOB ABOVE, WHICH ALREADY RUNS
+  # `rustfmt --check` OVER THE SAME FILES.
+  #
+  # `rustfmt --check` exits 1 for TWO unrelated reasons and `fmt` reads only the
+  # exit code, so its red says "one of these two things happened":
+  #
+  #     a formatting diff   -> written to STDOUT  ("Diff in <file>:<line>:")
+  #     a parse error       -> written to STDERR  ("error: ...")
+  #
+  # MEASURED, not assumed (lane H10, 2026-08-20, rustfmt 1.9.0-stable):
+  # `26e4b5db4`'s copy of `stub_ratchet.rs` produces 32 stderr errors, all
+  # lexer/parse, and ZERO bytes of stdout; the same file at HEAD produces zero
+  # stderr and a 1565-byte formatting diff. And this workspace is NOT
+  # rustfmt-clean — `types/src/flag_groups.rs` prints a diff on an untouched
+  # checkout — so the overwhelmingly common cause of a red `fmt` is the harmless
+  # one. A verdict that conflates "this file is laid out differently" with "this
+  # file is not Rust" cannot report the second.
+  #
+  # This job reads STDERR ONLY. Its red means exactly one thing, it is always
+  # actionable, and it is a SEPARATE JOB rather than a step so that neither gate
+  # can stand in front of the other — the `fmt`-first arrangement is what kept
+  # `cargo clippy --workspace --all-targets` from running on `dev` for weeks
+  # (see the `fmt` job's own header).
+  #
+  # WHAT IT DOES NOT CATCH. It is a PARSE check, not a type check. A file that
+  # parses can still fail to compile: a call with the wrong argument list that
+  # leaves the token stream balanced passes here, as does any unresolved name,
+  # missing import, borrow error or trait bound. `cargo check` is still the gate
+  # for that; this one costs seconds and needs no toolchain build, which is why
+  # it can run in front of it rather than instead of it.
+  merge-parse:
+    name: Parse check (changed files)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Every changed .rs file must parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              base="$(git rev-parse "$head^" 2>/dev/null || echo "$head")"
+            fi
+          fi
+          # EVERY .rs the diff touched, never a fixed list. Plus, when $head is
+          # a MERGE, the diff against its OTHER parents: a bad conflict
+          # resolution differs from at least one parent, and on a push whose
+          # `before` happens to be one of them the two-dot diff alone can miss
+          # the half that arrived from the other side.
+          {
+            git diff --name-only --diff-filter=ACMR "$base" "$head" -- '*.rs' || true
+            for p in $(git rev-list --parents -n 1 "$head" | cut -d' ' -f2-); do
+              git diff --name-only --diff-filter=ACMR "$p" "$head" -- '*.rs' || true
+            done
+          } | grep -v '^native-builtins/vendor/' | sort -u > changed-rs.txt || true
+          echo "changed .rs files: $(wc -l < changed-rs.txt)"
+          # --quiet suppresses the per-clean-file line; failures always print.
+          # The script exits 3 on a missing prerequisite, which must fail the
+          # job: "rustfmt was not installed" is not a pass.
+          bash scripts/merge-parse-check.sh --quiet \
+            --files "$(tr '\n' ' ' < changed-rs.txt)"
+
+  build-and-test:
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # `experimental-jmx` / `experimental-tls` are back-compat ALIASES
+      # (renamed 2026-07-30 to `management` / `deprecated-noop-tls`). They are
+      # fine on a `--features` command line, but a `#[cfg(feature = "...")]`
+      # written against an alias is a silent bug: the default set enables
+      # `management`, not the alias, so the block compiles to nothing in an
+      # ordinary build. For the JMX natives that means `ManagementFactory`
+      # loses its `sun.management` surface and dies with an
+      # `UnsatisfiedLinkError` at runtime, with no compile error anywhere.
+      # Cheap grep, no toolchain needed, so it fails in seconds.
+      - name: No cfg gates on deprecated feature aliases
+        shell: bash
+        run: |
+          if git grep -n -I -E 'cfg\([^)]*"(experimental-jmx|experimental-tls)"' -- '*.rs'; then
+            echo "::error::Found #[cfg] gate(s) on a deprecated feature alias (listed above)."
+            echo "Use 'management' instead of 'experimental-jmx'; note that"
+            echo "'experimental-tls' / 'deprecated-noop-tls' gate nothing at all."
+            exit 1
+          fi
+          echo "OK: no cfg gates on deprecated aliases."
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build
+        run: cargo build --workspace
+
+      # Forbid reintroduction of bring-up eprintln!/println! markers
+      # ([WP*], [DIAG*], [TRACE*], ...) in landed code.
+      # Bash-only script, so gate to the Linux leg.
+      - name: Clippy
+        # `[workspace.lints]` in Cargo.toml already silences the noise lints
+        # (dead_code, unused_*, rustdoc broken_intra_doc_links, clippy
+        # empty_loop / while_let_loop), so this check measures the repository's
+        # configured lint policy rather than the full default lint set.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # THE CORRECTNESS GATES RUN FIRST, and the policy ratchets below them.
+      #
+      # `Clippy --workspace --all-targets` is the only thing in this file that
+      # compiles TEST targets, and `Test` is the only thing that runs them.
+      # GitHub Actions skips every later step of a job once one fails, so any
+      # check standing in front of those two can switch them off -- silently,
+      # because the job's annotation names only the step that failed.
+      #
+      # That has now happened twice. The `fmt` job's header records the first:
+      # a whole-tree `cargo fmt --all --check` failed on every push and took the
+      # compile gate with it for weeks, which is how `084098bce` landed five
+      # `#[test]` functions applying `?` to a `Result` while declaring `-> ()`.
+      # Splitting `fmt` into its own job fixed that instance and left the shape
+      # intact: four policy steps still stood in front, and on 2026-09-04 the
+      # flag-surface guard went red -- a bench reading `SWEEP_BENCH_ROUNDS`
+      # through `std::env::var` -- and masked the gate again, in the same window
+      # an `OopMapEntry` field left two test files unable to compile on `dev`.
+      #
+      # Ordering is the fix rather than more jobs: the ratchets below need the
+      # same `Build` this job already paid for, and a separate job would pay for
+      # it twice. They still run, and still fail the build; they simply no
+      # longer stand in front of "does it compile" and "do the tests pass".
+      - name: Forbid debug-trace prints
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/check-no-diag-prints.sh
+
+      # Forbid an UNSCREENED `Value` decode of a heap cell.
+      # `read_value_atomic` transmutes 16 bytes into an enum without checking
+      # the discriminant; a later `match` on the result is a jump table indexed
+      # by the tag with no bounds check. That instruction, in
+      # `gc::heap::coerce_field_value_for_slot`, is the decoded faulting
+      # instruction of the eight hibernate-orm JSON/XML SIGSEGVs.
+      # Bash-only script, so gate to the Linux leg.
+      - name: Forbid unscreened Value-cell decodes
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/check-value-cell-reads.sh
+
+      # The CRATONVM_* surface reached 692 identifiers by growing roughly one
+      # per fixed bug with no retirement path. It is now ten grouped variables
+      # plus five scalars, and every knob is a token in
+      # `types/src/flag_groups.rs::INVENTORY`. This fails if a new
+      # `std::env::var("CRATONVM_...")` call site appears without one, or if the
+      # reference docs name a token that does not exist — the failure mode that
+      # left CRATONVM_PRECISE_JIT_MAPS documented-but-dead for months.
+      # Bash-only script, so gate to the Linux leg.
+      - name: Flag-surface guard
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash tools/flag-census/check-surface.sh
+
+      - name: Check maintained Markdown links
+        if: matrix.os == 'ubuntu-latest'
+        run: python tools/check_markdown_links.py
+
+
+      # THE PRODUCER FOR CRATONVM_REQUIRE_E2E. Until this step existed, nothing
+      # under .github/workflows/ mentioned the variable at all.
+      #
+      # `vm/tests/common/mod.rs` turns a missing `cratonvm` binary, a missing
+      # JDK or a missing Java fixture into a panic when CRATONVM_REQUIRE_E2E is
+      # set, and its own docs said "CI sets it to assert that a green run was a
+      # real one". No workflow did. So every one of those ~60 prerequisite skips
+      # was a silent green here — the helper was correct and switched off, which
+      # reads exactly like coverage. Recorded as W6-5-vacuous-tests.md section
+      # 3.3 and W7-51-vacuous-sweep-round-2.md.
+      #
+      # WHY A SEPARATE STEP AND NOT `env:` ON `Test` ABOVE. 16 of the 27 probe
+      # fixtures `vm/tests/*.rs` reaches for are still absent from the tree
+      # (they were written under the gitignored `apps/`, never tracked, and are
+      # censused by `vm/tests/probe_fixture_census.rs`). Setting the variable on
+      # the whole workspace run would panic on all 16 at once, which is a red
+      # nobody can clear, and a permanently-red job is a job nobody reads.
+      #
+      # THE LIST LIVES IN `tools/e2e-ratchet.txt`, and its ordering rule is the
+      # one section 3.1 of
+      # that record had to learn the hard way: a target goes on this list only
+      # AFTER someone has run it against a real CratonVM binary. Scheduling an
+      # unverified one manufactures either a red nobody trusts or — worse — a
+      # green that was never earned. The three seeded here were run under a
+      # CratonVM binary on 2026-08-12 with their rebuilt fixtures.
+      #
+      # The variable is load-bearing here and not decoration: with it set,
+      # deleting `apps/chm_basic/ChmScale.java` (or the JDK, or the built
+      # binary) FAILS this step, where the plain `Test` step above would still
+      # report `ok` in 0.00 s. That difference is the whole point of the step.
+      #
+      # ubuntu-latest only: one leg is enough to assert the gate fires, and the
+      # windows leg's probe timings are less predictable.
+      - name: E2E prerequisites are real (CRATONVM_REQUIRE_E2E)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        env:
+          CRATONVM_REQUIRE_E2E: 1
+        run: |
+          # The list moved to tools/e2e-ratchet.txt on 2026-08-30. Three
+          # targets were seeded here on 2026-08-12 and it had not grown
+          # since, while 95 of the 174 files in vm/tests use the helper that
+          # turns a missing prerequisite into a silent `ok`. A survey against
+          # a real binary (tools/e2e-ratchet-survey.sh) found 73 that RUN,
+          # so they are ratcheted here; the 19 whose green IS the skip are
+          # named in that file rather than left invisible.
+          fail=0
+          while read -r t; do
+            case "$t" in ''|'#'*) continue ;; esac
+            echo "::group::$t"
+            cargo test -p cratonvm-vm --test "$t" || fail=1
+            echo "::endgroup::"
+          done < tools/e2e-ratchet.txt
+          exit $fail
+
+      # Exact synthetic-stub ratchet. The committed baseline is intentionally
+      # slack-free, so newly introduced application-visible stubs fail CI.
+      # `cargo test --workspace` above does NOT exercise the feature set a
+      # suite runner gets. `libcratonvm` depends on `cratonvm-vm` with
+      # `experimental-serialization` / `-aot` / `-debug` enabled, and a
+      # workspace-wide resolve unifies those onto `cratonvm-native-builtins`
+      # for every member — including `cratonvm-cli`. A plain
+      # `cargo build --release -p cratonvm-cli` resolves without them.
+      # (`cratonvm-embed` used to leak the same way; its defaults were cleaned
+      # up 2026-07-30. `libcratonvm`'s are deliberate — what the shipped
+      # .so/.dll contains is a release decision — so the split stays and gets
+      # tested instead.) Verify with:
+      #   cargo tree -e features -p cratonvm-cli  -i cratonvm-native-builtins
+      #   cargo tree -e features --workspace      -i cratonvm-native-builtins
+      #
+      # That split is how `jdk/internal/misc/VM.latestUserDefinedLoader0()`
+      # stayed registered in CI while every H2/Hibernate/Spring suite build
+      # threw `UnsatisfiedLinkError` on it — 63 of the Spring suite's 90 FAIL
+      # classes. A `-p`-scoped run resolves features the way a suite build does,
+      # so gaps of that shape fail here. Scoped to the WHOLE unit suite, not one
+      # module: the bug was not that a specific test was missing, it was that no
+      # test ran in this resolve at all.
+      - name: Default-feature native registry surface (no workspace unification)
+        run: cargo test -p cratonvm-native-builtins --lib
+
+      # BOTH configurations, because the file freezes two constants and only one
+      # of them was ever run here. `BASELINE_SYNTHETIC_STUBS_MANAGEMENT` is the
+      # SHIPPING registry — `cratonvm-cli` enables `management`, so the ten
+      # `jmx::*` registrars and their 10 stub rows are in the binary users run
+      # and were in nothing CI adjudicated. Measured 2026-08-19 after the §1.4
+      # shadow wave: no-management 1611 stubs / 12792 rows, management 1622 /
+      # 13160. Both configurations report BOTH numbers, which is the point —
+      # the row count is what separates a relabel (welcome) from a new fake
+      # (the regression this gate exists for).
+      #
+      # This is the same shape as the two scope defects the ratchet file
+      # records against itself — a gate that names a population wider than the
+      # one it measures. A count baseline cannot notice a registration outside
+      # its own scope, and the shipping resolve was outside it.
+      - name: Synthetic-stub ratchet
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
+          cargo test -p cratonvm-native-builtins --features management \
+              --test stub_ratchet -- --nocapture
+
+      # The stub ratchet's sibling, and BLOCKING for the same reasons it is.
+      # Contract 1.5 defines a `Bridge` by its `ACC_NATIVE` target; 10,069 of the
+      # 10,842 `Bridge` registrations have none, every one of them inherited its
+      # kind from an ambient `set_category`, and this is what stops that number
+      # rising. See L6-unadjudicated-bridge-ratchet-DONE-20260805.md.
+      #
+      # WHY HERE AND NOT ONLY IN THE ADVISORY `jdk-only` JOB. That job is
+      # advisory for two documented reasons — wave 1 is measurement, and the
+      # strict corpus is not green — and NEITHER applies to this gate: it
+      # measures the `Compatible`-mode registry against a real image, is
+      # deterministic today, and has a committed baseline. Left only there, a new
+      # unadjudicated `Bridge` printed an error and failed nothing, which is the
+      # decorative-guard shape the lane exists to avoid. The `jdk-only` step
+      # stays as the multi-JDK/multi-OS probe that reports its ungated legs.
+      #
+      # `ubuntu-latest` only, exactly like its sibling above, and for a sharper
+      # reason: baselines are keyed `<jdk-feature>/<os>` because the registrars
+      # are platform-conditional, and `25/linux` is the only committed key. On
+      # the windows leg the gate would (correctly) refuse with exit 2, so it is
+      # not run here rather than made to look green.
+      #
+      # Prerequisites are already satisfied by earlier steps in this job: `Set up
+      # JDK 25` exports JAVA_HOME (the image under audit), and `Build`
+      # (`cargo build --workspace`) leaves target/debug/cratonvm for the script
+      # to find. The census is profile-invariant — verified byte-identical debug
+      # vs release — so the debug binary scores the numbers the baseline was
+      # frozen from.
+      #
+      # The script self-tests its own gate logic first, hermetically, and
+      # refuses to take a census if that fails. Exit codes: 1 the ratchet fired,
+      # 2 refused to adjudicate (never a pass), 3 a prerequisite is missing. All
+      # three fail this job; that is the point of it being here.
+      - name: Bridge ratchet (unadjudicated Bridge registrations)
+        if: matrix.os == 'ubuntu-latest'
+        run: sh regression-suite/bridge-ratchet.sh
+
+      # ACCEPTANCE CRITERION (design §11, criterion 6): the strict corpus is
+      # green. Unmeasured until 2026-08-04, and measuring it immediately found
+      # that `--jdk-only` could not start a thread; the widening on 2026-08-05
+      # found seven more defects, two of them JNI binding failures that had been
+      # hiding five others behind them.
+      #
+      # HERE, IN THE BLOCKING JOB — same reasoning as its sibling directly
+      # above, and the same words apply. L8's own brief says the point is that
+      # "a strict regression fails a build rather than waiting for someone to
+      # look". The `jdk-only` job is `continue-on-error` at the JOB level, so a
+      # step placed only there reports and fails nothing, which is precisely the
+      # decorative-guard shape this wave keeps producing. Its copy in that job
+      # stays as the multi-JDK/multi-OS probe; THIS one is the gate.
+      #
+      # It can block while the corpus is still red because it is a RATCHET, not
+      # a demand for zero: the known divergences are committed per
+      # `<jdk-feature>-<os>` and it fails when that set GROWS. A divergence that
+      # disappears prints "re-freeze" and passes, so a fix is never blocked by
+      # the gate that measured it. An arm that does not complete fails
+      # regardless of the baseline — there is no known-acceptable hang.
+      #
+      # `ubuntu-latest` only, exactly like the bridge ratchet and for the same
+      # LINUX AND WINDOWS. It was `ubuntu-latest` only, because `25-linux` was
+      # the only committed key and the windows leg would (correctly) refuse with
+      # exit 2 rather than look green. `scripts/baselines/jdk-only-strict-corpus-25-windows.txt`
+      # now exists, measured on a real Windows host against HotSpot 25, so the
+      # leg adjudicates instead of refusing. Two mode-independent defects had to
+      # be fixed before it could: `KeyStore.setEntry(SecretKeyEntry)` stored
+      # nothing at all, and the Windows attach provider's `tempPath()` had no
+      # bridge, so `VirtualMachine.list()` threw `UnsatisfiedLinkError`. Neither
+      # was visible to any Linux leg, which is the whole argument for this one.
+      #
+      # macOS stays out: there is no `25-macos` key, and minting one needs a run
+      # on that platform, not a copied file.
+      #
+      # IF THE WINDOWS LEG GOES RED ON THE JNI FIXTURE, READ THIS FIRST. The
+      # script builds `apps/probes/jdkonly_jni_probe.c` with `cc -shared -fPIC`,
+      # and falls back to MSVC (located through the versionless `vswhere.exe`
+      # path, then `vcvars64.bat`) when no `cc` is on PATH. If BOTH fail, the
+      # jni section reports `lib=absent` in all three arms, the arms agree
+      # vacuously, and the script REFUSES (exit 2) rather than calling that a
+      # pass. Fix the fixture; declaring it with `ALLOW_DEGRADED_FIXTURES` turns
+      # the one gate that covers the JNI boundary under `--jdk-only` back off.
+      #
+      # HOW MANY PROBES THIS RUNS IS NOT IN THIS FILE, AND THAT IS DELIBERATE.
+      # The script's built-in list is three. It then appends every line of
+      # `scripts/baselines/jdk-only-strict-corpus-<feature>-<os>.probes` for
+      # THIS leg's key, if that file exists -- so both the Windows and the
+      # Linux legs run 67 today, from one unchanged command. They were 67 and 3
+      # until 2026-09-09, when the 64 promoted on Windows were measured on Linux
+      # too: 64 of 64 clean over two runs, 25435 rows -- the SAME row total the
+      # Windows promotion measured, on a different platform and a different JDK
+      # build. The list has to be
+      # keyed that way because the ratchet is a set difference against a
+      # baseline with the same key: scheduling a probe on a leg whose baseline
+      # was frozen without it makes each of its divergent sections a NEW row
+      # and fails the leg. Promote a probe by measuring it on a key and adding
+      # it to that key's file; do not add legs to this step to compensate.
+      #
+      # Prerequisites are already met by earlier steps: `Set up JDK 25` exports
+      # JAVA_HOME, and `Build` leaves target/debug/cratonvm. `jar` comes from
+      # that JDK.
+      - name: Strict corpus ratchet (three arms vs a HotSpot control)
+        if: matrix.os != 'macos-latest'
+        shell: bash
+        run: |
+          CV=target/debug/cratonvm
+          [ -x "$CV" ] || CV=target/debug/cratonvm.exe
+          CV="$CV" TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
+
+      # A `--jdk-only` refusal is only a RETIREMENT when nothing already owns
+      # the triple. `register` is last-write-wins and its JdkOnly arm returns
+      # WITHOUT inserting, so when an earlier registration owns the slot the
+      # older native survives as the winner, the retirement silently does not
+      # happen, and the two modes run different code.
+      #
+      # HERE rather than only in the advisory `jdk-only` job, for the reason the
+      # two steps above state: that job is `continue-on-error` at the JOB level.
+      #
+      # It is a RATCHET over a committed set, not a demand for zero: the nine
+      # measured winner-differences are triaged (four are deliberate per-mode
+      # branching in `lang_system.rs`; the rest are this shape and behaviourally
+      # equal today), and it fails when that set GROWS. The script refuses with
+      # exit 2 rather than looking green when the report is empty or unparsable
+      # — a run with zero refusals is a broken measurement, not a clean gate.
+      #
+      # Prerequisites are the same ones the step above already relies on: `Set
+      # up JDK 25` exports JAVA_HOME and `Build` leaves target/debug/cratonvm.
+      - name: JDK-only refusal survivors (a refusal that did not retire)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: CV=target/debug/cratonvm bash scripts/jdk-only-refusal-survivors.sh
+
+      # ARCH-2026-08-04 A7. A `pub` item referenced only by its own tests is
+      # invisible to `dead_code`; `lockfree_resolve.rs` kept 389 lines of an
+      # unwired resolution cache alive that way, through a 2026-07-26 audit that
+      # correctly identified it as dead and left it in place. Ratcheted at the
+      # post-A7 count with zero slack. `--nocapture` so the offender list lands
+      # in the log when it trips — the count alone does not name the regression.
+      - name: Test-only public API ratchet
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p cratonvm-vm --test no_test_only_public_api -- --nocapture
+
+      # ARCH-2026-08-04 A6. native-builtins is the crate that re-enters the VM
+      # (a native callback calls back into Java, taking the heap and L10
+      # class-manager locks) and it carried 440 raw lock constructions with zero
+      # LockLevels. Converting them all blind would assert an unverified
+      # hierarchy, so this ratchets the count instead while the per-lock audit
+      # proceeds.
+      - name: Lock-discipline ratchet
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p cratonvm-native-builtins --test lock_discipline_ratchet -- --nocapture
+
+      # THE DUPLICATE-REGISTRATION GATE
+      # (native-builtins/tests/duplicate_registration_gate.rs; see
+      # docs/known-issues/jdk-only/W6-4-duplicate-registration-gate.md).
+      #
+      # `NativeMethodRegistry::register` is last-write-wins and rewrites the
+      # slot IN PLACE, so a second registration of the same (class, method,
+      # descriptor) triple silently replaces the callback AND the kind. Live
+      # instances keep being found by hand — a hardened
+      # `ClassLoader.defineClass2` bounds decoder shadowed by an older
+      # unhardened one, and `Integer.toString(II)` registered THREE times where
+      # the two copies lanes tried to fix were both shadowed by a third.
+      #
+      # NAMED HERE FOR THE FIRST TIME, BUT NOT RUN FOR THE FIRST TIME. "Nothing
+      # runs it" is half right: it appears nowhere else in this file, yet
+      # `cargo test --workspace` above builds and runs every workspace
+      # integration test, this one included, and so does the
+      # `experimental-features` job's `--features ...,management,...` test
+      # step. What it has never had is a resolve it STATES. Both of those
+      # inherit `management` from `cratonvm-vm`'s defaults through feature
+      # unification, so the configuration the number belongs to is an accident
+      # of who else is in the build graph — and would move silently if a
+      # member stopped enabling it. `-p` plus an explicit `--features` is the
+      # fix, and it is why these are steps rather than a comment.
+      #
+      # TWO CONFIGURATIONS, TWO BASELINES, ON PURPOSE. `vm_init`'s real-JDK arm
+      # gates all ten `jmx::*` registrars behind `#[cfg(feature =
+      # "management")]` (vm/src/vm/vm_init.rs:2728-2784) and this crate's `jmx`
+      # module is gated the same way (native-builtins/src/lib.rs:4128).
+      # `cratonvm-vm` declares `default = ["awt", "management"]`, so every
+      # shipping `cratonvm-cli` build has them; `cratonvm-native-builtins`
+      # declares `default = []`, so a `-p` resolve does not. The census is
+      # therefore genuinely feature-dependent, and the test refuses to pretend
+      # otherwise: it names its configuration on every line it prints and in
+      # every failure message, and seeds a separate constant per configuration.
+      # Collapsing the two would mean dropping those ten registrars from the
+      # model in BOTH, i.e. under-measuring the build that actually ships.
+      #
+      # The second step is also a regression guard for a live break: until
+      # 2026-08-07 the replay called those ten registrars unconditionally, so
+      # this test target did not COMPILE without `management` (ten E0433s). It
+      # looked green under `cargo check --workspace --all-targets`, where
+      # unification supplies the feature, while the `experimental-features`
+      # job's `cargo check --all-targets -p cratonvm-native-builtins --features
+      # app-stubs,synthetic-quarkus-arc,legacy-synthetic-crypto` step compiles
+      # exactly the resolve that could not build it.
+      #
+      # BLOCKING, AND HONEST ABOUT WHAT IT BLOCKS ON TODAY. Two of the four
+      # tests are deterministic now and gate for real: the source witness
+      # (`vm_init` must not grow, or reorder, a registrar the replay does not
+      # model — an order inversion makes every "which registration wins" answer
+      # in the census wrong, and it carries no baseline) and the negative
+      # control (the replay must register thousands of natives, so the ratchets
+      # cannot go vacuous). The two COUNT ratchets are UNSEEDED: their
+      # baselines are `None`, and while `None` they print the measurement plus
+      # the exact `const ... = Some(N);` line to paste, and adjudicate nothing.
+      # Seeding a guess would be worse than not gating — a baseline above the
+      # true count tolerates every duplicate below it, which is precisely this
+      # species' existing failure mode.
+      #
+      # THE UNSEEDED STATE IS SELF-EXPIRING, not a permanent soft gate.
+      # `UNSEEDED_GRACE_ENDS_UNIX` in the test is 2026-09-07T00:00:00Z; past
+      # it, an unseeded baseline FAILS, and the failure text names the only two
+      # legitimate fixes (seed it, or move the date in the same commit as a
+      # written reason). That is deliberately NOT the fixed-wall-clock-bound
+      # shape this repository spent a wave removing from the synthetic-jdk
+      # suite: those asserted that an operation finished inside a duration, so
+      # they went red under load, at random, and taught people to ignore CI.
+      # This reads the calendar, is deterministic, and fires exactly once.
+      #
+      # `ubuntu-latest` only, exactly like the three ratchets above and for the
+      # same reason: registrars are platform-conditional, so a baseline is
+      # keyed to the OS that produced it, and linux is the key every other
+      # committed baseline in this file uses. Worth running the windows leg
+      # once while seeding, to learn whether the two numbers differ at all —
+      # that is a measurement, not an assumption, and it decides whether a
+      # second key is ever needed.
+      #
+      # `--nocapture` on both, because the census IS the diagnosis: a count
+      # says something changed, the loser-site/winner-site pair says what.
+      - name: Duplicate-registration gate (shipping resolve, --features management)
+        if: matrix.os == 'ubuntu-latest'
+        run: >
+          cargo test -p cratonvm-native-builtins --features management
+          --test duplicate_registration_gate -- --nocapture
+
+      - name: Duplicate-registration gate (this crate's own default resolve)
+        if: matrix.os == 'ubuntu-latest'
+        run: >
+          cargo test -p cratonvm-native-builtins
+          --test duplicate_registration_gate -- --nocapture
+
+      # A `cargo test` binary runs its tests on parallel threads in ONE process,
+      # so a test that publishes PROCESS-GLOBAL state reinterprets the heaps of
+      # every test beside it. Five `gen_heap` unit tests used to enable narrow
+      # oops around their own assertions, which flips
+      # `element_byte_size(Reference)` from 8 to 4 process-wide; reference
+      # arrays written at stride 8 were read back at stride 4 and decoded the
+      # high half of a pointer as a whole reference. That surfaced as
+      # `ObjectRef pointer not 8-byte aligned` in the G1 parallel-evacuation
+      # tests and was mis-attributed to a race in the evacuator for months.
+      #
+      # The `cargo test --workspace` job above cannot see this class of bug:
+      # the measured rate was 14 failures in 300 full-suite runs, so a
+      # single-run job is green ~95% of the time while the defect is fully
+      # live. Repetition is the gate. Scoped to the two collector crates and
+      # to their `--lib` suites, which is where process-global heap geometry
+      # is both written and read.
+      - name: GC suite flake gate (repeat runs)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/gc-flake-gate.sh
+
+      # RJ.4 in Cargo.toml: `cargo doc --workspace --no-deps` is the roadmap
+      # success criterion for zero rustdoc warnings; nothing built it until
+      # this step existed.
+      - name: Build documentation
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo doc --workspace --no-deps
+
+  # `synthetic-jdk` feature gate. This feature is documented and supported (see
+  # the `[features]` table in vm/Cargo.toml and NEW-11 in docs/roadmap.md), but
+  # it is deliberately NOT in the default set — so every job above compiles the
+  # default build and *nothing* ever compiled the code behind this flag.
+  #
+  # That is exactly how it rotted. On 2026-07-25 `cargo build --features
+  # synthetic-jdk` was found to be broken on `dev`: two Thread-layout helpers
+  # had been nested inside `register_essential_natives` (22 x E0425 from
+  # `register_synthetic_overrides`), and behind that, 327 more errors' worth of
+  # API drift had accumulated in the `#[cfg(all(test, feature =
+  # "synthetic-jdk"))]` module in vm/src/vm.rs — 1,522 tests that no compiler
+  # had looked at. None of it produced a CI signal, because no job built this
+  # configuration.
+  #
+  # `--all-targets` is deliberate: the lib/bin scope alone would NOT have caught
+  # the test-module drift, which was the larger half of the breakage. Scoped to
+  # `-p cratonvm-vm -p cratonvm-native-builtins` (the only crates that declare a
+  # `synthetic-jdk` feature at all — `cratonvm-gc` and `cratonvm-jit` do not) so
+  # this stays a fast guard rather than a second full workspace matrix.
+  synthetic-jdk:
+    name: Feature gate (--features synthetic-jdk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # Lib + bin scope across the whole workspace: proves the feature-gated
+      # production code (native-builtins' synthetic overrides, and every crate
+      # that forwards the feature) still compiles.
+      - name: Check workspace (synthetic-jdk)
+        run: cargo check --workspace --features synthetic-jdk
+
+      # Test scope: proves the synthetic-jdk-only test modules still compile.
+      - name: Check tests (synthetic-jdk)
+        run: >
+          cargo check --all-targets --features synthetic-jdk
+          -p cratonvm-vm -p cratonvm-native-builtins
+
+      # `cratonvm-native-builtins` owns most synthetic overrides, so its
+      # feature-only unit tests must execute, not merely compile. This is a
+      # blocking signal with no accepted failure set.
+      - name: Test native-builtins (synthetic-jdk)
+        run: cargo test -p cratonvm-native-builtins --lib --features synthetic-jdk
+
+      # BLOCKING as of 2026-07-31. Promoted from advisory; the measurement
+      # trail is below because the numbers are the whole argument.
+      #
+      #   before  reported 2584 of 3927 (2523 pass, 61 fail), then exit 1 with
+      #           NO `test result` line — 1,343 tests never executed, so "61"
+      #           was never the failure count.
+      #   then    173 failures, once the run could finish at all.
+      #   now     0 failed, on BOTH platforms: Windows 3825 passed / 0 failed,
+      #           Linux 3826 passed / 0 failed (exit 0). The one-test delta is
+      #           a cfg(unix)/cfg(not(unix)) pair, not a skipped test.
+      #
+      # The 61 was a floor twice over. Two process-global caches held heap
+      # addresses without scoping them to the VM that produced them, which
+      # `NativeContext::vm_identity`'s own doc comment forbids:
+      # `native-collections`' `widened_obj_key` aliased two VMs' collections
+      # onto one overlay slot, and `logmanager`/`logging_shims` did the same
+      # across ten tables. Both aborted the process mid-run.
+      #
+      # WHY THE FAILURES WERE WORTH FIXING RATHER THAN DELETING
+      #
+      # A large share were real defects that silently corrupted real programs:
+      #   * `Signature.verify` accepted a signature made with a DIFFERENT key.
+      #     The phase53 KeyPairGenerator/Signature stubs shadowed the complete
+      #     `jca` implementations and minted 1-field keys carrying no key_id,
+      #     while the real-crypto dispatch sat behind a default-off cfg — so
+      #     sign/verify degraded to an HMAC over empty key bytes and every key
+      #     produced the same signature.
+      #   * `Cleaner.register` built a Cleanable and dropped it on the floor.
+      #   * `Unsafe.allocateMemory` read the receiver as its size argument,
+      #     returned 0, and leaked every block (freeMemory early-returns on 0).
+      #   * `Collectors.minBy` returned a Map; `teeing` discarded all three of
+      #     its arguments; `averaging*`/`summing*` returned an ArrayList.
+      #   * `SECONDS.toNanos(1)` returned 1 — the TimeUnit ordinal was written
+      #     by name and read from slot 0.
+      #   * `ServerSocketChannel.bind`'s covariant-return descriptor was still
+      #     owned by a stale synthetic, so `accept()` never saw the listener.
+      #
+      # FOUR of the bugs had the SAME structural cause: one JDK method
+      # registered in two places, where `register` is last-wins
+      # (`native-api/src/registry.rs`, "last-registration-wins") and the LATER,
+      # WORSE copy won. TimeUnit, MutableCallSite.setTarget, KeyPairGenerator/
+      # Signature, and Locale.getDefault. Before concluding any native behaves
+      # as its source reads, grep for a second registration and check which
+      # file registers last.
+      #
+      # Tests were corrected — not deleted — where they pinned wrong behaviour
+      # as contract, each with the citation that made the VM right: interrupt
+      # CLEARS the flag (JLS 17.2.1); `Deflater.finished()` is set by
+      # `deflate()`, not `finish()` (asserting otherwise makes the canonical
+      # drain loop emit zero bytes); `publicLookup()` is UNCONDITIONAL 0x20
+      # (JDK 25 source — 0x21 is unreachable); a proxy is `jdk/proxy1/$Proxy0`,
+      # and pinning the old `Proxy$Instance` name would have locked the VM to
+      # its own fallback path.
+      #
+      # LOAD-SENSITIVE FLAKES — the reason this can be blocking at all
+      #
+      # Twelve tests asserted fixed wall-clock bounds. They pass idle and fail
+      # under load, which is precisely what makes a promoted gate go red at
+      # random — worse than no gate, because it teaches people to ignore CI.
+      # All twelve now assert invariants instead. Measured on a 16-core Linux
+      # box under CPU burners plus concurrent suite loops:
+      #   p86_interrupt_unblocks_monitor_wait  40/800 red -> 0/1224
+      #   t19_k1 family (8 tests)              11/140 red -> 0/250
+      #   wakeup_reschedule_supersedes_stale   12/380 red -> 0/700
+      #   p86_chm_concurrent_iteration          1/60  red -> 0/702
+      #
+      # Two traps worth knowing before touching these again:
+      #   * A LOWER bound (`elapsed >= X`) is NOT the safe direction here.
+      #     These tests sample `start` AFTER spawning, so under load the sleeps
+      #     finish before the clock starts: `must wait for slowest: 134.294µs`.
+      #   * `t19_k1_deadline_exits_before_all_joined` measured NOTHING — five
+      #     30ms sleepers run concurrently, so on an idle box all finish at
+      #     ~30ms and the 60ms deadline never fires. A green fixed-bound timing
+      #     test may simply not be exercising its subject.
+      # The durable fix in every case: poll under a generous ceiling, and
+      # assert a state readout (a submission counter, a joined count, a
+      # completion flag) that has no timing dependence at all.
+      #
+      # RUNTIME AND THE TIMEOUT
+      #
+      # 873s on a 16-core Linux box, 1007s on Windows, and run-to-run variance
+      # is large — the same Linux suite measured 565s and 873s, and the sibling
+      # native-builtins suite 342s and 698s, all on identical code. A CI runner
+      # has fewer cores than either box, so assume slower still. The suite is
+      # genuinely more expensive than it
+      # was: it now performs real RSA keygen, real zlib deflate/inflate and
+      # real socket binds where it previously hit instant stubs. The 20-minute
+      # cap was set when this step was advisory and a timeout cost nothing;
+      # now a timeout would produce NO `test result` line at all — the exact
+      # failure this work removed. Raised to 40, which is headroom over the
+      # slowest observed run on a smaller runner, not a licence to grow.
+      #
+      # ONE KNOWN NON-REPRODUCING FAILURE, deliberately not "fixed":
+      # `m22_rsa_sign_into_buffer` was reported red once and then passed 646
+      # consecutive runs under load, with no timing surface in the test or in
+      # `crypto_impl` and cross-VM aliasing ruled out (`vm_identity` is a
+      # never-reused counter). Most likely a shared-`target/` rebuild swapping
+      # the binary mid-run. If it recurs the panic text discriminates:
+      # "sign into buffer should write bytes" means `sign_dispatch` returned
+      # Err and `sig_sign_into` swallowed it via `.unwrap_or_default()`
+      # (`jca/signature.rs`) — a real VM bug worth escalating.
+      #
+      # WHEN THIS STEP GOES RED
+      #
+      # Note `cargo check -p <crate>` builds the LIB ONLY — a crate's tests are
+      # a separate target. Checking just the lib once let a broken
+      # native-builtins test build through unnoticed; use --all-targets. And
+      # check BOTH feature configurations: every check during this work passed
+      # `--features synthetic-jdk`, which is why an ungated call into a
+      # `#[cfg(feature = "synthetic-jdk")]` module broke the DEFAULT build —
+      # i.e. the blocking `cargo test --workspace` job — and went unnoticed for
+      # a full session.
+      #
+      # The sibling `cargo check --all-targets` step above stays blocking too:
+      # it is what stops this module silently rotting out of compilability, the
+      # failure mode that cost this repository 1,522 tests once already.
+      - name: Test vm (synthetic-jdk)
+        timeout-minutes: 40
+        run: cargo test -p cratonvm-vm --lib --features synthetic-jdk
+
+  # The `experimental-*` features and `zgc` left the default set, so an ordinary
+  # build no longer carries them. That trade is only safe because of this job.
+  # The `synthetic-jdk` module already proved what happens otherwise: a
+  # configuration nothing compiles rots silently, and 1,522 tests had stopped
+  # building before anyone noticed. Code outside the default build must still be
+  # inside SOME build.
+  experimental-features:
+    name: Feature gate (experimental-* and zgc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # This list must stay a superset of every optional feature declared in
+      # `vm/Cargo.toml` and `native-builtins/Cargo.toml` except the two that
+      # have their own jobs (`synthetic-jdk`) or need hardware (`gpu-offload`,
+      # covered by `cuda-bridge.yml` and the self-hosted `gpu-selfhosted.yml`).
+      # `experimental-t19-diag`, `app-stubs` and `synthetic-quarkus-arc` were
+      # missing here and were compiled by nothing at all — which is how this
+      # repository lost 1,522 tests once already.
+      #
+      # `management` and `deprecated-noop-tls` are the post-2026-07-30 names for
+      # `experimental-jmx` / `experimental-tls`. The deprecated aliases get their
+      # own resolve check below, so a broken alias fails CI rather than silently
+      # breaking a downstream build.
+      - name: Check every optional feature compiles, test targets included
+        run: >
+          cargo check --all-targets
+          -p cratonvm-vm -p cratonvm-native-builtins
+          --features deprecated-noop-tls,management,experimental-serialization,experimental-aot,experimental-debug,experimental-t19-diag,zgc
+
+      # The whole point of keeping the old names is that existing invocations
+      # keep working. Resolve them explicitly — a feature that vanishes breaks
+      # downstream builds silently, and nothing else in CI spells them out.
+      - name: Check the deprecated feature aliases still resolve
+        run: >
+          cargo check
+          -p cratonvm-vm -p cratonvm-native-builtins
+          --features experimental-tls,experimental-jmx
+      - name: Check the native-builtins-only optional features compile
+        run: >
+          cargo check --all-targets
+          -p cratonvm-native-builtins
+          --features app-stubs,synthetic-quarkus-arc,legacy-synthetic-crypto
+
+      # THE ZGC HALF OF THIS JOB, AND WHY IT IS TWO MORE STEPS RATHER THAN ONE
+      # MORE NAME ON THE FEATURE LIST ABOVE.
+      #
+      # `zgc` was already on that list, and it was not enough. On 2026-08-05
+      # `ZgcRealHeap::with_capacity()` was left out of the change that gave the
+      # compact-layout registry a domain — its three sibling collectors (`Heap`,
+      # `G1Collector`, `GenHeap`) all got `layout_domain`, it did not — and the
+      # feature stopped compiling with E0063. It was found on 2026-08-07 by a
+      # human running a full suite, not by this job.
+      #
+      # Two gaps let that through, and these steps close both:
+      #
+      #  1. NOTHING BUILT THE BINARY. Every zgc step here is `-p cratonvm-vm -p
+      #     cratonvm-native-builtins`, i.e. libraries. `cratonvm-cli` was never
+      #     compiled with the feature by any job in this file. That matters more
+      #     than the usual lib-vs-bin distinction because `zgc` also gates an
+      #     enum variant (`GcAlgorithm::Zgc`) and a `parse_gc_algorithm` match
+      #     arm in `vm/src/config.rs`, plus the `VmHeap::Zgc` arms in
+      #     `gc/src/vm_heap.rs` — whole dispatch paths that a default build
+      #     resolves to nothing. It is also the `-p`-scoped resolve a suite build
+      #     actually gets, for the same reason the "Default-feature native
+      #     registry surface" step in `build-and-test` is `-p`-scoped.
+      #  2. THE COLLECTOR'S OWN TESTS RAN NOWHERE. When these steps were added
+      #     that was 89 `#[test]`s (86 in `gc/src/zgc.rs`, 3 in
+      #     `gc/src/zgc_concurrent.rs`), all inside `#[cfg(feature = "zgc")]`
+      #     modules of a crate that no job selected with the feature on.
+      #     As of 2026-08-07 it is 368, after eleven new `gc/src/zgc/` modules
+      #     landed and `zgc_concurrent.rs` was rewritten: 91 in `zgc.rs`,
+      #     12 in `zgc_concurrent.rs`, 265 across `gc/src/zgc/*.rs`. Recount
+      #     with (bash, from the repo root):
+      #       grep -c '#\[test\]' gc/src/zgc.rs gc/src/zgc_concurrent.rs \
+      #         $(sed -n 's/^pub mod \(.*\);$/gc\/src\/zgc\/\1.rs/p' gc/src/zgc.rs)
+      #     Count only modules `zgc.rs` actually declares — an undeclared file
+      #     in `gc/src/zgc/` does not compile and its tests do not run, which is
+      #     how `census.rs`'s 24 tests sat unexecuted until it was declared.
+      #     Compiling them is not the point — `ZgcRealHeap` is a real
+      #     memory-backed mark-sweep collector (`GarbageCollector` impl, real
+      #     `Arena` storage, real `ObjectHeader`s), so its unit tests are a
+      #     behavioural signal and must execute.
+      #
+      # `--features zgc` resolves bare here because `cratonvm-cli` declares its
+      # own pass-through (`zgc = ["cratonvm-vm/zgc"]`, added with these steps) —
+      # that is also the command a developer uses for a ZGC-capable launcher.
+      # `cargo build`, not `cargo check`: the missing-field class of break is a
+      # type error either way, but this is the only place the shipped launcher
+      # is linked with the collector in it, and a link-time break is not a
+      # compile-time one.
+      #
+      # NOT A MATRIX. `ubuntu-latest` only, like the rest of this job — the
+      # collector is platform-agnostic Rust over an owned `Arena`, so a second
+      # OS leg would re-prove the same compile. Behavioural parity with
+      # `Generational` is not asserted anywhere in CI and deliberately so: the
+      # backend is default-off precisely because it is not at parity yet
+      # (zgc-real-fullsuite-regression-RETIRED-20260807.md).
+      - name: Build the cratonvm launcher with the ZGC backend compiled in
+        run: cargo build -p cratonvm-cli --features zgc
+
+      # NOT `--lib`. The unit tests alone cannot catch two ZGC modules
+      # disagreeing with each other: each module declares its own decoupling
+      # traits and its own tests exercise only its own side. The cross-module
+      # seams live in `gc/tests/zgc_module_integration.rs`, and while this step
+      # was `--lib`-scoped that target was compiled by NOTHING — it silently
+      # stopped compiling, and eight consecutive reconciliation passes were
+      # merged against a suite that had not run since. Same shape as the E0063
+      # and the never-executed-tests gaps above: a target no job builds rots.
+      - name: Test the ZGC collector (cratonvm-gc unit + integration tests)
+        timeout-minutes: 20
+        run: cargo test -p cratonvm-gc --features zgc
+
+      # Some test targets are gated in their entirety —
+      # `vm/tests/t4_8_jdwp_conformance.rs` is `#![cfg(feature =
+      # "experimental-debug")]` — and so execute nowhere else.
+      - name: Test the feature-gated surface
+        timeout-minutes: 30
+        run: >
+          cargo test
+          -p cratonvm-vm -p cratonvm-native-builtins
+          --features deprecated-noop-tls,management,experimental-serialization,experimental-aot,experimental-debug,zgc
+
+      # THE INTERSECTION, which until now was compiled by nothing.
+      #
+      # `vm/src/vm/tests.rs` is `#[cfg(all(test, feature = "synthetic-jdk"))]`,
+      # and nine of its tests carry a SECOND gate on `experimental-aot` /
+      # `experimental-debug` (the three `p90_jdwp_*` and the six `cds_*`). The
+      # two steps that could reach them are disjoint: the step above has the
+      # experimental features and not `synthetic-jdk`, and
+      # `cargo test -p cratonvm-vm --lib --features synthetic-jdk` in the
+      # `synthetic-jdk` job has `synthetic-jdk` and not the experimental ones.
+      # So those nine bodies were never even TYPE-CHECKED — deleting them,
+      # or replacing one with `panic!()`, changed nothing anywhere.
+      #
+      # That is strictly worse than a weak assertion, and it is the same rot
+      # this file already documents twice (the E0063 in
+      # `native-builtins/src/jboss_jdkspecific.rs`, and the
+      # `gc/tests/zgc_module_integration.rs` target that stopped compiling while
+      # eight passes were merged against it). A target no job builds rots.
+      #
+      # Its OWN step rather than adding `synthetic-jdk` to the list above, so
+      # that if the intersection does not currently compile the failure names
+      # itself instead of being read as a regression in the experimental
+      # surface. `--lib` because `vm/src/vm/tests.rs` is a unit-test module.
+      - name: Test the synthetic-jdk x experimental intersection
+        timeout-minutes: 30
+        run: >
+          cargo test
+          -p cratonvm-vm --lib
+          --features synthetic-jdk,experimental-aot,experimental-debug
+
+  # Build + publish the libcratonvm C-ABI embedding library (cdylib + staticlib)
+  # and its public C headers as downloadable CI artifacts, per
+  # docs/feature-designs/embedding-api.md ("CI publication of the .so/.dll/.a +
+  # header"). cargo names the artifacts after the crate:
+  #   Linux:   liblibcratonvm.so (cdylib) + liblibcratonvm.a (staticlib)
+  #   Windows: libcratonvm.dll (cdylib) + libcratonvm.dll.lib (import lib) +
+  #            libcratonvm.lib (staticlib)
+  # (the doubled `lib` on Linux is cargo's prefix on a crate already named
+  # `lib...`; see the design doc). The build-and-test job already compiles the
+  # whole workspace including libcratonvm, so this never introduces a new build
+  # failure surface — it only adds a release build + artifact upload.
+  publish-libcratonvm:
+    name: Publish libcratonvm (cdylib/staticlib + headers)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build libcratonvm (release cdylib + staticlib)
+        run: cargo build --release -p libcratonvm
+
+      - name: Stage artifacts (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/liblibcratonvm.so dist/
+          cp target/release/liblibcratonvm.a  dist/
+          cp libcratonvm/include/cratonvm.h         dist/
+          cp libcratonvm/include/cratonvm_helpers.h dist/
+          ls -l dist
+
+      - name: Stage artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/libcratonvm.dll      dist/
+          cp target/release/libcratonvm.dll.lib  dist/
+          cp target/release/libcratonvm.lib      dist/
+          cp libcratonvm/include/cratonvm.h         dist/
+          cp libcratonvm/include/cratonvm_helpers.h dist/
+          ls -l dist
+
+      - name: Upload libcratonvm artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcratonvm-${{ runner.os }}
+          path: dist/
+          if-no-files-found: error
+
+  # Smoke-test every per-subsystem CRATONVM_REAL_* real-path gate.
+  # Requires a JDK (for javac to compile the Java test classes in build.rs)
+  # and the cratonvm binary. The tests skip gracefully when prerequisites are
+  # absent during local development; CI provisions both prerequisites.
+  real-path-coverage:
+    name: Real-path smoke tests (per-subsystem REAL_* gates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25 (needed for build.rs javac and as cratonvm boot JDK)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build (debug — produces cratonvm binary for subprocess tests)
+        run: cargo build --workspace
+
+      - name: Run real-path smoke tests
+        run: cargo test -p cratonvm-vm --test synthetic_diff -- --nocapture
+
+  # Semantic differential gate (difftest, design
+  # docs/feature-designs/differential-fuzzer.md §3.5). `cratonvm-difftest gate` diffs a
+  # fresh run of the seed corpus against the committed difftest/ledger.json and
+  # honors the exit-code contract (0 ok / 1 new-or-drift / 2 fixed-reopened /
+  # 3 bootstrap), with the determinism pre-flight + divergence re-confirmation
+  # forced on. It exits 3 (non-fatal) if `java` or the cratonvm binary is
+  # absent. A *new* CratonVM/HotSpot divergence on a seed fails this job;
+  # tracked `known` divergences (e.g. ExceptionId's message-parity gaps) pass.
+  difftest-gate:
+    name: Semantic differential gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25 (the HotSpot oracle)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build difftest + cratonvm
+        run: cargo build -p cratonvm-difftest -p cratonvm-cli
+
+      - name: Run the semantic differential gate
+        run: cargo run -p cratonvm-difftest --bin cratonvm-difftest -- gate --corpus difftest/seeds
+
+      # Opcode / execution-path coverage (docs/testing/opcode-coverage.md §8).
+      # Reuses this job's JDK 25 and build deliberately: `matrix` compiles the
+      # generated corpus with the *same* javac the differential run uses, so the
+      # grid describes the exact bytes that run executes.
+      #
+      # REPORT, NOT A GATE. `matrix` always exits 0 on a scannable corpus — a
+      # coverage gap is a backlog item, and failing here would make *adding an
+      # axis* a red build. Exit 3 (bootstrap: empty corpus, or no javac) is
+      # accepted too, so the step is adoptable before anyone commits to a
+      # ratchet. Any other exit code is a real failure and is not swallowed.
+      - name: Generate the opcode corpus and the coverage matrix
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          cargo run -p cratonvm-difftest --bin cratonvm-difftest -- \
+            gen-opcodes --out target/difftest-opcodes || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "::notice title=opcode corpus::gen-opcodes bootstrapped (exit 3); nothing to measure."
+            exit 0
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          status=0
+          cargo run -p cratonvm-difftest --bin cratonvm-difftest -- \
+            matrix --corpus target/difftest-opcodes --show-gaps \
+            --out target/coverage-matrix.json || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "::notice title=coverage matrix::matrix bootstrapped (exit 3); no corpus or no javac."
+            exit 0
+          fi
+          exit "$status"
+
+      # if-no-files-found: warn, not error — the generate step legitimately
+      # produces no matrix on the exit-3 bootstrap path above.
+      - name: Upload the coverage matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: opcode-coverage-matrix
+          path: target/coverage-matrix.json
+          if-no-files-found: warn
+
+  # JIT execution-path lane (docs/testing/jit-differential.md).
+  #
+  # `difftest-gate` above judges CratonVM against HotSpot in `jit-on`, `nojit`
+  # and `interp-decoded` only, so no IR, OSR or deopt mode was ever gated. This
+  # job runs `path-gate`: every mode in `Mode::execution_paths()` plus
+  # `moving-gc` must agree with the interpreter (`nojit`) on exit code,
+  # uncaught exception, stdout and checksums. It needs no HotSpot run and no
+  # ledger rows (the reference is CratonVM's own interpreter), which is why it
+  # is a SEPARATE job: the HotSpot gate step above stays byte-identical.
+  #
+  # Tracked splits go in difftest/path-gate-known.json. A split that does not
+  # reproduce on re-run is reported as flaky and does not fail the job.
+  #
+  # The IR verifier lanes are exported for the whole job. A rejection is
+  # printed only under CRATONVM_DBG_IR_COMPILES and is REPORTED here, not gated
+  # (no `--fail-on-ir-verify-reject`); the nightly workflow gates it. Promote
+  # it here once a nightly has shown the seeds are rejection-free.
+  #
+  # Exit 3 (bootstrap: no binary / no javac) is not swallowed: this job builds
+  # both, so a bootstrap exit here is a broken job, not a missing prerequisite.
+  difftest-jit-paths:
+    name: JIT execution paths vs interpreter
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CRATONVM_JIT_VERIFY_IR: '1'
+      CRATONVM_JIT_VERIFY_TYPES: '1'
+      CRATONVM_JIT_VERIFY_FRAME_STATES: '1'
+      CRATONVM_JIT_VERIFY_MEMORY_CHAIN: '1'
+      CRATONVM_JIT_VERIFY_ARENA_ORDER: '1'
+      CRATONVM_DBG_IR_COMPILES: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25 (javac for the seeds, and the boot image)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build difftest + cratonvm
+        run: cargo build -p cratonvm-difftest -p cratonvm-cli
+
+      # No VM: generates 256 class files and runs the typed assembler's checks
+      # plus the byte-level shape check on each. A red step here is a
+      # generator bug, and it would make every nightly fuzz result noise.
+      - name: Bytecode generator self-check
+        run: cargo run -p cratonvm-difftest --bin cratonvm-difftest -- fuzz-jit --dry-run --seed 1 --count 256
+
+      - name: Execution-path gate over the seeds
+        run: >-
+          cargo run -p cratonvm-difftest --bin cratonvm-difftest --
+          path-gate --corpus difftest/seeds
+          --modes nojit,interp-decoded,direct-emit,ir-jit,osr-eager,no-osr,forced-deopt,moving-gc
+          --reference nojit
+          --known difftest/path-gate-known.json
+
+  # Hermetic self-test for the JDK-only blocker generator
+  # (`tools/jdk-only-blockers/blockers.py`, the tool that derives the design-§6
+  # artifacts the `jdk-only` job below uploads). 51 assertions over synthetic
+  # dumps in both emitter shapes: generation, determinism (byte-identical
+  # reruns, no CRLF, no absolute paths in a file that gets committed as a
+  # baseline), the ratchet — including that a never-invoked stub still fails it,
+  # and that an extra *allowed* generated class does not — the status ledger,
+  # and every degraded-input path.
+  #
+  # ITS OWN CHEAP JOB, DELIBERATELY. `--selftest` is handled before every
+  # prerequisite check in scripts/jdk-only-census.sh, so this needs no cargo
+  # build, no Rust toolchain, no JDK image, no cratonvm binary and no network —
+  # it is a stdlib-only python run of a few seconds. Putting it in
+  # `build-and-test` would make it wait on a full workspace build, and putting it
+  # in the `jdk-only` matrix would pay for a JDK and a Rust build four times to
+  # learn the same hermetic fact.
+  #
+  # BLOCKING, unlike the advisory `jdk-only` job below. Neither of that job's two
+  # reasons to be advisory applies here: this depends on no runtime image, no
+  # committed baseline and no strict-mode corpus, so it is deterministic today.
+  # If it ever goes red, the generator is broken, and every artifact that job
+  # produces is then untrustworthy. Runner images ship python3; if one does not,
+  # the script exits 3 and names the interpreters it tried, which is the right
+  # failure rather than a silent skip.
+  jdk-only-blockers-selftest:
+    name: JDK-only blocker generator self-test (hermetic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test (no build, no JDK, no network)
+        shell: bash
+        run: sh scripts/jdk-only-census.sh --selftest
+
+      # The L6 bridge ratchet's own logic, on the same terms and for the same
+      # reasons: stdlib-only python, seconds, no cargo build, no JDK image, no
+      # cratonvm binary, so it belongs in this job rather than paying for a
+      # build four times in the `jdk-only` matrix below. `--selftest` is handled
+      # before every prerequisite check in regression-suite/bridge-ratchet.sh.
+      #
+      # What it proves is that the gate can fail: it injects an unadjudicated
+      # `Bridge` (a registration onto a method the image declares with concrete
+      # bytecode) into a synthetic census and requires rejection, AND injects an
+      # adjudicated one it must accept — so the gate is shown not to be merely
+      # always-red. It also pins every refusal path to exit 2, because a gate
+      # that cannot answer must not report a pass. The gate's *measured* half
+      # needs a JDK and runs in the `jdk-only` job below.
+      #
+      # BLOCKING, like its neighbour and for the same reason: it depends on no
+      # runtime image, no committed baseline and no corpus, so it is
+      # deterministic today. If it goes red, the ratchet in the job below is not
+      # evidence of anything.
+      - name: Bridge-ratchet gate self-test (no build, no JDK, no network)
+        shell: bash
+        run: sh regression-suite/bridge-ratchet.sh --selftest
+
+  # JDK-only mode (`--jdk-only`), per docs/feature-designs/jdk-only-mode.md.
+  # "Real class bytes are authoritative": no fabricated compatibility classes,
+  # no `NativeKind::SyntheticStub` registered or invoked.
+  #
+  # ADVISORY (`continue-on-error: true`) ON PURPOSE. Two independent reasons:
+  #
+  #  1. Wave 1 is measurement, not deletion (design §10). Synthetic-stub natives
+  #     are still registered on the default path, and the strict class-loading
+  #     refusals mean a `--jdk-only` run is *expected* to fail on real workloads
+  #     right now. The census is how that failure is measured.
+  #     MEASURED 2026-09-10, because the figure that stood here (157) was prose
+  #     and prose does not get re-frozen: `registry-real.json` carries **1701
+  #     synthetic-stub rows over 1584 distinct triples**. Under `--jdk-only` the
+  #     final registry holds ZERO of them, so design §11's criterion 2 is met at
+  #     registration -- but 7 of those triples are still answered by an OLDER
+  #     registration rather than by bytecode, and refused is not retired. Take
+  #     any remaining-work figure from a dump:
+  #     `docs/known-issues/jdk-only/the-six-acceptance-criteria-measured-20260910.md`.
+  #  2. The design's own acceptance criterion (§11) makes the zero-stub census
+  #     blocking only once "the strict corpus shows no new HotSpot divergence" —
+  #     i.e. once difftest/seeds-jdk-only is deterministic across both OS legs.
+  #
+  #     CORRECTED 2026-09-10. **That condition is now satisfied and it is NOT
+  #     sufficient**; the earlier wording ("promote this job by deleting
+  #     `continue-on-error` at that point, together with un-ignoring
+  #     `strict_mode_refuses_nothing`") read as an instruction to promote today,
+  #     and following it would enable a blocking gate whose own strong assertion
+  #     is still disabled. `21-linux` and `25-linux` reached ZERO divergent rows
+  #     on 2026-09-10 (`50b9c2482`), and the ratchet was proven to still fire
+  #     against the emptied files.
+  #
+  #     `native-builtins/tests/stub_ratchet.rs` governs, and it does not list
+  #     corpus determinism at all. `strict_mode_refuses_nothing` may be
+  #     un-ignored only after ALL THREE of: (a) the `SyntheticStub`
+  #     registrations are reclassified into real `Bridge`/`Intrinsic` or deleted
+  #     so real bytecode runs -- explicitly a separate wave with
+  #     subsystem-per-PR discipline, contract §8; (b) `BASELINE_SYNTHETIC_STUBS`
+  #     is driven to 0 in the SAME change, since the ratchet is slack-free and a
+  #     stale baseline would silently re-admit that many new stubs; (c) the test
+  #     is un-ignored so the zero is held. Promote this job as part of (c), not
+  #     before it.
+  #
+  # For the avoidance of doubt about the neighbouring jobs: the "Synthetic-stub
+  # ratchet" step in `build-and-test` is BLOCKING today — it runs in a job that
+  # provisions JDK 25 and carries no `continue-on-error`, and it asserts an
+  # exact ceiling (`synthetic <= BASELINE_SYNTHETIC_STUBS`, SLACK = 0) plus a
+  # separate, much weaker `total >= 8_000` floor. There are exactly TWO
+  # `continue-on-error: true` items in this file: the advisory
+  # `cargo test -p cratonvm-vm --lib --features synthetic-jdk` step, and this
+  # job. Nothing here weakens either, and the hermetic
+  # `jdk-only-blockers-selftest` job above is blocking.
+  #
+  # JDK MATRIX IS A PROPOSAL, NOT EXISTING COVERAGE. Every other job in this
+  # file pins `java-version: '25'`, so JDK 21 is currently tested by nothing at
+  # all. The 21 leg is here because "real class bytes are authoritative" is a
+  # claim about a *specific* runtime image — a boot-image layout or module set
+  # that differs between 21 and 25 shows up as a class-origin census diff and
+  # nowhere else. If the 21 leg proves noisy for reasons unrelated to strict
+  # mode, drop it from THIS matrix rather than adding 21 elsewhere; widening
+  # JDK coverage repo-wide is a separate decision.
+  #
+  # Inputs this job depends on, and their state as of this commit — every one of
+  # them is landing in the same wave, which is a third reason to stay advisory:
+  #   * `--jdk-only`, `--dump-class-origins`, `--jdk-only-report`,
+  #     `--dump-native-registry` (vm-cli, §9): PRESENT.
+  #   * `jdk-only-jit` / `jdk-only-nojit` difftest mode labels: PRESENT.
+  #   * `CompatibilityMode` / registry census / `ClassOrigin` (§§3-5): PRESENT.
+  #   * `CRATONVM_ARGS` forwarding in `regression-suite/run.sh`: PRESENT as of
+  #     this commit (it was not, one commit ago — see the note on that step).
+  jdk-only:
+    name: JDK-only mode (advisory) ${{ matrix.os }} / JDK ${{ matrix.java }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        java: ['21', '25']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK ${{ matrix.java }} (the runtime image under audit)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+
+      # The census script drives the real launcher, and the difftest gate needs
+      # its own binary; both are debug builds because this job measures
+      # provenance, not throughput.
+      - name: Build cratonvm + difftest
+        run: cargo build -p cratonvm-cli -p cratonvm-difftest
+
+      # The hermetic half: no JDK image, no subprocess, no Cargo feature. These
+      # four targets are the cross-crate contract (design §§4, 5, 7) and the
+      # strict half of the stub ratchet. Add `--test jdk_only_config` here when
+      # `vm/tests/jdk_only_config.rs` (design §6, VmConfig validation) lands.
+      - name: Strict-mode unit and integration tests
+        shell: bash
+        run: |
+          cargo test -p cratonvm-native-api    --test jdk_only_registry
+          cargo test -p cratonvm-classloading  --test jdk_only_class_origin
+          cargo test -p cratonvm-vm            --test jdk_only_dispatch
+          cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
+
+      # The booted-VM half.
+      #
+      # The script runs the VM ONCE PER POLICY and emits all four dumps on each
+      # run, with the policy in every file name — so a registry census and a
+      # class census that appear in the same artifact always describe the same
+      # booted process. (The previous layout paired a stub-dropped registry with
+      # a compatible-run class census; that mix looks fine and is wrong.)
+      #
+      #   real   (--real-jdk)  registry-real.json    missing-real-by-module.json
+      #                        classes-real.json     report-real.json
+      #   strict (--jdk-only)  registry-strict.json  missing-strict-by-module.json
+      #                        classes-strict.json   report-strict.json
+      #
+      # plus three byte-identical ALIASES OF THE STRICT SET kept for older
+      # consumers — registry-no-stubs.json, class-origins.json,
+      # jdk-only-report.json — and the design-§6 blocker pair
+      # `jdk-<feature>-{missing-natives,synthetic-dependencies}.json`, generated
+      # by tools/jdk-only-blockers/blockers.py from the *real* dump set at the
+      # output root and from the *strict* dump set under `strict/`.
+      #
+      # A non-zero VM exit is not a script failure here; only a missing artifact
+      # is. Script exit codes: 3 prerequisite missing (nothing ran), 4 a required
+      # dump was not written, 5 blocker generation or the ratchet failed.
+      #
+      # BLOCKERS is left at its default (`generate`). Python is what the derived
+      # artifacts need, and every hosted runner ships python3, so the default is
+      # the right one here: `BLOCKERS=off` would declare the §6 artifacts
+      # deliberately omitted, and they are not — they are the triage material
+      # this job exists to produce.
+      #
+      # THE RATCHET IS NOT ENABLED, AND ITS PRECONDITION IS NOT MET. Turning it
+      # on is one line — add `env: {BLOCKERS: check}` to this step — after which
+      # the script ratchets the `real` blocker pair against
+      # tools/jdk-only-blockers/baselines/ and exits 5 when the open set grows.
+      # That directory contains only `.gitkeep` today, and blockers.py correctly
+      # refuses `--check` with exit 2 (surfaced as census exit 5) when no
+      # baseline exists for the JDK feature under test. The precondition is a
+      # committed pair — baselines/jdk-<feature>-missing-natives.json and
+      # baselines/jdk-<feature>-synthetic-dependencies.json — produced by a real
+      # `BLOCKERS=update` run against the image this job pins. Never written by
+      # hand, and never from a partial run (blockers.py refuses that too). The
+      # artifacts are only valid for the image that produced them, so each
+      # matrix leg needs its own committed pair.
+      - name: JDK-only census (registry, class origins, missing natives)
+        shell: bash
+        run: |
+          rc=0
+          sh scripts/jdk-only-census.sh || rc=$?
+          echo "CENSUS_RC=$rc" >> "$GITHUB_ENV"
+          case "$rc" in
+            0)
+              echo "census: every artifact was produced."
+              ;;
+            5)
+              # Exit 5 is only reachable AFTER the script has verified that every
+              # required dump exists, so the four censuses are complete and the
+              # acceptance gates below are worth running against them. What is
+              # missing is the derived §6 blocker pair. In the script's own
+              # words that "is a gap in this run, not a clean result", so it must
+              # not pass silently — but failing here would skip the gates and the
+              # upload, so the non-zero exit is deferred to the last step of this
+              # job.
+              echo "::error::jdk-only-census.sh exited 5: the dumps were written, but the"
+              echo "  design section-6 blocker artifacts were not generated (no python interpreter,"
+              echo "  an undeterminable JDK feature version, or blockers.py itself failed)."
+              echo "  Hosted runners ship python3, so this is a real regression, not an"
+              echo "  expected environment gap. The dumps are complete; the gates below run"
+              echo "  and the job is failed by its final step."
+              ;;
+            *)
+              echo "::error::jdk-only-census.sh exited $rc (3 = a prerequisite is missing and"
+              echo "  nothing ran; 4 = the VM ran but a required dump was not written)."
+              echo "  There is no coherent dump set to assert on; failing now."
+              exit "$rc"
+              ;;
+          esac
+
+      # ACCEPTANCE CRITERION (design §11): the final native registry in strict
+      # mode contains zero SyntheticStub entries. Re-derived here from the
+      # artifact rather than trusting the script's own summary line, so the gate
+      # and the human-readable summary can disagree loudly.
+      #
+      # POLICY, NAMED EXPLICITLY: registry-strict.json is the --jdk-only run's
+      # own census. registry-no-stubs.json is a byte-identical alias of it (the
+      # script copies strict -> alias), and registry-real.json is the permissive
+      # run — asserting zero against *that* would be a gate that can never pass,
+      # and mixing the two is the exact defect the per-policy rename fixed. Read
+      # the policy-suffixed name so the file this gate reads says which world it
+      # came from.
+      - name: Assert zero synthetic-stub natives in the strict registry
+        shell: bash
+        run: |
+          f=target/jdk-only-audit/registry-strict.json
+          if [ ! -s "$f" ]; then
+            echo "::error::$f was not produced; the strict run did not get far enough to census."
+            exit 1
+          fi
+          # Schema 2 carries "synthetic-stub" TWICE as a numeric key: once in
+          # `counts` (REGISTRATIONS — what §11 gates on) and once in
+          # `invocations` (dispatches). Scope the read to the `counts` block
+          # instead of letting `head -n 1` depend on which block happens to be
+          # serialized first.
+          block=$(sed -n '/"counts"[[:space:]]*:[[:space:]]*{/,/^[[:space:]]*}/p' "$f")
+          if [ -z "$block" ]; then
+            echo "::error::$f has no readable \"counts\" block. That is not a zero —"
+            echo "the schema changed, or the dump is truncated."
+            exit 1
+          fi
+          n=$(printf '%s\n' "$block" \
+              | sed -n 's/.*"synthetic-stub"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+              | head -n 1)
+          if [ -z "$n" ]; then
+            echo "::error::$f carries no \"synthetic-stub\" count. A census without the"
+            echo "count is not a zero — the schema changed, or the dump is truncated."
+            exit 1
+          fi
+          echo "strict registry synthetic-stub natives: $n"
+          if [ "$n" -ne 0 ]; then
+            echo "::error::$n synthetic-stub native(s) survived --jdk-only. Every one of them"
+            echo "shadows real JDK bytecode. Make it a Bridge/Intrinsic or delete it; see"
+            echo "docs/feature-designs/jdk-only-mode.md \$4."
+            exit 1
+          fi
+
+      # ACCEPTANCE CRITERION (design §11): zero ClassOrigin::CompatibilityStub
+      # classes. Arrays, hidden classes, lambdas, proxies and reflection
+      # accessors carry their own origins and are explicitly allowed, so this
+      # counts the one forbidden tag rather than "anything VM-generated".
+      #
+      # POLICY, NAMED EXPLICITLY: classes-strict.json is the --jdk-only run's
+      # class census; class-origins.json is a byte-identical alias of it, and
+      # classes-real.json is the permissive run, which legitimately contains
+      # compatibility classes today. Reading the policy-suffixed name is what
+      # keeps this gate from being pointed at the wrong world.
+      - name: Assert zero compatibility classes in the class-origin census
+        shell: bash
+        run: |
+          f=target/jdk-only-audit/classes-strict.json
+          if [ ! -s "$f" ]; then
+            echo "::error::$f was not produced (--dump-class-origins wrote nothing)."
+            exit 1
+          fi
+          # Read the `counts` block, NOT `grep -c '"compatibility-stub"'`: the
+          # tag also appears once per offending row, so an occurrence count
+          # reports N+1.
+          block=$(sed -n '/"counts"[[:space:]]*:[[:space:]]*{/,/^[[:space:]]*}/p' "$f")
+          if [ -z "$block" ]; then
+            echo "::error::$f has no readable \"counts\" block; it is not evidence of a zero."
+            exit 1
+          fi
+          n=$(printf '%s\n' "$block" \
+              | sed -n 's/.*"compatibility-stub"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+              | head -n 1)
+          if [ -z "$n" ]; then
+            # `counts` is seeded from the full ClassOrigin tag vocabulary
+            # (CLASS_ORIGIN_TAGS / render_class_origins_json in
+            # vm/src/vm/vm_init.rs), so `"compatibility-stub": 0` is STATED, not
+            # implied by an absent key. Defaulting an absent key to zero here —
+            # as this step used to — would turn a schema break or a truncated
+            # dump into a silently passing gate.
+            echo "::error::$f has a \"counts\" block with no \"compatibility-stub\" key."
+            echo "That key is seeded to 0 for every run, so its absence means the schema"
+            echo "changed or the dump is truncated. It is not a zero."
+            exit 1
+          fi
+          echo "compatibility-stub classes: $n"
+          if [ "$n" -ne 0 ]; then
+            echo "::error::$n fabricated compatibility class(es) under --jdk-only. Real class"
+            echo "bytes are authoritative: the loader must raise ClassNotFoundException /"
+            echo "NoClassDefFoundError instead of fabricating. See jdk-only-mode.md \$5."
+            grep -n '"compatibility-stub"' "$f" | head -n 40
+            exit 1
+          fi
+
+      # THE BRIDGE RATCHET
+      # (L6-unadjudicated-bridge-ratchet-DONE-20260805.md).
+      #
+      # Contract §1.5 defines a `Bridge` by its `ACC_NATIVE` target. 10,069 of
+      # the 10,842 `Bridge` registrations have none, every one of them inherited
+      # its kind from an ambient `set_category`, and nothing stopped that number
+      # rising. This freezes it, slack-free, against
+      # scripts/baselines/jdk-only-bridge-ratchet.json.
+      #
+      # IT TAKES ITS OWN CENSUS, on purpose. The `image_declaring_method` column
+      # this gate reads is populated only under `--explain-jdk-only`, which
+      # scripts/jdk-only-census.sh does not pass — so the dumps produced above
+      # carry a null column and could not answer this question. The extra run
+      # boots the VM and prints one line; the numbers are workload-independent
+      # (registration happens in `SharedVm::new`, and the image adjudication
+      # parses class-path bytes without loading anything), which was verified
+      # against the breadth-first `JdkOnlyCensusLoadProbe` rather than assumed.
+      #
+      # BASELINES ARE KEYED `<jdk-feature>/<os>` and only `25/linux` is
+      # committed, so three of this matrix's four legs REFUSE (exit 2) instead
+      # of scoring one image's census against another image's numbers. A refusal
+      # is reported and does NOT fail the step — it is not a pass either, and
+      # the notice says so. Exit 1, the ratchet actually firing, does fail.
+      # Gating another leg is one `--update-baseline` run against the image that
+      # leg pins; never a hand-edited number.
+      #
+      # run.sh's convention: this job builds debug, so CV is pointed at it
+      # rather than paying for a release build.
+      - name: Bridge ratchet (unadjudicated Bridge registrations)
+        shell: bash
+        run: |
+          CV=target/debug/cratonvm
+          [ -x "$CV" ] || CV=target/debug/cratonvm.exe
+          rc=0
+          CV="$CV" sh regression-suite/bridge-ratchet.sh || rc=$?
+          case "$rc" in
+            0)
+              echo "bridge ratchet: pass."
+              ;;
+            2)
+              echo "::notice::bridge ratchet: no committed baseline for this matrix leg."
+              echo "  The key is <jdk-feature>/<os> and only 25/linux is committed. This"
+              echo "  leg is not gated; that is a gap, not a pass. Take a baseline with"
+              echo "  'sh regression-suite/bridge-ratchet.sh --update-baseline --note ...'"
+              echo "  on the image this leg pins."
+              ;;
+            1)
+              echo "::error::bridge ratchet FIRED: a Bridge registration was added whose"
+              echo "  target the JDK image does not declare ACC_NATIVE. Contract 1.5 defines"
+              echo "  a Bridge by that target. State the kind at the registration site with"
+              echo "  register_with_kind() and make it SyntheticStub/Intrinsic, or delete it"
+              echo "  so the real bytecode runs. Do not raise the baseline. See the table"
+              echo "  printed above for which bucket grew."
+              exit 1
+              ;;
+            *)
+              echo "::error::bridge-ratchet.sh exited $rc (3 = a prerequisite is missing, or"
+              echo "  the census run was killed by its timeout, so nothing was measured)."
+              exit "$rc"
+              ;;
+          esac
+
+      # PRECONDITION NOW MET — re-verified against `regression-suite/run.sh` at
+      # this commit, where it was NOT met one commit ago. The suite expands
+      # `${CRATONVM_ARGS:-}` (unquoted, so multi-flag values work) into every
+      # CratonVM invocation and deliberately withholds it from the HotSpot
+      # oracle, and `--jdk-only` in that variable additionally switches on the
+      # RJdk* strict corpus. So a green result here now really is "the suite
+      # passes under --jdk-only" — but re-check that expansion before quoting
+      # this step as strict-mode evidence, because a run.sh that stops reading
+      # the variable turns this back into a compatible-mode run whose green
+      # says nothing about the policy it names, with no other symptom.
+      #
+      # run.sh defaults CV to target/release/cratonvm[.exe]; this job builds
+      # debug, so point CV at it explicitly rather than paying for a release
+      # build.
+      # THE INSTRUMENT, BEFORE THE MEASUREMENT. run.sh reduces every vector's
+      # output to its PASS/CK lines before diffing the two VMs, and for a long
+      # time nothing checked that anything meaningful survived the filter:
+      # three scheduled vectors printed their entire evidence on other prefixes
+      # and reduced to the constant `PASS <Class>`, which always matches itself.
+      # RDataInputFastPull with a one-line defect injected exited rc=0 with
+      # output byte-identical to a clean run. See
+      # W7-60-harness-extract-blindness.md and W7-51-vacuous-sweep-round-2.md.
+      #
+      # run.sh runs the same four guards inline, so this step is not the only
+      # place they fire. It is here because it needs NO CratonVM binary: if the
+      # build above breaks, or a contributor's lane cannot build the VM at all,
+      # the harness's own soundness is still measured. It was green over all 70
+      # scheduled vectors on Temurin 25.0.3+9 when it was added, so a red here
+      # means a vector landed that the suite cannot see fail.
+      - name: Regression-suite harness self-check (HotSpot only)
+        shell: bash
+        run: bash regression-suite/harness-selfcheck.sh
+
+      # STRICT_COVERAGE=1 is the second half of a gate that had only ever had
+      # one. `run.sh`'s own documentation says "CI should set it"; no workflow
+      # did, so a `regression-suite/src/*.java` vector that appeared in NO class
+      # list printed a warning inside a passing build — which is how RJdkPhaser
+      # (240 checks) arrived inert and stayed that way. A warning in a green run
+      # is not a gate.
+      #
+      # Safe to arm now, and measured rather than assumed: at this commit the
+      # census is exactly 42 CORE + 28 JDK-only + 2 UNREGISTERED = 72 sources,
+      # with no unlisted vector and no list entry whose source is gone. If this
+      # step goes red on a coverage line, the fix is to schedule the vector or
+      # name it in UNREGISTERED_CLASSES with a reason — never to unset this.
+      - name: Regression suite under --jdk-only
+        shell: bash
+        env:
+          CRATONVM_ARGS: --jdk-only
+          STRICT_COVERAGE: 1
+        run: |
+          CV=target/debug/cratonvm
+          [ -x "$CV" ] || CV=target/debug/cratonvm.exe
+          CV="$CV" bash regression-suite/run.sh
+
+      # ACCEPTANCE CRITERION (design §11, criterion 6): the strict corpus is
+      # green. This is the criterion that went unmeasured until 2026-08-04, and
+      # measuring it immediately found that `--jdk-only` could not start a
+      # thread; the second widening, on 2026-08-05, found four more divergences
+      # in one run. It is where the defects are, so it runs on every build
+      # rather than when someone remembers to look.
+      #
+      # Three arms on ONE image and ONE set of class files: real HotSpot,
+      # `--real-jdk`, `--jdk-only`. The HotSpot control is not optional — a
+      # divergence present in both CratonVM modes is a compatibility defect
+      # that `--jdk-only` did not introduce, and without the control there is
+      # no way to say which kind you have. The script fails 4 for an arm that
+      # did not complete and 5 for a transcript that diverged, kept separate
+      # because a `timeout` kill prints a truncated transcript that reads
+      # exactly like a clean short run.
+      #
+      # BLOCKING, AND IT IS A RATCHET. The step's whole purpose is that "a
+      # strict regression fails a build rather than waiting for someone to
+      # look", so it carries no `continue-on-error`. It can do that while the
+      # corpus is still red because it does not demand zero divergence: the
+      # known divergences are committed to
+      # `scripts/baselines/jdk-only-strict-corpus-<feature>-<os>.txt` and the
+      # gate fails when that set GROWS. A divergence that disappears prints
+      # "re-freeze" and passes, so a fix is never blocked by the gate that
+      # measured it.
+      #
+      # It refuses (exit 2) rather than passing when there is no baseline for
+      # this matrix leg's `<feature>-<os>`. That is deliberate: a baseline from
+      # another key cannot adjudicate this one, and "no baseline" must never
+      # read as "nothing diverged". `25-linux` and `25-windows` are committed,
+      # so those two legs adjudicate. `21-windows` was minted 2026-09-08 against
+      # a real Temurin 21.0.12.1+1, so the Windows 21 leg adjudicates too. It
+      # carries 16 sections where the 25 keys carry 2, because the first run
+      # ever made against a 21 image found FOUR defects -- the JavaLangAccess
+      # carrier is pinned by name to `java.lang.System$1`, which on JDK 21 is a
+      # PrivilegedAction and not the JLA at all. Those rows are frozen so the
+      # gate can say "no worse"; they are NOT accepted behaviour, and the
+      # baseline's own note names the page that diagnoses them.
+      #
+      # `21-linux` was minted 2026-09-09 against Temurin 21.0.12+8, so ALL FOUR
+      # legs now adjudicate and none refuses. It was minted at 16 sections --
+      # the same count as `21-windows`, though NOT the same set: Linux does not
+      # diverge on `textformat` (that row is locale data and this is a different
+      # host), and it carries a vthreads row Windows does not.
+      #
+      # It was RE-FROZEN at 10 sections later the same day, when the JDK 21
+      # serialization defect was fixed and its six `JdkOnlyBreadthProbe` rows
+      # stopped diverging (that probe is now byte-identical to HotSpot in both
+      # modes). GONE rows pass, so leaving them would not have gone red -- it
+      # would just have left six rows of slack in the ratchet, which is exactly
+      # the state a re-freeze exists to remove.
+      #
+      # `21-windows` STILL CARRIES THOSE SIX ROWS, and that asymmetry is
+      # deliberate rather than an oversight: the fix is platform-independent, so
+      # they will read as GONE there too and the leg passes, but re-minting a
+      # key requires running the gate against a real JDK 21 image on that OS and
+      # the Windows host no longer has one. The Windows 21 leg is therefore six
+      # rows looser than the Linux one until someone with a Windows JDK 21
+      # re-freezes it. Anyone who does: expect exactly those six rows to drop.
+      #
+      # LATER THE SAME DAY a SEVENTH `21-windows` row joined them:
+      # `JdkOnlyBreadthProbe/strict/textformat`. The JDK 21 strict locale defect
+      # behind it was fixed on 2026-09-09 -- the provider lookup answered null
+      # for every SPI, so adapter selection fell through to the fallback
+      # adapter, whose `LocaleResources` is root-only on JDK 21. Expect that row
+      # to read GONE too and to drop on the same re-mint, making it seven.
+      #
+      # That row is also why this fix has NO corpus arm that can verify it.
+      # `21-linux` never froze a `textformat` row: the defect is invisible
+      # wherever the machine default locale is already `en-US`, which the Linux
+      # host's is -- and `21-windows`, the leg that does carry it, is the one
+      # that cannot be re-minted. The verification of record is therefore
+      # `probes/LocaleSelect.java`, which asks for `de-DE` BY NAME rather than
+      # relying on the default locale, and which reads identical to HotSpot 21
+      # in all four mode/image cells.
+      #
+      # It was not accepted from one mint. The vthreads section is an
+      # intermittent race, so a baseline minted from a run that saw the smaller
+      # set reads the larger set as NEW and the leg goes red at random -- which
+      # is what the first two mints here did. The accepted baseline is the
+      # MAXIMAL observed set (every later run is then a subset, and GONE always
+      # passes); it was required to pass ten consecutive gate runs, and the
+      # paired ratchet was then re-run against it to prove it can still fail.
+      #
+      # IF THE 21-LINUX LEG GOES RED ON A vthreads ROW, THIS IS WHY, and it is
+      # not a regression. The maximal set was observed on an 8-core host; a
+      # runner with a different core count can lose the race a way that was
+      # never seen here and produce a vthreads section identity the baseline
+      # does not carry. The fix is to re-freeze with a note saying which row
+      # appeared and on what runner -- NOT to widen it by hand, and NOT to
+      # drop the probe. Any other NEW row is a real regression.
+      #
+      # IF THE 21-LINUX LEG GOES RED ON A vthreads ROW, THIS IS WHY, and it is
+      # not a regression. The maximal set was observed on an 8-core host; a
+      # runner with a different core count can lose the race a way that was
+      # never seen here and produce a vthreads section identity the baseline
+      # does not carry. The fix is to re-freeze with a note saying which row
+      # appeared and on what runner -- NOT to widen it by hand, and NOT to
+      # drop the probe. Any other NEW row is a real regression.
+      #
+      # That risk was then measured rather than left as a worry. The race was
+      # amplified along the axis its window sits on -- LOAD -- by re-running the
+      # leg while the 8-core host sat at a load average of 30 to 40, i.e. four to
+      # five times oversubscribed, which is the closest available proxy for a
+      # small CI runner. 6 of 6 PASS, no new vthreads row. With the 10 runs at
+      # load ~3.5 that is 16 consecutive passes across a tenfold load range.
+      #
+      # The script self-tests its own ratchet hermetically before touching a VM
+      # — it asserts that an injected new section IS flagged and a baselined one
+      # is NOT — and refuses to adjudicate if that fails. A ratchet that has
+      # never been shown to fire is indistinguishable from one that cannot.
+      #
+      # An arm that does not complete fails regardless of the baseline. There is
+      # no such thing as a known-acceptable hang.
+      #
+      # `JAVA_HOME` is what actions/setup-java exported for this matrix leg, so
+      # the corpus is measured against both JDK 21 and JDK 25.
+      - name: Strict corpus ratchet (three-arm probe gate)
+        shell: bash
+        run: |
+          CV=target/debug/cratonvm
+          [ -x "$CV" ] || CV=target/debug/cratonvm.exe
+          CV="$CV" TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
+
+      - name: Upload strict-corpus transcripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jdk-only-strict-probes-${{ matrix.os }}-jdk${{ matrix.java }}
+          path: target/jdk-only-strict-probes/logs/
+          if-no-files-found: warn
+
+      # Semantic differential gate over the strict-mode seed corpus
+      # (difftest/seeds-jdk-only: lambda identity, dynamic proxies, reflection
+      # accessors, a missing optional dependency — the four shapes where a
+      # fabricated class or a stub native would silently substitute for the real
+      # thing). Both strict modes are run because a divergence that appears only
+      # with the JIT on is a JIT bug, not a policy bug, and the mode split is
+      # what tells them apart.
+      #
+      # `jdk-only-jit` / `jdk-only-nojit` are new mode labels landing with this
+      # wave; `Mode::from_label` rejects unknown labels, so this step fails
+      # loudly (and advisorily) until the runner learns them.
+      - name: Semantic differential gate (strict modes)
+        shell: bash
+        run: >
+          cargo run -p cratonvm-difftest --bin cratonvm-difftest --
+          gate --corpus difftest/seeds-jdk-only
+          --modes jdk-only-jit,jdk-only-nojit
+
+      # `if: always()` on purpose: the artifacts are most valuable exactly when
+      # a step above failed — the registry diff (real vs strict) and the
+      # missing-native work list ARE the triage material, and re-running a failed
+      # job to get them back is a wasted cycle. `if-no-files-found: warn` because
+      # a strict run that dies during boot legitimately produces nothing, and
+      # failing the upload would mask the real error.
+      #
+      # BOTH POLICIES, WHOLE. A failing job used to ship five files: the strict
+      # aliases plus two `real` dumps, with no `classes-real.json`,
+      # `report-real.json`, `missing-strict-by-module.json` or `report-strict.json`
+      # — i.e. neither policy's dump set was complete, and the real-vs-strict diff
+      # that motivates this job could not be reconstructed from the artifact. All
+      # eight per-policy dumps are listed below, the three back-compat aliases are
+      # kept (a downstream reader may still expect them), and the design-§6
+      # blocker pairs are included for both policies: the top-level pair is
+      # generated from the `real` dump set, the `strict/` pair from the strict
+      # one. `jdk-*` is globbed because the JDK feature version is part of the
+      # file name and varies with the matrix leg.
+      #
+      # Deliberately NOT globbing `target/jdk-only-audit/**`: that would sweep in
+      # the compiled probe under `probe/` and turn an evidence bundle into a build
+      # directory dump.
+      - name: Upload JDK-only audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jdk-only-audit-${{ matrix.os }}-jdk${{ matrix.java }}
+          path: |
+            target/jdk-only-audit/registry-real.json
+            target/jdk-only-audit/missing-real-by-module.json
+            target/jdk-only-audit/classes-real.json
+            target/jdk-only-audit/report-real.json
+            target/jdk-only-audit/registry-strict.json
+            target/jdk-only-audit/missing-strict-by-module.json
+            target/jdk-only-audit/classes-strict.json
+            target/jdk-only-audit/report-strict.json
+            target/jdk-only-audit/registry-no-stubs.json
+            target/jdk-only-audit/class-origins.json
+            target/jdk-only-audit/jdk-only-report.json
+            target/jdk-only-audit/jdk-*-missing-natives.json
+            target/jdk-only-audit/jdk-*-synthetic-dependencies.json
+            target/jdk-only-audit/strict/jdk-*-missing-natives.json
+            target/jdk-only-audit/strict/jdk-*-synthetic-dependencies.json
+            target/jdk-only-audit/*.stderr.txt
+            target/jdk-only-audit/*.stdout.txt
+          if-no-files-found: warn
+
+      # The deferred half of the census exit-code contract, and the last step in
+      # the job on purpose: everything above has run and the evidence is already
+      # uploaded. Exit 5 means the dumps were complete but the design-§6 blocker
+      # artifacts were not produced — a gap, not a clean result — so the job must
+      # end non-zero rather than green. (This job is advisory, so that shows up
+      # as a red step inside a job that does not fail the workflow; when the job
+      # is promoted per §11 it becomes a real failure with no further change.)
+      # `if: always()` so a failing gate above does not skip it.
+      - name: Fail on a deferred census gap (exit 5)
+        if: always()
+        shell: bash
+        run: |
+          rc="${CENSUS_RC:-not-run}"
+          echo "jdk-only-census.sh exit status: $rc"
+          if [ "$rc" = "5" ]; then
+            echo "::error::The design section-6 blocker artifacts are missing from this run"
+            echo "(jdk-<feature>-missing-natives.json / -synthetic-dependencies.json)."
+            echo "See the census step's log for which of the three causes fired."
+            exit 1
+          fi
+
+  # Fuzz build smoke. Keeping this blocking prevents the standalone harness and
+  # the native-builtins feature set from drifting.
+  fuzz-smoke:
+    name: Fuzz build smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+
+  miri:
+    name: Miri (core value and pointer invariants)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # Scoped to `heap_types` on purpose. The whole-crate run aborts partway
+      # through on Windows: `intern::tests::concurrent_intern_*` spawns threads
+      # and Miri stops with "can't call foreign function `GetModuleHandleA`",
+      # an unsupported-operation error, not UB. That leaves the crate-wide
+      # invocation unverifiable from a Windows host, and a gate nobody can run
+      # locally before pushing is the failure mode this whole audit is about.
+      #
+      # `heap_types` is the object header, `Value` cell layout and slot
+      # arithmetic — the "core value and pointer representation" this job is
+      # named for, and where the UB actually was: the first run of this gate
+      # rejected `field_cell_layout_matches_value_enum` for transmuting a
+      # padded enum to `[u8; 16]` and claiming every byte was an initialised
+      # integer. 63 tests, verified green under Miri on 2026-07-30.
+      #
+      # To widen it: run the crate-wide command on Linux, and if it is clean
+      # there, drop the filter and say in this comment that it is Linux-only.
+      - name: Run Miri on the core representation module
+        run: cargo +nightly miri test -p cratonvm-types --lib heap_types

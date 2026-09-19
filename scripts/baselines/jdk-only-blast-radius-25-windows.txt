@@ -1,0 +1,49 @@
+# jdk-only blast radius --- REFERENCE table for key '25-windows'
+#
+# Read by scripts/jdk-only-blast-radius.sh. !adjudicating is NO, so the script
+# prints these rows beside the measured table for a human to compare and then
+# exits 2 (no adjudicating baseline). It deliberately does NOT score against
+# them, and here is why that is not pedantry:
+#
+#   * these numbers were TRANSCRIBED from docs/known-issues/jdk-only/
+#     H0-4-the-blast-radius-table-20260820.md (its ConcurrentHashMap row's
+#     vector list comes from H0-3 §2, which H0-4 cites rather than repeats).
+#     They were not produced by this script;
+#   * they were measured against a corpus of 104 vectors. The corpus is 105 as
+#     of 2026-08-20 (RJitMapTierDiff), so the `total` column below is already
+#     stale, and there is no !corpus line -- so a newly-failing vector could not
+#     be told apart from a regression;
+#   * they were measured on ONE binary
+#     (C:/craton/target-jdkonly-h2/release/cratonvm.exe at db71dfb40) on
+#     Windows. An adjudicating baseline must be produced by this script, on the
+#     image the run uses.
+#
+# They are committed anyway because they are the only measurement of this
+# instrument that exists and a lane planning a retirement needs them at hand.
+# Replace this file with a real one:
+#
+#   bash scripts/jdk-only-blast-radius.sh --update-baseline #        --note 'first sweep produced by the script'
+#
+# THE CONTROL WAS CLEAN. H0-4's unarmed strict arm in the same session was
+# 104 / 104, so the sets below are already net of the control.
+#
+# H0-4 §4: RMapGcStress is ONE defect with four faces, not four defects. Net of
+# it the table reads 0 / 2 / 6 / 7 / 10 / 22 -- and java/util/HashSet then has
+# no remaining objection from this corpus at all. That is permission to attempt
+# the migration and measure it, NOT permission to skip measuring it.
+#
+# THE CELLS DO NOT SUM (each prefix armed alone) and the prefixes are NOT
+# DISJOINT IN EFFECT (LinkedHashMap extends HashMap). See the script header.
+#
+# <prefix>	<passed>	<total>	<failing vectors, net of control>
+!key	25-windows
+!adjudicating	no
+!taken	2026-08-20	rev=db71dfb40	transcribed-from=H0-4
+!note	H0-4 §1, six runs of the 104-vector strict arm, one armed prefix each. NOT produced by this script.
+!control	104	104	
+java/util/HashSet	103	104	RMapGcStress
+java/util/Hashtable	101	104	RJdkBridge1 RJdkEnumerations RMapGcStress
+java/util/LinkedHashMap	97	104	RForeignLayoutCollections RJdkJmx RJdkMapViews RJdkServices RMapGcStress ROverlaySystemGcStress RServiceLoaderDoubleSource
+java/util/TreeMap	97	104	RCollections RJdkBridge1 RJdkCollections RJdkEnumerations RJdkJmx RJdkViews RTreeRangeGc
+java/util/concurrent/ConcurrentHashMap	93	104	RChmKeySetView RCrypto RJdkEnumerations RJdkLogging RJdkModule RJdkProxyIface RJdkSecurity RJdkX509Intercept RMapGcStress RMapResizeGc RServiceLoaderDoubleSource
+java/util/HashMap	81	104	RBlockingQueue RChannelInterrupt RCollections RExecutorShutdown RFileTimes RJdkCollections RJdkEnumerations RJdkEnvMap RJdkExecutors RJdkFailure RJdkForkJoin RJdkJmx RJdkLogging RJdkModule RJdkNio RJdkOptionalShape RJdkProcess RJdkSecurity RJdkStrict RJdkViews RMapGcStress RSerial RSimpleTimeZoneRaw

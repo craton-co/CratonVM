@@ -1,0 +1,28 @@
+[package]
+name = "cratonvm-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["gpu", "annotations", "java", "jvm"]
+categories = ["development-tools::build-utils"]
+description = "Java annotation sources for CratonVM GPU/parallel-compute support, compiled at build time"
+readme = "README.md"
+build = "build.rs"
+# Virtual `links` name. No actual native library is linked; this purely
+# enables cargo's `DEP_<NAME>_<KEY>` mechanism so that build scripts of
+# crates that depend on `craton-gpu` can read the metadata this crate's
+# build.rs emits via `cargo:annotations_dir=` / `cargo:annotations_jar=`.
+links = "craton-gpu-annotations"
+# Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

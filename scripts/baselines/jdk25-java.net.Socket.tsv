@@ -1,0 +1,110 @@
+# jdk-baseline	2
+# kind	class
+# name	java.net.Socket
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/net/Socket.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	45
+# protected-methods	0
+# declared-methods	70
+# declared-fields	17
+# rows	94
+# columns	kind	name	descriptor	flags
+CLASS	java.net.Socket		public
+EXTENDS	java.lang.Object		
+IMPLEMENTS	java.io.Closeable		
+SUPERTYPE	java.io.Closeable		
+SUPERTYPE	java.lang.AutoCloseable		
+SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	()V	public
+METHOD	<init>	(Ljava/lang/String;I)V	public
+METHOD	<init>	(Ljava/lang/String;ILjava/net/InetAddress;I)V	public
+METHOD	<init>	(Ljava/lang/String;IZ)V	public
+METHOD	<init>	(Ljava/net/InetAddress;I)V	public
+METHOD	<init>	(Ljava/net/InetAddress;ILjava/net/InetAddress;I)V	public
+METHOD	<init>	(Ljava/net/InetAddress;IZ)V	public
+METHOD	<init>	(Ljava/net/Proxy;)V	public
+METHOD	<init>	(Ljava/net/SocketAddress;Ljava/net/SocketAddress;Z)V	private
+METHOD	<init>	(Ljava/net/SocketImpl;)V	protected
+METHOD	bind	(Ljava/net/SocketAddress;)V	public
+METHOD	checkAddress	(Ljava/net/InetAddress;Ljava/lang/String;)V	private
+METHOD	close	()V	public
+METHOD	closeSuppressingExceptions	(Ljava/lang/Throwable;)V	private
+METHOD	connect	(Ljava/net/SocketAddress;)V	public
+METHOD	connect	(Ljava/net/SocketAddress;I)V	public
+METHOD	createImpl	()Ljava/net/SocketImpl;	private,static
+METHOD	getAndBitwiseOrState	(I)I	private
+METHOD	getChannel	()Ljava/nio/channels/SocketChannel;	public
+METHOD	getImpl	()Ljava/net/SocketImpl;	private
+METHOD	getInetAddress	()Ljava/net/InetAddress;	public
+METHOD	getInputStream	()Ljava/io/InputStream;	public
+METHOD	getKeepAlive	()Z	public
+METHOD	getLocalAddress	()Ljava/net/InetAddress;	public
+METHOD	getLocalPort	()I	public
+METHOD	getLocalSocketAddress	()Ljava/net/SocketAddress;	public
+METHOD	getOOBInline	()Z	public
+METHOD	getOption	(Ljava/net/SocketOption;)Ljava/lang/Object;	public
+METHOD	getOutputStream	()Ljava/io/OutputStream;	public
+METHOD	getPort	()I	public
+METHOD	getReceiveBufferSize	()I	public
+METHOD	getRemoteSocketAddress	()Ljava/net/SocketAddress;	public
+METHOD	getReuseAddress	()Z	public
+METHOD	getSendBufferSize	()I	public
+METHOD	getSoLinger	()I	public
+METHOD	getSoTimeout	()I	public
+METHOD	getTcpNoDelay	()Z	public
+METHOD	getTrafficClass	()I	public
+METHOD	impl	()Ljava/net/SocketImpl;	
+METHOD	isBound	()Z	public
+METHOD	isBound	(I)Z	private,static
+METHOD	isClosed	()Z	public
+METHOD	isClosed	(I)Z	private,static
+METHOD	isConnected	()Z	public
+METHOD	isConnected	(I)Z	private,static
+METHOD	isInputShutdown	()Z	public
+METHOD	isInputShutdown	(I)Z	private,static
+METHOD	isOutputShutdown	()Z	public
+METHOD	isOutputShutdown	(I)Z	private,static
+METHOD	sendUrgentData	(I)V	public
+METHOD	setConnected	()V	
+METHOD	setConnectedImpl	(Ljava/net/SocketImpl;)V	
+METHOD	setImpl	(Ljava/net/SocketImpl;)V	
+METHOD	setKeepAlive	(Z)V	public
+METHOD	setOOBInline	(Z)V	public
+METHOD	setOption	(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/Socket;	public
+METHOD	setPerformancePreferences	(III)V	public
+METHOD	setReceiveBufferSize	(I)V	public
+METHOD	setReuseAddress	(Z)V	public
+METHOD	setSendBufferSize	(I)V	public
+METHOD	setSoLinger	(ZI)V	public
+METHOD	setSoTimeout	(I)V	public
+METHOD	setSocketImplFactory	(Ljava/net/SocketImplFactory;)V	public,static,synchronized
+METHOD	setTcpNoDelay	(Z)V	public
+METHOD	setTrafficClass	(I)V	public
+METHOD	shutdownInput	()V	public
+METHOD	shutdownOutput	()V	public
+METHOD	socketImplFactory	()Ljava/net/SocketImplFactory;	static
+METHOD	supportedOptions	()Ljava/util/Set;	public
+METHOD	toString	()Ljava/lang/String;	public
+FIELD	$assertionsDisabled	Z	static,final,synthetic
+FIELD	BOUND	I	private,static,final
+FIELD	CLOSED	I	private,static,final
+FIELD	CONNECTED	I	private,static,final
+FIELD	IN	Ljava/lang/invoke/VarHandle;	private,static,final
+FIELD	OUT	Ljava/lang/invoke/VarHandle;	private,static,final
+FIELD	SHUT_IN	I	private,static,final
+FIELD	SHUT_OUT	I	private,static,final
+FIELD	SOCKET_CREATED	I	private,static,final
+FIELD	STATE	Ljava/lang/invoke/VarHandle;	private,static,final
+FIELD	factory	Ljava/net/SocketImplFactory;	private,static,volatile
+FIELD	impl	Ljava/net/SocketImpl;	private,volatile
+FIELD	in	Ljava/io/InputStream;	private,volatile
+FIELD	options	Ljava/util/Set;	private,volatile
+FIELD	out	Ljava/io/OutputStream;	private,volatile
+FIELD	socketLock	Ljava/lang/Object;	private,final
+FIELD	state	I	private,volatile

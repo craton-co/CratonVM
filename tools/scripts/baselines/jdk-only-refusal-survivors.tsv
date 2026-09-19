@@ -1,0 +1,8 @@
+# Refusals under --jdk-only that left an EARLIER native owning the slot.
+# class<TAB>method<TAB>descriptor<TAB>survivor-kind
+# Regenerate: UPDATE_BASELINE=1 bash scripts/jdk-only-refusal-survivors.sh
+java/util/logging/Handler	getLevel	()Ljava/util/logging/Level;	intrinsic
+java/util/logging/Handler	setLevel	(Ljava/util/logging/Level;)V	intrinsic
+java/util/logging/LogRecord	getLevel	()Ljava/util/logging/Level;	intrinsic
+java/util/logging/LogRecord	getMessage	()Ljava/lang/String;	intrinsic
+java/util/logging/LogRecord	getSequenceNumber	()J	intrinsic
