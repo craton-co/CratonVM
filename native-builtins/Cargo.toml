@@ -142,7 +142,7 @@ filetime = "0.2"
 # Handles arbitrary arities, mixed int/float register classification,
 # variadic calls, struct-by-value, and closure (upcall) stubs across
 # SysV (Linux/macOS) and Win64 ABIs.
-libffi = "3.2"
+libffi = "5.2"
 # T2.6 — real crypto backends (RustCrypto family). These replace the
 # hand-rolled software primitives used under the legacy synthetic path
 # with audited, constant-time implementations.
