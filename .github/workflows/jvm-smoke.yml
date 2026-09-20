@@ -161,7 +161,7 @@ jobs:
           java-version: '25'
 
       - name: Download cratonvm binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: cratonvm-binary
           path: target/release
