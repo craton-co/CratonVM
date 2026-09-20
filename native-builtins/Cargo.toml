@@ -172,7 +172,7 @@ hmac = "0.12"
 subtle = "2"
 ctr = "0.9"
 chacha20poly1305 = "0.10"
-getrandom = "0.2"
+getrandom = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 # T3.3: Real Unicode normalization (NFC, NFD, NFKC, NFKD) for java.text.Normalizer
 unicode-normalization = "0.1"
