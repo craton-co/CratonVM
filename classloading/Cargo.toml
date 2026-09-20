@@ -109,7 +109,7 @@ ecdsa = { version = "0.16", features = ["der"] }
 spki = { version = "0.7", features = ["alloc"] }
 # `EncodePublicKey::to_public_key_der` for `PublicKey<C>` is gated on
 # elliptic-curve's `alloc` + `pkcs8` features; force them on for test builds.
-elliptic-curve = { version = "0.13", features = ["alloc", "pkcs8", "sec1"] }
+elliptic-curve = { version = "0.14", features = ["alloc", "pkcs8", "sec1"] }
 
 [lints]
 workspace = true
