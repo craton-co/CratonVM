@@ -563,7 +563,7 @@ jobs:
       # report about the finding you are confirming.
       - name: Open or update the explore issue
         if: steps.fuzz.outcome == 'failure' && github.event_name == 'schedule'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           AXIS: ${{ matrix.axis }}
           BODY_PATH: ${{ steps.body.outputs.path }}
