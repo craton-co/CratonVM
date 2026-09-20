@@ -63,7 +63,7 @@ jobs:
   untyped-alloc-ratchet:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # `git grep` with pathspecs needs the work tree, and the script reads
           # only the checked-out revision — no history is required.

@@ -130,7 +130,7 @@ jobs:
             modes: nojit,ir-jit,osr-eager,forced-deopt
             extra: '--extra-env CRATONVM_JIT_IR_LINEAR_SCAN=1 --extra-env CRATONVM_DEOPT_REAL=1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -184,7 +184,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -323,7 +323,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

@@ -96,7 +96,7 @@ jobs:
     continue-on-error: true
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -143,7 +143,7 @@ jobs:
       matrix:
         check: [advisories, licenses, bans, sources]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -186,7 +186,7 @@ jobs:
     continue-on-error: true
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -248,7 +248,7 @@ jobs:
     continue-on-error: true
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The evidence manifest records the last 30 commits and per-subsystem
           # history; the default shallow clone would make both empty.

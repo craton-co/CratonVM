@@ -80,7 +80,7 @@ jobs:
     name: Formatting (changed lines)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -151,7 +151,7 @@ jobs:
     name: Parse check (changed files)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -200,7 +200,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `experimental-jmx` / `experimental-tls` are back-compat ALIASES
       # (renamed 2026-07-30 to `management` / `deprecated-noop-tls`). They are
@@ -701,7 +701,7 @@ jobs:
     name: Feature gate (--features synthetic-jdk)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -862,7 +862,7 @@ jobs:
     name: Feature gate (experimental-* and zgc)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1034,7 +1034,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1082,7 +1082,7 @@ jobs:
     name: Real-path smoke tests (per-subsystem REAL_* gates)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1113,7 +1113,7 @@ jobs:
     name: Semantic differential gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1206,7 +1206,7 @@ jobs:
       CRATONVM_JIT_VERIFY_ARENA_ORDER: '1'
       CRATONVM_DBG_IR_COMPILES: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1264,7 +1264,7 @@ jobs:
     name: JDK-only blocker generator self-test (hermetic)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Self-test (no build, no JDK, no network)
         shell: bash
@@ -1371,7 +1371,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         java: ['21', '25']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1917,7 +1917,7 @@ jobs:
     name: Fuzz build smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install nightly Rust
         uses: dtolnay/rust-toolchain@nightly
@@ -1934,7 +1934,7 @@ jobs:
     name: Miri (core value and pointer invariants)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri

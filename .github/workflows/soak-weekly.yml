@@ -1,4 +1,4 @@
-﻿name: Soak weekly (WP8.7 placeholder for WP8.1)
+name: Soak weekly (WP8.7 placeholder for WP8.1)
 
 # WP8.7 created this stub. The real 24h soak harness lands in WP8.1
 # (docs/wildfly-ejbca-roadmap.md §11): one S2 app under 10 ops/s for 24h
@@ -33,7 +33,7 @@ jobs:
     # 30s smoke fits in 10min easily; WP8.1 will raise this.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
