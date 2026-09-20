@@ -158,7 +158,7 @@ num-bigint = "0.4"
 # default-on under route_ec_to_real). Bypasses the ~14 s one-time per-curve
 # generator-table precompute. P-256/384/521 (RustCrypto 0.13 family, aligned
 # elliptic-curve version).
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 aes = "0.8"
 argon2 = "0.5.3"
 cbc = { version = "0.1", features = ["std"] }
