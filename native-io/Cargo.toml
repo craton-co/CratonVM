@@ -30,7 +30,7 @@ parking_lot.workspace = true
 zip.workspace = true
 regex = "1"
 memmap2 = "0.9"
-notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 # Direct-buffer cleaners and net socket / option maps are keyed by internal
 # monotonic counters (AtomicI32-generated IDs). No adversarial-input concern
 # warrants SipHash; FxHashMap removes the per-op hash overhead on the hot
