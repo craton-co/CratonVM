@@ -174,7 +174,7 @@ jobs:
       # Per-item fixture cache — each runner drops its fixtures into
       # `.smoke-cache/<item>` so subsequent runs skip the download.
       - name: Cache smoke fixtures
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .smoke-cache/${{ matrix.item }}
           key: smoke-fixtures-${{ matrix.item }}-v1

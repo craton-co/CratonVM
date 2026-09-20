@@ -89,7 +89,7 @@ jobs:
           docker build --platform linux/arm64 -t cratonvm-arm64-dev -f Dockerfile.arm64 .
 
       - name: Cache the emulated build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: arm64-target
           key: aarch64-jit-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
