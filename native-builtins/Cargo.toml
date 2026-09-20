@@ -115,7 +115,7 @@ libz-sys = { version = "1.1.29", features = ["static"] }
 # mirror the established `flate2`-backed Inflater/Deflater approach in
 # `zip_real.rs`.
 snap = "1"
-zstd = "0.13"
+zstd = "0.14"
 # lz4-java (the `at.yawk.lz4` fork Kafka bundles) exposes `net.jpountz.lz4.LZ4JNI`
 # over the canonical LZ4 *block* format. `lz4_flex`'s raw `compress_into`/
 # `decompress_into` are byte-compatible with liblz4's block format (no size
