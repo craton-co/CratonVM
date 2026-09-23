@@ -1,0 +1,152 @@
+# Probes scheduled by the strict-corpus gate on the 25-windows key ONLY.
+#
+# Read by scripts/jdk-only-strict-probes.sh, which appends these to its
+# three-probe default. The file is keyed exactly like the .txt baseline beside
+# it, because the ratchet is a set difference against that baseline: a probe
+# scheduled on a key whose baseline was frozen without it turns every one of
+# its divergent sections into a NEW row, and the gate fails. Adding a probe to
+# the script's own default list would do that on every leg at once, which is
+# why 104 of the 107 files in apps/probes/ were scheduled by nothing.
+#
+# THE BAR FOR A LINE HERE: the probe's three arms (HotSpot control, --real-jdk,
+# --jdk-only) must all exit 0 AND all three transcripts must be byte-identical,
+# on THIS key, on at least two separate runs. A probe that diverges is not
+# barred from the gate -- it belongs in the .txt baseline instead, adjudicated
+# section by section. What is barred is promoting one on a single observation:
+# a probe seen clean once is a probe seen once.
+#
+# EVIDENCE. Windows 11, Temurin 25.0.3+9 -- the same image as the oracle.
+# FOUR runs, all 2026-09-08, across two different binaries and both build
+# profiles:
+#   run 1  05:17-06:05  release. The sweep that first ran all 107 files, each
+#                       probe in its own harness invocation. Verdict CLEAN =
+#                       every arm exit 0 and both modes byte-identical to the
+#                       control. 62 of the 107 came back CLEAN.
+#   run 2  ~10:00       release, freshly built from dev @ 2b0913374, all of
+#                       them in ONE invocation through this file: 69 probes,
+#                       207 arms, every one exit 0, ZERO divergent sections
+#                       contributed by any promoted probe. PASS.
+#   run 3  ~10:30       the four IO families re-run (they came from the IO
+#                       sweep, not the 107-probe one), plus the discovery that
+#                       their fifth sibling L4FilesSweep is NOT clean.
+#   run 4  ~11:15       DEBUG binary -- what ci.yml's step actually runs.
+#                       Same verdict. An optimisation-dependent "clean" would
+#                       have shown up here and did not.
+#
+# All four are the same day, so this is repetition, not soak. It is the bar the
+# file states and no more: enough that a probe is not clean by luck of a single
+# run, not enough to call any of them proven stable. A line that turns out to
+# flake belongs in prose like the FLAKY block of tools/e2e-ratchet.txt, deleted
+# from here -- never left in to redden the leg at random.
+#
+# 25435 rows of transcript across the 64 are now checked against a HotSpot
+# control that nothing checked them against before.
+#
+# COST, measured on the DEBUG binary because that is the one CI builds:
+#     3 probes (this file absent)   145s
+#    67 probes (this file present)  876s     -> +731s on the blocking leg
+# A release binary is far cheaper -- the 69-probe set (these 64 plus the two
+# dropped below) took 345s -- but CI does not build one for this step, so 731s
+# is the number to argue with. If it ever stops being worth it, cut lines from
+# here: the file is a list, and shortening it cannot make the gate wrong.
+#
+# FOUR MORE, from the IO sweep rather than the 107-probe one, same bar:
+#   run 1  2026-09-07  the-io-probe-families-swept-on-windows-for-the-first-time
+#   run 2  2026-09-08  re-run here; hs/real/strict all 0, zero divergent
+#                      sections, 1347 further rows
+#     AsyncChannelSweep FilePathSweep IoSystemSweep L4FileSweep
+# Their fifth sibling L4FilesSweep is NOT here: the same re-run found it
+# diverging in BOTH modes over 10 sections, which is a lead, not a promotion --
+# the-files-sweep-that-could-not-run-until-yesterday-found-four-nio-defects-20260908.md
+#
+# TWO THAT PASSED THE BAR AND ARE STILL NOT HERE, on cost. Measured on the
+# DEBUG binary, which is what ci.yml's step actually runs:
+#     FjpDeepSum      564s to check    1 row
+#     InvokeAllCount  436s to check    7 rows
+# Between them 1000s of a 1784s run, for 8 rows. Both are 100k-iteration
+# concurrency workloads that print a handful of summary counts, so almost all
+# of that time is the workload and almost none of it is the check. They are
+# clean -- they were clean in all three runs -- and they can come back the day
+# something wants a long-running concurrency arm. A transcript-diff gate is
+# not that thing. `ChmKeySetGrowth` is the same shape at 39s and is kept: the
+# line being drawn here is cost, not shape.
+#
+# What is lost by dropping them, said plainly: ExecutorService.invokeAll over
+# 100k tasks is covered by nothing else in this file, and deep ForkJoin
+# recursion only by `FjpProbe` (3 rows, 11s) and `ForkJoinShadowSweep`
+# (178 rows, 18s), which do not go 200k deep.
+#
+# NOT here, and each for a reason worth keeping:
+#   * the 30 BOTH / 5 REAL-ONLY / 2 STRICT-ONLY divergent probes -- they are
+#     leads, and four of them are written up in
+#     phase-2s-last-lead-closed-itself-and-the-sweep-found-five-that-retirement-cannot-take-20260908.md
+#   * the 6 whose HotSpot control exits non-zero -- an oracle that fails is not
+#     an oracle, and a gate cannot adjudicate what it cannot measure
+#   * the 2 whose CratonVM arms exit non-zero
+#   * NrpVariants -- its rows are JIT-timing dependent (see
+#     invokespecial-on-a-null-receiver-lost-its-npe-again-...-20260908.md), so
+#     it would be red at random, which is the one thing a ratchet must not be
+AdDispatch
+AdFailFast
+AdRetireProbe
+ArrayListShadowSweep
+BigIntegerSweep
+BufInsertProbe
+ChmElemDbg
+ChmKeySetGrowth
+ChmShadowSweep
+CollectionViewTypes
+CollectionsShadowSweep
+ConcurrentCollSweep
+DeadDoorProbe
+DequeListShadowSweep
+DhAgree
+EmptySingletonImmutable
+FailFastShapeProbe
+FfmCarrierProbe
+FfmLayoutProbe
+FjpProbe
+ForkJoinShadowSweep
+HashtableVectorShadowSweep
+HelpfulNpeProbe
+InstanceofScope
+ItrClassNameProbe
+JcaFunctional
+KeyStoreTypeProbe
+L4ByteBufferSweep
+L4Diag3
+L4PrintStreamSweep
+L4TypedBufferSweep
+L6MsgProbe
+LinkedSequencedShadowSweep
+MapCtorMsgProbe
+MapViewsShadowSweep
+MethodRefDoorProbe
+PqItrProbe
+PqOptionalShadowSweep
+PropertiesCloneProbe
+PropertiesShadowSweep
+PropsOrderSweep
+RandomAccessProbe
+RandomShadowSweep
+ReadableProbe
+RefFamilySweep
+SecuritySurfaceSweep
+SingleByteCharsets
+StaleViewAddAllProbe
+StringBuilderShadowSweep
+SyncFamilySweep
+SynthUsable
+SyntheticEnumSurface
+TailFamilySweep
+ThreadShadowSweep
+ThrowableFamilySweep
+UtilCoverageSweep
+UtilTail2Sweep
+UtilTailShadowSweep
+UtilUnshadowedSweep
+ViewIdentityProbe
+AsyncChannelSweep
+FilePathSweep
+IoSystemSweep
+L4FileSweep

@@ -1,0 +1,248 @@
+# Feature-configuration compile matrix.
+#
+# WHY THIS EXISTS
+# ---------------
+# `cargo build --workspace` and `cargo test --workspace` compile exactly ONE
+# feature configuration: the default set, unified across every member by the
+# workspace resolve. Everything else -- every non-default feature, every
+# combination of two of them, and every `--no-default-features` build -- is
+# compiled by nothing.
+#
+# This repository has already paid for that. On 2026-07-25 `cargo build
+# --features synthetic-jdk` was found broken on `dev`: 22 name-resolution
+# errors in production code and, behind them, 327 more errors' worth of API
+# drift in a `#[cfg(all(test, feature = "synthetic-jdk"))]` module -- 1,522
+# tests that no compiler had looked at in months. No CI signal existed because
+# no job built that configuration. ci.yml now has hand-written `synthetic-jdk`
+# and `experimental-features` jobs; they are a fixed list that a new feature
+# does not automatically join.
+#
+# THIS workflow derives the list from `cargo metadata`, so a feature added to
+# any member's `[features]` table is compiled from the moment it is declared,
+# with no workflow edit. The `enumerate` job emits the matrix; the `check` job
+# consumes it.
+#
+# WHY `cargo check --workspace --all-targets` AND NOT `cargo test`
+# ----------------------------------------------------------------
+#   * `--all-targets` is the load-bearing flag. Lib+bin scope would have caught
+#     only 22 of the 349 errors in the incident above; the larger half lived in
+#     test modules, examples and benches. `cargo test` compiles test targets but
+#     skips examples and benches, and stops at the first failing binary.
+#   * `check` not `build`: this workflow answers "does every configuration still
+#     compile", which is the question that rotted. Behaviour of the non-default
+#     configurations is ci.yml's job (it *runs* the synthetic-jdk and
+#     experimental-* test suites), and duplicating that here would multiply CI
+#     time by the matrix width for no additional signal.
+#
+# BLOCKING. Every leg is a compile check with no accepted failure set; a red leg
+# means a configuration does not build. If a newly-declared feature lands red,
+# fix the feature or delete it -- do not add it to the exclusion list below.
+#
+# WHAT IS DELIBERATELY EXCLUDED
+#   * anything matching `gpu` or `cuda`: those need the CUDA toolkit or a real
+#     device and already have dedicated workflows (cuda-bridge.yml compiles both
+#     backends on public CI, gpu-selfhosted.yml runs on the self-hosted GPU box).
+#     Excluding them here keeps this workflow hardware-free.
+#
+# COST, STATED HONESTLY
+# ---------------------
+# The workspace declares 52 non-default features; 12 are gpu/cuda and excluded,
+# leaving 40 single-feature legs plus 2 baselines plus 11 curated combinations =
+# ~53 full-workspace `cargo check` runs per triggering event. That is the price
+# of the guarantee, and it is not small. Two dials exist if it needs lowering,
+# both of which trade coverage for time -- pick deliberately, and record which:
+#
+#   (a) Move the single-feature legs to `schedule:` and keep only the baselines
+#       and combinations on push/PR. Cheapest, and still catches the incident
+#       class that motivated this workflow -- one day later.
+#   (b) Collapse each feature NAME to its topmost forwarder. `cratonvm-embed/
+#       management` transitively enables `cratonvm-vm/management` and
+#       `cratonvm-native-builtins/management`, so the one leg covers all three.
+#       Careful: the reverse is NOT true. Enabling the leaf does not enable the
+#       forwarder's own `#[cfg(feature = "...")]` blocks, so collapsing to the
+#       LEAF instead of the ROOT silently deletes coverage.
+#
+# `paths-ignore` already removes the largest chunk of waste: a docs-only change
+# cannot alter which feature configurations compile.
+
+name: Feature matrix
+
+on:
+  push:
+    branches: [main, dev]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  pull_request:
+    branches: [main, dev]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  workflow_dispatch:
+
+# A feature matrix is wide; superseded runs on the same ref are pure waste.
+concurrency:
+  group: feature-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  enumerate:
+    name: Enumerate feature configurations
+    runs-on: ubuntu-latest
+    outputs:
+      configs: ${{ steps.build-matrix.outputs.configs }}
+      count: ${{ steps.build-matrix.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `cargo metadata` resolves the dependency graph, which needs no JDK and
+      # no compilation -- this job is seconds, not minutes.
+      - name: Emit the configuration matrix
+        id: build-matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 --no-deps > metadata.json
+
+          # Every non-default feature of every workspace member, as an
+          # unambiguous `package/feature` pair. Qualified rather than bare
+          # because several members declare the SAME feature name
+          # (`synthetic-jdk` is declared by four crates) and a bare
+          # `--features synthetic-jdk` enables all of them at once, which is a
+          # different configuration from any one of them alone.
+          jq -r '
+            .packages[]
+            | . as $p
+            | ($p.features // {} | keys[])
+            | select(. != "default")
+            | "\($p.name)/\(.)"
+          ' metadata.json | sort -u > all-features.txt
+
+          echo "Declared non-default features:"
+          cat all-features.txt
+
+          # GPU/CUDA configurations need hardware or the CUDA toolkit; they are
+          # covered by cuda-bridge.yml and gpu-selfhosted.yml.
+          grep -Ev '(gpu|cuda)' all-features.txt > singles.txt || true
+
+          printf '' > configs.tsv
+
+          # ---- the two baselines -------------------------------------------
+          # `default` overlaps ci.yml's build-and-test, deliberately: it is the
+          # control. If it is red here and green there, the difference is this
+          # workflow's `--all-targets`, which is exactly the gap being closed.
+          printf 'default\t\n' >> configs.tsv
+          # `--no-default-features` is where `#[cfg(feature = "...")]` mistakes
+          # surface: code that compiles only because the default set happens to
+          # pull a dependency in.
+          printf 'no-default-features\t--no-default-features\n' >> configs.tsv
+
+          # ---- each declared feature, alone --------------------------------
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            printf '%s\t--features %s\n' "$f" "$f" >> configs.tsv
+          done < singles.txt
+
+          # ---- curated pairwise / triple set --------------------------------
+          # NOT an exhaustive pairwise expansion: n^2 over ~25 features is 300+
+          # full-workspace checks, which would dominate CI cost for pairs that
+          # cannot interact. These are the combinations that share code:
+          #   * synthetic-jdk x {zgc, management, app-stubs}: the synthetic
+          #     natives and the collector/JMX surfaces both touch object layout
+          #     and the native registry.
+          #   * the experimental-serialization + -aot + -debug triple: this is
+          #     the exact set `libcratonvm` turns on, and a workspace-wide
+          #     resolve unifies it onto native-builtins for every member. ci.yml
+          #     documents this as the split that hid a missing native from every
+          #     suite build.
+          #   * management x deprecated-noop-tls: the two renamed features whose
+          #     back-compat aliases ci.yml separately resolve-checks.
+          #   * app-stubs x synthetic-quarkus-arc and legacy-synthetic-crypto x
+          #     synthetic-jdk: overlapping synthetic-class families in
+          #     native-builtins.
+          #   * no-default-features + synthetic-jdk: awt/management OFF with the
+          #     synthetic surface ON -- the configuration a `#[cfg]` written
+          #     against the default set gets wrong.
+          add_combo() { printf '%s\t--features %s\n' "$1" "$2" >> configs.tsv; }
+          add_combo 'pair:synthetic-jdk+zgc'            'cratonvm-vm/synthetic-jdk,cratonvm-vm/zgc'
+          add_combo 'pair:synthetic-jdk+management'     'cratonvm-vm/synthetic-jdk,cratonvm-vm/management'
+          add_combo 'pair:synthetic-jdk+app-stubs'      'cratonvm-vm/synthetic-jdk,cratonvm-native-builtins/app-stubs'
+          add_combo 'pair:aot+debug'                    'cratonvm-vm/experimental-aot,cratonvm-vm/experimental-debug'
+          add_combo 'triple:libcratonvm-resolve'        'cratonvm-vm/experimental-serialization,cratonvm-vm/experimental-aot,cratonvm-vm/experimental-debug'
+          add_combo 'pair:management+noop-tls'          'cratonvm-vm/management,cratonvm-vm/deprecated-noop-tls'
+          add_combo 'pair:zgc+t19-diag'                 'cratonvm-vm/zgc,cratonvm-vm/experimental-t19-diag'
+          add_combo 'pair:app-stubs+quarkus-arc'        'cratonvm-native-builtins/app-stubs,cratonvm-native-builtins/synthetic-quarkus-arc'
+          add_combo 'pair:legacy-crypto+synthetic-jdk'  'cratonvm-native-builtins/legacy-synthetic-crypto,cratonvm-native-builtins/synthetic-jdk'
+          add_combo 'pair:synthetic-jdk+java-bin-alias' 'cratonvm-vm/synthetic-jdk,cratonvm-cli/java-bin-alias'
+          printf 'nodefault+synthetic-jdk\t--no-default-features --features cratonvm-vm/synthetic-jdk\n' >> configs.tsv
+
+          configs=$(jq -Rsc '
+            split("\n")
+            | map(select(length > 0))
+            | map(split("\t"))
+            | map({ name: .[0], args: (.[1] // "") })
+          ' configs.tsv)
+
+          count=$(printf '%s' "$configs" | jq 'length')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "configs=$configs" >> "$GITHUB_OUTPUT"
+
+          echo "Emitted $count configurations:"
+          printf '%s' "$configs" | jq -r '.[] | "  \(.name)  ->  cargo check --workspace --all-targets \(.args)"'
+
+      - name: Upload the enumerated matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-matrix-configs
+          path: |
+            all-features.txt
+            configs.tsv
+          if-no-files-found: warn
+
+  check:
+    name: check ${{ matrix.cfg.name }}
+    needs: enumerate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      # Wide but each leg is a `cargo check` against a warm shared cache. Capped
+      # so a feature-matrix run cannot starve the blocking ci.yml jobs of
+      # concurrency -- ci.yml is what gates merges, and it must never be queued
+      # behind ~53 advisory-in-spirit compile checks.
+      max-parallel: 6
+      matrix:
+        cfg: ${{ fromJSON(needs.enumerate.outputs.configs) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # One shared dependency cache for the whole matrix: the third-party graph
+      # barely changes between feature sets, and ~25 per-leg caches would blow
+      # the repository cache budget. Only the `default` leg writes it back, so
+      # the cache reflects the baseline configuration.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: feature-matrix
+          save-if: ${{ matrix.cfg.name == 'default' }}
+
+      # `vm/build.rs` and `gc/build.rs` compile Java fixtures with `javac`, so
+      # even a `cargo check` needs a JDK on PATH.
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: cargo check --workspace --all-targets ${{ matrix.cfg.args }}
+        run: cargo check --workspace --all-targets ${{ matrix.cfg.args }}

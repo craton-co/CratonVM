@@ -1,0 +1,413 @@
+[workspace]
+members = ["reader", "types", "native-api", "native-collections", "native-io", "native-builtins", "native-builtins-crypto", "native-builtins-security", "native-awt", "jit-api", "jit", "jit-cuda", "cuda-bridge", "classloading", "craton-gpu4j", "gc", "vm", "vm-cli", "jfr", "libcratonvm", "cratonvm-embed", "difftest"]
+# `fuzz` is intentionally NOT a workspace member: its libFuzzer `fuzz_target!`
+# macros expand to `#![no_main]` / `#[no_mangle]` code that trips the
+# workspace's production lints. It is its own standalone workspace (see
+# `fuzz/Cargo.toml`) and is built via `cargo +nightly fuzz build` / CI.
+resolver = "2"
+
+[workspace.package]
+# Note: members do NOT inherit a publish gate from here (none set
+# `publish.workspace = true`). Crates are publishable by default unless their
+# own `[package]` table sets `publish = false`; see docs/RELEASE_READINESS.md
+# for the current crates.io dry-run checklist and fenced-off package list.
+authors = ["Craton Software Company"]
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/craton-co/cratonvm"
+homepage = "https://craton.com.ar"
+documentation = "https://github.com/craton-co/cratonvm/tree/main/docs"
+description = "A Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler"
+keywords = ["jvm", "java", "virtual-machine", "interpreter", "jit"]
+categories = ["compilers", "emulators"]
+
+[workspace.dependencies]
+thiserror = "2"
+# Round-8 cross-cutting Bug 3 (RESOLVED round-12): workspace-wide pin for
+# `zip` so every crate that opts in via `zip.workspace = true` resolves to
+# the same major version. Both `native-io` and `native-builtins` now target
+# 2.x — the latter's migration replaced every `FileOptions::default()` with
+# `SimpleFileOptions::default()` at the five `start_file` call sites in
+# `jboss_module_loader.rs`, `phases_late.rs`, and `security_manager.rs`.
+# `ZipWriter::new` / `ZipArchive::new` / `ZipError` read-side APIs are
+# compatible between 0.6 and 2.x, so no read-path changes were required.
+# Cargo no longer reports a duplicate `zip` resolution (~80 KB binary cost
+# recovered).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Round-7 cross-cutting Fix 3: `release_max_level_info` causes `trace!` and
+# `debug!` macros to expand to no-ops in release builds.
+#
+# COROLLARY, and it has bitten repeatedly (audit 2026-09-03): a `debug!`
+# or `trace!` is NOT an instrument. It cannot be recovered with any
+# RUST_LOG value on a released binary, so it must never be the only
+# account of something a reader needs -- a counter, a data-loss event, a
+# fallback taken, a safety property a comment claims. If a zero is
+# meaningful, emit it at `info!`/`warn!` or give it an exit-summary
+# census (see `types::gpu_submission_census` for the shape). The sweep
+# that found this checked for three shapes: docs telling a user to set
+# `RUST_LOG=...=debug`, comments claiming a debug line makes something
+# visible, and counters whose only non-test reader was a `debug!`. The VM has thousands
+# of trace/debug sites in interpreter dispatch, GC scan loops, JIT entry, and
+# class-loading paths; even with subscriber filtering, the per-call
+# argument formatting / level check is non-zero. Compile-time elision wins it
+# back. Set on the workspace dep so every crate that uses
+# `tracing.workspace = true` inherits the cap.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Round-9 cross-cutting MED-9: hoist `parking_lot` and `rustc-hash` to the
+# workspace so every consumer resolves to one version. Previously declared
+# literally in 11 (parking_lot) / 9 (rustc-hash) crate manifests; each new
+# bump risked drift. Crates opt in via `parking_lot.workspace = true` /
+# `rustc-hash.workspace = true`.
+parking_lot = "0.12"
+rustc-hash = "1.1"
+# Round-5 JFR Fix 1: workspace-hoisted SmallVec so jfr + downstream consumers
+# (vm tests, vm benches) all resolve to a single version. Inline-N=8 covers
+# the field-count of every built-in JFR event in `jfr/src/builtin.rs`.
+smallvec = { version = "1", features = ["union"] }
+
+# -----------------------------------------------------------------------
+# Round-11 cross-cutting HIGH-5: transitive dep duplicates
+# -----------------------------------------------------------------------
+#
+# `cargo tree --duplicates` currently reports three families of duplicate
+# resolutions, each pulled by *different* transitive dependency chains:
+#
+#   hashbrown   0.14.5  (pulled by indexmap 1.x / our older interner code)
+#               0.15.5  (rustc-hash 1.x downstream)
+#               0.16.1  (modern std fallback used by some recent crates)
+#
+#   getrandom   0.2.17  (p12 — PKCS#12 reader for keystore tests, locked)
+#               0.3.4   (rand_core 0.9 line — current `rand` major)
+#               0.4.2   (newer `rand_chacha`/`uuid` pre-release line)
+#
+#   windows-sys 0.48.0  (deeply pinned by older `mio` / `socket2` lines)
+#               0.52.0  (parking_lot_core 0.9 current)
+#               0.61.2  (newest direct deps that bumped to follow)
+#
+# **Why we are NOT issuing `[patch.crates-io]` overrides:** each pair of
+# duplicate majors is a HARD API break:
+#
+#   * `hashbrown` 0.14 -> 0.15 swapped the default-hasher API; downstream
+#     consumers built against 0.14 use `RawTable::reserve` taking a
+#     different signature. 0.15 -> 0.16 added a `BuildHasher::default`
+#     bound that 0.14 code does not provide. A force-unify to either 0.15
+#     or 0.16 would refuse to link consumers of the other majors.
+#   * `getrandom` 0.2 -> 0.3 dropped the `try_fill` shim; 0.3 -> 0.4
+#     reorganised the error type. p12 specifically pins 0.2 because its
+#     PKCS#12 cryptographic constructions assume the 0.2 error variants.
+#   * `windows-sys` MUST stay multi-versioned: every minor (0.48 / 0.52 /
+#     0.61) wraps a DIFFERENT shape of the Win32 metadata; collapsing
+#     them to "the newest" deletes structs that older callers still
+#     reference. Cargo's own dependency-resolver docs flag this crate
+#     family as "expected to coexist".
+#
+# **The right fix is upstream:** wait for the older transitive consumers
+# to migrate to the newer majors (most are 1-2 releases behind). Until
+# then the binary cost is ~80 KB per duplicate × 3 = ~240 KB, which is
+# well under the size budget. Re-evaluate next round once the upstream
+# `mio`, `p12`, and `indexmap` consumers have shipped their major-bump
+# releases.
+#
+# Round-9 MED-8 / round-10 / round-11 audits all concur: no [patch] this
+# round, revisit in round-12.
+
+# RJ.4 — silence lints that do not represent real defects so
+# `cargo doc --workspace --no-deps` stays at zero warnings (the
+# roadmap success criterion). Code-lints are "allow" not "deny":
+# individual crates can still re-tighten them locally.
+#   * `dead_code`, `unused_*`: natives register at runtime via
+#     `NativeMethodRegistry::register`; the compiler sees them as
+#     orphaned. Marking with `#[used]` everywhere would be noisier
+#     than tolerating the lint.
+#   * rustdoc `broken_intra_doc_links` / `invalid_html_tags` /
+#     `private_intra_doc_links` / `redundant_explicit_links`:
+#     doc-comments liberally reference private helpers, Java types
+#     (`<offset>`, `[Xn,]`) and code samples; the net value of
+#     enforcing rustdoc hyperlinks over those is negative.
+[workspace.lints.rust]
+dead_code = "allow"
+unused_imports = "allow"
+unused_variables = "allow"
+unused_mut = "allow"
+unused_assignments = "allow"
+unused_doc_comments = "allow"
+unused_attributes = "allow"
+non_snake_case = "allow"
+function_casts_as_integer = "allow"
+let_underscore_lock = "allow"
+useless_ptr_null_checks = "allow"
+# Unlike the style allows above, this is an ABI-safety lint: two `extern`
+# declarations of the same Win32/native symbol with different signatures or
+# struct layouts are a real defect (one call path can read a mis-laid-out
+# struct). We had two such clashes in the vm crate (`VirtualQuery`,
+# `GetCurrentProcess`) declared per-module; both are now unified. Deny it so a
+# future divergent re-declaration fails the build instead of warning silently.
+clashing_extern_declarations = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "allow"
+private_intra_doc_links = "allow"
+invalid_html_tags = "allow"
+redundant_explicit_links = "allow"
+
+[workspace.lints.clippy]
+# Clippy "never returns" false positive on functions that panic — our
+# `unimplemented!()`/`panic!()` paths trip this on every native stub.
+empty_loop = "allow"
+# Forever-looping server accept loops also trip this.
+while_let_loop = "allow"
+# Repository-wide style and shape lints that are noisy for this VM codebase.
+# Many public/native/JFR emit functions intentionally mirror Java/JVM event
+# shapes, native registries carry large enum variants by design, and older code
+# has long-form safety docs whose markdown indentation is not semantically
+# important to the APIs. Keep clippy focused on defects rather than churn.
+too_many_arguments = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+result_large_err = "allow"
+should_implement_trait = "allow"
+collapsible_if = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+manual_checked_ops = "allow"
+explicit_counter_loop = "allow"
+manual_div_ceil = "allow"
+bool_assert_comparison = "allow"
+clone_on_copy = "allow"
+double_must_use = "allow"
+approx_constant = "allow"
+needless_borrows_for_generic_args = "allow"
+manual_range_contains = "allow"
+io_other_error = "allow"
+incompatible_msrv = "allow"
+mut_from_ref = "allow"
+seek_from_current = "allow"
+unnecessary_cast = "allow"
+needless_range_loop = "allow"
+explicit_auto_deref = "allow"
+useless_vec = "allow"
+redundant_pattern_matching = "allow"
+reversed_empty_ranges = "allow"
+assertions_on_constants = "allow"
+empty_line_after_doc_comments = "allow"
+needless_lifetimes = "allow"
+int_plus_one = "allow"
+unusual_byte_groupings = "allow"
+redundant_field_names = "allow"
+needless_question_mark = "allow"
+manual_is_multiple_of = "allow"
+excessive_precision = "allow"
+chunks_exact_to_as_chunks = "allow"
+manual_repeat_n = "allow"
+manual_dangling_ptr = "allow"
+absurd_extreme_comparisons = "allow"
+let_unit_value = "allow"
+if_same_then_else = "allow"
+cloned_ref_to_slice_refs = "allow"
+match_like_matches_macro = "allow"
+manual_clamp = "allow"
+identity_op = "allow"
+erasing_op = "allow"
+manual_unwrap_or = "allow"
+question_mark = "allow"
+manual_range_patterns = "allow"
+manual_flatten = "allow"
+double_ended_iterator_last = "allow"
+assign_op_pattern = "allow"
+vec_box = "allow"
+expect_used = "allow"
+unwrap_used = "allow"
+needless_late_init = "allow"
+unnecessary_map_or = "allow"
+missing_const_for_thread_local = "allow"
+op_ref = "allow"
+unnecessary_literal_unwrap = "allow"
+unnecessary_unwrap = "allow"
+needless_return = "allow"
+single_match = "allow"
+unnecessary_lazy_evaluations = "allow"
+manual_saturating_arithmetic = "allow"
+collapsible_match = "allow"
+manual_pattern_char_comparison = "allow"
+new_without_default = "allow"
+upper_case_acronyms = "allow"
+ptr_arg = "allow"
+derivable_impls = "allow"
+not_unsafe_ptr_arg_deref = "allow"
+only_used_in_recursion = "allow"
+manual_unwrap_or_default = "allow"
+manual_contains = "allow"
+len_without_is_empty = "allow"
+map_entry = "allow"
+manual_memcpy = "allow"
+mixed_case_hex_literals = "allow"
+manual_ok_err = "allow"
+field_reassign_with_default = "allow"
+unnecessary_get_then_check = "allow"
+option_as_ref_deref = "allow"
+vec_init_then_push = "allow"
+same_item_push = "allow"
+duplicated_attributes = "allow"
+needless_else = "allow"
+precedence = "allow"
+get_first = "allow"
+single_char_add_str = "allow"
+trim_split_whitespace = "allow"
+match_result_ok = "allow"
+sliced_string_as_bytes = "allow"
+map_identity = "allow"
+implicit_saturating_sub = "allow"
+manual_str_repeat = "allow"
+manual_strip = "allow"
+let_and_return = "allow"
+# Correctness/security lints: ambiguous file-creation semantics and slices
+# reconstructed from raw parts must be reviewed explicitly.
+suspicious_open_options = "deny"
+nonminimal_bool = "allow"
+redundant_closure = "allow"
+overly_complex_bool_expr = "allow"
+unnecessary_min_or_max = "allow"
+err_expect = "allow"
+unnecessary_mut_passed = "allow"
+unnecessary_to_owned = "allow"
+useless_format = "allow"
+default_constructed_unit_structs = "allow"
+items_after_test_module = "allow"
+unnecessary_sort_by = "allow"
+while_let_on_iterator = "allow"
+wildcard_in_or_patterns = "allow"
+match_single_binding = "allow"
+unwrap_or_default = "allow"
+for_kv_map = "allow"
+manual_find = "allow"
+iter_kv_map = "allow"
+result_unit_err = "allow"
+manual_split_once = "allow"
+let_underscore_lock = "allow"
+unused_enumerate_index = "allow"
+missing_safety_doc = "allow"
+cast_slice_from_raw_parts = "deny"
+undocumented_unsafe_blocks = "allow"
+borrow_deref_ref = "allow"
+iter_nth_zero = "allow"
+len_zero = "allow"
+needless_borrow = "allow"
+needless_update = "allow"
+iter_cloned_collect = "allow"
+manual_inspect = "allow"
+useless_conversion = "allow"
+expect_fun_call = "allow"
+bool_comparison = "allow"
+
+# Compile ZIP decompression with optimisations even in debug mode.
+# Without this, deflate is ~15x slower and JMOD loading takes 30s+ for 200 classes.
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+# Round-10 cross-cutting: with the round-9 benchmark additions (~163 LOC) +
+# steady native-builtins growth, MSVC link.exe hits LNK1140 ("too many
+# modules for program database") for the cli binaries when dev profile uses
+# `debug = 2` (full debug info, the cargo default). Drop to line-tables-only
+# — keeps file:line in backtraces but excludes per-symbol DWARF/CodeView
+# records that overflow the PDB module table on Windows. Linux/macOS pay no
+# cost; Windows builds again. Override locally with `cargo build --profile dev-full`.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev-full]
+inherits = "dev"
+debug = 2
+
+# Round-7 cross-cutting Fix 1: cargo defaults (lto=false, codegen-units=16)
+# defeat most cross-crate inlining. The VM has hundreds of `#[inline(always)]`
+# annotations on small hot-path helpers (interpreter dispatch, TLAB bump,
+# header reads) that only inline across crate boundaries under LTO.
+#
+# - `panic = "unwind"` MUST stay: the VM has 37 `std::panic::catch_unwind`
+#   sites that depend on stack unwinding to recover from JIT/interpreter
+#   faults; `panic = "abort"` would break exception safety.
+# - `codegen-units = 1` trades parallel codegen (slower link) for the
+#   single-unit optimization picture LTO + inliner need.
+# - `incremental = false` disables incremental release builds — they
+#   defeat LTO and are not safe to ship.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+# Perf-session note (perf/throughput-20260710): line-tables-only + no strip so
+# the PDB carries function symbols for sampling profilers (cdb attach). No
+# codegen impact — only fatter debug artifacts on disk.
+strip = "none"
+incremental = false
+debug = "line-tables-only"
+
+# NOTE: there is deliberately no `release-with-debug` profile. `release` above
+# already sets `debug = "line-tables-only"` and `strip = "none"`, so such a
+# profile inheriting `release` and re-stating those two keys was byte-identical
+# to `release` while costing a second full `target/` tree to build. Use
+# `--release` for line tables, `--profile profsym` for symbol-resolving
+# profilers, `--profile livedbg` for a debugger.
+
+# Full debuginfo (S_GPROC32 function records in the PDB) so a sampling
+# profiler (samply/ETW) can resolve Rust function names, not just line
+# tables. Profiling captures only — never shipped. Same codegen as release
+# (opt-level 3, fat LTO) so the profile is representative.
+[profile.profsym]
+inherits = "release"
+debug = 2
+strip = "none"
+
+# Live-debugger profile: full debuginfo AND no LTO / low opt-level so local
+# variables survive for conditional breakpoints. The default release profile
+# defeats both, via `debug = "line-tables-only"` and fat LTO, even where it
+# does not change program behaviour. Opt-in only (`--profile livedbg`), so it
+# carries no risk to the shipped build.
+#
+# Interpreter/JIT crates build at opt-level 1 — still far faster than a plain
+# debug build — while `native-builtins` and `native-io` drop to opt-level 0,
+# because that is where the socket/protocol code whose locals are most often
+# needed lives. Runtime is meaningfully slower than release but still boots a
+# large application server in reasonable time, which makes it right for
+# boot-time bugs and wrong for throughput work; use `profsym` for the latter.
+[profile.livedbg]
+inherits = "release"
+debug = 2
+strip = "none"
+lto = false
+codegen-units = 16
+opt-level = 1
+incremental = false
+
+[profile.livedbg.package.cratonvm-native-builtins]
+opt-level = 0
+
+[profile.livedbg.package.cratonvm-native-io]
+opt-level = 0
+
+
+# Benches must use the same codegen as release so criterion numbers are
+# representative of what users will actually run.
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "debuginfo"
+incremental = false
+debug = false
+
+# T-CBC.1: vendored, minimally-patched rustls 0.23.38 (native-builtins/vendor/rustls-cbc)
+# adding mac_key_len support to the TLS1.2 key schedule so classic CBC+HMAC
+# cipher suites (which need a separate MAC secret rustls's stock
+# Tls12AeadAlgorithm/KeyBlockShape has no field for) can derive standard
+# RFC 5246 A.6-ordered key material. See docs/known-issues/springboot/
+# rustls-cbc-cipher-suites-not-supported.md for the full rationale.
+[patch.crates-io]
+rustls = { path = "native-builtins/vendor/rustls-cbc" }

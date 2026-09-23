@@ -1,0 +1,4 @@
+# stale-receiver audit baseline — scripts/stale-receiver-audit.py
+# fn <sites-that-reuse-the-receiver>. See the script header for the
+# shape and for why a match is not automatically a defect.
+depth=6

@@ -1,0 +1,60 @@
+# jdk-baseline	2
+# kind	class
+# name	java.lang.management.ManagementFactory
+# module	java.management
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.management/java/lang/management/ManagementFactory.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	16
+# protected-methods	0
+# declared-methods	28
+# declared-fields	12
+# rows	44
+# columns	kind	name	descriptor	flags
+CLASS	java.lang.management.ManagementFactory		public
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	()V	private
+METHOD	addMXBean	(Ljavax/management/MBeanServer;Ljava/lang/String;Ljava/lang/Object;)V	private,static
+METHOD	getClassLoadingMXBean	()Ljava/lang/management/ClassLoadingMXBean;	public,static
+METHOD	getCompilationMXBean	()Ljava/lang/management/CompilationMXBean;	public,static
+METHOD	getGarbageCollectorMXBeans	()Ljava/util/List;	public,static
+METHOD	getMemoryMXBean	()Ljava/lang/management/MemoryMXBean;	public,static
+METHOD	getMemoryManagerMXBeans	()Ljava/util/List;	public,static
+METHOD	getMemoryPoolMXBeans	()Ljava/util/List;	public,static
+METHOD	getOperatingSystemMXBean	()Ljava/lang/management/OperatingSystemMXBean;	public,static
+METHOD	getPlatformMBeanServer	()Ljavax/management/MBeanServer;	public,static,synchronized
+METHOD	getPlatformMXBean	(Ljava/lang/Class;)Ljava/lang/management/PlatformManagedObject;	public,static
+METHOD	getPlatformMXBean	(Ljavax/management/MBeanServerConnection;Ljava/lang/Class;)Ljava/lang/management/PlatformManagedObject;	public,static
+METHOD	getPlatformMXBeans	(Ljava/lang/Class;)Ljava/util/List;	public,static
+METHOD	getPlatformMXBeans	(Ljavax/management/MBeanServerConnection;Ljava/lang/Class;)Ljava/util/List;	public,static
+METHOD	getPlatformManagementInterfaces	()Ljava/util/Set;	public,static
+METHOD	getProxyNames	(Lsun/management/spi/PlatformMBeanProvider$PlatformComponent;Ljavax/management/MBeanServerConnection;Ljava/lang/Class;)Ljava/util/stream/Stream;	private,static
+METHOD	getRuntimeMXBean	()Ljava/lang/management/RuntimeMXBean;	public,static
+METHOD	getThreadMXBean	()Ljava/lang/management/ThreadMXBean;	public,static
+METHOD	isInstanceOf	(Ljavax/management/MBeanServerConnection;Ljavax/management/ObjectName;Ljava/lang/String;)Z	private,static
+METHOD	lambda$getPlatformMBeanServer$0	(Lsun/management/spi/PlatformMBeanProvider$PlatformComponent;)Ljava/util/stream/Stream;	private,static,synthetic
+METHOD	lambda$getPlatformMBeanServer$1	(Ljava/util/Map$Entry;)V	private,static,synthetic
+METHOD	lambda$getPlatformMXBeans$0	(Ljava/lang/Class;Lsun/management/spi/PlatformMBeanProvider$PlatformComponent;)Ljava/util/stream/Stream;	private,static,synthetic
+METHOD	lambda$getPlatformManagementInterfaces$0	(Lsun/management/spi/PlatformMBeanProvider$PlatformComponent;)Ljava/util/stream/Stream;	private,static,synthetic
+METHOD	lambda$getPlatformManagementInterfaces$1	(Ljava/lang/Class;)Z	private,static,synthetic
+METHOD	lambda$getPlatformManagementInterfaces$2	(Ljava/lang/Class;)Ljava/lang/Class;	private,static,synthetic
+METHOD	loadNativeLib	()V	private,static
+METHOD	newPlatformMXBeanProxy	(Ljavax/management/MBeanServerConnection;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;	public,static
+METHOD	platformComponents	()Ljava/util/Collection;	private,static
+FIELD	$assertionsDisabled	Z	static,final,synthetic
+FIELD	CLASS_LOADING_MXBEAN_NAME	Ljava/lang/String;	public,static,final
+FIELD	COMPILATION_MXBEAN_NAME	Ljava/lang/String;	public,static,final
+FIELD	GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE	Ljava/lang/String;	public,static,final
+FIELD	MEMORY_MANAGER_MXBEAN_DOMAIN_TYPE	Ljava/lang/String;	public,static,final
+FIELD	MEMORY_MXBEAN_NAME	Ljava/lang/String;	public,static,final
+FIELD	MEMORY_POOL_MXBEAN_DOMAIN_TYPE	Ljava/lang/String;	public,static,final
+FIELD	NOTIF_EMITTER	Ljava/lang/String;	private,static,final
+FIELD	OPERATING_SYSTEM_MXBEAN_NAME	Ljava/lang/String;	public,static,final
+FIELD	RUNTIME_MXBEAN_NAME	Ljava/lang/String;	public,static,final
+FIELD	THREAD_MXBEAN_NAME	Ljava/lang/String;	public,static,final
+FIELD	platformMBeanServer	Ljavax/management/MBeanServer;	private,static

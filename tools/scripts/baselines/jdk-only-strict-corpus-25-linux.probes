@@ -1,0 +1,121 @@
+# Probes promoted into the strict-corpus gate for the key 25-linux.
+#
+# Read by scripts/jdk-only-strict-probes.sh IN ADDITION to the three default
+# probes (JdkOnlyCensusLoadProbe, JdkOnlyBreadthProbe, JdkOnlyPlatformProbe).
+# The list is per-key on purpose: a probe may be promoted on one platform and
+# not another, and this file is the Linux half of that. Setting PROBE_LIST in
+# the environment bypasses this file entirely.
+#
+# THE BAR, and it is the same one the 25-windows file states: all three arms
+# (HotSpot control, --real-jdk, --jdk-only) exit 0 AND the two CratonVM
+# transcripts are byte-identical to the HotSpot one, over at least two runs.
+# A probe that merely fails to crash is not promoted -- a divergence that is
+# already present would be frozen into the gate as acceptable by the act of
+# promoting it.
+#
+# EVIDENCE (2026-09-09, this file):
+#
+#   host      azure vm1, Linux 6.17.0-1022-azure x86_64, 8 cores
+#   jdk       Temurin 25.0.4+7 (/data/jdkimages/jdk25-linux)
+#   binary    release, built from origin/dev @ 5487287dc
+#   method    one harness run PER PROBE, not one run of 64 -- a single arm
+#             failure inside a shared run poisons the whole transcript, and
+#             per-probe attribution is the point of a promotion list
+#
+#   run 1     64 of 64 CLEAN, 25435 rows, 165 s total (2.6 s mean)
+#   run 2     64 of 64 CLEAN, 25435 rows
+#   delta     no probe changed verdict or row count between the two runs
+#
+# 25435 rows is the SAME total the 25-windows promotion measured. Two
+# platforms, two JDK builds, one row count: that is a stronger statement about
+# the corpus than either run alone, and it is why the two files carry the same
+# 64 names.
+#
+# COST. 165 s for all 64 on a release binary. The 25-windows file records
+# +731 s and defers nothing on cost; that number was measured on a DEBUG
+# binary and on Windows, so it is NOT comparable to this one and neither
+# number should be quoted for the other platform.
+#
+# VERIFIED ON THE PROFILE CI ACTUALLY USES. Everything above was measured with
+# a RELEASE binary, and ci.yml runs the strict-corpus step against
+# target/debug/cratonvm -- a gate run under a different codegen profile is not
+# that gate. Re-run end to end with a DEBUG binary:
+#
+#   25-linux debug, 64 promoted   rc=0 PASS   609 s   (host load average 27)
+#   21-linux debug, 3 default     rc=0 PASS   144 s   (host load average 22)
+#
+# 609 s is the number to budget against, and it is pessimistic twice over: a
+# debug binary, on an 8-core host that was four times oversubscribed by other
+# work at the time. The same leg on a release binary at low load took 171 s and
+# 195 s. If this step ever needs a timeout raised, raise it -- do not thin this
+# list to fit, because the promotion is what makes the leg measure anything
+# beyond the three default probes.
+#
+# The two probes the 25-windows file excludes on cost (FjpDeepSum, 564 s for
+# 1 row; InvokeAllCount, 436 s for 7 rows) are excluded here too, and for
+# consistency rather than from a Linux measurement: they were not swept here.
+# Someone adding them should measure them on this host first.
+AdDispatch
+AdFailFast
+AdRetireProbe
+ArrayListShadowSweep
+AsyncChannelSweep
+BigIntegerSweep
+BufInsertProbe
+ChmElemDbg
+ChmKeySetGrowth
+ChmShadowSweep
+CollectionViewTypes
+CollectionsShadowSweep
+ConcurrentCollSweep
+DeadDoorProbe
+DequeListShadowSweep
+DhAgree
+EmptySingletonImmutable
+FailFastShapeProbe
+FfmCarrierProbe
+FfmLayoutProbe
+FilePathSweep
+FjpProbe
+ForkJoinShadowSweep
+HashtableVectorShadowSweep
+HelpfulNpeProbe
+InstanceofScope
+IoSystemSweep
+ItrClassNameProbe
+JcaFunctional
+KeyStoreTypeProbe
+L4ByteBufferSweep
+L4Diag3
+L4FileSweep
+L4PrintStreamSweep
+L4TypedBufferSweep
+L6MsgProbe
+LinkedSequencedShadowSweep
+MapCtorMsgProbe
+MapViewsShadowSweep
+MethodRefDoorProbe
+PqItrProbe
+PqOptionalShadowSweep
+PropertiesCloneProbe
+PropertiesShadowSweep
+PropsOrderSweep
+RandomAccessProbe
+RandomShadowSweep
+ReadableProbe
+RefFamilySweep
+SecuritySurfaceSweep
+SingleByteCharsets
+StaleViewAddAllProbe
+StringBuilderShadowSweep
+SyncFamilySweep
+SynthUsable
+SyntheticEnumSurface
+TailFamilySweep
+ThreadShadowSweep
+ThrowableFamilySweep
+UtilCoverageSweep
+UtilTail2Sweep
+UtilTailShadowSweep
+UtilUnshadowedSweep
+ViewIdentityProbe

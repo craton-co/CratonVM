@@ -1,0 +1,19 @@
+# Frozen allowlist for scripts/check-orphan-instruments.sh.
+#
+# ONE LINE PER ORPHANED INSTRUMENT, as `fn <name>` or `row <name>`.
+#
+# This is a DEBT REGISTER, not a list of things that are fine. Every
+# entry is an instrument (or a metric row) that reads zero forever
+# because nothing outside its own file feeds or reads it, and zero is
+# indistinguishable from 'this never happened'. Several are certainly
+# the same defect round 10 found five times by hand.
+#
+# Written by `scripts/check-orphan-instruments.sh --update-allowlist`.
+# Never hand-edit a line (scripts/baselines/README.md). Removing a name
+# is the good direction. ADDING one admits a new orphan, and the commit
+# that does it has to say which instrument and why nothing reads it yet.
+#
+# Generated: 2026-09-22 UTC
+# Entries:   2
+fn note_mark_cycle_outcome
+fn record_allocation_stall

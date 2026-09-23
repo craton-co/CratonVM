@@ -1,0 +1,20 @@
+# jdk-baseline	2
+# kind	class
+# name	java.util.concurrent.Flow$Publisher
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/util/concurrent/Flow$Publisher.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	1
+# protected-methods	0
+# declared-methods	1
+# declared-fields	0
+# rows	4
+# columns	kind	name	descriptor	flags
+CLASS	java.util.concurrent.Flow$Publisher		public,interface,abstract
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	subscribe	(Ljava/util/concurrent/Flow$Subscriber;)V	public,abstract

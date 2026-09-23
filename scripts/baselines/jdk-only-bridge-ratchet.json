@@ -1,0 +1,95 @@
+{
+  "jdk": {
+    "25/linux": {
+      "bridge_shadows_bytecode": 3629,
+      "bridge_stated_shadows_bytecode": 382,
+      "bridge_without_acc_native": 7118,
+      "jdk_version": "25.0.4",
+      "mode": "compatible",
+      "note": "2026-09-17 investigation of the 38 rows flagged in the previous re-freeze (312b79d19/70f50ca49): 34 java.lang.Class/java.lang.Module rows are pre-existing ambient Bridge natives that never used register_with_kind -- 10 are explicitly withdrawn-from-retirement per retired_shadow.rs::the_l0_attributed_triples_are_not_retired -- their kind_stated=0 is correct, no source change needed. The 4 java.util.logging.LoggingPermission rows had a real cause: they used to reach SyntheticStub via an ambient Bridge scope plus register()'s retired-shadow re-tag which also sets kind_stated=true, until a with_category(SyntheticStub) refactor scoped the category directly at the call site and stopped tripping that re-tag, silently losing kind_stated with zero behaviour change. Fixed by converting the shared permission_cls loop in lib.rs to register_with_kind(.., SyntheticStub) so the whole family states its kind explicitly regardless of which path reaches it. See the accompanying commit message for the full row-by-row reasoning.",
+      "observed": {
+        "bridge": {
+          "abstract_method": 1402,
+          "acc_native": 781,
+          "class_absent": 1352,
+          "class_present_method_undeclared": 371,
+          "inherited_abstract_method": 364,
+          "inherited_acc_native": 19,
+          "inherited_shadows_bytecode": 852,
+          "rows": 7918,
+          "shadows_bytecode": 2777,
+          "shadows_bytecode_anywhere": 3629,
+          "stated_shadows_bytecode": 382,
+          "without_acc_native": 7118
+        },
+        "census_schema_version": 5,
+        "image_adjudication": true,
+        "mode": "compatible",
+        "partial": false,
+        "registrations": {
+          "bridge": 7918,
+          "intrinsic": 652,
+          "synthetic-stub": 4543
+        },
+        "schema": 1,
+        "superseded": {
+          "kind_disagreements": 23,
+          "rows": 1081,
+          "stub_lost_to_admitted": 0
+        },
+        "total_rows": 13113
+      },
+      "os": "linux",
+      "superseded_kind_disagreements": 23,
+      "superseded_stub_lost_to_admitted": 0,
+      "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"
+    },
+    "25/linux/jdk-only": {
+      "bridge_shadows_bytecode": 3626,
+      "bridge_stated_shadows_bytecode": 382,
+      "bridge_without_acc_native": 7115,
+      "jdk_version": "25.0.4",
+      "mode": "jdk-only",
+      "note": "2026-09-17 investigation of the 38 rows flagged in the previous re-freeze (312b79d19/70f50ca49): 34 java.lang.Class/java.lang.Module rows are pre-existing ambient Bridge natives that never used register_with_kind -- 10 are explicitly withdrawn-from-retirement per retired_shadow.rs::the_l0_attributed_triples_are_not_retired -- their kind_stated=0 is correct, no source change needed. The 4 java.util.logging.LoggingPermission rows had a real cause: they used to reach SyntheticStub via an ambient Bridge scope plus register()'s retired-shadow re-tag which also sets kind_stated=true, until a with_category(SyntheticStub) refactor scoped the category directly at the call site and stopped tripping that re-tag, silently losing kind_stated with zero behaviour change. Fixed by converting the shared permission_cls loop in lib.rs to register_with_kind(.., SyntheticStub) so the whole family states its kind explicitly regardless of which path reaches it. See the accompanying commit message for the full row-by-row reasoning. (--jdk-only leg)",
+      "observed": {
+        "bridge": {
+          "abstract_method": 1402,
+          "acc_native": 781,
+          "class_absent": 1352,
+          "class_present_method_undeclared": 371,
+          "inherited_abstract_method": 364,
+          "inherited_acc_native": 19,
+          "inherited_shadows_bytecode": 852,
+          "rows": 7915,
+          "shadows_bytecode": 2774,
+          "shadows_bytecode_anywhere": 3626,
+          "stated_shadows_bytecode": 382,
+          "without_acc_native": 7115
+        },
+        "census_schema_version": 5,
+        "image_adjudication": true,
+        "mode": "jdk-only",
+        "partial": false,
+        "registrations": {
+          "bridge": 7915,
+          "intrinsic": 652,
+          "synthetic-stub": 0
+        },
+        "schema": 1,
+        "superseded": {
+          "kind_disagreements": 23,
+          "rows": 671,
+          "stub_lost_to_admitted": 0
+        },
+        "total_rows": 8567
+      },
+      "os": "linux",
+      "superseded_kind_disagreements": 23,
+      "superseded_stub_lost_to_admitted": 0,
+      "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"
+    }
+  },
+  "min_total_rows": 8000,
+  "schema": 1,
+  "slack": 0
+}

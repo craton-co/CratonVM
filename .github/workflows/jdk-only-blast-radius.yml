@@ -1,0 +1,183 @@
+name: JDK-only blast radius
+
+# Prices a native RETIREMENT before anyone attempts it.
+#
+# `CRATONVM_ENFORCE_NATIVE_SHADOW=<prefix>` makes contract §1.4 enforced rather
+# than counted for that prefix — the native stops winning and real JDK bytecode
+# runs, which is exactly what a permanent retirement does. So one armed run of
+# the strict arm measures the blast radius of a retirement for ONE ENV VAR and
+# NO EXTRA BUILD. `H0-4` swept six collection families by hand on 2026-08-20 and
+# found a 23x spread where every previous argument — `G88-1` §5's included —
+# had treated "the collection cluster" as one undifferentiated body. That sweep
+# existed because somebody remembered to type it. This job is `H0-4` N3.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS NON-BLOCKING, AND WHY THAT IS NOT LAZINESS
+# ---------------------------------------------------------------------------
+#
+# **These cells are EXPECTED to be red.** A cell is "how many vectors object if
+# you retire this family today", and the answer is meant to be non-zero until
+# the migration is done. A gate whose red state is its normal state trains every
+# lane to scroll past it, and then it cannot report the abnormal one:
+#
+#   * `G89-1` measured a ratchet that had been RED in blocking CI since
+#     2026-08-14 and "adjudicated nothing" for five days;
+#   * `H3-1` found `native-builtins/tests/stub_ratchet.rs` had not PARSED since
+#     merge `26e4b5db4` — blocking CI in both configurations, and `origin/dev`
+#     still carried the break days later.
+#
+# So: `schedule:` + `workflow_dispatch:`, `continue-on-error: true` on the
+# measuring step, and the table goes to the JOB SUMMARY where it can be read at
+# a glance rather than dug out of a log.
+#
+# **THE SIGNAL IS A CHANGE IN A CELL, NOT THE CELL'S VALUE.** The script keys
+# its baseline on the SET of failing vectors per prefix, not the pass count —
+# a count moves whenever the corpus grows, and it grew three times in two days.
+# A vector that did not exist when the baseline was taken is reported as
+# NEW-VECTOR, never as a regression. See scripts/jdk-only-blast-radius.sh.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS JOB DOES NOT SETTLE
+# ---------------------------------------------------------------------------
+#
+#   * The cells DO NOT SUM. Each prefix is armed ALONE, so their total is not
+#     the cost of arming all six, and nobody has run that combination
+#     (`H0-4` §5). The script prints no total on purpose.
+#   * The prefixes are NOT DISJOINT IN EFFECT: `LinkedHashMap extends HashMap`,
+#     and `HashSet` is backed by a `HashMap`, so arming one already enforces
+#     shadows the other's run touches.
+#   * A green cell means "these vectors raise no objection", not "this family
+#     is retirable" — the corpus has no AWT vector at all (`G79-1`). The
+#     denominator moves; the script prints the live one.
+#   * **Cells measured before 2026-08-21 are void, and NOT in the direction the
+#     old caveat here claimed.** The dial then reached 1 of 14 dispatch doors
+#     (890 of 947 armed `Bridge` dispatches never asked it); it reaches all 14
+#     now. Half-armed measured MORE damage, not less — `java/util/HashMap`
+#     81/104 then, 86/104 once every door consulted the dial — because
+#     half-armed is a corrupt hybrid, not a partial retirement. An old cell is
+#     not a conservative version of a current one.
+#   * One conservatism survives and this one IS a floor: a yield needs concrete
+#     bytecode to yield to, so a triple whose shadowed method has no `Code`
+#     still runs its native. `--jdk-only-report`'s
+#     `enforcement_dial.declined_no_bytecode` counts exactly those.
+#
+# `25-linux` is what this job measures, and a baseline for that key was taken on
+# 2026-08-22 — before that, every scheduled run measured a table and scored
+# NOTHING, exiting 2 with a `::notice::` saying so.
+#
+# **The baseline deliberately EXCLUDES `RTreeRangeGc`**, and that is the whole
+# reason it was not taken sooner. That vector flips on the SAME BINARY (it
+# passed a `--jdk-only` arm and failed a `SUITE=all` arm nine minutes later, on
+# one build), so baselining it would make this job report REGRESSION/REPAIRED
+# noise every week. A gate that cries wolf is the `G89-1` failure this file's
+# own header cites as the reason it is non-blocking — so a flaky vector must be
+# characterised and excluded BEFORE a baseline is taken, never after.
+# See docs/known-issues/jdk-only/ for the flake's record.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefixes:
+        description: >-
+          Space-separated prefixes to arm, one arm each. A '+'-joined group
+          arms several at once in ONE arm (H0-4 N2 — the first real test of
+          whether this migration can proceed family-by-family). Empty = the six
+          collection families H0-4 measured.
+        required: false
+        default: ''
+  schedule:
+    # Weekly, offset off the hour and off the other scheduled jobs (the
+    # performance gate is '17 4 * * 2,5'). Seven full strict arms is not a
+    # per-push cost.
+    - cron: '43 3 * * 6'
+
+jobs:
+  blast-radius:
+    name: Retirement blast radius per collection family
+    runs-on: ubuntu-latest
+    # Seven sequential runs of the full strict arm. run.sh uses a FIXED
+    # `.guard-tmp` for its oracle transcripts, so concurrent arms would destroy
+    # each other's ground truth and report well-formed results about the wrong
+    # thing (W8-D2-1) — sequential is the only safe schedule, and the timeout
+    # has to cover all seven.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # Release, not debug: seven arms of a 105-vector suite on a debug VM is
+      # the difference between a scheduled job and a job nobody schedules.
+      - name: Build release VM
+        run: cargo build --release -p cratonvm-cli
+
+      # NON-BLOCKING BY CONSTRUCTION. The script's exit codes are
+      #   0 unchanged · 1 a cell MOVED · 2 no adjudicating baseline
+      #   3 a prerequisite is missing or an arm did not complete
+      # and `continue-on-error` keeps every one of them off the build's verdict.
+      # The codes are still distinguished below so the annotation says which
+      # happened — "the job is green" and "the job measured something" are
+      # different facts and this file must not conflate them.
+      - name: Sweep the collection families
+        id: sweep
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          CV=target/release/cratonvm
+          [ -x "$CV" ] || CV=target/release/cratonvm.exe
+          args=()
+          if [ -n "${{ inputs.prefixes }}" ]; then
+            args+=(--prefixes "${{ inputs.prefixes }}")
+          fi
+          CV="$CV" JDK="$JAVA_HOME" TIMEOUT=420 \
+            bash scripts/jdk-only-blast-radius.sh "${args[@]}" 2>&1 | tee blast-radius.txt
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+          {
+            echo '## JDK-only blast radius'
+            echo
+            echo 'Each cell is one run of the strict arm with `CRATONVM_ENFORCE_NATIVE_SHADOW`'
+            echo 'armed on that prefix **alone**. The cells do not sum and the prefixes are'
+            echo 'not disjoint in effect. A **change** in a cell is the signal; the absolute'
+            echo 'values are expected to be red.'
+            echo
+            echo '```'
+            cat blast-radius.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "$rc" in
+            0) echo "::notice::blast radius: every scored cell unchanged." ;;
+            1) echo "::warning::blast radius: a CELL MOVED. A retirement got more expensive"
+               echo "  (REGRESSION) or cheaper (REPAIRED), and any plan quoting the old number"
+               echo "  is stale. This is the signal this job exists to give. Adjudicate, then"
+               echo "  re-take the baseline with --update-baseline." ;;
+            2) echo "::notice::blast radius: no ADJUDICATING baseline for this key. The table"
+               echo "  above is the measurement and nothing scored it. That is not a pass."
+               echo "  Take one on this image with:"
+               echo "    bash scripts/jdk-only-blast-radius.sh --update-baseline --note '<why>'" ;;
+            *) echo "::warning::blast radius: exit $rc — a prerequisite is missing, or an arm"
+               echo "  did not complete, so NOTHING was measured. An empty table is not a"
+               echo "  green one." ;;
+          esac
+          exit 0
+
+      # The transcript outlives the log retention and is the thing a lane
+      # planning a retirement actually reads.
+      - name: Upload the table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jdk-only-blast-radius
+          path: blast-radius.txt
+          if-no-files-found: warn

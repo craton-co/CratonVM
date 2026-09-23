@@ -1,0 +1,125 @@
+# Run the JIT crate's tests ON AArch64.
+#
+# WHY THIS EXISTS
+# ---------------
+# `cross-platform.yml` COMPILES for AArch64 (and on macos-14, advisory). Until
+# 2026-09-04 nothing RAN anything there, and the cost of that was measured the
+# first time someone tried: `cargo test -p cratonvm-jit` had never been runnable
+# on AArch64 at all, in three layers, each hiding the next.
+#
+#   1. Five tests referenced `#[cfg(target_arch = "x86_64")]` APIs
+#      (`first_unsupported_precise_frame_site`, `CompiledMethod::osr_enter`), so
+#      the test binary did not COMPILE -- nine errors before a test ran.
+#   2. With those gated it linked, and then DIED: `jit/src/x64/tests.rs` and
+#      `ir_lower`'s test module EXECUTE the x86-64 code they emit, which on
+#      AArch64 is an illegal instruction. SIGILL at
+#      `a_previously_declined_large_method_now_compiles` took the whole binary
+#      down, so a single ungated test could hide every other result.
+#   3. Thirteen more assert how `try_compile_inner` ROUTES a compile, which on
+#      AArch64 returns through the Arm64 branch before any routing happens.
+#
+# A compile-only job cannot see any of those: (1) yes, but (2) and (3) are
+# runtime. This job exists so that class of rot is caught by CI instead of by
+# the next person who tries to use the backend.
+#
+# It also runs `aarch64_backend::tests::arm64_execution`, which compiles a
+# method, publishes the artifact and CALLS it -- the only tests in this
+# repository that execute emitted AArch64 instructions, including the safepoint
+# poll's `MOVZ/MOVK; LDRB; CBZ` sequence and the check that a poll's call does
+# not destroy the method's arguments.
+#
+# WHY EMULATION
+# -------------
+# QEMU under `docker/setup-qemu-action`, because it is the arrangement actually
+# validated for this repo (see docs/jit/aarch64-running-the-tests.md) and needs
+# no runner label that may not be available. It is slower than a native arm64
+# runner; if `ubuntu-24.04-arm` is available to this repository, switching this
+# job to it is a strict improvement and the container drops away entirely.
+#
+# QEMU is not a machine: it is trusted here for instruction semantics and
+# control flow, NOT for timing, memory ordering or errata. It is weakest at
+# self-modifying code, which is why the execution tests serialise themselves.
+
+name: AArch64 JIT tests
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'jit/**'
+      - 'types/**'
+      - '.github/workflows/aarch64-jit.yml'
+  pull_request:
+    paths:
+      - 'jit/**'
+      - 'types/**'
+      - '.github/workflows/aarch64-jit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  aarch64-jit-tests:
+    name: cargo test -p cratonvm-jit (aarch64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Register QEMU for linux/arm64
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # `libssl-dev` is not optional. Without it the link fails with
+      # `cannot find -lssl` several minutes into an emulated build, which is a
+      # slow way to learn it.
+      - name: Build the arm64 toolchain image
+        run: |
+          cat > Dockerfile.arm64 <<'EOF'
+          FROM rust:1-slim-bookworm
+          RUN apt-get update -qq \
+           && apt-get install -y -qq pkg-config libssl-dev \
+           && rm -rf /var/lib/apt/lists/*
+          EOF
+          docker build --platform linux/arm64 -t cratonvm-arm64-dev -f Dockerfile.arm64 .
+
+      - name: Cache the emulated build
+        uses: actions/cache@v4
+        with:
+          path: arm64-target
+          key: aarch64-jit-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            aarch64-jit-${{ hashFiles('Cargo.lock') }}-
+            aarch64-jit-
+
+      - name: cargo test -p cratonvm-jit --lib
+        run: |
+          mkdir -p arm64-target
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/arm64-target:/target" \
+            -e CARGO_TARGET_DIR=/target \
+            -w /src cratonvm-arm64-dev \
+            sh -c 'test "$(uname -m)" = aarch64 || { echo "not aarch64: $(uname -m)"; exit 1; }; cargo test --locked -p cratonvm-jit --lib'
+
+      # The execution tests are the point of the job, and a green run that
+      # SKIPPED them would be a vacuous pass -- they are `#[cfg(target_arch =
+      # "aarch64")]`, so on a runner that quietly fell back to x86 they would
+      # simply not exist. Assert they ran.
+      - name: Assert the execution tests actually ran
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/arm64-target:/target" \
+            -e CARGO_TARGET_DIR=/target \
+            -w /src cratonvm-arm64-dev \
+            sh -c 'cargo test --locked -p cratonvm-jit --lib arm64_execution -- --exact \
+                     aarch64_backend::tests::arm64_execution::a_compiled_leaf_method_executes_and_returns_the_right_value \
+                     aarch64_backend::tests::arm64_execution::a_clear_flag_skips_the_slow_path \
+                     aarch64_backend::tests::arm64_execution::a_set_flag_calls_the_slow_path_and_the_arguments_survive \
+                   2>&1 | tee /tmp/exec.txt; grep -q "3 passed" /tmp/exec.txt'
