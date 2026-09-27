@@ -35,7 +35,7 @@ fontdue = "0.9"
 
 # Platform-specific windowing backends
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_DirectWrite",
