@@ -153,7 +153,7 @@ sha2 = "0.10"
 # Auditable big-integer modular arithmetic for the byte-identical SunEC P-256
 # Montgomery field-multiply intrinsic (sunec_intpoly.rs). Reuses the
 # num-integer/num-traits already in the tree.
-num-bigint = "0.4"
+num-bigint = "0.5"
 # Coarse native EC scalar-multiply for the SunEC point engine (sunec_point.rs,
 # default-on under route_ec_to_real). Bypasses the ~14 s one-time per-curve
 # generator-table precompute. P-256/384/521 (RustCrypto 0.13 family, aligned
