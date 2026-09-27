@@ -159,7 +159,7 @@ num-bigint = "0.4"
 # generator-table precompute. P-256/384/521 (RustCrypto 0.13 family, aligned
 # elliptic-curve version).
 aes-gcm = "0.10"
-aes = "0.8"
+aes = "0.9"
 argon2 = "0.5.3"
 cbc = { version = "0.1", features = ["std"] }
 # KS-7: real JCEKS private-key entries are protected with SunJCE's proprietary
