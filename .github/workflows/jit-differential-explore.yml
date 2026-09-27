@@ -443,7 +443,7 @@ jobs:
 
       - name: Upload failing programs (already minimized by fuzz-jit)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jitfuzz-explore-${{ matrix.axis }}-${{ steps.window.outputs.seed_start }}
           path: target/jitfuzz-explore

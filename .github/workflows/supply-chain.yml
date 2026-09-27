@@ -120,7 +120,7 @@ jobs:
 
       - name: Upload audit report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supply-chain-audit
           path: target/supply-chain/cargo-audit.*
@@ -166,7 +166,7 @@ jobs:
 
       - name: Upload cargo-deny report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supply-chain-deny-${{ matrix.check }}
           path: target/supply-chain/cargo-deny-${{ matrix.check }}.txt
@@ -222,7 +222,7 @@ jobs:
 
       - name: Upload duplicate report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supply-chain-duplicates
           path: |
@@ -293,7 +293,7 @@ jobs:
 
       - name: Upload SBOM + evidence bundle
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supply-chain-sbom-and-evidence
           path: |

@@ -71,7 +71,7 @@ jobs:
         run: bash scripts/pgo.sh
 
       - name: Upload PGO-optimized binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cratonvm-pgo
           path: |
@@ -81,7 +81,7 @@ jobs:
 
       - name: Upload merged profile data
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cratonvm-pgo-profdata
           # scripts/pgo.sh leaves the merged .profdata under
