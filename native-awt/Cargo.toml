@@ -48,7 +48,7 @@ windows = { version = "0.58", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+x11rb = { version = "0.14", features = ["allow-unsafe-code"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
