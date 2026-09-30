@@ -1,0 +1,31 @@
+# Known differences between CratonVM's JDI transcripts and HotSpot 25's, read
+# by tools/jdi/run-jdi-conformance.sh (interpreter round i1 wave 24, lane L1).
+#
+# One entry per line, four TAB-separated fields:
+#
+#   <scenario or *>	<mode or *>	<diff line>	<page>
+#
+# <diff line> is a transcript line exactly as the runner prints it: "- " and
+# HotSpot's line, or "+ " and CratonVM's. <page> names the docs/known-issues/
+# page that records the difference; an entry without one is not a known
+# difference, it is a bug nobody has written down. Remove an entry when its
+# page closes: the runner does not fail on an entry that no longer matches,
+# so a stale one hides the next regression on that line.
+#
+# Modes: jdk-only, compatible, jdk-only:nojit, compatible:nojit.
+#
+# Wave 24 landed the runner empty; wave 25 (L1d) added the first entries.
+L1W23JdiConformance	compatible	-   this.tags = instance of java.util.ImmutableCollections$List12	docs/known-issues/interpreter/i25-L1-compatible-mode-list-of-is-cratonvms-own-list-class-20260927.md
+L1W23JdiConformance	compatible	+   this.tags = instance of cratonvm.internal.UnmodifiableList	docs/known-issues/interpreter/i25-L1-compatible-mode-list-of-is-cratonvms-own-list-class-20260927.md
+L1W23JdiConformance	compatible:nojit	-   this.tags = instance of java.util.ImmutableCollections$List12	docs/known-issues/interpreter/i25-L1-compatible-mode-list-of-is-cratonvms-own-list-class-20260927.md
+L1W23JdiConformance	compatible:nojit	+   this.tags = instance of cratonvm.internal.UnmodifiableList	docs/known-issues/interpreter/i25-L1-compatible-mode-list-of-is-cratonvms-own-list-class-20260927.md
+# Wave 46 follow-up (lane L1): `--compatible` keeps its Thread.sleep stand-in; a
+# thread in it lists the native leaf above its caller (predicted rows).
+L1W45JdiSuspendedInNative	compatible	-   sleeper top: java.lang.Thread.sleepNanos0[native] java.lang.Thread.sleepNanos java.lang.Thread.sleep	docs/known-issues/interpreter/i46-L1-a-sleep-or-wait-stand-in-lists-only-its-native-leaf-20261010.md
+L1W45JdiSuspendedInNative	compatible	+   sleeper top: java.lang.Thread.sleepNanos0[native] L1W45JdiSuspendedInNative$Sleeper.run	docs/known-issues/interpreter/i46-L1-a-sleep-or-wait-stand-in-lists-only-its-native-leaf-20261010.md
+L1W45JdiSuspendedInNative	compatible	-   sleeper top again: java.lang.Thread.sleepNanos0[native] java.lang.Thread.sleepNanos java.lang.Thread.sleep	docs/known-issues/interpreter/i46-L1-a-sleep-or-wait-stand-in-lists-only-its-native-leaf-20261010.md
+L1W45JdiSuspendedInNative	compatible	+   sleeper top again: java.lang.Thread.sleepNanos0[native] L1W45JdiSuspendedInNative$Sleeper.run	docs/known-issues/interpreter/i46-L1-a-sleep-or-wait-stand-in-lists-only-its-native-leaf-20261010.md
+L1W45JdiSuspendedInNative	compatible:nojit	-   sleeper top: java.lang.Thread.sleepNanos0[native] java.lang.Thread.sleepNanos java.lang.Thread.sleep	docs/known-issues/interpreter/i46-L1-a-sleep-or-wait-stand-in-lists-only-its-native-leaf-20261010.md
+L1W45JdiSuspendedInNative	compatible:nojit	+   sleeper top: java.lang.Thread.sleepNanos0[native] L1W45JdiSuspendedInNative$Sleeper.run	docs/known-issues/interpreter/i46-L1-a-sleep-or-wait-stand-in-lists-only-its-native-leaf-20261010.md
+L1W45JdiSuspendedInNative	compatible:nojit	-   sleeper top again: java.lang.Thread.sleepNanos0[native] java.lang.Thread.sleepNanos java.lang.Thread.sleep	docs/known-issues/interpreter/i46-L1-a-sleep-or-wait-stand-in-lists-only-its-native-leaf-20261010.md
+L1W45JdiSuspendedInNative	compatible:nojit	+   sleeper top again: java.lang.Thread.sleepNanos0[native] L1W45JdiSuspendedInNative$Sleeper.run	docs/known-issues/interpreter/i46-L1-a-sleep-or-wait-stand-in-lists-only-its-native-leaf-20261010.md

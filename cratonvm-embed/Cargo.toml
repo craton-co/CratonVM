@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2026 Craton Software Company
+
+[package]
+name = "cratonvm-embed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Curated, semver-stable Rust facade for embedding CratonVM (Layer 1 of the embedding API)"
+readme = "README.md"
+
+[features]
+# Keep the default facade dependency graph headless/packageable. Hosts that
+# need the VM crate's desktop or experimental runtime features opt in below.
+default = []
+# Mirrors `cratonvm-vm`'s own default set exactly. Keep these two lists in
+# sync: this feature's whole contract is "what an ordinary `cargo build` of
+# the VM crate gives you", so it is wrong the moment it drifts. It carried
+# `experimental-serialization` / `-aot` / `-debug` until 2026-07-30, which was
+# true of the VM's default set once but stopped being true when those features
+# left it — see `vm-experimental` below for the opt-in that replaces them.
+vm-defaults = [
+    "awt",
+    "management",
+]
+# The optional experiments, as a group. Not part of the VM's default build.
+# Hosts that were relying on `vm-defaults` to pull these in should ask for this
+# alongside it: `features = ["vm-defaults", "vm-experimental"]`.
+vm-experimental = [
+    "experimental-serialization",
+    "experimental-aot",
+    "experimental-debug",
+]
+awt = ["cratonvm-vm/awt"]
+synthetic-jdk = ["cratonvm-vm/synthetic-jdk"]
+# `sun.management` + `javax.management` natives. Called `experimental-jmx`
+# until 2026-07-30; the old name is retained below as a back-compat alias.
+management = ["cratonvm-vm/management"]
+experimental-jmx = ["management"]
+# DEPRECATED no-op (NEW-13) — `javax.net.ssl` is always compiled and
+# registered. Retained only so existing `--features` invocations keep
+# resolving; removal slated for 0.4.
+deprecated-noop-tls = ["cratonvm-vm/deprecated-noop-tls"]
+experimental-tls = ["deprecated-noop-tls"]
+experimental-serialization = ["cratonvm-vm/experimental-serialization"]
+experimental-aot = ["cratonvm-vm/experimental-aot"]
+experimental-debug = ["cratonvm-vm/experimental-debug"]
+gpu-offload = ["cratonvm-vm/gpu-offload"]
+# `gpu-offload` alone only links cuda-bridge's *stub* backend — every device
+# probe returns `DeviceError::NoDriver`, which is enough to exercise the
+# `VmConfig` GPU-field plumbing without a GPU present, but not enough to
+# actually dispatch work to a device. `gpu-driver` additionally turns on
+# cuda-bridge's real CUDA Driver API bindings so a device probe can succeed.
+# `cuda-bridge` has to be a *direct* optional dependency of this crate (see
+# `[dependencies.cuda-bridge]` below) for the `"cuda-bridge/cuda"` reference
+# here to be legal at all — Cargo only allows `<dep>/<feature>` syntax
+# against a package's own direct dependencies, not one pulled in only
+# transitively through `cratonvm-vm`. Mirrors vm-cli's
+# `gpu-driver = ["gpu", "cuda-bridge/cuda"]` (vm-cli/Cargo.toml). Enabling
+# this feature does not require CUDA on the *build* machine: cuda-bridge
+# dlopens the NVIDIA driver library at runtime, not link time, so the actual
+# GPU/driver only needs to be present wherever the resulting binary runs
+# with `gpu_offload_enabled = true`.
+gpu-driver = ["gpu-offload", "cuda-bridge/cuda"]
+
+[dependencies]
+cratonvm-vm = { path = "../vm", version = "0.3.0", default-features = false }
+
+# Optional direct dependency so the `gpu-driver` feature above can legally
+# reference `cuda-bridge/cuda` (see the comment on that feature for why a
+# direct dependency is required, not just a transitive one via
+# cratonvm-vm). Mirrors vm-cli/Cargo.toml's `[dependencies.cuda-bridge]`
+# stanza. Stays out of the dependency graph entirely unless `gpu-driver` (or
+# an embedder's own feature unification) turns it on.
+[dependencies.cuda-bridge]
+path = "../cuda-bridge"
+version = "0.3.0"
+optional = true
+package = "cratonvm-cuda-bridge"
+
+[lints]
+workspace = true

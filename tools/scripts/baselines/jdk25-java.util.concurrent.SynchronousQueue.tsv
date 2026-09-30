@@ -1,0 +1,62 @@
+# jdk-baseline	2
+# kind	class
+# name	java.util.concurrent.SynchronousQueue
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/util/concurrent/SynchronousQueue.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	23
+# protected-methods	0
+# declared-methods	28
+# declared-fields	6
+# rows	46
+# columns	kind	name	descriptor	flags
+CLASS	java.util.concurrent.SynchronousQueue		public
+EXTENDS	java.util.AbstractQueue		
+IMPLEMENTS	java.io.Serializable		
+IMPLEMENTS	java.util.concurrent.BlockingQueue		
+SUPERTYPE	java.io.Serializable		
+SUPERTYPE	java.lang.Iterable		
+SUPERTYPE	java.lang.Object		
+SUPERTYPE	java.util.AbstractCollection		
+SUPERTYPE	java.util.AbstractQueue		
+SUPERTYPE	java.util.Collection		
+SUPERTYPE	java.util.Queue		
+SUPERTYPE	java.util.concurrent.BlockingQueue		
+METHOD	<init>	()V	public
+METHOD	<init>	(Z)V	public
+METHOD	clear	()V	public
+METHOD	contains	(Ljava/lang/Object;)Z	public
+METHOD	containsAll	(Ljava/util/Collection;)Z	public
+METHOD	drainTo	(Ljava/util/Collection;)I	public
+METHOD	drainTo	(Ljava/util/Collection;I)I	public
+METHOD	isEmpty	()Z	public
+METHOD	iterator	()Ljava/util/Iterator;	public
+METHOD	offer	(Ljava/lang/Object;)Z	public
+METHOD	offer	(Ljava/lang/Object;JLjava/util/concurrent/TimeUnit;)Z	public
+METHOD	peek	()Ljava/lang/Object;	public
+METHOD	poll	()Ljava/lang/Object;	public
+METHOD	poll	(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;	public
+METHOD	put	(Ljava/lang/Object;)V	public
+METHOD	readResolve	()Ljava/lang/Object;	private
+METHOD	remainingCapacity	()I	public
+METHOD	remove	(Ljava/lang/Object;)Z	public
+METHOD	removeAll	(Ljava/util/Collection;)Z	public
+METHOD	retainAll	(Ljava/util/Collection;)Z	public
+METHOD	size	()I	public
+METHOD	spliterator	()Ljava/util/Spliterator;	public
+METHOD	take	()Ljava/lang/Object;	public
+METHOD	toArray	()[Ljava/lang/Object;	public
+METHOD	toArray	([Ljava/lang/Object;)[Ljava/lang/Object;	public
+METHOD	toString	()Ljava/lang/String;	public
+METHOD	writeObject	(Ljava/io/ObjectOutputStream;)V	private
+METHOD	xfer	(Ljava/lang/Object;J)Ljava/lang/Object;	private
+FIELD	fair	Z	private,final,transient
+FIELD	qlock	Ljava/util/concurrent/locks/ReentrantLock;	private
+FIELD	serialVersionUID	J	private,static,final
+FIELD	transferer	Ljava/util/concurrent/SynchronousQueue$Transferer;	private,final,transient
+FIELD	waitingConsumers	Ljava/util/concurrent/SynchronousQueue$WaitQueue;	private
+FIELD	waitingProducers	Ljava/util/concurrent/SynchronousQueue$WaitQueue;	private

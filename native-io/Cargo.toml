@@ -1,0 +1,59 @@
+[package]
+name = "cratonvm-native-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Java I/O native methods for CratonVM"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# T14: gate synthetic NIO overrides (ByteBuffer/HeapByteBuffer/etc.) behind
+# this flag.  In real-JDK mode the JDK classes have their own layout and
+# the synthetic overrides would panic with field-layout mismatches.
+synthetic-jdk = []
+
+[dependencies]
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+parking_lot.workspace = true
+# Round-8 cross-cutting Bug 3: pin `zip` to the workspace entry so this
+# crate and any future workspace consumer share one resolution. See the
+# workspace-deps comment for the pending `native-builtins` migration off
+# 0.6 — once that lands, the duplicate in Cargo.lock disappears.
+zip.workspace = true
+regex = "1"
+memmap2 = "0.9"
+notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+# Direct-buffer cleaners and net socket / option maps are keyed by internal
+# monotonic counters (AtomicI32-generated IDs). No adversarial-input concern
+# warrants SipHash; FxHashMap removes the per-op hash overhead on the hot
+# allocate/free and getIntOption0/setIntOption0 paths. Matches the migration
+# already done in native-api (`fd_table`, `ffi`, `native_ring`, `registry`).
+rustc-hash.workspace = true
+# Diagnostics that must reach the operator's normal log stream rather than a
+# debug-only `eprintln!` — e.g. a `WatchService.register` whose
+# `WatchEvent.Kind` arguments could not be decoded, which would otherwise
+# install a watch that can never fire and look identical to a quiet
+# filesystem.
+tracing.workspace = true
+
+# WP3.1 — real platform-backed Selector. Linux uses epoll via libc; Windows
+# uses WSAPoll via raw `#[link(name = "Ws2_32")]` FFI (same approach as
+# `native-builtins/src/servlet.rs`), so no extra Windows-specific crate is
+# needed. An IOCP-backed `WindowsAsyncSelector` for AsynchronousSocketChannel
+# is a separate WP.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

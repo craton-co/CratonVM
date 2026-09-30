@@ -1,0 +1,209 @@
+[package]
+name = "cratonvm-vm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Java Virtual Machine implementation in Rust"
+readme = "README.md"
+# Compiled Java test fixtures (.class files and the resource/boot-fixture
+# trees that hold them) are committed for the integration tests but must
+# not ship in the published crate ??? they bloat `cargo package` with ~2.5 MB
+# of opaque bytecode. Integration-test `.rs` sources live directly under
+# tests/ and are unaffected.
+exclude = [
+    "tests/resources/**",
+    "tests/wildfly_boot_fixtures/**",
+    # Historical Criterion output is useful for local comparisons but is
+    # generated data and must not be included in source packages.
+    "target_bench/**",
+    "**/*.class",
+]
+
+[features]
+# NEW-11: `synthetic-jdk` is intentionally NOT in the default feature set.
+# The default build boots against real JDK bytecode loaded from
+# `$JAVA_HOME/lib/modules` (via the NEW-5 jimage reader) with the ~150
+# essential natives as the Rust support surface. To run the legacy
+# synthetic test suite or to debug against Rust-side stubs, pass
+# `--features synthetic-jdk` explicitly. See `docs/roadmap.md` NEW-11
+# for the rationale and the census-driven migration plan.
+# Keep the shipping build surface to production-intended subsystems. What
+# dropping a feature actually removes differs per feature:
+#
+#  * `experimental-aot` / `-serialization` gate module declarations in
+#    `cratonvm-native-builtins`, so dropping them really stops compiling that
+#    code. `experimental-debug` gates the JDWP surface the same way. These are
+#    genuine experiments and are genuinely optional.
+#  * `management` is NOT optional in practice and stays in the default set. It
+#    gates the `sun.management` native surface that backs
+#    `java.lang.management` — core JDK API that the JDK's own bootstrap
+#    reaches — plus the `javax.management` (JMX) beans layered on top. Without
+#    it, `ManagementFactory.getMemoryPoolMXBeans()` dies with
+#    `UnsatisfiedLinkError: sun/management/VMManagementImpl.getVersion0()`
+#    (`vm/tests/wave1_a_jmx_mxbeans.rs` catches exactly this). It was called
+#    `experimental-jmx` until 2026-07-30; that name was wrong twice over — the
+#    surface is not an experiment, and it is not confined to JMX.
+#  * `deprecated-noop-tls` does nothing at all (NEW-13). The `javax.net.ssl`
+#    implementation is unconditionally compiled and registered; the feature is
+#    retained only so existing `--features` invocations and `check-cfg` keep
+#    resolving. Slated for removal in 0.4.
+#
+# ZGC remains selectable with `--features zgc`. The `experimental-features` CI
+# job builds and runs the whole optional surface, because this repository has
+# already lost 1,522 tests to a configuration that nothing compiled. For `zgc`
+# that job's library-scoped steps were NOT the whole surface: it also builds
+# `-p cratonvm-cli --features zgc` (the launcher binary, where the gated
+# `GcAlgorithm::Zgc` variant and `parse_gc_algorithm` arm actually get linked)
+# and runs `cargo test -p cratonvm-gc --lib --features zgc`.
+# `zgc` joined the default set on 2026-08-10: `GcAlgorithm`'s default is now
+# `Zgc`, and that variant is `#[cfg(feature = "zgc")]`, so the feature has to
+# be on for the default build to select it. `--no-default-features` still
+# compiles and falls back to `Generational`.
+default = ["awt", "management", "zgc"]
+# AWT/Swing/Java2D desktop natives. On by default so the standard build
+# registers them exactly as before. `cratonvm-native-awt` sets
+# `publish = false`, so this feature is what makes the dependency optional:
+# `cargo publish -p cratonvm-vm --no-default-features` can drop it.
+awt = ["dep:cratonvm-native-awt"]
+synthetic-jdk = [
+    "cratonvm-native-builtins/synthetic-jdk",
+    "cratonvm-native-collections/synthetic-jdk",
+    "cratonvm-native-io/synthetic-jdk",
+    # `synthetic_stub_fields` describes a different `java.io` Reader/Writer
+    # layout in this build, matching the natives above — which are the only
+    # writers of those slots. Without this the model would keep naming the real
+    # JDK fields while `native_isr_init` wrote VM values into them.
+    "cratonvm-classloading/synthetic-jdk",
+    # The legacy synthetic surface includes JMX bootstrap classes and therefore
+    # intentionally opts into the management native module.
+    "management",
+]
+# `sun.management` + `javax.management` native surface. Default-on: this backs
+# `java.lang.management.ManagementFactory`, which the JDK's own bootstrap
+# reaches. See the note above `default =`.
+management = ["cratonvm-native-builtins/management"]
+# DEPRECATED back-compat alias for `management`, renamed 2026-07-30. Kept so
+# existing `--features experimental-jmx` invocations keep building. Slated for
+# removal in 0.4 — prefer `management`.
+experimental-jmx = ["management"]
+# DEPRECATED no-op (NEW-13). Enables nothing: the native-tls-backed
+# `javax.net.ssl` implementation is compiled and registered unconditionally.
+# Retained only so existing `--features` invocations and `check-cfg` keep
+# resolving. Slated for removal in 0.4.
+deprecated-noop-tls = ["cratonvm-native-builtins/deprecated-noop-tls"]
+# DEPRECATED back-compat alias for `deprecated-noop-tls`, renamed 2026-07-30.
+# Equally a no-op; the old name wrongly implied TLS was feature-gated.
+experimental-tls = ["deprecated-noop-tls"]
+experimental-serialization = ["cratonvm-native-builtins/experimental-serialization"]
+experimental-aot = ["cratonvm-native-builtins/experimental-aot"]
+experimental-debug = []
+# T19.H7 diagnostic logger. Off by default ??? these warn-level traces are
+# bring-up scaffolding that fired on every class-load, opcode dispatch, and
+# native call; building with this feature flag re-enables them only when an
+# operator is explicitly debugging a Wave-7 hang. Sessions 93-94 had to
+# revert two silent re-enables; gating behind a feature ensures it cannot
+# leak back into the default build.
+experimental-t19-diag = []
+# GPU offload ??? Part C marshalling + (future Parts E/F) interpreter hook and
+# safepoint coordination. Off by default. With this feature off, the VM crate
+# compiles no GPU code paths and does not link `cuda-bridge` or `jit-cuda`.
+gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "cratonvm-gc/gpu-offload", "cratonvm-native-builtins/gpu-offload", "dep:bytemuck"]
+# Selectable memory-backed ZGC-real backend (`-XX:+UseZGC`). Gates the
+# `GcAlgorithm::Zgc` variant, its `parse_gc_algorithm` "z" | "zgc" arm
+# (`src/config.rs`) and the `GcBackend::Zgc` selection in `vm/src/vm/vm_init.rs`
+# — i.e. whole dispatch paths, not just a module. Default-off because the
+# backend is not yet at pass-rate parity with `Generational`; see
+# `gc/Cargo.toml`'s note and
+# `zgc-real-fullsuite-regression-RETIRED-20260807.md`.
+# `cratonvm-cli` has a matching pass-through, so the launcher is built with
+# `cargo build -p cratonvm-cli --features zgc`.
+# SCOPE, as of 2026-08-07: `cratonvm-gc` grew ELEVEN new `src/zgc/` modules that
+# day (colored pointers/vaddr, load barrier, pages, forwarding, metrics,
+# remembered set, marking, generations, relocation, TLABs, reference-slot
+# census) — ~26k lines and ~270 unit tests. NONE is wired into `ZgcRealHeap`, so
+# what this feature selects at runtime is unchanged — still stop-the-world,
+# non-moving, non-generational, no TLABs, no load barrier, no compaction.
+# Read the module list off the `pub mod` block in `gc/src/zgc.rs`, not off this
+# comment, and see `gc/Cargo.toml`'s longer note for the three-way maturity
+# split behind the flag.
+zgc = ["cratonvm-gc/zgc"]
+
+[dependencies]
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+cratonvm-native-collections = { path = "../native-collections", version = "0.3.0" }
+cratonvm-native-io = { path = "../native-io", version = "0.3.0" }
+cratonvm-native-builtins = { path = "../native-builtins", version = "0.3.0" }
+cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
+cratonvm-jit = { path = "../jit", version = "0.3.0" }
+# Decode-only x86-64 disassembler for the CRATONVM_DBG_JIT_DISASM diagnostic
+# (vm/src/jit/disasm.rs). Inert at runtime unless the env var is set.
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "nasm"] }
+cratonvm-classloading = { path = "../classloading", version = "0.3.0" }
+cratonvm-gc = { path = "../gc", version = "0.3.0" }
+cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
+# PUBLISH-BLOCKER FIX: `cratonvm-native-awt` sets `publish = false`, and
+# crates.io forbids publishing a crate with a non-optional, unpublished
+# normal dependency. Making it optional behind the (default-on) `awt`
+# feature keeps the default build/test behavior identical (AWT natives are
+# still registered) while allowing `cargo publish` of `cratonvm-vm` with
+# `--no-default-features` to exclude the unpublished crate.
+cratonvm-native-awt = { path = "../native-awt", version = "0.3.0", optional = true }
+# Optional, only pulled in by the `gpu-offload` feature. See the feature
+# table above. With `gpu-offload` off, these crates are not linked.
+cuda-bridge = { path = "../cuda-bridge", version = "0.3.0", optional = true, package = "cratonvm-cuda-bridge" }
+jit-cuda = { path = "../jit-cuda", version = "0.3.0", optional = true, package = "cratonvm-jit-cuda" }
+bytemuck = { version = "1.16", optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+indexmap = "2"
+bitfield-struct = "0.9"
+zip.workspace = true
+parking_lot.workspace = true
+regex = "1"
+libloading = "0.8"
+rustc-hash.workspace = true
+smallvec.workspace = true
+# NEW-20: bench-gate binary uses serde to read criterion estimates.json
+# files and the committed vm/bench/baseline.json file.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+cratonvm-native-api = { path = "../native-api", features = ["test-mock"] }
+tracing-subscriber.workspace = true
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "vm_benchmarks"
+harness = false
+
+# NEW-20: benchmark-gate CLI. Compares the criterion run output in
+# target/criterion/ against the committed vm/bench/baseline.json and
+# exits non-zero on regression > threshold.
+[[bin]]
+name = "bench-gate"
+path = "src/bin/bench_gate.rs"
+
+# T5.1.2: HotSpot C2 ratio comparator. Reads vm/bench/baseline.json and
+# vm/bench/hotspot-baseline.json, prints a per-metric ratio table plus
+# geomean, exits non-zero when the geomean exceeds the threshold (1.5??
+# by default per T5.8.1).
+[[bin]]
+name = "bench-hotspot-compare"
+path = "src/bin/bench_hotspot_compare.rs"
+
+[lints]
+workspace = true

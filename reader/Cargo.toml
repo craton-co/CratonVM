@@ -1,0 +1,35 @@
+[package]
+name = "cratonvm-reader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["jvm", "java", "classfile", "parser", "bytecode"]
+categories = ["parser-implementations", "encoding"]
+description = "Java .class file parser for the CratonVM project"
+readme = "README.md"
+
+[dependencies]
+cratonvm-types = { path = "../types", version = "0.3.0" }
+thiserror.workspace = true
+tracing.workspace = true
+bitflags = "2"
+cesu8 = "1.1"
+strum = { version = "0.26", features = ["derive"] }
+# Round-8 HIGH (reader): SIGNATURE_CACHE — generic-signature parses
+# are pure functions of the input string; Spring's `ResolvableType`
+# re-parses the same handful of signatures continuously, so a small
+# bounded FIFO cache keyed on the `Arc<str>` pointer eliminates the
+# work entirely on the hot path.
+parking_lot.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+# jdk-baseline	2
+# kind	class
+# name	java.util.Base64$Decoder
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/util/Base64$Decoder.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	5
+# protected-methods	0
+# declared-methods	9
+# declared-fields	7
+# rows	20
+# columns	kind	name	descriptor	flags
+CLASS	java.util.Base64$Decoder		public
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	(ZZ)V	private
+METHOD	decode	(Ljava/lang/String;)[B	public
+METHOD	decode	(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;	public
+METHOD	decode	([B)[B	public
+METHOD	decode	([B[B)I	public
+METHOD	decode0	([BII[B)I	private
+METHOD	decodeBlock	([BII[BIZZ)I	private
+METHOD	decodedOutLength	([BII)I	private
+METHOD	wrap	(Ljava/io/InputStream;)Ljava/io/InputStream;	public
+FIELD	RFC2045	Ljava/util/Base64$Decoder;	static,final
+FIELD	RFC4648	Ljava/util/Base64$Decoder;	static,final
+FIELD	RFC4648_URLSAFE	Ljava/util/Base64$Decoder;	static,final
+FIELD	fromBase64	[I	private,static,final
+FIELD	fromBase64URL	[I	private,static,final
+FIELD	isMIME	Z	private,final
+FIELD	isURL	Z	private,final

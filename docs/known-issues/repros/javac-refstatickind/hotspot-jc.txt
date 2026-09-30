@@ -1,0 +1,7 @@
+plain-ref OK
+deferred-ref OK
+deferred-overloaded-target OK
+static-and-instance OK
+generic-deferred OK
+ambiguous-ref OK
+JCDONE

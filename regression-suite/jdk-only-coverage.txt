@@ -1,0 +1,300 @@
+CratonVM JDK-only corpus — vector-to-blocker index
+==================================================
+
+Scope
+-----
+This file maps every RJdk* vector in regression-suite/src/ to the blocker row it
+covers in docs/jdk-only-runtime-services.md. It is the answer to "which test
+closes this row?", which that document's closure rule demands: an entry closes
+only when one of its five closure rules applies AND a test is named. This is
+that naming.
+
+Normative semantics live in docs/feature-designs/jdk-only-mode.md. This file
+tracks coverage, not semantics.
+
+How to run
+----------
+  # the historical core suite, unchanged
+  bash regression-suite/run.sh
+
+  # the JDK-only corpus under strict mode
+  SUITE=jdk-only CRATONVM_ARGS="--jdk-only" bash regression-suite/run.sh
+
+  # the same corpus under the default compatible mode (the mode-divergent
+  # vector RJdkStrict is skipped, with a message)
+  SUITE=jdk-only bash regression-suite/run.sh
+
+  # everything, across the javac release matrix
+  SUITE=all RELEASES="17 21 25" bash regression-suite/run.sh
+
+Every JDK-only vector is written to Java 17 source level so the whole 17/21/25
+matrix compiles from one source tree. Both vectors added on 2026-08-07
+(RJdkPhaser, RJdkFieldModule) were re-checked at --release 17 and 21 and are
+clean at both.
+
+KNOWN, as of 2026-08-07: `RELEASES="17 ..."` nevertheless FAILS at level 17,
+and not because of this corpus. run.sh compiles ALL of src/*.java in one javac
+invocation, so a single CORE vector above 17 takes the whole level down with
+it — today that is regression-suite/src/RChmKeySetView.java, which uses
+Executors.newVirtualThreadPerTaskExecutor() (Java 21) and ExecutorService in a
+try-with-resources (AutoCloseable since Java 19). Levels 21 and 25 compile
+clean. The level is counted as a failure, not skipped, so this shows up red
+rather than green — but the "one source tree at 17" claim above is currently
+true of the corpus and false of the suite as a whole.
+
+Mode-dependent expectations
+---------------------------
+Twenty-two of the twenty-three vectors are mode-INDEPENDENT: their correct
+outcome is identical under --real-jdk and --jdk-only, so HotSpot is a valid
+oracle in both modes and run.sh diffs against it either way.
+
+(Corpus size as of 2026-08-07: 23. RJdkPhaser and RJdkFieldModule were added on
+that date, having been written but registered in no class list — they compiled
+on every run and executed on none. Both are verified rc=0 with byte-identical
+repeated output on Temurin 25.0.3; NEITHER has yet been run on CratonVM, so
+their first scheduled run may be red, and that red is a finding, not a
+regression introduced by whoever lands next.)
+
+RJdkStrict is not. It probes precisely the places where compatible mode is
+DESIGNED to fabricate a class (the org.jboss / io.quarkus / io.smallrye
+enterprise-prefix fallback, the Function$Identity stand-in, the
+ProcessHandle/ProcessHandle$Info native-backed stubs). HotSpot always behaves
+the strict way, so:
+
+    expected under --jdk-only : identical to HotSpot  -> asserted, must pass
+    expected under --real-jdk : divergent by design   -> NOT asserted, skipped
+
+run.sh therefore schedules RJdkStrict only when CRATONVM_ARGS names --jdk-only,
+and prints a SKIP line with the reason otherwise. That is the explicit encoding
+of both expectations for that vector: strict = HotSpot parity, compatible = not
+asserted because fabrication is permitted there.
+
+For any FUTURE vector whose two modes both need pinning to a concrete output,
+run.sh supports per-mode goldens in regression-suite/expect/ — see the README
+in that directory. When a golden exists for the active mode it REPLACES the
+HotSpot oracle for that class; when none exists (the normal case) HotSpot
+remains the oracle, exactly as before.
+
+Coverage table
+--------------
+Column 1 is the required row from the task's corpus list; column 3 names the
+row in docs/jdk-only-runtime-services.md it maps to (P0/P1 table).
+
+  AREA                          VECTOR             BLOCKER ROW (jdk-only-runtime-services.md)
+  ----------------------------  -----------------  -----------------------------------------
+  HelloWorld / System / String  RJdkHello          P1 "Core String dispatch"
+                                                   P0 "Real boot-image requirement"
+  collections graph             RJdkCollections    P0 "Native-first dispatch and hard-coded
+                                                       overrides" (java.util shims)
+                                                   P0 "Duplicate dispatch implementations"
+  records and sealed classes    RJdkRecords        P2 "Verifier coverage" (modern class-file
+                                                       attributes: Record, PermittedSubclasses)
+                                                   P1 "Reflection and generated accessors"
+  lambdas / method references   RJdkLambdas        P0 "Function.identity()"  <-- named P0
+                                                   P0 "Synthetic class fallback policy"
+  MethodHandle / VarHandle      RJdkHandles        P1 "Reflection and generated accessors"
+                                                   P0 "Duplicate dispatch implementations"
+  dynamic proxy                 RJdkProxy          P1 "Reflection and generated accessors"
+                                                   P0 "Class-origin observability"
+                                                       (ClassOrigin::GeneratedProxy)
+  hidden class                  RJdkHidden         P1 "Reflection and generated accessors"
+                                                   P0 "Class-origin observability"
+                                                       (ClassOrigin::HiddenClass)
+  reflection and serialization  RJdkReflect        P1 "Reflection and generated accessors"
+                                                       (incl. the inflation/accessor path)
+  field access under JPMS       RJdkFieldModule    P1 "JPMS / module semantics" (the exports-
+                                                       vs-opens question on a field read)
+                                                   P1 "Reflection and generated accessors"
+                                                       (the typed getInt/setLong family)
+  JMX                           RJdkJmx            P0 "JMX real path"        <-- named P0
+  ServiceLoader (class path)    RJdkServices       P1 "JPMS / module semantics" (services half)
+  named-module application      RJdkModule         P1 "JPMS / module semantics"
+  executors                     RJdkExecutors      P1 "Thread and executor semantics"
+  ForkJoin                      RJdkForkJoin       P1 "ForkJoin worker execution"
+  AQS                           RJdkAqs            P1 "Concurrency + GC cooperation"
+                                                   P1 "Thread and executor semantics"
+  Phaser                        RJdkPhaser         P1 "Thread and executor semantics"
+                                                   P0 "Native-first dispatch and hard-coded
+                                                       overrides" (a shim mirroring Phaser's
+                                                       volatile long state into side-state is
+                                                       a split brain; every assertion here is
+                                                       a value such a model gets wrong)
+  WatchService contracts        RJdkWatchService   P0 "Wholesale Bridge over-tagging"
+                                                   P1 "NIO, files, networking"
+                                                   (written to make a RETAG verifiable:
+                                                   native-io/src/watch.rs holds 27 Bridge
+                                                   registrations of which ZERO are
+                                                   ACC_NATIVE, but it had 0 invocations, so
+                                                   moving the tag would have been unprovable
+                                                   -- G88-1 §9. Asks contracts only, never
+                                                   event timing, so it cannot be flaky. Two
+                                                   of its rows were DEFECTS when written:
+                                                   registering a file, and registering with
+                                                   an empty kind set, both returned a key
+                                                   where the JDK refuses.)
+  headless AWT contracts        RJdkAwtHeadless    P0 "Wholesale Bridge over-tagging"
+                                                   P2 "Headful AWT"  <-- CLOSES this
+                                                   row under closure rule 5; the
+                                                   headfulRefused() section IS the
+                                                   test that closure names.
+                                                   (the suite had NO AWT coverage at all, so
+                                                   all three arms were blind to the subsystem
+                                                   the over-tagging row nominates for retagging
+                                                   FIRST -- see known-issues/jdk-only/
+                                                   G79-1 and G80-1. Asks only CONTRACTS:
+                                                   the opaque-image alpha rule, fill and clip
+                                                   geometry, colour state, the bounds message
+                                                   and a PNG round trip. Deliberately asks
+                                                   NOTHING about rasterization quality, and
+                                                   deliberately omits getRaster/getColorModel,
+                                                   which still answer null -- G80-1 N1.)
+  ProcessHandle                 RJdkProcess        P1 "ProcessHandle"        <-- named P1
+  files and NIO                 RJdkNio            P1 "NIO, files, networking"
+  networking                    RJdkNet            P1 "NIO, files, networking"
+  security                      RJdkSecurity       P2 "Crypto provider completeness"
+  JNI                           RJdkJni            P1 "JNI and native binding"
+  failure semantics             RJdkFailure        P0 "Synthetic class fallback policy"
+                                                   P0 "Direct ensure_synthetic_class calls"
+                                                   (mode-independent half)
+  strict-mode divergence        RJdkStrict         P0 "Synthetic class fallback policy"
+                                                   P0 "Function.identity()"
+                                                   P0 "Native-first dispatch and hard-coded
+                                                       overrides"
+                                                   P1 "ProcessHandle"
+                                                   (mode-DIVERGENT half; --jdk-only only)
+
+Rows NOT covered by this corpus
+-------------------------------
+Recorded here so nobody reads a green run as blanket closure.
+
+  P0 "Residual synthetic native set"
+      A census/ratchet concern, not a Java-observable behaviour. Covered by
+      native-builtins/tests/stub_ratchet.rs and the --dump-native-registry
+      census, not by a vector.
+
+  P0 "Class-origin observability"
+      Partly covered (the vectors exercise every origin kind the contract
+      names), but the --dump-class-origins census output itself is a launcher
+      concern and is not asserted here.
+
+  P2 "JDBC / java.sql"
+      Deliberately untouched. The corpus avoids loading java.sql at all —
+      RJdkProxy originally used SQLException for its undeclared-checked-
+      exception probe and was changed to java.text.ParseException specifically
+      so that no vector drags java.sql in.
+
+  P2 "Headful AWT"
+      Out of scope by closure rule 5 (headless).
+
+Covered OUTSIDE this corpus, by the strict-corpus probe gate
+-----------------------------------------------------------
+scripts/jdk-only-strict-probes.sh runs probes/JdkOnly*Probe on three arms —
+real HotSpot, `--real-jdk`, `--jdk-only` — against one image and one set of
+class files, and diffs the two CratonVM transcripts against the HotSpot one.
+
+It is BLOCKING in CI, as a ratchet: the known divergences are committed to
+scripts/baselines/jdk-only-strict-corpus-<feature>-<os>.txt and the gate fails
+when that set grows. A divergence that disappears prints "re-freeze" and
+passes, so a fix is never blocked by the gate that measured it. It refuses
+(exit 2) rather than passing when no baseline exists for the current key, and
+an arm that does not complete fails regardless of the baseline. Re-freeze with:
+
+  bash scripts/jdk-only-strict-probes.sh --update-baseline --note "why"
+
+It is a different instrument from this suite and answers a different question:
+this suite asserts invariants a vector states about itself, the gate asserts
+that CratonVM's whole transcript is what HotSpot printed. A wrong VALUE that
+still satisfies every assertion — `FileChannel.size()` returning 0, a provider
+list with an extra entry — is invisible here and loud there.
+
+It also carries the two fixtures a determinism-bound suite cannot ship, which
+is what closes limitation 1 below and covers surfaces no vector reaches:
+
+  * probes/jdkonly_jni_probe.c, BUILT AT RUN TIME by the gate against
+    $JAVA_HOME/include, so there is no committed per-platform binary to go
+    stale. Eight families: the primitive/long/double call ABI, string
+    conversion, primitive-array commit-vs-abort, object arrays, field access,
+    a native->Java upcall, ThrowNew propagation, and one method bound by
+    JNI_OnLoad/RegisterNatives whose C symbol is DELIBERATELY unrelated to its
+    Java name, so a VM that only resolves by mangled symbol fails that one and
+    nothing else.
+  * probes/JdkOnlyProbeAgent.java, jarred with a Premain-Class manifest and
+    passed as `-javaagent:` to all three arms. It records whether premain ran,
+    whether its ClassFileTransformer saw the probe's own main class being
+    defined, and whether retransformation is supported.
+
+  Also covered there and NOWHERE in this corpus: virtual threads (grep confirms
+  no RJdk* vector names ofVirtual/startVirtualThread/isVirtual),
+  ProcessBuilder's redirect surface as VALUES rather than shapes, and a PKCS12
+  keystore round-trip. Both of the last two found open defects on their first
+  run — see docs/known-issues/vm/.
+
+Known limitations of the corpus itself
+--------------------------------------
+These are honest gaps, not oversights. Do not paper over them.
+
+1. JNI: purpose-built native library.
+   RJdkJni drives the JDK's OWN JNI-implemented natives (java.util.zip's
+   Deflater/Inflater/CRC32 native handles, System.loadLibrary of a
+   JDK-shipped library, an unbound ACC_NATIVE declaration, arraycopy's native
+   argument checks). It does NOT ship a hand-written .so/.dll exercising
+   RegisterNatives, local/global references, thread attach/detach or critical
+   arrays: this suite has no C toolchain step, and a compiled artefact would be
+   per-platform, which is exactly the nondeterminism the suite forbids.
+   RESOLVED OUTSIDE THIS SUITE, 2026-08-05: the toolchain-aware fixture this
+   paragraph asks for is probes/jdkonly_jni_probe.c, compiled per run by
+   scripts/jdk-only-strict-probes.sh — see the section above. The limitation
+   stands for `regression-suite/` itself and always will; the row is no longer
+   uncovered by the project.
+
+2. Named-module launch (-m <module>/<class>).
+   RJdkModule resolves a real named module with --module-path + --add-modules
+   and consumes it from the unnamed module, which is the ordinary "application
+   uses a modular dependency" shape. It does NOT launch AS a module, because
+   the CratonVM launcher has no -m/--module main-module option (vm-cli's arg
+   table carries --module-path/-p and --add-modules but no main-module form;
+   -mp is special-cased for JBoss Modules and is unrelated). Adding that flag
+   is a separate change; until then a fully modular launch is uncovered.
+
+3. TLS loopback handshake.  CLOSED 2026-08-13 by RSslLiveSession.
+   RJdkSecurity covers SSLContext/SSLEngine construction, protocol and cipher
+   enumeration and SSLParameters. The real handshake is RSslLiveSession's:
+   loopback SSLServerSocket plus HttpsURLConnection, 95 checks over the client
+   session, the server session, the HostnameVerifier door and invalidate(). The
+   claim that a portable self-signed certificate "requires internal sun.security
+   APIs" was measured FALSE -- it is assembled as DER and signed with
+   java.security.Signature, all public API, in-process, with no resource file
+   and no expiry. See docs/known-issues/jdk-only/F36-1-*.md SS3.1.
+
+4. ProcessHandle parent/info values.
+   Present-vs-absent and >0 predicates only. pids, command lines, users, start
+   instants and cpu durations are per-run and per-host, so they are asserted
+   for SHAPE and never printed. The same applies to allProcesses(), which many
+   platforms restrict.
+
+5. RConcurrent stays out of the default core set.
+   Unchanged by this work. Its move into the default set is, per
+   jdk-only-runtime-services.md, the closure test for P1 "Concurrency + GC
+   cooperation" — RJdkAqs and RJdkForkJoin add coverage but do not replace it.
+
+Determinism rules every vector obeys
+------------------------------------
+The suite diffs CratonVM's output against HotSpot's byte for byte, so any
+nondeterminism is an immediate false failure. Enforced conventions:
+
+  * No wall-clock values, uptimes, durations or timestamps are printed.
+  * No pids, thread names/ids, host names, port numbers or user names.
+  * No absolute paths, URLs or java.library.path-bearing messages.
+  * No hash-ordered iteration: every HashMap/HashSet view is sorted (or comes
+    from an insertion-ordered container) before being emitted.
+  * No unseeded randomness in output: SecureRandom is asserted through
+    invariants ("two draws differ") and never printed; RSA signatures use
+    randomised padding, so only verify() booleans are printed.
+  * No generated class NAMES: lambda, hidden and proxy class names carry
+    address- or counter-derived suffixes. Only shape predicates are printed.
+  * No non-ASCII on stdout: console encoding differences would otherwise show
+    up as a diff. Non-ASCII strings are asserted, then reported as length and
+    code point.
+  * Ordering that the JDK does not specify (ServiceLoader across multiple
+    config files, invokeAny's winner, MBeanInfo attribute order, ForkJoin split
+    order) is asserted as a sorted set or as membership, never as a sequence.

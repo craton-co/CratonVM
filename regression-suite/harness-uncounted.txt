@@ -1,0 +1,61 @@
+# Vectors that publish no count of the assertions they executed. Guard G3 in
+# harness-guard.sh; the reasoning is in W7-60-harness-extract-blindness.md.
+#
+# WHY A COUNT IS LOAD-BEARING. A failed assertion throws, so run.sh's rc check
+# already catches it. What a count catches is the other shape: a vector that
+# SILENTLY RAN FEWER ASSERTIONS than it looks like it did. RNioNoFollow was the
+# worked example — one failed Files.createSymbolicLink made it print a bail-out
+# line and return, skipping all 27 checks, on the platform the suite is usually
+# run from. Both VMs bailed identically, so the cross-VM diff agreed and the
+# gate was green. A published count makes that a red, because the oracle's count
+# and the VM's count are different numbers.
+#
+# THIS FILE IS A RATCHET, IN BOTH DIRECTIONS. A vector here that starts
+# publishing a count is ALSO an error, so a repair is not finished until its row
+# is deleted. A baseline that only ever records "known bad" decays into a list
+# nobody re-checks; this one cannot, because clearing an entry is what makes the
+# run green again.
+#
+# Format: one class name per line, `#` to end of line is a comment.
+
+RClassUnloadSweep      # zero assertions by design: whether a weak reference has
+                       # been cleared is a GC-policy outcome, not a language
+                       # guarantee, so its single observable is diff-only and
+                       # there is no assertion population to count. See the
+                       # comment in the vector itself.
+
+RClassUnloadSweepGen   # the same probe under -XX:+UseGenerationalGC (see
+                       # class_cv_args in run.sh), so it inherits the row above
+                       # for the same reason: one diff-only observable, no
+                       # assertion population.
+
+# CLEARED 2026-08-12 (lane W7-51/W7-60 round 3). RPriorityQueueGc and
+# RTreeRangeGc both publish a count now, so their rows are DELETED rather than
+# annotated — the reverse direction of the ratchet says a vector that starts
+# counting is an error until its row is gone.
+#
+# The decision the old rows deferred, recorded so it is not re-litigated: the
+# UNIT is one check() call, matching every other vector in the suite. Neither
+# repair needed a run under the --nojit / --Xmx 64m reproduction conditions,
+# because the number is a property of the SOURCE (how many assertion sites the
+# run executed), not of the heap configuration; the flags decide whether the
+# assertions FAIL, not how many of them run.
+#
+# RPriorityQueueGc needed one extra distinction and it is the interesting part.
+# Its concurrent drain loop runs three assertions per element drained, and how
+# many elements are left to drain is scheduling-dependent — the vector's own
+# comment already says so about the neighbouring CK line. Folding those into a
+# diffed count would make a CORRECT VM red at random, so they go through an
+# uncounted `checkDyn()` twin with identical failure behaviour. See the comment
+# on that helper.
+#
+# NOT ADDED, deliberately: RMapResizeGc and RMapGcStress were reported to this
+# lane as uncounted-and-unlisted. They are neither. Both have published
+# `PASS <Class> (N checks)` since they were written (RMapResizeGc.java:108,
+# RMapGcStress.java:233) and both also print a `CK n=... ` line, so G2 and G3
+# are both satisfied and adding them here would fire the REVERSE direction of
+# this ratchet on every run. Verified by reading the two sources, and by the
+# same census over all 72 vectors that produced this file: the only three
+# without a count are the two cleared above and RClassUnloadSweep (and, since
+# 2026-08-13, its Generational twin RClassUnloadSweepGen, which is that same
+# vector's probe and not a new observable).

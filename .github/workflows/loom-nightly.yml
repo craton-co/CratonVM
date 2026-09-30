@@ -1,0 +1,165 @@
+# The loom models, run nightly — because until 2026-09-21 nothing ran them.
+#
+# WHAT THIS LANE EXISTS TO FIX
+# ----------------------------
+# `gc/tests/loom_satb.rs` and `gc/tests/loom_w3a_region_metadata.rs` are
+# permutation models of two concurrency protocols: the SATB activation gate's
+# ACTIVE -> DRAINING -> INACTIVE FSM, and `G1Region`'s classification
+# publication. Both are behind `--cfg loom`. Without that flag they compile to
+# a `#[cfg(not(loom))]` half, so an ordinary `cargo test` run reports green
+# test names for models that did not execute — and `loom` appeared in no file
+# under `.github/workflows` or `ci/` at all. A model nobody runs is a comment
+# with a test's authority, which is worse than no model: round-5 and round-9
+# comments in `gc/src/satb.rs` cited "loom covers this" while leaning on
+# nothing. See
+# `docs/internal/gc/mark-satb-drain-happens-before-20260920-RETIRED-20260921.md`.
+#
+# NIGHTLY, NOT PER-PR, AND THAT IS THE POINT
+# ------------------------------------------
+# Loom enumerates every legal interleaving of every thread and every
+# synchronising access. The state space is exponential in both, which is why
+# the models are deliberately small (`loom_satb.rs` uses two shards, not
+# production's sixteen, and says why in its own header). Even so the cost is
+# not a PR-lane cost, and a gate that times out under load is a gate that gets
+# disabled. So: scheduled, plus `workflow_dispatch` for anyone who changes
+# either protocol and wants the answer before merging.
+#
+# BLOCKING, unlike `miri.yml`. A loom counterexample is not an
+# unsupported-operation report that says nothing about correctness — it is a
+# concrete interleaving under which the asserted property is false. There is
+# nothing to triage away.
+#
+# WHAT A GREEN NIGHT DOES NOT MEAN
+# --------------------------------
+#   * IT IS NOT A PROOF ABOUT THE SHIPPED TYPES. Loom intercepts
+#     `loom::sync::atomic`, not `std::sync::atomic`, so each model is a REPLICA
+#     of the production accessors with the atomic crate swapped. Both files say
+#     so in their headers and both name the production functions they mirror.
+#     If those change, the replica must change in lockstep or this lane goes on
+#     passing while describing a state machine nobody ships. That failure mode
+#     has already happened once, in `loom_satb.rs`, and is the reason its
+#     header is as long as it is.
+#   * IT IS NOT THE UNCONDITIONAL SATB NO-STRANDING PROPERTY. That property is
+#     FALSE and `loom_satb.rs` deliberately does not assert it: a mutator reads
+#     the activation gate once and never re-reads it, so a writer parked on a
+#     shard mutex the drain currently owns can push after the drain has moved
+#     on. What the model asserts is the caller-scoped property production
+#     actually depends on (every mutator quiesced before the drain begins,
+#     i.e. the remark pause), plus the invariants that hold for every
+#     interleaving: no fabricated entry, no duplicate, a terminal INACTIVE
+#     gate. `SatbQueue::deactivate_and_drain` takes a `&StopTheWorldToken` so
+#     the premise is a compile error to omit.
+#
+# WHAT IT COSTS, MEASURED
+# -----------------------
+# First run, 2026-09-21, 8-core x86-64 Linux, release, both models green:
+#
+#   loom_satb                 3 tests   10.69 s   (cold build 1 m 22 s)
+#   loom_w3a_region_metadata  2 tests    0.69 s   (same build reused)
+#
+# Seconds, not hours — which is the answer to "is this affordable?" and also a
+# warning: the models are small ON PURPOSE (two shards, two threads, two
+# accesses) and these numbers are what keeps them that way. Widening one to
+# production's sixteen shards is not a tuning knob, it is an exponential.
+# `timeout-minutes: 60` below is therefore almost entirely build budget for a
+# cold two-core runner, not model budget.
+#
+# TO EXTEND: add a leg. Each model gets its own leg so one counterexample does
+# not hide another's, and `fail-fast: false` keeps the rest of the matrix
+# running when one goes red.
+
+name: Loom (nightly)
+
+on:
+  schedule:
+    # 04:41 UTC — off the hour, and after `jit-differential-nightly` (03:17)
+    # has taken the runners it needs.
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+  # Also on a push that touches the SATB FSM or either model, because the
+  # failure this lane exists to prevent is REPLICA DRIFT and that is exactly
+  # the diff that causes it. `gc/src/g1.rs` is deliberately NOT in this list
+  # even though `loom_w3a_region_metadata.rs` mirrors five of its accessors:
+  # it is one of the hottest files in the tree, and a whole extra `--cfg loom`
+  # build of the workspace on every push to it is how a lane gets switched off
+  # (the models run in seconds; the BUILD is the cost — see the measurements
+  # above). The nightly catches a g1.rs drift within a day, and
+  # `workflow_dispatch` catches it sooner for anyone who knows they touched the
+  # publication ordering.
+  push:
+    branches: [main, dev]
+    paths:
+      - 'gc/src/satb.rs'
+      - 'gc/tests/loom_satb.rs'
+      - 'gc/tests/loom_w3a_region_metadata.rs'
+      - '.github/workflows/loom-nightly.yml'
+
+concurrency:
+  group: loom-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: --cfg loom
+  # NOT set: `LOOM_LOG`. Loom logs every branch of every execution it explores,
+  # so turning it on here would bury a counterexample under the executions that
+  # passed. To investigate a red night, re-run the failing model locally with
+  # `LOOM_CHECKPOINT_FILE` and `LOOM_LOG=trace` — loom prints that recipe
+  # itself when a model fails.
+
+jobs:
+  loom:
+    name: loom (${{ matrix.model }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The SATB activation FSM. Two shards, a mutator and a collector,
+          # the `in_flight` writer counter and the post-INACTIVE sweep.
+          - model: loom_satb
+          # `G1Region`'s classification publication: the one contract on this
+          # project's x86 build hosts that an x86 test CANNOT falsify, because
+          # TSO makes a weakened `Relaxed` pair behave like acquire/release for
+          # exactly this shape and only aarch64 would notice.
+          - model: loom_w3a_region_metadata
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Keyed on the model AND on `loom`: `RUSTFLAGS=--cfg loom` rebuilds
+          # the world, so this cache must never be shared with a lane that
+          # builds without it.
+          shared-key: loom-${{ matrix.model }}
+
+      # `--release`: loom's own scheduler is the hot loop, and a debug build
+      # makes the same enumeration several times slower without exploring one
+      # extra interleaving. Both model headers document this exact command.
+      - name: Run the model
+        run: cargo test -p cratonvm-gc --test ${{ matrix.model }} --release
+
+      # A run that compiled the `#[cfg(not(loom))]` half instead of the model
+      # is a green tick for nothing — the same defect this lane exists to
+      # remove, and the one that hid the SATB model's absence for as long as it
+      # did. Both files put their loom tests in `mod loom_model`, and that
+      # module exists ONLY under `--cfg loom`, so its presence in the test list
+      # is the proof that `RUSTFLAGS` reached this build. Without the flag the
+      # list is `loom_satb.rs`'s ordinary `production_fsm` tests, or
+      # `loom_w3a_region_metadata.rs`'s lone
+      # `region_metadata_publication_loom_model_check` stub, and this step
+      # fails.
+      - name: Prove the model actually ran
+        run: |
+          set -euo pipefail
+          out="$(cargo test -p cratonvm-gc --test ${{ matrix.model }} --release -- --list)"
+          printf '%s\n' "$out"
+          if ! printf '%s' "$out" | grep -q 'loom_model::'; then
+            echo "::error::no loom_model:: test was listed — RUSTFLAGS=--cfg loom did not reach this build, so the result above is the non-loom half"
+            exit 1
+          fi

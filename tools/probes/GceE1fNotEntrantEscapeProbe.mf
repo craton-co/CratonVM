@@ -1,0 +1,2 @@
+Premain-Class: GceE1fNotEntrantEscapeProbe$Agent
+Can-Redefine-Classes: true

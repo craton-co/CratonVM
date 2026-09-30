@@ -1,0 +1,28 @@
+{
+  "_comment": [
+    "Operator-maintained closure records for the JDK-only blocker artifacts.",
+    "Nothing in a runtime dump can say 'this was reviewed and closed' -- closure",
+    "is a human judgement, so it is recorded here and joined onto the",
+    "machine-observed rows by tools/jdk-only-blockers/blockers.py.",
+    "",
+    "An entry is CLOSED only when it is one of:",
+    "  bridge          implemented as a reviewed NativeKind::Bridge",
+    "  intrinsic       implemented as a reviewed NativeKind::Intrinsic",
+    "  real-bytecode   executed from real class bytes; the substitution is gone",
+    "  generated-class implemented as legitimate generated class bytes",
+    "  out-of-scope    explicitly declared out of scope, and the VM raises a",
+    "                  specification-consistent error instead",
+    "Anything else is 'open'. There is no 'wontfix' and no 'deferred'.",
+    "An off-vocabulary status is a hard error, not a warning.",
+    "",
+    "'note' is mandatory in review even though the tool does not enforce it:",
+    "a status with no reviewer-supplied justification is not a closure.",
+    "See docs/jdk-only-native-review.md for the promotion checklist.",
+    "",
+    "Rows that match nothing in a run are reported as stale. That is NOT proof",
+    "the blocker is gone -- the run may simply not have exercised it."
+  ],
+  "schema_version": 1,
+  "natives": [],
+  "classes": []
+}

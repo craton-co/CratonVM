@@ -1,0 +1,224 @@
+# JDK-only mode (`--jdk-only`) issue form.
+#
+# This is a GitHub *issue form* (YAML), not a legacy markdown template like the
+# sibling bug_report.md / feature_request.md. Both kinds coexist in this
+# directory; GitHub renders each according to its own file type. The structured
+# form is used here because a JDK-only report is only actionable with all five
+# of: JDK, platform, the diagnostic report, a reproducer, and the --real-jdk
+# fallback result. See docs/jdk-only-migration.md for the triage matrix those
+# five feed.
+#
+# Security issues do NOT belong here — use GitHub Security Advisories per
+# SECURITY.md (see config.yml's contact_links).
+
+name: JDK-only mode report
+description: A program that fails under --jdk-only, or a strict-mode invariant that did not hold.
+title: "[jdk-only] "
+labels: ["bug", "jdk-only"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing strict mode.
+
+        **Before filing**, please run the two-run triage from
+        [`docs/jdk-only-migration.md`](https://github.com/craton-co/cratonvm/blob/main/docs/jdk-only-migration.md):
+        the same command under `--jdk-only`, then under `--real-jdk`, then on
+        HotSpot. That single comparison decides whether this is "a compatibility
+        substitution is load-bearing" or an ordinary VM bug — and they go to
+        different owners.
+
+        **Please do not file** a bare `synthetic-native-registered` violation.
+        Those are already enumerated by the census and tracked in
+        [`docs/jdk-only-runtime-services.md`](https://github.com/craton-co/cratonvm/blob/main/docs/jdk-only-runtime-services.md).
+        File the *program* that fails because of one.
+
+        **Do not file security issues here.** Use GitHub Security Advisories —
+        see `SECURITY.md`.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I ran the same command under `--real-jdk` and recorded the result below.
+          required: true
+        - label: This is not a security report (those go to GitHub Security Advisories).
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, in one or two sentences.
+      placeholder: |
+        `--jdk-only` aborts on startup with compatibility-class-requested for
+        java/util/function/Function$Identity. The same command works under --real-jdk.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: violation-kind
+    attributes:
+      label: Violation kind
+      description: >-
+        The `kind` tag from the error or the report. If several appeared, pick
+        the first one — it is usually the cause and the rest are consequences.
+      options:
+        - compatibility-class-requested
+        - synthetic-native-registered
+        - synthetic-native-invocation
+        - missing-native
+        - native-shadows-bytecode
+        - missing-boot-class
+        - missing-implementation
+        - "Not a violation — wrong result, hang, or crash under --jdk-only"
+        - "Other / unsure"
+    validations:
+      required: true
+
+  - type: input
+    id: jdk-version
+    attributes:
+      label: JDK
+      description: >-
+        Vendor and feature version, plus the `--java-home` you passed. Paste the
+        `java -version` banner if you have it.
+      placeholder: "Temurin 25.0.1 (java.home=/opt/jdk-25), passed as --java-home /opt/jdk-25"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86-64
+        - Linux AArch64
+        - Windows x86-64
+        - macOS x86-64
+        - macOS AArch64
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: cratonvm-version
+    attributes:
+      label: CratonVM version or commit
+      description: Release tag, or `git rev-parse HEAD` output. Say if the tree was dirty.
+      placeholder: "v0.3.0, or 0c54a9184 (clean)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command line
+      description: >-
+        Both invocations, verbatim. Redact paths if you need to, but keep the
+        flags intact — flag order and `-cp` content are frequently the answer.
+      render: shell
+      placeholder: |
+        # strict
+        target/release/cratonvm --jdk-only --java-home "$JAVA_HOME" -cp app.jar com.example.Main
+
+        # fallback
+        target/release/cratonvm --real-jdk --java-home "$JAVA_HOME" -cp app.jar com.example.Main
+    validations:
+      required: true
+
+  - type: dropdown
+    id: fallback-result
+    attributes:
+      label: "`--real-jdk` fallback result"
+      description: >-
+        The single most useful field in this form. "Passes under --real-jdk"
+        means a compatibility substitution is load-bearing — that is the case
+        strict mode exists to find. "Fails under both" means an ordinary bug
+        that has nothing to do with strictness.
+      options:
+        - "Passes under --real-jdk (fails only under --jdk-only)"
+        - "Fails under --real-jdk too (same failure)"
+        - "Fails under --real-jdk too (different failure)"
+        - "Did not try / could not try"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hotspot-result
+    attributes:
+      label: HotSpot result
+      description: The same program on `$JAVA_HOME/bin/java`.
+      options:
+        - "Passes on HotSpot"
+        - "Fails on HotSpot too"
+        - "Did not try"
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Reproducer
+      description: >-
+        Minimal Java source and how you compiled it (`javac --release <N> ...`).
+        A jar we cannot run is not a reproducer. If the failure needs a
+        framework, say which version and give the smallest entry point you can.
+      render: java
+      placeholder: |
+        public final class Repro {
+            public static void main(String[] args) {
+                java.util.function.Function.identity().apply("x");
+            }
+        }
+        // javac --release 25 -d out Repro.java
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Full output
+      description: >-
+        Complete stdout and stderr from the strict run, including the violation
+        block. Do not trim the header — the class origin, attempted native kind
+        and JDK feature version live there.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: report-attachment
+    attributes:
+      label: Diagnostic report
+      description: |
+        Attach or paste the JSON produced by:
+
+        ```
+        --jdk-only-report              jdk-only-report.json
+        --dump-class-origins           classes.json
+        --dump-native-registry         natives.json
+        --dump-missing-natives-grouped missing.json
+        ```
+
+        Which ones matter depends on the violation kind:
+        `compatibility-class-requested` → class origins;
+        `missing-native` → the grouped missing-native dump;
+        `synthetic-native-*` → the registry dump.
+
+        **Absolute paths are redacted unless you passed `--explain-jdk-only`.**
+        If you did pass it, check the file before attaching.
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: >-
+        Frameworks in play, whether it reproduces with `CRATONVM_DISABLE_JIT=1`,
+        whether it is intermittent, and how many runs out of how many.
+    validations:
+      required: false

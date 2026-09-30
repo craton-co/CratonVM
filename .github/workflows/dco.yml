@@ -1,0 +1,12 @@
+name: DCO
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - name: DCO Check
+        uses: tisonkun/actions-dco@v1

@@ -1,0 +1,95 @@
+# AddressSanitizer / LeakSanitizer suppression + allowlist file for CratonVM.
+#
+# Used by .github/workflows/sanitizers.yml as:
+#     LSAN_OPTIONS=suppressions=scripts/evidence/asan-suppressions.txt
+#     ASAN_OPTIONS=...:suppressions=scripts/evidence/asan-suppressions.txt
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE ADDING A LINE
+# ---------------------------------------------------------------------------
+# A suppression is a claim that a finding is NOT a defect. Every entry below
+# names the reason it is not a defect. An entry added only to make the leg go
+# green is worse than a red leg, because it converts a known-unknown into an
+# unknown-unknown. If you cannot write the reason, do not add the entry --
+# file it in docs/known-issues/ and leave the leg red.
+#
+# ---------------------------------------------------------------------------
+# THE STRUCTURAL LIMIT: JIT-GENERATED CODE IS NOT INSTRUMENTED
+# ---------------------------------------------------------------------------
+# ASan works by having the *compiler* rewrite every load and store to consult a
+# shadow-memory map first. That instrumentation is applied at compile time, to
+# code rustc/LLVM emits.
+#
+# CratonVM's JIT emits x86-64 machine code at run time, straight into a
+# W^X-managed executable mapping. rustc never sees those bytes, so LLVM never
+# instruments them. The practical consequences, none of which a suppression
+# file can fix:
+#
+#   * A JIT-compiled method that reads out of bounds, reads a freed object, or
+#     walks a stale card-table entry produces NO ASan report. The whole
+#     JIT-compiled execution path is a sanitizer blind spot.
+#   * Heap objects the JIT touches directly (field loads/stores lowered to raw
+#     `mov`s, the TLAB bump pointer, inline-cache patch sites) are equally
+#     invisible.
+#   * Conversely, memory the JIT allocates via the Rust side and hands to
+#     generated code can be reported as "leaked" by LSan, because the only
+#     remaining reference lives in a register or in a JIT frame LSan cannot
+#     interpret as a root.
+#
+# What the ASan leg therefore DOES prove: the interpreter, the class reader and
+# metadata layer, the GC's own bookkeeping, the native/JNI shim surface, and
+# the FFI boundaries are free of the errors ASan can see, on the code paths the
+# workspace tests exercise. That is a real and useful guarantee. It is not
+# "the VM is memory-safe".
+#
+# To narrow the blind spot, run the sanitizer legs with the JIT disabled so the
+# interpreter executes everything (the flag surface is in
+# `types/src/flag_groups.rs`); the interpreter IS instrumented. Covering
+# generated code itself needs a different tool (hardware watchpoints, a
+# guard-page allocator, or the VM's own W^X + card-table assertions), not ASan.
+#
+# ---------------------------------------------------------------------------
+# LEAK SUPPRESSIONS
+# ---------------------------------------------------------------------------
+# Format: leak:<substring matched against a frame in the allocation stack>
+
+# Deliberately-immortal VM singletons. The interned-string table, the class
+# metadata arena, the loader-pin table and the boot classloader's mirrors are
+# allocated once and intentionally never freed: they are live for the whole
+# process and their teardown order against JIT frames and GC roots is exactly
+# the kind of shutdown hazard the VM avoids by not tearing them down at all.
+# LSan cannot distinguish "immortal by design" from "leaked".
+leak:cratonvm_types::intern
+leak:cratonvm_types::metadata_pin
+leak:cratonvm_types::loader_pin
+leak:cratonvm_types::mirror_pin
+
+# Executable code caches. Allocated with the platform's raw mapping calls and
+# owned by the JIT's code-cache bookkeeping, not by a Rust `Drop`. Freeing a
+# region while a frame from it is still on some thread's stack is the failure
+# mode recorded in the JIT known-issues set, so these mappings outlive the
+# test process on purpose.
+leak:cratonvm_jit::codecache
+leak:cratonvm_jit_api
+
+# The JDK boot image reader keeps the parsed jimage/jmod directory resident for
+# the lifetime of the VM; it is a cache, not a leak.
+leak:cratonvm_reader::jimage
+
+# ---------------------------------------------------------------------------
+# INTERCEPTOR / THIRD-PARTY SUPPRESSIONS
+# ---------------------------------------------------------------------------
+# `interceptor_via_lib:` and `interceptor_name:` entries go here. None are
+# needed today.
+#
+# One known hazard, recorded here because it will look like a suppression
+# problem when it is not: `cratonvm-cli` enables `mimalloc` by default and
+# installs it as the `#[global_allocator]`. mimalloc interposes malloc, and so
+# does ASan; when both are linked into the same test binary the reports become
+# nonsense (or ASan aborts at init). If the ASan leg fails inside mimalloc, the
+# fix is to narrow the leg with `--exclude cratonvm-cli` so ASan owns malloc --
+# NOT to add a suppression here.
+#
+# TODO(supply-chain): if a future leg links a C dependency that LSan reports
+# through (OpenSSL-style one-time init tables are the usual culprit), add it
+# here with its upstream issue link, not as a blanket `leak:*`.

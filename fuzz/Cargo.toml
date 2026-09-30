@@ -1,0 +1,192 @@
+[package]
+name = "cratonvm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.80"
+authors = ["Craton Software Company"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/craton-co/cratonvm"
+homepage = "https://craton.com.ar"
+documentation = "https://github.com/craton-co/cratonvm/tree/main/docs"
+
+# The fuzz crate is intentionally *not* a workspace member and does NOT
+# inherit workspace lints. libFuzzer-driven `fuzz_target!` macros expand
+# into code (e.g. `#[no_mangle] extern "C" fn rust_fuzzer_test_input`,
+# `#![no_main]`) that trips several workspace lints which are otherwise
+# correct for production crates. Keeping this manifest standalone lets
+# the rest of the workspace stay lint-clean.
+
+# Declare an empty workspace so this crate is its own workspace root and the
+# root `cargo check --workspace` never builds it (it was previously listed in
+# the root `members`, which contradicted the comment above and forced
+# `--exclude cratonvm-fuzz`). Build targets via `cargo +nightly fuzz build`.
+[workspace]
+
+# The root workspace patches `rustls` to the vendored, minimally-patched
+# 0.23.38 at `native-builtins/vendor/rustls-cbc`, which adds the
+# `KeyBlockShape::mac_key_len` that classic CBC+HMAC cipher suites need
+# (`native-builtins/src/t27_tls_cbc.rs`). `[patch]` is not inherited by a
+# standalone workspace, so without this the fuzz build resolves stock rustls
+# from crates.io and `cratonvm-native-builtins` does not compile at all.
+#
+# That is the entire content of "the fuzz workspace and the native-builtins
+# feature set are not aligned", which kept `fuzz-smoke` advisory. It has to be
+# kept in step with the root `[patch.crates-io]` by hand; there is no
+# mechanism that does it for us.
+[patch.crates-io]
+rustls = { path = "../native-builtins/vendor/rustls-cbc" }
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cratonvm-reader = { path = "../reader" }
+# Bytecode-mutation tier of the semantic differential fuzzer (design §3.1 tier
+# 3 / §4 Step 5). The `difftest_bytecode` target is panic-only over arbitrary
+# bytes; divergent inputs are promoted to the slow `difftest mutate` tier.
+cratonvm-difftest = { path = "../difftest" }
+# `legacy-synthetic-crypto` exposes `native-builtins::tls::tls_impl`, the TLS
+# record-layer parser that `fuzz_tls_record` targets (otherwise its import is
+# unresolved in the default feature set).
+cratonvm-native-builtins = { path = "../native-builtins", features = ["legacy-synthetic-crypto"] }
+cratonvm-classloading = { path = "../classloading" }
+# `fuzz_jfr_chunk` targets the JFR chunk/event wire format
+# (`cratonvm_jfr::dump`): the compressed-int/long varint codec plus the
+# header-offset-driven `read_jfr_header` / `read_events` walk. The crate is a
+# leaf (types + smallvec + parking_lot + tracing), so this costs the fuzz
+# build almost nothing.
+cratonvm-jfr = { path = "../jfr" }
+
+# -----------------------------------------------------------------------
+# Untrusted-byte parsers under fuzz.
+#
+# Each `[[bin]]` block below corresponds to a single libFuzzer target.
+# Run any of them with:
+#
+#     cargo +nightly fuzz run <name>
+#
+# See `README.md` in this directory for triage and OSS-Fuzz onboarding.
+# -----------------------------------------------------------------------
+
+[[bin]]
+name = "fuzz_classfile"
+path = "fuzz_targets/fuzz_classfile.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_read_class"
+path = "fuzz_targets/read_class.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_jimage"
+path = "fuzz_targets/fuzz_jimage.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_stack_map"
+path = "fuzz_targets/fuzz_stack_map.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_instruction"
+path = "fuzz_targets/fuzz_instruction.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_descriptor"
+path = "fuzz_targets/fuzz_descriptor.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_verifier"
+path = "fuzz_targets/fuzz_verifier.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_asn1"
+path = "fuzz_targets/fuzz_asn1.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_keystore"
+path = "fuzz_targets/fuzz_keystore.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_tls_record"
+path = "fuzz_targets/fuzz_tls_record.rs"
+test = false
+doc = false
+
+# Constant pool in isolation: the harness pins the class-file header and
+# tail so every mutation lands inside the pool. Asserts the u16 count cap,
+# the "no slot is free" byte accounting, and the JVMS 4.4.5 category-2
+# tombstone rule.
+[[bin]]
+name = "fuzz_constant_pool"
+path = "fuzz_targets/fuzz_constant_pool.rs"
+test = false
+doc = false
+
+# Recursive attribute nesting: Code-in-Code, nested annotation
+# element_values, and TypeAnnotation type_paths. Asserts bounded recursion
+# in both directions (a shallow nest must decode; a deep one must not).
+[[bin]]
+name = "fuzz_attribute_nesting"
+path = "fuzz_targets/fuzz_attribute_nesting.rs"
+test = false
+doc = false
+
+# JNI / JVM descriptors and generic signatures with harness-generated
+# adversarial shapes, plus a Display -> parse round-trip oracle.
+[[bin]]
+name = "fuzz_jni_descriptor"
+path = "fuzz_targets/fuzz_jni_descriptor.rs"
+test = false
+doc = false
+
+# JFR chunk / event wire format: varint codec round trips plus the
+# offset-driven header and record walk.
+[[bin]]
+name = "fuzz_jfr_chunk"
+path = "fuzz_targets/fuzz_jfr_chunk.rs"
+test = false
+doc = false
+
+# JAR/ZIP ingestion: central directory parsing, entry-name traversal
+# filters, and the decompression-bomb clamp.
+[[bin]]
+name = "fuzz_zip_entry"
+path = "fuzz_targets/fuzz_zip_entry.rs"
+test = false
+doc = false
+
+# Signed-JAR trust chain: PKCS#7 signer block, `.SF` binding, per-entry
+# manifest digests. Asserts explicit failure, never a success-shaped
+# default.
+[[bin]]
+name = "fuzz_signed_jar"
+path = "fuzz_targets/fuzz_signed_jar.rs"
+test = false
+doc = false
+
+# Semantic differential fuzzer — bytecode-mutation tier (panic-only; the
+# differential oracle runs out-of-process via `difftest mutate`).
+[[bin]]
+name = "difftest_bytecode"
+path = "fuzz_targets/difftest_bytecode.rs"
+test = false
+doc = false

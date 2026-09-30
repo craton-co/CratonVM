@@ -1,0 +1,157 @@
+# Strict-safety diagnostic lint profile.
+#
+# WHAT THIS IS, AND WHAT IT IS NOT
+# --------------------------------
+# ci.yml's Clippy step runs `cargo clippy --workspace --all-targets -- -D
+# warnings` against the repository's CONFIGURED lint policy. That policy, in the
+# root Cargo.toml's `[workspace.lints.clippy]` table, sets ~120 lints to
+# "allow" -- including `unwrap_used`, `expect_used`, `mut_from_ref` and
+# `not_unsafe_ptr_arg_deref`. Those four are not style lints: in a JVM
+# implementation with raw object pointers, a JIT that hands out `&mut` derived
+# from `&`, and native entry points that dereference caller-supplied pointers,
+# each one names a real class of unsoundness.
+#
+# The blanket allow is a defensible position for a large existing codebase --
+# turning them on repo-wide would produce thousands of findings and gate every
+# merge on unrelated work. What is NOT defensible is having no measurement at
+# all. This workflow is the measurement.
+#
+# NON-BLOCKING (`continue-on-error: true`) BY DESIGN, AND ADDITIVE:
+#   * it does not change ci.yml's Clippy step,
+#   * it does not add `-D` flags to any existing job,
+#   * it does not modify the root Cargo.toml lint tables.
+# It runs the strict set as a diagnostic and uploads the findings, so the debt
+# has a number attached to it and a trend over time.
+#
+# SCOPE: the five crates where these lints have the most safety weight.
+#   cratonvm-reader   class-file parsing of untrusted bytes
+#   cratonvm-types    object header, Value cell layout, slot arithmetic
+#   cratonvm-jit-api  the JIT <-> runtime boundary (raw code/frame pointers)
+#   cratonvm-jit      x86-64 code emission and patching
+#   cratonvm-gc       heap walking, forwarding pointers, root scanning
+# (Package names verified against the workspace members in the root Cargo.toml.)
+#
+# WHY THE COMMAND-LINE `-D` WINS OVER THE MANIFEST'S `allow`
+# ----------------------------------------------------------
+# Cargo materialises `[workspace.lints]` as `--allow`/`--warn` flags it passes
+# to rustc; flags after `--` on the clippy command line are appended, and rustc
+# applies the LAST matching flag. So `-D clippy::unwrap_used` here overrides
+# `unwrap_used = "allow"` there. This is worth stating explicitly because the
+# failure mode is silent: if the ordering ever changed, this job would report
+# ZERO findings, and zero findings here must NOT be read as "the strict set is
+# clean" without checking the log for the lint names actually being evaluated.
+# The summary step below prints the per-lint counts for exactly that reason.
+#
+# TO PROMOTE ANY OF THIS: drive one lint to zero in one crate, then move that
+# lint out of the workspace `allow` table and into that crate's own
+# `[lints.clippy]` with `= "deny"`. Per lint, per crate. Do not delete this
+# workflow to make the number go away.
+
+name: Strict lints
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: strict-lints-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  strict-safety:
+    name: strict-safety (diagnostic, non-blocking)
+    runs-on: ubuntu-latest
+    # DIAGNOSTIC PROFILE. This job reports debt; it does not gate merges.
+    # See the header for how to promote individual lints.
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # `--all-targets` pulls in test and bench targets, where `unwrap`/`expect`
+      # are conventional and expected to dominate the count. That is intentional
+      # rather than noise: the point is a full inventory, and the summary step
+      # splits the totals per lint so production findings can be read separately.
+      #
+      # `set -o pipefail` is deliberately NOT set: this step must always reach
+      # the artifact upload, and the job's exit status is carried by the
+      # explicitly recorded `clippy exit status` line instead.
+      - name: cargo clippy (strict-safety set)
+        shell: bash
+        run: |
+          set +e
+          mkdir -p target/strict-lints
+          cargo clippy \
+            -p cratonvm-reader \
+            -p cratonvm-types \
+            -p cratonvm-jit-api \
+            -p cratonvm-jit \
+            -p cratonvm-gc \
+            --all-targets \
+            -- \
+            -D warnings \
+            -D clippy::not_unsafe_ptr_arg_deref \
+            -D clippy::mut_from_ref \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used \
+            2>&1 | tee target/strict-lints/strict-safety.log
+          rc=${PIPESTATUS[0]}
+          echo "clippy exit status: $rc" | tee -a target/strict-lints/strict-safety.log
+          echo "STRICT_RC=$rc" >> "$GITHUB_ENV"
+
+      - name: Summarise findings per lint
+        if: always()
+        shell: bash
+        run: |
+          log=target/strict-lints/strict-safety.log
+          out=target/strict-lints/summary.txt
+          {
+            echo "strict-safety lint summary"
+            echo "commit: ${GITHUB_SHA:-unknown}"
+            echo ""
+            echo "Scope: cratonvm-reader, cratonvm-types, cratonvm-jit-api,"
+            echo "       cratonvm-jit, cratonvm-gc (--all-targets)"
+            echo ""
+            printf '%-40s %s\n' "LINT" "FINDINGS"
+            for lint in clippy::not_unsafe_ptr_arg_deref clippy::mut_from_ref \
+                        clippy::unwrap_used clippy::expect_used; do
+              n=$(grep -c -- "$lint" "$log" 2>/dev/null || echo 0)
+              printf '%-40s %s\n' "$lint" "$n"
+            done
+            echo ""
+            echo "total error lines: $(grep -c -E '^error' "$log" 2>/dev/null || echo 0)"
+            echo "total warn lines:  $(grep -c -E '^warning' "$log" 2>/dev/null || echo 0)"
+            echo ""
+            echo "A count of 0 for EVERY lint means either the code is clean or"
+            echo "the -D flags were not applied at all (see the workflow header)."
+            echo "Confirm by finding at least one of the lint names in the log."
+          } | tee "$out"
+
+      - name: Upload strict-lint diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strict-lints-diagnostics
+          path: |
+            target/strict-lints/strict-safety.log
+            target/strict-lints/summary.txt
+          if-no-files-found: warn

@@ -1,0 +1,34 @@
+kfusion.model.initialpositions.enable = false
+
+kfusion.tornado.platform=0
+kfusion.tornado.device=0
+
+kfusion.model.integrationrate = 2
+kfusion.model.renderingrate = 4
+
+kfusion.model.volumedims.x = 4.8
+kfusion.model.volumedims.y = 4.8
+kfusion.model.volumedims.z = 4.8
+
+kfusion.model.offset.x = 0.34
+kfusion.model.offset.y = 0.5
+kfusion.model.offset.z = 0.24
+
+kfusion.reduce.simple=True
+
+### ###############################
+### Custom reductions
+### ###############################
+#kfusion.reduce.custom=False
+#kfusion.reduce.model=1024
+#kfusion.reduce.fraction=2
+#
+#tornado.opencl.schedule=False
+#tornado.opencl.gpu.block.x=128
+#tornado.opencl.gpu.block2d.x=16
+#tornado.opencl.gpu.block2d.y=4
+## ################################
+
+kfusion.raw.enable = true
+kfusion.raw.file = C:/craton/CratonVM1/apps/kfusion-tornadovm/datasets/living_room_1f.raw
+

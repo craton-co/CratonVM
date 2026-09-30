@@ -1,0 +1,87 @@
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * SpliceCastProbe -- the callee shape the optimizing tier refused as
+ * `checkcast/instanceof`.
+ *
+ * `asBox` is the accessor every generic container read goes through once the
+ * container is untyped: take an Object, check it, return it typed. javac emits
+ * `checkcast` for the cast and the JIT's own survey counted 306 events on this
+ * pair -- the largest single whole-method refusal it found, more than every
+ * opcode gap combined. `kindOf` is the `instanceof` half.
+ *
+ * Both were refused for splicing, so a hot method reading a container paid a
+ * real call per element for a body that is one type check and a return.
+ *
+ * The list is built once and read in the timed loop, so the measurement is the
+ * read path and not allocation. Deterministic and checksummed, like every other
+ * harness here: a fast wrong answer is a bug, not a result.
+ *
+ * MEASURED 2026-09-09. The gate does what it says -- spliced bodies 2 -> 6 --
+ * and the throughput here is dominated by something else: the optimizing body
+ * is ~3x slower than the single-pass one in BOTH arms (931-1065 ms against
+ * 306-443 ms). `ir blind dispatches: own_code=0 in_splice=1` names the suspect.
+ * SpliceCastArrayProbe is the attribution: same accessors, no container, and
+ * there the optimizing body is the faster one.
+ *
+ * UPDATED 2026-09-10. That suspect was misidentified here as a virtual
+ * `ArrayList.elementData` missing its MIC/PIC. It is
+ * `jdk/internal/util/Preconditions.checkIndex`, `invokestatic` -- so not
+ * entitled to a MIC/PIC -- reached because `Objects.checkIndex`, which IS
+ * direct-bound, gets spliced into `ArrayList.get` and the call its body leaves
+ * behind is native-shadowed, which the direct-bind path declines. The splice
+ * traded a bound CALL for a name resolution. Refusing that trade
+ * (`CRATONVM_JIT_IR_SPLICE_REFUSE_UNBINDABLE`, default on) takes this probe's
+ * optimizing body from 1112 ms to 493 ms against a single-pass 338 ms.
+ *
+ * The residual 1.46x there is the HARNESS, not the tier: `C2_ACCEPT=always`
+ * also forces optimizing bodies onto `ArrayList.get` and the one-line
+ * `Objects.checkIndex` (694 bytes optimizing against 277 single-pass), which
+ * the default `evidence` policy refuses. Measured on the DEFAULT policy the
+ * refusal is worth 897 ms -> 316 ms, i.e. below the single-pass 338 ms,
+ * because the splice it removes was also the only "evidence" that got the
+ * slower body published.
+ *
+ * Usage: SpliceCastProbe [reps]     default 4,000,000
+ */
+public class SpliceCastProbe {
+    static final class Box {
+        final int v;
+        Box(int v) { this.v = v; }
+        int value() { return v; }
+    }
+
+    // `checkcast` behind an accessor -- the shape under test.
+    static Box asBox(Object o) {
+        return (Box) o;
+    }
+
+    // `instanceof` behind an accessor.
+    static int kindOf(Object o) {
+        return o instanceof Box ? 1 : 0;
+    }
+
+    static int step(List<Object> xs, int acc, int i) {
+        Object o = xs.get(i & 15);
+        return acc * 31 + asBox(o).value() + kindOf(o);
+    }
+
+    public static void main(String[] args) {
+        int reps = args.length > 0 ? Integer.parseInt(args[0]) : 4_000_000;
+        List<Object> xs = new ArrayList<>();
+        for (int i = 0; i < 16; i++) xs.add(new Box(i * 7 + 1));
+        // Warm past the tier manager's threshold AND far enough for the
+        // background compiler to publish before the timed loop starts; see
+        // SpliceStaticProbe's header on why the shorter warm-up mixes two
+        // bodies into one median.
+        int warm = 0;
+        for (int i = 0; i < 3_000_000; i++) warm = step(xs, warm, i);
+        long t0 = System.nanoTime();
+        int acc = 0;
+        for (int i = 0; i < reps; i++) acc = step(xs, acc, i);
+        long ms = (System.nanoTime() - t0) / 1_000_000L;
+        System.out.println("1. splicecast (" + reps + ") : " + ms + " ms  [" + acc + "]");
+        if (warm == 0x7FFFFFFF) System.out.println(warm);
+    }
+}

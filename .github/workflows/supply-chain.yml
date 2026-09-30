@@ -1,0 +1,302 @@
+# Dependency, licence and supply-chain audit.
+#
+# WHY THIS EXISTS
+# ---------------
+# Nothing in this repository currently answers any of these questions:
+#   * does any dependency have a published RUSTSEC advisory?
+#   * is every transitive licence compatible with redistributing an Apache-2.0
+#     binary that statically links them?
+#   * has a git or alternate-registry dependency been introduced?
+#   * what, exactly, ships inside a release artifact?
+#
+# The root Cargo.toml already contains a careful hand-written analysis of three
+# duplicate dependency families -- written by a human, at a point in time, with
+# no mechanism to notice a fourth. That analysis ends with "re-evaluate next
+# round", and this workflow is what makes the re-evaluation actually happen.
+#
+# NON-BLOCKING ON DAY ONE (`continue-on-error: true` on every job)
+# ---------------------------------------------------------------
+# deny.toml has never been run against this graph, and `cargo audit` goes red
+# whenever RUSTSEC publishes an advisory -- an event with no relationship to the
+# pull request that happens to be open at the time. Landing this as a gate would
+# block unrelated merges on day one and get it disabled within a week.
+#
+# PROMOTION CHECKLIST (per job, in this order -- each is a small separate PR):
+#   1. `deny (sources)`   -- promote FIRST. The expected result is "crates.io
+#      and nothing else"; it should be green on the first run, and it is the
+#      check that catches an unreviewed git dependency.
+#   2. `deny (licenses)`  -- promote once the first run has been used to shrink
+#      deny.toml's allow-list to the licences the graph actually contains.
+#   3. `cargo audit`      -- promote with `--deny warnings` only once the
+#      workflow also runs on a schedule (it does, below), so a newly published
+#      advisory surfaces on the nightly run rather than ambushing a PR.
+#   4. `deny (bans)`      -- promote LAST, after `multiple-versions` is flipped
+#      to "deny" with skip entries for the three documented families.
+# The SBOM job is a producer, not a gate; it stays advisory permanently.
+#
+# ---------------------------------------------------------------------------
+# ON PINNING ACTIONS BY COMMIT DIGEST
+# ---------------------------------------------------------------------------
+# A tag like `@v4` is a moving reference: whoever controls the repository can
+# repoint it, and a compromised action runs with this workflow's token. Digest
+# pinning (`uses: owner/repo@<40-hex-sha>`) removes that.
+#
+# This file does NOT pin, deliberately and consistently with the rest of
+# .github/workflows -- ci.yml, coverage.yml, release.yml and the others all use
+# tags, and pinning one file creates a false impression that the repository is
+# digest-pinned when the blocking workflows are not. Pinning is worth doing, but
+# as ONE change across every workflow, with the digests resolved and recorded.
+#
+# TODO(security): resolve and pin every action in .github/workflows/ at once:
+#     gh api repos/actions/checkout/git/ref/tags/v4      --jq .object.sha
+#     gh api repos/actions/setup-java/git/ref/tags/v4    --jq .object.sha
+#     gh api repos/actions/upload-artifact/git/ref/tags/v4 --jq .object.sha
+#     gh api repos/Swatinem/rust-cache/git/ref/tags/v2   --jq .object.sha
+#     gh api repos/dtolnay/rust-toolchain/git/ref/heads/master --jq .object.sha
+#     gh api repos/taiki-e/install-action/git/ref/tags/v2 --jq .object.sha
+# then rewrite each `uses:` as `owner/repo@<sha> # v4` and add a Dependabot
+# entry for `github-actions` so the pins are maintained rather than frozen.
+# Note the digests must be resolved at pin time -- a digest written from memory
+# is worse than a tag.
+#
+# The tool installs below already avoid one class of this risk: they go through
+# `taiki-e/install-action`, the same action ci.yml and coverage.yml already
+# trust for cargo-fuzz and cargo-llvm-cov, rather than adding new third-party
+# actions to the repository's trust set.
+
+name: Supply chain
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  schedule:
+    # 05:41 UTC daily -- advisories are published continuously, so the useful
+    # signal is a daily re-check of an unchanged tree, not a per-PR check.
+    # Offset from sanitizers.yml (03:23) and performance.yml (04:17).
+    - cron: '41 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------
+  # RUSTSEC advisories.
+  # ---------------------------------------------------------------------
+  audit:
+    name: cargo audit (RUSTSEC advisories)
+    runs-on: ubuntu-latest
+    # Advisory until promoted -- see the checklist in the header.
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      # Two outputs from one database fetch: a human-readable log and a JSON
+      # document that a future ratchet can diff against a committed baseline.
+      - name: cargo audit
+        shell: bash
+        run: |
+          set +e
+          mkdir -p target/supply-chain
+          cargo audit 2>&1 | tee target/supply-chain/cargo-audit.txt
+          echo "cargo audit exit status: ${PIPESTATUS[0]}" \
+            | tee -a target/supply-chain/cargo-audit.txt
+          cargo audit --json > target/supply-chain/cargo-audit.json 2>/dev/null
+          echo "--- advisory count ---"
+          grep -c 'RUSTSEC-' target/supply-chain/cargo-audit.txt || echo 0
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-audit
+          path: target/supply-chain/cargo-audit.*
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------
+  # cargo-deny: advisories, licences, bans and sources, per deny.toml.
+  # Each check is its own step so the four verdicts are separable -- the
+  # promotion checklist in the header promotes them one at a time, and that
+  # is only possible if their results are not collapsed into one exit code.
+  # ---------------------------------------------------------------------
+  deny:
+    name: cargo deny (${{ matrix.check }})
+    runs-on: ubuntu-latest
+    # Advisory until promoted -- see the checklist in the header.
+    continue-on-error: true
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [advisories, licenses, bans, sources]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Record the cargo-deny version
+        run: cargo deny --version
+
+      - name: cargo deny check ${{ matrix.check }}
+        shell: bash
+        run: |
+          set +e
+          mkdir -p target/supply-chain
+          cargo deny check ${{ matrix.check }} \
+            2>&1 | tee "target/supply-chain/cargo-deny-${{ matrix.check }}.txt"
+          echo "cargo deny check ${{ matrix.check }} exit status: ${PIPESTATUS[0]}" \
+            | tee -a "target/supply-chain/cargo-deny-${{ matrix.check }}.txt"
+
+      - name: Upload cargo-deny report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-deny-${{ matrix.check }}
+          path: target/supply-chain/cargo-deny-${{ matrix.check }}.txt
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------
+  # Duplicate-dependency report.
+  #
+  # Separate from `deny (bans)` on purpose: bans is a PASS/FAIL verdict that
+  # is currently configured to allow duplicates, whereas this produces the
+  # actual list. The root Cargo.toml names three accepted families; this is
+  # how a fourth becomes visible before it is load-bearing.
+  # ---------------------------------------------------------------------
+  duplicates:
+    name: Duplicate dependency report
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo tree --duplicates
+        shell: bash
+        run: |
+          set +e
+          mkdir -p target/supply-chain
+          {
+            echo "Duplicate dependency resolutions"
+            echo "commit: ${GITHUB_SHA:-unknown}"
+            echo ""
+            echo "ACCEPTED families (root Cargo.toml documents why each pair is a"
+            echo "hard API break that cannot be unified with a [patch]):"
+            echo "  hashbrown    0.14 / 0.15 / 0.16"
+            echo "  getrandom    0.2  / 0.3  / 0.4"
+            echo "  windows-sys  0.48 / 0.52 / 0.61"
+            echo ""
+            echo "Anything else below is NEW and should be triaged."
+            echo ""
+            cargo tree --duplicates --workspace 2>&1
+          } | tee target/supply-chain/cargo-duplicates.txt
+
+          echo ""
+          echo "--- families outside the documented three ---"
+          grep -E '^[a-zA-Z0-9_-]+ v' target/supply-chain/cargo-duplicates.txt \
+            | awk '{print $1}' | sort -u \
+            | grep -Ev '^(hashbrown|getrandom|windows-sys)$' \
+            | tee target/supply-chain/cargo-duplicates-new.txt
+
+      - name: Upload duplicate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-duplicates
+          path: |
+            target/supply-chain/cargo-duplicates.txt
+            target/supply-chain/cargo-duplicates-new.txt
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------
+  # SBOM (CycloneDX).
+  #
+  # Permanently advisory: this job PRODUCES evidence, it does not judge it.
+  # An SBOM is what makes a future "is CVE-XXXX in the binary we shipped in
+  # March?" answerable at all, which is not a question `cargo audit` against
+  # today's tree can answer.
+  #
+  # Emitted alongside the reproducibility manifest from
+  # scripts/evidence/collect.sh so a release artifact carries one bundle:
+  # what tree, what toolchain, what dependencies.
+  # ---------------------------------------------------------------------
+  sbom:
+    name: SBOM (CycloneDX) + evidence manifest
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The evidence manifest records the last 30 commits and per-subsystem
+          # history; the default shallow clone would make both empty.
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # Not available through taiki-e/install-action at time of writing, so it
+      # is built from source. That is slow but happens on a non-blocking job,
+      # and `--locked` keeps the tool's own dependency resolution reproducible.
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+
+      - name: Generate the SBOM
+        shell: bash
+        run: |
+          set +e
+          mkdir -p target/supply-chain
+          cargo cyclonedx --format json --all 2>&1 \
+            | tee target/supply-chain/cyclonedx.log
+          # cargo-cyclonedx writes <crate>.cdx.json next to each manifest;
+          # gather them so the artifact is one directory.
+          find . -name '*.cdx.json' -not -path './target/*' -print -exec \
+            cp {} target/supply-chain/ \;
+          ls -l target/supply-chain
+
+      # The reproducibility manifest: the same script a developer runs locally,
+      # so a CI bundle and a local bundle have identical shape and can be
+      # diffed against each other.
+      - name: Collect the evidence manifest
+        shell: bash
+        run: bash scripts/evidence/collect.sh
+
+      - name: Upload SBOM + evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-sbom-and-evidence
+          path: |
+            target/supply-chain/
+            evidence/
+          if-no-files-found: warn

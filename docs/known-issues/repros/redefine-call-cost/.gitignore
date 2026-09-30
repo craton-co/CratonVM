@@ -1,0 +1,3 @@
+# Build output. Recompile with the commands in README.md — committing the
+# .class files would make the probe depend on whichever javac produced them.
+*.class
