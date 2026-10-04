@@ -169,7 +169,7 @@ bitfield-struct = "0.9"
 zip.workspace = true
 parking_lot.workspace = true
 regex = "1"
-libloading = "0.8"
+libloading = "0.9"
 rustc-hash.workspace = true
 smallvec.workspace = true
 # NEW-20: bench-gate binary uses serde to read criterion estimates.json
