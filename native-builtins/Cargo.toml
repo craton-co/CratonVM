@@ -194,7 +194,7 @@ yasna = "0.5"
 # `SHA1(password_utf16be || "Mighty Aphrodite" || body)` construction — not a
 # real HMAC). Pulled transitively by `p12` already, declared here so direct use
 # is explicit. The `compress` feature of zip uses sha1 too.
-sha1 = "0.10"
+sha1 = "0.11"
 # WP5.5 / WP5.6: HTTP/1.1 status-line + header parser. Pure-Rust, no_std-friendly,
 # zero-allocation parser. Used by `http_client.rs` and `http_url_connection.rs`
 # to drive the response head in JDK 11+ `java.net.http.HttpClient` and the

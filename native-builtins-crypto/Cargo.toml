@@ -12,7 +12,7 @@ description = "Separately compiled cryptographic compatibility kernels for Crato
 [dependencies]
 sha3 = "0.10"
 rsa = "0.9"
-sha1 = { version = "0.10", features = ["oid"] }
+sha1 = { version = "0.11", features = ["oid"] }
 sha2 = { version = "0.10", features = ["oid"] }
 
 [dev-dependencies]
