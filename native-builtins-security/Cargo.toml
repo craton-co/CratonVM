@@ -15,7 +15,7 @@ cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
 num-bigint = "0.4"
 num-traits = "0.2"
 p256 = "0.13"
-p384 = "0.13"
+p384 = "0.14"
 p521 = "0.13"
 
 [lints]
