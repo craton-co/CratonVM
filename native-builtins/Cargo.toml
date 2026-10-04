@@ -96,7 +96,7 @@ rustls-native-certs = "0.8"
 # and report a hardcoded VARCHAR/TEXT for every column of every result set.
 # The feature is a pure cfg flag in rusqlite (`column_decltype = []`) — it adds
 # no transitive dependency and no C code.
-rusqlite = { version = "0.31", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
 # Zipkin verifies the exact bytes from the JDK's GZIPOutputStream, so its
 # Deflater path needs stock zlib rather than merely standards-compliant DEFLATE.
 # `zlib-rs` differs for the large JSON payload; the `zlib` feature below unifies
