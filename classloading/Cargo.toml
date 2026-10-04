@@ -84,7 +84,7 @@ p12 = "0.6"
 # * `const-oid` — typed OID constants shared with `x509-cert`.
 # * `der` — DER decoding of ECDSA `SEQUENCE { r, s }` signatures and of
 #   the EC / DSA AlgorithmIdentifier parameters in the SPKI.
-x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+x509-cert = { version = "0.3", default-features = false, features = ["std"] }
 # `pkcs8` feature gives `VerifyingKey::from_public_key_der` (SPKI decoding);
 # `ecdsa` feature pulls `ecdsa-core` with `der` (DER `r,s` signatures) +
 # the verifying path.
