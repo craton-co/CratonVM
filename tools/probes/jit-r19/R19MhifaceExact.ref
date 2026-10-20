@@ -1,0 +1,12 @@
+mono 506500
+bi 1003000
+default 2006500
+invoke 506500
+secret 1506500
+null throws=500 sum=1509000 first=java.lang.NullPointerException: Cannot invoke R19MhifaceExact$Fn.apply(int)int/invokeInterface with null receiver
+wrong throws=1000 sum=1006000 first=java.lang.IncompatibleClassChangeError: Receiver class R19MhifaceExact$Impostor does not implement the requested interface R19MhifaceExact$Fn
+after 506500
+time mono 0.3 ns/op
+time bi 187.6 ns/op
+time default 175.7 ns/op
+time invoke 95.8 ns/op

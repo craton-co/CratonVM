@@ -1,0 +1,105 @@
+# jdk-baseline	2
+# kind	class
+# name	java.lang.Module
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/lang/Module.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	22
+# protected-methods	0
+# declared-methods	69
+# declared-fields	14
+# rows	89
+# columns	kind	name	descriptor	flags
+CLASS	java.lang.Module		public,final
+EXTENDS	java.lang.Object		
+IMPLEMENTS	java.lang.reflect.AnnotatedElement		
+SUPERTYPE	java.lang.Object		
+SUPERTYPE	java.lang.reflect.AnnotatedElement		
+METHOD	<clinit>	()V	static
+METHOD	<init>	(Ljava/lang/ClassLoader;)V	
+METHOD	<init>	(Ljava/lang/ClassLoader;Ljava/lang/module/ModuleDescriptor;)V	
+METHOD	<init>	(Ljava/lang/ModuleLayer;Ljava/lang/ClassLoader;Ljava/lang/module/ModuleDescriptor;Ljava/net/URI;)V	
+METHOD	addExports	(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;	public
+METHOD	addExports0	(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V	private,static,native
+METHOD	addExportsToAll0	(Ljava/lang/Module;Ljava/lang/String;)V	private,static,native
+METHOD	addExportsToAllUnnamed0	(Ljava/lang/Module;Ljava/lang/String;)V	private,static,native
+METHOD	addOpens	(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;	public
+METHOD	addReads	(Ljava/lang/Module;)Ljava/lang/Module;	public
+METHOD	addReads0	(Ljava/lang/Module;Ljava/lang/Module;)V	private,static,native
+METHOD	addUses	(Ljava/lang/Class;)Ljava/lang/Module;	public
+METHOD	allows	(Ljava/util/Set;Ljava/lang/Module;)Z	private
+METHOD	canRead	(Ljava/lang/Module;)Z	public
+METHOD	canUse	(Ljava/lang/Class;)Z	public
+METHOD	defineModule0	(Ljava/lang/Module;ZLjava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)V	private,static,native
+METHOD	defineModules	(Ljava/lang/module/Configuration;Ljava/util/function/Function;Ljava/lang/ModuleLayer;)Ljava/util/Map;	static
+METHOD	ensureNativeAccess	(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;Z)V	
+METHOD	findModule	(Ljava/lang/ModuleLayer;Ljava/lang/module/ResolvedModule;)Ljava/lang/Module;	private,static
+METHOD	findModule	(Ljava/lang/String;Ljava/util/Map;Ljava/util/Map;Ljava/util/List;)Ljava/lang/Module;	private,static
+METHOD	getAnnotation	(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;	public
+METHOD	getAnnotations	()[Ljava/lang/annotation/Annotation;	public
+METHOD	getCallerModule	(Ljava/lang/Class;)Ljava/lang/Module;	private
+METHOD	getClassLoader	()Ljava/lang/ClassLoader;	public
+METHOD	getDeclaredAnnotations	()[Ljava/lang/annotation/Annotation;	public
+METHOD	getDescriptor	()Ljava/lang/module/ModuleDescriptor;	public
+METHOD	getLayer	()Ljava/lang/ModuleLayer;	public
+METHOD	getName	()Ljava/lang/String;	public
+METHOD	getPackages	()Ljava/util/Set;	public
+METHOD	getResourceAsStream	(Ljava/lang/String;)Ljava/io/InputStream;	public
+METHOD	implAddEnableNativeAccess	()Ljava/lang/Module;	
+METHOD	implAddEnableNativeAccessToAllUnnamed	()V	static
+METHOD	implAddExports	(Ljava/lang/String;)V	
+METHOD	implAddExports	(Ljava/lang/String;Ljava/lang/Module;)V	
+METHOD	implAddExportsNoSync	(Ljava/lang/String;)V	
+METHOD	implAddExportsNoSync	(Ljava/lang/String;Ljava/lang/Module;)V	
+METHOD	implAddExportsOrOpens	(Ljava/lang/String;Ljava/lang/Module;ZZ)V	private
+METHOD	implAddExportsToAllUnnamed	(Ljava/lang/String;)V	
+METHOD	implAddOpens	(Ljava/lang/String;)V	
+METHOD	implAddOpens	(Ljava/lang/String;Ljava/lang/Module;)V	
+METHOD	implAddOpensToAllUnnamed	(Ljava/lang/String;)V	
+METHOD	implAddReads	(Ljava/lang/Module;)V	
+METHOD	implAddReads	(Ljava/lang/Module;Z)V	private
+METHOD	implAddReadsAllUnnamed	()V	
+METHOD	implAddReadsNoSync	(Ljava/lang/Module;)V	
+METHOD	implAddUses	(Ljava/lang/Class;)V	
+METHOD	implIsExportedOrOpen	(Ljava/lang/String;Ljava/lang/Module;Z)Z	private
+METHOD	initExports	(Ljava/lang/Module;Ljava/util/Map;)V	private,static
+METHOD	initExportsAndOpens	(Ljava/lang/Module;Ljava/util/Map;Ljava/util/Map;Ljava/util/List;)V	private,static
+METHOD	isExplicitlyExportedOrOpened	(Ljava/lang/String;Ljava/lang/Module;Z)Z	private
+METHOD	isExported	(Ljava/lang/String;)Z	public
+METHOD	isExported	(Ljava/lang/String;Ljava/lang/Module;)Z	public
+METHOD	isNamed	()Z	public
+METHOD	isNativeAccessEnabled	()Z	public
+METHOD	isOpen	(Ljava/lang/String;)Z	public
+METHOD	isOpen	(Ljava/lang/String;Ljava/lang/Module;)Z	public
+METHOD	isReflectivelyExported	(Ljava/lang/String;Ljava/lang/Module;)Z	
+METHOD	isReflectivelyExportedOrOpened	(Ljava/lang/String;Ljava/lang/Module;Z)Z	private
+METHOD	isReflectivelyOpened	(Ljava/lang/String;Ljava/lang/Module;)Z	
+METHOD	lambda$findModule$0	(Ljava/lang/module/Configuration;Ljava/lang/ModuleLayer;)Z	private,static,synthetic
+METHOD	lambda$findModule$1	(Ljava/lang/String;Ljava/lang/ModuleLayer;)Ljava/lang/Module;	private,static,synthetic
+METHOD	lambda$getPackages$0	(Ljava/lang/Package;)Z	private,synthetic
+METHOD	lambda$implAddExportsOrOpens$0	(Ljava/lang/Module;Ljava/lang/Module;)Ljava/util/Map;	private,static,synthetic
+METHOD	lambda$implAddExportsOrOpens$1	(Ljava/lang/Module;Ljava/lang/String;Ljava/util/Set;)Ljava/util/Set;	private,static,synthetic
+METHOD	lambda$loadModuleInfoClass$0	(Ljava/lang/classfile/ClassBuilder;Ljava/lang/classfile/ClassElement;)V	private,static,synthetic
+METHOD	loadModuleInfoClass	()Ljava/lang/Class;	private
+METHOD	loadModuleInfoClass	(Ljava/io/InputStream;)Ljava/lang/Class;	private
+METHOD	moduleForNativeAccess	()Ljava/lang/Module;	private
+METHOD	moduleInfoClass	()Ljava/lang/Class;	private
+METHOD	toString	()Ljava/lang/String;	public
+FIELD	$assertionsDisabled	Z	static,final,synthetic
+FIELD	ALL_UNNAMED_MODULE	Ljava/lang/Module;	private,static,final
+FIELD	ALL_UNNAMED_MODULE_SET	Ljava/util/Set;	private,static,final
+FIELD	EVERYONE_MODULE	Ljava/lang/Module;	private,static,final
+FIELD	EVERYONE_SET	Ljava/util/Set;	private,static,final
+FIELD	descriptor	Ljava/lang/module/ModuleDescriptor;	private,final
+FIELD	enableNativeAccess	Z	private
+FIELD	exportedPackages	Ljava/util/Map;	private,volatile
+FIELD	layer	Ljava/lang/ModuleLayer;	private,final
+FIELD	loader	Ljava/lang/ClassLoader;	private,final
+FIELD	moduleInfoClass	Ljava/lang/Class;	private,volatile
+FIELD	name	Ljava/lang/String;	private,final
+FIELD	openPackages	Ljava/util/Map;	private,volatile
+FIELD	reads	Ljava/util/Set;	private,volatile

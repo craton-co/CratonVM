@@ -1,0 +1,229 @@
+# jdk-baseline	2
+# kind	class
+# name	java.math.BigInteger
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/math/BigInteger.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	52
+# protected-methods	0
+# declared-methods	162
+# declared-fields	43
+# rows	213
+# columns	kind	name	descriptor	flags
+CLASS	java.math.BigInteger		public
+EXTENDS	java.lang.Number		
+IMPLEMENTS	java.lang.Comparable		
+SUPERTYPE	java.io.Serializable		
+SUPERTYPE	java.lang.Comparable		
+SUPERTYPE	java.lang.Number		
+SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	(IILjava/util/Random;)V	public
+METHOD	<init>	(ILjava/util/Random;)V	public
+METHOD	<init>	(I[B)V	public
+METHOD	<init>	(I[BII)V	public
+METHOD	<init>	(I[I)V	private
+METHOD	<init>	(J)V	private
+METHOD	<init>	(JI)V	private
+METHOD	<init>	(Ljava/lang/String;)V	public
+METHOD	<init>	(Ljava/lang/String;I)V	public
+METHOD	<init>	([B)V	public
+METHOD	<init>	([BI)V	private
+METHOD	<init>	([BII)V	public
+METHOD	<init>	([CII)V	
+METHOD	<init>	([I)V	private
+METHOD	<init>	([II)V	
+METHOD	abs	()Ljava/math/BigInteger;	public
+METHOD	add	(J)Ljava/math/BigInteger;	
+METHOD	add	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	add	([IJ)[I	private,static
+METHOD	add	([I[I)[I	private,static
+METHOD	addOne	([IIII)I	static
+METHOD	and	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	andNot	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	bitCount	()I	public
+METHOD	bitLength	()I	public
+METHOD	bitLengthForInt	(I)I	static
+METHOD	bitLengthForLong	(J)I	static
+METHOD	byteValueExact	()B	public
+METHOD	checkRange	()V	private
+METHOD	clearBit	(I)Ljava/math/BigInteger;	public
+METHOD	compareMagnitude	(J)I	final
+METHOD	compareMagnitude	(Ljava/math/BigInteger;)I	final
+METHOD	compareTo	(Ljava/lang/Object;)I	public,bridge,synthetic
+METHOD	compareTo	(Ljava/math/BigInteger;)I	public
+METHOD	destructiveMulAdd	([III)V	private,static
+METHOD	divide	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	divideAndRemainder	(Ljava/math/BigInteger;)[Ljava/math/BigInteger;	public
+METHOD	divideAndRemainderBurnikelZiegler	(Ljava/math/BigInteger;)[Ljava/math/BigInteger;	private
+METHOD	divideAndRemainderKnuth	(Ljava/math/BigInteger;)[Ljava/math/BigInteger;	private
+METHOD	divideBurnikelZiegler	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	private
+METHOD	divideKnuth	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	private
+METHOD	doubleValue	()D	public
+METHOD	equals	(Ljava/lang/Object;)Z	public
+METHOD	exactDivideBy3	()Ljava/math/BigInteger;	private
+METHOD	flipBit	(I)Ljava/math/BigInteger;	public
+METHOD	floatValue	()F	public
+METHOD	gcd	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	getInt	(I)I	private
+METHOD	getLower	(I)Ljava/math/BigInteger;	private
+METHOD	getLowestSetBit	()I	public
+METHOD	getPrimeSearchLen	(I)I	private,static
+METHOD	getRadixConversionCache	(II)Ljava/math/BigInteger;	private,static
+METHOD	getToomSlice	(IIII)Ljava/math/BigInteger;	private
+METHOD	getUpper	(I)Ljava/math/BigInteger;	private
+METHOD	hashCode	()I	public
+METHOD	implMontgomeryMultiply	([I[I[IIJ[I)[I	private,static
+METHOD	implMontgomeryMultiplyChecks	([I[I[II[I)V	private,static
+METHOD	implMontgomerySquare	([I[IIJ[I)[I	private,static
+METHOD	implMulAdd	([I[IIII)I	private,static
+METHOD	implMulAddCheck	([I[IIII)V	private,static
+METHOD	implMultiplyToLen	([II[II[I)[I	private,static
+METHOD	implSquareToLen	([II[II)[I	private,static,final
+METHOD	implSquareToLenChecks	([II[II)V	private,static
+METHOD	intArrayCmpToLen	([I[II)I	private,static
+METHOD	intLength	()I	private
+METHOD	intValue	()I	public
+METHOD	intValueExact	()I	public
+METHOD	isProbablePrime	(I)Z	public
+METHOD	jacobiSymbol	(ILjava/math/BigInteger;)I	private,static
+METHOD	javaIncrement	([I)[I	static
+METHOD	largePrime	(IILjava/util/Random;)Ljava/math/BigInteger;	private,static
+METHOD	leftShift	([III)[I	private,static
+METHOD	longValue	()J	public
+METHOD	longValueExact	()J	public
+METHOD	lucasLehmerSequence	(ILjava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;	private,static
+METHOD	magBitLength	()I	private
+METHOD	magSerializedForm	()[B	private
+METHOD	makePositive	(I[BII)[I	private,static
+METHOD	makePositive	([I)[I	private,static
+METHOD	materialize	([II)[I	private,static
+METHOD	max	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	min	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	mod	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	mod2	(I)Ljava/math/BigInteger;	private
+METHOD	modInverse	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	modPow	(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	modPow2	(Ljava/math/BigInteger;I)Ljava/math/BigInteger;	private
+METHOD	montReduce	([I[III)[I	private,static
+METHOD	montgomeryMultiply	([I[I[IIJ[I)[I	private,static
+METHOD	montgomerySquare	([I[IIJ[I)[I	private,static
+METHOD	mulAdd	([I[IIII)I	static
+METHOD	multiply	(J)Ljava/math/BigInteger;	
+METHOD	multiply	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	multiply	(Ljava/math/BigInteger;ZZI)Ljava/math/BigInteger;	private
+METHOD	multiplyByInt	([III)Ljava/math/BigInteger;	private,static
+METHOD	multiplyKaratsuba	(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;	private,static
+METHOD	multiplyToLen	([II[II[I)[I	private,static
+METHOD	multiplyToLenCheck	([II)V	private,static
+METHOD	multiplyToomCook3	(Ljava/math/BigInteger;Ljava/math/BigInteger;ZI)Ljava/math/BigInteger;	private,static
+METHOD	negate	()Ljava/math/BigInteger;	public
+METHOD	nextProbablePrime	()Ljava/math/BigInteger;	public
+METHOD	not	()Ljava/math/BigInteger;	public
+METHOD	numberOfTrailingZeroInts	()I	private
+METHOD	oddModPow	(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;	private
+METHOD	or	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	padWithZeros	(Ljava/lang/StringBuilder;I)V	private,static
+METHOD	parallelMultiply	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	parseInt	([CII)I	private
+METHOD	passesLucasLehmer	()Z	private
+METHOD	passesMillerRabin	(ILjava/util/Random;)Z	private
+METHOD	pow	(I)Ljava/math/BigInteger;	public
+METHOD	primeToCertainty	(ILjava/util/Random;)Z	
+METHOD	primitiveLeftShift	([III)V	static
+METHOD	primitiveRightShift	([III)V	static
+METHOD	probablePrime	(ILjava/util/Random;)Ljava/math/BigInteger;	public,static
+METHOD	randomBits	(ILjava/util/Random;)[B	private,static
+METHOD	readObject	(Ljava/io/ObjectInputStream;)V	private
+METHOD	readObjectNoData	()V	private
+METHOD	remainder	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	remainderBurnikelZiegler	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	private
+METHOD	remainderKnuth	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	private
+METHOD	reportOverflow	()V	private,static
+METHOD	setBit	(I)Ljava/math/BigInteger;	public
+METHOD	shiftLeft	(I)Ljava/math/BigInteger;	public
+METHOD	shiftLeft	([II)[I	private,static
+METHOD	shiftLeftImplWorker	([I[IIII)V	private,static
+METHOD	shiftRight	(I)Ljava/math/BigInteger;	public
+METHOD	shiftRightImpl	(I)Ljava/math/BigInteger;	private
+METHOD	shiftRightImplWorker	([I[IIII)V	private,static
+METHOD	shortValueExact	()S	public
+METHOD	signBit	()I	private
+METHOD	signInt	()I	private
+METHOD	signum	()I	public
+METHOD	smallPrime	(IILjava/util/Random;)Ljava/math/BigInteger;	private,static
+METHOD	smallToString	(ILjava/lang/StringBuilder;I)V	private
+METHOD	sqrt	()Ljava/math/BigInteger;	public
+METHOD	sqrtAndRemainder	()[Ljava/math/BigInteger;	public
+METHOD	square	()Ljava/math/BigInteger;	private
+METHOD	square	(ZZI)Ljava/math/BigInteger;	private
+METHOD	squareKaratsuba	()Ljava/math/BigInteger;	private
+METHOD	squareToLen	([II[I)[I	private,static,final
+METHOD	squareToomCook3	(ZI)Ljava/math/BigInteger;	private
+METHOD	stripLeadingZeroBytes	(I[BII)[I	private,static
+METHOD	stripLeadingZeroBytes	([BII)[I	private,static
+METHOD	stripLeadingZeroInts	([IZ)[I	private,static
+METHOD	subN	([I[II)I	private,static
+METHOD	subtract	(J[I)[I	private,static
+METHOD	subtract	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	subtract	([IJ)[I	private,static
+METHOD	subtract	([I[I)[I	private,static
+METHOD	testBit	(I)Z	public
+METHOD	toByteArray	()[B	public
+METHOD	toMagArray	(J)[I	private,static
+METHOD	toString	()Ljava/lang/String;	public
+METHOD	toString	(I)Ljava/lang/String;	public
+METHOD	toString	(Ljava/math/BigInteger;Ljava/lang/StringBuilder;II)V	private,static
+METHOD	trustedStripLeadingZeroInts	([I)[I	private,static
+METHOD	unsignedLongPow	(JI)J	static
+METHOD	valueOf	(J)Ljava/math/BigInteger;	public,static
+METHOD	valueOf	([I)Ljava/math/BigInteger;	private,static
+METHOD	writeObject	(Ljava/io/ObjectOutputStream;)V	private
+METHOD	xor	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+FIELD	$assertionsDisabled	Z	static,final,synthetic
+FIELD	BURNIKEL_ZIEGLER_OFFSET	I	static,final
+FIELD	BURNIKEL_ZIEGLER_THRESHOLD	I	static,final
+FIELD	DEFAULT_PRIME_CERTAINTY	I	private,static,final
+FIELD	KARATSUBA_SQUARE_THRESHOLD	I	private,static,final
+FIELD	KARATSUBA_THRESHOLD	I	private,static,final
+FIELD	LOG_TWO	D	private,static,final
+FIELD	LONG_MASK	J	static,final
+FIELD	MAX_CONSTANT	I	private,static,final
+FIELD	MAX_MAG_LENGTH	I	private,static,final
+FIELD	MONTGOMERY_INTRINSIC_THRESHOLD	I	private,static,final
+FIELD	MULTIPLY_SQUARE_THRESHOLD	I	private,static,final
+FIELD	NEGATIVE_ONE	Ljava/math/BigInteger;	private,static,final
+FIELD	NUM_ZEROS	I	private,static
+FIELD	ONE	Ljava/math/BigInteger;	public,static,final
+FIELD	PRIME_SEARCH_BIT_LENGTH_LIMIT	I	private,static,final
+FIELD	SCHOENHAGE_BASE_CONVERSION_THRESHOLD	I	private,static,final
+FIELD	SMALL_PRIME_PRODUCT	Ljava/math/BigInteger;	private,static,final
+FIELD	SMALL_PRIME_THRESHOLD	I	private,static,final
+FIELD	TEN	Ljava/math/BigInteger;	public,static,final
+FIELD	TOOM_COOK_SQUARE_THRESHOLD	I	private,static,final
+FIELD	TOOM_COOK_THRESHOLD	I	private,static,final
+FIELD	TWO	Ljava/math/BigInteger;	public,static,final
+FIELD	ZERO	Ljava/math/BigInteger;	public,static,final
+FIELD	ZEROS	Ljava/lang/String;	private,static,final
+FIELD	bitCountPlusOne	I	private
+FIELD	bitsPerDigit	[J	private,static
+FIELD	bnExpModThreshTable	[I	static
+FIELD	digitsPerInt	[I	private,static
+FIELD	digitsPerLong	[I	private,static
+FIELD	intRadix	[I	private,static
+FIELD	logCache	[D	private,static,final
+FIELD	longRadix	[Ljava/math/BigInteger;	private,static
+FIELD	lowestSetBitPlusTwo	I	private
+FIELD	mag	[I	final
+FIELD	magBitLengthPlusOne	I	private
+FIELD	negConst	[Ljava/math/BigInteger;	private,static,final
+FIELD	numberOfTrailingZeroIntsPlusTwo	I	private
+FIELD	posConst	[Ljava/math/BigInteger;	private,static,final
+FIELD	powerCache	[[Ljava/math/BigInteger;	private,static,volatile
+FIELD	serialPersistentFields	[Ljava/io/ObjectStreamField;	private,static,final
+FIELD	serialVersionUID	J	private,static,final
+FIELD	signum	I	final

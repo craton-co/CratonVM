@@ -1,0 +1,22 @@
+# Known differences between CratonVM's JDI transcripts and HotSpot 25's, read
+# by tools/jdi/run-jdi-conformance.sh (interpreter round i1 wave 24, lane L1).
+#
+# One entry per line, four TAB-separated fields:
+#
+#   <scenario or *>	<mode or *>	<diff line>	<page>
+#
+# <diff line> is a transcript line exactly as the runner prints it: "- " and
+# HotSpot's line, or "+ " and CratonVM's. <page> names the docs/known-issues/
+# page that records the difference; an entry without one is not a known
+# difference, it is a bug nobody has written down. Remove an entry when its
+# page closes: the runner does not fail on an entry that no longer matches,
+# so a stale one hides the next regression on that line.
+#
+# Modes: jdk-only, compatible, jdk-only:nojit, compatible:nojit.
+#
+# Wave 24 landed the runner empty; wave 25 (L1d) added the first entries.
+# Wave 48 (L6) removed them: `--compatible`'s `List.of` is the JDK's class.
+#
+# Wave 103 (interpreter round i5, lane L1) allowed canRedefineClasses=0 for
+# L1W103RawJdwpCapabilities; wave 104 serves VirtualMachine.RedefineClasses
+# and grants the bit, and the two entries are gone.

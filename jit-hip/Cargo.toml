@@ -1,0 +1,39 @@
+[package]
+name = "cratonvm-jit-hip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Kernel-IR to HIP C++ rendering for CratonVM GPU offload"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["hip", "rocm", "gpu", "amd"]
+categories = ["api-bindings"]
+# Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.
+publish = false
+
+[dependencies]
+# For `kir` (the instruction list) and the module/kernel containers the
+# front end produces. A sibling crate rather than a fork of the
+# lowering: there is ONE bytecode front end, and this renders what it
+# already built. The crate is named for CUDA because renaming it would
+# touch every `jit_cuda::` path in `vm` for no functional gain; see its
+# README.
+cratonvm-jit-cuda = { path = "../jit-cuda", version = "0.3.0" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The golden test drives the real front end over the real `.class`
+# fixtures `jit-cuda`'s build script compiles, so it needs the reader
+# to parse them. No synthetic bytecode here either.
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+
+[build-dependencies]
+# Nothing to build; `build.rs` only re-exports the fixture directory
+# `jit-cuda`'s build script produced. See that file.
+
+[lints]
+workspace = true

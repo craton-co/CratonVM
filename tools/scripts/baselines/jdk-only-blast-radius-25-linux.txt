@@ -1,0 +1,21 @@
+# jdk-only blast radius — baseline for key '25-linux'
+#
+# Written by scripts/jdk-only-blast-radius.sh --update-baseline.
+# The SIGNAL is the failing SET per prefix, not the pass count: the count
+# moves whenever the corpus grows. See the script header.
+#
+# Lines: !key !adjudicating !taken !note !corpus, then one row per prefix:
+#   <prefix><TAB><passed><TAB><total><TAB><failing vectors, net of control>
+!key	25-linux
+!adjudicating	yes
+!taken	2026-08-22T15:53:15Z	rev=efdc40d21
+!note	first 25-linux baseline; RTreeRangeGc quarantined (3/12 under --jdk-only, WORKER-1-NOTE-1)
+!control	107	107	
+!corpus	RArrayStoreInterfaces RArrayStoreTiers RArraysMismatch RAtomicArray RBlockingQueue RCanAccessReceiver RCanAccessRules RChaCha20Cipher RChannelInterrupt RChmKeySetView RClassUnloadSweep RClassUnloadSweepGen RCollections RCrypto RDataInputFastPull RDirectBufferElem RExceptions RExecutorShutdown RFieldSiteCache RFileTimes RForNameGcStress RForeignLayoutCollections RForeignLayoutJdkInterfaces RFsSingleton RImmutableFactoryTypes RJdkAqs RJdkAsyncChannel RJdkAwtHeadless RJdkBridge1 RJdkByteOrder RJdkCollections RJdkDefineClass RJdkEnumerations RJdkEnvMap RJdkExecutors RJdkFailure RJdkFieldModule RJdkForeign RJdkForkJoin RJdkFormatLocale RJdkFunctionCombinators RJdkHandles RJdkHello RJdkHidden RJdkIntrinsics RJdkIntrinsics2 RJdkIntrinsics3 RJdkJmx RJdkJni RJdkLambdas RJdkLogging RJdkLookupIn RJdkMapViews RJdkModule RJdkNet RJdkNio RJdkOptionalShape RJdkPhaser RJdkProcess RJdkProxy RJdkProxyIface RJdkRecords RJdkReflBox RJdkReflect RJdkSecurity RJdkServices RJdkSqlPackage RJdkStampedStamps RJdkStrict RJdkStrictMath RJdkStringCodePoints RJdkViews RJdkWatchService RJdkX509Intercept RJitArrayTypecheck RJitArraycopyRefDeopt RJitGc RJitMapTierDiff RJitMultiArrayClass RJitStringLayout RLambdaDefaultOverload RLangPackages RLoaderChurnDefine RLockedIdentityHash RMapGcStress RMapResizeGc RMethodSiteCache RNioNoFollow RNumbers ROptionalClassForName ROverlaySystemGcStress RPriorityQueueGc RPrivateLambdaOwner RReflect RSerial RServiceLoaderDoubleSource RShutdownHooks RSimpleDateFormatZone RSimpleTimeZoneRaw RSocketChannelInterrupt RSslLiveSession RSslNullSession RStringBuilderContent RStrings RSyncMethodJit RTreeRangeGc RVarHandleAccess
+!quarantined	RTreeRangeGc
+java/util/HashSet	105	107	RMapGcStress
+java/util/Hashtable	105	107	RJdkBridge1 RJdkEnumerations
+java/util/LinkedHashMap	102	107	RForeignLayoutCollections RJdkServices ROverlaySystemGcStress RServiceLoaderDoubleSource
+java/util/TreeMap	104	107	RJdkCollections RJdkJmx RJdkViews
+java/util/concurrent/ConcurrentHashMap	103	107	RChmKeySetView RMapGcStress RMapResizeGc
+java/util/HashMap	88	107	RBlockingQueue RChannelInterrupt RCollections RExecutorShutdown RJdkBridge1 RJdkEnumerations RJdkExecutors RJdkJmx RJdkLogging RJdkModule RJdkNio RJdkOptionalShape RJdkViews RJitMapTierDiff RMapGcStress RMapResizeGc RNioNoFollow RServiceLoaderDoubleSource

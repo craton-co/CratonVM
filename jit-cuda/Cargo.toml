@@ -1,0 +1,46 @@
+[package]
+name = "cratonvm-jit-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Java bytecode → PTX lowering for CratonVM GPU offload"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.
+publish = false
+
+[dependencies]
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
+# `craton-gpu4j` is pulled in purely so cargo schedules its build script
+# BEFORE ours and exposes the `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_*`
+# env vars (via its `links = "craton-gpu-annotations"` declaration) to
+# our build.rs. The Rust code in this crate does not call into it.
+craton-gpu = { path = "../craton-gpu4j", version = "0.3.0", package = "cratonvm-gpu" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Real .class files are generated from ../test_classes/gpu/*.java by
+# build.rs into OUT_DIR/gpu-fixtures. Tests parse them through
+# cratonvm-reader - no synthetic bytecode arrays.
+
+[features]
+default = []
+# Run CUDA-toolchain integration checks such as the ptxas round trip.
+# This does not add runtime dependencies; the host must provide the
+# external NVIDIA tools.
+gpu-it = []
+
+[lints]
+workspace = true
+
+[build-dependencies]
+# build.rs invokes `javac` directly via std::process::Command;
+# no extra deps needed.

@@ -1,0 +1,73 @@
+name: Untyped-alloc ratchet
+
+# Watches the fabricated-carrier surface: every production site spelling
+# `alloc_object(ClassId::new(0), N)`, the untyped-allocation sentinel the VM
+# replaces with `cratonvm/synthetic/AnonymousObject$N`.
+#
+# WHY IT EXISTS
+# -------------
+# `H0-6` (2026-08-20) measured this surface at 49 sites on 2026-08-12 and 84 on
+# 2026-08-20 — one method, two revisions, **+71% in eight days** — while the
+# plan of record is to migrate exactly these producers to real construction.
+# Nothing was watching, and nothing COULD watch: the existing
+# `native-builtins/tests/stub_ratchet.rs` counts REGISTRATIONS, and a
+# substitution is not a registration. `H0-6` N1 asked for this job.
+#
+# What the surface costs, measured: `AnonymousObject$4` IS the `HashMap.Node`
+# (`{hash,key,value,next}`), and `H0-4` §7 measured that a `HashMap` armed under
+# `CRATONVM_ENFORCE_NATIVE_SHADOW` holds all 3000 entries and answers `size()`
+# and `get()` correctly, while `entrySet()` iteration throws
+# `ClassCastException` and `keySet()` yields 1 of 3000 — because the nodes are
+# the wrong class.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS ONE IS BLOCKING, WHERE THE BLAST-RADIUS JOB NEXT DOOR IS NOT
+# ---------------------------------------------------------------------------
+#
+# `.github/workflows/jdk-only-blast-radius.yml` is deliberately non-blocking
+# because **its cells are expected to be red** until the migration lands, and a
+# gate whose red state is its normal state trains every lane to scroll past it.
+#
+# This gate is the opposite shape: **its green state is the normal one.** It
+# goes red only when the surface actually GROWS or a NEW carrier width appears
+# — i.e. exactly when a human should look. It is a `git grep` and a comparison:
+# no build, no VM, no JDK, seconds to run, and deterministic.
+#
+# Re-baselining is one command and is a normal, expected part of a commit that
+# adds a site on purpose:
+#
+#     scripts/untyped-alloc-ratchet.sh --update
+#
+# The ratchet holds in BOTH directions on purpose — removing sites also asks for
+# a re-baseline, because a ratchet only holds if clearing it is what makes the
+# run green again. That is the rule `G89-1` and `H3-1` were both written about.
+#
+# ---------------------------------------------------------------------------
+# WHAT A GREEN RUN HERE DOES NOT MEAN
+# ---------------------------------------------------------------------------
+#
+# It is a ratchet against DRIFT, not a census of the problem. It greps source
+# text, so a site behind `cfg`, a macro-generated call, or a non-literal width
+# is invisible to it. Do not quote its number as the size of the fabrication
+# problem. The runtime instrument is `CRATONVM_DBG_ANONALLOC=1`, and `H0-6` §8
+# measured that it attributes only **97 of 2204 events (4.4%)** — with `--nojit`
+# giving an identical 97, so the obvious tier-up explanation is disproved and
+# the cause is still unknown. Neither instrument is authoritative alone.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  untyped-alloc-ratchet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `git grep` with pathspecs needs the work tree, and the script reads
+          # only the checked-out revision — no history is required.
+          fetch-depth: 1
+
+      - name: Ratchet the untyped-allocation surface
+        run: bash scripts/untyped-alloc-ratchet.sh

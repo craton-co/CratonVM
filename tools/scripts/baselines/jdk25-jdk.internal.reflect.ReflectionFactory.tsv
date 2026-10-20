@@ -1,0 +1,64 @@
+# jdk-baseline	2
+# kind	class
+# name	jdk.internal.reflect.ReflectionFactory
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/jdk/internal/reflect/ReflectionFactory.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	25
+# protected-methods	0
+# declared-methods	37
+# declared-fields	7
+# rows	48
+# columns	kind	name	descriptor	flags
+CLASS	jdk.internal.reflect.ReflectionFactory		public
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	()V	private
+METHOD	classFileFormatVersion	(Ljava/lang/Class;)Ljava/lang/reflect/ClassFileFormatVersion;	private,final
+METHOD	config	()Ljdk/internal/reflect/ReflectionFactory$Config;	private,static
+METHOD	copyConstructor	(Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;	public
+METHOD	copyField	(Ljava/lang/reflect/Field;)Ljava/lang/reflect/Field;	public
+METHOD	copyMethod	(Ljava/lang/reflect/Method;)Ljava/lang/reflect/Method;	public
+METHOD	defaultReadObjectForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	defaultWriteObjectForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	disableSerialConstructorChecks	()Z	private,static
+METHOD	findReadWriteObjectForSerialization	(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	private,final
+METHOD	generateConstructor	(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;	private,final
+METHOD	getExecutableSharedParameterTypes	(Ljava/lang/reflect/Executable;)[Ljava/lang/Class;	public
+METHOD	getExecutableTypeAnnotationBytes	(Ljava/lang/reflect/Executable;)[B	public
+METHOD	getReflectionFactory	()Ljdk/internal/reflect/ReflectionFactory;	public,static
+METHOD	getReplaceResolveForSerialization	(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/invoke/MethodHandle;	private
+METHOD	hasDefaultOrNoSerialization	(Ljava/lang/Class;)Z	private,static
+METHOD	hasStaticInitializerForSerialization	(Ljava/lang/Class;)Z	public,final
+METHOD	leafCopyMethod	(Ljava/lang/reflect/Method;)Ljava/lang/reflect/Method;	public
+METHOD	loadConfig	()Ljdk/internal/reflect/ReflectionFactory$Config;	private,static
+METHOD	newConstructorAccessor	(Ljava/lang/reflect/Constructor;)Ljdk/internal/reflect/ConstructorAccessor;	public
+METHOD	newConstructorForExternalization	(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;	public,final
+METHOD	newConstructorForSerialization	(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;	public,final
+METHOD	newConstructorForSerialization	(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;	public,final
+METHOD	newFieldAccessor	(Ljava/lang/reflect/Field;Z)Ljdk/internal/reflect/FieldAccessor;	public
+METHOD	newInstance	(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;Ljava/lang/Class;)Ljava/lang/Object;	public
+METHOD	newMethodAccessor	(Ljava/lang/reflect/Method;Z)Ljdk/internal/reflect/MethodAccessor;	public
+METHOD	newOptionalDataExceptionForSerialization	()Ljava/lang/reflect/Constructor;	public,final
+METHOD	packageEquals	(Ljava/lang/Class;Ljava/lang/Class;)Z	private,static
+METHOD	parseAccessFlags	(ILjava/lang/reflect/AccessFlag$Location;Ljava/lang/Class;)Ljava/util/Set;	public,final
+METHOD	readObjectForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	readObjectNoDataForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	readResolveForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	serialPersistentFields	(Ljava/lang/Class;)[Ljava/io/ObjectStreamField;	public,final
+METHOD	superHasAccessibleConstructor	(Ljava/lang/Class;)Z	private
+METHOD	useNativeAccessorOnly	()Z	static
+METHOD	writeObjectForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	writeReplaceForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+FIELD	$assertionsDisabled	Z	static,final,synthetic
+FIELD	DEFAULT_CONFIG	Ljdk/internal/reflect/ReflectionFactory$Config;	private,static,final
+FIELD	config	Ljdk/internal/reflect/ReflectionFactory$Config;	private,static
+FIELD	hasStaticInitializerMethod	Ljava/lang/reflect/Method;	private,static,volatile
+FIELD	langReflectAccess	Ljdk/internal/access/JavaLangReflectAccess;	private,final
+FIELD	nonSerializableLeafClasses	Ljava/util/Set;	private,static,final
+FIELD	soleInstance	Ljdk/internal/reflect/ReflectionFactory;	private,static,final

@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "host": "windows-x86_64",
+  "captured_at": "epoch:1785436557",
+  "jdk": "openjdk version \"25.0.3\" 2026-04-21 LTS",
+  "entries": [
+    {
+      "id": "div-0001",
+      "class": "ExceptionId",
+      "repro_path": "difftest/seeds\\ExceptionId.java",
+      "classification": "universal",
+      "cratonvm": {
+        "stdout": "AE: / by zero\nCCE: java.lang.String cannot be cast to java.lang.Integer\nNPE: Cannot load from int array because \"ExceptionId.arr\" is null\nSIOOBE: null\ndone",
+        "stderr": "\u001b[2m2026-07-30T18:35:56.284528Z\u001b[0m \u001b[33m WARN\u001b[0m \u001b[2mcratonvm_vm::vm::vm_object\u001b[0m\u001b[2m:\u001b[0m [NativeBridge] 1 unregistered native methods:\n\u001b[2m2026-07-30T18:35:56.284603Z\u001b[0m \u001b[33m WARN\u001b[0m \u001b[2mcratonvm_vm::vm::vm_object\u001b[0m\u001b[2m:\u001b[0m   MISSING: jdk/internal/misc/VM.latestUserDefinedLoader0()Ljava/lang/ClassLoader;\n\u001b[2m2026-07-30T18:35:56.284628Z\u001b[0m \u001b[33m WARN\u001b[0m \u001b[2mcratonvm_vm::vm::vm_init\u001b[0m\u001b[2m:\u001b[0m [NativeBridge] 1 ACC_NATIVE methods have no Rust implementation; they will throw UnsatisfiedLinkError if called\n[cratonvm] main-vm run() returned Ok — VM main exiting normally",
+        "exit_code": 0,
+        "exception": null,
+        "timed_out": false,
+        "wall_ms": 0
+      },
+      "hotspot": {
+        "stdout": "AE: / by zero\nCCE: class java.lang.String cannot be cast to class java.lang.Integer (java.lang.String and java.lang.Integer are in module java.base of loader 'bootstrap')\nNPE: Cannot load from int array because \"ExceptionId.arr\" is null\nSIOOBE: Index 9 out of bounds for length 3\ndone",
+        "stderr": "",
+        "exit_code": 0,
+        "exception": null,
+        "timed_out": false,
+        "wall_ms": 0
+      },
+      "status": "known",
+      "first_seen": "2026-06-21",
+      "linked_doc": "ExceptionId residual known divergences after the JEP-358 NPE fix (vm exceptions.rs block-start reconstruction): CCE lacks HotSpot module/loader detail + uses slashed names; charAt SIOOBE has no detail message. NPE now byte-identical.",
+      "jdk_profile": "compatible",
+      "jdk_feature": 25
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry EligibleRowReduction__rowSums____I_I_I_V(
+    .param .u64 p0_ptr,
+    .param .s32 p0_len,
+    .param .u64 p1_ptr,
+    .param .s32 p1_len,
+    .param .u64 p2_ptr,
+    .param .s32 p2_len,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<5>;
+    .reg .u64 %rd<6>;
+    .reg .s32 %r<14>;
+    .reg .pred %p<3>;
+
+    ld.param.u64 %rd0, [p0_ptr];
+    ld.param.s32 %r0, [p0_len];
+    ld.param.u64 %rd1, [p1_ptr];
+    ld.param.s32 %r1, [p1_len];
+    ld.param.u64 %rd2, [p2_ptr];
+    ld.param.s32 %r2, [p2_len];
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r3, %ru3;
+    ld.param.s32 %r4, [tid_base];
+    add.s32 %r5, %r3, %r4;
+    mov.s32 %r6, 0;
+    setp.ge.u32 %p0, %r5, %r1;
+    @%p0 bra L_done;
+    mov.s32 %r7, 0;
+    mov.s32 %r8, 0;
+L_body_23:
+    setp.ge.s32 %p1, %r8, %r2;
+    @%p1 bra L_body_49;
+L_body_29:
+    mul.lo.s32 %r9, %r5, %r2;
+    add.s32 %r10, %r9, %r8;
+    setp.ge.u32 %p2, %r10, %r0;
+    @%p2 bra L_bounds_fail;
+    mad.wide.s32 %rd3, %r10, 4, %rd0;
+    ld.global.s32 %r11, [%rd3];
+    add.s32 %r12, %r7, %r11;
+    add.s32 %r13, %r8, 1;
+    mov.s32 %r7, %r12;
+    mov.s32 %r8, %r13;
+    bra L_body_23;
+L_body_49:
+    mad.wide.s32 %rd4, %r5, 4, %rd1;
+    st.global.s32 [%rd4], %r7;
+    bra L_done;
+L_done:
+    ret;
+L_bounds_fail:
+    ld.param.u64 %rd5, [failure_flag];
+    mov.u32 %ru4, 1;
+    st.global.u32 [%rd5], %ru4;
+    ret;
+}
+

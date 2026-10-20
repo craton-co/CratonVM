@@ -1,0 +1,49 @@
+[package]
+name = "cratonvm-jfr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Java Flight Recorder support for CratonVM"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# JDK-only mode telemetry (`src/jdk_only.rs`, 2026-07-31): `JdkOnlyViolation`
+# is the aggregated input and `flag_groups::jdk_only_flag` is what the opt-in
+# gate is asserted against. `types` is the shared leaf of the layering in
+# `docs/feature-designs/jdk-only-mode.md` §2 — it depends on no workspace crate,
+# so this edge cannot cycle. The two crates that own the *other* JDK-only
+# sources, `native-api` and `classloading`, are deliberately NOT dependencies:
+# they drag in native-tls, socket2, encoding_rs, zip, mmap and an x509 /
+# trust-store parser, none of which belong under a counter. Their censuses
+# reach this crate as plain tags via `jdk_only::NativeCensusSample` and
+# `ClassOriginEntry::origin` strings instead.
+cratonvm-types = { path = "../types", version = "0.3.0" }
+# Round-4 (2026-05-17): re-introduced for the `ThreadRingRegistry::rings`
+# RwLock — the previous std `Mutex` serialized every drain against every
+# register, and the registry-side critical section is read-heavy (one
+# register per thread-lifetime, many drains).
+parking_lot.workspace = true
+rustc-hash.workspace = true
+# J5 (round-2 / round-5 fix 1): SmallVec for inline EventInstance.fields
+# storage. Inline N=8 covers every built-in JFR event (max field count is
+# 5–8 in `jfr/src/builtin.rs`), eliminating the per-event heap allocation
+# on the emit hot path. The `union` feature halves the inline footprint
+# (no length-vs-pointer tag) and is the standard configuration for
+# performance-sensitive use.
+smallvec = { workspace = true, features = ["union"] }
+# Round-9 CRIT-3 (2026-05-24): low-frequency `tracing::debug!` from the
+# filtered-event drain path so operators can diagnose "why aren't my
+# events showing up?" without grepping stats counters. Capped at
+# `release_max_level_info` workspace-wide, so debug emissions vanish in
+# release builds.
+tracing.workspace = true
+
+[lints]
+workspace = true

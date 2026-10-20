@@ -1,0 +1,139 @@
+# untyped-alloc ratchet baseline (v7: production sites + one-level reach)
+# regenerate: scripts/untyped-alloc-ratchet.sh --update
+# see docs/known-issues/jdk-only/H0-6, H23-3 and WORKER-5-3
+# v6 counted 359 sites; 197 of them were inside a #[cfg(test)] mod of a
+# production file. The drop to 158 is a CORRECTION, not a fix.
+#
+# 2026-08-22 re-baseline, 617 -> 618 reach, 29 -> 28 objects. WORKER-5-NOTE-9
+# raised this as a drift alarm and correctly did NOT touch the baseline
+# itself; the gate's author owns that, and the account is:
+#
+#   alloc_ref_array    157 -> 160   +3
+#   alloc_singleton      3 ->   0   -3   (the same three callers, renamed)
+#   chm_init_segments    6 ->   7   +1   <- the only real growth
+#
+# The +1 is 089329af7, WORKER-2's fix for a ConcurrentHashMap with no
+# segments reporting a DROPPED store as a fresh insert; it adds one caller
+# of a helper that already fabricates. The offsetting -3/+3 pair is a
+# rename, not movement, and is exactly the case the reach column exists to
+# make visible: a TOTAL that barely moved hides three callers changing
+# hands. The object column IMPROVED by one in the same window.
+objects=28
+arrays=130
+sites=158
+test_sites=201
+reach=618
+widths=1 2 3 4 5 6 7 8 12
+byfn=alloc_object=227 new_ref_array=148 define_class=6 try_new_ref_array=4 class_is=1 alloc_object_of=1
+reachfn_begin
+al_add=2
+al_init=1
+alloc_array_list_from=4
+alloc_bb_object=3
+alloc_file_lock=3
+alloc_mbean_server_with_domain=9
+alloc_obj=10
+alloc_path=12
+alloc_proxy_list=3
+alloc_ref_array=160
+alloc_ref_array_or_oom=2
+alloc_response=3
+alloc_t16=3
+alloc_time_synthetic=58
+alloc_typed_object=3
+alloc_wrapper=60
+alloc_zip_entry=2
+annotated_type_fill_bookkeeping=2
+build_method_mirror=7
+build_object_stream_class=10
+build_or_get_factory_bean_interface_proxy=1
+build_parameter_array=3
+build_real_hash_set=1
+build_serialized_lambda=1
+build_service_loader=4
+build_set=2
+build_stack_trace_element_array=3
+build_string_array=4
+build_string_keyed_map=6
+build_synthetic_hash_set=2
+chm_init_segments=7
+class_annotations_by_type_impl=2
+create_annotation_proxy_with_type=10
+degrade_bucket_table_to_untyped=1
+env_get_active_profiles=1
+env_get_default_profiles=1
+h2_range_cursor_next=1
+http1_exchange_register=1
+huc_perform=6
+init_gc_mxbean_fields=2
+init_runtime_mxbean_fields=2
+introspector_get_bean_info=2
+jdk_string_hash_from_obj=1
+jsse_supported_suite_name_array=7
+lookup_all_host_addr_impl=3
+make_annotated_type=3
+make_path_stream=8
+native_ad_init_capacity=1
+native_al_init_capacity=1
+native_class_get_annotated_interfaces=2
+native_class_get_generic_interfaces=4
+native_class_get_type_parameters=5
+native_constructor_get_exception_types=1
+native_fc_open=1
+native_files_read_all_lines=1
+native_header_map_init=4
+native_inet_get_all_by_name=1
+native_method_get_annotations_by_type=1
+native_method_get_generic_exception_types=1
+native_method_get_generic_param_types=3
+native_method_get_type_parameters=4
+native_option_map_iterator=1
+native_path_to_file=1
+native_picocli_regex_transform_synopsis=2
+native_pq_init_capacity=1
+native_serialized_application_read=4
+native_string_is_blank=1
+native_string_lines=1
+native_system_getenv_all=1
+native_thread_get_stack_trace=1
+native_throwable_add_suppressed=2
+native_throwable_get_stack_trace_array=1
+native_throwable_get_suppressed=2
+native_type_variable_get_annotated_bounds=2
+native_unsafe_allocate_memory=1
+native_unsafe_allocate_memory_realloc=1
+native_worker_get_io_threads=1
+native_worker_shutdown_now=1
+p59_sw_walk=1
+prop_idx=8
+re10_dispatch_pending=2
+re5_build_response=2
+re5_drive_body_handler=1
+register_accepted_issuers=2
+register_alpn_on_parameters=1
+register_apply_parameters=1
+register_apps_h2_overrides=1
+register_engine_impl_natives=4
+register_https_session_accessors=6
+register_key_manager_factory=1
+register_keycloak_tls_natives=1
+register_mbean_server=27
+register_open_data_carriers=1
+register_p72_beans=6
+register_re3_inet_address=2
+register_ssl_session_real=6
+register_sslserversocket=15
+register_trust_manager_factory=1
+register_vm_management_impl=4
+s2_keys_as_set=4
+s2_register_channel=1
+scan_make_pattern=2
+spawn_io_thread_with_ctx=3
+spawn_vertx_event_loop_inner=2
+ssl_sock_enabled_protocols=2
+ssl_sock_supported_cipher_suites=3
+supported_options_set=6
+thread_mirror_is_synthetic_layout=2
+url_path_or_file_field=2
+wrap_annotation_in_real_proxy=1
+reachfn_end

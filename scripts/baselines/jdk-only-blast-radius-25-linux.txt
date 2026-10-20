@@ -1,0 +1,21 @@
+# jdk-only blast radius — baseline for key '25-linux'
+#
+# Written by scripts/jdk-only-blast-radius.sh --update-baseline.
+# The SIGNAL is the failing SET per prefix, not the pass count: the count
+# moves whenever the corpus grows. See the script header.
+#
+# Lines: !key !adjudicating !taken !note !corpus, then one row per prefix:
+#   <prefix><TAB><passed><TAB><total><TAB><failing vectors, net of control>
+!key	25-linux
+!adjudicating	yes
+!taken	2026-09-21T08:28:51Z	rev=16ab9ea3f
+!note	H0-4/5/6 retirement, 2026-09-21: all six families REPAIRED to 0 net-of-control (was HashSet 1, Hashtable 2, LinkedHashMap 4, TreeMap 3, CHM 3, HashMap 17 on 2026-08-22 baseline). RTreeRangeGc no longer quarantined.
+!control	128	140	RChannelInterrupt RCrypto RFileChannelFastIo RJdkAsyncChannel RJdkFailure RJdkFfmSegment RJdkNio RJdkSecurity RJdkWatchService RNioNoFollow RSslEndpointIdentification RSslLiveSession
+!corpus	RAnnotationProxyGate RArrayStoreInterfaces RArrayStoreLibrary RArrayStoreTiers RArraysMismatch RAtomicArray RBigIntMontgomery RBlockingQueue RBufferPoolCount RBuiltinLoaderPackages RCanAccessReceiver RCanAccessRules RChaCha20Cipher RChannelInterrupt RChannelToString RChmKeySetView RClassUnloadSweep RClassUnloadSweepGen RCollections RCrypto RDataInputFastPull RDirectBufferElem REncodingFidelity RExceptions RExecutorShutdown RFieldSiteCache RFileChannelFastIo RFileTimes RForNameGcStress RForeignLayoutCollections RForeignLayoutJdkInterfaces RFsSingleton RImmutableFactoryTypes RJdkAqs RJdkAsyncChannel RJdkAwtHeadless RJdkBigNum RJdkBridge1 RJdkByteOrder RJdkCollections RJdkDefineClass RJdkEnumerations RJdkEnvMap RJdkExecutors RJdkFailure RJdkFfmSegment RJdkFieldModule RJdkForeign RJdkForkJoin RJdkFormatLocale RJdkFormatSurface RJdkFunctionCombinators RJdkG9Skew RJdkHandles RJdkHello RJdkHidden RJdkIntrinsics RJdkIntrinsics2 RJdkIntrinsics3 RJdkJmx RJdkJni RJdkLambdas RJdkLangPackages RJdkLogging RJdkLookupIn RJdkMapViews RJdkModule RJdkNet RJdkNio RJdkOptionalShape RJdkPhaser RJdkProcess RJdkProcessStreams RJdkProxy RJdkProxyIface RJdkRecords RJdkReflBox RJdkReflect RJdkSecurity RJdkServices RJdkSqlPackage RJdkStampedStamps RJdkStrict RJdkStrictMath RJdkStringCodePoints RJdkVarHandleModeSupport RJdkVarHandleNullCoord RJdkViews RJdkWatchService RJdkX509Intercept RJitArrayTypecheck RJitArraycopyRefDeopt RJitGc RJitLambdaNpeSupersede RJitMapTierDiff RJitMultiArrayClass RJitOsrStringDispatch RJitStackTraceLines RJitStringLayout RJitTreeSubMapIter RJitUnrollImplicitNpe RJitVarHandleRefRead RLambdaDefaultOverload RLangPackages RLoaderChurnDefine RLoaderExceptionShape RLoaderIdentity RLockedIdentityHash RMapGcStress RMapResizeGc RMethodSiteCache RNetIfaceScope RNioNoFollow RNumbers ROptionalClassForName ROverlaySystemGcStress RPermissionInit RPriorityQueueGc RPrivateLambdaOwner RPropertiesClone RReflect RSegmentBulkCopy RSerial RServiceLoaderDoubleSource RShutdownHooks RSimpleDateFormatZone RSimpleTimeZoneRaw RSocketChannelInterrupt RSocketFastIo RSslEndpointIdentification RSslLiveSession RSslNullSession RStreamToListCopy RStringBuilderContent RStrings RSyncMethodJit RThrowableFillFrames RTreeRangeGc RUnsafeArrayBase RVarHandleAccess
+!quarantined	
+java/util/HashSet	128	140	
+java/util/Hashtable	127	140	RJdkNet
+java/util/LinkedHashMap	128	140	
+java/util/TreeMap	128	140	
+java/util/concurrent/ConcurrentHashMap	127	140	RJdkNet
+java/util/HashMap	128	140	

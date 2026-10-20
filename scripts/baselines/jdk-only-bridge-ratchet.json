@@ -1,0 +1,95 @@
+{
+  "jdk": {
+    "25/linux": {
+      "bridge_shadows_bytecode": 494,
+      "bridge_stated_shadows_bytecode": 26,
+      "bridge_without_acc_native": 3754,
+      "jdk_version": "25.0.4",
+      "mode": "compatible",
+      "note": "r18 known-issues close: Class.isArray/isInterface/isPrimitive and getComponentType/componentType yield to JDK 25 bodies (5 rows removed)",
+      "observed": {
+        "bridge": {
+          "abstract_method": 1392,
+          "acc_native": 1065,
+          "class_absent": 1176,
+          "class_present_method_undeclared": 331,
+          "inherited_abstract_method": 361,
+          "inherited_acc_native": 20,
+          "inherited_shadows_bytecode": 86,
+          "rows": 4839,
+          "shadows_bytecode": 408,
+          "shadows_bytecode_anywhere": 494,
+          "stated_shadows_bytecode": 26,
+          "without_acc_native": 3754
+        },
+        "census_schema_version": 5,
+        "image_adjudication": true,
+        "mode": "compatible",
+        "partial": false,
+        "registrations": {
+          "bridge": 4839,
+          "intrinsic": 696,
+          "synthetic-stub": 6440
+        },
+        "schema": 1,
+        "superseded": {
+          "kind_disagreements": 11,
+          "rows": 987,
+          "stub_lost_to_admitted": 0
+        },
+        "total_rows": 11975
+      },
+      "os": "linux",
+      "superseded_kind_disagreements": 11,
+      "superseded_stub_lost_to_admitted": 0,
+      "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"
+    },
+    "25/linux/jdk-only": {
+      "bridge_shadows_bytecode": 496,
+      "bridge_stated_shadows_bytecode": 26,
+      "bridge_without_acc_native": 3760,
+      "jdk_version": "25.0.4",
+      "mode": "jdk-only",
+      "note": "r18 known-issues close: Class.isArray/isInterface/isPrimitive and getComponentType/componentType yield to JDK 25 bodies (5 rows removed) (--jdk-only leg)",
+      "observed": {
+        "bridge": {
+          "abstract_method": 1394,
+          "acc_native": 1065,
+          "class_absent": 1176,
+          "class_present_method_undeclared": 333,
+          "inherited_abstract_method": 361,
+          "inherited_acc_native": 20,
+          "inherited_shadows_bytecode": 88,
+          "rows": 4845,
+          "shadows_bytecode": 408,
+          "shadows_bytecode_anywhere": 496,
+          "stated_shadows_bytecode": 26,
+          "without_acc_native": 3760
+        },
+        "census_schema_version": 5,
+        "image_adjudication": true,
+        "mode": "jdk-only",
+        "partial": false,
+        "registrations": {
+          "bridge": 4845,
+          "intrinsic": 682,
+          "synthetic-stub": 0
+        },
+        "schema": 1,
+        "superseded": {
+          "kind_disagreements": 11,
+          "rows": 411,
+          "stub_lost_to_admitted": 0
+        },
+        "total_rows": 5527
+      },
+      "os": "linux",
+      "superseded_kind_disagreements": 11,
+      "superseded_stub_lost_to_admitted": 0,
+      "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"
+    }
+  },
+  "min_total_rows": 4000,
+  "schema": 1,
+  "slack": 0
+}

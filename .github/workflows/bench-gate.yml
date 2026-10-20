@@ -1,0 +1,79 @@
+name: Benchmark Gate (NEW-20)
+
+# NEW-20: run the criterion microbenchmark suite and gate on
+# regression > 15% (default) against bench/baseline.json. Triggered on
+# pushes to main/release branches and on PRs touching the JIT,
+# interpreter, GC, or core natives.
+
+on:
+  push:
+    branches: [main, "release/*"]
+  pull_request:
+    paths:
+      - 'vm/**'
+      - 'jit/**'
+      - 'gc/**'
+      - 'native-builtins/**'
+      - 'native-api/**'
+      - 'bench/**'
+      - '.github/workflows/bench-gate.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  # Microbenchmarks are noisy on shared CI runners; -Copt-level=3 is
+  # already implied by --release. Pin the rust toolchain for
+  # reproducibility.
+  #
+  # IMPORTANT: setting RUSTFLAGS here REPLACES (does not merge with) any
+  # `rustflags = [...]` from `.cargo/config.toml`. The config file enables
+  # `+sse4.2,+pclmulqdq` for x86_64; without these the bench-gate measures a
+  # baseline (x86-64-v1) build that does NOT reflect shipping binaries, and
+  # any regression numbers are meaningless. Include the config-toml flags
+  # explicitly so the gate exercises the same ISA users actually run.
+  RUSTFLAGS: "-C target-feature=+sse4.2,+pclmulqdq -Dwarnings"
+
+jobs:
+  bench-gate:
+    name: Benchmark Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'oracle'
+          java-version: '25'
+
+      - name: Build bench binary in release mode
+        run: cargo build --release --bin bench-gate
+
+      - name: Run criterion microbenchmark suite
+        # `--no-fail-fast` so a single bench panic doesn't hide the
+        # rest of the data. Criterion writes JSON to target/criterion/
+        # which the gate then consumes.
+        run: cargo bench --bench vm_benchmarks --no-fail-fast -- --quick
+
+      - name: Run benchmark gate
+        run: |
+          cargo run --release --bin bench-gate -- \
+            --baseline bench/baseline.json \
+            --threshold 0.15 \
+            --report bench/last_run.json
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-gate-report
+          path: |
+            bench/last_run.json
+            target/criterion/**/estimates.json
+          retention-days: 30
+          if-no-files-found: warn

@@ -1,0 +1,30 @@
+impostor cold throws=1 sum=0 first=java.lang.IncompatibleClassChangeError: Receiver class R19MhifaceResid$Impostor does not implement the requested interface R19MhifaceResid$Fn
+impostor warm throws=500 sum=0 first=java.lang.IncompatibleClassChangeError: Receiver class R19MhifaceResid$Impostor does not implement the requested interface R19MhifaceResid$Fn
+impostor good throws=0 sum=55 first=none
+plain cold throws=1 sum=0 first=java.lang.IncompatibleClassChangeError: Receiver class java.lang.String does not implement the requested interface R19MhifaceResid$Fn
+plain warm throws=500 sum=0 first=java.lang.IncompatibleClassChangeError: Receiver class java.lang.String does not implement the requested interface R19MhifaceResid$Fn
+plain good throws=0 sum=55 first=none
+array cold throws=1 sum=0 first=java.lang.IncompatibleClassChangeError: Receiver class [I does not implement the requested interface R19MhifaceResid$Fn
+array warm throws=500 sum=0 first=java.lang.IncompatibleClassChangeError: Receiver class [I does not implement the requested interface R19MhifaceResid$Fn
+array good throws=0 sum=55 first=none
+default cold throws=1 sum=0 first=java.lang.IncompatibleClassChangeError: Receiver class R19MhifaceResid$Impostor does not implement the requested interface R19MhifaceResid$Fn
+default warm throws=500 sum=0 first=java.lang.IncompatibleClassChangeError: Receiver class R19MhifaceResid$Impostor does not implement the requested interface R19MhifaceResid$Fn
+default good throws=0 sum=110 first=none
+unreflect cold throws=1 sum=0 first=java.lang.IncompatibleClassChangeError: Receiver class R19MhifaceResid$Impostor does not implement the requested interface R19MhifaceResid$Fn
+unreflect warm throws=500 sum=0 first=java.lang.IncompatibleClassChangeError: Receiver class R19MhifaceResid$Impostor does not implement the requested interface R19MhifaceResid$Fn
+unreflect good throws=0 sum=55 first=none
+astype cold throws=1 sum=0 first=java.lang.ClassCastException: Cannot cast R19MhifaceResid$Impostor to R19MhifaceResid$Fn
+astype warm throws=500 sum=0 first=java.lang.ClassCastException: Cannot cast R19MhifaceResid$Impostor to R19MhifaceResid$Fn
+astype good throws=0 sum=55 first=none
+invoke cold throws=1 sum=0 first=java.lang.ClassCastException: Cannot cast R19MhifaceResid$Impostor to R19MhifaceResid$Fn
+invoke warm throws=500 sum=0 first=java.lang.ClassCastException: Cannot cast R19MhifaceResid$Impostor to R19MhifaceResid$Fn
+invoke good throws=0 sum=55 first=none
+withargs cold throws=1 sum=0 first=java.lang.ClassCastException: Cannot cast R19MhifaceResid$Impostor to R19MhifaceResid$Fn
+withargs warm throws=500 sum=0 first=java.lang.ClassCastException: Cannot cast R19MhifaceResid$Impostor to R19MhifaceResid$Fn
+withargs good throws=0 sum=55 first=none
+bindto cold throws=1 sum=0 first=java.lang.ClassCastException: Cannot cast R19MhifaceResid$Impostor to R19MhifaceResid$Fn
+bindto warm throws=500 sum=0 first=java.lang.ClassCastException: Cannot cast R19MhifaceResid$Impostor to R19MhifaceResid$Fn
+bindto good throws=0 sum=55 first=none
+spread cold throws=1 sum=0 first=java.lang.ClassCastException: Cannot cast R19MhifaceResid$Impostor to R19MhifaceResid$Fn
+spread warm throws=500 sum=0 first=java.lang.ClassCastException: Cannot cast R19MhifaceResid$Impostor to R19MhifaceResid$Fn
+spread good throws=0 sum=55 first=none

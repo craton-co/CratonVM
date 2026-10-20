@@ -1,0 +1,27 @@
+# jdk-baseline	2
+# kind	class
+# name	java.util.Base64
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/util/Base64.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	7
+# protected-methods	0
+# declared-methods	8
+# declared-fields	0
+# rows	11
+# columns	kind	name	descriptor	flags
+CLASS	java.util.Base64		public,final
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	<init>	()V	private
+METHOD	getDecoder	()Ljava/util/Base64$Decoder;	public,static
+METHOD	getEncoder	()Ljava/util/Base64$Encoder;	public,static
+METHOD	getMimeDecoder	()Ljava/util/Base64$Decoder;	public,static
+METHOD	getMimeEncoder	()Ljava/util/Base64$Encoder;	public,static
+METHOD	getMimeEncoder	(I[B)Ljava/util/Base64$Encoder;	public,static
+METHOD	getUrlDecoder	()Ljava/util/Base64$Decoder;	public,static
+METHOD	getUrlEncoder	()Ljava/util/Base64$Encoder;	public,static

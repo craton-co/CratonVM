@@ -1,0 +1,183 @@
+# cargo-deny configuration.
+#
+# Run locally with:
+#     cargo install --locked cargo-deny
+#     cargo deny check
+#
+# CI: .github/workflows/supply-chain.yml (non-blocking on day one; see that
+# file's header for the promotion checklist).
+#
+# ---------------------------------------------------------------------------
+# DESIGN POSITION: START PERMISSIVE, TIGHTEN WITH EVIDENCE
+# ---------------------------------------------------------------------------
+# This file lands with no prior cargo-deny run against this dependency graph.
+# A configuration authored strictly, sight unseen, produces a wall of failures
+# on its first run, gets marked "advisory", and is then ignored forever -- the
+# exact fate this repository's other measurement jobs were designed to avoid.
+#
+# So: everything that would be noisy starts at `allow` or `warn`, with a TODO
+# naming the evidence needed to tighten it. The value on day one is the
+# *report*, not the gate. Every TODO below is a real, small, separate change --
+# not a placeholder.
+#
+# NOTE ON SCHEMA VERSIONS: the `version = 2` keys that older cargo-deny releases
+# required under [advisories] and [licenses] are deliberately omitted. Modern
+# cargo-deny (0.17+) makes those semantics the default and warns that the key is
+# obsolete; older releases accept the v2-shaped fields used here anyway.
+# TODO(supply-chain): once the CI-installed cargo-deny version is pinned, state
+# it here so a schema change cannot silently alter what this file means.
+
+# ---------------------------------------------------------------------------
+# [graph] -- which parts of the dependency graph get checked
+# ---------------------------------------------------------------------------
+[graph]
+# The two platforms ci.yml actually builds, plus the two that
+# .github/workflows/cross-platform.yml is bringing up. Listing targets matters
+# for this workspace specifically: the root Cargo.toml documents three
+# ACCEPTED duplicate families, one of which (windows-sys 0.48/0.52/0.61) exists
+# only because of Windows-only transitive dependencies. Without a target list,
+# cargo-deny reports the union of every platform's graph and the duplicate
+# report becomes unreadable.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+# Feature-gated dependencies (cudarc behind `cuda-bridge/cuda`, mimalloc behind
+# `cratonvm-cli/mimalloc`) are part of what ships, so include them.
+all-features = true
+# `difftest` and the benches pull test-only crates; they are still code this
+# project builds, so they stay in scope.
+exclude-dev = false
+
+# ---------------------------------------------------------------------------
+# [advisories] -- RUSTSEC vulnerability and maintenance database
+# ---------------------------------------------------------------------------
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Advisories are the one category worth failing on: a known-exploitable CVE in
+# a dependency is not a style preference. The CI job stays non-blocking on day
+# one only because this file has never been run; the *severity policy* is
+# strict from the start so the first report is honest.
+yanked = "warn"
+# TODO(supply-chain): populate ONLY with RUSTSEC ids that have been triaged and
+# written up, each with the reason and a re-check date. An empty list is the
+# correct starting state -- an id parked here without a note is worse than a
+# red build.
+ignore = []
+
+# ---------------------------------------------------------------------------
+# [licenses] -- what this project is allowed to redistribute
+# ---------------------------------------------------------------------------
+# CratonVM ships under Apache-2.0 (see LICENSE / NOTICE). The allow-list below
+# is the set of licences compatible with redistributing an Apache-2.0 binary
+# that statically links its dependencies.
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    # MPL-2.0 is file-level copyleft. Linking is fine for an Apache-2.0
+    # distribution; modifying an MPL file obliges publishing that file's source.
+    # Allowed because no MPL dependency is vendored or patched here.
+    # TODO(legal): if a vendored MPL crate ever appears under */vendor/, this
+    # entry needs a per-crate exception instead of a blanket allow.
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+]
+# 0.8 is cargo-deny's default. Raising it makes hand-written or dual-licence
+# headers fail to classify; lowering it accepts bad guesses.
+confidence-threshold = 0.8
+
+# Workspace members and other `publish = false` crates are ours -- the licence
+# question does not apply to them.
+[licenses.private]
+ignore = true
+
+# Per-crate exceptions. Deliberately empty: an exception should be added only
+# after the crate's licence has actually been read.
+# Example shape, for whoever needs the first one:
+#     [[licenses.exceptions]]
+#     name = "ring"
+#     allow = ["OpenSSL"]
+# TODO(supply-chain): run `cargo deny check licenses` and move each genuinely
+# unavoidable licence out of the blanket `allow` list above into an entry here,
+# so the allow-list shrinks to what the graph actually needs.
+
+# `native-builtins/vendor/rustls-cbc` is a minimally-patched vendored rustls
+# (see the [patch.crates-io] block in the root Cargo.toml). It keeps upstream
+# rustls's Apache-2.0/ISC/MIT triple licence, all three of which are allowed
+# above, so it needs no clarification entry today.
+# TODO(supply-chain): if the vendored copy ever diverges enough to carry its own
+# licence text, add a [[licenses.clarify]] entry pinning its expression and file
+# hash so a silent relicense cannot pass unnoticed.
+
+# ---------------------------------------------------------------------------
+# [bans] -- duplicate versions and specifically-forbidden crates
+# ---------------------------------------------------------------------------
+[bans]
+# STARTS PERMISSIVE FOR A DOCUMENTED REASON. The root Cargo.toml carries a
+# ~40-line analysis of three duplicate families (hashbrown 0.14/0.15/0.16,
+# getrandom 0.2/0.3/0.4, windows-sys 0.48/0.52/0.61), concluding that each pair
+# is a hard API break that cannot be unified with a [patch] and must wait for
+# upstream consumers to migrate. Setting this to "deny" today would fail on
+# three knowingly-accepted facts.
+#
+# TODO(supply-chain): flip to "warn" as soon as the first supply-chain run
+# confirms the duplicate set matches those three families and nothing else,
+# then add `skip` entries for exactly them and flip to "deny". At that point a
+# FOURTH duplicate family becomes a build failure, which is the actual goal --
+# the workspace comment says "re-evaluate next round" and this is the mechanism
+# that makes the re-evaluation happen automatically.
+multiple-versions = "allow"
+
+# A `*` version requirement makes a build non-reproducible. There are none in
+# this workspace today; "warn" so an accidental one is visible without failing
+# the first run.
+# TODO(supply-chain): flip to "deny" -- this one is expected to be free.
+wildcards = "warn"
+
+# Crates that must never enter the graph. Empty for now.
+# TODO(security): consider denying `openssl-sys` (the project deliberately uses
+# rustls, and an accidental native-OpenSSL link changes the distribution's
+# licence and CVE surface) once a run confirms it is not already present
+# transitively.
+deny = []
+
+# Duplicate-version exemptions go here once `multiple-versions` is tightened:
+#     skip = [
+#         { name = "hashbrown" },
+#         { name = "getrandom" },
+#         { name = "windows-sys" },
+#     ]
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# [sources] -- where code is allowed to come from
+# ---------------------------------------------------------------------------
+# This is the cheapest and highest-value section to make strict immediately: it
+# is about provenance, not taste, and the expected answer is "crates.io and
+# nothing else". A git dependency introduced without review is exactly the
+# supply-chain risk this lane exists to close.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git dependencies today. Any addition must be listed here WITH a pinned
+# revision, not a branch.
+allow-git = []

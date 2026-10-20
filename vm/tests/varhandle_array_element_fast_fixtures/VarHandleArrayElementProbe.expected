@@ -1,0 +1,28 @@
+single=-9192378020012801616
+ia=[19991, 19992, 19993, 19994, 19995, 19996, 19997, 19998, 19999, 20000, 20001, 20002, 20003, 20004, 20005, 20006] la=[1099511647766, 1099511647767, 1099511647768, 1099511647769, 1099511647770, 1099511647771, 1099511647772, 1099511647773, 1099511647774, 1099511647775, 1099511647776, 1099511647777, 1099511647778, 1099511647779, 1099511647780, 1099511647781]
+ia.get(16): java.lang.ArrayIndexOutOfBoundsException: Index 16 out of bounds for length 16
+ia.set(-1): java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 16
+la.getAndAdd(99): java.lang.ArrayIndexOutOfBoundsException: Index 99 out of bounds for length 16
+INTS.get(null): java.lang.NullPointerException: Cannot load from int array because "array" is null
+INTS.set(len): java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 8
+INTS.compareAndSet(-3): java.lang.ArrayIndexOutOfBoundsException: Index -3 out of bounds for length 8
+LONGS.get(len): java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 8
+BYTES.get(len): java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+ia.get(16): java.lang.ArrayIndexOutOfBoundsException: Index 16 out of bounds for length 16
+ia.set(-1): java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 16
+la.getAndAdd(99): java.lang.ArrayIndexOutOfBoundsException: Index 99 out of bounds for length 16
+INTS.get(null): java.lang.NullPointerException: Cannot load from int array because "array" is null
+INTS.set(len): java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 8
+INTS.compareAndSet(-3): java.lang.ArrayIndexOutOfBoundsException: Index -3 out of bounds for length 8
+LONGS.get(len): java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 8
+BYTES.get(len): java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+ia.get(16): java.lang.ArrayIndexOutOfBoundsException: Index 16 out of bounds for length 16
+ia.set(-1): java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 16
+la.getAndAdd(99): java.lang.ArrayIndexOutOfBoundsException: Index 99 out of bounds for length 16
+INTS.get(null): java.lang.NullPointerException: Cannot load from int array because "array" is null
+INTS.set(len): java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 8
+INTS.compareAndSet(-3): java.lang.ArrayIndexOutOfBoundsException: Index -3 out of bounds for length 8
+LONGS.get(len): java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 8
+BYTES.get(len): java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+shared=[1200000, 400000, 400000, 400000] sharedL=[1717986918600000, 1717986918600000, 1717986918600000, 1717986918600000]
+ARRAY-ELEMENT-OK

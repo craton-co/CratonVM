@@ -1,0 +1,641 @@
+name: JIT differential (explore, non-gating)
+
+# ---------------------------------------------------------------------------
+# WHAT THIS LANE IS FOR
+# ---------------------------------------------------------------------------
+#
+# Finding divergences that nobody has seen yet. It gates nothing.
+#
+# The problem it exists to solve: the PR lane (`difftest-jit-paths` in ci.yml)
+# judges SIX committed seed programs, and `jit-differential-nightly.yml` runs
+# `fuzz-jit` over the FIXED range `--seed 1 --count 400`. Both are the right
+# shape for a gate and the wrong shape for a search. A fixed range's coverage
+# is a constant: night 400 executes exactly the 400 programs night 1 executed,
+# so once those 400 are green they stay green and stop paying for themselves.
+# 2,493 encoder unit tests in 0.47 s do not close that gap either — they check
+# which bytes an emitter chose, not what the CPU then computed.
+#
+# So this lane runs the same generator over a window of seeds NOBODY HAS RUN
+# BEFORE, every night, forever.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS LANE MAY ROTATE SEEDS AND THE NIGHTLY MAY NOT
+# ---------------------------------------------------------------------------
+#
+# `jit-differential-nightly.yml`'s header is right and this file does not
+# contradict it: "a red night must be reproducible on the next night and
+# locally with the same command. Widen it with workflow_dispatch rather than by
+# rotating seeds by date." That is the GATE lane's contract. A gate whose input
+# changes under it cannot distinguish "the code regressed" from "today's dice
+# rolled differently", and re-running it after a fix has to re-run the same
+# programs or the green means nothing.
+#
+# This lane has the opposite contract. It is allowed to roll new dice because
+# it never blocks anything, and rolling them is the entire product. What it
+# owes in exchange is REPRODUCIBILITY OF ANY GIVEN NIGHT, which is a weaker
+# property than the nightly's and is enough here:
+#
+#   * the window is a pure function of the UTC calendar date, computed in the
+#     "Resolve the seed window" step below — no `$RANDOM`, no run id, no clock
+#     below day granularity;
+#   * the resolved numbers and a copy-pasteable local command are printed to
+#     the log as a `::notice::` AND to the job summary, on a pass and on a
+#     fail, BEFORE the fuzzer runs and again after it;
+#   * generation itself is seed-deterministic — same `--seed`, `--rounds`,
+#     `--class-version` always produce the same class bytes, pinned by
+#     `generation_is_byte_identical_per_seed` in difftest/src/jitfuzz.rs.
+#
+# Together those mean a finding from any night is replayable today, next month,
+# and on a laptop, from a command that is in the run's log. That is the only
+# reason rotation is acceptable at all; if you ever find yourself removing the
+# printing steps, remove the rotation with them.
+#
+# ---------------------------------------------------------------------------
+# HOW TO REPRODUCE A GIVEN NIGHT LOCALLY
+# ---------------------------------------------------------------------------
+#
+#   SEED_START = 1000000 + (whole UTC days since 1970-01-01) * 10000
+#
+# so every night gets its own disjoint block of 10,000 seeds and the blocks
+# never revisit each other. The `+ 1000000` base is what keeps this lane clear
+# of the nightly's `--seed 1 --count 400`: the first rotating window starts a
+# million seeds above it. (Stated limit: a human who dispatches the NIGHTLY
+# with `count` near 10^6 would walk into this lane's blocks. Nothing enforces
+# that; the nightly's committed default is 400.)
+#
+# Read the exact numbers off the run — every job prints, e.g.:
+#
+#   ::notice title=explore window (gc-stress)::--seed 208120000 --count 400
+#       [derived from 2026-09-16 UTC (epoch day 20712)]
+#
+# then locally:
+#
+#   cargo build --release -p cratonvm-cli -p cratonvm-difftest
+#   export CRATONVM_BIN=target/release/cratonvm
+#   export CRATONVM_JIT_VERIFY_IR=1 CRATONVM_JIT_VERIFY_TYPES=1 \
+#          CRATONVM_JIT_VERIFY_FRAME_STATES=1 CRATONVM_JIT_VERIFY_MEMORY_CHAIN=1 \
+#          CRATONVM_JIT_VERIFY_ARENA_ORDER=1 CRATONVM_DBG_IR_COMPILES=1
+#   target/release/cratonvm-difftest fuzz-jit \
+#       --seed <SEED_START> --count 400 \
+#       --modes <the axis's modes> <the axis's extra flags> \
+#       --fail-on-ir-verify-reject --max-failures 5 --out target/jitfuzz-explore
+#
+# Or recompute the date arithmetic yourself, which is the same two lines the
+# job runs:
+#
+#   EPOCH_DAY=$(( $(date -u -d 2026-09-16 +%s) / 86400 ))
+#   echo $(( 1000000 + EPOCH_DAY * 10000 ))
+#
+# `workflow_dispatch` takes the same two inputs as the nightly (`seed_start`,
+# `count`); supplying `seed_start` PINS the window and skips the date
+# arithmetic entirely, which is how you re-run a specific night by hand.
+#
+# ---------------------------------------------------------------------------
+# WHAT HAPPENS WHEN IT GOES RED
+# ---------------------------------------------------------------------------
+#
+# An issue, never a blocked merge. Concretely:
+#
+#   * the fuzz step carries `continue-on-error: true` and the job carries it
+#     too, so a divergence leaves this workflow GREEN in the checks list. That
+#     is deliberate and it is the whole reason this lane can rotate: a lane
+#     that is red for a week trains everyone to scroll past red, and then the
+#     lane that matters cannot report anything. (`jdk-only-blast-radius.yml`
+#     makes the same argument at more length, with two incidents behind it.)
+#     The outcome is carried in `steps.fuzz.outcome`, which is what every
+#     later step branches on.
+#   * `fuzz-jit` MINIMIZES each failing program itself before writing it —
+#     the shrinker drops snippets, then inputs, then halves `rounds`, while the
+#     split still reproduces (difftest/src/jitfuzz.rs `fuzz()` ->
+#     `minimize_program`). `--no-minimize` is therefore NOT passed, and the
+#     `<out>/JitFuzz_<seed>/JitFuzz_<seed>.class` this lane uploads is already
+#     the minimized reproducer.
+#
+#     NOT USED HERE, ON PURPOSE: the `min` subcommand. `min` is a SOURCE
+#     shrinker — difftest/src/main.rs rejects anything whose extension is not
+#     `.java` ("source minimization needs a .java seed") — and a `fuzz-jit`
+#     program has no Java source at any point; it is emitted straight to class
+#     bytes by difftest/src/classgen.rs. Running `min` on this lane's output
+#     would exit 3 (bootstrap) without shrinking a thing. See "WHAT WAS WANTED
+#     FROM THE CLI" at the bottom of this header.
+#   * everything under `target/jitfuzz-explore` is uploaded as a build
+#     artifact on every outcome: the minimized class, `original/`, `report.txt`
+#     (the ready-to-paste repro command and both sides' output) and
+#     `program.txt` (categories, inputs, and a disassembly of `t` for both the
+#     minimized and the original program).
+#   * one issue per AXIS is opened or commented on, labelled `jit-explore`.
+#
+# ---------------------------------------------------------------------------
+# WHAT THE OPERATOR DOES WITH A CONFIRMED FINDING
+# ---------------------------------------------------------------------------
+#
+# Promote it, or this lane finds it again next year and nothing is the wiser.
+#
+#   1. Download the artifact and confirm the split reproduces locally from the
+#      command in `report.txt`. A split that does not reproduce is a finding
+#      about nondeterminism, not about the JIT; file it as that.
+#   2. Fix the bug. `difftest/regression/` is defined by
+#      docs/feature-designs/differential-fuzzer.md §3.1 as "every
+#      confirmed-then-FIXED divergence, minimized, committed so a future
+#      regression re-trips it" — the normal promotion happens WITH the fix, in
+#      the same PR, and needs no known-splits entry because the repro is green
+#      from the moment it lands.
+#   3. Commit `JitFuzz_<seed>.class` (the MINIMIZED one, not `original/`) as a
+#      FLAT FILE directly in `difftest/regression/`, next to the existing
+#      `ExceptionId.java`. Flat matters: `harness::discover_programs` does a
+#      single `read_dir` with no recursion, so anything nested in a
+#      per-repro subdirectory — the layout §3.3 of the design sketches — is
+#      silently skipped by the gate below. It accepts `.class` as well as
+#      `.java`, so a bytecode-only repro is a first-class member there once it
+#      is flat.
+#      The nightly's "Path gate over the promoted regression repros" step
+#      (added to jit-differential-nightly.yml alongside this file) runs that
+#      directory every night from then on.
+#   4. ONLY IF the repro has to land before the fix — a bisect aid, a shared
+#      reproduction for a bug two people are working on — add a
+#      `difftest/path-gate-known.json` entry for the `(program, mode)` split
+#      naming this issue in `note`, or that nightly step is red from the day
+#      you commit it. `path-gate` reports a listed split that now agrees as
+#      RESOLVED, which is the signal to delete the entry; deleting it is what
+#      converts the repro from an acknowledged bug into a gate. This is the
+#      exception, not the route.
+#   5. PR-BLOCKING coverage is a separate, deliberate step: `ci.yml`'s
+#      `difftest-jit-paths` reads `difftest/seeds`, not `difftest/regression`.
+#      Copy the class there too once the bug is fixed. Be aware that
+#      `difftest-gate` in the same file ALSO reads `difftest/seeds` and judges
+#      it against HotSpot, so a class landing there may need a
+#      `difftest/ledger.json` row. That coupling is why this promotion is a
+#      human edit and why this lane does not open a PR by itself.
+#
+# ---------------------------------------------------------------------------
+# WHAT WAS WANTED FROM THE CLI AND DOES NOT EXIST
+# ---------------------------------------------------------------------------
+#
+#   * A minimizer that accepts `fuzz-jit`'s written class. `min` is
+#     `.java`-only (main.rs, `cmd_min`). The in-process shrinker inside
+#     `fuzz-jit` covers this lane, but it cannot be re-run on an artifact after
+#     the fact — you have to regenerate the seed to shrink it again.
+#   * A machine-readable summary from `fuzz-jit` (a `--report-json` or similar).
+#     The issue body below is assembled by concatenating the `report.txt` files
+#     `fuzz-jit` writes, because that is the only structured-ish output there
+#     is. Nothing was invented: every flag used here (`--seed`, `--count`,
+#     `--modes`, `--extra-env`, `--class-version`, `--out`, `--max-failures`,
+#     `--fail-on-ir-verify-reject`) is declared in `FuzzJitArgs`.
+#   * A `--seed-start` spelling. It is `--seed`. Do not "fix" it here.
+
+on:
+  schedule:
+    # 04:47 UTC. Ninety minutes behind the nightly's 03:17 so the two lanes do
+    # not contend for the same hosted-runner concurrency, and far enough from
+    # the hour that it does not queue behind everything else on the hour.
+    - cron: '47 4 * * *'
+  workflow_dispatch:
+    inputs:
+      seed_start:
+        description: 'First fuzz-jit seed (empty = derive from today UTC)'
+        required: false
+        default: ''
+      count:
+        description: 'Seeds per axis'
+        required: false
+        default: '400'
+
+permissions:
+  contents: read
+  # The only reason this lane needs more than `contents: read`: the divergence
+  # report is filed as an issue. Nothing here writes to the repository.
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Identical to jit-differential-nightly.yml, and identical on purpose: an
+  # explore finding has to be triageable by someone who only knows the nightly.
+  # A different verifier configuration would mean a seed that fails here and
+  # passes there, with no way to tell which lane was lying.
+  CRATONVM_JIT_VERIFY_IR: '1'
+  CRATONVM_JIT_VERIFY_TYPES: '1'
+  CRATONVM_JIT_VERIFY_FRAME_STATES: '1'
+  CRATONVM_JIT_VERIFY_MEMORY_CHAIN: '1'
+  CRATONVM_JIT_VERIFY_ARENA_ORDER: '1'
+  CRATONVM_DBG_IR_COMPILES: '1'
+  # The window formula, in one place so the header, the step and the docs
+  # cannot drift apart. STRIDE must be >= the largest `count` this lane is ever
+  # run with, or consecutive nights overlap and the "never revisits" claim
+  # above becomes false; the step asserts exactly that rather than trusting it.
+  EXPLORE_SEED_BASE: '1000000'
+  EXPLORE_SEED_STRIDE: '10000'
+
+jobs:
+  fuzz-jit-explore:
+    name: explore (${{ matrix.axis }}) — non-gating
+    runs-on: ubuntu-latest
+    # A red explore night must not look like a broken build. See the header.
+    continue-on-error: true
+    # The nightly budgets 300 for the same generator, same mode fan-out and the
+    # same `--count 400`. The only thing this lane changes is WHICH seeds, so
+    # the nightly's observed runtime is a direct estimate of this one's and the
+    # same budget is the honest number.
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ALL FOUR NIGHTLY AXES ARE KEPT, and that is the deliberate choice.
+          # The axes are not a per-seed luxury — they are what makes a single
+          # generated program run under the moving collector, under eager
+          # deopt, and through the type-inference verifier path. Dropping an
+          # axis here would mean the seeds in this lane's window are the only
+          # seeds in the project that NEVER get that treatment, which inverts
+          # the point of the lane. Depth (`count`) is the knob to turn if this
+          # ever has to get cheaper; breadth is not.
+          #
+          # The four blocks below are copied verbatim from
+          # jit-differential-nightly.yml. Keep them that way.
+
+          # The execution paths, plus the moving young-gen collector.
+          - axis: default
+            modes: nojit,direct-emit,ir-jit,osr-eager,forced-deopt,moving-gc
+            extra: ''
+          # Every JIT mode under a GC every 64 KiB allocated. The reference
+          # runs without it (extra env is applied to non-reference modes only).
+          - axis: gc-stress
+            modes: nojit,direct-emit,ir-jit,osr-eager,forced-deopt,moving-gc
+            extra: '--extra-env CRATONVM_DBG_GC_STRESS=65536'
+          # Eager deopt layered on the modes that do not already set it
+          # (`forced-deopt` does, so it is not repeated here).
+          - axis: deopt-eager
+            modes: nojit,direct-emit,ir-jit,osr-eager,moving-gc
+            extra: '--extra-env CRATONVM_DEOPT_EAGER=1 --extra-env CRATONVM_DEOPT_REAL=1 --extra-env CRATONVM_DEOPT_VERIFY=1'
+          # Major-49 classes: no StackMapTable, so the verifier takes the
+          # type-inference path and the decoded interpreter joins the matrix.
+          - axis: classfile-49
+            modes: nojit,interp-decoded,ir-jit,osr-eager,forced-deopt
+            extra: '--class-version 49'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Same `shared-key` as the nightly, on purpose: the two lanes build the
+      # byte-identical `cargo build --release -p cratonvm-cli -p
+      # cratonvm-difftest` from the same commit, so sharing the cache turns
+      # this lane's cold release build into a restore. If the two builds ever
+      # stop being identical, split the key — a shared key over differing
+      # builds is a slow cache, not a wrong one, but it is still a lie.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: jit-differential-nightly
+
+      - name: Set up JDK 25 (build and boot image)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build cratonvm + difftest (release)
+        run: cargo build --release -p cratonvm-cli -p cratonvm-difftest
+
+      # This step runs BEFORE the fuzzer so that the reproduction command is in
+      # the log even if the runner is killed mid-run, the job hits its timeout,
+      # or the fuzzer segfaults. A window you cannot recompute is a night you
+      # cannot replay, and a night you cannot replay is a night that should not
+      # have rotated.
+      - name: Resolve the seed window
+        id: window
+        shell: bash
+        env:
+          IN_SEED_START: ${{ github.event.inputs.seed_start }}
+          IN_COUNT: ${{ github.event.inputs.count || '400' }}
+          MODES: ${{ matrix.modes }}
+          EXTRA: ${{ matrix.extra }}
+          AXIS: ${{ matrix.axis }}
+        run: |
+          set -euo pipefail
+
+          case "$IN_COUNT" in
+            ''|*[!0-9]*) echo "count must be a positive integer (got '$IN_COUNT')"; exit 2 ;;
+          esac
+          if [ "$IN_COUNT" -lt 1 ]; then echo "count must be >= 1"; exit 2; fi
+
+          DAY_UTC="$(date -u +%Y-%m-%d)"
+          if [ -n "$IN_SEED_START" ]; then
+            case "$IN_SEED_START" in
+              *[!0-9]*) echo "seed_start must be an integer (got '$IN_SEED_START')"; exit 2 ;;
+            esac
+            SEED_START="$IN_SEED_START"
+            ORIGIN="pinned by workflow_dispatch"
+          else
+            # Whole UTC days since 1970-01-01. Deliberately computed from the
+            # DATE, not from `date +%s / 86400` directly: a job that starts at
+            # 23:59:59 and a re-run that starts at 00:00:01 must land on their
+            # own days, not silently share one, and truncating the timestamp
+            # first is what guarantees the printed date and the printed seed
+            # agree with each other.
+            EPOCH_DAY=$(( $(date -u -d "$DAY_UTC" +%s) / 86400 ))
+            SEED_START=$(( EXPLORE_SEED_BASE + EPOCH_DAY * EXPLORE_SEED_STRIDE ))
+            ORIGIN="derived from $DAY_UTC UTC (epoch day $EPOCH_DAY)"
+            # The "windows never overlap each other" claim in the header is
+            # only true while count <= stride. Assert it instead of believing
+            # it: a dispatch with a large `count` is exactly how it would get
+            # quietly violated.
+            if [ "$IN_COUNT" -gt "$EXPLORE_SEED_STRIDE" ]; then
+              echo "count ($IN_COUNT) exceeds the per-night stride ($EXPLORE_SEED_STRIDE):"
+              echo "consecutive nights would overlap. Raise EXPLORE_SEED_STRIDE in this"
+              echo "workflow (and the formula in docs/testing/jit-differential.md) instead."
+              exit 2
+            fi
+          fi
+          SEED_END=$(( SEED_START + IN_COUNT - 1 ))
+
+          # The exact local command, assembled from the same variables the run
+          # step uses so the two cannot disagree.
+          REPRO="target/release/cratonvm-difftest fuzz-jit --seed $SEED_START --count $IN_COUNT --modes $MODES $EXTRA --fail-on-ir-verify-reject --max-failures 5 --out target/jitfuzz-explore/$AXIS"
+
+          {
+            echo "seed_start=$SEED_START"
+            echo "seed_end=$SEED_END"
+            echo "count=$IN_COUNT"
+            echo "day_utc=$DAY_UTC"
+          } >> "$GITHUB_OUTPUT"
+          # Multi-line-safe: the repro string contains spaces but no newlines.
+          echo "repro=$REPRO" >> "$GITHUB_OUTPUT"
+
+          echo "::notice title=explore window ($AXIS)::--seed $SEED_START --count $IN_COUNT  [$ORIGIN]"
+          {
+            echo "### explore window — \`$AXIS\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| window | \`--seed $SEED_START --count $IN_COUNT\` (seeds $SEED_START..$SEED_END) |"
+            echo "| origin | $ORIGIN |"
+            echo "| modes | \`$MODES\` |"
+            echo
+            echo "Reproduce locally (after \`cargo build --release -p cratonvm-cli -p cratonvm-difftest\`,"
+            echo "with \`CRATONVM_BIN=target/release/cratonvm\` and the six \`CRATONVM_JIT_VERIFY_*\` /"
+            echo "\`CRATONVM_DBG_IR_COMPILES\` variables exported):"
+            echo
+            echo '```bash'
+            echo "$REPRO"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the bytecode differential fuzzer (explore window)
+        id: fuzz
+        # NOT a gate. The outcome is read by the steps below; the job's own
+        # conclusion must stay green so a real break elsewhere is still visible
+        # in the checks list.
+        continue-on-error: true
+        shell: bash
+        env:
+          CRATONVM_BIN: target/release/cratonvm
+          SEED_START: ${{ steps.window.outputs.seed_start }}
+          SEED_COUNT: ${{ steps.window.outputs.count }}
+          MODES: ${{ matrix.modes }}
+          EXTRA: ${{ matrix.extra }}
+          AXIS: ${{ matrix.axis }}
+        run: |
+          set -euo pipefail
+          # $EXTRA is intentionally unquoted: it is a fixed flag list from the
+          # matrix above, never user input. The seed and count came from the
+          # window step, which already rejected anything non-numeric.
+          # shellcheck disable=SC2086
+          target/release/cratonvm-difftest fuzz-jit \
+            --seed "$SEED_START" --count "$SEED_COUNT" \
+            --modes "$MODES" $EXTRA \
+            --fail-on-ir-verify-reject \
+            --max-failures 5 \
+            --out "target/jitfuzz-explore/$AXIS"
+
+      # `--max-failures 5` rather than the CLI default of 20. The product of
+      # this lane is ONE actionable, already-minimized repro plus a pointer to
+      # the window; five failing programs out of one 400-seed window are
+      # overwhelmingly the same defect found five ways, and each one costs a
+      # full shrink loop (every candidate re-runs every diverging mode). The
+      # remaining seeds in the window are not lost — the window is printed, so
+      # a triager who wants all of them reruns the command without the cap.
+
+      - name: Reproduction command (every outcome)
+        if: always()
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.fuzz.outcome }}
+          REPRO: ${{ steps.window.outputs.repro }}
+          AXIS: ${{ matrix.axis }}
+        run: |
+          set -euo pipefail
+          echo "::notice title=explore repro ($AXIS, $OUTCOME)::$REPRO"
+          {
+            echo
+            echo "**\`$AXIS\` outcome: \`$OUTCOME\`** — this lane gates nothing; a failure here"
+            echo "is a report, not a broken build."
+            echo
+            echo '```bash'
+            echo "$REPRO"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "=============================================================="
+          echo "  explore lane, axis=$AXIS, outcome=$OUTCOME"
+          echo "  reproduce this exact window locally:"
+          echo "    $REPRO"
+          echo "=============================================================="
+
+      - name: Upload failing programs (already minimized by fuzz-jit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jitfuzz-explore-${{ matrix.axis }}-${{ steps.window.outputs.seed_start }}
+          path: target/jitfuzz-explore
+          retention-days: 30
+          if-no-files-found: ignore
+
+      # Assembled in bash rather than in the github-script step because the
+      # reports are files on disk and reading them here keeps the JavaScript to
+      # "post this string", which is the part that is hard to debug from a CI
+      # log.
+      - name: Assemble the issue body
+        if: steps.fuzz.outcome == 'failure'
+        id: body
+        shell: bash
+        env:
+          AXIS: ${{ matrix.axis }}
+          MODES: ${{ matrix.modes }}
+          EXTRA: ${{ matrix.extra }}
+          REPRO: ${{ steps.window.outputs.repro }}
+          SEED_START: ${{ steps.window.outputs.seed_start }}
+          SEED_END: ${{ steps.window.outputs.seed_end }}
+          DAY_UTC: ${{ steps.window.outputs.day_utc }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          OUT=target/explore-issue-body.md
+          mkdir -p target
+          {
+            echo "### \`$AXIS\` — divergence in explore window \`$SEED_START..$SEED_END\`"
+            echo
+            echo "* night: **$DAY_UTC UTC**"
+            echo "* commit: \`${{ github.sha }}\`"
+            echo "* run: $RUN_URL"
+            echo "* modes: \`$MODES\`"
+            echo "* axis flags: \`${EXTRA:-(none)}\`"
+            echo
+            echo "**This lane gates nothing.** Nothing is blocked by this issue; it is a"
+            echo "report from the rotating explore lane (\`.github/workflows/jit-differential-explore.yml\`)."
+            echo
+            echo "#### Reproduce the whole window"
+            echo
+            echo '```bash'
+            echo "cargo build --release -p cratonvm-cli -p cratonvm-difftest"
+            echo "export CRATONVM_BIN=target/release/cratonvm"
+            echo "export CRATONVM_JIT_VERIFY_IR=1 CRATONVM_JIT_VERIFY_TYPES=1 \\"
+            echo "       CRATONVM_JIT_VERIFY_FRAME_STATES=1 CRATONVM_JIT_VERIFY_MEMORY_CHAIN=1 \\"
+            echo "       CRATONVM_JIT_VERIFY_ARENA_ORDER=1 CRATONVM_DBG_IR_COMPILES=1"
+            echo "$REPRO"
+            echo '```'
+            echo
+            echo "Each failing program's \`report.txt\` below carries a narrower"
+            echo "single-seed \`regenerate:\` line and a ready-to-paste launcher command"
+            echo "for the diverging mode."
+            echo
+            echo "#### Minimized reproducers"
+            echo
+            echo "\`fuzz-jit\` shrinks each failing program before writing it (snippets,"
+            echo "then inputs, then \`rounds\`), so the \`JitFuzz_<seed>.class\` in the"
+            echo "artifact **is** the minimized program. There is no Java source: these"
+            echo "classes are emitted directly as bytecode, which is why \`cratonvm-difftest min\`"
+            echo "(a \`.java\`-only source shrinker) does not apply. The disassembly of the"
+            echo "minimized \`t\` is in each \`program.txt\`."
+            echo
+            echo "Artifact: **jitfuzz-explore-$AXIS-$SEED_START** on the run linked above."
+            echo
+            for dir in target/jitfuzz-explore/"$AXIS"/*/; do
+              [ -d "$dir" ] || continue
+              name="$(basename "$dir")"
+              echo "<details><summary><code>$name</code> — report.txt</summary>"
+              echo
+              echo '```text'
+              if [ -f "$dir/report.txt" ]; then head -c 12000 "$dir/report.txt"; else echo "(no report.txt)"; fi
+              echo
+              echo '```'
+              echo
+              echo '</details>'
+              echo
+              echo "<details><summary><code>$name</code> — program.txt (minimized program, disassembled)</summary>"
+              echo
+              echo '```text'
+              if [ -f "$dir/program.txt" ]; then head -c 12000 "$dir/program.txt"; else echo "(no program.txt)"; fi
+              echo
+              echo '```'
+              echo
+              echo '</details>'
+              echo
+            done
+            echo "#### Promoting this"
+            echo
+            echo "See the \"WHAT THE OPERATOR DOES WITH A CONFIRMED FINDING\" section of"
+            echo "\`.github/workflows/jit-differential-explore.yml\` and"
+            echo "\`docs/testing/jit-differential.md\` §6: confirm locally, fix the bug, and"
+            echo "commit the minimized \`.class\` as a **flat file** in \`difftest/regression/\`"
+            echo "in the same PR (\`discover_programs\` does not recurse, so a nested repro is"
+            echo "silently skipped). If the repro has to land before the fix, it needs a"
+            echo "\`difftest/path-gate-known.json\` entry naming this issue, deleted when the"
+            echo "fix lands — deleting it is what turns the repro into a gate."
+          } > "$OUT"
+          # GitHub rejects an issue body over 65536 characters. Truncate with a
+          # visible marker rather than letting the API call fail and lose the
+          # whole report; the artifact always has the untruncated files.
+          if [ "$(wc -c < "$OUT")" -gt 60000 ]; then
+            head -c 60000 "$OUT" > "$OUT.tmp"
+            printf '\n\n_(truncated at 60 KB — the full reports are in the run artifact.)_\n' >> "$OUT.tmp"
+            mv "$OUT.tmp" "$OUT"
+          fi
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+
+      # `actions/github-script@v7` is this repository's only existing idiom for
+      # talking to the GitHub API from a workflow (jvm-smoke.yml's summary job
+      # uses it for `issues.createComment`). No `gh` CLI call exists in
+      # .github/workflows, so none is introduced here.
+      #
+      # SCHEDULED RUNS ONLY. A human who dispatched this lane by hand is
+      # already looking at the log and does not need an issue; without this
+      # guard, re-running a night to confirm a finding would file a second
+      # report about the finding you are confirming.
+      - name: Open or update the explore issue
+        if: steps.fuzz.outcome == 'failure' && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        env:
+          AXIS: ${{ matrix.axis }}
+          BODY_PATH: ${{ steps.body.outputs.path }}
+          SEED_START: ${{ steps.window.outputs.seed_start }}
+        with:
+          script: |
+            const fs = require('fs');
+            const axis = process.env.AXIS;
+            const body = fs.readFileSync(process.env.BODY_PATH, 'utf8');
+            const label = 'jit-explore';
+            // ONE OPEN ISSUE PER AXIS, and the title is the dedup key.
+            //
+            // The obvious alternative — key on the failing seed — is wrong
+            // here precisely because the window rotates: every night's seeds
+            // are new, so the same defect would file a fresh issue every
+            // night until someone fixed it. Keying on the axis means two
+            // genuinely different bugs found in the same axis arrive as two
+            // comments on one thread. That is the accepted cost: splitting a
+            // conflated thread is one human edit, while de-duplicating thirty
+            // issues about one bug is thirty.
+            const title = `JIT explore: divergence in \`${axis}\` (non-gating lane)`;
+
+            // Creating an issue with an unknown label is not reliably
+            // self-creating, so make sure the label exists first. Already
+            // existing is the normal case and is not an error.
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: label,
+                color: 'ededed',
+                description: 'Found by the rotating JIT differential explore lane. Non-gating.',
+              });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+
+            // `issues.listForRepo` rather than the search API: search is
+            // eventually consistent and separately rate-limited, and an issue
+            // this workflow opened an hour ago may not be indexed yet. That
+            // would open a duplicate, which is the one failure mode this
+            // whole block exists to avoid.
+            const existing = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+              per_page: 100,
+            });
+            const hit = existing.find(i => i.title === title && !i.pull_request);
+
+            if (hit) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: hit.number,
+                body,
+              });
+              core.notice(`explore: commented on #${hit.number} for axis ${axis} (window ${process.env.SEED_START})`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: [label],
+              });
+              core.notice(`explore: opened #${created.data.number} for axis ${axis} (window ${process.env.SEED_START})`);
+            }
+
+      - name: Note why no issue was filed (manual dispatch)
+        if: steps.fuzz.outcome == 'failure' && github.event_name != 'schedule'
+        shell: bash
+        run: |
+          echo "::notice title=no issue filed::This run was not a scheduled night (event=${{ github.event_name }}), so the explore lane did not open an issue. The failing programs are in the uploaded artifact."

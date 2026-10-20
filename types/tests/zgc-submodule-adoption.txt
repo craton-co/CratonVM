@@ -1,0 +1,12 @@
+adapters 3
+barrier 20
+census 37
+forwarding 17
+generation 25
+mark 116
+metrics 29
+page 15
+relocate 16
+remembered 6
+tlab 27
+vaddr 21
