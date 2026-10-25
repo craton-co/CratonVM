@@ -17,7 +17,7 @@ sha2 = { version = "0.10", features = ["oid", "compress"] }
 # SBR wave 5 (`jdk_intrinsics`): GHASH over the JDK's own GCM state, and
 # Keccak-f[1600] for `SHA3.implCompress0`. Both already in the lock file
 # (via `aes-gcm` and `sha3`).
-ghash = "0.5"
+ghash = "0.6"
 keccak = "0.1"
 
 [dev-dependencies]
