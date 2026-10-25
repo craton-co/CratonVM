@@ -35,7 +35,7 @@ fontdue = "0.9"
 # Glyph outlines, cmap and metrics for the Java2D font scaler natives
 # (`sun.font.FreetypeFontScaler` stand-in). Already in the lock file as a
 # dependency of fontdue; this only adds the direct edge.
-ttf-parser = { version = "0.21", default-features = false, features = ["std"] }
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 # Shaping (GSUB/GPOS/AAT, Arabic, Indic, Thai, ...) for the real sun.font.HBShaper: the
 # JDK glue calls four C functions of libfontmanager (HarfBuzz is linked into it), which
 # src/hb.rs provides. rustybuzz is a pure-Rust port of HarfBuzz under the MIT licence

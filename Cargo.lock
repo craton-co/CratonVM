@@ -698,7 +698,7 @@ dependencies = [
  "rustc-hash",
  "rustybuzz",
  "tracing",
- "ttf-parser 0.21.1",
+ "ttf-parser 0.25.1",
  "windows",
  "x11rb",
 ]
