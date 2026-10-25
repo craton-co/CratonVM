@@ -182,7 +182,7 @@ bytemuck = { version = "1.16", optional = true, features = ["extern_crate_alloc"
 thiserror.workspace = true
 tracing.workspace = true
 indexmap = "2"
-bitfield-struct = "0.9"
+bitfield-struct = "0.13"
 zip.workspace = true
 parking_lot.workspace = true
 regex = "1"
