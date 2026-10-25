@@ -1008,9 +1008,9 @@ dependencies = [
 
 [[package]]
 name = "cuda-bindings"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f42e2c99c56bf2eef9d569435bfd72a478dfaea3f178b8e5bae891875bbbe2e"
+checksum = "6056dad2ab4855a22eb1b16f597e4d3ef7fae6bfde80eed47f2acf90ddcfe78a"
 dependencies = [
  "bindgen",
  "libloading",
@@ -1022,9 +1022,9 @@ dependencies = [
 
 [[package]]
 name = "cuda-core"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84bdb592a2844148fb13bdfbbab158879f56916bde1d1a1b6580ca27f23850cd"
+checksum = "dedfb4b1351063f77ca85e6f72d22cae5cd591e538b950da452d1e88a66a601d"
 dependencies = [
  "anyhow",
  "cuda-bindings",
@@ -1035,9 +1035,9 @@ dependencies = [
 
 [[package]]
 name = "cuda-core-derive"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a48da7d10c1078f7fbb87d7176e9476affadea148babf31946e348073872d44"
+checksum = "f466efc33480f95d2968fd078ba4215d19d95e2a54274b2ab01cc5ee484dc587"
 dependencies = [
  "proc-macro2",
  "quote",

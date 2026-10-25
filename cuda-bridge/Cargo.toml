@@ -47,7 +47,7 @@ optional = true
 # NOTE: `cuda-core` 0.3.1 does not compile on Windows/MSVC; the enums
 # bind signed there. Linux only until that is fixed upstream.
 [dependencies.cuda-core]
-version = "0.3.1"
+version = "0.4.0"
 optional = true
 
 # The third backend: AMD HIP, via the bindings CubeCL maintains.
