@@ -1,0 +1,92 @@
+name: PGO Build
+
+# Round-11 cross-cutting HIGH-4: wire the round-9/10 PGO scaffolding
+# (scripts/pgo.sh) into a scheduled CI job so the optimized binary is
+# produced regularly without manual operator effort. The script itself
+# already implements the four-phase instrument -> profile -> merge ->
+# rebuild flow; this workflow runs it weekly and uploads the resulting
+# binary as an artifact for downstream consumers (perf benches, release
+# candidates).
+#
+# Trigger model:
+#   * `workflow_dispatch` — operators run on demand from the Actions UI.
+#   * `schedule` — weekly Sunday 06:00 UTC. Off-peak; runs after the
+#     soak-weekly job (Sunday 04:00) so they share cache warmth without
+#     racing the same `Swatinem/rust-cache` shared-key.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 0' # weekly Sunday 06:00 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Match scripts/pgo.sh and the rest of CI: `+sse4.2,+pclmulqdq` is the
+  # target-feature baseline for the released binary. Without it the
+  # PGO-instrumented build would diverge from what users actually run.
+  RUSTFLAGS: "-C target-feature=+sse4.2,+pclmulqdq"
+
+jobs:
+  pgo:
+    name: PGO instrument-profile-rebuild
+    runs-on: ubuntu-latest
+    # Instrumented + profiled + final rebuild each takes ~equivalent of a
+    # full release build; budget 90 minutes for the three sequential
+    # cargo invocations + criterion's profiling run.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + llvm-tools-preview
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      # Symlink llvm-profdata onto PATH so `pgo.sh` can find it without
+      # hardcoding sysroot lookups. Ships under
+      # $(rustc --print sysroot)/lib/rustlib/<host>/bin/.
+      - name: Expose llvm-profdata on PATH
+        run: |
+          SYSROOT="$(rustc --print sysroot)"
+          HOST="$(rustc -vV | grep host | cut -d' ' -f2)"
+          PROFDATA="$SYSROOT/lib/rustlib/$HOST/bin/llvm-profdata"
+          if [ -x "$PROFDATA" ]; then
+            sudo ln -sf "$PROFDATA" /usr/local/bin/llvm-profdata
+          else
+            echo "llvm-profdata not found at $PROFDATA" >&2
+            exit 1
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pgo-build
+          # The instrumented build is profile-generate=… which the cache
+          # cannot reuse across runs (different RUSTFLAGS hash). Save the
+          # final PGO-applied artefacts only.
+          cache-on-failure: false
+
+      - name: Run PGO build script
+        run: bash scripts/pgo.sh
+
+      - name: Upload PGO-optimized binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cratonvm-pgo
+          path: |
+            target/release/cratonvm
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload merged profile data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cratonvm-pgo-profdata
+          # scripts/pgo.sh leaves the merged .profdata under
+          # $PROFILE_DIR (default: /tmp/cratonvm-pgo). Upload for later
+          # inspection / replay against newer source revisions.
+          path: /tmp/cratonvm-pgo
+          if-no-files-found: ignore
+          retention-days: 14

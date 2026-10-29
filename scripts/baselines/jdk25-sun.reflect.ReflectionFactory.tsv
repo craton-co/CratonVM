@@ -1,0 +1,37 @@
+# jdk-baseline	2
+# kind	class
+# name	sun.reflect.ReflectionFactory
+# module	jdk.unsupported
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/jdk.unsupported/sun/reflect/ReflectionFactory.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	14
+# protected-methods	0
+# declared-methods	15
+# declared-fields	2
+# rows	21
+# columns	kind	name	descriptor	flags
+CLASS	sun.reflect.ReflectionFactory		public
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	()V	private
+METHOD	defaultReadObjectForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	defaultWriteObjectForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	getReflectionFactory	()Lsun/reflect/ReflectionFactory;	public,static
+METHOD	hasStaticInitializerForSerialization	(Ljava/lang/Class;)Z	public,final
+METHOD	newConstructorForExternalization	(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;	public,final
+METHOD	newConstructorForSerialization	(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;	public,final
+METHOD	newConstructorForSerialization	(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;	public
+METHOD	newOptionalDataExceptionForSerialization	(Z)Ljava/io/OptionalDataException;	public,final
+METHOD	readObjectForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	readObjectNoDataForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	readResolveForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	serialPersistentFields	(Ljava/lang/Class;)[Ljava/io/ObjectStreamField;	public,final
+METHOD	writeObjectForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+METHOD	writeReplaceForSerialization	(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;	public,final
+FIELD	delegate	Ljdk/internal/reflect/ReflectionFactory;	private,static,final
+FIELD	soleInstance	Lsun/reflect/ReflectionFactory;	private,static,final

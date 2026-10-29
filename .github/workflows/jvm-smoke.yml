@@ -1,0 +1,241 @@
+# TODO(orchestrator): refresh and re-activate.
+#
+# Parked: the RI.1..RI.17 smoke matrix runs 17 parallel application
+# reproducers on every PR. Each `scripts/smoke/riN_*.sh` runner expects an
+# externally-staged fixture (SPECjvm2008 jar, DaCapo mirror, Keycloak
+# tarball, etc.) and exits non-zero (typically `exit 78` "skipped") when
+# the mirror env var is unset. With no mirrors configured in repo secrets,
+# every slot fails red on every PR — defeating the point of CI.
+#
+# Re-activate once: (a) `SPECJVM_MIRROR_URL` / DaCapo / Keycloak mirror
+# URLs are wired as repo secrets, OR (b) the runners are updated to treat
+# `exit 78` (EX_CONFIG / skipped) as success and the workflow distinguishes
+# "skipped" from "failed" in the summary job.
+name: JVM Smoke (RI.1..RI.17)
+
+# Runs the Phase-I end-to-end application smoke matrix on every merge
+# to main and every pull request. Each job maps one-for-one to an
+# RI.N item in `docs/roadmap-any-java-app.md` and is fail/pass binary:
+# the job either emits the documented success signal in stdout/stderr,
+# or it fails the build. On failure the full stderr is uploaded as an
+# artifact so triage never has to re-run locally.
+#
+# Design constraints:
+#   * Every fixture is downloaded via `actions/cache` so a green run
+#     doesn't hit the network beyond the initial warm-up.
+#   * Any job that needs the JDK uses `actions/setup-java@v4` pinned
+#     to JDK 25 — the same version used for local reproducers.
+#   * Jobs run in parallel (one per RI.N) so a gap in one family
+#     doesn't stall the rest.
+#   * Every job has a hard 20-minute timeout to protect against
+#     infinite loops in JIT tier-up or deadlocks during GC.
+#   * A final `summary` job collates the pass/fail matrix and posts
+#     it to the PR as a comment (via actions/github-script) so
+#     roadmap-any-java-app can be updated in-place.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Smoke runs exercise the release build — the default cargo flags are
+  # deliberately verbose so crashes show full back-traces.
+  RUST_BACKTRACE: full
+  # Keep the bench jars pinned and cached.
+  DACAPO_VERSION: "9.12-MR1"
+  COMMONS_LANG_VERSION: "3.14.0"
+  JACKSON_VERSION: "2.17.1"
+  SLF4J_VERSION: "2.0.13"
+  LOGBACK_VERSION: "1.5.6"
+  NETTY_VERSION: "4.1.110.Final"
+  KOTLIN_VERSION: "1.9.24"
+  SCALA_VERSION: "3.4.2"
+  GROOVY_VERSION: "4.0.21"
+
+jobs:
+  # ---------------------------------------------------------------
+  # Stage 0 — build the JVM once, share the binary across all smokes
+  # ---------------------------------------------------------------
+  build:
+    name: Build cratonvm.exe (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release -p cratonvm-cli
+
+      - name: Archive cratonvm binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cratonvm-binary
+          path: target/release/cratonvm
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
+  # Stage 1 — Phase I smoke tests, parallel
+  # ---------------------------------------------------------------
+  smoke:
+    name: ${{ matrix.item }} / ${{ matrix.workload }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Do NOT cancel other jobs on first failure — we want the full
+      # pass/fail matrix for roadmap triage.
+      fail-fast: false
+      matrix:
+        include:
+          - item: RI.1
+            workload: SPECjvm2008-compiler
+            runner: scripts/smoke/ri1_specjvm_compiler.sh
+          - item: RI.2
+            workload: DaCapo-avrora
+            runner: scripts/smoke/ri2_dacapo_avrora.sh
+          - item: RI.3
+            workload: DaCapo-jython
+            runner: scripts/smoke/ri3_dacapo_jython.sh
+          - item: RI.4
+            workload: CommonsLang-unit-tests
+            runner: scripts/smoke/ri4_commons_lang.sh
+          - item: RI.5
+            workload: Jackson-databind-roundtrip
+            runner: scripts/smoke/ri5_jackson.sh
+          - item: RI.6
+            workload: SLF4J-Logback-file
+            runner: scripts/smoke/ri6_slf4j_logback.sh
+          - item: RI.7
+            workload: Tomcat10-embed
+            runner: scripts/smoke/ri7_tomcat.sh
+          - item: RI.8
+            workload: Jetty11-embedded
+            runner: scripts/smoke/ri8_jetty.sh
+          - item: RI.9
+            workload: SpringBoot3.2-hello
+            runner: scripts/smoke/ri9_springboot.sh
+          - item: RI.10
+            workload: Hibernate6-H2
+            runner: scripts/smoke/ri10_hibernate_h2.sh
+          - item: RI.11
+            workload: Netty4-echo-loopback
+            runner: scripts/smoke/ri11_netty_echo.sh
+          - item: RI.12
+            workload: Kotlin-hello
+            runner: scripts/smoke/ri12_kotlin.sh
+          - item: RI.13
+            workload: Scala3-hello
+            runner: scripts/smoke/ri13_scala.sh
+          - item: RI.14
+            workload: Groovy4-script
+            runner: scripts/smoke/ri14_groovy.sh
+          - item: RI.15
+            workload: Quarkus3-fast-jar
+            runner: scripts/smoke/ri15_quarkus.sh
+          - item: RI.16
+            workload: Keycloak16-standalone
+            runner: scripts/smoke/ri16_keycloak16.sh
+          - item: RI.17
+            workload: Keycloak26-quarkus
+            runner: scripts/smoke/ri17_keycloak26.sh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'oracle'
+          java-version: '25'
+
+      - name: Download cratonvm binary
+        uses: actions/download-artifact@v4
+        with:
+          name: cratonvm-binary
+          path: target/release
+
+      - name: Make runner executable
+        run: |
+          chmod +x target/release/cratonvm
+          chmod +x ${{ matrix.runner }}
+
+      # Per-item fixture cache — each runner drops its fixtures into
+      # `.smoke-cache/<item>` so subsequent runs skip the download.
+      - name: Cache smoke fixtures
+        uses: actions/cache@v4
+        with:
+          path: .smoke-cache/${{ matrix.item }}
+          key: smoke-fixtures-${{ matrix.item }}-v1
+
+      - name: Run ${{ matrix.item }} reproducer
+        env:
+          CRATONVM: ${{ github.workspace }}/target/release/cratonvm
+          FIXTURE_CACHE: ${{ github.workspace }}/.smoke-cache/${{ matrix.item }}
+          JAVA_HOME_FOR_SMOKE: ${{ env.JAVA_HOME }}
+        run: ${{ matrix.runner }} 2>&1 | tee smoke-stdout.log
+
+      - name: Upload failure artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.item }}-failure
+          path: |
+            smoke-stdout.log
+            hs_err_pid*.log
+            core.*
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # Stage 2 — roll-up summary for dashboards / PR comments
+  # ---------------------------------------------------------------
+  summary:
+    name: Smoke matrix summary
+    needs: smoke
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Emit summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+              per_page: 100,
+            });
+            const rows = jobs.data.jobs
+              .filter(j => j.name.startsWith("RI."))
+              .map(j => `| ${j.name} | ${j.conclusion || j.status} |`)
+              .join("\n");
+            const body = [
+              "### JVM Smoke Matrix",
+              "",
+              "| Item | Result |",
+              "|---|---|",
+              rows,
+            ].join("\n");
+            core.summary.addRaw(body).write();
+            if (context.eventName === "pull_request") {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

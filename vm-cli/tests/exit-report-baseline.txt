@@ -1,0 +1,52 @@
+# Direct `eprintln!`/`eprint!` sites printing a `[cratonvm]` line, per file.
+# Frozen by vm-cli/tests/exit_report_ratchet.rs (JIT round 23 wave 1 L11): a file may not grow.
+# Route new exit narration through cratonvm_types::exit_report! instead.
+# ZGC round zt (merged by t28, raised by t29): gc/src/zgc.rs 1->3 (CRATONVM_ZGC_LOAD_BARRIER opt-in warnings),
+# native-io/src/lib.rs 0->1, native-builtins/src/lib.rs 0->1, lang_system.rs 11->13, vm-cli/src/main.rs 139->144:
+# print-loss / print-state / alloc-spill-sink / main-entered diagnostics, each printed only under its CRATONVM_DBG key.
+classloading/src/class_manager.rs 1
+classloading/src/proxy_gen.rs 1
+classloading/src/resolution.rs 2
+gc/src/compressed_oops.rs 1
+gc/src/zgc.rs 3
+jit/src/lib.rs 1
+jit/src/tiered.rs 27
+jit/src/x64/licm.rs 1
+native-api/src/init_level.rs 1
+native-api/src/unretire.rs 3
+native-builtins/src/craton_gpu.rs 2
+native-builtins/src/date_format_fast.rs 1
+native-builtins/src/ffm_fallback_linker.rs 1
+native-builtins/src/ffm_fast.rs 1
+native-builtins/src/jfr_backend.rs 2
+native-builtins/src/lang_class.rs 2
+native-builtins/src/lang_system.rs 13
+native-builtins/src/lib.rs 1
+native-builtins/src/math_bignum.rs 4
+native-builtins/src/panama_upcall.rs 3
+native-builtins/src/quarkus_staticinit.rs 1
+native-builtins/src/spring_startup_bootstrap.rs 1
+native-builtins/src/util_concurrent_ext.rs 2
+native-io/src/lib.rs 1
+native-io/src/socket_fast_io.rs 6
+types/src/hotspot_alignment.rs 1
+types/src/lib.rs 27
+vm-cli/src/main.rs 144
+vm-cli/src/rss_report.rs 2
+vm/src/dispatch_trace.rs 1
+vm/src/jit/conservative_roots.rs 5
+vm/src/jit/helpers.rs 4
+vm/src/jit/helpers/access.rs 1
+vm/src/jit/helpers/alloc.rs 2
+vm/src/jit/helpers/dispatch.rs 1
+vm/src/native/jni.rs 1
+vm/src/runtime/instrument_census.rs 1
+vm/src/runtime/interp_census.rs 4
+vm/src/runtime/interpreter.rs 1
+vm/src/runtime/interpreter/deopt_resume.rs 1
+vm/src/runtime/interpreter/gc_and_alloc.rs 3
+vm/src/runtime/native_oom.rs 1
+vm/src/threading/monitor.rs 1
+vm/src/threading/thread_registry.rs 3
+vm/src/vm/vm_exec.rs 2
+vm/src/vm/vm_init.rs 4

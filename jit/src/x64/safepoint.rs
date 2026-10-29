@@ -1,0 +1,5665 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! Safepoint polls, shadow-stack publication and oop maps.
+//!
+//! The collector half of the compiled frame. A safepoint is only sound if
+//! every live reference is findable when the collector stops the world, so
+//! each poll site has to spill the operand stack, publish register-homed oops,
+//! and record a map the collector can walk and — under a moving young
+//! generation — rewrite.
+//!
+//! `can_elide_self_call_register_spill` and
+//! `moving_young_safepoint_coverage_complete` are the two places where that
+//! obligation is discharged by proof rather than by emission; both are
+//! deliberately conservative, because the failure mode of being wrong here is
+//! a reclaimed live object rather than a wrong answer.
+
+use super::*;
+
+/// Whether a CONDITIONAL / switch back edge may leave an OSR body for the
+/// interpreter (`branch_mode_exit_target`). A kill switch, not a gate: it was
+/// off for wave 13 because the Linux run of
+/// `a_nonzero_conditional_back_edge_verdict_leaves_an_osr_body_at_its_branch`
+/// read the counter as 0. That 0 was the ROTATED shape's correct value — its
+/// bottom test (and so its poll) runs once before the first body iteration —
+/// and the test demanded `1..1000`. The test now pins the exact counter
+/// against the number of polls taken, per shape. See
+/// `docs/feature-designs/jit-ir-optimizations.md`.
+const BRANCH_MODE_EXITS_ENABLED: bool = true;
+
+/// A conditional back edge with values on the operand stack BELOW its own
+/// operands (hand-written or non-javac bytecode: javac's loop tests leave
+/// nothing else live) gets the branch map like any other, with the whole
+/// stack in its frame: the arm flushed every operand to its frame word before
+/// the poll, and the admission's frame check
+/// ([`branch_exit_frame_is_transferable`]) still refuses an operand with no
+/// width source. Until the i41 page's shape-3 work the admission demanded
+/// the stack be exactly the branch's operands (`operands-below-the-branch`),
+/// so such a loop finished its activation compiled. `false` restores that.
+const BRANCH_EXITS_WITH_OPERANDS_BELOW_ENABLED: bool = true;
+
+/// An unconditional back edge whose loop header's `OsrExit` map is refused
+/// (an `invokedynamic` header, no map recorded there, a header frame the
+/// transfer would not take) leaves through a map at the `goto`'s own bci
+/// instead ([`Compiler::emit_back_edge_safepoint_poll`]), as a `goto` with a
+/// live stack has since wave 18. Before the i41 page's shape-3 work such a
+/// poll had no exit. `false` restores that.
+const BACK_EDGE_GOTO_EXIT_FALLBACK_ENABLED: bool = true;
+
+/// Whether a METHOD-ENTRY (non-OSR-tier) single-pass body's back-edge and
+/// self-tail polls may leave for the interpreter
+/// (`mode_exit_target`, `branch_mode_exit_target`,
+/// `self_tail_mode_exit_target`). A kill switch, not a gate, like
+/// [`BRANCH_MODE_EXITS_ENABLED`]. Such a poll leaves only on
+/// `crate::SAFEPOINT_VERDICT_POLLING_BODY` (about this body since wave 17),
+/// and the VM's stash sinks take the
+/// exit uncharged (`jvmti_events::exit_left_for_the_interpreter`). `false`
+/// restores the wave-14 codegen of every method-entry body exactly.
+/// Interpreter round i1 wave 15, lane L3
+/// (`i9-L5-jvmti-frames-already-compiled-finish-compiled`, stage 3).
+const METHOD_ENTRY_MODE_EXITS_ENABLED: bool = true;
+
+/// The synthetic bytecode pc the METHOD-ENTRY safepoint poll records.
+///
+/// No real method's bytecode is anywhere near 4 GiB, so this can never collide
+/// with a genuine bci in the sp-id-keyed oop-map lookup — which is the whole
+/// reason `emit_safepoint_poll_prologue` uses it instead of the `0` that
+/// `cur_bc_pc` still holds at that point. Named rather than spelled
+/// `u32::MAX as usize` at each site, because `Compiler::local_oop_mask_at_current_pc`
+/// has to recognise it and a bare literal is not a thing a reader can look up.
+pub(crate) const ENTRY_POLL_BC_PC: usize = u32::MAX as usize;
+
+/// "This frame has not reached a safepoint yet" -- the value the single-pass
+/// prologue stamps into the reserved safepoint-id slot.
+///
+/// Crate-visible because the aarch64 backend stamps and stores the SAME two
+/// synthetic pcs: they are a property of the safepoint-id CONTRACT the runtime
+/// reads (`active_safepoint_id` -> `OopMapEntry::bytecode_pc`), not of x64.
+///
+/// The IR backend can use `0` for this, because its ids are a monotonic
+/// counter that starts at 1. This backend stores the BYTECODE PC, and **bci 0
+/// is legal** -- a constructor or a method that opens with `new`/an `invoke` is
+/// a very common shape -- so `0` there is ambiguous between "at bci 0" and
+/// "never stored", and stamping it would let an unsafepointed frame match the
+/// bci-0 map and be relocated against it.
+///
+/// `u32::MAX - 1` is unambiguous from both sides: no real bytecode pc is
+/// anywhere near 4 GiB, and it is distinct from [`ENTRY_POLL_BC_PC`], the other
+/// synthetic pc this backend uses. `find_oop_map_for_safepoint_id` finds
+/// nothing for it, so the coverage proof fails CLOSED -- which is the point.
+/// The hazard it removes is the one that is NOT loud: an uninitialised slot can
+/// read as a valid id for the method standing at that rbp, and relocation then
+/// rewrites against the wrong program point's map.
+pub(crate) const SP_ID_UNSET_BC_PC: usize = (u32::MAX - 1) as usize;
+
+/// `CRATONVM_JIT_RAX_DEAD_AT_CALL` -- default ON, `=0` restores the register
+/// oop mask's unconditional RAX bit at every Java-invoke safepoint (gen
+/// r5w6/oomjit10) and, since ngr (2026-10-27), at every array-allocation
+/// helper call and `invoke_dispatch` call
+/// (`emit_pre_safepoint_spill_before_helper_call`). See the RAX
+/// section of `Compiler::live_oop_register_mask`.
+/// Baked into each map at compile time; read per safepoint, no static
+/// (`jit/tests/process_global_statics_ratchet.rs`).
+pub(super) fn rax_dead_at_call_enabled() -> bool {
+    cratonvm_types::flags::runtime_flag_default_on("CRATONVM_JIT_RAX_DEAD_AT_CALL")
+}
+
+/// `CRATONVM_JIT_DEBUGGER_LOCALS_HOME_SPILL` (interpreter round i6 wave 120,
+/// lane L2; default OFF; first stage of
+/// `i43-L1-proposal-deoptimize-a-compiled-frame-for-the-frame-commands`): in a
+/// compile a debugger may read (`BackendRequest::debugger_observes_locals`),
+/// every safepoint stores every register-homed GPR local to its home slot.
+/// Read per safepoint of such a compile only; no static.
+pub(super) fn debugger_locals_home_spill_enabled() -> bool {
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_DEBUGGER_LOCALS_HOME_SPILL")
+}
+
+// gcg g6/jm (2026-10-02): two gcg g1/s opt-ins are DELETED, no row argued for
+// either at round close (`g6-jm-report.md`):
+// - `CRATONVM_JIT_SPILL_ZERO_PUBLISHED_REGS` zeroed the blind-spill image slots
+//   of the RAX / `ARG_REGS` a narrowed or elided spill skipped. Its d6u holder
+//   (the post-call stub's `reg=rcx` word) is dropped by the scanner's default-on
+//   stub map (`CRATONVM_GC_SP_STUB_OWN_MAP`), and no row ever failed on the
+//   call position alone. A skipped slot still keeps an earlier safepoint's
+//   value (`licm.rs` `narrow_safepoint_spill_enabled`); the band scan
+//   re-validates it.
+// - `CRATONVM_JIT_SP_LOCAL_LIVENESS` dropped every liveness-dead reference
+//   local from the maps. It never changed a row (vg2, vg3: identical arms),
+//   and no HotSpot-deterministic control can exist for it, because HotSpot
+//   drops a dead local only in its own compiled frames. The shared-register
+//   rule (`dead_shared_register_oop_locals`) is unchanged.
+
+// gch h4/jm (2026-10-09) -- the second build of the same rule, now with a
+// positive control: `gch-h3fd-proposal-single-pass-call-site-maps-keep-dead-locals-CLOSED-20261015`.
+//
+// With both interpreter doors holding an owning body's arguments weakly (d9d
+// P3 + P2), `Gcd1ArgPinSpecialProbe more settle` still fails `spliced-direct`
+// 8/8 on every collector (vh3-fd F on h3a), and the whole-file census names ONE
+// holder: `relay`'s single-pass frame, `off=8 region=java-local sp=2
+// in_map=true` (`cat=11 jit-shadow-stack-value`) -- the home of parameter `a`,
+// which `relay(long[] a, boolean check) { return dropStatic(a, check); }` never
+// reads after staging the call. The call-site map names it because the
+// single-pass Stage 2 is the forward "holds a reference" dataflow
+// (`local_oop_masks`), not liveness; HotSpot's C1/C2 maps come from liveness
+// and HotSpot passes the case (its `relay` is compiled after the warm-up). So,
+// unlike g1/s, a HotSpot-deterministic control exists: the `more settle` rows.
+//
+// The rule is the g1/s one: at a safepoint whose pc the bytecode liveness
+// covers (`local_liveness`, which already unions every covering handler's
+// live-in), a reference local dead there AND at the next instruction, and
+// not in the debugger's kept set, is dropped from the ONE filtered set every
+// GC consumer reads (`dead_shared_register_oop_locals`): the map's Stage 2,
+// the published `local_oop_mask` oracle (so the band scan's default-on
+// java-local claim drops the home word too), the register oop mask, the
+// shadow push and its reloads. The DEOPT frame state is not one of them: it is
+// built by `build_frame_state_at` from the same liveness table, which already
+// describes such a local `Undefined`. Refused at a debugger-observed compile
+// and inside a splice (`sp_map_local_liveness_applies`); gci i8/sp's opt-in
+// `CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS_IN_SPLICES` lifts the splice refusal
+// for the outer method's locals.
+
+/// `CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS=1` -- opt-in (default OFF), gch h4/jm:
+/// the single-pass GC maps drop every liveness-dead reference local, not only
+/// one whose register another local shares (see the section above). Read per
+/// safepoint at compile time, only when the cheap refusals pass; no static
+/// (`jit/tests/process_global_statics_ratchet.rs`).
+pub(super) fn sp_map_local_liveness_enabled() -> bool {
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS")
+}
+
+/// `CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS_IN_SPLICES=1` -- opt-in (default OFF),
+/// gci i8/sp: lets the [`sp_map_local_liveness_enabled`] rule speak at a
+/// safepoint INSIDE a splice too (a call a spliced body makes), for the outer
+/// method's own locals only; see `Compiler::sp_map_local_liveness_applies`.
+/// Without `CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS=1` it does nothing. Read per
+/// safepoint at compile time, only inside a splice; no static.
+pub(super) fn sp_map_local_liveness_in_splices_enabled() -> bool {
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS_IN_SPLICES")
+}
+
+// OOM21-6 / ARGWIN21-6 (re-landed 2026-10-26; JIT round 21 lane argwin's fix,
+// which merge `624fae0b49` dropped; page
+// `jr21-compiled-caller-roots-its-outgoing-arguments-for-the-whole-callee-FIXED-20261026.md`):
+// the [`sp_map_local_liveness_enabled`] rule UNNAMES a dead local without
+// zeroing it, so it is sound only if it is MONOTONE -- once a safepoint dropped
+// the local, every later safepoint before its next store must drop it too, or
+// the later map publishes a home the earlier (moving) collection never
+// relocated: a stale precise root. Three places broke that:
+//
+// * inside a splice the rule was refused unless the second opt-in
+//   [`sp_map_local_liveness_in_splices_enabled`] was set -- a drop at a call,
+//   then a spliced allocating static before the local's next store, and the
+//   splice's maps named the home again;
+// * past a gap longer than 64 bytes to the next instruction (a switch payload)
+//   the rule dropped nothing;
+// * at a pc the liveness table does not cover (unreachable code the forward
+//   "holds a reference" dataflow still reaches) it dropped nothing.
+//
+// Under `CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS_MONOTONE` (default ON; acts only
+// with the opt-in rule on) the rule speaks inside splices (gci i8/sp's own
+// argument: the candidates are the outer method's locals at the outer invoke's
+// pc), searches the whole table for the next instruction and, with none,
+// answers from the pc's own liveness (the last reachable instruction has no
+// fall-through and writes no local for code after it), and at an uncovered pc
+// drops every candidate (no reachable path runs that safepoint, and dropping
+// is the direction that stays monotone). The shared-register default rule is
+// byte-for-byte unchanged. `=0` restores the gch h4/jm + gci i8/sp behaviour.
+
+/// `CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS_MONOTONE` -- default on, `=0` off. See
+/// the section above.
+pub(super) fn sp_map_local_liveness_monotone_enabled() -> bool {
+    cratonvm_types::flags::runtime_flag_default_on("CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS_MONOTONE")
+}
+
+// gcg g3/v (2026-10-01) -- the build of
+// `gcg-g1s-proposal-oop-map-records-the-spill-images-written-set-20261001.md`:
+// the zero-cost form of `CRATONVM_JIT_SPILL_ZERO_PUBLISHED_REGS`.
+//
+// Instead of zeroing the image slots a narrowed / elided spill skipped, every
+// spill records WHICH slots it wrote (`Compiler::note_spill_written`), and the
+// map of its id publishes the merge as `OopMapEntry::spill_written`; the band
+// scan (`vm/src/jit/conservative_roots.rs`, `spill_slot_may_hold_oop` over
+// `ActiveMapFacts::spill_written`) skips a slot outside it, as a root and as a
+// pin. No store in compiled code; two bytes per map.
+//
+// Why a slot outside the set is dead at the safepoint: the selection
+// (`oop_capable_spill_regs`) drops only a register that holds no reference
+// the frame does not already hold elsewhere (a primitive local's home, a
+// register the method never uses, RAX / `ARG_REGS` whose values the site
+// already wrote to frame slots), and a metadata-only safepoint is licensed by
+// "no live reference is only in a register" (`call_spill_elision_core`). So
+// an unwritten slot holds an EARLIER safepoint's value of a register whose
+// current value this safepoint does not need -- the exact argument the zeroing
+// switch rests on, without the stores. The mutator never reads the image.
+//
+// Fail-closed shape:
+//   * a map's set is the UNION over every event of its id, in either emission
+//     order (`note_spill_written` widens maps already pushed at the id), so a
+//     spill that pairs with no map, a splice sharing the outer invoke's id, or
+//     a rolled-back inline attempt can only widen it;
+//   * a `None` event (the `=1` callee-saved layout, `nostore`, no image) makes
+//     the whole id `None`, and so does a map whose id saw no event at all;
+//   * off the switch nothing is recorded and every map publishes `None`.
+//
+// It also covers the shape no register-mask fix can: a direct call with a
+// reference argument, where `live_oop_register_mask` abstains
+// (`STAGED_ARGS_UNMAPPED`) -- the `Gcd1PinnedCalleeOomeProbe` `reg=rcx
+// mask=none` holder.
+
+/// `CRATONVM_JIT_SPILL_WRITTEN_SET` -- default ON since interpreter round i5 (`=0` off): publish each
+/// map's blind-spill written set (see the section above). Read per safepoint
+/// at compile time, no static.
+pub(super) fn spill_written_set_enabled() -> bool {
+    // Default ON since interpreter round i5's GC triage (gc wave 9 lane gcC:
+    // sound and free on every row; it only drops retention HotSpot lacks).
+    // `=0` turns it off.
+    cratonvm_types::flags::runtime_flag_default_on("CRATONVM_JIT_SPILL_WRITTEN_SET")
+}
+
+/// Every [`ALL_SPILL_GPRS`] position: a full, un-narrowed spill's written set.
+const ALL_SPILL_IMAGE_MASK: u16 = 0x3FFF;
+
+/// Two events' written sets for one id: the union, or `None` (no claim) the
+/// moment either cannot say.
+fn merge_spill_written(a: Option<u16>, b: Option<u16>) -> Option<u16> {
+    Some(a? | b?)
+}
+
+/// The written set a map of id `pc` publishes: the merge over every recorded
+/// event of `pc` (kept merged per id, `Compiler::spill_written_by_pc`), or
+/// `None` when there is none.
+fn spill_written_for(by_pc: &rustc_hash::FxHashMap<u32, Option<u16>>, pc: u32) -> Option<u16> {
+    by_pc.get(&pc).copied().flatten()
+}
+
+// gch h4/jm (2026-10-09) -- the `[sp-band]` census (DBG,
+// `CRATONVM_DBG_SP_BAND_OWNERS`): who owns each operand-spill word below a
+// single-pass safepoint's live cursor, as the compiler's own model says at the
+// moment it builds the map.
+//
+// Why: `gcg-g5jm`'s one compiled-frame holder is `caseOomeCompiledCallee off=80
+// region=operand-spill tier=sp sp=63 live_hi=104 in_map=false` -- a word below
+// the cursor the map does not name. Two different remedies fit two different
+// owners, and the collector's census cannot tell them apart: a current operand
+// the stack model calls a primitive (`OopMapEntry::non_oop_stack_slots`, the
+// claim of `gch-h3yc-proposal-single-pass-non-oop-operand-slots-are-not-roots`)
+// or a word no current operand owns at all (a popped argument's source slot, a
+// primitive staged argument, a service copy). This prints the answer once per
+// compiled safepoint, at compile time (no run-time cost). Classes:
+// `oop` (named by the map), `prim` (a current operand the model calls a
+// non-reference), `inline-local` (a live splice's local), `unowned`
+// (everything else below the cursor).
+
+/// The `[sp-band]` class of the operand-spill word at `[rbp - off]` (see the
+/// section above). `slots` are the map's named words, `prims` the current
+/// operands' non-reference words, `inline` the live splices'
+/// `(local_base, num_locals, _)`.
+pub(super) fn sp_band_owner(
+    off: i32,
+    slots: &[i16],
+    prims: &[i16],
+    inline: &[(i32, u16, u64)],
+) -> &'static str {
+    let named = |list: &[i16]| i16::try_from(off).is_ok_and(|o| list.contains(&o));
+    if named(slots) {
+        "oop"
+    } else if named(prims) {
+        "prim"
+    } else if inline
+        .iter()
+        .any(|&(base, n, _)| off >= base && off < base.saturating_add(i32::from(n) * 8))
+    {
+        "inline-local"
+    } else {
+        "unowned"
+    }
+}
+
+/// The `words=` field of one `[sp-band]` line: `off:class` for every word in
+/// `[lo, hi)` (8-byte steps), comma-separated; empty when the range is.
+pub(super) fn sp_band_owner_words(
+    lo: i32,
+    hi: i32,
+    slots: &[i16],
+    prims: &[i16],
+    inline: &[(i32, u16, u64)],
+) -> String {
+    let mut out = String::new();
+    let mut off = lo;
+    while off < hi {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{off}:{}",
+            sp_band_owner(off, slots, prims, inline)
+        ));
+        off = off.saturating_add(8);
+    }
+    out
+}
+
+/// `CRATONVM_DBG_SP_BAND_OWNERS` -- DBG, default off. `1` prints a `[sp-band]`
+/// line for every single-pass safepoint map; any other non-empty value is a
+/// substring of the method label and prints only the matching methods'. Read
+/// per map at compile time, no static. gci i1/sp: also gates the
+/// `[sp-band-zero]` line of `op_invoke.rs::emit_zero_dead_arg_sources`.
+pub(super) fn sp_band_owners_wanted(method_label: &str) -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_DBG_SP_BAND_OWNERS") {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && (v == "1" || method_label.contains(v))
+        }
+        Err(_) => false,
+    }
+}
+
+/// gcg g3/v: may a mask over [`ALL_SPILL_GPRS`] positions speak for this
+/// frame's blind-spill image, slot `i` = bit `i`? `true` when there is no
+/// image at all (the mask then only names registers, which
+/// `caller_register_claim` reads) or when the image is the `=all` layout;
+/// `false` for the callee-saved-only `=1` image, whose slots are
+/// `alloc_used_regs`-indexed.
+fn image_slots_follow_mask_bits(spill: bool, spill_all: bool, reg_spill_base: i32) -> bool {
+    !spill || reg_spill_base == 0 || spill_all
+}
+
+/// The three bytes before the imm32 of `CMP r64, imm32` — `REX.W [+ REX.B]`,
+/// opcode `0x81`, ModRM `mod=11 /7 rm=r`.
+///
+/// A free function with a test rather than three inline literals, because the
+/// inline version carried REX.B unconditionally (`0x49`) on the strength of a
+/// comment asserting the register was always `r8..r15`. It is not: shadow homes
+/// come from `SCRATCH_REGS` **or** `LOCAL_REGS`, and `LOCAL_REGS` holds RBX on
+/// every platform and RSI/RDI on Windows. Forcing REX.B on rewrites the ModRM
+/// `r/m` field to `r + 8`, i.e. compares an entirely different register.
+pub(super) const fn cmp_r64_imm32_opcode(r: u8) -> [u8; 3] {
+    // 0x48 = REX.W; |0x01 adds REX.B, needed only for r8..r15.
+    let rex = 0x48 | if r >= 8 { 0x01 } else { 0x00 };
+    [rex, 0x81, 0xC0 | (7 << 3) | (r & 7)]
+}
+
+/// Why a safepoint's oop map was recorded as INCOMPLETE, counted per cause.
+///
+/// `emit_oop_map_for_safepoint` withholds such a safepoint's pc from
+/// `mapped_safepoint_pcs`, which turns `CompiledMethod::fully_oop_covered`
+/// false for the whole method, which the runtime reports as one
+/// `map_coverage=N` counter on the `[jitroots]` line. That aggregate is where
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` ran out of
+/// road: it names the field, never the reason, and the six ways to get there
+/// want six different repairs.
+///
+/// Process-global relaxed counters — compilation is not on any hot path and
+/// these are read once, at the end of a run, by `CRATONVM_DBG_OOPCOV`.
+pub mod map_incomplete_cause {
+    use std::sync::atomic::AtomicUsize;
+    /// The operand-stack oop mark vector was not exact at this safepoint.
+    pub static MARKS_INEXACT: AtomicUsize = AtomicUsize::new(0);
+    /// A marked operand-stack oop was still register/scratch/xmm resident.
+    pub static OOP_STILL_IN_REGISTER: AtomicUsize = AtomicUsize::new(0);
+    /// An operand-stack frame slot sits further than `i16::MAX` from `rbp`.
+    pub static STACK_OFF_TOO_DEEP: AtomicUsize = AtomicUsize::new(0);
+    /// A local-variable home sits further than `i16::MAX` from `rbp`.
+    pub static LOCAL_OFF_TOO_DEEP: AtomicUsize = AtomicUsize::new(0);
+    /// A staged invoke-argument home sits further than `i16::MAX` from `rbp`.
+    pub static STAGED_ARG_OFF_TOO_DEEP: AtomicUsize = AtomicUsize::new(0);
+    /// A reference was staged somewhere no map can name (native-ABI outgoing
+    /// args, direct-call service slots, inlined-callee parameter locals).
+    pub static STAGED_ARG_UNMAPPABLE: AtomicUsize = AtomicUsize::new(0);
+    /// A live inline (spliced-callee) scope could not be named: its local home
+    /// sits further than `i16::MAX` from `rbp`, or its dataflow could not
+    /// classify the callee pc at all. See `Compiler::inline_oop_scopes`.
+    pub static INLINE_LOCAL_UNMAPPABLE: AtomicUsize = AtomicUsize::new(0);
+
+    /// The local-oop dataflow could not describe this method's locals AT ALL,
+    /// so the map names none of them.
+    ///
+    /// `compute_local_oop_masks` returns EMPTY vectors above its supported local
+    /// count, and Stage 2 is wrapped in `if !self.local_oop_masks.is_empty()` --
+    /// so for such a method it contributed no slots, bumped no cause, and did
+    /// not set `map_incomplete`. The map shipped naming no reference locals
+    /// while `fully_oop_covered` stayed TRUE.
+    ///
+    /// This is a DIFFERENT statement from [`LOCAL_MASK_UNREACHED`], which is
+    /// about one pc inside a method the dataflow did run on. Here it never ran.
+    ///
+    /// MEASURED on `probes/OopMapWideLocals.java` (83 locals, 80 of them live
+    /// references across allocations that collect): `frameslot=true` with all
+    /// eight other causes ZERO and `mapped=409` of 409 safepoints, while the
+    /// SHADOW census read `locals64=409`. One half of the machinery knew and
+    /// the half that publishes the claim did not.
+    pub static LOCAL_MASK_UNSUPPORTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// The local-oop dataflow never reached this safepoint's pc, so the map
+    /// names NO reference locals for it.
+    ///
+    /// `record_oop_map` reads the locals through `local_oop_mask_at_current_pc()`
+    /// inside an `if let Some(..)` with no `else`: a `None` there contributes no
+    /// slots, sets no `map_incomplete`, and bumps nothing, so the safepoint
+    /// would publish a map claiming complete coverage while every live reference
+    /// local is unnamed. That is a real hole in the shape of the one
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829-RETIRED-20260909.md` is about.
+    ///
+    /// **Measured 2026-09-02, and it reads ZERO** on every method of
+    /// `probes/SafepointMapResidue.java`, including the one whose frames the
+    /// residue instrument flags. The dataflow does reach those safepoints and
+    /// does hand back a mask, and the mask is correct — `javap -c` on the
+    /// flagged method shows the slot the instrument called a missed root is an
+    /// `int` local at that pc. Kept as a ruled-out hypothesis rather than a
+    /// live lead: the `tlab_retire_skipped` pattern, where the point of
+    /// printing a zero is that the hypothesis it eliminates is a good one.
+    ///
+    /// The hole it guards is still real even though it has not been observed:
+    /// a `None` from `local_oop_mask_at_current_pc()` would contribute no
+    /// slots, set no `map_incomplete` and bump nothing, so the safepoint would
+    /// publish a map claiming complete coverage while every live reference
+    /// local went unnamed. This counter is what would show that happening.
+    pub static LOCAL_MASK_UNREACHED: AtomicUsize = AtomicUsize::new(0);
+
+    /// How many causes [`snapshot`] returns.
+    ///
+    /// Named so the census printer can assert against it. `driver.rs` printed
+    /// SIX of these seven for as long as the seventh existed, which made a run
+    /// whose only unnameable references were inline-scope locals read as
+    /// `causes(... all zero)` -- "no cause", from a cause census. The
+    /// 2026-08-30 diagnosis that concluded "One cause, `staged_unmappable`"
+    /// was made from that line.
+    pub const COUNT: usize = 9;
+
+    /// `(marks_inexact, oop_in_register, stack_deep, local_deep, staged_deep,
+    /// staged_unmappable, inline_local_unmappable, local_mask_unreached,
+    /// local_mask_unsupported)`.
+    pub fn snapshot() -> [usize; COUNT] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            MARKS_INEXACT.load(Relaxed),
+            OOP_STILL_IN_REGISTER.load(Relaxed),
+            STACK_OFF_TOO_DEEP.load(Relaxed),
+            LOCAL_OFF_TOO_DEEP.load(Relaxed),
+            STAGED_ARG_OFF_TOO_DEEP.load(Relaxed),
+            STAGED_ARG_UNMAPPABLE.load(Relaxed),
+            INLINE_LOCAL_UNMAPPABLE.load(Relaxed),
+            LOCAL_MASK_UNREACHED.load(Relaxed),
+            LOCAL_MASK_UNSUPPORTED.load(Relaxed),
+        ]
+    }
+}
+
+/// Why a safepoint's SHADOW claim (`OopMapEntry::moving_young_coverage_complete`)
+/// came out false, counted per cause.
+///
+/// The sibling of [`map_incomplete_cause`], for the other of the two coverage
+/// notions. `CompiledMethod::fully_shadow_covered` ANDs this flag over every
+/// safepoint of a method, and the OSR fallback reads that aggregate — so a
+/// single false here refuses relocation for every collection with one of this
+/// method's frames live. Six causes, six different repairs.
+pub mod shadow_incomplete_cause {
+    use std::sync::atomic::AtomicUsize;
+    /// Moving-young is off, or the compile already failed.
+    pub static GATE_OFF_OR_FAILED: AtomicUsize = AtomicUsize::new(0);
+    /// `stack.len() != stack_oop_marks.len()` — the lockstep invariant broke.
+    pub static MARK_VECTOR_DESYNC: AtomicUsize = AtomicUsize::new(0);
+    /// The operand-stack oop marks are not exact at this safepoint (a revived
+    /// dead-code merge reconstructed the stack at a nonzero depth).
+    pub static MARKS_INEXACT: AtomicUsize = AtomicUsize::new(0);
+    /// A marked oop is in a scratch or XMM slot, which the push cannot name.
+    pub static OOP_IN_SCRATCH_OR_XMM: AtomicUsize = AtomicUsize::new(0);
+    /// More than 64 locals, so `color_graph`'s mask cannot describe them all.
+    pub static TOO_MANY_LOCALS: AtomicUsize = AtomicUsize::new(0);
+    /// The forward "must be oop" dataflow never reached this bytecode pc, so
+    /// there is no local oop mask to publish from.
+    pub static LOCAL_OOP_DATAFLOW_UNREACHED: AtomicUsize = AtomicUsize::new(0);
+    /// The push was not emitted at all (shadow gate off, helper unwired, or the
+    /// prologue reserved no thread slot).
+    pub static PUSH_NOT_EMITTED: AtomicUsize = AtomicUsize::new(0);
+    /// A live inline (spliced-callee) scope could not say which of its locals
+    /// hold references at the callee pc being emitted, so the splice's frame
+    /// slots cannot be published. See `Compiler::inline_oop_scopes`.
+    pub static INLINE_SCOPE_UNMAPPED: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(gate_off, desync, marks_inexact, oop_in_scratch, too_many_locals,
+    /// dataflow_unreached, push_not_emitted, inline_scope_unmapped)`.
+    pub fn snapshot() -> [usize; 8] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            GATE_OFF_OR_FAILED.load(Relaxed),
+            MARK_VECTOR_DESYNC.load(Relaxed),
+            MARKS_INEXACT.load(Relaxed),
+            OOP_IN_SCRATCH_OR_XMM.load(Relaxed),
+            TOO_MANY_LOCALS.load(Relaxed),
+            LOCAL_OOP_DATAFLOW_UNREACHED.load(Relaxed),
+            PUSH_NOT_EMITTED.load(Relaxed),
+            INLINE_SCOPE_UNMAPPED.load(Relaxed),
+        ]
+    }
+}
+
+impl Compiler {
+    // -----------------------------------------------------------------------
+    // Frame layout, prologue and epilogue
+    // -----------------------------------------------------------------------
+    //
+    // Moved to `x64/frames.rs`. The offsets computed there are read by the oop
+    // maps, the deopt snapshots and the OSR trampoline, so they are a contract
+    // rather than a private detail.
+
+    /// Round-8 wave-3 HIGH fix (round-4 #15 / round-5 #9 / round-7 #5):
+    /// defensive callee-saved register spill before a safepoint.
+    ///
+    /// Any Java local assigned to a callee-saved GPR (RBX, R12-R15,
+    /// plus RSI/RDI on Windows) holds its live value EXCLUSIVELY in
+    /// the register between aload/astore opcodes. The slot-based oop
+    /// map and the conservative frame-region sweep both walk stack
+    /// memory only — they never read register values. So every
+    /// register-resident local is spilled back to its canonical frame
+    /// slot `[rbp - (idx+1)*8]` immediately BEFORE the safepoint-causing
+    /// CALL, where the conservative scanner observes it.
+    ///
+    /// The spill is conservative (non-oop locals are also flushed)
+    /// but correct: `conservative_roots::scan_one_frame_precise`
+    /// filters frame qwords via `heap.is_object_address`, so non-oop
+    /// values are ignored. Cost: one store per used callee-saved local
+    /// per safepoint that reaches this (a poll's slow path, a call).
+    ///
+    /// (This doc used to sit, orphaned, on `frames.rs::frame_layout` after
+    /// the file split; its old TODO about per-local oop typing is served by
+    /// `local_oop_masks` and the shadow-stack publication in this file.)
+    pub(super) fn emit_pre_safepoint_spill(&mut self) {
+        self.emit_pre_safepoint_spill_impl(true);
+    }
+
+    /// [`Self::emit_pre_safepoint_spill`] for a site that has already written
+    /// every Java argument of its call into a frame slot, so the blind spill
+    /// may drop `RAX` and `ARG_REGS` from its selection.
+    ///
+    /// The one-shot is set and consumed in the same breath — this function is
+    /// the only writer, and the spill it calls takes the flag at its top — so a
+    /// site that stages and then does NOT reach the spill (the elision wins)
+    /// cannot leak the claim into the next safepoint. See
+    /// [`spill_args_published_enabled`] for what the four opting-in sites have
+    /// actually done by this point.
+    pub(super) fn emit_pre_safepoint_spill_args_published(
+        &mut self,
+        arg_regs_published: bool,
+        rax_published: bool,
+    ) {
+        let on = spill_args_published_enabled();
+        self.args_published_for_next_spill = (arg_regs_published && on, rax_published && on);
+        // gen r5w6/oomjit10: every caller of this function is a Java invoke
+        // whose CALL goes to a compiled entry, the dispatch or IC helper, or
+        // the hashed stub -- none reads RAX, and RAX is caller-saved, so its
+        // value at the spill is read by nobody after it. See
+        // `rax_dead_at_call_enabled`.
+        self.rax_dead_request_for_next_spill = true;
+        self.emit_pre_safepoint_spill_impl(true);
+    }
+
+    /// [`Self::emit_pre_safepoint_spill`] for a site whose GC can run only
+    /// inside a Rust helper's `CALL` that takes its arguments in `ARG_REGS`
+    /// and the frame, or inside a compiled entry's `CALL`, so the map this
+    /// spill pairs with leaves RAX out (`rax_dead_at_call_enabled`). The
+    /// sites: the array allocations (`newarray`, `anewarray`,
+    /// `anewarray_object_cp`, `multianewarray_n`); the `invoke_dispatch`
+    /// calls that read their Java arguments from a frame buffer (the
+    /// static/special/virtual fallbacks, the spliced and `codePointAt` arms,
+    /// the arraycopy fallback); the indy bridges; the `getstatic` /
+    /// `putstatic` `<clinit>` helpers; and a spliced callee's direct call,
+    /// whose entry prologue clobbers RAX as every compiled entry does.
+    ///
+    /// The argument is the Java-invoke one: RAX is caller-saved on both ABIs
+    /// and an argument register of neither, so the helper never reads its
+    /// pre-call value and its result arrives in it; it is never an
+    /// operand-stack home; and an inline TLAB arm emitted after this spill
+    /// overwrites it before anything reads it. A dispatch site's RAX is at
+    /// most a copy of an argument it already stored in the buffer, which the
+    /// map names (`pending_staged_arg_oops`) or the band scan roots. What it holds at the spill is
+    /// the previous bytecode's temporary. ngr (2026-10-27): in
+    /// `Arrays.copyOf`'s single-pass frame at its `anewarray` (sp=7) that was
+    /// an `ldc` class or an argument, and on G1 the unrewritable
+    /// `safepoint-gpr-spill-image` word pinned its region in the middle of the
+    /// free space, so `NativeGrowthReclaimProbe`'s 50 MB array found no window
+    /// (`blocked_by_pin=77`). gcki-ngr (2026-10-28): with that word gone, the
+    /// holder was RAX at an `invoke_dispatch` call of `ArrayList.grow`'s
+    /// single-pass frame: the old 34 MB `elementData`, which then pinned its
+    /// humongous span in every failing run's blocker census.
+    pub(super) fn emit_pre_safepoint_spill_before_helper_call(&mut self) {
+        self.rax_dead_request_for_next_spill = true;
+        self.emit_pre_safepoint_spill_impl(true);
+    }
+
+    /// Publish a cold safepoint without claiming moving-young shadow coverage.
+    /// Used by the overflow guard and the self-tail back-edge poll
+    /// (`op_invoke.rs::emit_self_tail_safepoint_poll`) of a GC-inert recursive
+    /// method; an exceptional collection safely falls back to the non-moving sweep.
+    pub(super) fn emit_pre_safepoint_spill_without_shadow(&mut self) {
+        self.emit_pre_safepoint_spill_impl(false);
+    }
+
+    /// Interpreter round i6 wave 120, lane L2 (`CRATONVM_JIT_DEBUGGER_LOCALS_HOME_SPILL`,
+    /// stage 2 of `i43-L1`): store every XMM-homed float / double local to its
+    /// home slot, `MOVQ [rbp - off], xmmN` (the whole 64-bit lane: a `float`'s
+    /// bits are its low 32, which is how the VM reads a `Float` home). Only
+    /// under the switch, in a compile a debugger may read; the stored value is
+    /// the one the register holds, so no reader of the slot sees anything
+    /// older than before.
+    fn emit_debugger_xmm_home_spill(&mut self) {
+        for idx in 0..self.xmm_assignments.len() {
+            let Some(xmm) = self.xmm_assignments[idx] else {
+                continue;
+            };
+            let off = self.local_offset(idx);
+            // 66 [REX.R] 0F D6 /r, ModRM mod=10 reg=xmm rm=101 (RBP), disp32.
+            self.buf.emit_byte(0x66);
+            if xmm >= 8 {
+                self.buf.emit_byte(0x44);
+            }
+            self.buf.emit(&[0x0F, 0xD6, 0x85 | ((xmm & 7) << 3)]);
+            self.buf.emit(&(-off).to_le_bytes());
+        }
+    }
+
+    /// Record, for the current top-level safepoint, what each local's home
+    /// slot holds ([`crate::DebuggerHomeLocal`]), from the deopt snapshot the
+    /// backend builds here anyway (`build_frame_state_at`): a local the
+    /// snapshot places in its own register or XMM (just stored to its home by
+    /// this spill) or in its home slot is described by kind; a constant by
+    /// its bits; a never-written slot as `Undefined`; anything else as
+    /// `Unknown`, which keeps the frame `OPAQUE_FRAME`. Inside a splice nothing
+    /// is recorded (the frame state is the inlined callee's, and the VM lists
+    /// that level without a frame). One entry per bci, the latest winning.
+    fn record_debugger_home_locals(&mut self) {
+        if !self.inline_callee_scopes.is_empty() {
+            return;
+        }
+        let Ok(bci) = u32::try_from(self.cur_bc_pc) else {
+            return;
+        };
+        let fs = self.build_frame_state_at(self.cur_bc_pc, None);
+        if fs.caller.is_some() {
+            return;
+        }
+        let entries: Box<[crate::DebuggerHomeLocal]> = fs
+            .locals
+            .iter()
+            .enumerate()
+            .map(|(idx, fv)| self.debugger_home_local_of(idx, fv))
+            .collect();
+        match self
+            .debugger_home_locals
+            .iter_mut()
+            .find(|(at, _)| *at == bci)
+        {
+            Some(row) => row.1 = entries,
+            None => self.debugger_home_locals.push((bci, entries)),
+        }
+    }
+
+    /// [`crate::DebuggerHomeLocal`] for local `idx` described by `fv`.
+    fn debugger_home_local_of(
+        &self,
+        idx: usize,
+        fv: &crate::deopt::FrameValue,
+    ) -> crate::DebuggerHomeLocal {
+        use crate::deopt::FrameValue as F;
+        use crate::DebuggerHomeLocal as H;
+        // `StackSlot*` carry the NEGATED home offset (`frame_value_for_slot`).
+        let home = -self.local_offset(idx);
+        let reg = self.reg_for_local(idx);
+        let xmm = self.xmm_for_local(idx);
+        match *fv {
+            F::Undefined => H::Undefined,
+            // Cast: the snapshot's constant bits, kept verbatim.
+            F::Int(v) => H::Constant(b'I', v as u64),
+            F::Long(v) => H::Constant(b'J', v as u64),
+            F::Float(bits) => H::Constant(b'F', bits),
+            F::Double(bits) => H::Constant(b'D', bits),
+            F::Register(r) if Some(r) == reg => H::Int,
+            F::RegisterLong(r) if Some(r) == reg => H::Long,
+            F::RegisterRef(r) if Some(r) == reg => H::Ref,
+            F::XmmFloat(x) if Some(x) == xmm => H::Float,
+            F::XmmDouble(x) if Some(x) == xmm => H::Double,
+            F::StackSlot(o) if o == home => H::Int,
+            F::StackSlotLong(o) if o == home => H::Long,
+            F::StackSlotRef(o) if o == home => H::Ref,
+            F::StackSlotFloat(o) if o == home => H::Float,
+            F::StackSlotDouble(o) if o == home => H::Double,
+            _ => H::Unknown,
+        }
+    }
+
+    fn emit_pre_safepoint_spill_impl(&mut self, publish_shadow: bool) {
+        // Handshake with `emit_inline_tlab_new` (see `alloc_spill_sink_enabled`).
+        // The `new` site raises `sink_alloc_blind_spill` immediately before
+        // calling us; we withhold every register the allocation fast path does
+        // NOT clobber and acknowledge on `deferred_alloc_blind_spill`, which the
+        // inline emitter consumes at its slow-path label.
+        //
+        // Taken ABOVE the `failed` guard so an abandoned compile cannot leave the
+        // request standing for a LATER safepoint, which would withhold eleven
+        // registers (seven at a ZGC announce site) with nobody to emit them.
+        // Cleared unconditionally so a
+        // request this safepoint cannot honour (spill disabled, `nostore`, or the
+        // callee-saved-only `=1` mode, whose slot layout is `alloc_used_regs`-
+        // indexed rather than `ALL_SPILL_GPRS`-indexed) leaves the consumer with
+        // nothing to emit and the full spill in place.
+        let sink = std::mem::take(&mut self.sink_alloc_blind_spill);
+        // zt t11/ca3: taken with `sink`, for the same reason; the wider
+        // clobber set of a ZGC announce site (`ZGC_ALLOC_FAST_PATH_CLOBBERS`).
+        let zgc_announce_sink = std::mem::take(&mut self.sink_alloc_zgc_announce);
+        self.deferred_alloc_zgc_announce = false;
+        self.deferred_alloc_shadow_push = false;
+        self.alloc_safepoint_on_slow_edge = false;
+        // Taken here, next to `sink`, and for the same reason: a claim that
+        // outlives the safepoint it was made for is a claim about the wrong
+        // frame. Cleared even on the `failed` return below.
+        let (arg_regs_published, rax_published) =
+            std::mem::take(&mut self.args_published_for_next_spill);
+        // gen r5w6/oomjit10: overwritten by EVERY spill, so the map this spill
+        // pairs with reads only its own site's claim.
+        self.pending_rax_dead_at_call =
+            std::mem::take(&mut self.rax_dead_request_for_next_spill) && rax_dead_at_call_enabled();
+        self.deferred_alloc_blind_spill = false;
+        // gcg g3/v (lane s's g1 review item 2): reset per spill, so a site
+        // whose arm below does not set it cannot leave an earlier site's
+        // selection for a reader. Latent today (its one reader runs only
+        // after the `=all` arm set it), not after the next reader.
+        self.pending_narrow_spill = None;
+        if self.failed {
+            return;
+        }
+        // Bisect lever, default = current behaviour. `CRATONVM_JIT_MY_SCRATCH_FLUSH=0`
+        // drops this flush when relocation is vetoed anyway.
+        //
+        // Why it is a candidate: this runs at EVERY GC-capable safepoint under
+        // `moving_young`, and it is one of the few remaining costs that
+        // `CRATONVM_NO_MOVING_YOUNG=1` removes but the relocation-scoped
+        // admission gates do not. The `type.temporal` Hibernate classes still
+        // exceed the 300 s cap on default flags while passing under that
+        // variable, so a residual of this shape is unaccounted for. Shadow
+        // push/reload has already been eliminated as the cause (measured
+        // no-change; see `shadow_stack_maps_enabled`), which leaves this and
+        // the self-call spill-elision proof.
+        //
+        // The lever question is answered: measured on `BinTreesClassic 18`
+        // @512m, five interleaved reps, `CRATONVM_JIT_MY_SCRATCH_FLUSH=0`
+        // moves nothing (median 4117 ms against a 4281 ms default, ranges
+        // overlapping in both directions), so this is NOT the `type.temporal`
+        // residual it was added to bisect.
+        //
+        // TRIED AND REVERTED 2026-07-31 — and the RECORDED REASON WAS WRONG.
+        // Corrected 2026-08-03. Dropping the `moving_young_enabled()` term (so
+        // the flush also runs in the non-moving lane) was reverted because that
+        // lane then SIGILL'd 2/2, and the revert note blamed THIS call site:
+        // "calling it here reserves spill slots and rewrites `self.stack` at a
+        // point the non-precise frame layout did not budget for". It does not.
+        // The SIGILL was the inline-PIC cascade's inter-slot `JNE` truncating
+        // to `rel8` and branching backwards into the blind spill run emitted a
+        // few lines below (fixed in `7f1b1f263`); ANY change that pushed a PIC
+        // slot body past 127 bytes reproduced it, and this one did. Re-tested
+        // 2026-08-03 with the truncation fixed — term removed,
+        // `CRATONVM_GC=-moving-young`, Hibernate `ZonedDateTimeTest`, run
+        // INTERLEAVED with a pre-fix build as a positive control: control
+        // SIGILL 2/2 (1st and 5th), this variant clean 3/3.
+        //
+        // The term nevertheless STAYS, now for a reason about this mechanism
+        // rather than about a crash: in the non-moving lane the full-GPR blind
+        // spill below (`safepoint_reg_spill_all`, default-on since the same
+        // day) already copies every caller-saved register into a frame slot the
+        // conservative scan reads, so the flush buys no root visibility there —
+        // only per-safepoint code size. Under moving-young it is NOT redundant:
+        // it also rewrites `self.stack`, so the PRECISE map names those slots,
+        // and a moving cycle has no conservative backstop to fall back on.
+        // See `jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
+        if moving_young_enabled() && scratch_flush_at_safepoint_enabled() {
+            self.flush_scratch_registers();
+        }
+        // Capture the live-frame bound for the map this safepoint will record.
+        // Taken here rather than in `emit_oop_map_for_safepoint` because that
+        // runs AFTER the call, by which point `emit_stack_arg_cleanup` may have
+        // moved the cursor. Includes the staged invoke-argument buffer, which
+        // sits above the operand stack in the same spill reserve and is live
+        // for the duration of the call.
+        self.pending_live_frame_hi = self.next_spill_offset;
+        // Publish register-homed locals to their canonical slots — only the
+        // ones that can hold a reference, when the plan says which those are
+        // (r11 x64gen). A primitive's slot has no reader: the GC scan is
+        // stack-only and reads references, `emit_post_safepoint_reload` reloads
+        // only oop locals, and deopt / precise exception frames read the
+        // saved register, not the slot — the five-point argument on
+        // `can_elide_self_call_register_spill`, which already skips this whole
+        // loop when NO register-homed local is a reference. This narrows the
+        // same loop per local. No plan (legacy wrapper, OSR artifacts):
+        // unchanged, every home is stored.
+        let reference_homes = self
+            .safepoint_publish
+            .as_ref()
+            .map(|p| p.register_homed_reference_locals);
+        // Interpreter round i6 wave 120, lane L2 (`CRATONVM_JIT_DEBUGGER_LOCALS_HOME_SPILL`,
+        // default OFF; first stage of
+        // `i43-L1-proposal-deoptimize-a-compiled-frame-for-the-frame-commands`):
+        // a compile a debugger may read (`debugger_observes_locals`) stores
+        // EVERY register-homed GPR local to its home slot at every safepoint
+        // (each call, each poll's slow path), not only the reference ones, so
+        // a parked caller's home slots `[rbp - (idx + 1) * 8]` hold its locals
+        // for a `StackFrame.GetValues` (the VM-side read is the next stage).
+        // XMM-homed float / double locals are not stored yet.
+        let debugger_home_spill =
+            self.debugger_observes_locals && debugger_locals_home_spill_enabled();
+        for idx in 0..self.local_assignments.len() {
+            if let Some(reg) = self.local_assignments[idx] {
+                let may_hold_reference = match reference_homes {
+                    Some(mask) => idx >= 64 || mask & (1u64 << idx) != 0,
+                    None => true,
+                };
+                if !may_hold_reference && !debugger_home_spill {
+                    continue;
+                }
+                let off = self.local_offset(idx);
+                self.emit_store_local(off, reg);
+            }
+        }
+        // Wave 120 (L2), stage 2 of the same switch: the XMM-homed float /
+        // double locals too, and what every home holds here.
+        if debugger_home_spill {
+            self.emit_debugger_xmm_home_spill();
+            self.record_debugger_home_locals();
+        }
+        // SB-CRASH-04 (register-invisibility) — blind-spill the CURRENT value of
+        // every used callee-saved GPR into its reserved frame slot. The local
+        // flush above only covers register-resident *locals*; an oop can also
+        // live in a callee-saved register as an operand-stack temporary that
+        // survives the call, or via a value the per-slot oop tracker fails to
+        // tag. Spilling ALL of `alloc_used_regs` is fully conservative: the
+        // scanner re-validates each slot via `heap.is_object_address`, so non-
+        // oop register values are simply ignored. Under the default non-moving
+        // young sweep no post-call reload is needed (the object never moves, so
+        // the register keeps a valid address). The slots are scanned by the
+        // conservative `[scanner_sp, entry_sp)` frame walk. `=nostore` reserves
+        // the slots but skips the stores (frame-perturbation A/B control).
+        if self.safepoint_reg_spill && !self.safepoint_reg_spill_nostore && self.reg_spill_base != 0
+        {
+            // Gap 9 (`=all`): spill the FULL GPR file so a live oop in a
+            // caller-saved / argument / RAX register (e.g. an invoke receiver
+            // staged in an ARG reg, which the callee-saved-only spill misses) is
+            // visible to the conservative root scan. `emit_store_local(off, reg)`
+            // only reads `reg` (a plain `mov [rbp-off], reg`), so spilling the
+            // arg registers here does not perturb the pending call's arguments.
+            // Default path is unchanged (`=1` → callee-saved only).
+            if self.safepoint_reg_spill_all {
+                let narrow = self.oop_capable_spill_regs(arg_regs_published, rax_published);
+                self.pending_narrow_spill = narrow;
+                // Cast: `count_ones` is at most 14, well inside u64.
+                let kept =
+                    narrow.map_or(ALL_SPILL_GPRS.len() as u64, |m| u64::from(m.count_ones()));
+                crate::metrics::note_spill_width(
+                    kept,
+                    ALL_SPILL_GPRS.len() as u64,
+                    narrow.is_none(),
+                );
+                if sink {
+                    let clobbers = alloc_fast_path_clobbers(zgc_announce_sink);
+                    self.emit_blind_reg_spill(|reg| {
+                        clobbers.contains(&reg) && Self::spill_selects(narrow, reg)
+                    });
+                    self.deferred_alloc_blind_spill = true;
+                    self.deferred_alloc_zgc_announce = zgc_announce_sink;
+                } else {
+                    self.emit_blind_reg_spill(|reg| Self::spill_selects(narrow, reg));
+                }
+                // gcg g3/v: the slots this spill wrote (both halves of a sunk
+                // spill: the deferred half writes the rest of `narrow` before
+                // the slow-path call this safepoint's map describes).
+                self.note_spill_written(Some(narrow.unwrap_or(ALL_SPILL_IMAGE_MASK)));
+            } else {
+                for i in 0..self.alloc_used_regs.len() {
+                    let reg = self.alloc_used_regs[i];
+                    let off = self.reg_spill_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
+                    self.emit_store_local(off, reg);
+                }
+                // gcg g3/v: `alloc_used_regs`-indexed, not `ALL_SPILL_GPRS`-
+                // indexed: no claim.
+                self.note_spill_written(None);
+            }
+        } else {
+            // gcg g3/v: no image, or `nostore` (an A/B control): no claim.
+            self.note_spill_written(None);
+        }
+        // Stage 3 — record WHICH safepoint is active by storing the current
+        // bytecode PC into the reserved safepoint-id slot. The GC root walker
+        // reads `[rbp - sp_id_slot_off]` to recover the exact oop map (matched
+        // on `OopMapEntry::bytecode_pc`). RAX is caller-saved and not an
+        // argument register, and args are already staged in ARG_REGS before
+        // this call, so clobbering RAX here is safe. Gated off by default.
+        if self.precise_maps && self.sp_id_slot_off != 0 {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SPID") {
+                eprintln!(
+                    "[DBG_SPID] cur_bc_pc={} sp_id_slot_off={}",
+                    self.cur_bc_pc, self.sp_id_slot_off
+                );
+            }
+            self.emit_mov_imm32_sx(RAX, self.cur_bc_pc as i32); // Cast: bytecode PC fits i32
+            self.emit_store_local(self.sp_id_slot_off, RAX);
+            // Stage A.2 — this is a GC-capable safepoint that flushed its
+            // register-locals and stored an sp-id; record it so finalize can
+            // require a matching oop map (coverage = spilled ⊆ mapped).
+            // Cast: bytecode/native offset to u32 (non-negative, fits)
+            self.safepoint_pcs.insert(self.cur_bc_pc as u32);
+        }
+        // Shadow-stack precise roots — push every live oop onto the thread's
+        // shadow stack so a moving collector can rewrite it precisely. Paired
+        // with `emit_shadow_reload` in `emit_oop_map_for_safepoint`. Gated.
+        if publish_shadow {
+            // An allocation whose blind spill was sunk has no call on its fast
+            // path, so its roots need publishing only on the slow edge. That
+            // edge (`emit_inline_tlab_new`) emits the push, and then the oop
+            // map and the reload right after its call.
+            if sink && self.deferred_alloc_blind_spill && super::licm::alloc_sink_enabled() {
+                self.deferred_alloc_shadow_push = true;
+            } else {
+                self.emit_shadow_push();
+            }
+        } else {
+            self.pending_shadow.clear();
+            self.pending_shadow_coverage_complete = false;
+        }
+    }
+
+    /// The registers that can hold an oop at THIS safepoint, as a bitmask over
+    /// [`ALL_SPILL_GPRS`] positions. `None` means "cannot prove anything here"
+    /// and keeps the full fourteen-store copy.
+    ///
+    /// Four sources, and the first two are the reason `=all` exists at all
+    /// (`Compiler::new`: "a receiver/args staged into ARG_REGS immediately
+    /// before a GC-capable call ... which the callee-saved-only spill never
+    /// covers"):
+    ///
+    ///  1. `RAX` — where the emitter materialises every loaded/allocated/
+    ///     returned reference before it is pushed or stored;
+    ///  2. every `ARG_REGS` member — a staged receiver or reference argument;
+    ///  3. the register home of any local the method-wide reference mask says
+    ///     can hold a reference (`register_homed_reference_locals` indexed
+    ///     through `local_assignments`);
+    ///  4. any register currently holding an operand-stack entry, oop-marked or
+    ///     not — cheaper to keep than to reason about, and `self.stack` is
+    ///     short.
+    ///
+    /// What is dropped is a register hosting a local the mask says is
+    /// primitive, and a register this method's model never put anything in
+    /// (R10/R11 on SysV, plus unused local homes). See
+    /// [`narrow_safepoint_spill_enabled`] for what that gives up and why the
+    /// stale slot it leaves behind is safe.
+    fn oop_capable_spill_regs(&self, arg_regs_published: bool, rax_published: bool) -> Option<u16> {
+        if !narrow_safepoint_spill_enabled() {
+            return None;
+        }
+        // An explicit `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` is a request for
+        // the full blind copy; honour it literally.
+        if safepoint_reg_spill_all() {
+            return None;
+        }
+        let plan = self.safepoint_publish.as_ref()?;
+        // The mask cannot represent locals >= 64. `color_graph` never gives one
+        // a register home, so no register is actually at risk -- but this is a
+        // root-visibility decision, so it fails closed rather than reasoning.
+        if self.num_locals > 64 {
+            return None;
+        }
+        let bit = |reg: u8| -> u16 {
+            match ALL_SPILL_GPRS.iter().position(|&r| r == reg) {
+                // Cast: position < 14 < 16, so the shift is in range.
+                Some(i) => 1u16 << i,
+                None => 0,
+            }
+        };
+        // Sources 1 and 2 -- RAX and the ABI argument registers -- each kept
+        // unless the site has already written its contents to the frame, in
+        // which case the register copy duplicates a publication that already
+        // happened. The two are asked separately because different code
+        // publishes them: see `args_published_for_next_spill`.
+        let mut keep = 0u16;
+        if !rax_published {
+            keep |= bit(RAX);
+        }
+        if !arg_regs_published {
+            for &r in ARG_REGS.iter() {
+                keep |= bit(r);
+            }
+        }
+        if arg_regs_published || rax_published {
+            crate::metrics::note_spill_args_published();
+        }
+        let refs = plan.register_homed_reference_locals;
+        for (idx, home) in self.local_assignments.iter().enumerate().take(64) {
+            if refs & (1u64 << idx) != 0 {
+                if let Some(reg) = *home {
+                    keep |= bit(reg);
+                }
+            }
+        }
+        for slot in self.stack.iter() {
+            match *slot {
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) => keep |= bit(r),
+                StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
+            }
+        }
+        Some(keep)
+    }
+
+    /// `true` when `reg` is selected by `mask` (`None` selects everything).
+    fn spill_selects(mask: Option<u16>, reg: u8) -> bool {
+        match mask {
+            None => true,
+            Some(m) => match ALL_SPILL_GPRS.iter().position(|&r| r == reg) {
+                Some(i) => m & (1u16 << i) != 0,
+                None => false,
+            },
+        }
+    }
+
+    /// Emit the `=all` blind GPR spill for the registers `want` selects, into
+    /// their fixed `reg_spill_base + i*8` slots. The slot layout is indexed by
+    /// position in [`ALL_SPILL_GPRS`] and does not depend on the selection, so a
+    /// spill split across two program points (the sink) writes exactly the slots
+    /// a single full spill would have.
+    fn emit_blind_reg_spill(&mut self, want: impl Fn(u8) -> bool) {
+        for (i, &reg) in ALL_SPILL_GPRS.iter().enumerate() {
+            if !want(reg) {
+                continue;
+            }
+            let off = self.reg_spill_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
+            // gkr: a spill that claims RAX dead (`rax_dead_at_call_enabled`)
+            // writes 0, not the dead value. Maps are found by safepoint id,
+            // which every safepoint of one bci shares, so the map the scan
+            // resolves for this slot may be another site's, one that keeps
+            // RAX: the stored temporary then rooted whatever it named.
+            if reg == RAX && self.pending_rax_dead_at_call {
+                self.emit_zero_frame_slot(off);
+            } else {
+                self.emit_store_local(off, reg);
+            }
+        }
+    }
+
+    /// gcg g3/v, under [`spill_written_set_enabled`]: record that the safepoint
+    /// at `cur_bc_pc` wrote the image slots `written` (`None`: no claim), and
+    /// widen every map already published at that id to match, so the merge is
+    /// order-independent (see the section on [`spill_written_for`]).
+    fn note_spill_written(&mut self, written: Option<u16>) {
+        if !spill_written_set_enabled() {
+            return;
+        }
+        // Cast: a bytecode pc fits u32 (the map's own tag).
+        let pc = self.cur_bc_pc as u32;
+        let merged = match self.spill_written_by_pc.get(&pc) {
+            Some(&prev) => merge_spill_written(prev, written),
+            None => written,
+        };
+        self.spill_written_by_pc.insert(pc, merged);
+        // gc wave 9 (lane gcC): only the maps of this id published with a
+        // `Some` set can change (see `spill_written_maps`).
+        if let Some(indices) = self.spill_written_maps.get(&pc) {
+            for &i in indices {
+                if let Some(m) = self.oop_maps.get_mut(i) {
+                    if m.bytecode_pc == pc {
+                        m.spill_written = merge_spill_written(m.spill_written, written);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emit the half of the blind GPR spill that
+    /// [`Self::emit_pre_safepoint_spill`] withheld at an inline-TLAB `new`, at
+    /// the allocation's slow-path label. Returns whether anything was emitted.
+    ///
+    /// Every register written here is one the fast path provably does not touch
+    /// (see [`alloc_fast_path_clobbers`]: [`ALLOC_FAST_PATH_CLOBBERS`], or
+    /// [`ZGC_ALLOC_FAST_PATH_CLOBBERS`] at a ZGC announce site, zt t11/ca3), so
+    /// its value at the slow-path label is still its value at the safepoint.
+    /// The ones it does touch were already spilled at the safepoint itself.
+    pub(super) fn emit_deferred_alloc_blind_spill(&mut self) -> bool {
+        // zt t11/ca3: the clobber set the safepoint used, taken first so it
+        // never outlives this site.
+        let zgc_announce_sink = std::mem::take(&mut self.deferred_alloc_zgc_announce);
+        if !std::mem::take(&mut self.deferred_alloc_blind_spill) || self.failed {
+            return false;
+        }
+        // The SAME selection the safepoint made -- see `pending_narrow_spill`.
+        let narrow = self.pending_narrow_spill;
+        let clobbers = alloc_fast_path_clobbers(zgc_announce_sink);
+        self.emit_blind_reg_spill(|reg| {
+            !clobbers.contains(&reg) && Self::spill_selects(narrow, reg)
+        });
+        true
+    }
+
+    /// zt t12/ca4: the stores [`Self::emit_deferred_alloc_blind_spill`] would
+    /// emit, WITHOUT consuming the acknowledgement, for a second edge of the
+    /// same allocation that calls before the slow-path label does: the ZGC
+    /// announce arm's refusal edge (`CRATONVM_JIT_ZGC_ALLOC_SPILL_SINK`), which
+    /// calls `zgc_note_tlab_object`. Same selection and same slots, so the
+    /// image that edge leaves is the one the slow edge (and an unsunk spill)
+    /// leaves. Returns whether a sunk spill was pending (`false`: nothing
+    /// emitted, and the caller had no withheld half to discharge).
+    pub(super) fn emit_deferred_alloc_blind_spill_copy(&mut self) -> bool {
+        if !self.deferred_alloc_blind_spill || self.failed {
+            return false;
+        }
+        let narrow = self.pending_narrow_spill;
+        let clobbers = alloc_fast_path_clobbers(self.deferred_alloc_zgc_announce);
+        self.emit_blind_reg_spill(|reg| {
+            !clobbers.contains(&reg) && Self::spill_selects(narrow, reg)
+        });
+        true
+    }
+
+    /// Publish the precise-map safepoint id without conservatively copying the
+    /// whole GPR file into the frame. This is used only when
+    /// [`Self::can_elide_self_call_register_spill`] proves that no live oop at
+    /// the direct recursive call resides exclusively in a register. Under
+    /// moving-young the proof is stronger: coverage must be complete and the
+    /// exact live-oop home set must be empty, so the empty precise map itself is
+    /// the complete root publication and no shadow slots need push/reload.
+    pub(super) fn emit_safepoint_metadata_only(&mut self) {
+        // gen r5w6/oomjit10: no spill ran, so no claim about RAX either.
+        self.pending_rax_dead_at_call = false;
+        self.rax_dead_request_for_next_spill = false;
+        if self.failed {
+            return;
+        }
+        // gce e1/f (row 8 of
+        // `gcd-d9d-call-argument-copies-still-rooted-on-other-call-shapes-FIXED-20261012.md`):
+        // the live-frame bound, on BOTH arms, as `emit_pre_safepoint_spill`
+        // records it (the same statement). Only the moving arm below used to
+        // record it, so under `CRATONVM_NO_MOVING_YOUNG` the map shipped
+        // `live_frame_hi = 0` ("unknown") and the band scan read the popped
+        // argument slots above the cursor as roots. The moving arm sets the
+        // same value again.
+        self.pending_live_frame_hi = self.next_spill_offset;
+        // Must mirror `can_elide_self_call_register_spill` exactly — see the
+        // note there. Both read `self_call_moving_proof_enabled()`.
+        if self.shadow_enabled || self_call_moving_proof_enabled() {
+            let coverage_complete = self.moving_young_safepoint_coverage_complete();
+            let live_oop_home_count = self.collect_live_oop_homes().len();
+            if !moving_oop_free_self_call_is_publishable(
+                self_call_moving_proof_enabled(),
+                coverage_complete,
+                live_oop_home_count,
+            ) {
+                // This should be unreachable because the caller uses the same
+                // predicate. Fail compilation closed if future call-site
+                // refactoring breaks that pairing.
+                self.fail("singlepass-codegen/self-call-moving-proof-unpublishable");
+                return;
+            }
+            // Match the metadata state normally established by
+            // `emit_pre_safepoint_spill` + an empty `emit_shadow_push`.
+            self.pending_live_frame_hi = self.next_spill_offset;
+            self.pending_shadow.clear();
+            self.pending_shadow_coverage_complete = true;
+        }
+        // gcg g3/v: no slot written, licensed by the same elision proof as the
+        // zeroing below. Only the `=all` layout's bit order is claimed.
+        let written = (self.safepoint_reg_spill && self.safepoint_reg_spill_all).then_some(0u16);
+        self.note_spill_written(written);
+        if self.precise_maps && self.sp_id_slot_off != 0 {
+            if cratonvm_types::flags::runtime_flag_on("CRATONVM_DBG_SPID") {
+                eprintln!(
+                    "[DBG_SPID] cur_bc_pc={} sp_id_slot_off={} (metadata-only)",
+                    self.cur_bc_pc, self.sp_id_slot_off
+                );
+            }
+            self.emit_mov_imm32_sx(RAX, self.cur_bc_pc as i32);
+            self.emit_store_local(self.sp_id_slot_off, RAX);
+            self.safepoint_pcs.insert(self.cur_bc_pc as u32);
+        }
+    }
+
+    /// Cooperative JIT safepoint poll (`CRATONVM_JIT_SAFEPOINT_POLLS`, see
+    /// [`jit_safepoint_polls_enabled`]) — emits:
+    /// ```asm
+    /// TEST byte ptr [rip+disp32], 0xFF  ; helpers.safepoint_flag_addr
+    /// JZ   .no_poll
+    ///   <emit_pre_safepoint_spill>              ; frame-slot oop map valid
+    ///   CALL helpers.safepoint_slow_path
+    ///   <emit_oop_map_for_safepoint>             ; precise/shadow modes only
+    /// .no_poll:
+    /// ```
+    /// matching the `self_call_stack_guard` call sequence's spill/call/oop-map
+    /// bracketing exactly (see that call site in the direct self-recursive
+    /// call arm).
+    ///
+    /// x86-64 has no `TEST [m64], imm8` form that takes a bare 64-bit absolute
+    /// address, and this poll used to conclude from that that the flag address
+    /// had to be materialized into the scratch register R11 first
+    /// (`MOV R11, imm64` — 10 bytes) before a `TEST BYTE [R11], 0xFF`
+    /// (5 bytes). It does have a RIP-relative form, which is the whole poll in
+    /// **one 7-byte instruction and no register**:
+    /// [`Self::emit_test_mem8_abs_imm8`]. The back edge of every compiled loop
+    /// in the VM pays this, not only array loops — see
+    /// `array-element-load-baseline-codegen-20260901` for the sizing.
+    ///
+    /// The RIP-relative form needs the flag to sit within ±2GB of the emitted
+    /// instruction, which is a property of the process layout and not
+    /// something this emitter may assume: `emit_test_mem8_abs_imm8` reports
+    /// the reach failure and the old `MOV R11, imm64` sequence is emitted
+    /// instead. R11 is never a Java-local home (see `LOCAL_REGS`) nor an
+    /// `ARG_REGS`/`SCRATCH_REGS` member, so it stays free to clobber on that
+    /// path.
+    ///
+    /// The allocation side cooperates, and did not until 2026-09-10. The flag
+    /// used to be an inline field of `GcBarrier`, i.e. Rust-heap memory, and
+    /// under mimalloc that put it ~130 TB from the code cache on Linux — so
+    /// the fallback above ran at EVERY poll site in every process and nothing
+    /// said so, the poll being correct at any address.
+    ///
+    /// Two mechanisms now address that, and exactly one of them is ever
+    /// engaged. `CRATONVM_JIT_CODE_NEAR_GLOBALS` moves the CODE, hinting each
+    /// buffer near `layout_replace_epoch_guard()` and carrying the flag along
+    /// because it is a few hundred megabytes away in the same allocator.
+    /// Otherwise the flag comes from `platform::alloc_code_adjacent_cell`, the
+    /// code cache's own OS primitive, so the two land in the same region — see
+    /// `vm/src/threading/gc_barrier.rs::CacheLineFlag`, and that allocator's
+    /// doc for why it declines when the other strategy owns placement.
+    ///
+    /// Both are hints — the OS picks — which is why the fallback stays.
+    ///
+    /// The slow helper resolves the current VM and Java thread from published
+    /// process state/TLS, so the sequence is valid in pure methods too.
+    ///
+    /// The helper returns a verdict (`crate::SAFEPOINT_VERDICT_*` bits), which
+    /// only [`Self::emit_back_edge_safepoint_poll`],
+    /// [`Self::emit_branch_back_edge_safepoint_poll`] and
+    /// [`Self::emit_self_tail_entry_poll`] read; every other poll ignores RAX.
+    pub(super) fn emit_safepoint_poll(&mut self) {
+        self.emit_safepoint_poll_leaving_to(None);
+    }
+
+    /// The poll at a `goto` / `goto_w` back edge whose target is `header_pc`.
+    ///
+    /// Identical to [`Self::emit_safepoint_poll`] unless
+    /// [`Self::mode_exit_target`] admits the header, in which case the SLOW
+    /// path (after the CALL and its post-safepoint reloads) also emits
+    ///
+    /// ```asm
+    ///   TEST AL, SAFEPOINT_VERDICT_INNERMOST_FRAME   ; the helper's verdict
+    ///   JNZ  <header's reason-7 stub>
+    /// ```
+    ///
+    /// (`TEST RAX, RAX` until interpreter round i1 wave 17: the same answer
+    /// while the other verdict bit was only ever set together with this one.)
+    ///
+    /// so a loop running compiled when an agent asks for interpreter-only
+    /// execution leaves at the next poll it takes through the header's
+    /// OSR-exit map, with nothing replayed: nothing is emitted between this
+    /// poll and the `JMP` to the header, so the machine state at the `JNZ` is
+    /// the state the header join receives, which is the state its map
+    /// describes (the Step-8 test trigger exits from the same map at the same
+    /// join). RAX is not a Java-local home and both reload sequences preserve
+    /// it (`emit_shadow_reload`, `emit_post_safepoint_reload`); EFLAGS are dead
+    /// at the join. The fast path (flag clear) is byte-identical.
+    ///
+    /// In a method-entry compile (interpreter round i1 wave 15) the test is
+    /// `TEST AL, SAFEPOINT_VERDICT_POLLING_BODY` instead: the innermost-frame
+    /// bit is about the innermost interpreter frame, which is not this
+    /// body's. Since wave 17 the poll names its body (the slow
+    /// path's second argument, [`Self::emit_safepoint_body_id_arg`]), so that
+    /// bit is about this body's method rather than about every method.
+    ///
+    /// Interpreter round i1 wave 18, lane L3: a `goto` at `goto_pc` with a
+    /// LIVE operand stack (the arm has canonicalised it; the header map, if
+    /// any, is not argued to describe it) leaves through a map at the `goto`'s
+    /// own bci instead, with the whole stack as its operands — the conditional
+    /// back edge's form ([`Self::branch_mode_exit_target`]). The interpreter
+    /// re-executes the `goto` (`REEXECUTE`), which jumps to the header with
+    /// that stack, so the exit is exact; the map is recorded only for a frame
+    /// the transfer takes. javac leaves the stack empty at a loop's back edge;
+    /// other compilers and hand-written bytecode need not.
+    pub(super) fn emit_back_edge_safepoint_poll(
+        &mut self,
+        code: &[u8],
+        goto_pc: usize,
+        header_pc: usize,
+    ) {
+        let exit = if self.stack.is_empty() {
+            match self.mode_exit_target(code, header_pc) {
+                Some(header) => Some(header),
+                // The header's map refused for a reason of its own (an
+                // `invokedynamic` header whose bci may hold the indy trap's
+                // snapshot, no map there, a frame it cannot hand over):
+                // leave through a map at the `goto`'s own bci instead, as a
+                // live-stack `goto` does. The interpreter re-executes the
+                // `goto`, which jumps to the header, so the exit is exact;
+                // the admission re-checks every compile-wide condition and
+                // fails closed. (The i41 page, shape 3.)
+                None if BACK_EDGE_GOTO_EXIT_FALLBACK_ENABLED => {
+                    let exit = self.branch_mode_exit_target(goto_pc, 0);
+                    if exit.is_none() && crate::x64::dbg_jitc_enabled() {
+                        self.note_branch_mode_exit_refused(goto_pc, 0);
+                    }
+                    exit
+                }
+                None => None,
+            }
+        } else {
+            let operands = self.stack.len();
+            let exit = self.branch_mode_exit_target(goto_pc, operands);
+            if exit.is_none() && crate::x64::dbg_jitc_enabled() {
+                self.note_branch_mode_exit_refused(goto_pc, operands);
+            }
+            exit
+        };
+        self.emit_safepoint_poll_leaving_to(exit);
+    }
+
+    /// The loop header a back-edge poll may leave through on a non-zero
+    /// verdict, or `None` to emit the plain poll.
+    ///
+    /// Every condition is a reason the header's OSR-exit map might NOT
+    /// describe the machine state at this poll, or the exit might not reach
+    /// the uncharged OSR-exit transfer:
+    ///
+    /// * an OSR-tier compile (`mode_exit_polls`), or any other single-pass
+    ///   compile while [`METHOD_ENTRY_MODE_EXITS_ENABLED`] (wave 15: its
+    ///   stash sinks take the exit uncharged, and its poll leaves only on the
+    ///   every-frame verdict bit);
+    /// * an empty operand stack — javac's loop headers; a canonicalised
+    ///   non-empty stack is not argued here (wave 18: such a `goto` leaves
+    ///   through a map at its own bci, [`Self::emit_back_edge_safepoint_poll`]);
+    /// * the enclosing method's own walk — inside a splice `header_pc` is a
+    ///   callee pc, and the bare-bci map would name the caller's point;
+    /// * no bytecode loop rewrite (`bci_provenance`) — an output pc of a
+    ///   rewritten body can have several images;
+    /// * a recorded `OsrExit` map at the header with the deopt register
+    ///   region reserved — the stub then takes the frame-deopt path. A header
+    ///   that is itself an `invokedynamic` is refused: that pc's
+    ///   `osr_exit_box_ptr_by_bci` entry can be the indy trap's
+    ///   `UnreachedCode` snapshot, whose exit is charged as a failed
+    ///   speculation;
+    /// * that map describes a frame the sinks resume
+    ///   ([`Self::recorded_osr_exit_is_transferable`]). An OSR-tier artifact
+    ///   with an unresumable map is refused entry anyway (`osr_exit_policy`);
+    ///   a method-entry artifact has no such veto, and an exit its sink cannot
+    ///   resume is re-run from entry, which replays what the body committed;
+    /// * no elided monitor — `can_osr_exit` is false for such an artifact, and
+    ///   an exit it cannot transfer would be replayed. (`has_elided_monitor` is
+    ///   never set today; see its declaration.)
+    pub(super) fn mode_exit_target(&self, code: &[u8], header_pc: usize) -> Option<usize> {
+        if !(self.mode_exit_polls || METHOD_ENTRY_MODE_EXITS_ENABLED)
+            || !crate::deopt_real_enabled()
+        {
+            return None;
+        }
+        let refusal = if self.has_elided_monitor {
+            "elided-monitor"
+        } else if self.holds_self_lock_no_frame_names() && !self.self_lock_mode_exits_hand_over() {
+            "self-lock"
+        } else if !self.stack.is_empty() {
+            "operand-stack"
+        } else if !self.inline_callee_scopes.is_empty() {
+            "in-a-splice"
+        } else if self.bci_provenance.is_some() {
+            "loop-rewrite"
+        } else if self.deopt_regs_base == 0 {
+            "no-deopt-register-region"
+        } else if code.get(header_pc).copied() == Some(0xba) {
+            "invokedynamic-header"
+        } else if !self.osr_exit_box_ptr_by_bci.contains_key(&header_pc) {
+            "no-header-map"
+        } else if !self.recorded_osr_exit_is_transferable(header_pc) {
+            "frame-not-transferable"
+        } else if self.recorded_exit_hides_an_assigned_local(header_pc) {
+            "hides-an-assigned-local"
+        } else {
+            return Some(header_pc);
+        };
+        self.note_mode_exit_refused("back-edge", header_pc, refusal);
+        None
+    }
+
+    /// The single-pass twin of the optimizing tier's mode-exit census
+    /// (interpreter round i2 wave 55, lane L2; the "Progress (wave 51)" next
+    /// step of shape 3 in
+    /// `docs/feature-designs/jit-ir-optimizations.md`):
+    /// under `CRATONVM_DBG_JITC=1`, one line per back-edge poll or
+    /// conditional back edge whose exit a sought compile refused, naming the
+    /// refusal, so a run can rank them with `grep | sort | uniq -c`. Nothing
+    /// is counted in a static (`process_global_statics_ratchet`); compile
+    /// time only, nothing on any run-time path.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn note_mode_exit_refused(&self, what: &str, pc: usize, refusal: &str) {
+        if crate::x64::dbg_jitc_enabled() {
+            eprintln!(
+                "[jit-mode-exit-refused] {refusal} {what} pc={pc} osr-tier={} method={}",
+                self.mode_exit_polls, self.method_key,
+            );
+        }
+    }
+
+    /// Round 13 wave 6 (lane sync3): does this body hold a monitor no frame
+    /// state names -- a SELF-LOCKING body's method monitor, taken in its
+    /// prologue (`frames.rs` `emit_self_lock_enter`)? Then no poll may leave
+    /// for the interpreter: `build_frame_state_at` records no `MonitorInfo` for
+    /// the method monitor, the exit stub's epilogue would release it, and the
+    /// resumed frame would run the rest of the `synchronized` body unlocked.
+    /// The same refusal `has_elided_monitor` describes, for the one monitor
+    /// that flag cannot be set for (`r10_deoptverify_elided_monitor_contract`
+    /// pins it `false`). With this, a loop no longer fails the body's
+    /// closed-exit check (`driver.rs` `self_lock_exits_are_closed`) through
+    /// its back-edge polls; the loop simply runs to completion compiled, as
+    /// every method-entry body did before the mode exits existed.
+    pub(super) fn holds_self_lock_no_frame_names(&self) -> bool {
+        self.self_lock_obj_off > 0
+    }
+
+    /// Interpreter round i2 wave 56, lane L2: does every `OsrExit` point of
+    /// this self-locking METHOD-ENTRY body name its method monitor, so its
+    /// mode exits may leave with the hold handed to the resumed frame
+    /// (`CRATONVM_JIT_SELF_LOCK_MODE_EXIT_HANDOVER`,
+    /// `deopt_stubs.rs` `self_lock_hands_over_at`)? Then the back-edge and
+    /// conditional back-edge admissions (and through them the post-call and
+    /// constant-pool helper sites) stop refusing the body as `self-lock`;
+    /// the body check admits the stubs that hand over
+    /// (`self_lock_deopt_exits_hand_over`). The self-tail poll keeps refusing
+    /// it: its exit would resume a NEW activation at bci 0.
+    pub(super) fn self_lock_mode_exits_hand_over(&self) -> bool {
+        self.self_lock_hands_over_at(crate::deopt::DeoptReason::OsrExit)
+    }
+
+    /// Would a mode exit at bytecode `bci`, resuming the frame `fs` describes,
+    /// show a local a debugger can read as `0`? True while a debugger may read
+    /// locals ([`Self::debugger_observes_locals`]) and some local assigned at
+    /// `bci` (`regalloc::assigned_locals_per_pc_all`) is published
+    /// `Undefined`, which every resume maps to `0` although the local holds a
+    /// value a JDWP `StackFrame.GetValues` would read. The admissions then
+    /// refuse the exit and the body finishes compiled, as every body did
+    /// before the mode exits existed. Interpreter round i1 wave 19, lane L1
+    /// (`interpreter-resumed-frames-show-dead-locals-as-zero`).
+    ///
+    /// Since wave 21 (lane L3) a debugger's compile keeps an assigned local
+    /// alive (`regalloc::allocate_registers_keeping_assigned`) and the
+    /// snapshot describes it from its home even where it is dead
+    /// (`build_frame_state_at`), so this asks the published frame rather than
+    /// the liveness bits: what remains `Undefined` is a slot no home describes
+    /// exactly (a reference only the kind scan claims; a primitive parameter
+    /// the method never reads when the door gave no descriptor kinds or their
+    /// slot layout disagrees with the prologue's — wave 22, lane L1,
+    /// `BackendRequest::param_slot_tags`). Always `false` without a debugger,
+    /// so no admission changes then.
+    pub(super) fn frame_hides_an_assigned_local(
+        &self,
+        bci: usize,
+        fs: &crate::deopt::FrameState,
+    ) -> bool {
+        if !self.debugger_observes_locals || self.local_liveness_words == 0 {
+            return false;
+        }
+        let words = self.local_liveness_words;
+        let row = bci.saturating_mul(words);
+        fs.locals
+            .iter()
+            .take(self.num_locals)
+            .enumerate()
+            .any(|(i, value)| {
+                let assigned = self.local_assigned.get(row + i / 64).copied().unwrap_or(0);
+                assigned & (1u64 << (i % 64)) != 0
+                    && matches!(value, crate::deopt::FrameValue::Undefined)
+            })
+    }
+
+    /// [`Self::frame_hides_an_assigned_local`] for the `OsrExit` points
+    /// already recorded at emitter pc `pc`: true when any of them hides one.
+    fn recorded_exit_hides_an_assigned_local(&self, pc: usize) -> bool {
+        if !self.debugger_observes_locals {
+            return false;
+        }
+        self.deopt_point_pcs
+            .iter()
+            .zip(&self.deopt_points)
+            .filter(|(at, point)| {
+                **at == pc && matches!(point.reason, crate::deopt::DeoptReason::OsrExit)
+            })
+            .any(|(_, point)| self.frame_hides_an_assigned_local(pc, &point.frame_state))
+    }
+
+    /// Is there an `OsrExit` point recorded at emitter pc `pc`, and does every
+    /// one there describe a frame the VM resumes
+    /// ([`branch_exit_frame_is_transferable`])? Also `false` when an
+    /// `UnreachedCode` point (the `invokedynamic` trap snapshot, filed in the
+    /// same by-bci map) sits at `pc`: the stub could bake that one instead.
+    fn recorded_osr_exit_is_transferable(&self, pc: usize) -> bool {
+        use crate::deopt::DeoptReason;
+        let mut found = false;
+        for (&at, point) in self.deopt_point_pcs.iter().zip(&self.deopt_points) {
+            if at != pc {
+                continue;
+            }
+            match point.reason {
+                DeoptReason::OsrExit => {
+                    if !branch_exit_frame_is_transferable(&point.frame_state) {
+                        return false;
+                    }
+                    found = true;
+                }
+                DeoptReason::UnreachedCode => return false,
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// The poll at a CONDITIONAL back edge (`if*`, `if_icmp*`, `if_acmp*`,
+    /// `ifnull` / `ifnonnull`, or a switch with a backward arm) at
+    /// `branch_pc`, emitted while the branch's `operands` (the compared values,
+    /// or the switch key) are still on the simulated stack.
+    ///
+    /// Identical to [`Self::emit_safepoint_poll`] unless
+    /// [`Self::branch_mode_exit_target`] admits the branch. Then an `OsrExit`
+    /// map is recorded at the BRANCH's own bci, with its operands on the
+    /// stack, and the slow path leaves through it on the verdict (the
+    /// `TEST AL, bit; JNZ` of [`Self::emit_back_edge_safepoint_poll`]). The
+    /// header map cannot serve here: this poll runs before the branch decides
+    /// whether the header is next, with the operands live. The branch's own
+    /// map describes exactly the state at the poll — it is recorded right
+    /// before the poll's code, after the arm's `flush_scratch_registers`, and
+    /// the slow path's reloads restore that state before the `JNZ` — and the
+    /// interpreter resumes by re-executing the branch (`REEXECUTE`). The fast
+    /// path is byte-identical. Interpreter round i1 wave 13, lane L4
+    /// (`i9-L5-jvmti-frames-already-compiled-finish-compiled`): javac's
+    /// `do { } while` loops and loops rotated by ecj or kotlinc back-edge here.
+    pub(super) fn emit_branch_back_edge_safepoint_poll(
+        &mut self,
+        branch_pc: usize,
+        operands: usize,
+    ) {
+        let exit = self.branch_mode_exit_target(branch_pc, operands);
+        if exit.is_none() && crate::x64::dbg_jitc_enabled() {
+            self.note_branch_mode_exit_refused(branch_pc, operands);
+        }
+        self.emit_safepoint_poll_leaving_to(exit);
+    }
+
+    /// [`Self::note_mode_exit_refused`] for a conditional back edge whose map
+    /// [`Self::branch_mode_exit_target`] refused (debug runs only: the
+    /// refusal is asked again here).
+    #[cold]
+    #[inline(never)]
+    fn note_branch_mode_exit_refused(&mut self, branch_pc: usize, operands: usize) {
+        match self.branch_mode_exit_refusal(branch_pc, operands) {
+            Some("not-sought") | None => {}
+            Some(refusal) => self.note_mode_exit_refused("branch", branch_pc, refusal),
+        }
+    }
+
+    /// Admit a conditional back edge's poll to leave through a map at its own
+    /// bci, recording that map; `None` for the plain poll, with nothing
+    /// recorded.
+    ///
+    /// The conditions of [`Self::mode_exit_target`] that are about the compile
+    /// (an OSR-tier request or, since wave 15, [`METHOD_ENTRY_MODE_EXITS_ENABLED`];
+    /// no splice, no loop rewrite, a reserved deopt register region, no elided
+    /// monitor), plus:
+    ///
+    /// * the poll is emitted at all (polls on, both helpers wired), so no map
+    ///   is recorded without its consumer;
+    /// * the operand stack is exactly the branch's operands — the state after
+    ///   the branch is the header's empty stack, the javac/ecj/kotlinc shape;
+    /// * no other point at `branch_pc` (a second reason at one bci would make
+    ///   the reason lookup of the other trap ambiguous);
+    /// * the frame is one the in-place OSR-exit transfer takes
+    ///   ([`branch_exit_frame_is_transferable`]). This check is what keeps
+    ///   the new point from vetoing the artifact: `osr_exit_policy` refuses
+    ///   OSR ENTRY at every pc when any point of the artifact is unresumable,
+    ///   and a live operand has no width source in some methods.
+    ///
+    /// Since interpreter round i1 wave 27 (lane L6) also the admission and the
+    /// map of a post-call exit site (`op_invoke.rs::emit_post_call_exit_site`),
+    /// at the call's successor with the whole post-call stack as `operands`:
+    /// the same state, re-executed at a bci nothing else files a point at.
+    pub(super) fn branch_mode_exit_target(
+        &mut self,
+        branch_pc: usize,
+        operands: usize,
+    ) -> Option<usize> {
+        if !self.branch_mode_exit_admits(branch_pc, operands) {
+            return None;
+        }
+        self.emit_osr_exit_map_at(branch_pc);
+        // `emit_osr_exit_map_at` files under the bare bci only outside a
+        // splice, which the conditions above guarantee; checked anyway so a
+        // missing key can never bake the shared exit into this stub.
+        if !self.osr_exit_box_ptr_by_bci.contains_key(&branch_pc) {
+            return None;
+        }
+        Some(branch_pc)
+    }
+
+    /// The admission of [`Self::branch_mode_exit_target`] without the filing:
+    /// would a map at `branch_pc` with `operands` stack entries be admitted
+    /// now? Also asked by a post-call exit CLAIM
+    /// (`op_invoke.rs::Compiler::emit_post_call_exit_claim`, interpreter
+    /// round i1 wave 48), which builds the point here and files it only after
+    /// the walk.
+    pub(super) fn branch_mode_exit_admits(&mut self, branch_pc: usize, operands: usize) -> bool {
+        self.branch_mode_exit_refusal(branch_pc, operands).is_none()
+    }
+
+    /// Why [`Self::branch_mode_exit_admits`] refuses a map at `branch_pc`
+    /// with `operands` stack entries, or `None` when it admits it. `Some("not-sought")`
+    /// for a compile that seeks no exit (a switch, the polls or a helper off).
+    /// Named for the refusal lines of [`Self::note_mode_exit_refused`]
+    /// (interpreter round i2 wave 55, lane L2).
+    pub(super) fn branch_mode_exit_refusal(
+        &mut self,
+        branch_pc: usize,
+        operands: usize,
+    ) -> Option<&'static str> {
+        if !BRANCH_MODE_EXITS_ENABLED
+            || self.failed
+            || !(self.mode_exit_polls || METHOD_ENTRY_MODE_EXITS_ENABLED)
+            || !crate::deopt_real_enabled()
+            || !jit_safepoint_polls_enabled()
+            || self.helpers.safepoint_flag_addr == 0
+            || self.helpers.safepoint_slow_path == 0
+        {
+            return Some("not-sought");
+        }
+        let refusal = if self.has_elided_monitor {
+            "elided-monitor"
+        } else if self.holds_self_lock_no_frame_names() && !self.self_lock_mode_exits_hand_over() {
+            "self-lock"
+        } else if self.stack.len() < operands
+            || (self.stack.len() != operands && !BRANCH_EXITS_WITH_OPERANDS_BELOW_ENABLED)
+        {
+            "operands-below-the-branch"
+        } else if !self.inline_callee_scopes.is_empty() {
+            "in-a-splice"
+        } else if self.bci_provenance.is_some() {
+            "loop-rewrite"
+        } else if self.deopt_regs_base == 0 {
+            "no-deopt-register-region"
+        } else if self.osr_exit_box_ptr_by_bci.contains_key(&branch_pc) {
+            "exit-map-already-there"
+        } else if !crate::osr_exit::OSR_EXIT_MAPS_BESIDE_GUARDS
+            && self.deopt_point_pcs.contains(&branch_pc)
+        {
+            "point-already-there"
+        } else {
+            let mut fs =
+                self.build_frame_state_at(branch_pc, Some(crate::deopt::DeoptReason::OsrExit));
+            // Wave 56: the frame the map will have, the self-lock hold
+            // included (`build_deopt_point` names it), so a guard beside it
+            // that names the hold too compares equal.
+            self.name_self_lock_hold(&mut fs, branch_pc, crate::deopt::DeoptReason::OsrExit);
+            if !branch_exit_frame_is_transferable(&fs) {
+                "frame-not-transferable"
+            } else if self.frame_hides_an_assigned_local(branch_pc, &fs) {
+                "hides-an-assigned-local"
+            } else if !self.points_at_admit_an_exit_map(branch_pc, &fs) {
+                "point-of-another-frame-there"
+            } else {
+                return None;
+            }
+        };
+        Some(refusal)
+    }
+
+    /// Does every point already filed at `pc` let an `OsrExit` map of frame
+    /// `fs` sit beside it? With
+    /// [`crate::osr_exit::OSR_EXIT_MAPS_BESIDE_GUARDS`] off there are none
+    /// ([`Self::branch_mode_exit_admits`] refused already). On (interpreter
+    /// round i1 wave 49, lane L2): each must be a `REEXECUTE` guard of the
+    /// same frame (`op_invoke::guard_admits_an_exit_map_beside`); a rethrow
+    /// point, an `OsrExit` or `UnreachedCode` one, or a guard of another
+    /// frame still refuses, as the bare `deopt_point_pcs` test did.
+    fn points_at_admit_an_exit_map(&self, pc: usize, fs: &crate::deopt::FrameState) -> bool {
+        let semantics =
+            crate::deopt::ResumeSemantics::for_reason(crate::deopt::DeoptReason::OsrExit);
+        self.deopt_point_pcs
+            .iter()
+            .zip(&self.deopt_points)
+            .filter(|(&at, _)| at == pc)
+            .all(|(_, p)| super::op_invoke::guard_admits_an_exit_map_beside(p, fs, semantics))
+    }
+
+    /// [`Self::emit_safepoint_poll`], plus the verdict test when `exit_header`
+    /// names a header [`Self::mode_exit_target`] admitted.
+    fn emit_safepoint_poll_leaving_to(&mut self, exit_header: Option<usize>) {
+        if self.failed {
+            return;
+        }
+        if !jit_safepoint_polls_enabled() {
+            return;
+        }
+        if self.helpers.safepoint_flag_addr == 0 || self.helpers.safepoint_slow_path == 0 {
+            return;
+        }
+        // t1 wave 8, lane SAFEPOLL (`CRATONVM_JIT_PAGE_POLL`, default ON on Linux and Windows x86-64 since j27): the
+        // branch-free page form, for a poll that reads no verdict (no exit
+        // header: the forced-exit patch rewrites a `JZ` this form does not
+        // have) and tests no owed-cycle latch. Every other poll, and every
+        // poll with the switch off, is the byte poll below.
+        if self.page_form_poll_shape_admits(exit_header) && crate::poll_page::emit_enabled() {
+            self.emit_page_form_poll();
+            return;
+        }
+        // Interpreter round i6 wave 119, lane L2 (`CRATONVM_JIT_POLL_THREAD_WORD`,
+        // default OFF; stage 3 of `i24-L3`): the per-thread poll word through
+        // its TLS mirror, the baked flag below when the mirror is null.
+        //
+        //   MOV R11, <seg>:[disp32] ; TEST R11, R11 ; JZ .global
+        //   TEST byte [R11], 0xFF   ; JMP .tested
+        // .global: <the flag test> ; .tested:
+        //
+        // Both arms end on a `TEST` whose ZF the `JZ` below reads; the `JMP`
+        // keeps the flags. Every jump is local to the poll, so a copy of the
+        // poll (the loop unroller) stays right.
+        let word_tested = if crate::x64::jit_poll_thread_word_enabled() {
+            // Cast: the probe answers a 32-bit segment displacement.
+            let disp = crate::x64::loop_poll_word_tls_disp() as u32;
+            self.buf
+                .emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+            self.buf.emit(&[0x4C, 0x8B, 0x1C, 0x25]); // MOV R11, <seg>:[disp32]
+            self.buf.emit(&disp.to_le_bytes());
+            self.buf.emit(&[0x4D, 0x85, 0xDB]); // TEST R11, R11
+            let to_global = self.emit_jcc_rel32_patch(0x84); // JZ .global
+            self.emit_test_mem8_imm8(R11, 0, 0xFF); // the word's pause byte
+            let to_tested = self.emit_jmp_rel32_patch();
+            self.patch_rel32_to_here(to_global);
+            Some(to_tested)
+        } else {
+            None
+        };
+        if !jit_rip_safepoint_poll_enabled()
+            || !self.emit_test_mem8_abs_imm8(self.helpers.safepoint_flag_addr, 0xFF)
+        {
+            // Out of ±2GB RIP reach, or the kill switch is set — materialize
+            // the address and read through it, the shape this poll had before
+            // 2026-09-02.
+            // Cast: x86-64 immediate encoding
+            self.emit_mov_imm64(R11, self.helpers.safepoint_flag_addr as i64);
+            self.emit_test_mem8_imm8(R11, 0, 0xFF);
+        }
+        if let Some(to_tested) = word_tested {
+            self.patch_rel32_to_here(to_tested);
+        }
+        // gcg g4/oo hunk 5.2 (b) 2, applied by g4/jm: under
+        // `CRATONVM_GEN_CONC_OWED_POLL` (`DirectHelperTable::gen_owed_poll_flag_addr`
+        // non-zero) the poll also tests the VM's owed-cycle latch; either byte
+        // set takes the same slow path. The final `JZ` below stays the one
+        // that skips it, so an exit-forcing patch of `exit_poll_sites` keeps
+        // its meaning. `0`: not emitted, the poll is byte for byte as before.
+        let owed_latch = self.direct_helpers.gen_owed_poll_flag_addr;
+        let stw_set = if owed_latch != 0 {
+            let stw_set = self.emit_jcc_rel32_patch(0x85); // JNZ (STW flag set) -> slow path
+                                                           // Cast: x86-64 immediate encoding
+            self.emit_mov_imm64(R11, owed_latch as i64);
+            self.emit_test_mem8_imm8(R11, 0, 0xFF);
+            Some(stw_set)
+        } else {
+            None
+        };
+        let no_poll = self.emit_jcc_rel32_patch(0x84); // JZ (flag clear) -> skip slow path
+        if let Some(stw_set) = stw_set {
+            self.patch_rel32_to_here(stw_set);
+        }
+        // Interpreter round i1 wave 25, lane L6: a poll that may leave is one a
+        // class redefinition that withdraws this body forces
+        // (`CompiledMethod::exit_poll_sites`): the `0x84` just before `no_poll`.
+        // JIT round 23 wave 1, lane L1: and, in a single-pass OSR body, one the
+        // OSR profit exit forces once an optimizing OSR body can be entered at
+        // every header of the method (`JitCache::arm_osr_profit_exit`); the
+        // verdict below then carries `SAFEPOINT_VERDICT_INNERMOST_FRAME` for it
+        // (`vm::jit::helpers::osr_profit_exit_body`).
+        if exit_header.is_some() && self.compile_id.id() != 0 {
+            if let Ok(cc) = u32::try_from(no_poll - 1) {
+                self.exit_poll_sites.push(cc);
+            }
+        }
+        self.emit_pre_safepoint_spill();
+        // Argument 0 = the flag byte this poll tested, which names the VM to
+        // park on (`native::jni::vm_for_stw_flag_addr`). Loaded after the
+        // spill, so the spill saw the register's previous contents, and the
+        // CALL clobbers every argument register anyway.
+        // Cast: x86-64 immediate encoding
+        self.emit_mov_imm64(ARG_REGS[0], self.helpers.safepoint_flag_addr as i64);
+        // Argument 1 = this body's compile id (0 = none reserved), so the
+        // verdict can be about THIS body (interpreter round i1 wave 17).
+        self.emit_safepoint_body_id_arg();
+        cratonvm_jit_api::assert_helper_call_shape!(
+            "safepoint_slow_path",
+            int_args = 2,
+            returns_value = true
+        );
+        self.emit_call_absolute(self.helpers.safepoint_slow_path);
+        if self.precise_maps || self.shadow_enabled {
+            self.emit_oop_map_for_safepoint();
+        }
+        if let Some(header_pc) = exit_header {
+            // The verdict, still in RAX after the reloads (see
+            // `emit_back_edge_safepoint_poll`). The stub bakes the header's
+            // `OsrExit` map (`osr_exit_box_ptr_by_bci`), as for the Step-8
+            // trigger. An OSR body runs inside the innermost interpreter
+            // frame's activation, so it leaves on the innermost-frame bit —
+            // the question its transfer sink asks of that frame
+            // (`jit_bridge::osr_exit_left_for_the_interpreter`); `TEST RAX,
+            // RAX` until wave 17, the same answer while the polling-body bit
+            // was only ever set with it. Any other body leaves on the
+            // polling-body bit alone (wave 15; about this body since wave 17).
+            if self.mode_exit_polls {
+                // Cast: the verdict bit is below 0x100 (x86-64 imm8).
+                self.emit_test_r8_imm8(RAX, crate::SAFEPOINT_VERDICT_INNERMOST_FRAME as u8);
+            } else {
+                // Cast: the verdict bit is below 0x100 (x86-64 imm8).
+                self.emit_test_r8_imm8(RAX, crate::SAFEPOINT_VERDICT_POLLING_BODY as u8);
+            }
+            let leave = self.emit_jcc_rel32_patch(0x85); // JNZ -> reason-7 stub
+            self.deopt_stubs.push((leave, header_pc, 7)); // 7 = OSR-exit
+        }
+        self.patch_rel32_to_here(no_poll);
+        // A join: the slow path's post-safepoint reloads may have left a
+        // reload-elision mirror that the fast edge never established.
+        self.slot_mirror = None;
+    }
+
+    /// May this poll take the page form, the switch aside? No exit header and
+    /// no owed-cycle latch (wave 8), a pair in disp32 reach, and (t1 wave 11,
+    /// lane GCA) NOT inside a splice: a splice's rollback
+    /// (`inlining.rs::rollback_splice`) rewinds the buffer but deliberately
+    /// not `implicit_null_sites` ("a splice never touches" them), so a
+    /// page-form site pushed inside an abandoned splice would stay registered
+    /// at an offset the fall-through code then reuses -- a stale recovery pc
+    /// for whatever instruction lands there. No splice emits a poll today
+    /// (callee branches are forward-only), so this keeps that true by
+    /// construction rather than by the walker's shape; a splice's poll, if one
+    /// ever appears, is the byte poll.
+    fn page_form_poll_shape_admits(&self, exit_header: Option<usize>) -> bool {
+        exit_header.is_none()
+            && self.direct_helpers.gen_owed_poll_flag_addr == 0
+            && crate::poll_page::base_fits_disp32(self.direct_helpers.page_poll_base)
+            && self.inline_scope_stack.is_empty()
+            && self.inline_oop_scopes.is_empty()
+            && self.inline_callee_scopes.is_empty()
+    }
+
+    /// The page form of [`Self::emit_safepoint_poll_leaving_to`] (t1 wave 8,
+    /// lane SAFEPOLL; `CRATONVM_JIT_PAGE_POLL`; `crate::poll_page`):
+    ///
+    /// ```text
+    ///   MOV  R11, <seg>:[cell_disp32]      ; this OS thread's cell: 0 or ARMED_OFFSET
+    /// site:
+    ///   TEST [R11 + page_poll_base], EAX    ; faults on the stop page during a
+    ///                                       ; pause, on the armed page while armed
+    ///   JMP  .done
+    /// .slow:                                ; the fault's recovery pc
+    ///   <pre-safepoint spill> ; MOV ARG0, flag ; MOV ARG1, id ; CALL slow path
+    ///   <oop map>
+    /// .done:
+    /// ```
+    ///
+    /// The fault leaves every register but R11 (a poll scratch on both forms)
+    /// and the flags (`TEST` never completed) as they were before the poll, so
+    /// `.slow` runs exactly the byte poll's slow path, and the helper decides
+    /// what the visit was for as it does now (pause flag, handshake arm). The
+    /// `(site, .slow)` pair goes into the implicit-null site list: the driver
+    /// registers it all-or-nothing with the rest, the unroller shifts both
+    /// offsets per copy (both are inside the duplicated body), and the
+    /// mapping's retirement retires it.
+    fn emit_page_form_poll(&mut self) {
+        let base = self.direct_helpers.page_poll_base;
+        // Cast: the probe answers a 32-bit segment displacement.
+        let disp = crate::poll_page::cell_tls_disp() as u32;
+        self.buf
+            .emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+        self.buf.emit(&[0x4C, 0x8B, 0x1C, 0x25]); // MOV R11, <seg>:[disp32]
+        self.buf.emit(&disp.to_le_bytes());
+        let site = self.buf.pos();
+        // TEST r/m32, r32 (0x85) with REX.B (R11 base), ModRM mod=10 (disp32),
+        // reg=000 (EAX), rm=011 (R11).
+        self.buf.emit(&[0x41, 0x85, 0x83]);
+        // Cast: `base_fits_disp32` admitted it below 2 GiB.
+        self.buf.emit(&(base as u32).to_le_bytes());
+        let done = self.emit_jmp_rel32_patch();
+        let slow = self.buf.pos();
+        self.implicit_null_sites.push((site, slow));
+        self.emit_pre_safepoint_spill();
+        // Cast: x86-64 immediate encoding
+        self.emit_mov_imm64(ARG_REGS[0], self.helpers.safepoint_flag_addr as i64);
+        self.emit_safepoint_body_id_arg();
+        cratonvm_jit_api::assert_helper_call_shape!(
+            "safepoint_slow_path",
+            int_args = 2,
+            returns_value = true
+        );
+        self.emit_call_absolute(self.helpers.safepoint_slow_path);
+        if self.precise_maps || self.shadow_enabled {
+            self.emit_oop_map_for_safepoint();
+        }
+        self.patch_rel32_to_here(done);
+        // A join, as for the byte poll.
+        self.slot_mirror = None;
+    }
+
+    /// `MOV ARG_REGS[1], <this compile's id>` for the safepoint slow path's
+    /// second argument (`HelperFnSafepointSlowPath`), or `XOR` when no id was
+    /// reserved. Emitted on the slow path only, after the flag argument; the
+    /// CALL that follows clobbers the register anyway.
+    ///
+    /// The id is the one the prologue publishes into the compile-id mirror.
+    /// The VM trusts it only when it equals the mirror it reads on the
+    /// polling thread (`helpers::jit_safepoint_loop_exit_verdict`), so a poll
+    /// of another backend that leaves the register undefined is answered as
+    /// an unnamed body. Interpreter round i1 wave 17, lane L1
+    /// (`i15-L3-proposal-poll-slow-path-names-its-compiled-body`).
+    pub(super) fn emit_safepoint_body_id_arg(&mut self) {
+        self.emit_mov_imm64(ARG_REGS[1], i64::from(self.compile_id.id()));
+    }
+
+    /// Method-entry variant of [`Self::emit_safepoint_poll`], called once
+    /// from the END of [`Self::emit_prologue`].
+    ///
+    /// `emit_prologue` runs before `compile_bytecode`'s per-instruction loop
+    /// ever assigns `self.cur_bc_pc` (see `compile`'s call order), so at
+    /// this point `cur_bc_pc` still holds its `Compiler::new` default of
+    /// `0` — the SAME value a genuine safepoint at the method's first real
+    /// bytecode instruction (bci 0, a very common shape: a constructor or
+    /// method that opens with `new`/an `invoke`) would use. Under
+    /// `precise_maps`, both `emit_pre_safepoint_spill` and
+    /// `emit_oop_map_for_safepoint` key their bookkeeping off `cur_bc_pc`
+    /// (the frame's sp-id slot store and the pushed `OopMapEntry::
+    /// bytecode_pc` respectively) — recording the prologue poll under the
+    /// SAME bci as a real bci-0 safepoint would let the GC's sp-id-keyed
+    /// oop-map lookup for a thread parked at ONE of the two safepoints
+    /// match the OTHER one's (differently-shaped) frame-slot list, which
+    /// could under-report live oops.
+    ///
+    /// `native_pc_offset` (the primary, always-unique-per-call-site key —
+    /// see its doc on [`crate::OopMapEntry`]) does not collide here, only
+    /// the auxiliary `bytecode_pc` cross-check does. Sidestepping it costs
+    /// nothing: swap `cur_bc_pc` to `u32::MAX` (no real method's bytecode
+    /// is anywhere near 4 GiB, so this can never equal a genuine bci) for
+    /// the duration of the poll, then restore the saved value so the
+    /// upcoming bytecode loop starts from its expected `0`.
+    pub(super) fn emit_safepoint_poll_prologue(&mut self) {
+        let saved_pc = self.cur_bc_pc;
+        self.cur_bc_pc = ENTRY_POLL_BC_PC;
+        self.emit_safepoint_poll();
+        self.cur_bc_pc = saved_pc;
+    }
+
+    /// The back-edge poll of a self-recursive TAIL call, in its non-GC-inert
+    /// form (`op_invoke.rs::emit_self_tail_safepoint_poll`):
+    /// [`Self::emit_safepoint_poll_prologue`], plus the verdict test of
+    /// [`Self::emit_back_edge_safepoint_poll`] when
+    /// [`Self::self_tail_mode_exit_target`] admits an exit at bci 0.
+    ///
+    /// At this poll the arguments are already in the parameter homes and the
+    /// operand stack is empty: the state at bci 0 of the next activation,
+    /// which is where the `JMP` that follows continues. Resuming the method
+    /// at bci 0 with those locals is the same continuation in the
+    /// interpreter, and the tail call's result is this activation's result,
+    /// as in the compiled loop. Interpreter round i1 wave 15, lane L3.
+    pub(super) fn emit_self_tail_entry_poll(&mut self) {
+        let exit = self.self_tail_mode_exit_target();
+        let saved_pc = self.cur_bc_pc;
+        self.cur_bc_pc = ENTRY_POLL_BC_PC;
+        self.emit_safepoint_poll_leaving_to(exit);
+        self.cur_bc_pc = saved_pc;
+    }
+
+    /// Admit a self-tail poll to leave through an `OsrExit` map at bci 0,
+    /// recording that map when none is there; `None` for the plain poll.
+    ///
+    /// The compile conditions of [`Self::branch_mode_exit_target`] (the poll
+    /// is emitted, an OSR-tier request or [`METHOD_ENTRY_MODE_EXITS_ENABLED`],
+    /// no splice, no loop rewrite, a reserved deopt register region, no elided
+    /// monitor), an empty operand stack, plus:
+    ///
+    /// * liveness is computed at bci 0, so every non-parameter local is
+    ///   published `Undefined`. Their homes still hold the previous
+    ///   activation's values, which no oop map at this poll names: decoding
+    ///   one as a reference would read a word a moving collection did not
+    ///   update;
+    /// * an `OsrExit` map already at bci 0 (a loop header there, or an
+    ///   earlier tail site) is reused when it describes an empty stack and a
+    ///   frame the sinks resume, and no `invokedynamic` snapshot shares the
+    ///   bci; otherwise no other point may sit at bci 0, and the new map must
+    ///   be one the sinks resume ([`branch_exit_frame_is_transferable`]).
+    fn self_tail_mode_exit_target(&mut self) -> Option<usize> {
+        const ENTRY_BCI: usize = 0;
+        if self.failed
+            || !(self.mode_exit_polls || METHOD_ENTRY_MODE_EXITS_ENABLED)
+            || !crate::deopt_real_enabled()
+            || !jit_safepoint_polls_enabled()
+            || self.helpers.safepoint_flag_addr == 0
+            || self.helpers.safepoint_slow_path == 0
+            || self.has_elided_monitor
+            || self.holds_self_lock_no_frame_names()
+            || !self.stack.is_empty()
+            || !self.inline_callee_scopes.is_empty()
+            || self.bci_provenance.is_some()
+            || self.deopt_regs_base == 0
+            || !self
+                .local_liveness_covered
+                .get(ENTRY_BCI)
+                .copied()
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        if self.osr_exit_box_ptr_by_bci.contains_key(&ENTRY_BCI) {
+            let empty_stack = self
+                .deopt_point_pcs
+                .iter()
+                .zip(&self.deopt_points)
+                .filter(|(at, _)| **at == ENTRY_BCI)
+                .all(|(_, point)| point.frame_state.stack.is_empty());
+            return (empty_stack
+                && self.recorded_osr_exit_is_transferable(ENTRY_BCI)
+                && !self.recorded_exit_hides_an_assigned_local(ENTRY_BCI))
+            .then_some(ENTRY_BCI);
+        }
+        if self.deopt_point_pcs.contains(&ENTRY_BCI) {
+            return None;
+        }
+        let fs = self.build_frame_state_at(ENTRY_BCI, Some(crate::deopt::DeoptReason::OsrExit));
+        if !fs.stack.is_empty()
+            || !branch_exit_frame_is_transferable(&fs)
+            || self.frame_hides_an_assigned_local(ENTRY_BCI, &fs)
+        {
+            return None;
+        }
+        self.emit_osr_exit_map_at(ENTRY_BCI);
+        // Filed under the bare bci only outside a splice, which the
+        // conditions above guarantee; checked so a missing key can never bake
+        // the shared exit into this stub.
+        if !self.osr_exit_box_ptr_by_bci.contains_key(&ENTRY_BCI) {
+            return None;
+        }
+        Some(ENTRY_BCI)
+    }
+
+    /// The live oop LOCALS at the current safepoint, as a bitmask over JVM
+    /// local slots — or `None` when this safepoint's local state is unknown
+    /// and no precise claim may be made about it.
+    ///
+    /// Every reader of `local_oop_masks` / `local_oop_reached` must go through
+    /// here, because the METHOD-ENTRY poll is at `ENTRY_POLL_BC_PC` — a
+    /// synthetic pc chosen (see [`Self::emit_safepoint_poll_prologue`]) so it
+    /// cannot collide with bci 0 in the sp-id-keyed lookup. That choice is
+    /// right, but `local_oop_reached.get(ENTRY_POLL_BC_PC)` is `None`, so the
+    /// entry poll read as "the dataflow never reached here" and its map was
+    /// pushed with `moving_young_coverage_complete: false`.
+    ///
+    /// The consequence was not local to the entry poll. `fully_shadow_covered`
+    /// ANDs that flag over every safepoint of a method, so ONE such entry made
+    /// it false for **every method the fast tier ever compiled**, which through
+    /// the OSR fallback refused relocation on 725 of 759 collections of
+    /// `TestKillProcessWhileWriting` — the
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+    /// residual. Measured with `CRATONVM_DBG_OOPCOV=1`: every uncovered method
+    /// reported exactly `shadow_missing_pcs=[4294967295]`.
+    ///
+    /// The entry state is knowable and is not a guess: the prologue has just
+    /// stored every incoming argument to its home (this poll is emitted from
+    /// the END of `emit_prologue`), the operand stack is empty, and the live
+    /// oops are exactly the reference parameters — `param_oop_mask`, the same
+    /// value that seeds the dataflow at bci 0.
+    ///
+    /// Minus the dead reference locals whose register home another local
+    /// shares ([`Self::dead_shared_register_oop_locals`]): the register holds
+    /// that other local's value there, which may be a primitive.
+    #[inline]
+    pub(super) fn local_oop_mask_at_current_pc(&self) -> Option<u64> {
+        if self.cur_bc_pc == ENTRY_POLL_BC_PC {
+            return Some(self.param_oop_mask);
+        }
+        if !self
+            .local_oop_reached
+            .get(self.cur_bc_pc)
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let mask = self.local_oop_masks.get(self.cur_bc_pc).copied()?;
+        Some(mask & !self.dead_shared_register_oop_locals(0, mask))
+    }
+
+    /// The reference locals of window `w` (slots `[w*64, w*64+64)`, a subset of
+    /// `candidates`) that must NOT be published at the current safepoint
+    /// because their home register may hold ANOTHER local's value here.
+    ///
+    /// # The defect (`common-w4o-shadow-stack-dereferences-a-mistyped-odd-primitive`)
+    ///
+    /// `local_oop_masks` is a forward "holds a reference" dataflow, not a
+    /// liveness analysis: a reference local stays in it after its last use.
+    /// The register allocator colours by LIVENESS (`regalloc::build_interference`),
+    /// so a dead reference local may share its callee-saved register with a
+    /// local that is live there -- in `ShadowOddLongProbe.main`, `String[] a`
+    /// (never read) and the `long` counter share `r12`. Every safepoint in
+    /// the loop then published `r12` as `a`'s reference home: the shadow stack
+    /// pushed the counter (odd half the time, i.e. an `INDIRECT_TAG` entry the
+    /// collector had to reject), the map named `a`'s canonical slot, into which
+    /// the pre-safepoint flush had just copied the counter, and a moving
+    /// collection could rewrite the counter if it ever equalled a moved
+    /// object's old address.
+    ///
+    /// # What licenses dropping a local
+    ///
+    /// Both conditions, so the change is confined to homes that are wrong:
+    ///
+    /// 1. **Dead here.** Not in the per-pc liveness (`local_liveness`, which
+    ///    already unions the live-in of every handler covering the pc), nor in
+    ///    the debugger's kept set (`local_assigned`), at this pc or at the next
+    ///    instruction's (a store emitted under this pc defines the local for
+    ///    the code after it). A dead local is never read again as itself
+    ///    before a redefinition, and the deopt / OSR snapshots already publish
+    ///    it `Undefined` from the same table. No table (`local_liveness_words
+    ///    == 0`), an unreached pc, or the method-entry poll (where every
+    ///    parameter home holds its own incoming argument) drops nothing.
+    /// 2. **Its register is shared** with another local. A register that only
+    ///    this local owns still holds this local's last value -- a reference
+    ///    or null -- so publishing it is type-correct, only possibly
+    ///    retentive. Keeping those published leaves the code of every method
+    ///    whose homes were already right byte-for-byte unchanged. (A dead
+    ///    frame-homed reference is the same retention question; it is left to
+    ///    `common-w4o-allocation-driven-collections-do-not-clear-weak-referents`.)
+    ///
+    /// Every consumer reads the SAME filtered set -- the shadow push
+    /// (`collect_live_oop_homes`) and its reload, the map's Stage 2 slots, the
+    /// register mask, the coverage verdict and the Stage 4 reload -- so the
+    /// push/reload pairs stay balanced and no reload copies an un-rewritten
+    /// slot over a live sharer's register.
+    fn dead_shared_register_oop_locals(&self, w: usize, candidates: u64) -> u64 {
+        // gch h4/jm (opt-in): every dead reference local, not only a shared
+        // register's -- see `sp_map_local_liveness_enabled`.
+        let every_dead = candidates != 0 && self.sp_map_local_liveness_applies();
+        let monotone = every_dead && sp_map_local_liveness_monotone_enabled();
+        self.dead_oop_locals_rule_monotone(w, candidates, every_dead, monotone)
+    }
+
+    /// gch h4/jm: may the "every dead local" form of the filter
+    /// ([`sp_map_local_liveness_enabled`]) speak at the current safepoint?
+    /// Never for a compile a debugger observes (JDWP must read the stale value
+    /// as the interpreter's frame would) and, by default, never inside a
+    /// splice (a splice runs at the OUTER invoke's `cur_bc_pc`, whose liveness
+    /// is the outer method's, not the spliced body's; the g1/s build refused it
+    /// for the same reason). The switches are read last, only when they could
+    /// matter.
+    ///
+    /// gci i8/sp (opt-in [`sp_map_local_liveness_in_splices_enabled`]): inside
+    /// a splice the rule may speak too. Sound because of the very fact the
+    /// refusal names: the filter only ever reads the OUTER method's tables
+    /// (`local_oop_masks`, `local_liveness`, `local_assigned`) at the outer
+    /// invoke's `cur_bc_pc`, and it is applied only to the OUTER method's
+    /// locals -- a spliced body's own locals are `inline_oop_scopes`' and are
+    /// never passed through it. An invoke reads no local, so an outer local
+    /// that is not live-in at the invoke (nor at the instruction after it) is
+    /// read by no code the splice can reach before its redefinition: the
+    /// spliced body cannot name the caller's locals, and a throw out of it
+    /// lands in a handler whose live-in `local_liveness` already unions at
+    /// this pc. The default shared-register rule already runs inside splices
+    /// on exactly this lookup.
+    fn sp_map_local_liveness_applies(&self) -> bool {
+        if self.debugger_observes_locals {
+            return false;
+        }
+        let in_splice = !self.inline_scope_stack.is_empty() || !self.inline_oop_scopes.is_empty();
+        if in_splice
+            && !sp_map_local_liveness_in_splices_enabled()
+            && !(sp_map_local_liveness_enabled() && sp_map_local_liveness_monotone_enabled())
+        {
+            return false;
+        }
+        sp_map_local_liveness_enabled()
+    }
+
+    /// [`Self::dead_shared_register_oop_locals`]'s default rule (the shared
+    /// register form only). (gcg g6/jm deleted the g1/s "every dead local"
+    /// switch `CRATONVM_JIT_SP_LOCAL_LIVENESS`; gch h4/jm rebuilt the same
+    /// rule behind `CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS`, now with a positive
+    /// control -- see [`sp_map_local_liveness_enabled`].) Only the tests ask
+    /// it by name; production goes through `dead_shared_register_oop_locals`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn dead_oop_locals_with(&self, w: usize, candidates: u64) -> u64 {
+        self.dead_oop_locals_rule(w, candidates, false)
+    }
+
+    /// The filter, with the gch h4/jm rule passed in (`every_dead`: drop every
+    /// liveness-dead reference local, whatever its home), so a test can ask
+    /// both rules without the environment.
+    pub(super) fn dead_oop_locals_rule(&self, w: usize, candidates: u64, every_dead: bool) -> u64 {
+        self.dead_oop_locals_rule_monotone(w, candidates, every_dead, false)
+    }
+
+    /// [`Self::dead_oop_locals_rule`], with OOM21-6's monotone extensions of
+    /// the every-dead rule when `monotone` (the section above
+    /// [`sp_map_local_liveness_monotone_enabled`]): an uncovered pc drops every
+    /// candidate, the next instruction is searched past the 64-byte bound,
+    /// and with no later instruction the pc's own liveness answers. Only the
+    /// map filter passes `monotone`; a ZEROING caller wants the conservative
+    /// answer.
+    fn dead_oop_locals_rule_monotone(
+        &self,
+        w: usize,
+        candidates: u64,
+        every_dead: bool,
+        monotone: bool,
+    ) -> u64 {
+        if candidates == 0 || self.cur_bc_pc == ENTRY_POLL_BC_PC || self.local_liveness_words == 0 {
+            return 0;
+        }
+        let monotone = monotone && every_dead;
+        let pc = self.cur_bc_pc;
+        if !self
+            .local_liveness_covered
+            .get(pc)
+            .copied()
+            .unwrap_or(false)
+        {
+            // ARGWIN21-6: no reachable path runs this safepoint.
+            return if monotone { candidates } else { 0 };
+        }
+        let base = w.saturating_mul(64);
+        let live_at =
+            |p: usize| self.local_liveness_word(p, base) | self.local_assigned_word(p, base);
+        let mut live = live_at(pc);
+        // The next instruction laid out after `pc`. `covered` marks exactly the
+        // instruction starts of reachable blocks; a longer gap (a switch
+        // payload, or unreachable code) is bounded, and not finding one drops
+        // nothing.
+        const NEXT_INSN_SEARCH: usize = 64;
+        let search_end = if monotone {
+            self.local_liveness_covered.len()
+        } else {
+            self.local_liveness_covered
+                .len()
+                .min(pc + 1 + NEXT_INSN_SEARCH)
+        };
+        let next = (pc + 1..search_end).find(|&p| self.local_liveness_covered[p]);
+        match next {
+            Some(p) => live |= live_at(p),
+            // OOM21-6: the last reachable instruction; its own liveness.
+            None if monotone => {}
+            None => return 0,
+        }
+        let mut dropped = 0u64;
+        let mut dead = candidates & !live;
+        while dead != 0 {
+            // Cast: a bit index below 64.
+            let bit = dead.trailing_zeros() as usize;
+            dead &= dead - 1;
+            if every_dead {
+                dropped |= 1u64 << bit;
+                continue;
+            }
+            let k = base + bit;
+            let Some(reg) = self.reg_for_local(k) else {
+                continue;
+            };
+            let shared = self
+                .local_assignments
+                .iter()
+                .enumerate()
+                .any(|(j, home)| j != k && *home == Some(reg));
+            if shared {
+                dropped |= 1u64 << bit;
+            }
+        }
+        dropped
+    }
+
+    /// Every JVM local slot holding a reference at the current safepoint,
+    /// across ALL windows -- the reader to use wherever the question is "which
+    /// locals", rather than "the low 64 bits".
+    ///
+    /// Returns `false` when no claim can be made (the dataflow did not reach
+    /// this pc, or refused the method outright). Every caller must treat that
+    /// as a REFUSAL and not as "no oop locals": that distinction is why
+    /// `local_oop_mask_at_current_pc` returns an `Option`, and widening the
+    /// analysis must not quietly lose it.
+    pub(super) fn for_each_oop_local_at_current_pc(&self, mut f: impl FnMut(usize)) -> bool {
+        let Some(w0) = self.local_oop_mask_at_current_pc() else {
+            return false;
+        };
+        let mut emit = |base: usize, mut mask: u64| {
+            while mask != 0 {
+                // Cast: count/index to usize
+                let k = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                f(base + k);
+            }
+        };
+        emit(0, w0);
+        if self.cur_bc_pc == ENTRY_POLL_BC_PC {
+            // The entry poll answers from `param_oop_mask`, a single `u64` over
+            // slots 0..63. A reference parameter at slot 64 or above needs that
+            // many slots of parameters ahead of it; the mask cannot express it,
+            // so refuse rather than claim coverage of a parameter nothing
+            // named. `compute_param_oop_mask` has the same width, so this is
+            // not a new limit -- only a newly honest one.
+            return self.num_params <= 64;
+        }
+        for w in 1..self.local_oop_windows {
+            let idx = w * self.local_oop_stride + self.cur_bc_pc;
+            if let Some(&m) = self.local_oop_masks.get(idx) {
+                // Window 0 was filtered by the accessor above. `color_graph`
+                // homes no local at or above slot 64 in a register today, so
+                // this drops nothing yet; it is asked so the two windows can
+                // never disagree about what a shared register holds.
+                emit(w * 64, m & !self.dead_shared_register_oop_locals(w, m));
+            }
+        }
+        true
+    }
+
+    /// A direct self-call may omit the blind all-GPR spill when this method's
+    /// exact call-site state proves every surviving operand is already visible
+    /// in a canonical frame slot.
+    /// The callee prologue canonicalizes its arguments before it can reach a GC
+    /// safepoint; the caller still publishes its precise oop-map id.
+    ///
+    /// # The local test is reference-only (arch-2026-07-26 R1)
+    ///
+    /// This used to fail closed on `local_assignments.iter().any(Option::is_some)`
+    /// — *any* register-homed local at all. That made the register allocator
+    /// actively counter-productive on the workload the elision exists for: give
+    /// `int fib(int n)` a register home and both recursive call sites go from
+    /// `emit_safepoint_metadata_only` (2 instructions) to the full
+    /// `emit_pre_safepoint_spill` — a per-local publish plus the 14-store blind
+    /// full-GPR spill, twice per invocation.
+    ///
+    /// The test is now `no_reference_in_registers()`: the elision is refused
+    /// only when a register-homed local can actually hold an **object
+    /// reference**. Verified rather than assumed, on the merged tree:
+    ///
+    /// 1. **The GC scan is stack-only.** `OopMapEntry` carries
+    ///    `frame_slot_offsets` and nothing else — the `reg_oops` register bitmap
+    ///    is a TODO with no field, no producer and no consumer anywhere in the
+    ///    workspace. A primitive's frame slot is therefore never *read* as a
+    ///    root; and the conservative `[scanner_sp, entry_sp)` walk re-validates
+    ///    every qword through `heap.is_object_address`, so a slot left stale can
+    ///    only over-retain, never under-report.
+    /// 2. **The reference mask is method-wide and conservative.**
+    ///    `regalloc::find_reference_locals` linearly scans the whole method and
+    ///    ORs in every `aload`/`astore` (all encodings, including `wide`), so
+    ///    javac's cross-scope slot reuse only makes it *more* conservative — a
+    ///    slot used as a reference anywhere is a reference everywhere. Unioned
+    ///    with `param_oop_mask`, which covers the one case the scan cannot see:
+    ///    a reference parameter the method never loads.
+    /// 3. **Nothing reads a primitive's slot back.**
+    ///    `emit_post_safepoint_reload` walks `local_oop_masks[pc]` — oops only —
+    ///    so the store this elides has no paired load.
+    /// 4. **Deopt and precise exception frames read the register, not the slot.**
+    ///    `build_and_record_deopt_point` prefers `FrameValue::Register` /
+    ///    `RegisterLong` / `RegisterRef` over the slot descriptor for a
+    ///    register-homed local, and the frame-deopt stub fills
+    ///    `deopt::SavedRegisters` with the whole GPR file. Reconstruction never
+    ///    consults the unpublished slot.
+    /// 5. **Locals `>= 64` cannot be register-homed at all** (`color_graph` caps
+    ///    at 64 and hands out `None` above it), so a zero
+    ///    `register_homed_reference_locals` really does mean "no register-homed
+    ///    local can hold an oop" — there is no unrepresented tail.
+    ///
+    /// Consequently the R2 invariant ("the oop map's slots must be a subset of
+    /// what the call site keeps current") holds here *by construction*: when the
+    /// predicate passes, every oop local is frame-homed, so its canonical slot —
+    /// which is exactly what `emit_oop_map_for_safepoint` advertises — was
+    /// written at its `astore` and is authoritative. Register-homed *reference*
+    /// locals are unchanged: they still fail the predicate and are still spilled.
+    ///
+    /// When `safepoint_publish` is `None` (the legacy `compile` test wrapper and
+    /// the OSR artifact path, which do not build a plan) this falls back to the
+    /// old all-or-nothing test, so those paths are byte-identical.
+    ///
+    /// Moving-young formerly disabled this optimization unconditionally. That
+    /// was necessary for frames containing references because the collector
+    /// suppresses its conservative JIT-frame scan and must be able to rewrite
+    /// every root. It is unnecessary for an exactly proven oop-free frame:
+    /// `moving_young_safepoint_coverage_complete` certifies the analysis, and an
+    /// empty `collect_live_oop_homes` proves the empty precise map is complete.
+    /// Any reference home or incomplete analysis still fails closed to the full
+    /// spill + shadow publication.
+    pub(super) fn can_elide_self_call_register_spill(&self) -> bool {
+        self.call_spill_elision_core(true)
+    }
+
+    /// Shared body of [`Self::can_elide_self_call_register_spill`] and
+    /// [`Self::can_elide_direct_call_register_spill`].
+    ///
+    /// `strict_survivors` is the ONE difference, and it is why this is a
+    /// parameter rather than a copy. The self-call form requires every operand-
+    /// stack survivor to be `StackSlot::Frame`. That is stronger than the
+    /// mechanism needs, and it is stronger in the same way the predicate's own
+    /// history records for LOCALS: it used to fail closed on *any* register-
+    /// homed local and was narrowed to register-homed *reference* locals once
+    /// it was shown that a primitive's slot is never read as a root.
+    ///
+    /// A survivor in a `CalleeSaved` register is preserved across the `CALL` by
+    /// the callee's own prologue/epilogue (`LOCAL_REGS` is callee-saved on both
+    /// ABIs), and its saved copy lives inside the callee's frame where the
+    /// conservative `[scanner_sp, entry_sp)` walk reads it. Under the moving
+    /// proof `collect_live_oop_homes()` must be empty anyway, so no oop is
+    /// riding in one. A survivor in `Scratch`/`Xmm` is a different matter — the
+    /// call CLOBBERS those registers, which is why `flush_scratch_registers`
+    /// exists and why `emit_pre_safepoint_spill` runs it — so the relaxed form
+    /// still refuses outright when one is present, rather than eliding the
+    /// flush that keeps the value alive.
+    ///
+    /// `probes/CallArgCostProbe.java`'s arms are the shape this unlocks:
+    /// `s += int1(i)` leaves the `long` accumulator on the operand stack across
+    /// the invoke, in a callee-saved register. Strict survivors refused every
+    /// one of them (`direct-call spill: elided=0 frame-not-clean=6`).
+    fn call_spill_elision_core(&self, strict_survivors: bool) -> bool {
+        let any_reference_local_in_a_register =
+            reference_local_in_register(self.safepoint_publish.as_ref(), &self.local_assignments);
+        if full_self_call_spill_requested() {
+            return false;
+        }
+        if !self.precise_maps {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_NO_PRECISE_MAPS);
+            }
+            return false;
+        }
+        if any_reference_local_in_a_register {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_REF_LOCAL_IN_REG);
+            }
+            return false;
+        }
+        if self.stack.len() != self.stack_oop_marks.len() || !self.stack_oop_marks_exact {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_MARKS_INEXACT);
+            }
+            return false;
+        }
+
+        // At this bytecode boundary the invoke arguments have already been
+        // popped and staged in ABI argument registers. The callee prologue
+        // canonicalizes those arguments before it can safepoint. Requiring all
+        // values that survive in the caller to be frame-resident means the
+        // conservative frame walk sees them regardless of their oop tags; any
+        // register/XMM home fails closed to the SB-CRASH-04 full spill.
+        let survivors_ok = if strict_survivors {
+            self.stack
+                .iter()
+                .all(|slot| matches!(slot, StackSlot::Frame(_)))
+        } else {
+            !self
+                .stack
+                .iter()
+                .any(|slot| matches!(slot, StackSlot::Scratch(..) | StackSlot::Xmm(_)))
+        };
+        if !survivors_ok {
+            if !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_SURVIVOR_IN_SCRATCH);
+            }
+            return false;
+        }
+
+        // `self_call_moving_proof_enabled()` rather than `moving_young_enabled()`:
+        // the paired emitter `emit_safepoint_metadata_only` reads the SAME
+        // predicate and fails the compile closed if the two ever disagree, so
+        // they must move together. Default-identical to the old expression.
+        if self.shadow_enabled || self_call_moving_proof_enabled() {
+            let ok = moving_oop_free_self_call_is_publishable(
+                self_call_moving_proof_enabled(),
+                self.moving_young_safepoint_coverage_complete(),
+                self.collect_live_oop_homes().len(),
+            );
+            if !ok && !strict_survivors {
+                crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_MOVING_UNPUBLISHABLE);
+            }
+            return ok;
+        }
+        true
+    }
+
+    /// [`Self::can_elide_self_call_register_spill`], generalised to a DIRECT
+    /// call to a compiled callee that is not this method.
+    ///
+    /// Everything the self-call predicate proves is about THIS frame — no
+    /// register-homed reference local, exact operand-stack oop marks, every
+    /// surviving stack value frame-resident, and (under moving-young) a
+    /// complete analysis over an empty live-oop set. None of it depends on
+    /// which compiled method is called, so it transfers unchanged.
+    ///
+    /// What does NOT transfer is the ARGUMENTS. At the `CALL` they are staged
+    /// in ABI registers, so a reference argument is a live oop with no frame
+    /// home that the caller-frame proof cannot see. Two answers, selected by
+    /// [`call_spill_elision_mode`]:
+    ///
+    ///  * mode 1 (default) — refuse the elision outright if any argument is a
+    ///    reference. Conservative and needs no assumption about the callee.
+    ///  * mode 2 (`args`) — admit them when `service_args_base` is `Some`, i.e.
+    ///    `reserve_direct_call_service_slots` copied every argument into a
+    ///    contiguous frame range for the cold callee-sentinel service. That
+    ///    range lives inside `[scanner_sp, entry_sp)`, so the conservative walk
+    ///    reads it, and the argument oop is frame-resident at the `CALL` after
+    ///    all.
+    ///
+    /// Fails closed in every uncertain case, and the whole thing is off under
+    /// `CRATONVM_JIT_CALL_SPILL_ELISION=0`.
+    pub(super) fn can_elide_direct_call_register_spill(
+        &self,
+        arg_oops: &[bool],
+        args_frame_resident: bool,
+        min_mode: u8,
+    ) -> bool {
+        let mode = call_spill_elision_mode();
+        if mode == 0 || mode < min_mode {
+            return false;
+        }
+        if !self.call_spill_elision_core(false) {
+            // The core already counted WHICH clause refused.
+            return false;
+        }
+        if arg_oops.iter().any(|&o| o) && (mode < 2 || !args_frame_resident) {
+            crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_OOP_ARG);
+            return false;
+        }
+        crate::metrics::note_call_spill(crate::metrics::CALL_SPILL_ELIDED);
+        true
+    }
+
+    /// Which GPRs may hold a LIVE object reference at the current safepoint, as
+    /// a bitmask over [`ALL_SPILL_GPRS`] positions — [`crate::OopMapEntry::reg_oop_mask`].
+    ///
+    /// `emit_pre_safepoint_spill` writes the register file into the frame so a
+    /// conservative scan can see it, and that image is BLIND: every register's
+    /// last value is retained, live or not. This is the narrowing, and it is the
+    /// register-file counterpart of the `frame_slot_offsets` the same map
+    /// already carries.
+    ///
+    /// # What licenses excluding a register
+    ///
+    /// Exactly one claim: **a live reference is either on the simulated operand
+    /// stack, or in a live oop local, or staged for the pending call.** All
+    /// three are modelled here register-by-register.
+    ///
+    /// The third one was originally waved through on the grounds that a staged
+    /// argument is "frame-resident by the time this runs", since
+    /// `pending_staged_arg_oops` holds FRAME offsets. That is true and it is
+    /// not enough. Frame-residency answers the MAP's question — is the object
+    /// findable at all — and this function is asking the REGISTER file's
+    /// question, which is a different one. `pop_invoke_args` takes the argument
+    /// entries off the simulated stack while the registers that held them still
+    /// hold them, so between that pop and the `CALL` a reference sits in, say,
+    /// `r14` with its mask bit clear. Copying a value to the frame does not
+    /// erase it from the register. `pending_call_oop_arg_regs` is the missing
+    /// half, and the two channels are now both consulted.
+    ///
+    /// This is the same model `collect_live_oop_homes` publishes to the shadow
+    /// stack, read for a different question. That function asks "what must I
+    /// make rewritable"; this asks "what may hold a reference at all", which is
+    /// a superset — it keeps `Scratch` and XMM-adjacent cases the shadow push
+    /// refuses, because for a mask they are answers rather than refusals.
+    ///
+    /// # Fail-open, in one direction only
+    ///
+    /// Every uncertainty returns `None`, which means "no claim" and leaves the
+    /// consumer scanning the whole image — the behaviour from before this
+    /// existed. A `Some` that is too NARROW frees a live object, so each
+    /// refusal below is load-bearing rather than tidy:
+    ///
+    /// * marks out of sync with the stack, or not exact — the marks are then not
+    ///   a type map and an unmarked entry may still be a reference;
+    /// * the local oop dataflow did not reach this pc — no per-bci statement
+    ///   about which locals hold references;
+    /// * an inline scope whose mask is unavailable — a spliced callee's locals
+    ///   are references this frame's mask does not describe;
+    /// * `local_oop_window_count` refusing the method outright;
+    /// * `pending_staged_args_unmapped` — a reference argument was staged into
+    ///   the native outgoing-argument area, the direct-call service slots, or an
+    ///   inlined callee's parameter locals, none of which this compiler can
+    ///   name. Its own doc calls that fail-closed, and this is the same close.
+    ///
+    /// `RAX` is kept unconditionally. It is where the emitter materialises every
+    /// loaded, allocated and returned reference before it is pushed or stored,
+    /// so it can hold one in flight at a point the simulated stack does not yet
+    /// describe. One slot is not worth the argument.
+    ///
+    /// # gen r5w6/oomjit10: RAX at a Java invoke
+    ///
+    /// `rax_dead_at_call` withdraws that last paragraph for one family of
+    /// sites: the Java invokes that come through
+    /// `emit_pre_safepoint_spill_args_published` (the dispatch helper, the
+    /// MIC/PIC cascade, the direct and retire-cell calls, the cycle-edge
+    /// cell). There the GC can only run INSIDE the site's `CALL`, and RAX's
+    /// value at the spill has no reader: RAX is caller-saved on both ABIs, so
+    /// nothing after the call reads its pre-call value (the call's result
+    /// arrives in it); it is an argument register of neither ABI, so the Rust
+    /// helpers do not read it; a compiled entry's prologue clobbers it before
+    /// it reads anything (the stack bang and the TLS loads go through it);
+    /// and the hashed stub (`runtime_lowering`) reads its arguments from the
+    /// frame. RAX is never an operand-stack home either (`StackSlot` has no
+    /// RAX form: `Scratch` is R8/R9 and `CalleeSaved` the local registers), so
+    /// no value the simulated stack still describes can be in it. What IS in
+    /// it at such a site is the previous bytecode's temporary -- in
+    /// `cleared(ref)`'s loop the `ref.get()` result, i.e. the very referent the
+    /// loop is waiting to see cleared (`GenR5W3OsrHolderProbe`, census
+    /// `region=safepoint-gpr-spill-image`). `CRATONVM_JIT_RAX_DEAD_AT_CALL=0`
+    /// restores the unconditional bit.
+    ///
+    /// ngr (2026-10-27): the array-allocation helper calls make the same
+    /// claim, on the same argument
+    /// (`emit_pre_safepoint_spill_before_helper_call`), and since gcki-ngr
+    /// (2026-10-28) the `invoke_dispatch` helper calls that read their
+    /// arguments from a frame buffer.
+    fn live_oop_register_mask(
+        &self,
+        staged_args_unmapped: bool,
+        call_oop_arg_regs: u16,
+        rax_dead_at_call: bool,
+    ) -> Option<u16> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !reg_oop_maps_enabled() || self.failed {
+            reg_oop_mask_cause::DISABLED.fetch_add(1, Relaxed);
+            return None;
+        }
+        // gcg g3/v (review): the mask's bits are `ALL_SPILL_GPRS` positions,
+        // and the scan inverts an image slot to a bit by its index
+        // (`FrameLayout::spill_image_index`). That holds for the `=all` image
+        // only. The callee-saved-only `=1` image (`CRATONVM_JIT_SAFEPOINT_REG_SPILL=1`
+        // with the root-visibility spill opted out) is `alloc_used_regs`-indexed,
+        // so its slot 1 (say R12) would be read through RCX's bit and a live
+        // reference there dropped. No claim for that layout.
+        if !image_slots_follow_mask_bits(
+            self.safepoint_reg_spill,
+            self.safepoint_reg_spill_all,
+            self.reg_spill_base,
+        ) {
+            reg_oop_mask_cause::DISABLED.fetch_add(1, Relaxed);
+            return None;
+        }
+        // A reference staged where no map can name it. Fail closed.
+        //
+        // PASSED IN, not read from `self`: `emit_oop_map_for_safepoint` takes
+        // the flag before it calls this, so reading the field here always saw
+        // `false` and this clause was dead code wearing the appearance of a
+        // guard.
+        if staged_args_unmapped {
+            reg_oop_mask_cause::STAGED_ARGS_UNMAPPED.fetch_add(1, Relaxed);
+            // gen r5w2/oomjit6 (opt-in `CRATONVM_GC_STAGED_ARGS_KEEP_MASK`):
+            // the unmappable staging is in MEMORY -- the native outgoing
+            // area, the direct-call service slots, an inlined callee's
+            // parameter locals -- and the pending call's reference
+            // arguments still in registers are `call_oop_arg_regs`, below.
+            // So the fact concerns the outgoing reserve, not the register
+            // file: keep computing the mask, and let the caller record the
+            // safepoint so the method's reserve claim is withdrawn instead
+            // (`staged_args_unmapped_sp_ids`, `x64/driver.rs`). The operand
+            // spill, service slots and inline locals are not narrowed by a
+            // mask at all, so nothing else changes for them.
+            if !staged_args_keep_mask_enabled() {
+                return None;
+            }
+        }
+        if self.stack.len() != self.stack_oop_marks.len() {
+            reg_oop_mask_cause::MARK_DESYNC.fetch_add(1, Relaxed);
+            return None;
+        }
+        if !self.stack.is_empty() && !self.stack_oop_marks_exact {
+            reg_oop_mask_cause::MARKS_INEXACT.fetch_add(1, Relaxed);
+            return None;
+        }
+        if crate::x64::licm::local_oop_window_count(self.num_locals).is_none() {
+            reg_oop_mask_cause::LOCAL_WINDOWS.fetch_add(1, Relaxed);
+            return None;
+        }
+        for scope in &self.inline_oop_scopes {
+            if scope.mask_at_cur().is_none() {
+                reg_oop_mask_cause::INLINE_SCOPE.fetch_add(1, Relaxed);
+                return None;
+            }
+        }
+        let bit = crate::x64::licm::spill_gpr_bit;
+        // RAX — see the doc above, both halves.
+        let mut mask = if rax_dead_at_call { 0 } else { bit(RAX) };
+        // The pending call's own reference arguments, in the registers they
+        // still occupy. `pop_invoke_args` took them off the simulated stack, so
+        // the loop below cannot see them; see `pending_call_oop_arg_regs`.
+        mask |= call_oop_arg_regs;
+        // Operand-stack entries the marks call references, in whichever
+        // register holds them. `Scratch` is included rather than refused: it is
+        // flushed before every call, so it is normally empty here, and when it
+        // is not the honest answer is a set bit.
+        let n = self.stack.len().min(self.stack_oop_marks.len());
+        for i in 0..n {
+            if !self.stack_oop_marks[i] {
+                continue;
+            }
+            match self.stack[i] {
+                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => mask |= bit(reg),
+                StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
+            }
+        }
+        // Reference locals live at THIS pc, in their register homes. The
+        // frame-homed ones need no bit: they are not in the spill image.
+        let mut reached = true;
+        let mut regs: Vec<u8> = Vec::new();
+        let ok = self.for_each_oop_local_at_current_pc(|k| {
+            if let Some(r) = self.reg_for_local(k) {
+                regs.push(r);
+            }
+        });
+        if !ok {
+            reached = false;
+        }
+        if !reached {
+            reg_oop_mask_cause::LOCAL_DATAFLOW.fetch_add(1, Relaxed);
+            return None;
+        }
+        for r in regs {
+            mask |= bit(r);
+        }
+        reg_oop_mask_cause::PUBLISHED.fetch_add(1, Relaxed);
+        Some(mask)
+    }
+
+    /// Return whether the shadow-stack push can prove it will publish every
+    /// live oop for the current safepoint. Any `false` result is a correctness
+    /// signal to the GC: if this frame is live here, moving-young must divert to
+    /// the non-moving sweep for that cycle.
+    fn moving_young_safepoint_coverage_complete(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !moving_young_enabled() || self.failed {
+            shadow_incomplete_cause::GATE_OFF_OR_FAILED.fetch_add(1, Relaxed);
+            return false;
+        }
+        if self.stack.len() != self.stack_oop_marks.len() {
+            shadow_incomplete_cause::MARK_VECTOR_DESYNC.fetch_add(1, Relaxed);
+            return false;
+        }
+        if !self.stack.is_empty() && !self.stack_oop_marks_exact {
+            shadow_incomplete_cause::MARKS_INEXACT.fetch_add(1, Relaxed);
+            return false;
+        }
+        for (slot, &is_oop) in self.stack.iter().zip(self.stack_oop_marks.iter()) {
+            if is_oop && matches!(slot, StackSlot::Scratch(..) | StackSlot::Xmm(_)) {
+                shadow_incomplete_cause::OOP_IN_SCRATCH_OR_XMM.fetch_add(1, Relaxed);
+                return false;
+            }
+        }
+        // The analysis's own verdict, not a bare 64. Above 64 locals it now
+        // returns one word per 64 slots (see `wide_local_oop_maps_enabled`), and
+        // `None` means it refused the method outright -- which is what this
+        // cause has always been for.
+        if crate::x64::licm::local_oop_window_count(self.num_locals).is_none() {
+            shadow_incomplete_cause::TOO_MANY_LOCALS.fetch_add(1, Relaxed);
+            return false;
+        }
+        // A live splice's callee locals are published by `collect_live_oop_homes`
+        // only when its dataflow can classify them. When it cannot, this frame
+        // holds references in slots nothing rewrites, so the safepoint must not
+        // claim complete coverage -- which is what keeps the collector on its
+        // conservative (pinning) sweep for the cycle.
+        for scope in &self.inline_oop_scopes {
+            if scope.mask_at_cur().is_none() {
+                shadow_incomplete_cause::INLINE_SCOPE_UNMAPPED.fetch_add(1, Relaxed);
+                return false;
+            }
+        }
+        if self.num_locals == 0 {
+            return true;
+        }
+        let ok = self.for_each_oop_local_at_current_pc(|_| {});
+        if !ok {
+            shadow_incomplete_cause::LOCAL_OOP_DATAFLOW_UNREACHED.fetch_add(1, Relaxed);
+        }
+        ok
+    }
+
+    /// Collect the homes of every live oop at the current safepoint: operand-
+    /// stack entries tagged as references (`stack_oop_marks`) plus oop locals
+    /// (`local_oop_masks[cur_bc_pc]`). XMM operand entries are skipped (they
+    /// hold FP data, never references). Returns the homes in push order.
+    fn collect_live_oop_homes(&self) -> Vec<ShadowHome> {
+        let mut homes: Vec<ShadowHome> = Vec::new();
+        // B-K kafka fix: publish ONLY the genuinely register-invisible oops —
+        // operand-stack reference entries that live in a REGISTER across the
+        // call. Everything else is already covered, so re-publishing it only
+        // over-pins (the bt18 @ small-heap OOM):
+        //   * operand-stack Frame slots are on the stack → the conservative scan
+        //     `scan_active_jit_frames` already finds them;
+        //   * oop LOCALS are flushed to their canonical frame slots by
+        //     `emit_pre_safepoint_spill` just above → also on the stack;
+        //   * Xmm entries are FP data, never references.
+        // The operand-stack Reg homes (callee-saved survive the call un-spilled;
+        // caller-saved/Scratch are kept for safety) are the only ones the stack
+        // scan can miss, so they are exactly the set the GC must be told about.
+        // Moving young gen (`CRATONVM_MOVING_YOUNG`) requires COMPLETE coverage: a
+        // Cheney copy relocates every reachable object and the conservative frame
+        // scan is suppressed, so EVERY live JIT-held oop must be published here as a
+        // rewritable root — operand-stack entries in frame slots AND every oop
+        // local (register- or frame-resident) as well, not just the
+        // register-invisible operand oops. Under the register-only shadow path
+        // (`CRATONVM_SHADOW_STACK` without moving), the conservative scan still
+        // covers frame slots + flushed locals, so publishing only the register
+        // homes avoids the over-pin OOM the B-K kafka fix warns about.
+        let complete = moving_young_enabled();
+        let n = self.stack.len().min(self.stack_oop_marks.len());
+        for i in 0..n {
+            if !self.stack_oop_marks[i] {
+                continue;
+            }
+            match self.stack[i] {
+                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
+                    homes.push(ShadowHome::Reg(reg))
+                }
+                // Operand entry spilled to a frame slot: covered by the
+                // conservative scan on the non-moving path, but that scan cannot
+                // REWRITE it, so the moving path must publish it here. The frame
+                // slot uses the same `[rbp - off]` convention as the push/reload
+                // (`emit_load_local`/`emit_store_local`).
+                StackSlot::Frame(off) => {
+                    if complete {
+                        homes.push(ShadowHome::Frame(off));
+                    }
+                }
+                StackSlot::Xmm(_) => {}
+            }
+        }
+        // Oop locals — every reference-typed local live at this PC, in its home
+        // register (`reg_for_local`) or canonical frame slot (`local_offset`).
+        // Mirrors the enumeration in `build_and_record_deopt_point`. Only under
+        // moving coverage: on the non-moving path a register-local is flushed to
+        // its frame slot by `emit_pre_safepoint_spill` and found conservatively.
+        if complete {
+            // Every window, so a reference local above slot 63 is published on
+            // the shadow stack as well. Naming it in the map without publishing
+            // it here would leave the band verifier finding a movable word
+            // nothing published -- the pairing
+            // `a_staged_invoke_argument_is_published_on_the_shadow_stack_too`
+            // exists to pin.
+            let mut oop_locals: Vec<usize> = Vec::new();
+            self.for_each_oop_local_at_current_pc(|k| oop_locals.push(k));
+            for i in oop_locals {
+                if i >= self.num_locals {
+                    continue;
+                }
+                if let Some(r) = self.reg_for_local(i) {
+                    homes.push(ShadowHome::Reg(r));
+                } else {
+                    homes.push(ShadowHome::Frame(self.local_offset(i)));
+                }
+            }
+            // The STAGED INVOKE-ARGUMENT buffer. Same set the oop map's Stage 3
+            // names, and for the same reason: these oops were popped off the
+            // simulated operand stack before the call, so neither loop above can
+            // see them.
+            //
+            // Naming them in the MAP is not enough. The map makes them precise
+            // roots for marking; the SHADOW STACK is the rewritable channel, and
+            // it is the only one `moving_young_unpublished_frame_oop_present`
+            // consults — `published_shadow_values(shadow_window_from_frame(..))`,
+            // with no reference to the map at all. So a staged argument that was
+            // mapped but not pushed sat in the frame's spill band as a
+            // movable-resident word the shadow stack never published, and the
+            // band verifier correctly refused the whole collection with
+            // UNPUBLISHED_FRAME_OOP.
+            //
+            // Measured on `bug-h2-testkillprocess-zgc-oom-at-97-percent-free`:
+            // `CRATONVM_JIT_INDY_BRIDGE=0` took that reason from 28 to 5 per 76
+            // collections while four other 2026-08-24 switches left it above 21,
+            // because a bridged `invokedynamic` stages a capturing lambda's
+            // arguments across a call that runs a bootstrap and allocates.
+            // `a51077342` closed the map half of this and stopped there.
+            //
+            // READ, not taken: `emit_oop_map_for_safepoint` still consumes the
+            // list after the call, and taking it here would silently empty the
+            // map's Stage 3.
+            if staged_arg_shadow_enabled() {
+                for off in &self.pending_staged_arg_oops {
+                    homes.push(ShadowHome::Frame(*off));
+                }
+            }
+            // THE LOCALS OF EVERY LIVE SPLICE. A call-carrying inline body
+            // keeps the callee's JVM locals in this frame's spill area and then
+            // makes a real GC-capable call from inside that body; neither loop
+            // above can see those slots (the marks describe operands, the mask
+            // describes the ENCLOSING method's locals), so without this the
+            // spliced callee's `this` was published on no rewritable channel at
+            // all. See `Compiler::inline_oop_scopes`.
+            for scope in &self.inline_oop_scopes {
+                let mask = scope.mask_at_cur().unwrap_or(0);
+                for k in 0..scope.num_locals.min(64) {
+                    if mask & (1u64 << k) == 0 {
+                        continue;
+                    }
+                    // Cast: a JVM local index times 8, added to a frame offset.
+                    homes.push(ShadowHome::Frame(scope.local_base + (k as i32) * 8));
+                }
+            }
+            // V6: the LICM ref-hoist slots live here (`live_ref_hoist_slots`).
+            // Published for the same reason as the staged arguments: the map
+            // names them (Stage 3c), and a mapped slot the shadow stack does
+            // not publish is a movable word the band verifier refuses.
+            for off in self.live_ref_hoist_slots() {
+                homes.push(ShadowHome::Frame(off));
+            }
+            // A local and an operand entry can share the same home register (or two
+            // operand entries the same frame slot). Deduplicate preserving order:
+            // the push and reload walk the identical list, so a duplicate would
+            // only re-store the same rewritten value — harmless, but it inflates
+            // shadow depth, and depth drift is a documented hazard.
+            let mut seen: Vec<ShadowHome> = Vec::with_capacity(homes.len());
+            homes.retain(|h| {
+                if seen.contains(h) {
+                    false
+                } else {
+                    seen.push(*h);
+                    true
+                }
+            });
+        }
+        homes
+    }
+
+    /// V6 (`docs/feature-designs/jit-machine-level-and-instruction-selection.md`; the pin page
+    /// `r12w3-vec-licm-ref-hoist-slots-pin-young-cycles-FIXED-20260926.md`, step 2):
+    /// the LICM ref-hoist slots (`aaload` rows and X2 array fields) that hold
+    /// a live reference at the safepoint being emitted.
+    ///
+    /// A slot is live at a safepoint whose bytecode pc lies in its loop's
+    /// `[loop_header, loop_end)` once the walk has emitted the slot's
+    /// pre-header store at that header (`ref_hoist_written`). Exact because:
+    ///
+    /// * every entry into that span runs the pre-header first: the driver
+    ///   drops a hoist whose header a branch or an exception handler can reach
+    ///   around it (`hoist_preheader_skipped`), and an OSR entry strictly
+    ///   inside a hoisted loop is published ineligible (`inside_hoisted_loop`)
+    ///   while one AT the header lands before the pre-header;
+    /// * the store precedes every in-span safepoint in emission order, and a
+    ///   safepoint at the header pc emitted before it (none today) is excluded
+    ///   by `ref_hoist_written`;
+    /// * nothing else writes the slot, and every value it holds is a
+    ///   reference or null (an `aaload` of a reference array, a reference
+    ///   field).
+    ///
+    /// Deopt: no deopt snapshot describes these slots (the interpreter re-reads
+    /// the row / field), so a deopt drops them with the frame. A collection
+    /// that runs while a deopt stub (or any other call that writes no
+    /// safepoint id) holds the frame resolves the frame's LAST safepoint id;
+    /// if that names this slot, the slot still holds the value it held there,
+    /// which every collection since has kept (the map names it, so it is
+    /// marked and rewritten) -- the pre-header's guards deopt BEFORE its
+    /// store, never after.
+    fn live_ref_hoist_slots(&self) -> Vec<i32> {
+        let mut out: Vec<i32> = Vec::new();
+        if !self.ref_hoist_oop_maps {
+            return out;
+        }
+        let pc = self.cur_bc_pc;
+        for (k, (h, &slot)) in self
+            .hoist_info
+            .iter()
+            .zip(self.hoist_offsets.iter())
+            .enumerate()
+        {
+            let written = self.ref_hoist_written.get(k).copied().unwrap_or(false);
+            if written && h.loop_header <= pc && pc < h.loop_end && !out.contains(&slot) {
+                out.push(slot);
+            }
+        }
+        out
+    }
+
+    /// Shadow-stack push (paired with [`Self::emit_shadow_reload`]).
+    ///
+    /// Emitted just before a GC-capable CALL, after args are staged. For each
+    /// live oop home it stores the value onto the thread's shadow stack and
+    /// bumps `top`. Uses R10 (thread ptr, from the prologue-set frame slot),
+    /// R11 (running `top`), and RAX (frame-slot value temp) — all caller-saved
+    /// non-argument scratch, and never a live-oop home (homes are callee-saved
+    /// or frame). The live homes are recorded in `pending_shadow` for the
+    /// matching reload. `pending_shadow` is cleared first so an unbalanced
+    /// (no-reload) safepoint cannot hand stale homes to a later reload.
+    pub(super) fn emit_shadow_push(&mut self) {
+        // The `helpers.get_current_thread != 0` check MUST mirror the
+        // prologue's gate (`emit_prologue`'s shadow-stack block): the
+        // prologue only zero-initializes `shadow_thread_slot_off` when that
+        // helper is wired. Without this matching guard here, a context
+        // where the helper isn't wired (e.g. the JIT unit tests' stub
+        // `test_helpers()`) would load uninitialized stack garbage as if it
+        // were a live `*mut JvmThread` and dereference it — see the epilogue
+        // fix in `emit_epilogue` for the full incident writeup.
+        if self.failed
+            || !self.shadow_enabled
+            || self.helpers.get_current_thread == 0
+            || self.shadow_thread_slot_off == 0
+        {
+            shadow_incomplete_cause::PUSH_NOT_EMITTED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.pending_shadow_coverage_complete = false;
+            return;
+        }
+        // Bisect toggle: CRATONVM_SHADOW_NOPUSH skips the push/reload codegen
+        // (keeps the prologue thread-fetch + gate flip) so the SEGV can be
+        // localized to push/reload vs the rest without a rebuild.
+        if shadow_nopush() {
+            self.pending_shadow_coverage_complete = false;
+            return;
+        }
+        self.pending_shadow.clear();
+        self.pending_shadow_coverage_complete = self.moving_young_safepoint_coverage_complete();
+        let homes = self.collect_live_oop_homes();
+        if !homes.is_empty() && shadow2_diag_enabled(&self.method_label) {
+            let lm = self.local_oop_mask_at_current_pc().unwrap_or(0);
+            let reached = self.local_oop_mask_at_current_pc().is_some();
+            eprintln!(
+                "[SHADOW2] method={} pc={} stack={:?} marks={:?} local_reached={} local_mask={:#x} homes={:?}",
+                self.method_label,
+                self.cur_bc_pc,
+                self.stack,
+                self.stack_oop_marks,
+                reached,
+                lm,
+                homes
+            );
+        }
+        if homes.is_empty() {
+            return;
+        }
+        // A push wider than the collector's shadow-bail window (kept equal to
+        // `conservative_roots::SHADOW_BAIL_MAX_PUSH_BYTES`, 1.5 MiB) is not
+        // emitted, so the per-thread bail bound holds by construction.
+        if homes.len().saturating_mul(8) > 1536 * 1024 {
+            shadow_incomplete_cause::PUSH_NOT_EMITTED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.pending_shadow_coverage_complete = false;
+            return;
+        }
+        self.emit_shadow_push_homes(homes);
+    }
+
+    /// The code half of [`Self::emit_shadow_push`]: publish exactly `homes`
+    /// (non-empty, gates already passed) and leave them in `pending_shadow`
+    /// for the matching [`Self::emit_shadow_reload`]. Also used to
+    /// RE-publish a call's homes after a nested service safepoint popped
+    /// them (`emit_callee_deopt_service_check`).
+    pub(super) fn emit_shadow_push_homes(&mut self, homes: Vec<ShadowHome>) {
+        // Lazy-prologue lever: this method genuinely publishes a register-
+        // resident oop, so the prologue thread-fetch must be KEPT (not NOP'd).
+        self.shadow_pushed_any = true;
+        let ss_top = self.shadow_off_in_thread; // + ShadowStack::TOP_OFFSET (0)
+                                                // spring-bug-10 DIAGNOSTIC (CRATONVM_SHADOW_SENTINEL): write a recognizable
+                                                // NON-CANONICAL sentinel into the savebase slot UNCONDITIONALLY (before the
+                                                // null-thread guard), so the matching reload's value distinguishes the three
+                                                // hypotheses if it faults: 0x5151_5151_5151_5151 ⇒ the push BODY was skipped
+                                                // (null thread) and the slot kept the sentinel; 0xFFFF…FFFE ⇒ an EXTERNAL
+                                                // write overwrote the real top with -2; a valid buffer ptr ⇒ no corruption.
+        if shadow_sentinel() && self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
+            // Cast: u64 -> i64 (same-width bit reinterpretation of a sentinel pattern)
+            self.emit_mov_imm64_full(R11, 0x5151_5151_5151_5151u64 as i64);
+            self.emit_store_local(self.shadow_savebase_slot_off, R11);
+        }
+        // R10 = thread (cached in the prologue-set frame slot); R11 = shadow top.
+        self.emit_load_local(R10, self.shadow_thread_slot_off);
+        // Guard: if the cached thread pointer is null (get_current_thread
+        // returned null for this method), skip the whole push.
+        self.emit_test_r64_r64(R10);
+        let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+        let savebase_ok = self.shadow_savebase_slot_off != 0 && !shadow_no_savebase();
+        // OVERFLOW GUARD (`ShadowStack::END_OFFSET`). Without it a push that
+        // runs off the end of the 2 MiB buffer keeps storing straight through
+        // the allocator arena behind it — including the `JvmThread` — until it
+        // leaves the mapping ~170 MiB later. That is silent heap corruption,
+        // not a bail, and it is what an unbalanced push in a hot loop actually
+        // produces. LEA does not touch flags, so the bump can be undone
+        // between the CMP and the branch and no scratch register beyond R11 is
+        // needed (RAX may hold a staged value at this point).
+        //
+        // `top == end` is the legal "exactly full" state, so the test is
+        // strictly-above. On a bail nothing is stored and `top` is left where
+        // it was; the matching reload learns this from the tag bit set in the
+        // saved-base slot below (slot addresses are 8-aligned, so bit 0 is
+        // free) and skips the value-restore, which would otherwise read slots
+        // this push never wrote.
+        let need = (homes.len() as i32) * 8; // Cast: x86-64 disp32
+        let overflow = if savebase_ok && crate::shadow_end_guard_enabled() {
+            self.emit_lea_r64_mem_disp32(R11, R11, need);
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs `end`
+            self.emit_lea_r64_mem_disp32(R11, R11, -need); // flags preserved
+            Some(self.emit_jcc_rel32_patch(0x87)) // JA → would overrun
+        } else {
+            None
+        };
+        // Save this push's base `top` so the matching reload restores from /
+        // resets `top` to exactly here, immune to any intervening unbalanced
+        // push that drifts `top` (spring-bug-10).
+        if savebase_ok {
+            self.emit_store_local(self.shadow_savebase_slot_off, R11);
+        }
+        if shadow_indirect_frame_homes() {
+            // A frame-slot home is published by ADDRESS for this call: the
+            // entry is `rbp - off + 1` (`ShadowStack::INDIRECT_TAG`), the
+            // collector reads and rewrites the slot itself, and the reload has
+            // nothing to copy back. Sound for the entry's whole life, which is
+            // this call: the slot holds this safepoint's live reference, the
+            // caller writes nothing between here and the CALL, a callee never
+            // writes its caller's rbp-relative homes, and the reload pops the
+            // entry before anything else runs. Stored by displacement, with one
+            // bump at the end — the reload already addresses `[base + 8i]`.
+            for (i, &home) in homes.iter().enumerate() {
+                let disp = (i as i32) * 8; // Cast: x86-64 disp32
+                match home {
+                    ShadowHome::Reg(r) => {
+                        self.emit_mov_mem_disp32_r64(R11, r, disp);
+                    }
+                    ShadowHome::Frame(off) => {
+                        self.emit_lea_r64_mem_disp32(RAX, RBP, 1 - off);
+                        self.emit_mov_mem_disp32_r64(R11, RAX, disp);
+                    }
+                }
+            }
+            self.emit_lea_r64_mem_disp32(R11, R11, need);
+        } else {
+            for &home in &homes {
+                match home {
+                    ShadowHome::Reg(r) => {
+                        self.emit_mov_mem_disp32_r64(R11, r, 0);
+                    }
+                    ShadowHome::Frame(off) => {
+                        self.emit_load_local(RAX, off);
+                        self.emit_mov_mem_disp32_r64(R11, RAX, 0);
+                    }
+                }
+                self.emit_lea_r64_mem_disp32(R11, R11, 8);
+            }
+        }
+        // Commit new top.
+        self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+        if let Some(overflow) = overflow {
+            let done = self.emit_jmp_rel32_patch();
+            self.patch_rel32_to_here(overflow);
+            // Overflow bail. R11 still holds the pre-push `top` (the LEA was
+            // undone), which is exactly what the reload must restore `top` to.
+            // Tag it so the reload skips the value-restore.
+            self.emit_or_r64_imm8(R11, 1);
+            self.emit_store_local(self.shadow_savebase_slot_off, R11);
+            self.emit_shadow_overflow_note();
+            self.patch_rel32_to_here(done);
+        }
+        self.patch_rel32_to_here(skip); // null-thread guard target
+        self.pending_shadow = homes;
+    }
+
+    /// Shadow-stack reload (paired with [`Self::emit_shadow_push`]).
+    ///
+    /// Emitted immediately after the CALL returns. Pops each pushed slot in
+    /// reverse and writes the (possibly GC-rewritten) value back into its home,
+    /// so a relocated object's new address flows into the registers/slots the
+    /// compiled code keeps using. Preserves RAX (the call's return value): the
+    /// scratch used is R10 (thread), R11 (top), R8 (frame-slot value temp).
+    /// No-op when `pending_shadow` is empty (unmatched safepoint).
+    pub(super) fn emit_shadow_reload(&mut self) {
+        // Mirror `emit_shadow_push`'s gate — see its comment for why.
+        if self.failed
+            || !self.shadow_enabled
+            || self.helpers.get_current_thread == 0
+            || self.shadow_thread_slot_off == 0
+        {
+            return;
+        }
+        if shadow_nopush() || shadow_noreload() {
+            // Still drain pending so a later reload can't consume stale homes.
+            self.pending_shadow.clear();
+            return;
+        }
+        if self.pending_shadow.is_empty() {
+            return;
+        }
+        let homes = std::mem::take(&mut self.pending_shadow);
+        let ss_top = self.shadow_off_in_thread;
+        self.emit_load_local(R10, self.shadow_thread_slot_off);
+        // Guard: null thread pointer (see push) → skip reload. Symmetric with
+        // the push guard, so a method with a null thread is consistently
+        // untracked (the push was skipped too).
+        self.emit_test_r64_r64(R10);
+        let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+
+        // spring-bug-10: PINNED reload. With `CRATONVM_SHADOW_PIN` the shadow
+        // oops are published as PINNED roots, so the collector NEVER moves them.
+        // The home values are therefore already correct after the call — callee-
+        // saved registers survive it un-clobbered, and any caller-saved operand
+        // oop was spilled to a frame slot by the normal pre-call codegen (and is
+        // reloaded from there by the normal post-call codegen). The shadow
+        // value-restore is thus redundant, and — when the saved base is stale /
+        // corrupt — it is the *cause* of the corruption (it writes a wrong buffer
+        // slot into a live home register; the bisection showed NORELOAD is clean
+        // but reload-with-restore hangs). So under pin we SKIP the value-restore
+        // entirely and only pop `top`, and only to a *validated* base: an
+        // over-high `top` merely over-scans (harmless for marking), whereas a
+        // too-low `top` could drop a live root, so we never pop below a
+        // validated savebase (if savebase is out of range we leave `top` for the
+        // JIT-exit boundary heal `restore_jit_thread` to reset).
+        if shadow_pin_codegen() {
+            if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
+                self.emit_load_local(R11, self.shadow_savebase_slot_off);
+                // Strip the overflow tag (see `emit_shadow_push`). A no-op on
+                // the normal path — slot addresses are 8-aligned — and on the
+                // bail path it recovers the pre-push `top`, which is the value
+                // this path wants anyway (it only pops, never restores).
+                self.emit_and_r64_imm8(R11, -2);
+                self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
+                let leave_lo = self.emit_jcc_rel32_patch(0x82); // JB  → leave top
+                self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs end
+                let leave_hi = self.emit_jcc_rel32_patch(0x83); // JAE → leave top
+                self.emit_mov_mem_disp32_r64(R10, R11, ss_top); // top = savebase
+                self.patch_rel32_to_here(leave_lo);
+                self.patch_rel32_to_here(leave_hi);
+            }
+            self.patch_rel32_to_here(skip); // null-thread guard target
+            return;
+        }
+
+        // Restore from the SAVED BASE this push recorded (NOT the current
+        // `top`, which an intervening unbalanced push may have drifted high —
+        // reading from a drifted `top` is what faulted on an uninitialised slot,
+        // the spring-bug-10 SIGSEGV). `R11 = base`; each home `i` was stored at
+        // `[base + i*8]`. Resetting `top` to `base` afterwards also self-corrects
+        // any drift. Works for both movable (slot holds the GC-rewritten value)
+        // and pinned (slot holds the unchanged value; the restore is a harmless
+        // no-op since the callee-saved home was preserved).
+        let n_bytes = -(homes.len() as i32) * 8; // Cast: x86-64 disp32
+                                                 // SB-CRASH-04 fix: branches to here (resolved after the commit) when the
+                                                 // savebase is invalid — the reload then leaves the home registers + `top`
+                                                 // untouched instead of reading an out-of-bounds healed slot.
+        let mut sr_patches: Vec<usize> = Vec::new();
+        // Set when the push emitted an overflow guard: the branch taken when
+        // its bail tag is present, resolved to the recovery block below.
+        let mut ovf_patch: Option<usize> = None;
+        if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() && shadow_reload_raw() {
+            // DIAGNOSTIC raw deref: load savebase and use it unvalidated, so a
+            // corrupt value faults on the home-restore below (crash dump shows it).
+            // The overflow tag is still stripped — a legitimate overflow bail is
+            // not the corruption this mode is hunting.
+            self.emit_load_local(R11, self.shadow_savebase_slot_off);
+            self.emit_and_r64_imm8(R11, -2);
+        } else if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
+            // R11 = savebase (the saved pre-push `top` for this safepoint).
+            self.emit_load_local(R11, self.shadow_savebase_slot_off);
+            // Overflow bail protocol (see `emit_shadow_push`): bit 0 set means
+            // the paired push stored nothing, so the value-restore below would
+            // read slots that were never written. Take the tail block instead,
+            // which only puts `top` back where the push found it.
+            self.emit_test_r64_imm32(R11, 1);
+            ovf_patch = Some(self.emit_jcc_rel32_patch(0x85)); // JNE → bail path
+                                                               // spring-bug-10 hardening: validate savebase ∈ [base, end) BEFORE
+                                                               // dereferencing it for the home-restore below. The observed SIGSEGV
+                                                               // read 0xFFFF_FFFF_FFFF_FFFE from this slot — a corrupt / stale /
+                                                               // uninitialised value that the unconditional deref then faulted on.
+                                                               // ShadowStack layout (relative to `ss_top`): top@+0, end@+8, base@+16.
+                                                               //   cmp R11, base ; jb  heal   (below base)
+                                                               //   cmp R11, end  ; jae heal   (at/above end)
+                                                               // On heal, fall back to popping `homes.len()` slots off the live
+                                                               // `top` — never out of the backing buffer, so it cannot fault.
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
+                                                                 // SB-CRASH-04 fix: on an invalid savebase (corrupt/uninitialised —
+                                                                 // the observed 0xFFFF_FFFF_FFFF_FFFE), SKIP the value-restore rather
+                                                                 // than healing to `top - n*8`. The old heal read `[top - n*8]`, which
+                                                                 // is OUT OF BOUNDS below `base` when the stack is shallow/empty
+                                                                 // (top≈base) → it loaded an adjacent non-pointer word (the observed
+                                                                 // `0x1`) and wrote it into the `this` register → SIGSEGV at the next
+                                                                 // field access. Under the non-moving sweep the home registers already
+                                                                 // hold the correct, un-moved object, so leaving them (and `top`)
+                                                                 // untouched is correct; an over-high `top` is reset by the JIT-exit
+                                                                 // boundary heal (`restore_jit_thread`).
+            sr_patches.push(self.emit_jcc_rel32_patch(0x82)); // JB  (savebase < base) → skip restore
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs end
+            sr_patches.push(self.emit_jcc_rel32_patch(0x83)); // JAE (savebase >= end) → skip restore
+        } else {
+            // Fallback (savebase unavailable): old current-top behaviour.
+            self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+            self.emit_lea_r64_mem_disp32(R11, R11, n_bytes);
+        }
+        // A frame-slot home pushed by address was rewritten in place by the
+        // collector (see the push); only a register home has a value to take
+        // back. Same `shadow_indirect_frame_homes` latch as the push, so the
+        // two always agree about which form each entry has.
+        let indirect = shadow_indirect_frame_homes();
+        for (i, &home) in homes.iter().enumerate() {
+            let disp = (i as i32) * 8; // Cast: x86-64 disp32
+            match home {
+                ShadowHome::Reg(r) => {
+                    self.emit_mov_r64_mem_disp32(r, R11, disp);
+                }
+                ShadowHome::Frame(_) if indirect => {}
+                ShadowHome::Frame(off) => {
+                    self.emit_mov_r64_mem_disp32(R8, R11, disp);
+                    self.emit_store_local(off, R8);
+                }
+            }
+        }
+        // Commit popped top = savebase (drift-corrected).
+        self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+        // SB-CRASH-04: on the valid path, jump past the invalid-savebase recovery.
+        let after_pop = self.emit_jmp_rel32_patch();
+        // Invalid-savebase recovery (the corrupt 0xFFFF…FFFE case): DON'T restore
+        // the home registers (they already hold the correct, un-moved object under
+        // the non-moving sweep — reading a healed `top - n*8` went OOB below `base`
+        // and corrupted `this` with `0x1`). But still POP `top` by the pushed count,
+        // clamped to `base`, so the LIFO stays balanced and cannot drift/overflow.
+        for p in sr_patches.drain(..) {
+            self.patch_rel32_to_here(p);
+        }
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top); // R11 = current top
+        self.emit_lea_r64_mem_disp32(R11, R11, n_bytes); // R11 = top - n*8
+        self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
+        let no_clamp = self.emit_jcc_rel32_patch(0x83); // JAE → R11 >= base
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top + 16); // clamp R11 = base
+        self.patch_rel32_to_here(no_clamp);
+        self.emit_mov_mem_disp32_r64(R10, R11, ss_top); // commit top = R11
+        self.patch_rel32_to_here(after_pop);
+        if let Some(ovf) = ovf_patch {
+            // Overflow-bail recovery. Reached only from the tagged-savebase
+            // branch above, so it must not fall through from the normal path.
+            let past = self.emit_jmp_rel32_patch();
+            self.patch_rel32_to_here(ovf);
+            self.emit_load_local(R11, self.shadow_savebase_slot_off);
+            self.emit_and_r64_imm8(R11, -2); // recover the pre-push `top`
+                                             // Bound it before committing: an over-high `top` over-scans
+                                             // (harmless) but a wild one would widen the scan out of the buffer.
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
+            let leave_lo = self.emit_jcc_rel32_patch(0x82); // JB  → leave top
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs end
+            let leave_hi = self.emit_jcc_rel32_patch(0x87); // JA  → leave top
+            self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+            self.patch_rel32_to_here(leave_lo);
+            self.patch_rel32_to_here(leave_hi);
+            self.patch_rel32_to_here(past);
+        }
+        // DBG (CRATONVM_DBG_SHADOW_RELOAD): for a single Reg home, if the reloaded
+        // value is a non-pointer (< 0x10000) — the `1`-as-`this` bug — call the log
+        // helper with (thread=R10, orig-savebase=[rbp-savebase_slot], slotval=home,
+        // read_addr=R11). Bad-path only: the pointer path emits just cmp+jae.
+        if shadow_reload_dbg() && homes.len() == 1 && self.shadow_savebase_slot_off != 0 {
+            if let ShadowHome::Reg(r) = homes[0] {
+                // cmp r, 0x10000   (REX.W [+ REX.B], 0x81 /7 id).
+                //
+                // REX.B is CONDITIONAL. This used to be a hard-coded `0x49`
+                // (REX.W|REX.B) with the comment "r is r8..r15 here", and that
+                // premise is false: `collect_live_oop_homes` builds
+                // `ShadowHome::Reg` from `SCRATCH_REGS` *or* `LOCAL_REGS`, and
+                // `LOCAL_REGS` contains RBX(3) on every platform plus RSI(6)
+                // and RDI(7) on Windows. With REX.B forced on, `r == RBX`
+                // encoded `cmp r11, 0x10000` — and R11 holds the shadow-buffer
+                // read address, a heap pointer, so the JAE was always taken and
+                // this probe could never fire for the very homes it exists to
+                // inspect. `r == RSI` encoded `cmp r14, ...` instead, firing
+                // spuriously on a healthy reload.
+                self.buf.emit(&cmp_r64_imm32_opcode(r));
+                self.buf.emit(&0x10000i32.to_le_bytes());
+                let skip2 = self.emit_jcc_rel32_patch(0x83); // JAE → skip (pointer)
+                self.buf.emit_byte(0x50); // push rax (preserve call return value)
+                                          // `jit_dbg_shadow_reload_log` is `extern "C"`, so the argument
+                                          // registers are the platform's, not Win64's. These were hard-coded
+                                          // RCX/RDX/R8/R9, which on SysV passed three of the four fields in
+                                          // the wrong registers and printed garbage. Every other cross-ABI
+                                          // call site in this backend goes through `ARG_REGS`.
+                                          //
+                                          // Write order is safe on both ABIs: the sources are R10, [rbp-off],
+                                          // `r` and R11, and each `ARG_REGS[i]` that could alias a later
+                                          // source (`r == R8`/`R9` under Win64) is read before it is written.
+                self.emit_mov_reg_reg(ARG_REGS[0], R10); // arg0 = thread
+                self.emit_mov_r64_mem_disp32(ARG_REGS[1], RBP, -self.shadow_savebase_slot_off); // arg1 = orig savebase slot
+                self.emit_mov_reg_reg(ARG_REGS[2], r); // arg2 = reloaded value
+                self.emit_mov_reg_reg(ARG_REGS[3], R11); // arg3 = actual read address
+                                                         // 0x28 on both ABIs: Win64 needs 32 bytes of shadow space, and the
+                                                         // total 8 (`push rax`) + 40 = 48 keeps RSP 16-aligned either way.
+                self.emit_sub_rsp_imm(0x28);
+                // Cast through a raw pointer before converting the helper address to an integer.
+                self.emit_call_absolute(jit_dbg_shadow_reload_log as *const () as usize);
+                self.buf.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+                self.buf.emit_byte(0x58); // pop rax
+                self.patch_rel32_to_here(skip2);
+            }
+        }
+        self.patch_rel32_to_here(skip); // null-thread guard target
+    }
+
+    /// T1.1.a — record an oop map at the current native PC for the
+    /// live frame slots that hold object references.
+    ///
+    /// Call this *immediately after* any helper call that may trigger
+    /// GC (object allocation, method dispatch, array allocation). The
+    /// `self.buf.len()` at the time of this call is the return PC of
+    /// the call — the exact PC the GC walker will look up in the
+    /// finalized oop map.
+    ///
+    /// Empty maps (no oops live at the call) are skipped to keep the
+    /// per-method oop map size bounded: GC falls back to conservative
+    /// scanning for that frame, which produces the same correct
+    /// result.
+    ///
+    /// `extra_popped` is the number of oop-typed stack entries the
+    /// caller has already popped *for the call itself* but that would
+    /// otherwise still be live if the call could return. For most
+    /// alloc helpers this is 0 (they take primitive arguments). For
+    /// `invoke*` the caller pops `this + args` before this call and
+    /// passes `0` here because those entries are consumed.
+    /// `CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY=1` — count a safepoint as
+    /// mapped even when its map is known to have dropped a live oop, i.e. the
+    /// pre-fix accounting behind `fully_oop_covered`.
+    ///
+    /// Kept so the change is measurable in one binary: the fix can only ever
+    /// make coverage claims RARER, and the question it opens is how much
+    /// precise-only suppression it costs on workloads that were relying on it.
+    fn oopmap_presence_only() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY")
+        })
+    }
+
+    pub(super) fn emit_oop_map_for_safepoint(&mut self) {
+        // Defensive: if the compiler is already in a failed state,
+        // don't emit bogus maps.
+        if self.failed {
+            return;
+        }
+        // §25.3 — the shadow push paired with this safepoint ran before the
+        // call; `emit_shadow_reload` below consumes `pending_shadow`, so the
+        // count has to be taken here or not at all.
+        let shadow_pushed_here = u16::try_from(self.pending_shadow.len()).unwrap_or(u16::MAX);
+        // Shadow-stack precise roots — reload every oop pushed by the matching
+        // `emit_shadow_push` from its (possibly GC-rewritten) shadow slot back
+        // into its home register/frame slot, then pop. Emitted right after the
+        // call returns (before the return value is consumed below). No-op when
+        // the shadow gate is off or no oops were pushed at this safepoint.
+        self.emit_shadow_reload();
+        // Stage 1 (precise oop maps) — the lockstep invariant
+        // `stack.len() == stack_oop_marks.len()` now holds continuously:
+        // every push goes through `stack_push`/`push_stack` (which pair
+        // both vectors) and the dup/swap/merge-reconstruct paths rebuild
+        // marks in step. Assert it in debug builds. The release-mode pad
+        // below is retained purely as a defensive backstop: should any
+        // future un-instrumented `self.stack.push` re-introduce a desync,
+        // padding with `false` (non-oop) stays SOUND because
+        // `conservative_roots::scan_one_frame_precise` also conservatively
+        // sweeps the frame region — but a desync would silently degrade
+        // precision (and is unsafe for the *moving* path), so the assert
+        // is the real guard.
+        if self.stack.len() != self.stack_oop_marks.len() {
+            self.stack_oop_marks_exact = false;
+        }
+        debug_assert_eq!(
+            self.stack.len(),
+            self.stack_oop_marks.len(),
+            "stack/oop-marks desync at safepoint (native_pc={}): every \
+             self.stack growth must go through stack_push/push_stack",
+            self.buf.pos(),
+        );
+        while self.stack_oop_marks.len() < self.stack.len() {
+            self.stack_oop_marks.push(false);
+        }
+        // If marks is somehow longer than stack (pop desync), truncate.
+        self.stack_oop_marks.truncate(self.stack.len());
+
+        // Consume the bound captured by the paired `emit_pre_safepoint_spill`.
+        // Taking it (rather than copying) means a map emitted without a paired
+        // spill records `0` = "unknown" and the GC scans conservatively, which
+        // is the fail-closed direction.
+        let live_frame_hi = std::mem::take(&mut self.pending_live_frame_hi);
+        let native_pc = self.buf.pos() as u32; // Cast: x86-64 immediate encoding
+        let mut slots: Vec<i16> = Vec::new();
+        // Whether this safepoint's map is known to be INCOMPLETE — some live
+        // oop could not be recorded.
+        //
+        // MEASURED INERT on every workload run so far (probe and ntru, all
+        // three collectors): this never fires there, and the arms with and
+        // without it are byte-identical. It is fail-closed hardening for drops
+        // that ARE unsound whenever they happen — it is NOT the explanation for
+        // the never-mapped operand-spill slots those runs report. Those are
+        // staged invoke-arguments, which were never in this vocabulary to be
+        // dropped from. See
+        // `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820-FIXED.md`. Every `continue`/failed-`if let` below is
+        // a silent omission, and until this existed none of them reached
+        // `fully_oop_covered`, which tests only that each safepoint produced AN
+        // entry (`safepoint_pcs ⊆ mapped_safepoint_pcs`). A safepoint whose map
+        // dropped every oop still counted as mapped, and the runtime then spent
+        // that claim to skip the conservative backstop.
+        //
+        // Seeded from the mark vector's own exactness. `stack_oop_marks_exact`
+        // is already trusted to veto a spill elision
+        // (`can_elide_self_call_register_spill`) and the shadow publication; it
+        // was not consulted here. When it is false the padding a few lines above
+        // filled the marks with `false`, i.e. "not an oop" for entries nobody
+        // classified — sound only because a conservative sweep follows, which is
+        // exactly what the coverage claim suppresses.
+        let mut map_incomplete = !self.stack.is_empty() && !self.stack_oop_marks_exact;
+        if map_incomplete {
+            map_incomplete_cause::MARKS_INEXACT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // The complement of the marked set: frame-resident operand slots the
+        // stack model says are NOT references. Diagnostic only, and only
+        // meaningful while the marks are exact -- see
+        // `OopMapEntry::non_oop_stack_slots`.
+        let mut non_oop_stack_slots: Vec<i16> = Vec::new();
+        let n = self.stack.len();
+        for i in 0..n {
+            if !self.stack_oop_marks[i] {
+                if let StackSlot::Frame(off) = self.stack[i] {
+                    if let Ok(i16_off) = i16::try_from(off) {
+                        non_oop_stack_slots.push(i16_off);
+                    }
+                }
+                continue;
+            }
+            match self.stack[i] {
+                StackSlot::Frame(off) => match i16::try_from(off) {
+                    Ok(i16_off) => slots.push(i16_off),
+                    // A frame deeper than i16 from `rbp`. Rare, and silent.
+                    Err(_) => {
+                        map_incomplete = true;
+                        map_incomplete_cause::STACK_OFF_TOO_DEEP
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+                // An oop operand that is still register/scratch/xmm resident at
+                // the safepoint. There was no `else` arm here: the value is live,
+                // the map does not name it, and nothing recorded that.
+                _ => {
+                    map_incomplete = true;
+                    map_incomplete_cause::OOP_STILL_IN_REGISTER
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        // Stage 2 (precise oop maps) — add the canonical frame slots of local
+        // variables that hold object references at this safepoint, per the
+        // forward "must be oop" dataflow. For register-resident locals this is
+        // exactly the slot `emit_pre_safepoint_spill` flushed the live value to
+        // just before the call; for memory-resident locals it is where the
+        // value always lives. The GC root walker then has precise, updatable
+        // coverage of every live oop local (not just operand-stack temporaries).
+        // Sound on the default path regardless of dataflow precision: the
+        // consumer re-validates each slot via `heap.is_object_address`.
+        // THE LOCALS COULD NOT BE DESCRIBED AT ALL -- fail closed.
+        //
+        // `compute_local_oop_masks` hands back EMPTY vectors when the method's
+        // local count exceeds what it supports, and the Stage 2 block below is
+        // wrapped in `if !self.local_oop_masks.is_empty()`. So such a method
+        // contributed no slots, bumped no cause, and left `map_incomplete`
+        // alone: the map shipped naming none of its reference locals while the
+        // frame-slot coverage claim stayed TRUE. `probes/OopMapWideLocals.java`
+        // reads exactly that -- `frameslot=true`, all other causes zero, 409 of
+        // 409 safepoints "mapped", 80 live reference locals named by nothing.
+        //
+        // The SHADOW half already refused this method
+        // (`shadow_incomplete_cause::TOO_MANY_LOCALS`), which is why relocation
+        // was never actually unsafe here. But `fully_oop_covered` is spent
+        // separately -- `conservative_roots`' coverage PIN reads
+        // `!cm.fully_oop_covered` -- so the claim had a consumer of its own.
+        //
+        // Guarded on `num_locals > 0` because a method with no locals has
+        // nothing to describe and its empty vectors are the honest answer.
+        if self.precise_maps
+            && self.local_oop_masks.is_empty()
+            && self.num_locals > 0
+            && local_mask_fail_closed_enabled()
+        {
+            map_incomplete = true;
+            map_incomplete_cause::LOCAL_MASK_UNSUPPORTED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if !self.local_oop_masks.is_empty() {
+            // Via the shared accessor: the METHOD-ENTRY poll must name its
+            // reference parameters here too, or `moving_young_coverage_complete`
+            // (which now claims coverage for it) would be claiming coverage of
+            // a map that names nothing. See `local_oop_mask_at_current_pc`.
+            //
+            // A `None` here is a SILENT omission -- no slots, no cause, and the
+            // map still ships claiming complete coverage. Counted (and only
+            // counted) so the population can be priced before anything fails
+            // closed on it: see `map_incomplete_cause::LOCAL_MASK_UNREACHED`.
+            if self.local_oop_mask_at_current_pc().is_none() {
+                map_incomplete_cause::LOCAL_MASK_UNREACHED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // FAIL CLOSED, as `LOCAL_MASK_UNSUPPORTED` already does.
+                //
+                // Measured on `org.h2.test.jdbc.TestCachedQueryResults`
+                // 2026-09-03: `local_mask_unreached=125` and climbing, the
+                // dominant cause on that workload -- while the SHADOW half of
+                // the same machinery counted the identical population
+                // (`scauses(... dataflow=125 ...)`) and refused its claim. The
+                // map half counted it and shipped: `map_incomplete` stayed
+                // false, so `fully_oop_covered` stayed TRUE for a safepoint
+                // naming none of its live reference locals.
+                //
+                // That is the same asymmetry `LOCAL_MASK_UNSUPPORTED` was
+                // fixed for: one half of the machinery knew and the half that
+                // publishes the claim did not. A safepoint that ships
+                // `fully_oop_covered` while naming none of its live reference
+                // locals is a use-after-free the moment relocation trusts it.
+                //
+                // NOT the root of `bug-box-unbox-intrinsic-segv-under-
+                // relocation-20260902`, which is what this comment claimed
+                // until 2026-09-05. That crash was a WRITE by `relocate_stw`'s
+                // own `ptr::copy` into a decommitted arena granule, fixed by
+                // `Arena::commit_for_relocation`; failing closed here was
+                // measured against it at 3 of 4, i.e. no effect. The hole is
+                // real on its own evidence and is fixed on its own merits.
+                //
+                // The counter reads ZERO on `probes/SafepointMapResidue.java`,
+                // which is why this was filed as a ruled-out hypothesis. It was
+                // ruled out on the wrong workload.
+                //
+                // It is a REFUSAL -- each such safepoint diverts its cycle to
+                // the non-moving sweep -- so it was opt-in until the cost was
+                // measured rather than assumed. Measured 2026-09-05 on
+                // `TestCachedQueryResults`: ZERO fragmentation OOM in either
+                // arm, and no throughput difference (concurrent-pair ratios
+                // 0.97/0.99/1.00/1.00). Per-safepoint, not the blanket
+                // refusal (the retired `CRATONVM_ZGC_JIT_BLANKET_REFUSAL`), which
+                // cost ~9700 OOMs on this class and never completed. Default ON
+                // on that evidence;
+                // `=0` restores the old claim.
+                if crate::x64::licm::local_mask_unreached_fail_closed_enabled() {
+                    map_incomplete = true;
+                }
+            }
+            // ACROSS EVERY WINDOW, not just the low 64 slots. A method above
+            // 64 locals used to get no mask at all and so named none of its
+            // reference locals; it now gets one word per 64 slots, and this walk
+            // covers all of them. The accessor yields real JVM local indices, so
+            // `local_offset` is unchanged.
+            let mut oop_locals: Vec<usize> = Vec::new();
+            if self.for_each_oop_local_at_current_pc(|k| oop_locals.push(k)) {
+                for k in oop_locals {
+                    let off = self.local_offset(k);
+                    match i16::try_from(off) {
+                        Ok(i16_off) => {
+                            if !slots.contains(&i16_off) {
+                                slots.push(i16_off);
+                            }
+                        }
+                        Err(_) => {
+                            map_incomplete = true;
+                            map_incomplete_cause::LOCAL_OFF_TOO_DEEP
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+        // Stage 3 — the STAGED INVOKE-ARGUMENT buffer. These oops were popped
+        // off the simulated operand stack before the call, so neither loop above
+        // can see them; without this they were covered only by the conservative
+        // bound this safepoint publishes, while the method still claimed full
+        // precise coverage. Naming them here makes them precise roots, which
+        // also means a moving collection REWRITES them rather than merely
+        // marking them — the property the claim is actually spent on.
+        //
+        // Taken, not copied, so a staging site that emits no map cannot leak
+        // into a later safepoint (same discipline as `live_frame_hi`).
+        for off in std::mem::take(&mut self.pending_staged_arg_oops) {
+            match i16::try_from(off) {
+                Ok(i16_off) => {
+                    if !slots.contains(&i16_off) {
+                        slots.push(i16_off);
+                    }
+                }
+                Err(_) => {
+                    map_incomplete = true;
+                    map_incomplete_cause::STAGED_ARG_OFF_TOO_DEEP
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        // Stage 3c (V6) -- the live LICM ref-hoist slots, the same set
+        // `collect_live_oop_homes` publishes on the shadow stack. Named, the
+        // slot is a precise root `remap_one_jit_frame` rewrites and the pin
+        // ledger excuses; unnamed (the wave-3 state) it was reachable only
+        // through the conservative band scan, which pinned the row and diverted
+        // every young cycle to the non-moving sweep.
+        for off in self.live_ref_hoist_slots() {
+            match i16::try_from(off) {
+                Ok(i16_off) => {
+                    if !slots.contains(&i16_off) {
+                        slots.push(i16_off);
+                    }
+                }
+                Err(_) => {
+                    map_incomplete = true;
+                    map_incomplete_cause::LOCAL_OFF_TOO_DEEP
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        // A reference staged somewhere no map can name it (native-ABI outgoing
+        // args, direct-call service slots, inlined-callee parameter locals).
+        // Fail closed.
+        //
+        // Taken into a LOCAL because `live_oop_register_mask` refuses on this
+        // same bit and runs later in this function -- see the call site, which
+        // once carried a comment claiming the state was "still un-taken at this
+        // point". It was not: this take is ~140 lines above it, so the mask's
+        // fail-closed clause read a flag that had already been cleared and the
+        // refusal could never fire. The cause counter reading zero looked like
+        // "nothing ever stages unmappably" and was really "the question is
+        // never asked".
+        let staged_args_unmapped = std::mem::take(&mut self.pending_staged_args_unmapped);
+        // Same discipline, same reason: taken here so a staging site that emits
+        // no map cannot leak its argument registers into a later safepoint's
+        // mask, and passed to `live_oop_register_mask` rather than re-read.
+        let call_oop_arg_regs = std::mem::take(&mut self.pending_call_oop_arg_regs);
+        // gen r5w6/oomjit10: the paired spill's claim, taken for the same
+        // reason as the two above.
+        let rax_dead_at_call = std::mem::take(&mut self.pending_rax_dead_at_call);
+        if staged_args_unmapped {
+            map_incomplete = true;
+            map_incomplete_cause::STAGED_ARG_UNMAPPABLE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Stage 3b -- THE LOCALS OF EVERY LIVE SPLICE. The same set
+        // `collect_live_oop_homes` publishes, named here for the same reason
+        // Stage 3 names staged arguments: the shadow stack is the channel a
+        // parked mutator remaps itself through, the map is what
+        // `remap_active_jit_frames` rewrites, and a moving cycle needs BOTH.
+        // A scope that cannot classify its locals fails the safepoint closed.
+        let mut inline_local_scopes: Vec<(i32, u16, u64)> = Vec::new();
+        for scope in &self.inline_oop_scopes {
+            match scope.mask_at_cur() {
+                Some(mask) => {
+                    // The same record the java-locals oracle keeps, for a band
+                    // it cannot address. Diagnostic only; see
+                    // `OopMapEntry::inline_local_scopes`.
+                    inline_local_scopes.push((
+                        scope.local_base,
+                        u16::try_from(scope.num_locals).unwrap_or(u16::MAX),
+                        mask,
+                    ));
+                    for k in 0..scope.num_locals.min(64) {
+                        if mask & (1u64 << k) == 0 {
+                            continue;
+                        }
+                        // Cast: a JVM local index times 8, plus a frame offset.
+                        let off = scope.local_base + (k as i32) * 8;
+                        match i16::try_from(off) {
+                            Ok(i16_off) => {
+                                if !slots.contains(&i16_off) {
+                                    slots.push(i16_off);
+                                }
+                            }
+                            Err(_) => {
+                                map_incomplete = true;
+                                map_incomplete_cause::INLINE_LOCAL_UNMAPPABLE
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    map_incomplete = true;
+                    map_incomplete_cause::INLINE_LOCAL_UNMAPPABLE
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        // Stage A.2 (precise oop maps, B-K fix) — under the precise gate, record
+        // an entry for EVERY safepoint, including ones with no live oops (empty
+        // `slots`). The default path keeps skipping empties (smaller metadata,
+        // GC falls back to the conservative sweep there). The empty entries make
+        // every safepoint's sp-id resolve to a definitive map, which is the
+        // precondition for `fully_oop_covered`: without them, a safepoint with
+        // zero live oops would look "un-mapped" and wrongly break coverage.
+        //
+        // A safepoint that LOST an oop above still pushes its entry — the entry
+        // is what makes the sp-id resolve, and the recorded slots are still
+        // worth rewriting — but it is NOT added to `mapped_safepoint_pcs`, so
+        // `fully_oop_covered` goes false for the whole method and the collector
+        // keeps its conservative backstop. This is the same fail-closed
+        // direction this function already takes for a missing paired spill
+        // (`live_frame_hi` = 0 = "unknown, scan conservatively").
+        //
+        // `mapped_safepoint_pcs` feeds `fully_oop_covered` and nothing else, so
+        // withholding a pc cannot affect anything at run time.
+        //
+        // `CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY=1` restores the old
+        // presence-only accounting so the difference is an A/B in one binary.
+        let push_map = !slots.is_empty() || self.precise_maps;
+        if push_map {
+            // The unmaskable half of the same accounting. See
+            // `Compiler::incomplete_oop_maps` for why the pc-keyed set below
+            // cannot answer this on its own.
+            if map_incomplete {
+                self.incomplete_oop_maps += 1;
+            }
+            if self.precise_maps && (!map_incomplete || Self::oopmap_presence_only()) {
+                // Cast: bytecode/native offset to u32 (non-negative, fits)
+                self.mapped_safepoint_pcs.insert(self.cur_bc_pc as u32);
+            }
+            // The register-file half of this map. Computed here rather than in
+            // `emit_shadow_push` for the reasons given at the field below.
+            let reg_oop_mask = self.live_oop_register_mask(
+                staged_args_unmapped,
+                call_oop_arg_regs,
+                rax_dead_at_call,
+            );
+            // gen r5w2/oomjit6: a mask kept over unmappable staging
+            // (`CRATONVM_GC_STAGED_ARGS_KEEP_MASK`) is recorded, so the driver
+            // withdraws the method's outgoing-reserve claim, which a `Some`
+            // mask would otherwise license (`is_dead_outgoing_reserve`).
+            if staged_args_unmapped && reg_oop_mask.is_some() {
+                // Cast: bytecode PC fits u32
+                self.staged_args_unmapped_sp_ids.push(self.cur_bc_pc as u32);
+            }
+            // gcg g3/v: the merge over every spill of this id so far; later
+            // ones widen it in `note_spill_written`. Empty (`None`) off the
+            // switch.
+            // Cast: bytecode PC fits u32
+            let spill_written = spill_written_for(&self.spill_written_by_pc, self.cur_bc_pc as u32);
+            // gc wave 9 (lane gcC): a later spill of this id widens this map
+            // through its index (`note_spill_written`).
+            if spill_written.is_some() {
+                let index = self.oop_maps.len();
+                // Cast: bytecode PC fits u32
+                let pc = self.cur_bc_pc as u32;
+                self.spill_written_maps.entry(pc).or_default().push(index);
+            }
+            // gch h4/jm: the `[sp-band]` census (DBG; see `sp_band_owner`).
+            if sp_band_owners_wanted(&self.method_label) {
+                eprintln!(
+                    "[sp-band] method={} sp={} lo={} live_hi={} exact={} incomplete={} words={}",
+                    self.method_label,
+                    self.cur_bc_pc,
+                    self.base_spill_offset,
+                    live_frame_hi,
+                    self.stack.is_empty() || self.stack_oop_marks_exact,
+                    map_incomplete,
+                    sp_band_owner_words(
+                        self.base_spill_offset,
+                        live_frame_hi,
+                        &slots,
+                        &non_oop_stack_slots,
+                        &inline_local_scopes,
+                    ),
+                );
+            }
+            self.oop_maps.push(crate::OopMapEntry {
+                native_pc_offset: native_pc,
+                // Stage 3 — tag with the safepoint's bytecode PC so the GC root
+                // walker can match the value the JIT stored into the sp-id slot.
+                bytecode_pc: self.cur_bc_pc as u32, // Cast: bytecode PC fits u32
+                frame_slot_offsets: slots,
+                // `pending_shadow_coverage_complete` AND `!map_incomplete`.
+                //
+                // The two flags answer different halves of the same question
+                // and only the first was reaching the collector.
+                // `moving_young_safepoint_coverage_complete` runs back in
+                // `emit_shadow_push`, BEFORE this function builds the slot
+                // list, so it cannot see what building it discovers: an oop
+                // still in a register, a stack/local/staged-arg offset that
+                // does not fit `i16`, an inline local whose offset does not
+                // either. Those set `map_incomplete` here, and `map_incomplete`
+                // fed exactly one consumer — `mapped_safepoint_pcs`, i.e.
+                // `fully_oop_covered`, i.e. whether the collector keeps its
+                // CONSERVATIVE backstop.
+                //
+                // That was sound while the backstop was the whole story: a
+                // conservative sweep still MARKS an oop the map missed, so
+                // nothing is lost. Relocation needs more than marking — it
+                // needs the slot REWRITTEN, and a conservative scan cannot
+                // rewrite. So a map this function already knows to be short
+                // was still published as complete coverage, and
+                // `remap_one_jit_frame` rewrote only what it named and left
+                // the rest pointing into from-space.
+                //
+                // Measured on `String.substring(II)` (safepoint 41, live band
+                // `off<120`): the map named one slot — the `this` parameter
+                // home — while offsets 88 and 112 inside that band held the
+                // same live reference and kept their pre-move addresses. That
+                // is the H2 `TestRandomMapOps` corruption, and the same shape
+                // appears in `String.substring(I)` and in ordinary application
+                // frames.
+                //
+                // Fail-closed and one-directional: this can only turn a `true`
+                // into a `false`, never the reverse. The cost is that a cycle
+                // reaching such a safepoint declines to relocate and the arena
+                // keeps its fragmentation — which is the trade
+                // `CRATONVM_ZGC_RELOCATE=0` makes today, wholesale, as the
+                // workaround.
+                moving_young_coverage_complete: relocation_coverage_complete(
+                    self.pending_shadow_coverage_complete,
+                    map_incomplete,
+                ),
+                live_frame_hi,
+                // The register-file half of this map. Computed here rather than
+                // in `emit_shadow_push` for the same reason
+                // `moving_young_coverage_complete` is fixed up here: this is
+                // where the map is actually built. The staged-argument state it
+                // refuses on has ALREADY been taken by this point, so it is
+                // passed in rather than re-read -- see `staged_args_unmapped`.
+                reg_oop_mask,
+                // The oracle a stale-word report needs to say "live". Taken
+                // through the shared accessor so the method-entry poll records
+                // its parameter mask rather than a `None` (see
+                // `local_oop_mask_at_current_pc`), and left `None` when the
+                // masks are unavailable at all (`max_locals > 64`), which is
+                // the same "no claim" the dataflow itself makes there.
+                // Its contract is "bit `k` = local `k`", over ONE `u64`. A
+                // method needing more than one window cannot be described that
+                // way, and a TRUNCATED mask read as a complete one is exactly
+                // the false claim this exercise is about -- so publish `None`,
+                // the value that already means "no claim". `frame_slot_offsets`
+                // (Stage 2 above) still names every window's locals; only this
+                // DIAGNOSTIC oracle abstains.
+                local_oop_mask: if self.local_oop_masks.is_empty() || self.local_oop_windows > 1 {
+                    None
+                } else {
+                    self.local_oop_mask_at_current_pc()
+                },
+                num_locals: u16::try_from(self.num_locals).unwrap_or(u16::MAX),
+                inline_local_scopes,
+                non_oop_stack_slots,
+                // `map_incomplete` was SEEDED from this above; read the source
+                // rather than the seed, which later causes also set.
+                stack_marks_exact: self.stack.is_empty() || self.stack_oop_marks_exact,
+                // §25.3 — captured at the top of this function, before
+                // `emit_shadow_reload` took `pending_shadow`.
+                shadow_pushed: shadow_pushed_here,
+                spill_written,
+            });
+            self.pending_shadow_coverage_complete = false;
+        }
+        // Stage 4 (precise oop maps) — reload oop register-locals from their
+        // (GC-updated) canonical slots after the safepoint. `native_pc` above
+        // is the call's return PC and equals the position of the first reload
+        // instruction (the `push` emits no code), so the GC walker rewrites the
+        // frame slots at the return PC and control then falls into the reload,
+        // which propagates each moved object's new address back into its
+        // callee-saved register. Without this, Stage 3 updates the slot but the
+        // code keeps reading the stale register → register-invisibility
+        // persists. Gated off by default (no reload → byte-identical codegen).
+        if self.precise_maps && !moving_young_enabled() {
+            self.emit_post_safepoint_reload();
+        }
+    }
+
+    /// Stage 4 (precise oop maps) — reload every oop register-local live at the
+    /// current safepoint from its canonical frame slot `[rbp - local_offset(k)]`
+    /// into its assigned callee-saved register.
+    ///
+    /// Pairs with [`Self::emit_pre_safepoint_spill`] (which flushed the live
+    /// values to those slots before the call) and the GC's
+    /// `remap_active_jit_frames` (which rewrote the moved ones in place during
+    /// the call). Only oop locals are reloaded — primitives don't move, so
+    /// their spilled slot still matches the register. RAX is never a local
+    /// register, so the call's return value survives this sequence.
+    fn emit_post_safepoint_reload(&mut self) {
+        if self.failed || self.local_oop_masks.is_empty() {
+            return;
+        }
+        let Some(mut mask) = self.local_oop_mask_at_current_pc() else {
+            return;
+        };
+        while mask != 0 {
+            // Cast: count/index to usize
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1; // clear lowest set bit
+            if let Some(Some(reg)) = self.local_assignments.get(k).copied() {
+                let off = self.local_offset(k);
+                self.emit_load_local(reg, off); // reg <- [rbp - off]
+            }
+        }
+    }
+
+    /// Emit the shadow-stack overflow bookkeeping: bump the process-wide bail
+    /// counter and, under `CRATONVM_SHADOW_OVERFLOW_DIAG`, record this method's
+    /// label. RAX is pushed/popped around it because this runs on a live call
+    /// site whose arguments are already staged.
+    fn emit_shadow_overflow_note(&mut self) {
+        // Cast through a raw pointer before converting the static's address.
+        let counter =
+            (&crate::SHADOW_OVERFLOW_COUNT as *const std::sync::atomic::AtomicUsize) as usize;
+        self.buf.emit_byte(0x50); // push rax
+        self.emit_mov_imm64_full(RAX, counter as i64); // Cast: baked address
+        self.buf.emit(&[0xF0, 0x48, 0xFF, 0x00]); // lock inc qword [rax]
+        if shadow_overflow_diag() {
+            let label = match self.shadow_overflow_label {
+                Some(p) => p,
+                None => {
+                    let owned: &'static str =
+                        Box::leak(format!("{}\0", self.method_label).into_boxed_str());
+                    let p = owned.as_ptr() as usize;
+                    self.shadow_overflow_label = Some(p);
+                    p
+                }
+            };
+            let sink =
+                (&crate::SHADOW_OVERFLOW_LABEL as *const std::sync::atomic::AtomicUsize) as usize;
+            // Cast: baked absolute address of a leaked NUL-terminated label.
+            self.emit_mov_imm64_full(RAX, label as i64);
+            self.buf.emit(&[0x48, 0xA3]); // mov moffs64, rax
+            self.buf.emit(&(sink as u64).to_le_bytes());
+        }
+        self.buf.emit_byte(0x58); // pop rax
+    }
+}
+
+/// `CRATONVM_GC_STAGED_ARGS_KEEP_MASK=1` -- opt-in (default OFF), gen
+/// r5w2/oomjit6, the cross-lane request of
+/// `docs/feature-designs/jit-ir-optimizations.md`:
+/// a safepoint that staged a reference where no map names it keeps its
+/// register-oop mask (`Compiler::live_oop_register_mask`) instead of
+/// withdrawing it, and records itself in `staged_args_unmapped_sp_ids`, which
+/// makes `x64/driver.rs` withdraw the METHOD's outgoing-reserve claim
+/// (`FrameLayout::outgoing_lo = 0`). That keeps the one region the unmapped
+/// staging can live in scanned, so the switch is sound with the scanner as it
+/// stands; the per-safepoint refinement (keep the reserve only at the recorded
+/// safepoints) is the scanner's half, `vm/src/jit/conservative_roots.rs`.
+///
+/// The oracle for the flip is `CRATONVM_DBG_VERIFY_REG_OOP_MAPS=1`: every
+/// blind-spill word the kept mask excludes is re-checked against the finished
+/// root set, and `unreachable == 0` over the regression suite is the licence.
+///
+/// Read per safepoint that staged unmappably, not latched: no `static`
+/// (`process_global_statics_ratchet`), and the question is asked only on that
+/// path.
+fn staged_args_keep_mask_enabled() -> bool {
+    cratonvm_types::flags::runtime_flag_on("CRATONVM_GC_STAGED_ARGS_KEEP_MASK")
+}
+
+/// The relocation gate: may a moving collector rewrite this frame from this
+/// safepoint's map alone?
+///
+/// Both halves must hold, and they are discovered at different times.
+/// `shadow_complete` is [`Compiler::moving_young_safepoint_coverage_complete`],
+/// evaluated back in `emit_shadow_push`. `map_incomplete` is what BUILDING the
+/// slot list then discovers — an oop still in a register, a stack, local,
+/// staged-argument or inline-local offset that does not fit `i16`.
+///
+/// A free function, and pure, for the same reason
+/// `g1::refuse_evacuation_for_empty_publication` is: the coupling is the whole
+/// content of the fix, and a predicate that lives in a struct method a hundred
+/// lines from its inputs is one nobody can pin with a truth table.
+fn relocation_coverage_complete(shadow_complete: bool, map_incomplete: bool) -> bool {
+    shadow_complete && (!map_incomplete || !reloc_gate_on_map_incomplete())
+}
+
+/// Kill switch for the coupling above (`CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE=0`).
+///
+/// Default ON, because publishing a map the compiler has already judged short
+/// as complete coverage is a heap-corruption bug. It is a switch rather than a
+/// bare constant because the fix has a MEASURED cost: on String-heavy code
+/// every cycle that meets a live compiled frame now declines to relocate
+/// (`compaction_cycles` 26 -> 0, `objects_relocated` 145 -> 0 on one probe),
+/// and that reaches `TestMVStoreTool` -- an already-open fragmentation OOM --
+/// roughly 10x sooner (57-61 s against 581 s). Both halves of that trade
+/// deserve a same-binary A/B, and the ZGC lane needs one to bisect against.
+fn reloc_gate_on_map_incomplete() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_flag_default_on("CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE")
+    })
+}
+
+/// `CRATONVM_JIT_NO_STAGED_ARG_SHADOW=1` — stop publishing the staged
+/// invoke-argument buffer on the shadow stack, restoring the state in which it
+/// was named by the oop map alone.
+///
+/// The bisect lever for that repair, default-ON. Latched: it is a codegen
+/// decision and must not change under a running process.
+///
+/// (Moved above the test module in round 9 wave 7: production code after the
+/// test gate is invisible to the panic-free ratchet.)
+fn staged_arg_shadow_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| !cratonvm_types::flags::runtime_flag_on("CRATONVM_JIT_NO_STAGED_ARG_SHADOW"))
+}
+
+/// May a conditional back edge leave through an `OsrExit` map describing
+/// `fs`? Exactly the frames the VM's in-place OSR-exit transfer
+/// (`transfer_osr_exit_into_live_frame_checked`) takes and `osr_exit_policy`
+/// does not veto: every slot resumable, no caller chain, no monitor to
+/// re-acquire, and no scalar-replaced object (the transfer has no
+/// materialization path). Interpreter round i1 wave 13, lane L4.
+fn branch_exit_frame_is_transferable(fs: &crate::deopt::FrameState) -> bool {
+    use crate::deopt::FrameValue;
+    crate::deopt::first_unresumable_slot(fs).is_none()
+        && fs.caller.is_none()
+        && !fs.monitors.iter().any(|m| m.relock)
+        && !fs.locals.iter().chain(fs.stack.iter()).any(|v| {
+            matches!(
+                v,
+                FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Interpreter round i1 wave 13, lane L4: a conditional back edge records
+    /// its exit map only for a frame the in-place transfer takes, so the new
+    /// point can never make `osr_exit_policy` veto the artifact.
+    #[test]
+    fn a_branch_exit_frame_must_be_one_the_transfer_takes() {
+        use crate::deopt::{FrameState, FrameValue, MonitorInfo};
+        let frame = |locals: Vec<FrameValue>, stack: Vec<FrameValue>| FrameState {
+            method_key: "T.m:()I".to_string(),
+            bci: 9,
+            locals,
+            stack,
+            monitors: Vec::new(),
+            caller: None,
+        };
+        let ok = frame(
+            vec![FrameValue::StackSlot(8)],
+            vec![FrameValue::StackSlot(16), FrameValue::StackSlot(24)],
+        );
+        assert!(branch_exit_frame_is_transferable(&ok));
+        assert!(!branch_exit_frame_is_transferable(&frame(
+            vec![FrameValue::StackSlot(8)],
+            vec![FrameValue::Unsupported, FrameValue::StackSlot(24)],
+        )));
+        assert!(!branch_exit_frame_is_transferable(&frame(
+            vec![FrameValue::VirtualObjectRef(3)],
+            vec![FrameValue::StackSlot(16)],
+        )));
+        let mut locked = ok.clone();
+        locked.monitors.push(MonitorInfo {
+            object: FrameValue::StackSlotRef(8),
+            lock_depth: 1,
+            relock: true,
+        });
+        assert!(!branch_exit_frame_is_transferable(&locked));
+        let mut inlined = ok.clone();
+        inlined.caller = Some(Box::new(ok.clone()));
+        assert!(!branch_exit_frame_is_transferable(&inlined));
+    }
+
+    /// The truth table of the relocation gate.
+    ///
+    /// The `map_incomplete=true, shadow_complete=true` row is the defect this
+    /// exists for: before the coupling, that row published complete coverage.
+    /// `record_oop_map` had ALREADY discovered the map was short — an oop left
+    /// in a register, or an offset that would not fit `i16` — and routed that
+    /// knowledge only to `mapped_safepoint_pcs`, which decides whether the
+    /// CONSERVATIVE backstop stays on. A conservative sweep marks what the map
+    /// missed, so that was sufficient while nothing moved. Relocation must
+    /// REWRITE the slot, which the backstop cannot do, so the short map went
+    /// to the collector labelled complete and `remap_one_jit_frame` left every
+    /// unnamed live reference pointing into from-space.
+    #[test]
+    fn a_short_map_cannot_claim_relocation_coverage() {
+        assert!(
+            !relocation_coverage_complete(true, true),
+            "a map this function knows is short must not gate relocation, \
+             however good the shadow publication was"
+        );
+        assert!(relocation_coverage_complete(true, false));
+        assert!(!relocation_coverage_complete(false, false));
+        assert!(!relocation_coverage_complete(false, true));
+    }
+
+    /// The gate is one-directional: it can only ever REMOVE a claim.
+    ///
+    /// Stated as a property because the failure mode that matters is someone
+    /// later "simplifying" it into something that can turn a false into a
+    /// true — which would hand the collector a frame nothing proved.
+    #[test]
+    fn the_gate_only_ever_subtracts() {
+        for shadow in [false, true] {
+            for incomplete in [false, true] {
+                assert!(
+                    !relocation_coverage_complete(shadow, incomplete) || shadow,
+                    "gate turned shadow_complete=false into a claim"
+                );
+            }
+        }
+    }
+
+    /// `map_incomplete` must actually REACH the gate.
+    ///
+    /// The bug was not a wrong expression, it was a value that existed, was
+    /// maintained in seven places, and was never wired to the thing it should
+    /// have gated. A truth table over the predicate cannot see that; this can.
+    #[test]
+    fn the_pushed_map_gates_on_map_incomplete() {
+        let src = include_str!("safepoint.rs");
+        let at = src
+            .find("moving_young_coverage_complete: relocation_coverage_complete(")
+            .expect("the pushed OopMapEntry must gate through relocation_coverage_complete");
+        let tail = &src[at..at + 200];
+        assert!(
+            tail.contains("map_incomplete"),
+            "the gate at the OopMapEntry push must be fed `map_incomplete`; \
+             found instead: {tail:?}"
+        );
+    }
+
+    /// Every register a `ShadowHome::Reg` can actually name must encode as
+    /// ITSELF. The `CRATONVM_DBG_SHADOW_RELOAD` probe hard-coded `0x49`
+    /// (REX.W|REX.B) with the comment "r is r8..r15 here"; `LOCAL_REGS`
+    /// contains RBX on every platform (and RSI/RDI on Windows), so for those
+    /// homes the emitted `cmp` targeted `r + 8` instead. With `r == RBX` that
+    /// is R11 — the shadow-buffer read address, always a large pointer — so
+    /// `JAE` was always taken and the probe could never report the
+    /// non-pointer reload it exists to catch.
+    #[test]
+    fn cmp_r64_imm32_sets_rex_b_only_for_the_extended_half() {
+        for &r in SCRATCH_REGS.iter().chain(LOCAL_REGS.iter()) {
+            let [rex, opcode, modrm] = cmp_r64_imm32_opcode(r);
+            assert_eq!(opcode, 0x81, "reg {r}: opcode");
+            assert_eq!(modrm >> 6, 0b11, "reg {r}: mod must be register-direct");
+            assert_eq!((modrm >> 3) & 7, 7, "reg {r}: /7 selects CMP");
+            assert_eq!(modrm & 7, r & 7, "reg {r}: rm must be the low 3 bits");
+            assert_eq!(rex & 0x48, 0x48, "reg {r}: REX.W must be set");
+            // The bug: REX.B is the fourth bit of `rm`, so it must be set iff
+            // the register really is r8..r15.
+            assert_eq!(
+                rex & 0x01,
+                u8::from(r >= 8),
+                "reg {r}: REX.B must track the register's high bit — setting \
+                 it unconditionally re-targets the compare at r{}",
+                r + 8
+            );
+        }
+    }
+
+    /// A staged invoke argument is published on the SHADOW stack, not only
+    /// named in the oop map.
+    ///
+    /// The two are different channels with different consumers. The map makes a
+    /// slot a precise root for MARKING; the shadow stack is the REWRITABLE
+    /// channel, and it is the only one
+    /// `conservative_roots::moving_young_unpublished_frame_oop_present`
+    /// consults — it asks `published_shadow_values(shadow_window_from_frame(..))`
+    /// and never looks at the map. So a staged argument that reached the map but
+    /// not the shadow stack sat in the frame's spill band as a movable-resident
+    /// word the shadow stack never published, and the band verifier correctly
+    /// refused the entire collection with `UNPUBLISHED_FRAME_OOP`.
+    ///
+    /// `a51077342` added the map half (`emit_oop_map_for_safepoint`'s Stage 3)
+    /// and stopped there. Measured consequence on
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821`:
+    /// `CRATONVM_JIT_INDY_BRIDGE=0` took `compiled-frame-oop-not-published`
+    /// from 28 to 5 per 76 collections where four other switches left it above
+    /// 21 — a bridged `invokedynamic` stages a capturing lambda's arguments
+    /// across a call that runs a bootstrap and allocates.
+    ///
+    /// The assertion is `shadow ⊇ map Stage 3`, which is the invariant that was
+    /// violated; it deliberately does not require equality, because the shadow
+    /// list also carries register homes the map has no slot for.
+    #[test]
+    fn a_staged_invoke_argument_is_published_on_the_shadow_stack_too() {
+        // The staged buffer only has to be published under MOVING coverage —
+        // that is the mode whose band verifier demands it, and the mode
+        // `collect_live_oop_homes` gates its frame-slot homes on.
+        crate::x64::set_moving_young_override(Some(true));
+
+        const STAGED: [i32; 3] = [64, 72, 80];
+        let mut c = staged_arg_test_compiler();
+        c.pending_staged_arg_oops = STAGED.to_vec();
+
+        let homes = c.collect_live_oop_homes();
+        for off in STAGED {
+            assert!(
+                homes.contains(&ShadowHome::Frame(off)),
+                "staged arg at [rbp-{off}] is named by the oop map's Stage 3 but \
+                 was not published on the shadow stack; homes={homes:?}"
+            );
+        }
+
+        // The list the map will consume must still be intact: this collection
+        // READS it, and taking it here would silently empty Stage 3.
+        assert_eq!(
+            c.pending_staged_arg_oops, STAGED,
+            "collect_live_oop_homes must not consume the staged-arg list"
+        );
+
+        crate::x64::set_moving_young_override(None);
+    }
+
+    /// A frame-slot home is published by ADDRESS and never copied back.
+    ///
+    /// The push stores `rbp - off + 1` (the slot's address with
+    /// `ShadowStack::INDIRECT_TAG`), and the reload restores nothing into the
+    /// slot, because the collector rewrote the slot itself. With the switch off
+    /// the value form comes back: load the slot, push the value, and copy the
+    /// shadow word back into the slot after the call.
+    #[test]
+    fn a_frame_home_is_published_by_address_and_never_copied_back() {
+        crate::x64::set_moving_young_override(Some(true));
+        const OFF: i32 = 64;
+        let tagged_lea: Vec<u8> = [0x48, 0x8D, 0x85]
+            .into_iter()
+            .chain((1 - OFF).to_le_bytes())
+            .collect();
+        // MOV R8, [R11 + 0] — the reload's read of the first shadow word.
+        let copy_back_read: [u8; 7] = [0x4D, 0x8B, 0x83, 0, 0, 0, 0];
+        for indirect in [true, false] {
+            SHADOW_INDIRECT_FORCE.with(|c| c.set(Some(indirect)));
+            let mut c = staged_arg_test_compiler();
+            c.shadow_enabled = true;
+            c.helpers.get_current_thread = 0x7fff_0000_1000;
+            c.shadow_thread_slot_off = 40;
+            c.shadow_savebase_slot_off = 48;
+            c.shadow_off_in_thread = 0x2B8;
+            c.pending_staged_arg_oops = vec![OFF];
+            let start = c.buf.pos();
+            c.emit_shadow_push();
+            assert_eq!(c.pending_shadow, vec![ShadowHome::Frame(OFF)]);
+            c.emit_shadow_reload();
+            let code = c.buf.as_slice()[start..].to_vec();
+            let count = |needle: &[u8]| code.windows(needle.len()).filter(|w| *w == needle).count();
+            assert_eq!(
+                count(&tagged_lea),
+                usize::from(indirect),
+                "indirect={indirect}: the push publishes the slot's tagged address exactly when indirect"
+            );
+            assert_eq!(
+                count(&copy_back_read),
+                usize::from(!indirect),
+                "indirect={indirect}: the reload copies the slot back exactly when it pushed a value"
+            );
+        }
+        SHADOW_INDIRECT_FORCE.with(|c| c.set(None));
+        crate::x64::set_moving_young_override(None);
+    }
+
+    /// The control. Non-moving coverage keeps the conservative frame scan, which
+    /// already finds a staged slot on the stack, so publishing it would only
+    /// over-pin — the hazard `collect_live_oop_homes` documents as the bt18
+    /// small-heap OOM. Without this, the test above would pass just as well if
+    /// the homes were published unconditionally.
+    #[test]
+    fn a_staged_invoke_argument_is_not_published_when_nothing_moves() {
+        crate::x64::set_moving_young_override(Some(false));
+        let mut c = staged_arg_test_compiler();
+        c.pending_staged_arg_oops = vec![64];
+        let homes = c.collect_live_oop_homes();
+        assert!(
+            !homes.contains(&ShadowHome::Frame(64)),
+            "the non-moving path must not publish staged args; homes={homes:?}"
+        );
+        crate::x64::set_moving_young_override(None);
+    }
+
+    /// The SELF-RECURSIVE call arm must name its reference arguments rather
+    /// than refuse the safepoint.
+    ///
+    /// `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` gave the two direct-call arms a
+    /// nameable service range and stopped them raising
+    /// `pending_staged_args_unmapped`; the 0xb8 self-recursive arm kept
+    /// raising it for any reference argument, which makes `map_incomplete`
+    /// true at the next safepoint and so takes `fully_shadow_covered` false
+    /// for the whole method. Measured on `probes/OopMapSelfCall.java`: its two
+    /// self-recursive methods were the ONLY two uncovered methods in the run.
+    ///
+    /// This is the source-level half of that repair — that the arm reaches the
+    /// staging channel at all, and that it fails closed on a home a frame-slot
+    /// map genuinely cannot describe.
+    #[test]
+    fn the_self_recursive_arm_stages_its_reference_arguments() {
+        let src = crate::x64::bytecode_walk::WALK_SOURCES;
+        let at = src
+            .find("let staged_self_args_mark = self.pending_staged_arg_oops.len();")
+            .expect("the self-recursive arm must mark the staged-arg buffer");
+        let body = &src[at..at + 1400];
+        assert!(
+            body.contains("self_call_arg_maps_enabled()"),
+            "the repair must be behind its kill switch"
+        );
+        assert!(
+            body.contains("StackSlot::Frame(off) => {"),
+            "a frame-resident argument oop must be pushed to the staging buffer"
+        );
+        assert!(
+            body.contains("_ => unnameable = true,"),
+            "an argument with a non-frame home must still fail the safepoint closed"
+        );
+        // The legacy arm has to survive verbatim, or the kill switch does not
+        // bisect anything.
+        assert!(
+            body.contains("} else if arg_oops.iter().any(|&o| o) {"),
+            "`=0` must restore the unconditional refusal"
+        );
+    }
+
+    /// The TAIL form of that arm must un-stage what it staged.
+    ///
+    /// It emits no safepoint before the `JMP`, and `reset_spills` hands the
+    /// argument slots straight back to the spill allocator — so a staged
+    /// offset left pending there is taken by a later, unrelated safepoint and
+    /// names a slot something else now owns. That is the mirror of the defect
+    /// the staging fixes, and it is the reason the mark exists rather than a
+    /// bare `push`.
+    #[test]
+    fn the_tail_self_call_form_unstages_before_it_jumps() {
+        let src = crate::x64::bytecode_walk::WALK_SOURCES;
+        let at = src
+            .find("let staged_self_args_mark = self.pending_staged_arg_oops.len();")
+            .expect("the self-recursive arm must mark the staged-arg buffer");
+        let rest = &src[at..];
+        let trunc = rest
+            .find(".truncate(staged_self_args_mark);")
+            .expect("the tail form must truncate the staged-arg buffer back to the mark");
+        // The truncate belongs to the tail form: after that path's argument
+        // moves, and -- since round 9 wave 5 added a back-edge poll to the
+        // tail form -- BEFORE that poll and its JMP, so the poll's map cannot
+        // consume the staged homes the moves just vacated.
+        let window = &rest[..trunc];
+        assert!(
+            window.contains("self.emit_self_tail_param_moves(&arg_slots);"),
+            "the truncate must sit on the TAIL path, after its argument moves"
+        );
+        let after = &rest[trunc..];
+        let poll = after
+            .find("self.emit_self_tail_safepoint_poll();")
+            .expect("the tail form polls on its back edge");
+        let jmp = after
+            .find("JMP rel32 back to body entry")
+            .expect("the tail form JMPs back to the body entry");
+        assert!(
+            poll < jmp,
+            "the tail form must un-stage, then poll, then JMP"
+        );
+    }
+
+    /// An incomplete map must be counted where a pc SET cannot mask it.
+    ///
+    /// `mapped_safepoint_pcs` is keyed by bytecode pc, and a pc is not a
+    /// safepoint: a splice emits one safepoint per `invoke*` in the callee
+    /// under one enclosing bci, and the self-recursive arm emits its
+    /// stack-guard safepoint and its recursive CALL under one bci too. A
+    /// COMPLETE map at that bci inserts the pc, and the subset test then reads
+    /// true with an incomplete map sitting beside it -- the same mistake
+    /// `remap_one_jit_frame` made using `find` on `bytecode_pc` where every
+    /// other reader used `filter`.
+    ///
+    /// The count is what `fully_oop_covered` tests, so it has to be maintained
+    /// beside the set and not derived from it.
+    #[test]
+    fn an_incomplete_map_is_counted_not_just_withheld_from_the_pc_set() {
+        let src = include_str!("safepoint.rs");
+        let at = src
+            .find("let push_map = !slots.is_empty() || self.precise_maps;")
+            .expect("the map push must be findable");
+        let body = &src[at..at + 700];
+        let count_at = body
+            .find("self.incomplete_oop_maps += 1;")
+            .expect("an incomplete map must bump the unmaskable count");
+        let set_at = body
+            .find("self.mapped_safepoint_pcs.insert(")
+            .expect("the pc set must still be maintained");
+        assert!(
+            count_at < set_at,
+            "the count is guarded by `if map_incomplete`, the set by its negation; \
+             they must be separate statements, not one branch"
+        );
+
+        // ...and the predicate must actually spend it.
+        let driver = include_str!("driver.rs");
+        let at = driver
+            .find("cm.fully_oop_covered = compiler.precise_maps")
+            .expect("the coverage predicate must be findable");
+        let pred = &driver[at..at + 400];
+        assert!(
+            pred.contains("compiler.incomplete_oop_maps == 0"),
+            "the coverage predicate must test the unmaskable count; found: {pred:?}"
+        );
+        assert!(
+            pred.contains("inline_sites.is_empty()"),
+            "`CRATONVM_JIT_INLINE_OOP_COVERAGE=0` must restore the previous term \
+             verbatim, or the pair cannot be bisected"
+        );
+    }
+
+    /// A bare `Compiler` with no locals, no operand stack and no register
+    /// assignments, so `collect_live_oop_homes` returns exactly what the staged
+    /// buffer contributes and nothing else can be mistaken for it.
+    fn staged_arg_test_compiler() -> Compiler {
+        let alloc_result = crate::regalloc::RegAllocResult {
+            assignments: Vec::new(),
+            xmm_assignments: Vec::new(),
+            used_callee_saved: Vec::new(),
+            used_xmm_regs: Vec::new(),
+            block_live_in: Vec::new(),
+        };
+        Compiler::new(
+            "staged-arg-shadow-test".to_string(),
+            ExecutableBuffer::new(4096).expect("test executable buffer"),
+            0,
+            0,
+            8,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            alloc_result,
+            false,
+            // SAFETY: `JitRuntimeHelpers` is `#[repr(C)]` with all-integer
+            // fields, so an all-zero bit pattern is a valid value. Nothing here
+            // dereferences a helper pointer.
+            unsafe { std::mem::zeroed() },
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+        )
+    }
+
+    /// gen r5w2/oomjit6: `CRATONVM_GC_STAGED_ARGS_KEEP_MASK` makes an
+    /// unmappable staging IRRELEVANT to the register mask -- the answer is
+    /// whatever the mask would be without it -- and without the opt-in the
+    /// staging still withdraws the mask, as it always did.
+    #[test]
+    fn keeping_the_mask_makes_unmapped_staging_irrelevant_to_it() {
+        let c = staged_arg_test_compiler();
+        let withdrawn = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_GC_STAGED_ARGS_KEEP_MASK", None)],
+            || c.live_oop_register_mask(true, 0, false),
+        );
+        assert_eq!(
+            withdrawn, None,
+            "without the opt-in the staging withdraws the mask"
+        );
+        let (baseline, kept) = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_GC_STAGED_ARGS_KEEP_MASK", Some("1"))],
+            || {
+                (
+                    c.live_oop_register_mask(false, 0, false),
+                    c.live_oop_register_mask(true, 0, false),
+                )
+            },
+        );
+        assert_eq!(
+            kept, baseline,
+            "with the opt-in the staging must not change the mask"
+        );
+    }
+
+    /// gen r5w6/oomjit10: a Java invoke's claim that RAX is dead at its CALL
+    /// clears exactly RAX's bit and nothing else; without the claim RAX stays
+    /// in the mask, as it always did; and the claim never ADDS a register.
+    #[test]
+    fn a_call_that_reads_no_rax_leaves_its_bit_clear() {
+        let c = staged_arg_test_compiler();
+        let rax = crate::x64::licm::spill_gpr_bit(RAX);
+        let arg = crate::x64::licm::spill_gpr_bit(ARG_REGS[1]);
+        let Some(kept) = c.live_oop_register_mask(false, arg, false) else {
+            // Masks switched off in this environment: nothing to compare.
+            return;
+        };
+        assert_eq!(kept, rax | arg, "the unclaimed mask keeps RAX");
+        let dead = c
+            .live_oop_register_mask(false, arg, true)
+            .expect("the claim does not withdraw the mask");
+        assert_eq!(
+            dead, arg,
+            "the claim clears RAX and keeps the call's argument"
+        );
+        assert_eq!(dead & !kept, 0, "the claim never widens the mask");
+    }
+
+    /// ngr / gcki-ngr: a helper call's spill (array allocation, `invoke_dispatch`)
+    /// claims RAX dead for the map it pairs with, `CRATONVM_JIT_RAX_DEAD_AT_CALL=0`
+    /// withdraws the claim, and a plain spill never makes it.
+    #[test]
+    fn ngr_an_alloc_helper_spill_claims_rax_dead() {
+        let claim = |alloc: bool, flag: Option<&str>| {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_RAX_DEAD_AT_CALL", flag)],
+                || {
+                    let mut c = staged_arg_test_compiler();
+                    if alloc {
+                        c.emit_pre_safepoint_spill_before_helper_call();
+                    } else {
+                        c.emit_pre_safepoint_spill();
+                    }
+                    assert!(!c.rax_dead_request_for_next_spill, "the request is consumed");
+                    c.pending_rax_dead_at_call
+                },
+            )
+        };
+        assert!(claim(true, None), "default: the alloc helper's RAX is dead");
+        assert!(!claim(true, Some("0")), "=0 keeps RAX in the mask");
+        assert!(!claim(false, None), "a plain spill makes no claim");
+    }
+
+    /// gkr (2026-10-28, `T1W9ArgrefOwnedArgs temp-arg` on ZGC): a spill that
+    /// claims RAX dead writes 0 into RAX's image slot, not RAX. The frame's
+    /// map is found by its safepoint id, which every safepoint of one bci
+    /// shares, so the first map of the id (a plain spill's, RAX kept) can
+    /// describe the slot this spill wrote: `tempArg`'s `newarray` result stayed
+    /// in RAX up to its `invokestatic consume` and rooted the dead 52 MiB
+    /// argument for the whole callee. Without the claim RAX is stored as before.
+    #[test]
+    fn gkr_a_spill_that_claims_rax_dead_zeroes_its_image_slot() {
+        let spill = |claim: bool, flag: Option<&str>| {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_RAX_DEAD_AT_CALL", flag)],
+                || {
+                    let mut c = staged_arg_test_compiler();
+                    c.safepoint_reg_spill = true;
+                    c.safepoint_reg_spill_all = true;
+                    c.safepoint_reg_spill_nostore = false;
+                    c.reg_spill_base = 64;
+                    let rax_slot = c.reg_spill_base;
+                    let start = c.buf.pos();
+                    if claim {
+                        c.emit_pre_safepoint_spill_before_helper_call();
+                    } else {
+                        c.emit_pre_safepoint_spill();
+                    }
+                    let code = c.buf.as_slice()[start..].to_vec();
+                    let mut probe = staged_arg_test_compiler();
+                    let p0 = probe.buf.pos();
+                    probe.emit_store_local(rax_slot, RAX);
+                    let store_rax = probe.buf.as_slice()[p0..].to_vec();
+                    let p1 = probe.buf.pos();
+                    probe.emit_zero_frame_slot(rax_slot);
+                    let store_zero = probe.buf.as_slice()[p1..].to_vec();
+                    let has = |needle: &[u8]| code.windows(needle.len()).any(|w| w == needle);
+                    (has(&store_rax), has(&store_zero))
+                },
+            )
+        };
+        assert_eq!(spill(true, None), (false, true), "the claim stores 0");
+        assert_eq!(spill(false, None), (true, false), "a plain spill stores RAX");
+        assert_eq!(
+            spill(true, Some("0")),
+            (true, false),
+            "=0 withdraws the claim and stores RAX"
+        );
+    }
+
+    /// Spot-check two concrete encodings against the ISA so the property test
+    /// above cannot pass a self-consistent but wrong rule.
+    #[test]
+    fn cmp_r64_imm32_matches_known_encodings() {
+        // 48 81 FB — cmp rbx, imm32
+        assert_eq!(cmp_r64_imm32_opcode(RBX), [0x48, 0x81, 0xFB]);
+        // 49 81 FC — cmp r12, imm32
+        assert_eq!(cmp_r64_imm32_opcode(R12), [0x49, 0x81, 0xFC]);
+    }
+
+    /// The poll's slow-path CALL carries the flag address it tested in
+    /// argument register 0, loaded AFTER the pre-safepoint spill and before
+    /// the CALL, so the helper can name the VM whose flag fired.
+    #[test]
+    fn the_poll_passes_its_flag_address_in_arg0() {
+        if !jit_safepoint_polls_enabled() {
+            return;
+        }
+        // Both far from any code buffer: the flag test takes the `MOV R11`
+        // form and the CALL the absolute `imm64` form, so each value appears
+        // in the stream as a searchable immediate.
+        const FLAG: usize = 0x0000_7abc_def0_1230;
+        const SLOW: usize = 0x0000_7bcd_ef01_2340;
+        let mut c = staged_arg_test_compiler();
+        c.precise_maps = false;
+        c.shadow_enabled = false;
+        c.helpers.safepoint_flag_addr = FLAG;
+        c.helpers.safepoint_slow_path = SLOW;
+        let start = c.buf.pos();
+        c.emit_safepoint_poll();
+        let code = c.buf.as_slice()[start..].to_vec();
+
+        let mut probe = staged_arg_test_compiler();
+        let p0 = probe.buf.pos();
+        // Cast: x86-64 immediate encoding
+        probe.emit_mov_imm64(ARG_REGS[0], FLAG as i64);
+        let arg0_load = probe.buf.as_slice()[p0..].to_vec();
+
+        let find = |needle: &[u8]| code.windows(needle.len()).position(|w| w == needle);
+        let load_at = find(&arg0_load).expect("the poll loads its flag address into ARG_REGS[0]");
+        let call_at = find(&SLOW.to_le_bytes()).expect("the poll calls the slow path");
+        assert!(
+            load_at < call_at,
+            "the flag address must be in ARG_REGS[0] before the CALL"
+        );
+    }
+
+    /// gcg g4/oo hunk 5.2 (b), applied by g4/jm: with the owed-cycle latch
+    /// published (`DirectHelperTable::gen_owed_poll_flag_addr`), the poll also
+    /// tests it -- its address is a `MOV R11` immediate before the slow path's
+    /// CALL; unpublished, no latch byte appears and the poll is shorter.
+    #[test]
+    fn gcg_g4jm_the_poll_tests_the_owed_cycle_latch_only_when_published() {
+        if !jit_safepoint_polls_enabled() {
+            return;
+        }
+        const FLAG: usize = 0x0000_7abc_def0_1230;
+        const SLOW: usize = 0x0000_7bcd_ef01_2340;
+        const LATCH: usize = 0x0000_7cde_f012_3450;
+        let emit = |latch: usize| {
+            let mut c = staged_arg_test_compiler();
+            c.precise_maps = false;
+            c.shadow_enabled = false;
+            c.helpers.safepoint_flag_addr = FLAG;
+            c.helpers.safepoint_slow_path = SLOW;
+            c.direct_helpers.gen_owed_poll_flag_addr = latch;
+            let start = c.buf.pos();
+            c.emit_safepoint_poll();
+            c.buf.as_slice()[start..].to_vec()
+        };
+        let base = emit(0);
+        let armed = emit(LATCH);
+        let find =
+            |code: &[u8], needle: &[u8]| code.windows(needle.len()).position(|w| w == needle);
+        assert!(
+            find(&base, &LATCH.to_le_bytes()).is_none(),
+            "unpublished: no latch test"
+        );
+        let latch_at =
+            find(&armed, &LATCH.to_le_bytes()).expect("the armed poll loads the latch address");
+        let call_at =
+            find(&armed, &SLOW.to_le_bytes()).expect("the armed poll calls the slow path");
+        assert!(
+            latch_at < call_at,
+            "the latch is tested before the slow path"
+        );
+        assert!(armed.len() > base.len());
+    }
+
+    /// t1 wave 8, lane SAFEPOLL (`CRATONVM_JIT_PAGE_POLL`): the page form is
+    /// `MOV R11, seg:[disp32]`, `TEST [R11 + base], EAX` (the registered
+    /// site), `JMP .done`, then the byte poll's slow path at the registered
+    /// recovery offset, and nothing on the fast path tests the flag.
+    #[test]
+    fn t1w8_safepoll_the_page_form_registers_its_site_and_slow_path() {
+        const FLAG: usize = 0x0000_7abc_def0_1230;
+        const SLOW: usize = 0x0000_7bcd_ef01_2340;
+        const PAIR: usize = 0x3000_0000;
+        let mut c = staged_arg_test_compiler();
+        c.precise_maps = false;
+        c.shadow_enabled = false;
+        c.helpers.safepoint_flag_addr = FLAG;
+        c.helpers.safepoint_slow_path = SLOW;
+        c.direct_helpers.page_poll_base = PAIR;
+        let sites_before = c.implicit_null_sites.len();
+        let start = c.buf.pos();
+        c.emit_page_form_poll();
+        let code = c.buf.as_slice().to_vec();
+        assert_eq!(c.implicit_null_sites.len(), sites_before + 1);
+        let (site, slow) = *c.implicit_null_sites.last().unwrap();
+        // The TLS load first: segment prefix, then `4C 8B 1C 25 disp32`.
+        assert_eq!(code[start], crate::x64::inline_rbp_tls_segment_prefix());
+        assert_eq!(&code[start + 1..start + 5], &[0x4C, 0x8B, 0x1C, 0x25]);
+        assert_eq!(site, start + 9);
+        let mut touch = vec![0x41, 0x85, 0x83];
+        // Cast: the pair base is a disp32.
+        touch.extend_from_slice(&(PAIR as u32).to_le_bytes());
+        assert_eq!(&code[site..site + 7], touch.as_slice(), "TEST [R11 + base], EAX");
+        assert_eq!(code[site + 7], 0xE9, "JMP rel32 over the slow path");
+        assert_eq!(slow, site + 12, "the recovery pc follows the JMP");
+        let rel = i32::from_le_bytes([code[site + 8], code[site + 9], code[site + 10], code[site + 11]]);
+        // Cast: a rel32 jump displacement.
+        let done = (site + 12).wrapping_add_signed(rel as isize);
+        assert_eq!(done, code.len(), "the JMP lands after the slow path");
+        let find = |needle: &[u8]| code[slow..].windows(needle.len()).position(|w| w == needle);
+        assert!(find(&SLOW.to_le_bytes()).is_some(), "the slow path calls the helper");
+        assert!(find(&FLAG.to_le_bytes()).is_some(), "with the flag in ARG_REGS[0]");
+        assert!(
+            code[start..slow].windows(8).all(|w| w != FLAG.to_le_bytes()),
+            "the fast path never reads the flag"
+        );
+    }
+
+    /// Off (no published pair, or the switch / handler absent), the poll is the
+    /// byte poll: no page touch and no implicit-null site.
+    #[test]
+    fn t1w8_safepoll_without_a_pair_or_the_switch_the_poll_is_the_byte_poll() {
+        if !jit_safepoint_polls_enabled() {
+            return;
+        }
+        const FLAG: usize = 0x0000_7abc_def0_1230;
+        const SLOW: usize = 0x0000_7bcd_ef01_2340;
+        for pair in [0usize, 0x3000_0000] {
+            if pair != 0 && crate::poll_page::emit_enabled() {
+                continue; // the process runs with the switch on and a handler
+            }
+            let mut c = staged_arg_test_compiler();
+            c.precise_maps = false;
+            c.shadow_enabled = false;
+            c.helpers.safepoint_flag_addr = FLAG;
+            c.helpers.safepoint_slow_path = SLOW;
+            c.direct_helpers.page_poll_base = pair;
+            let sites_before = c.implicit_null_sites.len();
+            let start = c.buf.pos();
+            c.emit_safepoint_poll();
+            let code = c.buf.as_slice()[start..].to_vec();
+            assert_eq!(c.implicit_null_sites.len(), sites_before);
+            assert!(code.windows(3).all(|w| w != [0x41, 0x85, 0x83]));
+        }
+    }
+
+    /// t1 wave 11, lane GCA: the page form's shape gate (the switch aside)
+    /// admits a top-level poll with a pair and refuses one inside a splice
+    /// (whose rollback does not rewind `implicit_null_sites`), one with an
+    /// exit header, one with the owed-cycle latch, and one with no pair.
+    #[test]
+    fn t1w11_gca_the_page_form_is_refused_inside_a_splice() {
+        const PAIR: usize = 0x3000_0000;
+        let top = || {
+            let mut c = staged_arg_test_compiler();
+            c.direct_helpers.page_poll_base = PAIR;
+            c
+        };
+        assert!(top().page_form_poll_shape_admits(None), "top level, pair in reach");
+        assert!(!top().page_form_poll_shape_admits(Some(7)), "an exit header");
+        let mut c = top();
+        c.direct_helpers.gen_owed_poll_flag_addr = 0x1000;
+        assert!(!c.page_form_poll_shape_admits(None), "the owed-cycle latch");
+        let mut c = top();
+        c.direct_helpers.page_poll_base = 0;
+        assert!(!c.page_form_poll_shape_admits(None), "no pair");
+        let mut c = top();
+        c.inline_oop_scopes.push(InlineOopScope {
+            local_base: 64,
+            num_locals: 1,
+            masks: vec![0b1; 4],
+            reached: vec![true; 4],
+            cur_pc: 0,
+        });
+        assert!(!c.page_form_poll_shape_admits(None), "inside a splice");
+    }
+
+    /// Wave 17, lane L1: the slow-path CALL carries this compile's id in
+    /// argument register 1, after the flag address, and the flag-clear path is
+    /// unchanged by it: everything up to and including the `JZ` is the same
+    /// bytes whatever the id.
+    #[test]
+    fn the_poll_names_its_body_in_arg1_on_the_slow_path_only() {
+        if !jit_safepoint_polls_enabled() {
+            return;
+        }
+        const FLAG: usize = 0x0000_7abc_def0_1230;
+        const SLOW: usize = 0x0000_7bcd_ef01_2340;
+        let emit = |reserve: bool| {
+            let mut c = staged_arg_test_compiler();
+            c.precise_maps = false;
+            c.shadow_enabled = false;
+            c.helpers.safepoint_flag_addr = FLAG;
+            c.helpers.safepoint_slow_path = SLOW;
+            // Set either way: `Compiler::new` reserves an id of its own when
+            // the inline frame record is available.
+            c.compile_id = if reserve {
+                crate::CompileIdReservation::reserve()
+            } else {
+                crate::CompileIdReservation::none()
+            };
+            let id = c.compile_id.id();
+            let start = c.buf.pos();
+            c.emit_safepoint_poll();
+            (id, c.buf.as_slice()[start..].to_vec())
+        };
+        let (id, named) = emit(true);
+        if id == 0 {
+            // Every compile id is live or awaiting grace in this process.
+            return;
+        }
+        let (none, unnamed) = emit(false);
+        assert_eq!(none, 0);
+
+        let mut probe = staged_arg_test_compiler();
+        let p0 = probe.buf.pos();
+        // Cast: x86-64 immediate encoding
+        probe.emit_mov_imm64(ARG_REGS[0], FLAG as i64);
+        let arg0_load = probe.buf.as_slice()[p0..].to_vec();
+        let p1 = probe.buf.pos();
+        probe.emit_mov_imm64(ARG_REGS[1], i64::from(id));
+        let arg1_load = probe.buf.as_slice()[p1..].to_vec();
+
+        let find =
+            |code: &[u8], needle: &[u8]| code.windows(needle.len()).position(|w| w == needle);
+        let arg0_at = find(&named, &arg0_load).expect("the flag address in ARG_REGS[0]");
+        let arg1_at = find(&named, &arg1_load).expect("the compile id in ARG_REGS[1]");
+        let call_at = find(&named, &SLOW.to_le_bytes()).expect("the slow-path CALL");
+        assert!(
+            arg0_at < arg1_at && arg1_at < call_at,
+            "flag, id, then CALL"
+        );
+        // The fast path: the flag test and the `JZ` over the slow path open
+        // both sequences with the same bytes (only the `JZ`'s rel32 differs,
+        // by the slow path's extra length), and so does the spill after them.
+        let unnamed_arg0 = find(&unnamed, &arg0_load).expect("the unnamed poll's flag load");
+        assert_eq!(
+            unnamed_arg0, arg0_at,
+            "the same bytes precede the argument loads"
+        );
+        let jz = find(&named, &[0x0F, 0x84]).expect("the JZ over the slow path");
+        assert!(jz + 6 <= arg0_at);
+        assert_eq!(
+            &named[..jz + 2],
+            &unnamed[..jz + 2],
+            "flag test and JZ opcode"
+        );
+        assert_eq!(
+            &named[jz + 6..arg0_at],
+            &unnamed[jz + 6..arg0_at],
+            "the spill before the argument loads"
+        );
+        let skip = |code: &[u8]| {
+            i32::from_le_bytes([code[jz + 2], code[jz + 3], code[jz + 4], code[jz + 5]])
+        };
+        assert!(
+            skip(&named) > skip(&unnamed),
+            "only the skipped slow path grew"
+        );
+    }
+
+    /// Restores the thread-local moving-young override on drop, so a failing
+    /// assertion cannot leave it set for the next test on this thread.
+    struct MovingYoungOverride;
+    impl MovingYoungOverride {
+        fn on() -> Self {
+            crate::x64::set_moving_young_override(Some(true));
+            MovingYoungOverride
+        }
+    }
+    impl Drop for MovingYoungOverride {
+        fn drop(&mut self) {
+            crate::x64::set_moving_young_override(None);
+        }
+    }
+
+    /// The `ShadowOddLongProbe.main` shape, reduced: local 0 is a reference
+    /// parameter the body never reads, local 1 a live reference, locals 2-3 a
+    /// `long`, and the allocator gave locals 0 and 2 the same register (they
+    /// never interfere). Three one-byte instructions; at each of them locals 1
+    /// and 2 are live and local 0 is not.
+    fn shared_home_compiler() -> Compiler {
+        let alloc_result = crate::regalloc::RegAllocResult {
+            assignments: vec![None; 4],
+            xmm_assignments: Vec::new(),
+            used_callee_saved: Vec::new(),
+            used_xmm_regs: Vec::new(),
+            block_live_in: Vec::new(),
+        };
+        let mut c = Compiler::new(
+            "dead-shared-home-test".to_string(),
+            ExecutableBuffer::new(4096).expect("test executable buffer"),
+            4,
+            1,
+            8,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            alloc_result,
+            false,
+            // SAFETY: as in `staged_arg_test_compiler`.
+            unsafe { std::mem::zeroed() },
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+        );
+        c.local_assignments = vec![Some(R12), Some(R15), Some(R12), None];
+        c.param_oop_mask = 0b001;
+        c.local_oop_masks = vec![0b011; 3];
+        c.local_oop_reached = vec![true; 3];
+        c.local_oop_windows = 1;
+        c.local_oop_stride = 3;
+        c.local_liveness = vec![0b0110; 3];
+        c.local_liveness_words = 1;
+        c.local_liveness_covered = vec![true, true, true, false];
+        c.cur_bc_pc = 1;
+        c
+    }
+
+    /// gc-common w36-b (`common-w4o-shadow-stack-dereferences-a-mistyped-odd-primitive`):
+    /// a dead reference local whose register another local shares is not a
+    /// reference home -- not in the mask, not on the shadow stack.
+    #[test]
+    fn a_dead_reference_local_sharing_its_register_is_not_published() {
+        let _moving = MovingYoungOverride::on();
+        let mut c = shared_home_compiler();
+
+        assert_eq!(
+            c.local_oop_mask_at_current_pc(),
+            Some(0b010),
+            "local 0 is dead and r12 holds the long: it must not be named"
+        );
+        let mut named = Vec::new();
+        assert!(c.for_each_oop_local_at_current_pc(|k| named.push(k)));
+        assert_eq!(named, vec![1]);
+        let homes = c.collect_live_oop_homes();
+        assert!(
+            !homes.contains(&ShadowHome::Reg(R12)),
+            "r12 holds the counter here; homes={homes:?}"
+        );
+        assert!(homes.contains(&ShadowHome::Reg(R15)), "homes={homes:?}");
+
+        // The method-entry poll: every parameter home holds its own argument.
+        c.cur_bc_pc = ENTRY_POLL_BC_PC;
+        assert_eq!(c.local_oop_mask_at_current_pc(), Some(0b001));
+    }
+
+    /// The filter drops only what it can prove wrong, and each condition is
+    /// load-bearing on its own.
+    #[test]
+    fn a_reference_home_is_kept_unless_dead_and_shared() {
+        let _moving = MovingYoungOverride::on();
+
+        // A register only local 0 owns still holds local 0's last value.
+        let mut c = shared_home_compiler();
+        c.local_assignments[2] = Some(RBX);
+        assert_eq!(c.local_oop_mask_at_current_pc(), Some(0b011));
+        assert!(c.collect_live_oop_homes().contains(&ShadowHome::Reg(R12)));
+
+        // Live at the NEXT instruction (a store emitted under this pc).
+        let mut c = shared_home_compiler();
+        c.local_liveness[2] = 0b0111;
+        assert_eq!(c.local_oop_mask_at_current_pc(), Some(0b011));
+
+        // Kept for a debugger.
+        let mut c = shared_home_compiler();
+        c.local_assigned = vec![0b0001; 3];
+        assert_eq!(c.local_oop_mask_at_current_pc(), Some(0b011));
+
+        // No liveness table (the ungated compile): no claim, nothing dropped.
+        let mut c = shared_home_compiler();
+        c.local_liveness_words = 0;
+        assert_eq!(c.local_oop_mask_at_current_pc(), Some(0b011));
+
+        // An uncovered pc, or no next instruction to consult.
+        let mut c = shared_home_compiler();
+        c.cur_bc_pc = 2;
+        assert_eq!(
+            c.local_oop_mask_at_current_pc(),
+            Some(0b011),
+            "pc 2 has no covered successor"
+        );
+    }
+
+    /// The shared-register rule drops a dead reference local only when its
+    /// register is shared (gcg g6/jm: kept from the deleted
+    /// `CRATONVM_JIT_SP_LOCAL_LIVENESS` test, whose other half is gone).
+    #[test]
+    fn gcg_g1s_the_shared_register_rule_drops_only_a_shared_registers_dead_local() {
+        let c = shared_home_compiler();
+        assert_eq!(c.dead_oop_locals_with(0, 0b011), 0b001, "shared register");
+        let mut c = shared_home_compiler();
+        c.local_assignments[2] = Some(RBX);
+        assert_eq!(c.dead_oop_locals_with(0, 0b011), 0, "unshared register");
+        let mut c = shared_home_compiler();
+        c.local_assignments[0] = None;
+        assert_eq!(c.dead_oop_locals_with(0, 0b011), 0, "frame-homed");
+    }
+
+    /// gch h4/jm (`CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS`): with the rule on, a
+    /// dead reference local is dropped whether its register is shared,
+    /// unshared or absent (frame-homed); a live one never is; and every
+    /// refusal of the shared-register rule (uncovered pc, no successor, the
+    /// entry poll, the debugger's kept set) still refuses.
+    #[test]
+    fn gch_h4jm_every_dead_reference_local_is_dropped_under_the_map_liveness_rule() {
+        // Shared register (r12 with the long): both rules drop local 0.
+        let c = shared_home_compiler();
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, false), 0b001);
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0b001);
+
+        // Unshared register: only the liveness rule drops it.
+        let mut c = shared_home_compiler();
+        c.local_assignments[2] = Some(RBX);
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, false), 0);
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0b001);
+
+        // Frame-homed (the `relay` parameter's shape): only the liveness rule.
+        let mut c = shared_home_compiler();
+        c.local_assignments[0] = None;
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, false), 0);
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0b001);
+
+        // Live at the next instruction: kept.
+        let mut c = shared_home_compiler();
+        c.local_assignments[0] = None;
+        c.local_liveness[2] = 0b0111;
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0);
+
+        // The debugger's kept set: kept.
+        let mut c = shared_home_compiler();
+        c.local_assignments[0] = None;
+        c.local_assigned = vec![0b0001; 3];
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0);
+
+        // No covered successor, an uncovered pc, the entry poll: nothing.
+        let mut c = shared_home_compiler();
+        c.local_assignments[0] = None;
+        c.cur_bc_pc = 2;
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0, "no successor");
+        c.cur_bc_pc = 3;
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0, "uncovered");
+        c.cur_bc_pc = ENTRY_POLL_BC_PC;
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0, "entry poll");
+
+        // The live local 1 is never dropped by either rule.
+        let c = shared_home_compiler();
+        assert_eq!(c.dead_oop_locals_rule(0, 0b010, true), 0);
+    }
+
+    /// gch h4/jm: the switch is default OFF (the published mask is the
+    /// shared-register one), `=1` drops the unshared dead local from the ONE
+    /// accessor every GC consumer reads, and a debugger-observed compile
+    /// refuses the rule even with the switch on.
+    #[test]
+    fn gch_h4jm_the_map_liveness_switch_is_default_off_and_refused_under_a_debugger() {
+        const SWITCH: &str = "CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS";
+        let unshared = || {
+            let mut c = shared_home_compiler();
+            c.local_assignments[2] = Some(RBX);
+            c
+        };
+        cratonvm_types::flags::with_thread_overrides(&[(SWITCH, None)], || {
+            assert_eq!(
+                unshared().local_oop_mask_at_current_pc(),
+                Some(0b011),
+                "default OFF"
+            );
+        });
+        cratonvm_types::flags::with_thread_overrides(&[(SWITCH, Some("1"))], || {
+            assert_eq!(
+                unshared().local_oop_mask_at_current_pc(),
+                Some(0b010),
+                "=1: the dead local 0 is not named"
+            );
+            let mut named = Vec::new();
+            assert!(unshared().for_each_oop_local_at_current_pc(|k| named.push(k)));
+            assert_eq!(named, vec![1]);
+            let mut c = unshared();
+            c.debugger_observes_locals = true;
+            assert_eq!(
+                c.local_oop_mask_at_current_pc(),
+                Some(0b011),
+                "debugger: refused"
+            );
+        });
+    }
+
+    /// gci i8/sp (`CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS_IN_SPLICES`): inside a
+    /// splice the map-liveness rule is refused unless the second switch is on
+    /// too; with both on, the OUTER method's dead local 0 is dropped at the
+    /// splice's safepoint exactly as at a top-level one; the second switch
+    /// alone changes nothing; a debugger still refuses; and outside a splice
+    /// the second switch is never consulted (same answer either way).
+    #[test]
+    fn gci_i8sp_map_liveness_speaks_inside_a_splice_only_under_its_own_switch() {
+        const LL: &str = "CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS";
+        const IN_SPLICES: &str = "CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS_IN_SPLICES";
+        let in_splice = || {
+            let mut c = shared_home_compiler();
+            c.local_assignments[2] = Some(RBX);
+            c.inline_oop_scopes.push(InlineOopScope {
+                local_base: 64,
+                num_locals: 1,
+                masks: vec![0b1; 4],
+                reached: vec![true; 4],
+                cur_pc: 0,
+            });
+            c
+        };
+        let top_level = || {
+            let mut c = shared_home_compiler();
+            c.local_assignments[2] = Some(RBX);
+            c
+        };
+        const MONOTONE: &str = "CRATONVM_JIT_SP_MAP_LOCAL_LIVENESS_MONOTONE";
+        cratonvm_types::flags::with_thread_overrides(
+            &[(LL, Some("1")), (IN_SPLICES, None), (MONOTONE, Some("0"))],
+            || {
+                assert_eq!(in_splice().local_oop_mask_at_current_pc(), Some(0b011), "splice: refused");
+                assert_eq!(top_level().local_oop_mask_at_current_pc(), Some(0b010), "top level: dropped");
+            },
+        );
+        // OOM21-6 (default on): the rule must be monotone, so with LL on it
+        // speaks inside a splice without the second switch.
+        cratonvm_types::flags::with_thread_overrides(&[(LL, Some("1")), (IN_SPLICES, None)], || {
+            assert_eq!(in_splice().local_oop_mask_at_current_pc(), Some(0b010), "monotone: dropped");
+        });
+        cratonvm_types::flags::with_thread_overrides(
+            &[(LL, Some("1")), (IN_SPLICES, Some("1"))],
+            || {
+                assert_eq!(
+                    in_splice().local_oop_mask_at_current_pc(),
+                    Some(0b010),
+                    "both on: the outer dead local 0 is not named inside the splice"
+                );
+                assert_eq!(top_level().local_oop_mask_at_current_pc(), Some(0b010));
+                let mut c = in_splice();
+                c.debugger_observes_locals = true;
+                assert_eq!(c.local_oop_mask_at_current_pc(), Some(0b011), "debugger: refused");
+            },
+        );
+        cratonvm_types::flags::with_thread_overrides(&[(LL, None), (IN_SPLICES, Some("1"))], || {
+            assert_eq!(in_splice().local_oop_mask_at_current_pc(), Some(0b011), "LL off: nothing");
+            assert_eq!(top_level().local_oop_mask_at_current_pc(), Some(0b011), "LL off: nothing");
+        });
+    }
+
+    /// ARGWIN21-9: an owned direct call zeroes a dead reference local's frame
+    /// slot (and its callee-saved register when no other local shares it);
+    /// nothing for a shared register, an operand-stack alias, a debugger, an
+    /// unowned site or the switch off.
+    #[test]
+    fn argwin21_9_an_owned_call_zeroes_the_callers_dead_reference_locals() {
+        let frame_store = |off: i32| {
+            let mut c = shared_home_compiler();
+            let at = c.buf.pos();
+            c.buf.emit_byte(0x48);
+            c.buf.emit_byte(0xC7);
+            c.modrm_rbp_disp(0, off);
+            c.buf.emit(&0i32.to_le_bytes());
+            c.buf.as_slice()[at..].to_vec()
+        };
+        // Local 0 dead, frame-homed.
+        let mut c = shared_home_compiler();
+        c.local_assignments[0] = None;
+        let off0 = c.local_offset(0);
+        let at = c.buf.pos();
+        assert_eq!(c.emit_owned_call_dead_local_clears(true), vec![0]);
+        assert_eq!(&c.buf.as_slice()[at..], &frame_store(off0)[..], "the slot alone");
+        // Unowned: nothing.
+        let mut c = shared_home_compiler();
+        c.local_assignments[0] = None;
+        assert!(c.emit_owned_call_dead_local_clears(false).is_empty());
+        // A register another local shares (r12 with local 2): nothing.
+        let mut c = shared_home_compiler();
+        assert!(c.emit_owned_call_dead_local_clears(true).is_empty());
+        // An unshared register: zeroed, and the slot.
+        let mut c = shared_home_compiler();
+        c.local_assignments[0] = Some(RBX);
+        let at = c.buf.pos();
+        assert_eq!(c.emit_owned_call_dead_local_clears(true), vec![0]);
+        let mut probe = shared_home_compiler();
+        let p0 = probe.buf.pos();
+        probe.emit_xor_reg_self(RBX);
+        let mut want = probe.buf.as_slice()[p0..].to_vec();
+        want.extend(frame_store(off0));
+        assert_eq!(&c.buf.as_slice()[at..], &want[..]);
+        // An operand-stack entry still aliasing the slot: nothing.
+        let mut c = shared_home_compiler();
+        c.local_assignments[0] = None;
+        c.stack.push(StackSlot::Frame(off0));
+        assert!(c.emit_owned_call_dead_local_clears(true).is_empty());
+        // A debugger: nothing.
+        let mut c = shared_home_compiler();
+        c.local_assignments[0] = None;
+        c.debugger_observes_locals = true;
+        assert!(c.emit_owned_call_dead_local_clears(true).is_empty());
+        // The switch off: nothing.
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_SP_OWNED_CALL_DEAD_LOCAL_CLEARS", Some("0"))],
+            || {
+                let mut c = shared_home_compiler();
+                c.local_assignments[0] = None;
+                assert!(c.emit_owned_call_dead_local_clears(true).is_empty());
+            },
+        );
+    }
+
+    /// OOM21-6 / ARGWIN21-6: under the map-liveness rule the monotone form
+    /// looks past the 64-byte next-instruction bound, answers from the pc's
+    /// own liveness with no later instruction, and drops every candidate at
+    /// an uncovered pc; the shared-register rule and the zeroing callers'
+    /// conservative form are unchanged at each of those points.
+    #[test]
+    fn oom21_6_the_map_liveness_rule_is_monotone() {
+        let unshared = || {
+            let mut c = shared_home_compiler();
+            c.local_assignments[2] = Some(RBX);
+            c
+        };
+        // A gap past the bound: the next instruction is 100 bytes on.
+        let mut c = unshared();
+        c.local_liveness = vec![0b0110; 102];
+        c.local_liveness_covered = vec![false; 102];
+        c.local_liveness_covered[1] = true;
+        c.local_liveness_covered[101] = true;
+        c.local_oop_masks = vec![0b011; 102];
+        c.local_oop_reached = vec![true; 102];
+        c.local_oop_stride = 102;
+        assert_eq!(c.dead_oop_locals_rule_monotone(0, 0b011, true, true), 0b001, "far next");
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0, "conservative form");
+        c.local_liveness[101] = 0b0111;
+        assert_eq!(c.dead_oop_locals_rule_monotone(0, 0b011, true, true), 0, "live far on");
+        // No later instruction at all: the pc's own liveness.
+        let mut c = unshared();
+        c.local_liveness_covered = vec![false; 4];
+        c.local_liveness_covered[1] = true;
+        assert_eq!(c.dead_oop_locals_rule_monotone(0, 0b011, true, true), 0b001, "last insn");
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0);
+        // An uncovered pc: every candidate.
+        let mut c = unshared();
+        c.cur_bc_pc = 2;
+        c.local_liveness_covered = vec![true, true, false, true];
+        assert_eq!(c.dead_oop_locals_rule_monotone(0, 0b011, true, true), 0b011, "uncovered");
+        assert_eq!(c.dead_oop_locals_rule(0, 0b011, true), 0);
+        // The shared-register rule never takes the monotone form.
+        assert_eq!(c.dead_oop_locals_rule_monotone(0, 0b011, false, true), 0);
+    }
+}
+
+#[cfg(test)]
+mod r13_sync3_self_lock_mode_exit_tests {
+    //! Round 13 wave 6 (lane sync3): no poll of a self-locking body may leave
+    //! for the interpreter, whichever of the three exit admissions it asks.
+
+    /// The body of `fn <name>` in this file, up to the next `fn `.
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let at = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("`fn {name}` not found"));
+        let rest = &src[at + 3..];
+        let end = [rest.find("\n    fn "), rest.find("\n    pub(super) fn ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Interpreter round i2 wave 56 (lane L2): the two loop admissions refuse
+    /// it unless its exits hand the monitor over
+    /// (`self_lock_mode_exits_hand_over`, `CRATONVM_JIT_SELF_LOCK_MODE_EXIT_HANDOVER`);
+    /// the self-tail admission always does.
+    #[test]
+    fn every_mode_exit_admission_refuses_a_self_locking_body() {
+        let src = include_str!("safepoint.rs");
+        // `branch_mode_exit_target` asks `branch_mode_exit_admits` (wave 48),
+        // which the post-call exit claims ask too, and which asks
+        // `branch_mode_exit_refusal` since interpreter round i2 wave 55 (this
+        // test read the delegating `branch_mode_exit_admits` until wave 56,
+        // and failed from wave 55 on).
+        for name in [
+            "mode_exit_target",
+            "branch_mode_exit_refusal",
+            "self_tail_mode_exit_target",
+        ] {
+            assert!(
+                fn_body(src, name).contains("self.holds_self_lock_no_frame_names()"),
+                "`{name}` must refuse a body holding its method monitor"
+            );
+        }
+        for name in ["mode_exit_target", "branch_mode_exit_refusal"] {
+            assert!(
+                fn_body(src, name).contains(
+                    "self.holds_self_lock_no_frame_names() && !self.self_lock_mode_exits_hand_over()"
+                ),
+                "`{name}` admits a self-locking body only when its exits hand the monitor over"
+            );
+        }
+        assert!(
+            !fn_body(src, "self_tail_mode_exit_target").contains("self_lock_mode_exits_hand_over"),
+            "a self-tail exit would resume a new activation: never handed over"
+        );
+    }
+
+    #[test]
+    fn the_refusal_is_the_self_lock_home() {
+        let mut c = super::super::emit::tests::test_compiler();
+        assert!(!c.holds_self_lock_no_frame_names());
+        c.self_lock_obj_off = 8;
+        assert!(c.holds_self_lock_no_frame_names());
+    }
+}
+
+#[cfg(test)]
+mod gce_e1f_metadata_only_cursor_tests {
+    /// gce e1/f (row 8 of the call-argument copies page): a metadata-only
+    /// safepoint records the live-frame bound on the NON-moving arm too, so
+    /// its map does not ship "unknown" and the band scan can drop the popped
+    /// argument slots above the cursor.
+    #[test]
+    fn gce_e1f_a_metadata_only_safepoint_records_the_cursor_without_moving_young() {
+        let saved = super::super::licm::MOVING_YOUNG_OVERRIDE.with(|c| c.get());
+        super::super::licm::set_moving_young_override(Some(false));
+        let mut c = super::super::emit::tests::test_compiler();
+        c.shadow_enabled = false;
+        c.next_spill_offset = 136;
+        c.pending_live_frame_hi = 0;
+        c.emit_safepoint_metadata_only();
+        let recorded = c.pending_live_frame_hi;
+        super::super::licm::set_moving_young_override(saved);
+        assert_eq!(
+            recorded, 136,
+            "the cursor, as the pre-safepoint spill takes it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gcg_g3v_spill_written_set_tests {
+    //! gcg g3/v: `CRATONVM_JIT_SPILL_WRITTEN_SET` -- each map publishes the
+    //! blind-spill slots every spill of its id wrote (`OopMapEntry::spill_written`).
+    use super::super::licm::ALL_SPILL_GPRS;
+    use super::{
+        image_slots_follow_mask_bits, merge_spill_written, spill_written_for, ALL_SPILL_IMAGE_MASK,
+    };
+
+    /// gcg g3/v (review): only the `=all` image (or no image) lets a register
+    /// mask's bit `i` speak for image slot `i`; the `=1` callee-saved image
+    /// gets no register mask, and so no slot of it is ever excluded by one.
+    #[test]
+    fn gcg_g3v_the_callee_saved_only_image_gets_no_register_mask() {
+        assert!(image_slots_follow_mask_bits(true, true, 64), "=all");
+        assert!(image_slots_follow_mask_bits(false, false, 64), "no spill");
+        assert!(image_slots_follow_mask_bits(true, false, 0), "no image");
+        assert!(!image_slots_follow_mask_bits(true, false, 64), "=1");
+        let mut c = super::super::emit::tests::test_compiler();
+        c.safepoint_reg_spill = true;
+        c.safepoint_reg_spill_all = false;
+        c.reg_spill_base = 64;
+        assert_eq!(c.live_oop_register_mask(false, 0, false), None);
+    }
+
+    const ON: &[(&str, Option<&str>)] = &[
+        ("CRATONVM_JIT_SPILL_WRITTEN_SET", Some("1")),
+        ("CRATONVM_JIT_MY_SELFCALL_PROOF", Some("0")),
+    ];
+
+    /// The full mask is exactly the fourteen `ALL_SPILL_GPRS` positions.
+    #[test]
+    fn gcg_g3v_the_full_written_set_is_every_spill_gpr() {
+        assert_eq!(
+            ALL_SPILL_IMAGE_MASK.count_ones() as usize,
+            ALL_SPILL_GPRS.len()
+        );
+        assert_eq!(
+            u32::from(ALL_SPILL_IMAGE_MASK) + 1,
+            1u32 << ALL_SPILL_GPRS.len()
+        );
+    }
+
+    /// Sets of one id merge by UNION (a slot is unwritten only if no event of
+    /// the id wrote it), `None` withdraws the claim, and an id with no event
+    /// publishes `None`.
+    #[test]
+    fn gcg_g3v_written_sets_merge_by_union_and_none_withdraws() {
+        assert_eq!(merge_spill_written(Some(0b01), Some(0b10)), Some(0b11));
+        assert_eq!(merge_spill_written(Some(0b01), None), None);
+        assert_eq!(merge_spill_written(None, Some(0b01)), None);
+        // gc wave 9 (lane gcC): the events reach `spill_written_for` merged
+        // per id, through `note_spill_written`.
+        let ev = [
+            (7u32, Some(0b001u16)),
+            (9, Some(0b100)),
+            (7, Some(0b010)),
+            (5, None),
+        ];
+        let by_pc = |events: &[(u32, Option<u16>)]| {
+            let mut c = super::super::emit::tests::test_compiler();
+            cratonvm_types::flags::with_thread_overrides(ON, || {
+                for &(pc, w) in events {
+                    c.cur_bc_pc = pc as usize;
+                    c.note_spill_written(w);
+                }
+            });
+            c.spill_written_by_pc
+        };
+        let m = by_pc(&ev);
+        assert_eq!(spill_written_for(&m, 7), Some(0b011));
+        assert_eq!(spill_written_for(&m, 9), Some(0b100));
+        assert_eq!(spill_written_for(&m, 5), None, "a None event");
+        assert_eq!(spill_written_for(&m, 3), None, "no event at the id");
+        let m = by_pc(&[(7u32, Some(0u16)), (7, Some(0b10))]);
+        assert_eq!(
+            spill_written_for(&m, 7),
+            Some(0b10),
+            "metadata-only adds nothing"
+        );
+        let m = by_pc(&[(7u32, None), (7, Some(0b10))]);
+        assert_eq!(
+            spill_written_for(&m, 7),
+            None,
+            "a None event withdraws for good"
+        );
+    }
+
+    /// A spill emitted AFTER a map of its id widens that map, so the merge
+    /// does not depend on emission order; a map of another id is untouched,
+    /// and off the switch nothing is recorded.
+    #[test]
+    fn gcg_g3v_a_later_spill_of_the_same_id_widens_the_published_map() {
+        let mut c = super::super::emit::tests::test_compiler();
+        let mut m7 = crate::OopMapEntry::new(0x10);
+        m7.bytecode_pc = 7;
+        m7.spill_written = Some(0b001);
+        let mut m9 = crate::OopMapEntry::new(0x20);
+        m9.bytecode_pc = 9;
+        m9.spill_written = Some(0b001);
+        c.oop_maps.push(m7);
+        c.oop_maps.push(m9);
+        // gc wave 9 (lane gcC): the publish site files each `Some` map's
+        // index under its id; a stale index (2: truncated away) is skipped.
+        c.spill_written_maps.insert(7, vec![0, 2]);
+        c.spill_written_maps.insert(9, vec![1]);
+        c.cur_bc_pc = 7;
+        cratonvm_types::flags::with_thread_overrides(ON, || c.note_spill_written(Some(0b100)));
+        assert_eq!(c.oop_maps[0].spill_written, Some(0b101));
+        assert_eq!(c.oop_maps[1].spill_written, Some(0b001), "another id");
+        // An index reused by a map of another id is not widened by this id.
+        c.spill_written_maps.insert(7, vec![0, 1]);
+        cratonvm_types::flags::with_thread_overrides(ON, || c.note_spill_written(None));
+        assert_eq!(c.oop_maps[0].spill_written, None, "a None event withdraws");
+        assert_eq!(
+            c.oop_maps[1].spill_written,
+            Some(0b001),
+            "index 1 is id 9's"
+        );
+        assert_eq!(c.spill_written_by_pc.get(&7), Some(&None));
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_SPILL_WRITTEN_SET", Some("0"))],
+            || {
+                c.cur_bc_pc = 4;
+                c.note_spill_written(Some(0))
+            },
+        );
+        assert_eq!(c.spill_written_by_pc.len(), 1, "off the switch: nothing");
+    }
+
+    /// The emitters: an `=all` spill records what it wrote (no plan: the full
+    /// copy), the `=1` callee-saved layout records no claim, and a
+    /// metadata-only safepoint records that it wrote nothing.
+    #[test]
+    fn gcg_g3v_each_spill_shape_records_its_written_set() {
+        let saved = super::super::licm::MOVING_YOUNG_OVERRIDE.with(|c| c.get());
+        super::super::licm::set_moving_young_override(Some(false));
+        let run = |all: bool, metadata_only: bool| {
+            let mut c = super::super::emit::tests::test_compiler();
+            c.shadow_enabled = false;
+            c.safepoint_reg_spill = true;
+            c.safepoint_reg_spill_all = all;
+            c.safepoint_reg_spill_nostore = false;
+            c.reg_spill_base = 64;
+            c.cur_bc_pc = 11;
+            cratonvm_types::flags::with_thread_overrides(ON, || {
+                if metadata_only {
+                    c.emit_safepoint_metadata_only();
+                } else {
+                    c.emit_pre_safepoint_spill_without_shadow();
+                }
+            });
+            assert!(!c.failed, "all={all} metadata_only={metadata_only}");
+            let mut events: Vec<(u32, Option<u16>)> = c
+                .spill_written_by_pc
+                .iter()
+                .map(|(&pc, &w)| (pc, w))
+                .collect();
+            events.sort_unstable();
+            events
+        };
+        let full = run(true, false);
+        let one = run(false, false);
+        let meta = run(true, true);
+        super::super::licm::set_moving_young_override(saved);
+        assert_eq!(
+            full,
+            vec![(11, Some(ALL_SPILL_IMAGE_MASK))],
+            "no plan: every slot"
+        );
+        assert_eq!(one, vec![(11, None)], "the `=1` layout claims nothing");
+        assert_eq!(meta, vec![(11, Some(0))], "metadata-only wrote nothing");
+    }
+}
+
+#[cfg(test)]
+mod gch_h4jm_sp_band_census_tests {
+    //! gch h4/jm: the `[sp-band]` census classes (`CRATONVM_DBG_SP_BAND_OWNERS`).
+    use super::{sp_band_owner, sp_band_owner_words};
+
+    /// Each word gets exactly one class, in the order named > primitive
+    /// operand > live splice local > unowned.
+    #[test]
+    fn gch_h4jm_each_band_word_gets_one_owner_class() {
+        let slots = [64i16, 96];
+        let prims = [72i16, 96];
+        let inline = [(104i32, 2u16, 0b01u64)];
+        assert_eq!(sp_band_owner(64, &slots, &prims, &inline), "oop");
+        assert_eq!(sp_band_owner(72, &slots, &prims, &inline), "prim");
+        assert_eq!(sp_band_owner(80, &slots, &prims, &inline), "unowned");
+        assert_eq!(
+            sp_band_owner(96, &slots, &prims, &inline),
+            "oop",
+            "named wins"
+        );
+        assert_eq!(sp_band_owner(104, &slots, &prims, &inline), "inline-local");
+        assert_eq!(sp_band_owner(112, &slots, &prims, &inline), "inline-local");
+        assert_eq!(
+            sp_band_owner(120, &slots, &prims, &inline),
+            "unowned",
+            "past the scope"
+        );
+        assert_eq!(sp_band_owner(i32::MAX, &slots, &prims, &[]), "unowned");
+    }
+
+    /// The `words=` field walks `[lo, hi)` in 8-byte steps.
+    #[test]
+    fn gch_h4jm_the_words_field_covers_lo_to_live_hi() {
+        let w = sp_band_owner_words(64, 88, &[64], &[80], &[]);
+        assert_eq!(w, "64:oop,72:unowned,80:prim");
+        assert_eq!(sp_band_owner_words(64, 64, &[64], &[], &[]), "");
+        assert_eq!(
+            sp_band_owner_words(64, 0, &[], &[], &[]),
+            "",
+            "an unknown cursor"
+        );
+    }
+}

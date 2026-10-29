@@ -1,0 +1,3 @@
+# Refusals under --jdk-only that left an EARLIER native owning the slot.
+# class<TAB>method<TAB>descriptor<TAB>survivor-kind
+# Regenerate: UPDATE_BASELINE=1 bash scripts/jdk-only-refusal-survivors.sh

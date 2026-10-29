@@ -1,0 +1,40 @@
+# jdk-baseline	2
+# kind	class
+# name	javax.net.ssl.SSLSession
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/javax/net/ssl/SSLSession.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	21
+# protected-methods	0
+# declared-methods	21
+# declared-fields	0
+# rows	24
+# columns	kind	name	descriptor	flags
+CLASS	javax.net.ssl.SSLSession		public,interface,abstract
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	getApplicationBufferSize	()I	public,abstract
+METHOD	getCipherSuite	()Ljava/lang/String;	public,abstract
+METHOD	getCreationTime	()J	public,abstract
+METHOD	getId	()[B	public,abstract
+METHOD	getLastAccessedTime	()J	public,abstract
+METHOD	getLocalCertificates	()[Ljava/security/cert/Certificate;	public,abstract
+METHOD	getLocalPrincipal	()Ljava/security/Principal;	public,abstract
+METHOD	getPacketBufferSize	()I	public,abstract
+METHOD	getPeerCertificateChain	()[Ljavax/security/cert/X509Certificate;	public
+METHOD	getPeerCertificates	()[Ljava/security/cert/Certificate;	public,abstract
+METHOD	getPeerHost	()Ljava/lang/String;	public,abstract
+METHOD	getPeerPort	()I	public,abstract
+METHOD	getPeerPrincipal	()Ljava/security/Principal;	public,abstract
+METHOD	getProtocol	()Ljava/lang/String;	public,abstract
+METHOD	getSessionContext	()Ljavax/net/ssl/SSLSessionContext;	public,abstract
+METHOD	getValue	(Ljava/lang/String;)Ljava/lang/Object;	public,abstract
+METHOD	getValueNames	()[Ljava/lang/String;	public,abstract
+METHOD	invalidate	()V	public,abstract
+METHOD	isValid	()Z	public,abstract
+METHOD	putValue	(Ljava/lang/String;Ljava/lang/Object;)V	public,abstract
+METHOD	removeValue	(Ljava/lang/String;)V	public,abstract

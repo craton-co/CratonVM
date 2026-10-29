@@ -1,0 +1,100 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry EligibleHalfPrecisionMatmul__matmul____I_F_F_V(
+    .param .u64 p0_ptr,
+    .param .s32 p0_len,
+    .param .u64 p1_ptr,
+    .param .s32 p1_len,
+    .param .u64 p2_ptr,
+    .param .s32 p2_len,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<5>;
+    .reg .u64 %rd<8>;
+    .reg .s32 %r<30>;
+    .reg .f32 %f<9>;
+    .reg .pred %p<5>;
+    .reg .b16 %rs<2>;
+
+    ld.param.u64 %rd0, [p0_ptr];
+    ld.param.s32 %r0, [p0_len];
+    ld.param.u64 %rd1, [p1_ptr];
+    ld.param.s32 %r1, [p1_len];
+    ld.param.u64 %rd2, [p2_ptr];
+    ld.param.s32 %r2, [p2_len];
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r3, %ru3;
+    ld.param.s32 %r4, [tid_base];
+    add.s32 %r5, %r3, %r4;
+    mov.s32 %r6, 1;
+    and.b32 %r8, %r6, 31;
+    shr.s32 %r7, %r1, %r8;
+    mov.s32 %r9, 0;
+    setp.ge.u32 %p0, %r5, %r2;
+    @%p0 bra L_done;
+    mov.f32 %f0, 0f00000000;
+    mul.lo.s32 %r10, %r5, %r7;
+    mov.s32 %r11, 0;
+L_body_31:
+    setp.ge.s32 %p1, %r11, %r7;
+    @%p1 bra L_body_89;
+L_body_37:
+    add.s32 %r12, %r10, %r11;
+    setp.ge.u32 %p2, %r12, %r0;
+    @%p2 bra L_bounds_fail;
+    mad.wide.s32 %rd3, %r12, 4, %rd0;
+    ld.global.s32 %r13, [%rd3];
+    shl.b32 %r15, %r13, 16;
+    shr.s32 %r14, %r15, 16;
+    cvt.u16.u32 %rs0, %r14;
+    cvt.f32.f16 %f1, %rs0;
+    mov.s32 %r16, 1;
+    and.b32 %r18, %r16, 31;
+    shl.b32 %r17, %r11, %r18;
+    setp.ge.u32 %p3, %r17, %r1;
+    @%p3 bra L_bounds_fail;
+    mad.wide.s32 %rd4, %r17, 4, %rd1;
+    ld.global.f32 %f2, [%rd4];
+    mul.rn.f32 %f3, %f1, %f2;
+    mov.s32 %r19, 16;
+    and.b32 %r21, %r19, 31;
+    shr.s32 %r20, %r13, %r21;
+    shl.b32 %r23, %r20, 16;
+    shr.s32 %r22, %r23, 16;
+    cvt.u16.u32 %rs1, %r22;
+    cvt.f32.f16 %f4, %rs1;
+    mov.s32 %r24, 1;
+    and.b32 %r26, %r24, 31;
+    shl.b32 %r25, %r11, %r26;
+    mov.s32 %r27, 1;
+    add.s32 %r28, %r25, %r27;
+    setp.ge.u32 %p4, %r28, %r1;
+    @%p4 bra L_bounds_fail;
+    mad.wide.s32 %rd5, %r28, 4, %rd1;
+    ld.global.f32 %f5, [%rd5];
+    mul.rn.f32 %f6, %f4, %f5;
+    add.rn.f32 %f7, %f3, %f6;
+    add.rn.f32 %f8, %f0, %f7;
+    add.s32 %r29, %r11, 1;
+    mov.f32 %f0, %f8;
+    mov.s32 %r11, %r29;
+    bra L_body_31;
+L_body_89:
+    mad.wide.s32 %rd6, %r5, 4, %rd2;
+    st.global.f32 [%rd6], %f0;
+    bra L_done;
+L_done:
+    ret;
+L_bounds_fail:
+    ld.param.u64 %rd7, [failure_flag];
+    mov.u32 %ru4, 1;
+    st.global.u32 [%rd7], %ru4;
+    ret;
+}
+

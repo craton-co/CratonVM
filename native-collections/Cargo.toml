@@ -1,0 +1,36 @@
+[package]
+name = "cratonvm-native-collections"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Java collections native methods for CratonVM"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+synthetic-jdk = []
+
+[dependencies]
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+cratonvm-gc = { path = "../gc", version = "0.3.0" }
+parking_lot.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+# Behavioural-coverage integration tests in `tests/` build a heap-backed
+# `MockCtx` against the `NativeContext` trait surface. The `test-mock`
+# feature pulls in the lightweight `test_mock::MockNativeContext` fixture
+# from `cratonvm-native-api` so tests can also exercise trait default-impl
+# methods directly (e.g. `atomic_fetch_add_int`) without re-rolling them.
+cratonvm-native-api = { path = "../native-api", features = ["test-mock"] }
+
+[lints]
+workspace = true

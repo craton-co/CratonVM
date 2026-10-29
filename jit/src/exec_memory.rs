@@ -1,0 +1,1558 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! Executable memory: the one type in this crate that owns a W^X mapping, from
+//! the `alloc_executable` that creates it to the `free_executable` that returns
+//! it.
+//!
+//! Split out of `lib.rs` on 2026-09-16, following `jfr_compile_decision`,
+//! `osr_entry`, `inline_cache_pic` and `ea_ir_bridge`.
+//!
+//! # Why this is a real boundary and not just a section
+//!
+//! [`ExecutableBuffer`] is the crate's only handle on memory that the CPU will
+//! fetch instructions from, and every rule about that memory is enforced by a
+//! method on this one type and by nothing else:
+//!
+//!   * the mapping starts read-write and only ever becomes read-execute through
+//!     [`ExecutableBuffer::finalize`], so a jump into a half-written body faults
+//!     on instruction fetch rather than executing rubble;
+//!   * every write after that flip is bracketed by a `platform::JitWriteScope`,
+//!     which is what keeps Apple silicon's per-thread W^X toggle honest — the
+//!     emit and patch methods are the only places that scope is entered for a
+//!     code buffer, so "did this write take the toggle?" is answerable by
+//!     reading this file alone;
+//!   * the address range is registered with the code-region table on creation
+//!     and deregistered in `drop`, which is what makes the `usize -> fn` casts
+//!     elsewhere in the crate checkable rather than hopeful;
+//!   * overflow and unencodable-codegen discards are two DIFFERENT states
+//!     (`overflowed` vs `codegen_failed`) because one is worth retrying at a
+//!     measured size and the other never is, and only this type can tell them
+//!     apart.
+//!
+//! Every one of those is an invariant stated about a private field and checked
+//! by a method of the same struct. The fields stayed private across this split:
+//! nothing outside this file can reach the raw pointer, the length or the
+//! published flag, which is what lets the list above be read as a proof rather
+//! than as a convention.
+//!
+//! # Why `Drop` travelled with it
+//!
+//! The destructor is the only code in the crate that may unmap a code page, so
+//! it belongs to the type that owns the page even though most of its body is
+//! bookkeeping. Keeping it here is what allowed the fields to stay private —
+//! had it stayed behind in `lib.rs` it would have needed `ptr`, `len`,
+//! `capacity` and `published` widened to `pub(crate)`, and the encapsulation
+//! argued for above would have been traded away for a file boundary.
+//!
+//! It brought exactly the two helpers nothing else calls
+//! (`CRATONVM_DBG_JIT_UNMAP` and `CRATONVM_JIT_NEVER_FREE_CODE`) and nothing
+//! more. What it did NOT bring is the reclamation protocol itself: the
+//! authorised-reclaim gate, the code-free ring, the cap, the retirement queue
+//! and their census all stay at the crate root, because `AuthorisedReclaim` is
+//! entered from dozens of sites that have nothing to do with this buffer. The
+//! destructor CALLS into that protocol (`reclaim_is_authorised`,
+//! `record_code_free`, the `RECLAMATION` ledger) through the imports below; it
+//! does not own it. That is the seam: this file owns the mapping, `lib.rs` owns
+//! the question of when releasing one is safe.
+//!
+//! Glob-re-exported from the crate root, so every path a caller used before the
+//! split still resolves -- the code moved, the API did not.
+
+use crate::{
+    dbg_jit_code_free_enabled, defer_orphaned_mapping, jit_code_regions, platform,
+    reclaim_is_authorised, reclaim_is_cascaded, record_code_free, CompileError,
+    ACTIVE_JIT_EXECUTIONS, CODE_FREE_AUTHORISED, CODE_FREE_ENTERED, CODE_FREE_PUBLISHED,
+    COMMITTED_JIT_CODE_BYTES, PUBLISHED_CODE_FREES, RECLAMATION, UNQUEUED_PUBLISHED_CODE_FREES,
+};
+
+/// Bytes every [`ExecutableBuffer`] maps past its emit capacity, for the
+/// not-entrant stub `CompiledMethod::make_not_entrant` writes there
+/// (interpreter round i1 wave 22, lane L6). The x86-64 stub is at most
+/// [`crate::NOT_ENTRANT_STUB_MAX`] bytes and starts 16-byte aligned after the
+/// emitted code, so 128 leaves room for both. Not part of `capacity`: codegen,
+/// the overflow retry and the code-cache accounting are unchanged by it.
+pub const NOT_ENTRANT_TAIL_RESERVE: usize = 128;
+
+/// JIT round 23 wave 8 (lane L5): the bytes a coloured [`ExecutableBuffer`]
+/// reserves in front of its code, and the bound of [`code_entry_colour`].
+/// 4 KiB is one L1 instruction cache's worth of sets (64 sets x 64-byte
+/// lines on every x86-64 core this runs on), so the colours reach every set.
+pub const CODE_ENTRY_COLOUR_SPAN: usize = 4096;
+
+/// The granule of a colour: one cache line, which also keeps every entry
+/// 16-byte aligned, as the uncoloured base was (and more).
+pub const CODE_ENTRY_COLOUR_LINE: usize = 64;
+
+/// `CRATONVM_JIT_CODE_ENTRY_COLOUR` (JIT round 23 wave 8, lane L5; perf,
+/// **default ON since j27 2026-10-28**; `=0` starts every body at its
+/// mapping's base as before).
+///
+/// Was opt-in after the n23-w8g A/B (P-cores, 3 reps, rep 3 host-loaded; RxLoop
+/// ns/op, `=1` vs off): matches 3111/2877/3883 vs 2746/2211/2805, split-ws
+/// 9266/7011/12056 vs 9814/6382/12064, split-comma 1219/1017/1740 vs
+/// 1395/974/1419, replaceall 4242/3779/4797 vs 4451/3680/4406 -- no win,
+/// matches worse. The C probe below is the case for revisiting it.
+///
+/// Every [`ExecutableBuffer::new`] is its own OS mapping, so every compiled
+/// body began at a 64 KiB boundary on Windows (`VirtualAlloc`'s allocation
+/// granularity) and at a 4 KiB one on Unix. Either way, byte `X` of every
+/// body falls in the same L1i set (and uop-cache and BTB set). A workload
+/// that calls a few dozen bodies round-robin then misses the instruction
+/// cache at each entry and through each prologue. The regex rows are that
+/// shape: `RxLoop split-ws` on n23-w8c had 6.4 % of all compiled-code
+/// samples on byte 0 of a body, and 14 % in the first 0xa0 bytes.
+///
+/// The C probe `C:\craton\n23p\w8L5\c\alias.c` builds JIT-like bodies, each
+/// in its own 64 KiB `VirtualAlloc`, and calls them round-robin (P-core,
+/// ns/call, base-aligned vs coloured):
+/// - 16 bodies: 11.3 vs 8.6;
+/// - 32 bodies: 20.3 vs 8.1;
+/// - 64 bodies: 24.3 vs 8.2.
+///
+/// With the switch on, the code starts [`code_entry_colour`] bytes into its
+/// mapping. Nothing else moves: `ptr` is still the code start and the entry,
+/// every offset codegen recorded is still relative to it, and the mapping
+/// grows by [`CODE_ENTRY_COLOUR_SPAN`]. Read once per buffer; no `static`.
+pub fn code_entry_colour_enabled() -> bool {
+    // WARNING j27-user-flip-20261028 (default ON; =0 restores the old default)
+    cratonvm_types::flags::runtime_flag_default_on("CRATONVM_JIT_CODE_ENTRY_COLOUR")
+}
+
+/// JIT r23 wave 8b (lane L5): the cap charge of a trimmed buffer with
+/// `len` code bytes: the capacity [`ExecutableBuffer::trim_unused_tail`]
+/// keeps for an uncoloured buffer, i.e. the code (16-byte rounded) and the
+/// not-entrant stub room, rounded up to whole pages, less the stub room. It
+/// does not depend on the colour.
+pub fn trimmed_charge(len: usize, page: usize) -> usize {
+    let need = ((len + 15) & !15usize).saturating_add(NOT_ENTRANT_TAIL_RESERVE);
+    need.saturating_add(page - 1) / page * page - NOT_ENTRANT_TAIL_RESERVE
+}
+
+/// The colour of a mapping at `base`: a multiple of [`CODE_ENTRY_COLOUR_LINE`]
+/// below [`CODE_ENTRY_COLOUR_SPAN`], taken from the base's page number by
+/// the splitmix64 finalizer. It spreads 64 KiB-strided Windows bases and
+/// adjacent 4 KiB Unix ones alike; a plain Fibonacci hash gave the Windows
+/// stride only 19 colours in 64. It is deterministic in the address, so it
+/// needs no counter and no global.
+pub fn code_entry_colour(base: usize) -> usize {
+    let mut z = (base >> 12) as u64;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // Cast: `z >> 58 < 64`.
+    ((z >> 58) as usize) * CODE_ENTRY_COLOUR_LINE
+}
+
+/// A buffer of executable machine code allocated via OS-level APIs.
+///
+/// Every platform enforces W^X (see `platform.rs`): the buffer is mapped
+/// read-write, and [`finalize`](ExecutableBuffer::finalize) flips it to
+/// read-execute (`VirtualProtect` to `PAGE_EXECUTE_READ` on Windows, `mprotect`
+/// to `PROT_READ | PROT_EXEC` on Linux/FreeBSD and macOS). Until then, a jump
+/// into it faults on instruction fetch.
+pub struct ExecutableBuffer {
+    pub(crate) ptr: *mut u8,
+    pub(crate) len: usize,
+    pub(crate) capacity: usize,
+    /// Bytes actually mapped, protected, registered and freed: `capacity` plus
+    /// [`NOT_ENTRANT_TAIL_RESERVE`] (interpreter round i1 wave 22, lane L6).
+    ///
+    /// Codegen never sees the difference: every emit and patch bound, the
+    /// accessor [`capacity`](Self::capacity), and the committed-bytes and
+    /// reclamation accounting still read `capacity`. The tail exists so that
+    /// a published body can always be made NOT ENTRANT
+    /// (`CompiledMethod::make_not_entrant`): the stub its patched entry jumps
+    /// to is written there, inside this same mapping, so it is always within a
+    /// `JMP rel32` of the entry and is freed with the body. The whole mapping
+    /// is registered with the code-region table, so a return address into the
+    /// stub keeps the body alive through the retirement queue's blocked-thread
+    /// summary exactly as a return address into the body does.
+    pub(crate) mapped: usize,
+    /// JIT round 23 wave 8 (lane L5, `CRATONVM_JIT_CODE_ENTRY_COLOUR`): bytes
+    /// from the OS mapping's base to `ptr`, a multiple of 64 under
+    /// [`CODE_ENTRY_COLOUR_SPAN`] ([`code_entry_colour`]); `0` uncoloured. The
+    /// mapping is `[ptr - lead, ptr - lead + os_len)`; the code and every
+    /// offset codegen records stay relative to `ptr`.
+    pub(crate) lead: usize,
+    /// Bytes of the OS mapping from its base: `lead + mapped` or more (the
+    /// colour span is reserved whole). What [`platform::free_executable`] and
+    /// the tail trim are given. `mapped` when uncoloured.
+    pub(crate) os_len: usize,
+    /// JIT r23 wave 8b (lane L5): the bytes this buffer has added to
+    /// `COMMITTED_JIT_CODE_BYTES`, the quantity the code-cache cap bounds.
+    /// It is charged on creation, reduced by the trim, and credited in `Drop`,
+    /// always by this field, so the charge and the credit are the same number.
+    ///
+    /// It is `capacity` at creation and, after a trim, the capacity the trim
+    /// would have kept with the code at the mapping base ([`trimmed_charge`]).
+    /// Uncoloured that is `capacity` exactly, as it always was. Coloured, the
+    /// trim keeps `os_keep - lead` bytes, up to most of a page more than the
+    /// code needs. That slack is a placement artefact, not code, and the cap
+    /// counts code (HotSpot's code cache does the same). The colour's real
+    /// commit is at most one page per body (`os_len - lead - mapped` is 0
+    /// after a trim) and is not charged. Charging it filled the 1 MiB cap of
+    /// `vm/tests/code_cache_sweep_phases.rs` with bodies that no sweep could
+    /// reclaim (n23-w8f).
+    pub(crate) charged: usize,
+    /// Named codegen invariant that discarded this method when the discard was
+    /// NOT a capacity problem — see
+    /// [`mark_codegen_unencodable`](Self::mark_codegen_unencodable). `None`
+    /// alongside a set `overflowed` means the buffer really was too small.
+    pub(crate) codegen_failed: Option<&'static str>,
+    /// Set when an `emit`/`emit_byte` call could not fit in the buffer.
+    /// `estimated_size` in the x64 backend is a heuristic, so a pathological
+    /// method can exceed it. Rather than panicking the whole process, the
+    /// emit hot path records overflow here and the compile driver bails to
+    /// the interpreter (returns `None`) after codegen.
+    pub(crate) overflowed: bool,
+    /// Total bytes codegen ASKED to emit, counted whether or not the write
+    /// fit. `len` freezes at the first overflow, so it cannot answer "how big
+    /// should this buffer have been?" — and without that number an overflow
+    /// bail is indistinguishable from a method the JIT declined for any other
+    /// reason. See [`wanted`](Self::wanted).
+    pub(crate) wanted: usize,
+    /// AUDIT: set once the owning `CompiledMethod` has been published into a
+    /// dispatch surface, i.e. once a raw pointer into this buffer can be held
+    /// by generated code. A free of a buffer with this bit clear is harmless
+    /// whatever `ACTIVE_JIT_EXECUTIONS` reads; a free of one with it set is
+    /// only safe if the retirement queue authorised it.
+    pub(crate) published: bool,
+    /// Set once a body that is ENTERED without ever being published — the
+    /// accepted optimizing OSR body (`register_unpublished_body`), a lambda
+    /// adapter thunk — becomes reachable by generated code. `published` stays
+    /// clear for such a body (it is not an install), so without this bit its
+    /// last-owner drop outside the retirement queue unmapped it at once, with no
+    /// question asked about a thread inside it, and the crash ring then called
+    /// it "a discarded compile attempt". `Drop` rescues it exactly as it
+    /// rescues a published body (round 13 wave 8, lane codecache,
+    /// `r13w8-codecache-baked-entry-of-a-refused-callee-FIXED-20260928.md`).
+    /// Atomic because it is set through the `Arc` the body is already shared by.
+    pub(crate) entered_unpublished: std::sync::atomic::AtomicBool,
+    /// Which sizing heuristic allocated this buffer, for the overflow warning.
+    ///
+    /// Four independent estimates allocate executable buffers, and the warning
+    /// named none of them — so an overflow flood was attributed by arithmetic
+    /// on the printed `len`, and got attributed to the WRONG one
+    /// (`basicerrorcontroller-jit-only-failure-20260731-FIXED.md`
+    /// blamed the single-pass backend's estimate for a flood that was entirely
+    /// the optimizing tier's).
+    pub(crate) tag: &'static str,
+    /// The x86-64 `CALL`s emitted while a census is open
+    /// ([`Self::begin_call_census`]); `None` (every compile but one that
+    /// spliced something under `CRATONVM_DBG_INLINE_ROW_CENSUS=1`) records
+    /// nothing. Interpreter round i1 wave 49, lane L3: the inline-frame-row
+    /// census (`ir_lower::Lowerer::report_inline_row_census`).
+    pub(crate) call_census: Option<Box<CallCensus>>,
+}
+
+/// What an open call census has recorded ([`ExecutableBuffer::call_census`]).
+#[derive(Debug, Default)]
+pub(crate) struct CallCensus {
+    /// The return address of each `CALL`, in emission order: one written by
+    /// one `emit` of exactly that instruction ([`is_one_call_instruction`]),
+    /// or a lone `E8` byte followed at once by a four-byte `emit` (the
+    /// `CALL rel32` whose displacement is patched later).
+    ends: Vec<u32>,
+    /// Where a lone `E8` byte just ended, until the next write.
+    lone_e8_end: Option<usize>,
+}
+
+/// Is `bytes` exactly one x86-64 `CALL` instruction: `CALL rel32` (`E8`), or
+/// `CALL r/m64` (`FF /2`, an optional `REX` prefix, every ModRM / SIB /
+/// displacement form)? Anything else (another instruction, an immediate,
+/// several instructions in one slice): `false`. Besides these the census
+/// knows one split form (a lone `E8`, then its displacement); any other
+/// call written in pieces is not recognised, and a lone `E8` that is the
+/// ModRM of an instruction written in pieces (`81 /5 E8 id`, `SUB EAX,
+/// imm32`) would be taken for a call. A diagnostic: its reports name the
+/// offset, and the disassembly (`CRATONVM_DBG_JIT_DISASM`) settles it.
+fn is_one_call_instruction(bytes: &[u8]) -> bool {
+    let bytes = match bytes {
+        [rex, rest @ ..] if rex & 0xF0 == 0x40 => rest,
+        _ => bytes,
+    };
+    match bytes {
+        [0xE8, _, _, _, _] => true,
+        [0xFF, modrm, rest @ ..] if (modrm >> 3) & 7 == 2 => {
+            let (md, rm) = (modrm >> 6, modrm & 7);
+            let sib = usize::from(md != 3 && rm == 4);
+            let disp = match md {
+                0 if rm == 5 => 4,
+                0 if rm == 4 => rest.first().map_or(0, |s| if s & 7 == 5 { 4 } else { 0 }),
+                1 => 1,
+                2 => 4,
+                _ => 0,
+            };
+            rest.len() == sib + disp
+        }
+        _ => false,
+    }
+}
+
+// SAFETY: an `ExecutableBuffer` uniquely owns its mapping, like a `Vec<u8>`, so
+// moving it to another thread moves that ownership and nothing else.
+unsafe impl Send for ExecutableBuffer {}
+// SAFETY: every write goes through `&mut self`. Once finalized and shared behind
+// the JIT cache's `Arc`, a buffer is executed and read; the `&self` operations
+// only read the mapping or change its protection through the OS.
+unsafe impl Sync for ExecutableBuffer {}
+
+impl ExecutableBuffer {
+    /// Allocate a new executable buffer with the given capacity.
+    ///
+    /// The mapping is [`NOT_ENTRANT_TAIL_RESERVE`] bytes longer than
+    /// `capacity`; see [`Self::mapped`]. Nothing emitted can reach that tail.
+    pub fn new(capacity: usize) -> Option<Self> {
+        let mapped = capacity.checked_add(NOT_ENTRANT_TAIL_RESERVE)?;
+        // JIT r23 wave 8 (lane L5): the code starts `lead` bytes into the
+        // mapping, so bodies do not all begin on the same cache set
+        // ([`code_entry_colour`]).
+        let colour = code_entry_colour_enabled();
+        let os_len = if colour {
+            mapped.checked_add(CODE_ENTRY_COLOUR_SPAN)?
+        } else {
+            mapped
+        };
+        let base = platform::alloc_executable(os_len)?;
+        let lead = if colour {
+            code_entry_colour(base as usize)
+        } else {
+            0
+        };
+        debug_assert!(lead + mapped <= os_len && lead % CODE_ENTRY_COLOUR_LINE == 0);
+        // SAFETY: `lead < CODE_ENTRY_COLOUR_SPAN`, so `[base + lead, base +
+        // lead + mapped)` lies inside the `os_len`-byte mapping just returned.
+        let ptr = unsafe { base.add(lead) };
+        // Account the committed executable memory. `COMMITTED_JIT_CODE_BYTES`
+        // tracks currently-mapped code and is the quantity the code-cache cap
+        // bounds; the `try_compile` gate reads it to decide whether to keep
+        // compiling. Bumped here (not in `Drop`, which fires only on the rare
+        // free path) so the figure reflects live mappings.
+        COMMITTED_JIT_CODE_BYTES.fetch_add(capacity, std::sync::atomic::Ordering::Relaxed);
+        // Register this region for code pointer validation.
+        // Poison is recovered, as everywhere else this lock is taken. Skipping
+        // the registration after an unrelated panic would make every
+        // `validate_code_ptr` into this buffer fail.
+        crate::note_code_mapping(ptr as usize, mapped);
+        jit_code_regions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register(ptr, mapped);
+        Some(Self {
+            ptr,
+            len: 0,
+            capacity,
+            mapped,
+            lead,
+            os_len,
+            charged: capacity,
+            overflowed: false,
+            codegen_failed: None,
+            wanted: 0,
+            published: false,
+            entered_unpublished: std::sync::atomic::AtomicBool::new(false),
+            tag: "untagged",
+            call_census: None,
+        })
+    }
+
+    /// Start recording the return address of every `CALL` emitted as one
+    /// instruction (see [`Self::call_census`]), discarding any earlier record.
+    #[cold]
+    pub(crate) fn begin_call_census(&mut self) {
+        self.call_census = Some(Box::default());
+    }
+
+    /// Stop the census and return the return addresses it recorded (empty
+    /// when none was open), in emission order.
+    pub(crate) fn take_call_census(&mut self) -> Vec<u32> {
+        self.call_census.take().map(|c| c.ends).unwrap_or_default()
+    }
+
+    /// `bytes` were just written, ending at `self.len`.
+    #[cold]
+    #[inline(never)]
+    fn note_census_write(&mut self, bytes: &[u8]) {
+        let len = self.len;
+        let Some(census) = self.call_census.as_mut() else {
+            return;
+        };
+        let after_lone_e8 = census.lone_e8_end.take() == Some(len - bytes.len());
+        let end = u32::try_from(len).unwrap_or(u32::MAX);
+        if is_one_call_instruction(bytes) || (after_lone_e8 && bytes.len() == 4) {
+            census.ends.push(end);
+        } else if bytes == [0xE8] {
+            census.lone_e8_end = Some(len);
+        }
+    }
+
+    /// Mark a body that generated code can enter WITHOUT it being published
+    /// (see [`Self::entered_unpublished`]). Idempotent; bumps no install
+    /// accounting, because nothing was installed. Its only effect is that a
+    /// last-owner drop outside the retirement queue is rescued into the queue
+    /// instead of unmapping, and that the code-free ring records the release
+    /// with [`CODE_FREE_ENTERED`].
+    #[inline]
+    pub(crate) fn note_entered_unpublished(&self) {
+        self.entered_unpublished
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// AUDIT: mark this buffer as reachable by generated code.
+    ///
+    /// Also the code-cache install count: a published body is counted once
+    /// here and once more when its mapping is released (`Drop`), so installed
+    /// minus reclaimed is exactly the published code still mapped. See
+    /// [`jit_code_reclamation_stats`].
+    ///
+    /// Returns **whether this call performed that accounting** — `false` on a
+    /// second call for the same buffer, which is idempotent and bumps nothing.
+    /// The two callers use it to keep the per-method publication census
+    /// (`note_jit_published_method_version`) counting exactly the population
+    /// `installed_bodies` counts: a census that could exceed the install count
+    /// would put `versions_per_method` below `1.0`, which is one of the two
+    /// arithmetically impossible readings the process report was rebuilt to stop
+    /// printing. Nothing today calls this twice; the return value is what makes
+    /// that a checked property rather than an assumption about the callers.
+    #[inline]
+    pub fn mark_published(&mut self) -> bool {
+        let first = !self.published;
+        if first {
+            use std::sync::atomic::Ordering::Relaxed;
+            RECLAMATION.installed_bodies.fetch_add(1, Relaxed);
+            RECLAMATION
+                .installed_bytes
+                .fetch_add(self.capacity as u64, Relaxed);
+            RECLAMATION
+                .installed_code_bytes
+                .fetch_add(self.len as u64, Relaxed);
+        }
+        self.published = true;
+        first
+    }
+
+    /// Name the sizing heuristic that allocated this buffer. Shown by the
+    /// overflow warnings, which otherwise cannot say which estimate was short.
+    #[inline]
+    pub fn set_tag(&mut self, tag: &'static str) {
+        self.tag = tag;
+    }
+
+    /// Write bytes into the buffer at the current position.
+    ///
+    /// If the write would exceed capacity the buffer is marked
+    /// [`overflowed`](Self::overflowed) and the write is skipped instead of
+    /// panicking. `len` is never advanced past `capacity`, so the buffer
+    /// stays safe to slice/patch; the compile driver is expected to check
+    /// `overflowed()` and discard the result.
+    ///
+    /// The `overflowed` flag is sticky: once any emit has overflowed, every
+    /// subsequent `emit`/`emit_byte` becomes a no-op. This freezes `len` at
+    /// the point of first overflow so a later (smaller) emit cannot slip
+    /// bytes in past the gap left by the dropped instruction and produce a
+    /// silently misaligned code stream.
+    pub fn emit(&mut self, bytes: &[u8]) {
+        self.wanted += bytes.len();
+        if self.overflowed || self.len + bytes.len() > self.capacity {
+            self.overflowed = true;
+            return;
+        }
+        // Per-thread write permission for this copy only: a no-op except on
+        // macOS/ARM64, where `MAP_JIT` code pages are writable only inside a
+        // scope. See `platform::JitWriteScope`.
+        let _write = platform::JitWriteScope::enter();
+        // SAFETY: `len + bytes.len() <= capacity` was checked above, `ptr` is this buffer's own writable mapping of `capacity` bytes, and `&mut self` rules out `bytes` aliasing it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
+        }
+        self.len += bytes.len();
+        if self.call_census.is_some() {
+            self.note_census_write(bytes);
+        }
+    }
+
+    /// Write bytes into the buffer, returning `false` (without writing) if
+    /// there is not enough capacity instead of panicking.
+    ///
+    /// Honours the same sticky [`overflowed`](Self::overflowed) state as
+    /// [`emit`](Self::emit): once any earlier write was dropped, this refuses
+    /// too, rather than appending bytes after the gap the dropped write left
+    /// (a silently misaligned stream is exactly what the sticky flag exists to
+    /// prevent). A refusal does not itself set `overflowed` — the caller asked
+    /// to be told instead — but it does count toward [`wanted`](Self::wanted),
+    /// so a retry sized from `wanted` covers these bytes as well.
+    pub fn emit_checked(&mut self, bytes: &[u8]) -> bool {
+        self.wanted += bytes.len();
+        if self.overflowed || self.len + bytes.len() > self.capacity {
+            return false;
+        }
+        let _write = platform::JitWriteScope::enter();
+        // SAFETY: `len + bytes.len() <= capacity` was checked above, `ptr` is this buffer's own writable mapping of `capacity` bytes, and `&mut self` rules out `bytes` aliasing it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
+        }
+        self.len += bytes.len();
+        if self.call_census.is_some() {
+            self.note_census_write(bytes);
+        }
+        true
+    }
+
+    /// Emit a single byte.
+    ///
+    /// Marks the buffer [`overflowed`](Self::overflowed) and skips the write
+    /// instead of panicking when capacity is exhausted. Like [`emit`](Self::emit),
+    /// honors the sticky `overflowed` flag: a no-op once the buffer has
+    /// already overflowed.
+    #[inline]
+    pub fn emit_byte(&mut self, b: u8) {
+        self.wanted += 1;
+        if self.overflowed || self.len >= self.capacity {
+            self.overflowed = true;
+            return;
+        }
+        let _write = platform::JitWriteScope::enter();
+        // SAFETY: `len < capacity` was checked above and `ptr` is this buffer's own writable mapping of `capacity` bytes.
+        unsafe {
+            *self.ptr.add(self.len) = b;
+        }
+        self.len += 1;
+        if self.call_census.is_some() {
+            self.note_census_write(&[b]);
+        }
+    }
+
+    /// Returns `true` if any `emit`/`emit_byte` call exceeded capacity.
+    /// When set, the emitted code is incomplete and must be discarded.
+    #[inline]
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// Force the buffer into the [`overflowed`](Self::overflowed) state.
+    ///
+    /// Reserved for a genuine CAPACITY problem — a write that did not fit, or a
+    /// patch offset past the emitted length. A codegen site that discards the
+    /// method for any OTHER reason must use
+    /// [`mark_codegen_unencodable`](Self::mark_codegen_unencodable) instead:
+    /// see that method for why the distinction is load-bearing.
+    #[inline]
+    pub fn mark_overflowed(&mut self) {
+        self.overflowed = true;
+    }
+
+    /// Discard the method because codegen hit a hard invariant it cannot encode
+    /// — a `rel8`/`rel32` displacement out of range, a frame offset with no
+    /// ModRM form, a deopt stub whose frame reserved no register-save area.
+    ///
+    /// These sites used to call [`mark_overflowed`](Self::mark_overflowed),
+    /// which made the driver report every one of them as
+    /// *"code buffer estimate too small; retrying at the measured size"*. That
+    /// was wrong twice over:
+    ///
+    /// * **It named the wrong defect.** The buffer was not too small; `wanted`
+    ///   on such a bail is typically well UNDER `capacity`, so the printed
+    ///   diagnostic contradicted itself and no reader could tell which of the
+    ///   ten sites had fired.
+    /// * **It retried forever.** The overflow bail is the one bail
+    ///   `try_compile` exempts from the permanent bail list, on the theory that
+    ///   the next attempt allocates from a measurement instead of the
+    ///   heuristic. But the hint is derived from `wanted`, and when `wanted` is
+    ///   below the heuristic the recomputed size is IDENTICAL — so the method
+    ///   was re-lowered in full, and failed in exactly the same place, on every
+    ///   warmup-gate re-attempt for the life of the process, while never
+    ///   becoming compiled.
+    ///
+    /// A bigger buffer cannot fix any of these, so they are permanent: the
+    /// driver reports `reason` by name and lets `try_compile` bail-list the
+    /// method after ONE attempt.
+    ///
+    /// Also sets `overflowed`, so every existing
+    /// `if buf.overflowed() { return None; }` discard keeps working unchanged.
+    #[inline]
+    pub fn mark_codegen_unencodable(&mut self, reason: &'static str) {
+        if self.codegen_failed.is_none() {
+            self.codegen_failed = Some(reason);
+        }
+        self.overflowed = true;
+    }
+
+    /// The named codegen invariant that discarded this method, if the discard
+    /// was NOT a capacity problem. `None` means a genuine buffer overflow (or
+    /// no failure at all — check [`overflowed`](Self::overflowed) first).
+    #[inline]
+    pub fn codegen_failure_reason(&self) -> Option<&'static str> {
+        self.codegen_failed
+    }
+
+    /// Current write position (offset from start).
+    #[inline]
+    pub fn pos(&self) -> usize {
+        self.len
+    }
+
+    /// Total bytes codegen asked to emit, including writes dropped after an
+    /// overflow. On an overflowed buffer this is the capacity the compile
+    /// actually needed (a lower bound: a dropped write still advances it, and
+    /// `rewind_to` does not take bytes back off it).
+    #[inline]
+    pub fn wanted(&self) -> usize {
+        self.wanted
+    }
+
+    /// Rewind the write position back to a previously recorded `pos()`.
+    ///
+    /// Used to discard speculatively-emitted code — e.g. when
+    /// `try_emit_inline` abandons a partially-emitted callee body and
+    /// falls back to a normal call. Bytes past `offset` are left as-is
+    /// in the backing allocation (they will be overwritten by the next
+    /// `emit`); only `len` moves. Rewinding *forward* (offset > len) is
+    /// rejected so a stale checkpoint cannot expose uninitialized bytes.
+    #[inline]
+    pub fn rewind_to(&mut self, offset: usize) {
+        if offset <= self.len {
+            self.len = offset;
+            if let Some(census) = self.call_census.as_mut() {
+                // A discarded call is not in the code.
+                census.ends.retain(|&end| end as usize <= offset);
+                census.lone_e8_end = None;
+            }
+        }
+    }
+
+    /// Get a pointer to the start of the executable code.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// The OS mapping's base: `ptr` less the colour lead (JIT r23 wave 8,
+    /// [`code_entry_colour`]); `ptr` itself for an uncoloured buffer.
+    #[inline]
+    pub(crate) fn mapping_base(&self) -> *mut u8 {
+        self.ptr.wrapping_sub(self.lead)
+    }
+
+    /// Size of the private executable allocation backing this method.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Bytes mapped for this buffer: [`Self::capacity`] plus the not-entrant
+    /// tail. See the `mapped` field.
+    #[inline]
+    pub fn mapped_len(&self) -> usize {
+        self.mapped
+    }
+
+    /// Get the emitted bytes as a slice.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` is this buffer's live mapping, which the OS zero-fills, and `len <= capacity` always holds.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Patch 4 bytes (little-endian i32) at the given offset.
+    ///
+    /// On out-of-bounds offset, marks the buffer
+    /// [`overflowed`](Self::overflowed) and returns
+    /// `Err(CompileError::PatchFailed)` instead of panicking. The surrounding
+    /// compile driver inspects `overflowed()` after codegen and bails to the
+    /// interpreter; the caller may ignore the `Err` and rely on that bail.
+    pub fn try_patch_i32(&mut self, offset: usize, value: i32) -> Result<(), CompileError> {
+        if offset.checked_add(4).map_or(true, |end| end > self.len) {
+            // Log only the FIRST overflow for this buffer. `overflowed` is
+            // sticky, so every later patch in the same compile hits this arm
+            // too; one oversized method used to emit tens of thousands of
+            // identical lines. The actionable diagnostic (method, code_len,
+            // capacity, wanted) is logged once per method by the compile
+            // driver's "code buffer estimate too small" bail.
+            if !self.overflowed {
+                tracing::warn!(
+                    offset = offset,
+                    len = self.len,
+                    capacity = self.capacity,
+                    wanted = self.wanted,
+                    buffer = self.tag,
+                    "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
+                );
+            }
+            self.overflowed = true;
+            return Err(CompileError::PatchFailed {
+                kind: "i32",
+                offset,
+            });
+        }
+        let bytes = value.to_le_bytes();
+        let _write = platform::JitWriteScope::enter();
+        // Safety: bounds checked above; ptr is owned and writable.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), 4);
+        }
+        Ok(())
+    }
+
+    /// Patch 1 byte at the given offset.
+    ///
+    /// On out-of-bounds offset, marks the buffer
+    /// [`overflowed`](Self::overflowed) and returns
+    /// `Err(CompileError::PatchFailed)` instead of panicking. See
+    /// [`try_patch_i32`](Self::try_patch_i32) for the bail-out contract.
+    pub fn try_patch_byte(&mut self, offset: usize, value: u8) -> Result<(), CompileError> {
+        if offset >= self.len {
+            // First overflow only; see `try_patch_i32` for why.
+            if !self.overflowed {
+                tracing::warn!(
+                    offset = offset,
+                    len = self.len,
+                    capacity = self.capacity,
+                    wanted = self.wanted,
+                    buffer = self.tag,
+                    "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
+                );
+            }
+            self.overflowed = true;
+            return Err(CompileError::PatchFailed {
+                kind: "byte",
+                offset,
+            });
+        }
+        let _write = platform::JitWriteScope::enter();
+        // Safety: bounds checked above.
+        unsafe {
+            *self.ptr.add(offset) = value;
+        }
+        Ok(())
+    }
+
+    /// Patch a `rel8` branch displacement, or discard the compile.
+    ///
+    /// The one rule this enforces is that a displacement which does not fit in
+    /// an `i8` must NEVER be written truncated. `rel as u8` is not a near-miss:
+    /// it turns an out-of-range forward branch into a backward one, and on x86
+    /// the landing site is normally the middle of an earlier instruction. The
+    /// inline-PIC cascade shipped exactly that — `JNE -128` into the body of
+    /// the pre-call spill/shadow-push run, which then ran as an unguarded
+    /// infinite push loop (`jit-raw-jit-to-jit-shadow-stack-
+    /// overflow-FIXED-20260731.md`), and the same wrap reappeared as a
+    /// deterministic SIGILL in the `CRATONVM_NO_MOVING_YOUNG=1` lane, whose
+    /// larger slot bodies pushed the same branch past 127 bytes.
+    ///
+    /// Marking the buffer overflowed makes the driver's
+    /// `if buf.overflowed() { return None; }` discard the half-emitted method
+    /// and fall back to the interpreter, which is always valid. Every emitter
+    /// that patches a short branch goes through here — `jit`'s only remaining
+    /// `try_patch_byte(.., .. as u8)` is the one inside this function, which
+    /// `rel8_displacement_patches_all_go_through_the_range_checked_helper`
+    /// pins.
+    pub fn patch_rel8_or_bail(&mut self, patch: usize, rel: i64) {
+        match i8::try_from(rel) {
+            // Cast: rel8 displacement, range-checked immediately above.
+            Ok(v) => {
+                self.try_patch_byte(patch, v as u8).ok();
+            }
+            Err(_) => self.mark_codegen_unencodable("rel8-displacement-out-of-range"),
+        }
+    }
+
+    /// Erase an already-emitted, straight-line byte range so it costs (almost)
+    /// nothing to execute, without moving any byte that follows it.
+    ///
+    /// Both backends emit the shadow-stack thread fetch unconditionally and
+    /// then discover, after the body is lowered, that the method published
+    /// nothing and the fetch is dead. Neither can *remove* it: every recorded
+    /// offset downstream — branch patches, deopt points, oop-map native PCs —
+    /// is already keyed on the current layout. So the range is overwritten in
+    /// place.
+    ///
+    /// Overwriting it with `0x90` alone is not enough. A one-byte `NOP` is
+    /// still an instruction that has to be fetched, decoded and retired, and
+    /// this range sits on the ENTRY path of the method — a ~46-byte fetch
+    /// becomes 46 NOPs executed on every single invocation. On a small, hot,
+    /// call-heavy method that is the dominant cost: it is what made
+    /// `CratonBench fib` run ~2x slower on the IR tier than the single-pass
+    /// body it displaced. Jumping over the range instead retires two bytes.
+    ///
+    /// The caller must guarantee the range is straight-line and that nothing
+    /// branches INTO its interior — landing on `start + 1` would decode the
+    /// `rel8` displacement as an opcode. Both current callers emit the range
+    /// as one unbroken prologue unit, before any bytecode is lowered.
+    pub fn erase_range_with_jump_over(&mut self, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        let len = end - start;
+        // `JMP rel8` is 2 bytes, so it needs 2 bytes to live in, and the
+        // displacement over the remainder must fit in an `i8`.
+        if len >= 2 && (len - 2) <= 127 && self.try_patch_byte(start, 0xEB).is_ok() {
+            // `len - 2 <= 127` is established above; the helper is here so no
+            // rel8 displacement in this crate is written by a hand-rolled cast
+            // (see `patch_rel8_or_bail`).
+            self.patch_rel8_or_bail(start + 1, (len - 2) as i64);
+            // The skipped bytes are unreachable now, so their encoding is
+            // irrelevant; `0x90` keeps a disassembly dump readable.
+            for off in (start + 2)..end {
+                let _ = self.try_patch_byte(off, 0x90);
+            }
+            return;
+        }
+        for off in start..end {
+            let _ = self.try_patch_byte(off, 0x90);
+        }
+    }
+
+    // task #44: the deprecated panicking `patch_i32` / `patch_byte` shims
+    // have been removed. Every internal codegen site was migrated to the
+    // `try_patch_*` variants in task #20 (commit acd57f2). A workspace grep
+    // confirmed zero remaining callers before deletion; the `try_*`
+    // variants are the only entry points now.
+
+    /// Read 4 bytes (little-endian i32) at the given offset.
+    ///
+    /// The bound is `checked_add`, the same shape [`try_patch_i32`](Self::try_patch_i32)
+    /// uses, and for the same reason: `offset + 4` wraps in a release build, so
+    /// an `offset` near `usize::MAX` produced a small sum that passed a plain
+    /// `offset + 4 <= self.len` and the read then went ahead outside the
+    /// mapping. Every caller passes a computed patch offset, which is exactly
+    /// the kind of value an arithmetic slip can make enormous.
+    pub fn read_i32(&self, offset: usize) -> i32 {
+        assert!(
+            offset.checked_add(4).is_some_and(|end| end <= self.len),
+            "read out of bounds"
+        );
+        let mut bytes = [0u8; 4];
+        // SAFETY: the assert above bounds `offset + 4` by `len`, inside this buffer's live mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr.add(offset), bytes.as_mut_ptr(), 4);
+        }
+        i32::from_le_bytes(bytes)
+    }
+
+    /// Return the whole pages past the emitted code to the OS, keeping room
+    /// for the not-entrant stub (16-byte aligned after `len`, at most
+    /// [`NOT_ENTRANT_TAIL_RESERVE`] bytes). Call once codegen is done and
+    /// before [`finalize`](Self::finalize).
+    ///
+    /// The capacity is a pre-codegen ESTIMATE (`x64/driver.rs` charges a
+    /// trivial getter 8 KiB plus 1 KiB per call site), and the code-cache cap
+    /// bounds [`COMMITTED_JIT_CODE_BYTES`], which counts capacity. Untrimmed,
+    /// 37% of a full cache was never-written estimate, and the Hibernate
+    /// Reactive single-process suite reached the 256 MiB cap at class 23 of
+    /// 206; every method that went hot after that ran interpreted
+    /// (`docs/feature-designs/jit-ir-optimizations.md`).
+    ///
+    /// A no-op on an arena block, a published or overflowed buffer, or when
+    /// less than one page would come back.
+    pub fn trim_unused_tail(&mut self) {
+        if self.ptr.is_null() || self.published || self.overflowed {
+            return;
+        }
+        let page = platform::code_page_size();
+        // JIT r23 wave 8 (`CRATONVM_JIT_CODE_ENTRY_COLOUR`): the pages are
+        // counted from the OS mapping's base, `lead` bytes before the code, and
+        // the buffer keeps whatever of the last kept page lies past the code
+        // (`keep = os_keep - lead`, still at least the code and the stub
+        // room). Uncoloured, `lead == 0`: `keep` is the old whole-page figure,
+        // `os_len == mapped`, and the call below is the old one.
+        let Some(os_keep) = ((self.len + 15) & !15usize)
+            .checked_add(NOT_ENTRANT_TAIL_RESERVE)
+            .and_then(|n| n.checked_add(self.lead))
+            .and_then(|n| n.checked_add(page - 1))
+            .map(|n| n & !(page - 1))
+        else {
+            return;
+        };
+        let keep = os_keep - self.lead;
+        if keep >= self.mapped
+            || os_keep >= self.os_len
+            || !platform::trim_executable_tail(self.mapping_base(), os_keep, self.os_len)
+        {
+            return;
+        }
+        self.os_len = os_keep;
+        {
+            let mut regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
+            regions.deregister(self.ptr);
+            regions.register(self.ptr, keep);
+        }
+        let capacity = keep - NOT_ENTRANT_TAIL_RESERVE;
+        // The cap's charge: what the trim would keep with the code at the
+        // mapping base (JIT r23 wave 8b; see `charged`), never more than was
+        // charged. Uncoloured that is `capacity` exactly, as before.
+        let charged = trimmed_charge(self.len, page).min(self.charged);
+        COMMITTED_JIT_CODE_BYTES.fetch_sub(
+            self.charged - charged,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.charged = charged;
+        self.capacity = capacity;
+        self.mapped = keep;
+    }
+
+    /// Transition the buffer from writable to executable.
+    ///
+    /// Calls the OS API to switch from RW to RX permissions.
+    ///
+    /// After calling `finalize`, writes via `emit`/`emit_byte`/`try_patch_i32` are
+    /// undefined behavior; production code never re-opens a finalized buffer.
+    ///
+    /// ABORTS the process if the OS refuses the flip. Prefer
+    /// [`try_finalize`](Self::try_finalize) (via `CompiledMethod::try_new`) on
+    /// any path that can decline to the interpreter instead.
+    pub fn finalize(&self) {
+        self.try_finalize().unwrap_or_else(|e| {
+            eprintln!("FATAL: JIT: make_executable failed: {e}");
+            std::process::abort();
+        });
+    }
+
+    /// [`finalize`](Self::finalize) without the abort (round 9 wave 2).
+    ///
+    /// `mprotect`/`VirtualProtect` can refuse for reasons that say nothing
+    /// about the process's health — Linux `ENOMEM` at `vm.max_map_count`
+    /// (every arena block flip splits the region's VMA), or a policy denial
+    /// (SELinux `execmem`, Windows ACG). A compile that gets `Err` here should
+    /// discard its artifact and decline to the interpreter, exactly as it does
+    /// on an allocation failure; the buffer is still RW and unpublished, so
+    /// dropping it is an ordinary unmap (an arena block is restored to RW by
+    /// the arena's own release).
+    ///
+    /// On success the code-stream epoch is advanced exactly as `finalize`
+    /// always did; on failure it is not (no bytes became executable).
+    pub fn try_finalize(&self) -> Result<(), platform::JitError> {
+        // From the mapping base (JIT r23 wave 8): the same pages `page_span`
+        // would give for `ptr`, said directly.
+        platform::make_executable(self.mapping_base(), self.lead + self.mapped)?;
+        // The instruction bytes now exist and are executable, and no entry
+        // pointer into them has been published yet (publication follows the
+        // `CompiledMethod` constructor that called this). That is exactly the
+        // window the reader-side barrier epoch must move in — see
+        // `note_code_stream_published` for the stale-stream case the
+        // registration-time bump alone missed.
+        crate::note_code_stream_published();
+        Ok(())
+    }
+
+    /// Transition the buffer back from executable to writable.
+    ///
+    /// Test-only since round 11: nothing in production re-opens a finalized
+    /// buffer, and on a PUBLISHED one the RX->RW flip would fault every other
+    /// thread fetching from the page (and abort on refusal). Patching live
+    /// code needs a different protocol, not this call.
+    #[cfg(test)]
+    pub(crate) fn make_writable(&self) {
+        platform::make_writable(self.mapping_base(), self.lead + self.mapped).unwrap_or_else(|e| {
+            eprintln!("FATAL: JIT: make_writable failed: {e}");
+            std::process::abort();
+        });
+    }
+}
+
+/// Whether to trace code-buffer unmaps (`CRATONVM_DBG_JIT_UNMAP`). Read once and
+/// cached: `Drop` runs on compile threads and during teardown, where a
+/// per-call environment read would be both hot and needlessly fallible.
+fn dbg_jit_unmap_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_UNMAP")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+impl ExecutableBuffer {
+    /// Would dropping this buffer NOW rescue its mapping into the retirement
+    /// queue rather than unmap it (one of the three rescue arms at the top of
+    /// `Drop`: a published or entered-unpublished buffer released inside
+    /// another buffer's reclamation scope, or outside any authorised
+    /// reclamation)? The same predicate, read without side effects, so the
+    /// owning `CompiledMethod`'s destructor can keep the side tables its code
+    /// bakes with the rescued mapping (JIT round 21 wave 4, lane codecache;
+    /// `CRATONVM_JIT_RESCUE_KEEPS_SIDE_TABLES`).
+    pub(crate) fn release_would_be_rescued(&self) -> bool {
+        if self.ptr.is_null() {
+            return false;
+        }
+        let entered = self
+            .entered_unpublished
+            .load(std::sync::atomic::Ordering::Acquire);
+        (self.published || entered)
+            && (reclaim_is_cascaded(self.ptr as usize) || !reclaim_is_authorised())
+    }
+
+    /// Move this buffer's mapping into a fresh value and leave `self` empty, so
+    /// the rest of `self`'s destructor is a no-op.
+    ///
+    /// An exhaustive struct literal rather than `ptr::read`: a field added
+    /// later fails to compile here instead of being silently duplicated.
+    fn detach_mapping(&mut self) -> ExecutableBuffer {
+        let moved = ExecutableBuffer {
+            ptr: self.ptr,
+            len: self.len,
+            capacity: self.capacity,
+            mapped: self.mapped,
+            lead: self.lead,
+            os_len: self.os_len,
+            charged: self.charged,
+            codegen_failed: self.codegen_failed,
+            overflowed: self.overflowed,
+            wanted: self.wanted,
+            published: self.published,
+            entered_unpublished: std::sync::atomic::AtomicBool::new(
+                self.entered_unpublished
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
+            tag: self.tag,
+            call_census: self.call_census.take(),
+        };
+        self.ptr = std::ptr::null_mut();
+        moved
+    }
+}
+
+impl Drop for ExecutableBuffer {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        // THE INVARIANT, ENFORCED RATHER THAN AUDITED. A published body's
+        // mapping may be returned to the OS only from a reclamation the
+        // retirement queue proved safe. A last owner dropped anywhere else —
+        // a local `Arc` that outlived the cache's withdrawal of the body, a
+        // dispatch memo, a per-thread cache — used to unmap right here, with
+        // no question asked about whether a thread was still executing inside
+        // (`jit-code-uaf-outside-retirement-queue-FIXED-20260918.md`: a C2
+        // compile task's `superseded_body` local freed ~27 published C1 bodies
+        // per Spring test process this way, and one of them was being executed).
+        //
+        // Such a drop is now RESCUED: the mapping, still registered and still
+        // intact, goes into the retirement queue and is unmapped only once the
+        // queue's quiescence proof covers it. The audit keeps counting these —
+        // each still names a holder that should have released through the
+        // queue — but a stray drop can no longer become a use-after-free.
+        //
+        // Round 13 wave 8 (lane codecache): a body ENTERED without publication
+        // is rescued the same way. It is not counted in the published audit,
+        // which is an install-accounting figure; the ring's
+        // `CODE_FREE_ENTERED` bit is what records it.
+        let entered = self
+            .entered_unpublished
+            .load(std::sync::atomic::Ordering::Acquire);
+        // Round 14 wave 1 (lane codecache, `gcd-d10v`): released last by the
+        // drop of ANOTHER body the drain freed on per-thread evidence (a
+        // callee root, an inline-cache or cell owner). That evidence was
+        // checked against the other body's buffer, not this one, so this one
+        // goes back through the queue for its own proof. Not counted in the
+        // unqueued audit: no stray holder dropped it, the queue's own release
+        // did. Off (`CRATONVM_JIT_RECLAIM_CASCADE_PROOF=0`) no scope is ever set.
+        if (self.published || entered) && reclaim_is_cascaded(self.ptr as usize) {
+            if dbg_jit_code_free_enabled() {
+                eprintln!(
+                    "[jit-cascaded-free] body base={:#x} len={:#x} released by another \
+body's reclamation -- re-queued for its own quiescence proof",
+                    self.ptr as usize, self.capacity,
+                );
+            }
+            defer_orphaned_mapping(self.detach_mapping());
+            return;
+        }
+        if !self.published && entered && !reclaim_is_authorised() {
+            if dbg_jit_code_free_enabled() {
+                eprintln!(
+                    "[jit-unqueued-free] ENTERED-UNPUBLISHED body base={:#x} len={:#x} \
+released OUTSIDE the retirement queue -- rescued into it; active_jit_executions={}",
+                    self.ptr as usize,
+                    self.capacity,
+                    ACTIVE_JIT_EXECUTIONS.get(),
+                );
+            }
+            defer_orphaned_mapping(self.detach_mapping());
+            return;
+        }
+        if self.published && !reclaim_is_authorised() {
+            let n =
+                UNQUEUED_PUBLISHED_CODE_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 32 && dbg_jit_code_free_enabled() {
+                eprintln!(
+                    "[jit-unqueued-free] PUBLISHED body base={:#x} len={:#x} \
+released OUTSIDE the retirement queue -- rescued into it; active_jit_executions={}\n{}",
+                    self.ptr as usize,
+                    self.capacity,
+                    ACTIVE_JIT_EXECUTIONS.get(),
+                    std::backtrace::Backtrace::force_capture(),
+                );
+            }
+            defer_orphaned_mapping(self.detach_mapping());
+            return;
+        }
+        // Poison is recovered here too. Skipping the deregistration would leave
+        // the region validating pointers into memory unmapped below.
+        jit_code_regions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .deregister(self.ptr);
+        // Withdraw debugger symbols before the address can be reused.
+        crate::code_events::retire(self.ptr as usize, self.capacity);
+        // Credit exactly what was charged (`charged`; `capacity` uncoloured).
+        COMMITTED_JIT_CODE_BYTES.fetch_sub(self.charged, std::sync::atomic::Ordering::Relaxed);
+        // DIAG: `CRATONVM_DBG_JIT_UNMAP=1` names every code buffer as it is
+        // unmapped. Paired with `CRATONVM_DBG=jitc` (which prints each
+        // artifact's `entry=0x..`) and the crash handler's `pc=` line, it
+        // answers "did this SIGSEGV jump into a body that had just been
+        // retired?" in a single run — the question each round of the
+        // retired-JIT-code family previously needed a bespoke LD_PRELOAD shim
+        // for. It is what identified the unrooted OSR direct-call targets
+        // (`osr_direct_callee_entries` in the interpreter's
+        // `compile_osr_artifact`).
+        if dbg_jit_unmap_enabled() {
+            eprintln!(
+                "[jit-unmap] ptr=0x{:x} cap={} tid={:?}",
+                self.ptr as usize,
+                self.capacity,
+                std::thread::current().id()
+            );
+        }
+        // Record the unmap BEFORE it happens, so a thread that faults inside
+        // this range can be told it was executing freed code (see
+        // `recent_code_free_covering`, which the crash handler prints). The
+        // active-execution count is what makes the report actionable: a
+        // non-zero value means the buffer was released while at least one
+        // thread was inside compiled code — which is precisely the bug the
+        // `defer_jit_owner` retirement queue above exists to prevent, so a
+        // non-zero value here means some release path is still bypassing it.
+        let authorised = reclaim_is_authorised();
+        let mut flags = 0usize;
+        if self.published {
+            flags |= CODE_FREE_PUBLISHED;
+            PUBLISHED_CODE_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The reclaim half of `mark_published`'s install accounting.
+            RECLAMATION
+                .reclaimed_bodies
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            RECLAMATION
+                .reclaimed_bytes
+                .fetch_add(self.capacity as u64, std::sync::atomic::Ordering::Relaxed);
+            RECLAMATION
+                .reclaimed_code_bytes
+                .fetch_add(self.len as u64, std::sync::atomic::Ordering::Relaxed);
+            // Unreachable for `!authorised`: the rescue at the top of this
+            // function sent every unauthorised published release to the queue,
+            // which frees it under `AuthorisedReclaim`.
+            debug_assert!(
+                authorised,
+                "unauthorised published release escaped the rescue"
+            );
+        }
+        if authorised {
+            flags |= CODE_FREE_AUTHORISED;
+        }
+        if entered {
+            flags |= CODE_FREE_ENTERED;
+        }
+        record_code_free(
+            self.ptr as usize,
+            self.capacity,
+            ACTIVE_JIT_EXECUTIONS.get(),
+            flags,
+        );
+        if never_free_code_enabled() {
+            return;
+        }
+        // THE LAST WITHDRAWAL, and the only one keyed to the instant the
+        // ADDRESS becomes reusable rather than to the instant an owner went
+        // away.
+        //
+        // `CompiledMethod::drop` used to retire this range as well, for a good
+        // reason: an implicit-null entry that outlives its buffer eventually
+        // matches a PC belonging to whatever `alloc_executable` hands out next,
+        // and the fault handler resumes at a stale address inside a live
+        // method. But that call ran when the last `Arc` went away, which is NOT
+        // when the mapping goes away — the rescue arm at the top of this
+        // function exists precisely because a published buffer can reach `drop`
+        // while a thread is still executing inside it, and it then keeps the
+        // mapping alive in the retirement queue. Retiring only there left a
+        // still-executing rescued body with no recovery entries, so a null
+        // receiver at one of its elided sites was a process-killing fault
+        // instead of a `NullPointerException`.
+        //
+        // Doing it HERE, and only here, makes "no implicit-null entry outlives
+        // its mapping, and none is retired before it" a property of the file
+        // that owns the mapping. The other call is gone; `CompiledMethod`'s
+        // `Drop` carries a comment where it was, so it does not come back.
+        // Still idempotent by construction, which is what makes the single
+        // remaining call safe on paths that reach it twice: a range whose
+        // entries are already tombstoned costs one page-chain walk and changes
+        // nothing (`implicit_null::unregister_range`). The whole mapping is retired,
+        // not just `[ptr, ptr + len)`, because it is the whole mapping the
+        // allocator may hand out again.
+        crate::implicit_null::unregister_range(self.ptr as usize, self.capacity);
+        // The whole OS mapping, from its base (JIT r23 wave 8: a coloured
+        // buffer's `ptr` is `lead` bytes in, and `VirtualFree(MEM_RELEASE)` /
+        // `munmap` need the base). Uncoloured: `(ptr, mapped)` as before.
+        platform::free_executable(self.mapping_base(), self.os_len);
+    }
+}
+
+/// DIAG: `CRATONVM_JIT_NEVER_FREE_CODE=1` never unmaps an executable buffer,
+/// for ANY owner — unlike [`jit_leak_code_enabled`], which only defers the
+/// owners routed through [`defer_jit_owner`]. If a SIGSEGV vanishes under this
+/// flag but survives `CRATONVM_JIT_LEAK_CODE=1`, the use-after-free is on a
+/// release path the retirement queue does not cover. Leaks every retired body;
+/// diagnosis only, never a shipping mode.
+fn never_free_code_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_NEVER_FREE_CODE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        code_entry_colour, platform, ExecutableBuffer, CODE_ENTRY_COLOUR_LINE,
+        CODE_ENTRY_COLOUR_SPAN, NOT_ENTRANT_TAIL_RESERVE,
+    };
+
+    const COLOUR: &str = "CRATONVM_JIT_CODE_ENTRY_COLOUR";
+
+    /// The pre-wave-8 trim figures assume the code starts at the mapping base.
+    fn uncoloured<R>(f: impl FnOnce() -> R) -> R {
+        cratonvm_types::flags::with_thread_overrides(&[(COLOUR, Some("0"))], f)
+    }
+
+    /// The inline-row census (wave 49, lane L3) records the return address of
+    /// each `CALL` emitted as one instruction, nothing for other instructions
+    /// or immediates, forgets a rewound call, and records nothing while closed.
+    #[test]
+    fn the_call_census_records_whole_call_instructions_only() {
+        use super::is_one_call_instruction as call;
+        assert!(call(&[0xFF, 0xD0])); // CALL RAX
+        assert!(call(&[0x41, 0xFF, 0xD3])); // CALL R11
+        assert!(call(&[0xE8, 1, 2, 3, 4])); // CALL rel32
+        assert!(call(&[0xFF, 0x15, 1, 2, 3, 4])); // CALL [RIP+disp32]
+        assert!(call(&[0xFF, 0x50, 0x10])); // CALL [RAX+disp8]
+        assert!(call(&[0x41, 0xFF, 0x53, 0x10])); // CALL [R11+disp8]
+        assert!(call(&[0xFF, 0x14, 0x24])); // CALL [RSP]
+        assert!(!call(&[0xFF, 0xE0])); // JMP RAX
+        assert!(!call(&[0xFF, 0xD0, 0x90])); // CALL RAX; NOP
+        assert!(!call(&[0xE8, 1, 2, 3])); // truncated
+        assert!(!call(&[0xD0, 0xFF, 0, 0, 0, 0, 0, 0])); // an imm64
+        let mut buf = ExecutableBuffer::new(64).expect("buffer");
+        buf.emit(&[0xFF, 0xD0]);
+        assert!(
+            buf.take_call_census().is_empty(),
+            "closed: nothing recorded"
+        );
+        buf.begin_call_census();
+        buf.emit(&[0x48, 0x89, 0xC0]); // MOV RAX, RAX
+        buf.emit(&[0xFF, 0xD0]);
+        buf.emit(&[0x41, 0xFF, 0xD3]);
+        let before_rewind = buf.pos();
+        buf.emit(&[0xE8, 0, 0, 0, 0]);
+        buf.rewind_to(before_rewind);
+        // The split form: a lone `E8`, then its displacement (a self-call).
+        buf.emit(&[0xE8]);
+        buf.emit(&[0, 0, 0, 0]);
+        // A lone `E8` not followed by four bytes is nothing.
+        buf.emit_byte(0xE8);
+        buf.emit_byte(0x01);
+        assert_eq!(buf.take_call_census(), vec![7, 10, 15]);
+        buf.emit(&[0xFF, 0xD0]);
+        assert!(buf.take_call_census().is_empty(), "taken: closed again");
+    }
+
+    /// The estimate tail goes back: whole pages past the code and the
+    /// not-entrant reserve are released, the code and stub room stay, and the
+    /// buffer still finalizes and runs.
+    #[test]
+    fn trim_unused_tail_keeps_code_and_stub_room() {
+        uncoloured(trim_unused_tail_keeps_code_and_stub_room_uncoloured);
+    }
+
+    fn trim_unused_tail_keeps_code_and_stub_room_uncoloured() {
+        let page = platform::code_page_size();
+        let mut buf = ExecutableBuffer::new(16 * page).expect("alloc");
+        buf.emit(&[0xC3; 100]); // RET x100
+        buf.trim_unused_tail();
+        assert_eq!(buf.mapped_len(), page);
+        assert_eq!(buf.capacity(), page - NOT_ENTRANT_TAIL_RESERVE);
+        assert!(buf.mapped_len() >= ((buf.pos() + 15) & !15) + NOT_ENTRANT_TAIL_RESERVE);
+        assert_eq!(buf.as_slice(), &[0xC3; 100][..]);
+        buf.trim_unused_tail(); // nothing left to give back
+        assert_eq!(buf.mapped_len(), page);
+        buf.finalize();
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: the buffer is RX and starts with RET.
+            let f: extern "C" fn() = unsafe { std::mem::transmute(buf.as_ptr()) };
+            f();
+        }
+    }
+
+    /// A one-page mapping has no whole page to give back.
+    #[test]
+    fn trim_unused_tail_is_a_no_op_without_a_whole_free_page() {
+        uncoloured(trim_unused_tail_is_a_no_op_without_a_whole_free_page_uncoloured);
+    }
+
+    fn trim_unused_tail_is_a_no_op_without_a_whole_free_page_uncoloured() {
+        let page = platform::code_page_size();
+        let mut buf = ExecutableBuffer::new(page - NOT_ENTRANT_TAIL_RESERVE).expect("alloc");
+        buf.emit(&[0x90; 10]);
+        buf.trim_unused_tail();
+        assert_eq!(buf.mapped_len(), page);
+        assert_eq!(buf.capacity(), page - NOT_ENTRANT_TAIL_RESERVE);
+    }
+
+    /// JIT r23 wave 8 (lane L5): a colour is a whole cache line under the
+    /// span. 64 KiB-strided bases (Windows) and adjacent pages (Unix) both
+    /// spread over many colours.
+    #[test]
+    fn r23_w8_l5_colours_are_lines_under_the_span_and_spread() {
+        let mut seen = std::collections::BTreeSet::new();
+        for k in 0..64usize {
+            let c = code_entry_colour(0x7ff6_0000_0000 + k * 0x1_0000);
+            assert_eq!(c % CODE_ENTRY_COLOUR_LINE, 0);
+            assert!(c < CODE_ENTRY_COLOUR_SPAN);
+            seen.insert(c);
+        }
+        assert!(seen.len() >= 32, "64 KiB-strided bases: {} colours", seen.len());
+        let mut unix = std::collections::BTreeSet::new();
+        for k in 0..64usize {
+            unix.insert(code_entry_colour(0x5555_0000_0000 + k * 0x1000));
+        }
+        assert!(unix.len() >= 32, "adjacent pages: {} colours", unix.len());
+        // Deterministic in the address.
+        assert_eq!(code_entry_colour(0x1234_5000), code_entry_colour(0x1234_5000));
+    }
+
+    /// JIT r23 wave 8 (lane L5): a coloured buffer starts `lead` bytes into
+    /// its mapping, emits, trims from the mapping base, finalizes, runs and
+    /// unmaps; `=0` starts at the base.
+    #[test]
+    fn r23_w8_l5_a_coloured_buffer_trims_finalizes_and_runs() {
+        let page = platform::code_page_size();
+        cratonvm_types::flags::with_thread_overrides(&[(COLOUR, Some("1"))], || {
+            let mut buf = ExecutableBuffer::new(16 * page).expect("alloc");
+            let base = buf.mapping_base() as usize;
+            assert_eq!(buf.as_ptr() as usize, base + buf.lead);
+            assert_eq!(buf.lead, code_entry_colour(base));
+            assert_eq!(buf.os_len, buf.mapped + CODE_ENTRY_COLOUR_SPAN);
+            assert_eq!(buf.as_ptr() as usize % CODE_ENTRY_COLOUR_LINE, 0);
+            buf.emit(&[0xC3; 100]); // RET x100
+            buf.trim_unused_tail();
+            // The kept mapping is whole pages from the base, and holds the
+            // code and the stub room after the lead.
+            assert_eq!(buf.os_len % page, 0);
+            assert_eq!(buf.lead + buf.mapped_len(), buf.os_len);
+            assert!(buf.mapped_len() >= ((buf.pos() + 15) & !15) + NOT_ENTRANT_TAIL_RESERVE);
+            assert_eq!(buf.capacity(), buf.mapped_len() - NOT_ENTRANT_TAIL_RESERVE);
+            assert!(buf.os_len <= 2 * page);
+            assert_eq!(buf.as_slice(), &[0xC3; 100][..]);
+            buf.finalize();
+            #[cfg(target_arch = "x86_64")]
+            {
+                // SAFETY: the buffer is RX and starts with RET.
+                let f: extern "C" fn() = unsafe { std::mem::transmute(buf.as_ptr()) };
+                f();
+            }
+            drop(buf);
+        });
+        cratonvm_types::flags::with_thread_overrides(&[(COLOUR, Some("0"))], || {
+            let buf = ExecutableBuffer::new(page).expect("alloc");
+            assert_eq!(buf.lead, 0);
+            assert_eq!(buf.os_len, buf.mapped_len());
+            assert_eq!(buf.mapping_base() as *const u8, buf.as_ptr());
+        });
+    }
+
+    /// JIT r23 wave 8b (lane L5, n23-w8f `code_cache_sweep_phases`): a
+    /// coloured body is charged to the cap exactly what the same body is
+    /// charged uncoloured, both at creation and after the trim. The charge is
+    /// one field (`charged`), which the trim reduces and `Drop` credits, so
+    /// charge == credit by construction.
+    #[test]
+    fn r23_w8b_l5_a_coloured_body_charges_the_cap_what_an_uncoloured_one_does() {
+        let page = platform::code_page_size();
+        for len in [1usize, 100, 2000, 3900, page - 200, page + 500, 3 * page + 7] {
+            let make = |colour: Option<&str>| {
+                cratonvm_types::flags::with_thread_overrides(&[(COLOUR, colour)], || {
+                    let mut buf = ExecutableBuffer::new(8 * page).expect("alloc");
+                    assert_eq!(buf.charged, buf.capacity(), "charged at creation");
+                    buf.emit(&vec![0xCC; len]);
+                    buf.trim_unused_tail();
+                    buf
+                })
+            };
+            let plain = make(Some("0"));
+            let coloured = make(Some("1"));
+            assert_eq!(plain.charged, plain.capacity(), "len {len}: uncoloured charge");
+            assert_eq!(plain.charged, super::trimmed_charge(len, page), "len {len}");
+            assert_eq!(
+                coloured.charged, plain.charged,
+                "len {len}: lead {} must not change the charge",
+                coloured.lead
+            );
+            assert!(coloured.mapped_len() >= ((len + 15) & !15) + NOT_ENTRANT_TAIL_RESERVE);
+        }
+    }
+
+    /// Once a write has been dropped, `emit_checked` refuses as well: a byte
+    /// appended after the gap the dropped write left would sit at the wrong
+    /// offset in a stream every recorded patch site is keyed on.
+    #[test]
+    fn emit_checked_honours_the_sticky_overflow() {
+        let mut buf = ExecutableBuffer::new(4).expect("alloc");
+        buf.emit(&[1, 2, 3]);
+        buf.emit(&[4, 5]); // does not fit: sticky overflow, `len` frozen at 3
+        assert!(buf.overflowed());
+        // One byte of room is left and a one-byte write would fit, but it
+        // would land where the dropped write's first byte belonged.
+        assert!(!buf.emit_checked(&[9]));
+        assert_eq!(buf.pos(), 3);
+        assert_eq!(buf.as_slice(), &[1, 2, 3]);
+    }
+
+    /// A refused `emit_checked` is reported to its caller, not recorded as an
+    /// overflow — but it is still demand the buffer could not meet, so a retry
+    /// sized from `wanted` must see it.
+    #[test]
+    fn emit_checked_counts_toward_wanted_without_poisoning() {
+        let mut buf = ExecutableBuffer::new(4).expect("alloc");
+        assert!(buf.emit_checked(&[1, 2]));
+        assert!(!buf.emit_checked(&[3, 4, 5]));
+        assert_eq!(buf.wanted(), 5);
+        assert!(!buf.overflowed());
+        assert!(buf.emit_checked(&[6, 7]));
+        assert_eq!(buf.as_slice(), &[1, 2, 6, 7]);
+    }
+
+    /// `finalize` moves the code-region epoch the AArch64 reader-side barrier
+    /// is gated on, AFTER the bytes exist. Only "it rose" is asserted: other
+    /// tests allocate and finalize concurrently, and the epoch only rises.
+    #[test]
+    fn finalize_advances_the_code_stream_epoch() {
+        let mut buf = ExecutableBuffer::new(64).expect("alloc");
+        buf.emit(&[0xC3]);
+        let before = crate::code_ptr_regions_epoch();
+        buf.finalize();
+        assert!(crate::code_ptr_regions_epoch() > before);
+    }
+
+    /// `read_i32`'s bound must not be reachable by wrap-around.
+    ///
+    /// `offset + 4 <= self.len` is a release-build wrap: `usize::MAX - 1` plus
+    /// four is `2`, which is inside any non-trivial buffer, so the assertion
+    /// PASSED and the read went ahead at `ptr + (usize::MAX - 1)`. The panic
+    /// asserted here is the correct outcome; the bug was that it did not happen.
+    #[test]
+    #[should_panic(expected = "read out of bounds")]
+    fn read_i32_rejects_an_offset_that_wraps_its_own_bound() {
+        let mut buf = ExecutableBuffer::new(64).expect("alloc");
+        buf.emit(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        // Sanity: an in-range read works, so the panic below is about the bound
+        // and not about the buffer being empty.
+        assert_eq!(buf.read_i32(0), 0);
+        let _ = buf.read_i32(usize::MAX - 1);
+    }
+
+    /// Dropping a buffer retires the implicit-null recovery entries that name
+    /// PCs inside it, BEFORE the mapping is returned to the OS.
+    ///
+    /// This is now the WHOLE of the retirement, and it belongs to the mapping's
+    /// owner. `CompiledMethod::drop` used to retire the range as well, but it
+    /// runs when the last `Arc` went away, which can be while a thread is still
+    /// executing inside a published body — that is what the rescue arm in
+    /// `Drop` is for, and retiring there left a rescued body running with no
+    /// recovery entries. The property this pins is the one that makes a reused
+    /// address safe: once the address can be handed out again, no PC in it can
+    /// be recovered.
+    #[test]
+    fn dropping_a_buffer_retires_the_implicit_null_entries_inside_it() {
+        let (base, len) = {
+            let mut buf = ExecutableBuffer::new(4096).expect("alloc");
+            buf.emit(&[0x90; 0x40]);
+            let base = buf.as_ptr() as usize;
+            let fault = base + 0x10;
+            assert!(
+                crate::implicit_null::register(fault, base + 0x20),
+                "the site must register, or this test proves nothing"
+            );
+            assert_eq!(
+                crate::implicit_null::recover(fault, 0),
+                Some(base + 0x20),
+                "the fixture must establish a recoverable site"
+            );
+            (base, buf.capacity())
+        };
+        assert_eq!(
+            crate::implicit_null::recover(base + 0x10, 0),
+            None,
+            "the mapping has been unmapped and its address is reusable, so a \
+             fault at this PC belongs to whoever gets the address next"
+        );
+        // The retirement covers the whole mapping, not just the emitted bytes:
+        // the allocator hands back the whole mapping.
+        assert!(len >= 0x40);
+    }
+
+    /// Round 13 wave 8 (lane codecache): a body entered WITHOUT publication
+    /// (the accepted optimizing OSR body) is rescued into the retirement queue
+    /// by a last-owner drop outside it, exactly like a published one, instead
+    /// of being unmapped under a thread that may still run it.
+    ///
+    /// This thread holds a JIT-execution token across the drop, so the queue
+    /// cannot prove quiescence and must keep the mapping: it stays registered.
+    /// Before the fix the drop unmapped and deregistered it at once.
+    #[test]
+    fn an_entered_unpublished_body_dropped_outside_the_queue_stays_mapped() {
+        fn registered_at(base: usize) -> bool {
+            // `try_lock` underneath: retry past a concurrent test's hold.
+            for _ in 0..10_000 {
+                match crate::jit_code_region_covering(base) {
+                    crate::JitRegionLookup::Found(b, _) => return b == base,
+                    crate::JitRegionLookup::NotFound => return false,
+                    crate::JitRegionLookup::Locked => std::thread::yield_now(),
+                }
+            }
+            false
+        }
+        let mut buf = ExecutableBuffer::new(64).expect("alloc");
+        buf.emit(&[0xC3]);
+        buf.finalize();
+        buf.note_entered_unpublished();
+        let base = buf.as_ptr() as usize;
+        assert!(registered_at(base), "the fixture must be registered");
+        let token = crate::jit_execution_enter();
+        drop(buf);
+        let still_mapped = registered_at(base);
+        crate::jit_execution_leave(token);
+        assert!(
+            still_mapped,
+            "an entered-unpublished body released while a thread is inside \
+             compiled code must be rescued into the retirement queue, not unmapped"
+        );
+    }
+
+    /// A refused RW->RX flip is an `Err`, not an abort, and a buffer whose
+    /// flip was refused is still writable and droppable (round 9 wave 2).
+    #[test]
+    fn try_finalize_reports_a_refused_protect_instead_of_aborting() {
+        let mut buf = ExecutableBuffer::new(64).expect("alloc");
+        buf.emit(&[0xC3]);
+        crate::platform::fail_next_make_executable_for_test(12); // ENOMEM
+        match buf.try_finalize() {
+            Err(crate::platform::JitError::ProtectFailed(12)) => {}
+            other => panic!("expected ProtectFailed(12), got {other:?}"),
+        }
+        // Still RW: a write after the refused flip must not fault.
+        buf.emit(&[0x90]);
+        assert_eq!(buf.as_slice(), &[0xC3, 0x90]);
+        // The injection is one-shot: the next flip succeeds.
+        assert!(buf.try_finalize().is_ok());
+    }
+}

@@ -1,0 +1,77 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry EligibleLlamaKernels__embedT____III_F_V(
+    .param .u64 p0_ptr,
+    .param .s32 p0_len,
+    .param .s32 p1,
+    .param .s32 p2,
+    .param .u64 p3_ptr,
+    .param .s32 p3_len,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<5>;
+    .reg .u64 %rd<5>;
+    .reg .s32 %r<25>;
+    .reg .f32 %f<1>;
+    .reg .pred %p<3>;
+    .reg .b16 %rs<1>;
+
+    ld.param.u64 %rd0, [p0_ptr];
+    ld.param.s32 %r0, [p0_len];
+    ld.param.s32 %r1, [p1];
+    ld.param.s32 %r2, [p2];
+    ld.param.u64 %rd1, [p3_ptr];
+    ld.param.s32 %r3, [p3_len];
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r4, %ru3;
+    ld.param.s32 %r5, [tid_base];
+    add.s32 %r6, %r4, %r5;
+    mov.s32 %r7, 1;
+    and.b32 %r9, %r7, 31;
+    shr.s32 %r8, %r1, %r9;
+    mov.s32 %r10, 1;
+    and.b32 %r11, %r1, %r10;
+    mov.s32 %r12, 0;
+    setp.ge.u32 %p0, %r6, %r3;
+    @%p0 bra L_done;
+    mul.lo.s32 %r13, %r6, %r2;
+    add.s32 %r14, %r13, %r8;
+    setp.ge.u32 %p1, %r14, %r0;
+    @%p1 bra L_bounds_fail;
+    mad.wide.s32 %rd2, %r14, 4, %rd0;
+    ld.global.s32 %r15, [%rd2];
+    setp.eq.s32 %p2, %r11, 0;
+    @%p2 mov.s32 %r16, %r15;
+    @%p2 mov.s32 %r17, %r15;
+    @!%p2 mov.s32 %r18, %r15;
+    @!%p2 mov.s32 %r19, %r15;
+    @%p2 bra L_body_51;
+L_body_44:
+    mov.s32 %r20, 16;
+    and.b32 %r22, %r20, 31;
+    shr.s32 %r21, %r18, %r22;
+    mov.s32 %r16, %r18;
+    mov.s32 %r17, %r21;
+L_body_51:
+    shl.b32 %r24, %r17, 16;
+    shr.s32 %r23, %r24, 16;
+    cvt.u16.u32 %rs0, %r23;
+    cvt.f32.f16 %f0, %rs0;
+    mad.wide.s32 %rd3, %r6, 4, %rd1;
+    st.global.f32 [%rd3], %f0;
+    bra L_done;
+L_done:
+    ret;
+L_bounds_fail:
+    ld.param.u64 %rd4, [failure_flag];
+    mov.u32 %ru4, 1;
+    st.global.u32 [%rd4], %ru4;
+    ret;
+}
+

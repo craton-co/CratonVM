@@ -1,0 +1,63 @@
+#JavaTest Interview Configuration
+#
+# JCK interview file for CratonVM. This file configures the JavaTest harness
+# to execute JCK tests against the CratonVM binary. The @CRATONVM_BIN@ token
+# is replaced at CI time with the absolute path to the built `cratonvm` binary.
+#
+# See: https://openjdk.org/groups/conformance/JckAccess/
+#
+
+INTERVIEW=com.sun.jck.lib.interview.JCKParameters
+
+# --- Test suite location ---
+# JCK_HOME is resolved from the environment; the testsuite path is relative.
+jck.testsuite=$JCK_HOME/tests
+
+# --- Implementation under test ---
+jck.env.runtime.jvm=other
+jck.env.runtime.jvm.other.command=@CRATONVM_BIN@
+
+# The VM is invoked as: @CRATONVM_BIN@ -cp <classpath> <classname> [args...]
+jck.env.runtime.jvm.other.options=-cp @CLASSPATH@
+
+# --- Compiler configuration (not applicable; CratonVM is a runtime only) ---
+jck.env.compiler=skip
+
+# --- Test selection ---
+# Start with java.base API surface: java.lang, java.util, java.io, java.nio,
+# java.net, java.security, java.lang.reflect, java.math.
+jck.tests.select=\
+    api/java_lang \
+    api/java_util \
+    api/java_io \
+    api/java_nio \
+    api/java_net \
+    api/java_security \
+    api/java_lang/reflect \
+    api/java_math
+
+# --- Concurrency ---
+jck.concurrency=1
+
+# --- Timeout per test (seconds) ---
+jck.timeout=120
+
+# --- Output directory ---
+jck.workdir=/tmp/jck-work
+
+# --- Prior status filter (only run tests that need action) ---
+jck.priorStatus.needAction=true
+
+# --- Keywords / exclude lists ---
+# Exclude tests that require AWT, Swing, or other UI subsystems that CratonVM
+# does not implement.
+jck.excludeList=\
+    api/java_awt \
+    api/javax_swing \
+    api/java_applet \
+    api/javax_sound \
+    api/java_beans
+
+# --- Report configuration ---
+jck.report.type=html
+jck.report.dir=/tmp/jck-work/report

@@ -1,0 +1,28 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry EligibleStraightLine__constReturn____I(
+    .param .u64 ret_ptr,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<4>;
+    .reg .u64 %rd<1>;
+    .reg .s32 %r<4>;
+
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r0, %ru3;
+    ld.param.s32 %r1, [tid_base];
+    add.s32 %r2, %r0, %r1;
+    mov.s32 %r3, 0;
+    ld.param.u64 %rd0, [ret_ptr];
+    st.global.s32 [%rd0], %r3;
+    bra L_done;
+L_done:
+    ret;
+}
+

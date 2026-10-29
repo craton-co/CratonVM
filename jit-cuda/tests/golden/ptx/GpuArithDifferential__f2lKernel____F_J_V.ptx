@@ -1,0 +1,52 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry GpuArithDifferential__f2lKernel____F_J_V(
+    .param .u64 p0_ptr,
+    .param .s32 p0_len,
+    .param .u64 p1_ptr,
+    .param .s32 p1_len,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<5>;
+    .reg .u64 %rd<5>;
+    .reg .s32 %r<6>;
+    .reg .s64 %rl<2>;
+    .reg .f32 %f<1>;
+    .reg .pred %p<3>;
+
+    ld.param.u64 %rd0, [p0_ptr];
+    ld.param.s32 %r0, [p0_len];
+    ld.param.u64 %rd1, [p1_ptr];
+    ld.param.s32 %r1, [p1_len];
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r2, %ru3;
+    ld.param.s32 %r3, [tid_base];
+    add.s32 %r4, %r2, %r3;
+    mov.s32 %r5, 0;
+    setp.ge.u32 %p0, %r4, %r1;
+    @%p0 bra L_done;
+    setp.lt.s32 %p1, %r0, %r1;
+    @%p1 bra L_bounds_fail;
+    mad.wide.s32 %rd2, %r4, 4, %rd0;
+    ld.global.f32 %f0, [%rd2];
+    cvt.rzi.s64.f32 %rl0, %f0;
+    setp.nan.f32 %p2, %f0, %f0;
+    selp.s64 %rl1, 0, %rl0, %p2;
+    mad.wide.s32 %rd3, %r4, 8, %rd1;
+    st.global.s64 [%rd3], %rl1;
+    bra L_done;
+L_done:
+    ret;
+L_bounds_fail:
+    ld.param.u64 %rd4, [failure_flag];
+    mov.u32 %ru4, 1;
+    st.global.u32 [%rd4], %ru4;
+    ret;
+}
+

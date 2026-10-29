@@ -1,0 +1,22 @@
+# Tier-made HotSpot answers (CONF21-3), read by regression-suite/jit-xint-gate.sh.
+#
+# One `<probe> <fact-name-glob>` per line. For a listed fact, a CratonVM line
+# equal to HotSpot -Xint's line (instead of HotSpot default's) is accepted as
+# TIER-OK: the default answer is one only HotSpot's C2 gives (a compiled loop's
+# checksum, a string identity or interning C2 decides at compile time), and the
+# interpreter's answer is equally a correct Java answer. Every fact NOT listed
+# here must equal HotSpot default's line exactly, so a real regression in these
+# probes stays visible.
+#
+# Add a row only with the evidence (the jr21-conf-* page, or a model of the
+# Java semantics reproducing CratonVM's value) cited in a comment above it.
+
+# jit-r21-conf-proposals.md CONF21-3: C2's compiled OSR loop answers differently
+# from a model of the Java semantics; CratonVM matches the model.
+R20QUnsafeOsrSplit osr*
+R20FuzzEUnsafeArr1 osr*
+# CONF21-2 (built 2026-10-27; jr21-conf-string-identity-differs-only-from-hotspot-c2-FIXED-20261027.md):
+# the optimizing tier now answers C2's fresh String, but a C1 body reaches it only at a drain clock, after
+# this probe's 30000-call warm window
+# (jr21-conf-compiled-bodies-reach-c2-only-at-a-drain-clock-FIXED-20261029.md). Remove with that page.
+R20QStrIdentity identity-warm
