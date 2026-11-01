@@ -35,7 +35,7 @@ thiserror = "2"
 # compatible between 0.6 and 2.x, so no read-path changes were required.
 # Cargo no longer reports a duplicate `zip` resolution (~80 KB binary cost
 # recovered).
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # Round-7 cross-cutting Fix 3: `release_max_level_info` causes `trace!` and
 # `debug!` macros to expand to no-ops in release builds.
 #
