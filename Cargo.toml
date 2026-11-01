@@ -61,7 +61,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # literally in 11 (parking_lot) / 9 (rustc-hash) crate manifests; each new
 # bump risked drift. Crates opt in via `parking_lot.workspace = true` /
 # `rustc-hash.workspace = true`.
-parking_lot = "0.12"
+parking_lot = "0.13"
 rustc-hash = "1.1"
 # Round-5 JFR Fix 1: workspace-hoisted SmallVec so jfr + downstream consumers
 # (vm tests, vm benches) all resolve to a single version. Inline-N=8 covers
