@@ -772,7 +772,7 @@ dependencies = [
  "tracing",
  "twox-hash",
  "unicode-normalization",
- "yasna",
+ "yasna 0.6.0",
  "zip",
  "zstd",
 ]
@@ -2287,7 +2287,7 @@ dependencies = [
  "lazy_static",
  "rc2",
  "sha1",
- "yasna",
+ "yasna 0.5.2",
 ]
 
 [[package]]
@@ -3949,6 +3949,12 @@ name = "yasna"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+
+[[package]]
+name = "yasna"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5f6765e852b9b4dc8e2a76843e4d64d1cea8e79bcde0b6901aea8e7c7f08282"
 
 [[package]]
 name = "zerocopy"
