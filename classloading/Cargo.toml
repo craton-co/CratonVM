@@ -112,7 +112,7 @@ tempfile = "3"
 # `spki`; pull both here (test builds only — no production binary impact).
 # Versions match the production p256/p384 0.13 axis (ecdsa 0.16 / spki 0.7).
 ecdsa = { version = "0.16", features = ["der"] }
-spki = { version = "0.7", features = ["alloc"] }
+spki = { version = "0.8", features = ["alloc"] }
 # `EncodePublicKey::to_public_key_der` for `PublicKey<C>` is gated on
 # elliptic-curve's `alloc` + `pkcs8` features; force them on for test builds.
 elliptic-curve = { version = "0.13", features = ["alloc", "pkcs8", "sec1"] }
