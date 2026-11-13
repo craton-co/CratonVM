@@ -1,0 +1,30 @@
+# mdBook configuration for the CratonVM documentation.
+#
+# Build locally with:
+#   cargo install mdbook
+#   mdbook serve docs/book      # live preview at http://localhost:3000
+#   mdbook build docs/book      # render static HTML into docs/book/book/
+#
+# Every page is also readable as plain Markdown on GitHub; mdBook is optional.
+
+[book]
+title = "CratonVM Documentation"
+authors = ["The CratonVM Authors"]
+description = "User and developer manual for CratonVM, a Java Virtual Machine written in Rust."
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/craton-co/cratonvm"
+edit-url-template = "https://github.com/craton-co/cratonvm/edit/main/docs/book/{path}"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 30

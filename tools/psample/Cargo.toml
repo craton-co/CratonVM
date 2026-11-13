@@ -1,0 +1,17 @@
+# Standalone (NOT a member of the root workspace, like `fuzz/`): the empty
+# `[workspace]` table below detaches it. Build with
+#   cargo build --release --manifest-path tools/psample/Cargo.toml
+[package]
+name = "psample"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Windows RIP sampler for a running cratonvm process (no admin rights needed)"
+
+[workspace]
+
+[dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel"] }
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,69 @@
+# This repo is developed on Windows with core.autocrlf=true, so tracked files
+# are checked out with CRLF by default. That is fine for sources the toolchain
+# reads, but fatal for a shell script the MSYS/Git-bash `bash` actually
+# executes: every trailing \r ends up inside the token it terminates, so
+# `TIMEOUT="${TIMEOUT:-300}"` yields "300\r" and the first arithmetic
+# comparison against it fails.
+#
+# The Hibernate suite runner and its per-class override table are tracked
+# specifically so they cannot silently vanish (see
+# apps/hib-suite-runner/class-overrides.tsv's header). Pin them to LF so the
+# copy git materialises is the copy that runs.
+#
+# Pinned for EVERY tracked shell script, not just the two noticed first. The
+# hazard is a property of "git materialises this file and bash executes it", so
+# an allow-list of individual paths only waits for the next script to be added
+# — `probes/*.sh`, including the pre-existing hib-mapresize reproducer, was
+# already exposed while this file listed just the two below.
+*.sh text eol=lf
+apps/hib-suite-runner/run-hib.sh text eol=lf
+apps/hib-suite-runner/class-overrides.tsv text eol=lf
+apps/hib-suite-runner/known-benign-aborts.tsv text eol=lf
+
+# The strict-corpus baselines are read line-by-line by
+# scripts/jdk-only-strict-probes.sh under bash. A trailing CR ends up inside
+# the comparison key, so every baselined entry reads as absent and every
+# observed one reads as new -- the ratchet would fire on all 28 at once, on
+# Windows only. Same hazard, same fix, as the shell scripts above.
+scripts/baselines/*.txt text eol=lf
+
+# Same hazard for the JDK surface baselines. `scripts/jdk-baseline/generate.py`
+# writes them with an explicit '\n' so the file is byte-identical on every
+# platform, and its `--check` mode diffs the working tree against a fresh
+# generation. With core.autocrlf=true and no pin here, the checked-out copy is
+# CRLF on Windows and LF on Linux while the generator's output is always LF, so
+# the check would answer differently on the two hosts for a difference that is
+# not in the data. Both readers trim_end() anyway; this makes the bytes match.
+#
+# Measured before this line existed: `git ls-files --eol scripts/baselines/`
+# reports `i/lf w/crlf` for every unpinned neighbour in this directory
+# (`jdk-only-kind-map-25-linux.tsv`, `jdk-only-dead-everywhere.tsv`, …) and
+# `i/lf w/lf attr/text eol=lf` for the one file the stanza above pins. The
+# jdk25-*.tsv are LF in the working tree today only because they were just
+# written by the generator and have not yet been through a checkout; the first
+# clone on Windows is where they would flip.
+scripts/baselines/jdk25-*.tsv text eol=lf
+
+# Rust sources, pinned to LF for the same class of reason as the scripts above,
+# but a subtler failure. Several tests in native-builtins read
+# native-builtins/src/lib.rs *as text* and match 
+-anchored patterns against
+# it -- counting registration sites, locating a column-0 closing brace after a
+# named fn. Any tool that rewrites a .rs file with CRLF endings (a Python
+# read_text/write_text round trip on Windows does exactly that) breaks four of
+# those tests at once, and every failure message points at registration
+# bookkeeping rather than at line endings.
+*.rs text eol=lf
+# CUDA sources and the PTX generated from them. nvcc emits CRLF on Windows,
+# and vm/src/runtime/kernels/mod.rs reads BOTH files back as text to check
+# they have not drifted apart (entry points, target arch, the TILE constant).
+# Left unpinned, a checkout on another platform changes their bytes and those
+# tests start failing for a reason that has nothing to do with the kernels --
+# which is exactly what the *.rs pin above already exists to prevent.
+*.cu  text eol=lf
+*.ptx text eol=lf
+
+# The same reasoning for the other tracked text the toolchain parses rather
+# than merely compiles.
+*.toml text eol=lf
+*.tsv  text eol=lf

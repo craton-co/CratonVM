@@ -1,0 +1,707 @@
+{
+  "date": "2026-11-05",
+  "baseline": "c78d9eef3916816988fd1626de74ebc8830bfb2f",
+  "implementation_commit": "7e2065158b",
+  "probe_commit": "22e755a269",
+  "host": {
+    "os": "Ubuntu 26.10 x86_64",
+    "cpu": "AMD EPYC-Turin Processor",
+    "cpus": 16,
+    "vm_cpu_affinity": 2,
+    "jdk": "OpenJDK 25.0.4.1+1-1-Ubuntu",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "profile": "cargo build --release -p cratonvm-cli",
+    "binary_sha256": "f4e3408b85de29fd150f11efed78a2d85c31019a63e18a1e098da31ce0e33ae2"
+  },
+  "tests": {
+    "new_regressions_red": 2,
+    "new_regressions_green": 2,
+    "jit_reference_tests_passed": 33,
+    "jit_reference_baseline_exclusion": "ir_lower::lv11_tests::lv12_prepin_lists_refs_under_splits_only_with_the_switch",
+    "decoder_flip_field_tests_passed": 23,
+    "vm_reference_tests_passed": 76
+  },
+  "matrix": {
+    "total": 92,
+    "hotspot": 4,
+    "cratonvm": 88,
+    "all_facts_same": true,
+    "heap": "-Xmx64m -XX:+UseZGC",
+    "modes": [
+      "--jdk-only",
+      "--compatible"
+    ],
+    "stress_variants": {
+      "default": {},
+      "plain": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "1"
+      },
+      "mark": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "mark"
+      },
+      "colored": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored"
+      },
+      "colored-call": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_JIT_IR_REFERS_TO_INLINE": "0"
+      },
+      "colored-kill": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_ZGC_INLINE_LOAD_BARRIER": "0"
+      },
+      "flip": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_ZGC_COLOR_FLIP": "1"
+      },
+      "flip-call": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_ZGC_COLOR_FLIP": "1",
+        "CRATONVM_JIT_IR_REFERS_TO_INLINE": "0"
+      },
+      "no-keepalive-kill": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_JIT_IR_REFERS_TO_NO_KEEPALIVE": "0"
+      },
+      "legacy": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_COMPACT_REF_FIELDS": "0"
+      },
+      "row-kill": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_JIT_IR_REFERS_TO_COMPACT_ROW": "0"
+      },
+      "zgc-row-kill": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_JIT_IR_REFERS_TO_ZGC_ROW": "0"
+      },
+      "concurrent-flip": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_ZGC_COLOR_FLIP": "1",
+        "CRATONVM_ZGC_CONCURRENT": "1",
+        "CRATONVM_ZGC_CONCURRENT_REFERENT_CLEAR": "0"
+      },
+      "relocate": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_ZGC_COLOR_FLIP": "1",
+        "CRATONVM_ZGC_CONCURRENT": "1",
+        "CRATONVM_ZGC_CONCURRENT_REFERENT_CLEAR": "0",
+        "CRATONVM_ZGC_CONCURRENT_RELOCATE": "1",
+        "CRATONVM_ZGC_REMAP_IN_MARK": "1"
+      },
+      "relocate-call": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_ZGC_COLOR_FLIP": "1",
+        "CRATONVM_ZGC_CONCURRENT": "1",
+        "CRATONVM_ZGC_CONCURRENT_REFERENT_CLEAR": "0",
+        "CRATONVM_ZGC_CONCURRENT_RELOCATE": "1",
+        "CRATONVM_ZGC_REMAP_IN_MARK": "1",
+        "CRATONVM_JIT_IR_REFERS_TO_INLINE": "0"
+      },
+      "lbm": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_ZGC_COLOR_FLIP": "1",
+        "CRATONVM_ZGC_CONCURRENT": "1",
+        "CRATONVM_ZGC_CONCURRENT_REFERENT_CLEAR": "0",
+        "CRATONVM_ZGC_LOAD_BARRIER_MARKING": "1"
+      },
+      "gated": {
+        "CRATONVM_ZGC_LOAD_BARRIER": "colored",
+        "CRATONVM_ZGC_COLOR_FLIP": "1",
+        "CRATONVM_ZGC_CONCURRENT": "1",
+        "CRATONVM_ZGC_CONCURRENT_REFERENT_CLEAR": "1"
+      }
+    },
+    "relocation_extra_arg": "-XX:-UseTLAB",
+    "nojit_stress_variants": [
+      "colored",
+      "flip"
+    ],
+    "probes": [
+      "Refs2ColoredRefersTo",
+      "T1W9Refs2RefersTo",
+      "T1W12Refs4RefersTo",
+      "Atm20RefersTo"
+    ],
+    "passed_labels": [
+      "hs-Refs2ColoredRefersTo",
+      "hs-T1W9Refs2RefersTo",
+      "hs-T1W12Refs4RefersTo",
+      "hs-Atm20RefersTo",
+      "jdk-only-stress-default",
+      "jdk-only-stress-plain",
+      "jdk-only-stress-mark",
+      "jdk-only-stress-colored",
+      "jdk-only-stress-colored-call",
+      "jdk-only-stress-colored-kill",
+      "jdk-only-stress-flip",
+      "jdk-only-stress-flip-call",
+      "jdk-only-stress-no-keepalive-kill",
+      "jdk-only-stress-legacy",
+      "jdk-only-stress-row-kill",
+      "jdk-only-stress-zgc-row-kill",
+      "jdk-only-stress-concurrent-flip",
+      "jdk-only-stress-relocate",
+      "jdk-only-stress-relocate-call",
+      "jdk-only-stress-lbm",
+      "jdk-only-stress-gated",
+      "jdk-only-facts-default",
+      "jdk-only-facts-colored",
+      "jdk-only-facts-colored-call",
+      "jdk-only-facts-flip",
+      "jdk-only-facts-gated",
+      "jdk-only-facts-lbm",
+      "jdk-only-T1W12Refs4RefersTo-colored",
+      "jdk-only-T1W12Refs4RefersTo-colored-call",
+      "jdk-only-Atm20RefersTo-colored",
+      "jdk-only-Atm20RefersTo-colored-call",
+      "jdk-only-nojit-colored",
+      "jdk-only-nojit-flip",
+      "compatible-stress-default",
+      "compatible-stress-plain",
+      "compatible-stress-mark",
+      "compatible-stress-colored",
+      "compatible-stress-colored-call",
+      "compatible-stress-colored-kill",
+      "compatible-stress-flip",
+      "compatible-stress-flip-call",
+      "compatible-stress-no-keepalive-kill",
+      "compatible-stress-legacy",
+      "compatible-stress-row-kill",
+      "compatible-stress-zgc-row-kill",
+      "compatible-stress-concurrent-flip",
+      "compatible-stress-relocate",
+      "compatible-stress-relocate-call",
+      "compatible-stress-lbm",
+      "compatible-stress-gated",
+      "compatible-facts-default",
+      "compatible-facts-colored",
+      "compatible-facts-colored-call",
+      "compatible-facts-flip",
+      "compatible-facts-gated",
+      "compatible-facts-lbm",
+      "compatible-T1W12Refs4RefersTo-colored",
+      "compatible-T1W12Refs4RefersTo-colored-call",
+      "compatible-Atm20RefersTo-colored",
+      "compatible-Atm20RefersTo-colored-call",
+      "compatible-nojit-colored",
+      "compatible-nojit-flip",
+      "bench-0-jdk-only-colored",
+      "bench-0-jdk-only-colored-call",
+      "bench-0-jdk-only-flip",
+      "bench-0-compatible-colored",
+      "bench-0-compatible-colored-call",
+      "bench-0-compatible-flip",
+      "bench-1-jdk-only-colored-call",
+      "bench-1-jdk-only-flip",
+      "bench-1-jdk-only-colored",
+      "bench-1-compatible-colored-call",
+      "bench-1-compatible-flip",
+      "bench-1-compatible-colored",
+      "bench-2-jdk-only-flip",
+      "bench-2-jdk-only-colored",
+      "bench-2-jdk-only-colored-call",
+      "bench-2-compatible-flip",
+      "bench-2-compatible-colored",
+      "bench-2-compatible-colored-call",
+      "bench-3-jdk-only-colored",
+      "bench-3-jdk-only-colored-call",
+      "bench-3-jdk-only-flip",
+      "bench-3-compatible-colored",
+      "bench-3-compatible-colored-call",
+      "bench-3-compatible-flip",
+      "bench-4-jdk-only-colored-call",
+      "bench-4-jdk-only-flip",
+      "bench-4-jdk-only-colored",
+      "bench-4-compatible-colored-call",
+      "bench-4-compatible-flip",
+      "bench-4-compatible-colored"
+    ]
+  },
+  "engagement": {
+    "jdk-only": {
+      "colored": {
+        "inline": 24,
+        "colored": 47,
+        "flip": 0,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 0,
+        "lb_flips_remap": 0,
+        "lb_referent_keep_alive": 0,
+        "objects_relocated": 21,
+        "crl_cycles": 0,
+        "crl_planned": 0,
+        "crl_barrier": 0,
+        "crl_drain": 0
+      },
+      "colored-kill": {
+        "inline": 0,
+        "colored": 0,
+        "flip": 0,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 0,
+        "lb_flips_remap": 0,
+        "lb_referent_keep_alive": 0,
+        "objects_relocated": 21,
+        "crl_cycles": 0,
+        "crl_planned": 0,
+        "crl_barrier": 0,
+        "crl_drain": 0
+      },
+      "flip": {
+        "inline": 24,
+        "colored": 0,
+        "flip": 44,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 0,
+        "lb_flips_remap": 0,
+        "lb_referent_keep_alive": 0,
+        "objects_relocated": 21,
+        "crl_cycles": 0,
+        "crl_planned": 0,
+        "crl_barrier": 0,
+        "crl_drain": 0
+      },
+      "gated": {
+        "inline": 0,
+        "colored": 0,
+        "flip": 17,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 26,
+        "lb_flips_remap": 26,
+        "lb_referent_keep_alive": 1,
+        "objects_relocated": 4,
+        "crl_cycles": 0,
+        "crl_planned": 0,
+        "crl_barrier": 0,
+        "crl_drain": 0
+      },
+      "relocate": {
+        "inline": 24,
+        "colored": 0,
+        "flip": 44,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 26,
+        "lb_flips_remap": 26,
+        "lb_referent_keep_alive": 1,
+        "objects_relocated": 323,
+        "crl_cycles": 3,
+        "crl_planned": 319,
+        "crl_barrier": 3,
+        "crl_drain": 20
+      },
+      "relocate-call": {
+        "inline": 0,
+        "colored": 0,
+        "flip": 17,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 25,
+        "lb_flips_remap": 25,
+        "lb_referent_keep_alive": 1,
+        "objects_relocated": 729,
+        "crl_cycles": 7,
+        "crl_planned": 726,
+        "crl_barrier": 7,
+        "crl_drain": 32
+      },
+      "lbm": {
+        "inline": 24,
+        "colored": 0,
+        "flip": 44,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 24,
+        "lb_flips_remap": 24,
+        "lb_referent_keep_alive": 1,
+        "objects_relocated": 5,
+        "crl_cycles": 0,
+        "crl_planned": 0,
+        "crl_barrier": 0,
+        "crl_drain": 0
+      }
+    },
+    "compatible": {
+      "colored": {
+        "inline": 21,
+        "colored": 41,
+        "flip": 0,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 0,
+        "lb_flips_remap": 0,
+        "lb_referent_keep_alive": 0,
+        "objects_relocated": 21,
+        "crl_cycles": 0,
+        "crl_planned": 0,
+        "crl_barrier": 0,
+        "crl_drain": 0
+      },
+      "colored-kill": {
+        "inline": 0,
+        "colored": 0,
+        "flip": 0,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 0,
+        "lb_flips_remap": 0,
+        "lb_referent_keep_alive": 0,
+        "objects_relocated": 21,
+        "crl_cycles": 0,
+        "crl_planned": 0,
+        "crl_barrier": 0,
+        "crl_drain": 0
+      },
+      "flip": {
+        "inline": 21,
+        "colored": 0,
+        "flip": 32,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 0,
+        "lb_flips_remap": 0,
+        "lb_referent_keep_alive": 0,
+        "objects_relocated": 21,
+        "crl_cycles": 0,
+        "crl_planned": 0,
+        "crl_barrier": 0,
+        "crl_drain": 0
+      },
+      "gated": {
+        "inline": 0,
+        "colored": 0,
+        "flip": 17,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 25,
+        "lb_flips_remap": 25,
+        "lb_referent_keep_alive": 0,
+        "objects_relocated": 4,
+        "crl_cycles": 0,
+        "crl_planned": 0,
+        "crl_barrier": 0,
+        "crl_drain": 0
+      },
+      "relocate": {
+        "inline": 21,
+        "colored": 0,
+        "flip": 35,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 25,
+        "lb_flips_remap": 25,
+        "lb_referent_keep_alive": 1,
+        "objects_relocated": 220,
+        "crl_cycles": 2,
+        "crl_planned": 215,
+        "crl_barrier": 2,
+        "crl_drain": 16
+      },
+      "relocate-call": {
+        "inline": 0,
+        "colored": 0,
+        "flip": 17,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 25,
+        "lb_flips_remap": 25,
+        "lb_referent_keep_alive": 1,
+        "objects_relocated": 667,
+        "crl_cycles": 5,
+        "crl_planned": 662,
+        "crl_barrier": 5,
+        "crl_drain": 100
+      },
+      "lbm": {
+        "inline": 21,
+        "colored": 0,
+        "flip": 32,
+        "lb_colored_stores": 1,
+        "lb_colored_refused": 0,
+        "lb_flips_mark": 26,
+        "lb_flips_remap": 26,
+        "lb_referent_keep_alive": 0,
+        "objects_relocated": 4,
+        "crl_cycles": 0,
+        "crl_planned": 0,
+        "crl_barrier": 0,
+        "crl_drain": 0
+      }
+    }
+  },
+  "timing": {
+    "method": "Five rotated/interleaved process runs per arm and mode, CPU 2; each process reports best of five warmed samples. ns/op uses T1W9 probe convention: base does two comparisons. Shared host; no collector or unrelated optimization default changed.",
+    "samples_ns_per_op": {
+      "jdk-only": {
+        "colored": {
+          "softref-refersto": [
+            1.622312,
+            1.618095,
+            1.656053,
+            1.695253,
+            1.629994
+          ],
+          "phantom-refersto": [
+            1.615992,
+            1.61487,
+            1.625766,
+            1.617515,
+            1.611405
+          ],
+          "weakref-refersto": [
+            1.61432,
+            1.615061,
+            1.622673,
+            1.643584,
+            1.651456
+          ],
+          "base-refersto": [
+            3.009657,
+            2.986042,
+            2.738155,
+            2.693027,
+            2.704424
+          ]
+        },
+        "colored-call": {
+          "softref-refersto": [
+            50.445332,
+            50.194331,
+            50.237336,
+            49.891661,
+            49.973977
+          ],
+          "phantom-refersto": [
+            49.856338,
+            50.077364,
+            49.871802,
+            49.590265,
+            49.829727
+          ],
+          "weakref-refersto": [
+            49.93672,
+            52.312026,
+            50.204556,
+            50.00277,
+            49.674311
+          ],
+          "base-refersto": [
+            108.364837,
+            106.788495,
+            108.377184,
+            106.235634,
+            107.611704
+          ]
+        },
+        "flip": {
+          "softref-refersto": [
+            1.80593,
+            1.814763,
+            1.892071,
+            1.829606,
+            1.748883
+          ],
+          "phantom-refersto": [
+            2.090843,
+            2.156141,
+            1.978884,
+            2.137774,
+            2.151545
+          ],
+          "weakref-refersto": [
+            2.031654,
+            2.156191,
+            2.165717,
+            2.150864,
+            2.152086
+          ],
+          "base-refersto": [
+            3.091541,
+            2.994995,
+            2.971419,
+            3.118423,
+            2.968966
+          ]
+        }
+      },
+      "compatible": {
+        "colored": {
+          "softref-refersto": [
+            1.631867,
+            1.6215,
+            1.683795,
+            1.619598,
+            1.612078
+          ],
+          "phantom-refersto": [
+            1.632197,
+            1.613428,
+            1.617845,
+            1.611887,
+            1.611766
+          ],
+          "weakref-refersto": [
+            1.611336,
+            1.612758,
+            1.616252,
+            1.609132,
+            1.615262
+          ],
+          "base-refersto": [
+            2.697593,
+            2.691374,
+            2.707679,
+            2.6955,
+            2.687007
+          ]
+        },
+        "colored-call": {
+          "softref-refersto": [
+            44.439969,
+            44.478087,
+            44.194156,
+            44.075386,
+            44.44085
+          ],
+          "phantom-refersto": [
+            43.83369,
+            43.830294,
+            43.780989,
+            47.897666,
+            43.906919
+          ],
+          "weakref-refersto": [
+            44.484447,
+            44.311594,
+            44.788687,
+            44.694025,
+            51.856032
+          ],
+          "base-refersto": [
+            95.705826,
+            96.216491,
+            94.456119,
+            95.695159,
+            95.082339
+          ]
+        },
+        "flip": {
+          "softref-refersto": [
+            1.829586,
+            1.794262,
+            1.786541,
+            1.762155,
+            1.778118
+          ],
+          "phantom-refersto": [
+            2.039955,
+            2.155371,
+            2.048899,
+            1.961126,
+            2.045854
+          ],
+          "weakref-refersto": [
+            2.154029,
+            1.900304,
+            2.029219,
+            1.896407,
+            2.082241
+          ],
+          "base-refersto": [
+            3.004929,
+            2.979491,
+            2.971129,
+            2.968044,
+            2.967664
+          ]
+        }
+      }
+    },
+    "medians_ns_per_op": {
+      "jdk-only": {
+        "colored": {
+          "softref-refersto": 1.629994,
+          "phantom-refersto": 1.615992,
+          "weakref-refersto": 1.622673,
+          "base-refersto": 2.738155
+        },
+        "colored-call": {
+          "softref-refersto": 50.194331,
+          "phantom-refersto": 49.856338,
+          "weakref-refersto": 50.00277,
+          "base-refersto": 107.611704
+        },
+        "flip": {
+          "softref-refersto": 1.814763,
+          "phantom-refersto": 2.137774,
+          "weakref-refersto": 2.152086,
+          "base-refersto": 2.994995
+        }
+      },
+      "compatible": {
+        "colored": {
+          "softref-refersto": 1.6215,
+          "phantom-refersto": 1.613428,
+          "weakref-refersto": 1.612758,
+          "base-refersto": 2.6955
+        },
+        "colored-call": {
+          "softref-refersto": 44.439969,
+          "phantom-refersto": 43.83369,
+          "weakref-refersto": 44.694025,
+          "base-refersto": 95.695159
+        },
+        "flip": {
+          "softref-refersto": 1.786541,
+          "phantom-refersto": 2.045854,
+          "weakref-refersto": 2.029219,
+          "base-refersto": 2.971129
+        }
+      }
+    }
+  },
+  "broader_jit_suite": {
+    "baseline_and_modified_failures_identical": true,
+    "failed_assertions_before_crash": [
+      "deopt::gkr_rerun_window_tests::the_window_closes_after_the_first_commit_of_straight_line_code",
+      "entry_counter::tests::the_drained_count_weighs_eight_back_edges_as_one_entry",
+      "inline_cache_pic::r12w6_mega5_site_state_tests::a_bound_site_never_overflows_into_the_megamorphic_paths",
+      "inline_cache_pic::r12w6_mega5_site_state_tests::t1refl_the_hashed_ways_switch_lifts_only_the_gate_and_hashed_way_exclusions",
+      "inline_cache_pic::r19_mega19_quiet_inline_tests::the_switch_off_or_an_unmarked_slot_publishes_inline_as_before",
+      "ir::cha_class_set_tests::j27_proxy_switch_is_opt_in",
+      "ir::r12w4_iropt3_exact_receiver_tests::r19_mega5_the_interface_switch_needs_the_nested_guarded_splice",
+      "ir::r14w2_guard_tests::the_polymorphic_switch_off_keeps_the_bimorphic_splice",
+      "ir::tests::mcs21_the_guard_load_carries_the_compact_row_only_under_its_switch",
+      "ir_check_elim::r19w4_irops3_clamp_index_tests::the_clamp_arm_is_opt_in",
+      "ir_lower::dead_ref_slot_clear_tests::gci_i41rv_the_shared_colour_kill_premises_hold",
+      "ir_lower::i64_l2_token_slot_tests::i64_l2_the_slots_switch_implies_the_allocator_rule_and_the_guard",
+      "ir_lower::i66_l2_one_liveness_pass_tests::i66_l2_the_entry_reads_the_switches",
+      "ir_lower::jr21_tl3_referent_gate_tests::jr21_tl3_the_referent_arm_tests_the_gate_after_the_read",
+      "ir_lower::lv10_liveness_tests::lv10_the_compile_path_entries_through_a_scratch_are_the_plain_ones",
+      "ir_lower::lv10_liveness_tests::lv10_the_switches_are_off_by_default_and_one_driver_maps_the_round_robin",
+      "ir_lower::lv11_tests::lv11_carried_first_gives_the_carried_registers_back",
+      "ir_lower::lv11_tests::lv11_opening_the_gate_trades_carried_registers_for_split_values",
+      "ir_lower::lv11_tests::lv11_the_token_switches_read_as_documented",
+      "ir_lower::lv11_tests::lv12_carried_priced_yields_a_split_that_buys_nothing",
+      "ir_lower::lv11_tests::lv12_prepin_lists_refs_under_splits_only_with_the_switch",
+      "ir_lower::lv11_tests::lv12_refuse_no_gain_refuses_pressures_reload_only_splits",
+      "ir_lower::lv11_tests::lv12_the_deopt_point_range_check_leaves_default_compiles_unchanged",
+      "ir_lower::r16_matrix_osr_tests::an_osr_entry_rebuilds_the_hoisted_row_and_its_predicate",
+      "ir_lower::r17_loop_codegen_tests::r17_multiplies_by_two_to_the_n_plus_or_minus_one_shift_and_answer_alike",
+      "ir_lower::r19_osr4_cell_writeback_tests::r19_osr4_the_wide_static_remat_switch_is_opt_in",
+      "ir_lower::r19w4_irops3_tests::a_resident_fp_minmax_lowers_branch_free_under_the_switch",
+      "ir_lower::r22_memory_newarray_map_sink_tests::r22_memory_newarray_map_sink_is_opt_in"
+    ],
+    "crash": "SIGSEGV in ir_lower::r25w7c_tail_republish_sink_tests::r25w7c_ic_hits_sink_their_republish_only_under_the_switch; reproduced in untouched dev and in isolation on modified tree"
+  },
+  "limits": [
+    "Windows and non-x86_64 not run; host execution requested on Linux.",
+    "crapper, dryer and mutator tools unavailable; behavioral/emission tests and manual review used.",
+    "Other H1-H6 items in shared t1refl report are separate pages and remain open."
+  ]
+}

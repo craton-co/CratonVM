@@ -1,0 +1,51 @@
+{
+  "jdk": {
+    "25/linux": {
+      "bridge_shadows_bytecode": 6066,
+      "bridge_stated_shadows_bytecode": 24,
+      "bridge_without_acc_native": 8912,
+      "jdk_version": "25.0.4",
+      "mode": "compatible",
+      "note": "Re-measured on the merge of fix/jdk-only-precedence-and-bridge-wave-20260811 with origin/dev b240353e1. Two independent movements: this branch (census schema 4 with hierarchy resolution, three new ratchets, and the java.util.logging shadow retirement) and dev (fc7d9c9f0 / c2391d63b / acb43cf4b, the openmbean carrier and java.io directory-open natives). Neither side baseline described the merged tree, so both were re-taken from one census here.  ||  PENDING RE-FREEZE, NOT APPLIED, 2026-08-12 (W7-62-ratchets-and-dead-code.md). This entry is STALE against HEAD and at least two of its five ratchets will FIRE on the next real run. It is deliberately left at the 12:20 numbers rather than hand-edited: every figure here is a count over an image adjudication, the session that found the drift could not build or take a census, and a hand-written count that lands too HIGH widens a slack-free ratchet -- the one direction a hand edit can do damage. A gate that fires with a stated reason is strictly better than one re-frozen to a derived guess. The movement, derived from the three commits that are ancestors of HEAD and not of 1c4377b5f (6ae3ca634, 4eaa5d321, 3b20b83b5, plus 01cfc2609): bridge.without_acc_native UP by 10 (nine LinkedListSnapshotListItr rows retagged bridge, no image declares the carrier, plus java/util/logging/Formatter.formatMessage) -> expect 8922; bridge.shadows_bytecode_anywhere UP by 1 (formatMessage alone -- JDK 25 declares it concrete, javap-confirmed; the carrier is absent from every image so it shadows nothing) -> expect 6067; bridge.stated_shadows_bytecode UNCHANGED at 24 (the nine state their kind from 2026-08-12 but shadow no bytecode; formatMessage shadows bytecode but does not state its kind); superseded.kind_disagreements DOWN by 2 (LogManager.getLogManager/getLogger ordinal 0 stop disagreeing with the ordinal-2 winner) -> expect 50; superseded.stub_lost_to_admitted UNCHANGED at 4. Those are LOWER BOUNDS on the delta: 182 commits separate the freeze from HEAD and any of them may add or remove registrations. SETTLE IT, do not copy it: bash regression-suite/bridge-ratchet.sh, then python3 scripts/jdk-only-bridge-ratchet.py --census <c> --jdk-feature 25 --update-baseline --note \"...\". The diff must be exactly the rows above; anything else is a finding.  ||  H3-1, 2026-08-20, TWO NOTES AND NO NUMBER CHANGED. (1) The gate now prints a SECOND COLUMN and reads it out of the `observed` block below, so this entry's `total_rows` (11636) and `registrations` are live inputs from today rather than a record. They are as stale as everything else here, so the row line will report a large delta on the next real run; that is the entry being stale, not the column being wrong, and re-freezing fixes both at once. (2) The key is now `<jdk-feature>/<os>` for `compatible` and `<jdk-feature>/<os>/<mode>` otherwise, so `25/linux` below is UNCHANGED and still scores. There is deliberately NO `25/linux/jdk-only` entry: `regression-suite/bridge-ratchet.sh` now takes a strict census and the gate REFUSES it (exit 2, reported, non-blocking) until somebody runs `--update-baseline` on a real image. A fabricated strict baseline is the one thing that would be worse than the gap. Separately: H3-1 deleted seven `SyntheticStub` rows (the `java.util.function` combinators in `native-builtins/src/phases_late/streams.rs`), which moves `registrations['synthetic-stub']` and `total_rows` by -7 and NONE of the five ratcheted Bridge counts -- expected, and stated here so the next re-freeze can tell that -7 apart from whatever else the 182-commit drift brings.",
+      "observed": {
+        "bridge": {
+          "abstract_method": 1327,
+          "acc_native": 780,
+          "class_absent": 872,
+          "class_present_method_undeclared": 364,
+          "inherited_abstract_method": 283,
+          "inherited_acc_native": 19,
+          "inherited_shadows_bytecode": 1609,
+          "rows": 9711,
+          "shadows_bytecode": 4457,
+          "shadows_bytecode_anywhere": 6066,
+          "stated_shadows_bytecode": 24,
+          "without_acc_native": 8912
+        },
+        "census_schema_version": 5,
+        "image_adjudication": true,
+        "mode": "compatible",
+        "partial": false,
+        "registrations": {
+          "bridge": 9711,
+          "intrinsic": 663,
+          "synthetic-stub": 1262
+        },
+        "schema": 1,
+        "superseded": {
+          "kind_disagreements": 52,
+          "rows": 1215,
+          "stub_lost_to_admitted": 4
+        },
+        "total_rows": 11636
+      },
+      "os": "linux",
+      "superseded_kind_disagreements": 52,
+      "superseded_stub_lost_to_admitted": 4,
+      "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"
+    }
+  },
+  "min_total_rows": 8000,
+  "schema": 1,
+  "slack": 0
+}

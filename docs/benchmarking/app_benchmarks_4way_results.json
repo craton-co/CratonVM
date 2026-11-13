@@ -1,0 +1,158 @@
+{
+  "CommonsMath-NeuralNet": {
+    "description": "Kohonen SOM, 2D mesh, neuron strings, decay functions (66 tests)",
+    "configs": {
+      "cvm_default": {
+        "name": "CVM Default",
+        "times": [
+          2516,
+          2694,
+          2464
+        ],
+        "status": "66 tests ok"
+      },
+      "cvm_fastboot": {
+        "name": "CVM Fast-Boot",
+        "times": [
+          2479,
+          2496,
+          2450
+        ],
+        "status": "66 tests ok"
+      },
+      "hotspot": {
+        "name": "HotSpot JDK 25",
+        "times": [
+          436,
+          448,
+          449
+        ],
+        "status": "66 tests ok"
+      },
+      "graalvm": {
+        "name": "GraalVM JDK 25",
+        "times": [
+          509,
+          506,
+          498
+        ],
+        "status": "66 tests ok"
+      }
+    }
+  },
+  "CommonsMath-Transform-FFT": {
+    "description": "Fast Fourier Transform (Cooley-Tukey, complex transforms, 10 tests)",
+    "configs": {
+      "cvm_default": {
+        "name": "CVM Default",
+        "times": [
+          2120,
+          2237,
+          2107
+        ],
+        "status": "10 tests ok"
+      },
+      "cvm_fastboot": {
+        "name": "CVM Fast-Boot",
+        "times": [
+          2198,
+          2158,
+          2240
+        ],
+        "status": "10 tests ok"
+      },
+      "hotspot": {
+        "name": "HotSpot JDK 25",
+        "times": [
+          407,
+          410,
+          408
+        ],
+        "status": "10 tests ok"
+      },
+      "graalvm": {
+        "name": "GraalVM JDK 25",
+        "times": [
+          461,
+          485,
+          457
+        ],
+        "status": "10 tests ok"
+      }
+    }
+  },
+  "CommonsMath-LeastSquares": {
+    "description": "Gauss-Newton least squares & Cholesky decomposition (21 tests)",
+    "configs": {
+      "cvm_default": {
+        "name": "CVM Default",
+        "times": [
+          2392,
+          2221,
+          2398
+        ],
+        "status": "21 tests ok"
+      },
+      "cvm_fastboot": {
+        "name": "CVM Fast-Boot",
+        "times": [
+          2229,
+          2403,
+          2418
+        ],
+        "status": "21 tests ok"
+      },
+      "hotspot": {
+        "name": "HotSpot JDK 25",
+        "times": [
+          437,
+          426,
+          430
+        ],
+        "status": "21 tests ok"
+      },
+      "graalvm": {
+        "name": "GraalVM JDK 25",
+        "times": [
+          493,
+          504,
+          501
+        ],
+        "status": "21 tests ok"
+      }
+    }
+  },
+  "BouncyCastle-EC-Math": {
+    "description": "Elliptic curve arithmetic, GF(2^m) polynomials & secp curves (23 tests)",
+    "configs": {
+      "cvm_default": {
+        "name": "CVM Default",
+        "times": [
+          313062
+        ],
+        "status": "OK (23 tests)"
+      },
+      "cvm_fastboot": {
+        "name": "CVM Fast-Boot",
+        "times": [
+          311445
+        ],
+        "status": "OK (23 tests)"
+      },
+      "hotspot": {
+        "name": "HotSpot JDK 25",
+        "times": [
+          56753
+        ],
+        "status": "OK (23 tests)"
+      },
+      "graalvm": {
+        "name": "GraalVM JDK 25",
+        "times": [
+          57956
+        ],
+        "status": "OK (23 tests)"
+      }
+    }
+  }
+}

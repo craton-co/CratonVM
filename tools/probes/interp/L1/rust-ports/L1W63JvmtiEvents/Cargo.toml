@@ -1,0 +1,12 @@
+[package]
+name = "l1w63-jvmti-events"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+# Its own workspace: never a member of the VM's.
+[workspace]

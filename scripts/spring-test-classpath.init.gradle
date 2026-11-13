@@ -1,0 +1,19 @@
+// Prints the classpath of every Spring Framework module's own `test` task.  A module may
+// rewrite it (spring-core swaps the jar for the classes dir, which SpringVersion needs),
+// so the task is the source of truth, not sourceSets.test.runtimeClasspath.  Gradle also
+// resolves one version per artifact inside a module, unlike a globbed ~/.gradle cache,
+// which carries every version ever downloaded.  Driven by spring_classpath.py.
+allprojects {
+    plugins.withId('java') {
+        def test = tasks.findByName('test')
+        if (test != null) {
+            tasks.register('printTestClasspath') {
+                def cp = test.classpath
+                def path = project.path
+                doLast {
+                    cp.files.each { println "CPENTRY\t${path}\t${it.absolutePath}" }
+                }
+            }
+        }
+    }
+}

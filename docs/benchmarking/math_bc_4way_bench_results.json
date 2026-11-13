@@ -1,0 +1,2502 @@
+[
+  {
+    "category": "Bouncy Castle (Cryptography)",
+    "suite_name": "SHA-256 Digest",
+    "main_class": "org.bouncycastle.crypto.test.SHA256DigestTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 458,
+          "output_tail": "SHA-256: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 436,
+          "output_tail": "SHA-256: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 444,
+          "output_tail": "SHA-256: Okay"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 420,
+          "output_tail": "SHA-256: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 429,
+          "output_tail": "SHA-256: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 429,
+          "output_tail": "SHA-256: Okay"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 71,
+          "output_tail": "SHA-256: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 71,
+          "output_tail": "SHA-256: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 67,
+          "output_tail": "SHA-256: Okay"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 99,
+          "output_tail": "SHA-256: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 103,
+          "output_tail": "SHA-256: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 99,
+          "output_tail": "SHA-256: Okay"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 436,
+        "avg_ms": 446,
+        "med_ms": 444,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 420,
+        "avg_ms": 426,
+        "med_ms": 429,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 67,
+        "avg_ms": 69,
+        "med_ms": 71,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 99,
+        "avg_ms": 100,
+        "med_ms": 99,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Bouncy Castle (Cryptography)",
+    "suite_name": "SHA-512 Digest",
+    "main_class": "org.bouncycastle.crypto.test.SHA512DigestTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 545,
+          "output_tail": "SHA-512: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 521,
+          "output_tail": "SHA-512: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 492,
+          "output_tail": "SHA-512: Okay"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 464,
+          "output_tail": "SHA-512: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 492,
+          "output_tail": "SHA-512: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 432,
+          "output_tail": "SHA-512: Okay"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 67,
+          "output_tail": "SHA-512: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 67,
+          "output_tail": "SHA-512: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 71,
+          "output_tail": "SHA-512: Okay"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 95,
+          "output_tail": "SHA-512: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 97,
+          "output_tail": "SHA-512: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 96,
+          "output_tail": "SHA-512: Okay"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 492,
+        "avg_ms": 519,
+        "med_ms": 521,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 432,
+        "avg_ms": 462,
+        "med_ms": 464,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 67,
+        "avg_ms": 68,
+        "med_ms": 67,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 95,
+        "avg_ms": 96,
+        "med_ms": 96,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Bouncy Castle (Cryptography)",
+    "suite_name": "MD5 Digest",
+    "main_class": "org.bouncycastle.crypto.test.MD5DigestTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 398,
+          "output_tail": "MD5: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 403,
+          "output_tail": "MD5: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 412,
+          "output_tail": "MD5: Okay"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 353,
+          "output_tail": "MD5: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 352,
+          "output_tail": "MD5: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 353,
+          "output_tail": "MD5: Okay"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 54,
+          "output_tail": "MD5: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 56,
+          "output_tail": "MD5: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 54,
+          "output_tail": "MD5: Okay"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 81,
+          "output_tail": "MD5: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 82,
+          "output_tail": "MD5: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 81,
+          "output_tail": "MD5: Okay"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 398,
+        "avg_ms": 404,
+        "med_ms": 403,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 352,
+        "avg_ms": 352,
+        "med_ms": 353,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 54,
+        "avg_ms": 54,
+        "med_ms": 54,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 81,
+        "avg_ms": 81,
+        "med_ms": 81,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Bouncy Castle (Cryptography)",
+    "suite_name": "AES Block Cipher",
+    "main_class": "org.bouncycastle.crypto.test.AESTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 19264,
+          "output_tail": "AES: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 19250,
+          "output_tail": "AES: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 19349,
+          "output_tail": "AES: Okay"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 19315,
+          "output_tail": "AES: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 19406,
+          "output_tail": "AES: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 19344,
+          "output_tail": "AES: Okay"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 5889,
+          "output_tail": "AES: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 5675,
+          "output_tail": "AES: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 5735,
+          "output_tail": "AES: Okay"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 5534,
+          "output_tail": "AES: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 5369,
+          "output_tail": "AES: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 5352,
+          "output_tail": "AES: Okay"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 19250,
+        "avg_ms": 19287,
+        "med_ms": 19264,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 19315,
+        "avg_ms": 19355,
+        "med_ms": 19344,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 5675,
+        "avg_ms": 5766,
+        "med_ms": 5735,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 5352,
+        "avg_ms": 5418,
+        "med_ms": 5369,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Bouncy Castle (Cryptography)",
+    "suite_name": "AES-GCM AEAD Mode",
+    "main_class": "org.bouncycastle.crypto.test.GCMTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1299,
+          "output_tail": "GCM: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1221,
+          "output_tail": "GCM: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1256,
+          "output_tail": "GCM: Okay"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1251,
+          "output_tail": "GCM: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1218,
+          "output_tail": "GCM: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1310,
+          "output_tail": "GCM: Okay"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 213,
+          "output_tail": "GCM: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 195,
+          "output_tail": "GCM: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 197,
+          "output_tail": "GCM: Okay"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 258,
+          "output_tail": "GCM: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 268,
+          "output_tail": "GCM: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 240,
+          "output_tail": "GCM: Okay"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 1221,
+        "avg_ms": 1258,
+        "med_ms": 1256,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 1218,
+        "avg_ms": 1259,
+        "med_ms": 1251,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 195,
+        "avg_ms": 201,
+        "med_ms": 197,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 240,
+        "avg_ms": 255,
+        "med_ms": 258,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Bouncy Castle (Cryptography)",
+    "suite_name": "ChaCha20-Poly1305 AEAD",
+    "main_class": "org.bouncycastle.crypto.test.ChaCha20Poly1305Test",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 686,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 683,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 684,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 719,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 696,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 694,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 196,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 183,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 189,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 226,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 234,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 216,
+          "output_tail": "ChaCha20Poly1305: Okay"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 683,
+        "avg_ms": 684,
+        "med_ms": 684,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 694,
+        "avg_ms": 703,
+        "med_ms": 696,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 183,
+        "avg_ms": 189,
+        "med_ms": 189,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 216,
+        "avg_ms": 225,
+        "med_ms": 226,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Bouncy Castle (Cryptography)",
+    "suite_name": "RSA Asymmetric & KeyGen",
+    "main_class": "org.bouncycastle.crypto.test.RSATest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 6437,
+          "output_tail": "RSA: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 7651,
+          "output_tail": "RSA: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 7744,
+          "output_tail": "RSA: Okay"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 6843,
+          "output_tail": "RSA: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 5821,
+          "output_tail": "RSA: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 7045,
+          "output_tail": "RSA: Okay"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2480,
+          "output_tail": "RSA: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2302,
+          "output_tail": "RSA: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2627,
+          "output_tail": "RSA: Okay"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2112,
+          "output_tail": "RSA: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2178,
+          "output_tail": "RSA: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2030,
+          "output_tail": "RSA: Okay"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 6437,
+        "avg_ms": 7277,
+        "med_ms": 7651,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 5821,
+        "avg_ms": 6569,
+        "med_ms": 6843,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 2302,
+        "avg_ms": 2469,
+        "med_ms": 2480,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 2030,
+        "avg_ms": 2106,
+        "med_ms": 2112,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Bouncy Castle (Cryptography)",
+    "suite_name": "Ed25519 Curve Signatures",
+    "main_class": "org.bouncycastle.crypto.test.Ed25519Test",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1929,
+          "output_tail": "Ed25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1929,
+          "output_tail": "Ed25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1906,
+          "output_tail": "Ed25519: Okay"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1987,
+          "output_tail": "Ed25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1996,
+          "output_tail": "Ed25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2004,
+          "output_tail": "Ed25519: Okay"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 195,
+          "output_tail": "Ed25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 193,
+          "output_tail": "Ed25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 193,
+          "output_tail": "Ed25519: Okay"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 212,
+          "output_tail": "Ed25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 214,
+          "output_tail": "Ed25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 210,
+          "output_tail": "Ed25519: Okay"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 1906,
+        "avg_ms": 1921,
+        "med_ms": 1929,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 1987,
+        "avg_ms": 1995,
+        "med_ms": 1996,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 193,
+        "avg_ms": 193,
+        "med_ms": 193,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 210,
+        "avg_ms": 212,
+        "med_ms": 212,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Bouncy Castle (Cryptography)",
+    "suite_name": "X25519 Key Agreement",
+    "main_class": "org.bouncycastle.crypto.test.X25519Test",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 508,
+          "output_tail": "X25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 505,
+          "output_tail": "X25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 517,
+          "output_tail": "X25519: Okay"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 473,
+          "output_tail": "X25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 479,
+          "output_tail": "X25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 474,
+          "output_tail": "X25519: Okay"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 70,
+          "output_tail": "X25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 71,
+          "output_tail": "X25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 70,
+          "output_tail": "X25519: Okay"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 95,
+          "output_tail": "X25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 95,
+          "output_tail": "X25519: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 96,
+          "output_tail": "X25519: Okay"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 505,
+        "avg_ms": 510,
+        "med_ms": 508,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 473,
+        "avg_ms": 475,
+        "med_ms": 474,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 70,
+        "avg_ms": 70,
+        "med_ms": 70,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 95,
+        "avg_ms": 95,
+        "med_ms": 95,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Bouncy Castle (Cryptography)",
+    "suite_name": "Message Authentication (MAC)",
+    "main_class": "org.bouncycastle.crypto.test.MacTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 382,
+          "output_tail": "Mac: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 376,
+          "output_tail": "Mac: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 387,
+          "output_tail": "Mac: Okay"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 323,
+          "output_tail": "Mac: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 329,
+          "output_tail": "Mac: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 320,
+          "output_tail": "Mac: Okay"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 53,
+          "output_tail": "Mac: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 53,
+          "output_tail": "Mac: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 51,
+          "output_tail": "Mac: Okay"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 74,
+          "output_tail": "Mac: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 74,
+          "output_tail": "Mac: Okay"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 75,
+          "output_tail": "Mac: Okay"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 376,
+        "avg_ms": 381,
+        "med_ms": 382,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 320,
+        "avg_ms": 324,
+        "med_ms": 323,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 51,
+        "avg_ms": 52,
+        "med_ms": 53,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 74,
+        "avg_ms": 74,
+        "med_ms": 74,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Apache Commons Math (Numerical)",
+    "suite_name": "Dfp Decimal Floating Point",
+    "main_class": "org.apache.commons.math4.legacy.core.dfp.DfpTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2115,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 1.44\n\nOK (80 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2177,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 1.459\n\nOK (80 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2137,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 1.448\n\nOK (80 tests)"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2104,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 1.472\n\nOK (80 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2123,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 1.484\n\nOK (80 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 2123,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 1.493\n\nOK (80 tests)"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 664,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 0.509\n\nOK (80 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 739,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 0.575\n\nOK (80 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 669,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 0.512\n\nOK (80 tests)"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 749,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 0.562\n\nOK (80 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 779,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 0.588\n\nOK (80 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 712,
+          "output_tail": "JUnit version 4.13.2\n................................................................................\nTime: 0.531\n\nOK (80 tests)"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 2115,
+        "avg_ms": 2143,
+        "med_ms": 2137,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 2104,
+        "avg_ms": 2116,
+        "med_ms": 2123,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 664,
+        "avg_ms": 690,
+        "med_ms": 669,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 712,
+        "avg_ms": 746,
+        "med_ms": 749,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Apache Commons Math (Numerical)",
+    "suite_name": "DfpMath High-Precision Math",
+    "main_class": "org.apache.commons.math4.legacy.core.dfp.DfpMathTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 809,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.155\n\nOK (2 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 822,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.157\n\nOK (2 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 896,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.164\n\nOK (2 tests)"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 753,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.167\n\nOK (2 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 754,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.161\n\nOK (2 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 791,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.159\n\nOK (2 tests)"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 232,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.083\n\nOK (2 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 232,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.083\n\nOK (2 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 226,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.083\n\nOK (2 tests)"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 261,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.089\n\nOK (2 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 277,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.105\n\nOK (2 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 274,
+          "output_tail": "JUnit version 4.13.2\n..\nTime: 0.103\n\nOK (2 tests)"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 809,
+        "avg_ms": 842,
+        "med_ms": 822,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 753,
+        "avg_ms": 766,
+        "med_ms": 754,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 226,
+        "avg_ms": 230,
+        "med_ms": 232,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 261,
+        "avg_ms": 270,
+        "med_ms": 274,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Apache Commons Math (Numerical)",
+    "suite_name": "DfpDec Decimal Precision",
+    "main_class": "org.apache.commons.math4.legacy.core.dfp.DfpDecTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 881,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.157\n\nOK (3 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 818,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.155\n\nOK (3 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 801,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.154\n\nOK (3 tests)"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 797,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.164\n\nOK (3 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 806,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.164\n\nOK (3 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 751,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.163\n\nOK (3 tests)"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 244,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.088\n\nOK (3 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 232,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.085\n\nOK (3 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 244,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.084\n\nOK (3 tests)"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 276,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.102\n\nOK (3 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 271,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.097\n\nOK (3 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 271,
+          "output_tail": "JUnit version 4.13.2\n...\nTime: 0.094\n\nOK (3 tests)"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 801,
+        "avg_ms": 833,
+        "med_ms": 818,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 751,
+        "avg_ms": 784,
+        "med_ms": 797,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 232,
+        "avg_ms": 240,
+        "med_ms": 244,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 271,
+        "avg_ms": 272,
+        "med_ms": 271,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Apache Commons Math (Numerical)",
+    "suite_name": "MathArrays Vector Math",
+    "main_class": "org.apache.commons.math4.legacy.core.MathArraysTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 744,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.071\n\nOK (45 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 729,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.07\n\nOK (45 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 722,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.069\n\nOK (45 tests)"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 689,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.074\n\nOK (45 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 698,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.074\n\nOK (45 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 657,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.072\n\nOK (45 tests)"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 185,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.039\n\nOK (45 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 188,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.039\n\nOK (45 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 183,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.037\n\nOK (45 tests)"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 213,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.04\n\nOK (45 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 219,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.042\n\nOK (45 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 207,
+          "output_tail": "JUnit version 4.13.2\n.............................................\nTime: 0.039\n\nOK (45 tests)"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 722,
+        "avg_ms": 731,
+        "med_ms": 729,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 657,
+        "avg_ms": 681,
+        "med_ms": 689,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 183,
+        "avg_ms": 185,
+        "med_ms": 185,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 207,
+        "avg_ms": 213,
+        "med_ms": 213,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Apache Commons Math (Numerical)",
+    "suite_name": "Integer Sequence Steppers",
+    "main_class": "org.apache.commons.math4.legacy.core.IntegerSequenceTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 700,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.045\n\nOK (16 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 673,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.044\n\nOK (16 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 668,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.043\n\nOK (16 tests)"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 604,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.038\n\nOK (16 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 621,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.038\n\nOK (16 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 612,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.037\n\nOK (16 tests)"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 152,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.01\n\nOK (16 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 160,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.01\n\nOK (16 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 144,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.009\n\nOK (16 tests)"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 179,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.011\n\nOK (16 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 184,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.01\n\nOK (16 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 173,
+          "output_tail": "JUnit version 4.13.2\n................\nTime: 0.01\n\nOK (16 tests)"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 668,
+        "avg_ms": 680,
+        "med_ms": 673,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 604,
+        "avg_ms": 612,
+        "med_ms": 612,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 144,
+        "avg_ms": 152,
+        "med_ms": 152,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 173,
+        "avg_ms": 178,
+        "med_ms": 179,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Apache Commons Math (Numerical)",
+    "suite_name": "LU Matrix Decomposition",
+    "main_class": "org.apache.commons.math4.legacy.linear.LUDecompositionTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 662,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.101\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 659,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.099\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 649,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.099\n\nOK (9 tests)"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 602,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.108\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 622,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.119\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 613,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.119\n\nOK (9 tests)"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 174,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.043\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 173,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.042\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 174,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.042\n\nOK (9 tests)"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 205,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.045\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 199,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.044\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 203,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.045\n\nOK (9 tests)"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 649,
+        "avg_ms": 656,
+        "med_ms": 659,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 602,
+        "avg_ms": 612,
+        "med_ms": 613,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 173,
+        "avg_ms": 173,
+        "med_ms": 174,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 199,
+        "avg_ms": 202,
+        "med_ms": 203,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Apache Commons Math (Numerical)",
+    "suite_name": "QR Matrix Decomposition",
+    "main_class": "org.apache.commons.math4.legacy.linear.QRDecompositionTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 747,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.183\n\nOK (10 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 764,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.193\n\nOK (10 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 818,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.19\n\nOK (10 tests)"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 704,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.199\n\nOK (10 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 693,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.192\n\nOK (10 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 714,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.191\n\nOK (10 tests)"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 204,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.068\n\nOK (10 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 204,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.069\n\nOK (10 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 211,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.07\n\nOK (10 tests)"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 234,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.072\n\nOK (10 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 232,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.072\n\nOK (10 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 241,
+          "output_tail": "JUnit version 4.13.2\n..........\nTime: 0.077\n\nOK (10 tests)"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 747,
+        "avg_ms": 776,
+        "med_ms": 764,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 693,
+        "avg_ms": 703,
+        "med_ms": 704,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 204,
+        "avg_ms": 206,
+        "med_ms": 204,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 232,
+        "avg_ms": 235,
+        "med_ms": 234,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Apache Commons Math (Numerical)",
+    "suite_name": "Cholesky Decomposition",
+    "main_class": "org.apache.commons.math4.legacy.linear.CholeskyDecompositionTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 702,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.102\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 673,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.099\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 711,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.104\n\nOK (9 tests)"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 635,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.121\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 609,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.103\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 660,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.12\n\nOK (9 tests)"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 181,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.044\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 178,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.043\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 180,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.044\n\nOK (9 tests)"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 228,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.046\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 211,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.044\n\nOK (9 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 203,
+          "output_tail": "JUnit version 4.13.2\n.........\nTime: 0.044\n\nOK (9 tests)"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 673,
+        "avg_ms": 695,
+        "med_ms": 702,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 609,
+        "avg_ms": 634,
+        "med_ms": 635,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 178,
+        "avg_ms": 179,
+        "med_ms": 180,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 203,
+        "avg_ms": 214,
+        "med_ms": 211,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Apache Commons Math (Numerical)",
+    "suite_name": "EigenDecomposition Spectral",
+    "main_class": "org.apache.commons.math4.legacy.linear.EigenDecompositionTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1176,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.535\n\nOK (31 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1161,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.529\n\nOK (31 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1161,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.533\n\nOK (31 tests)"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1112,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.542\n\nOK (31 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1128,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.55\n\nOK (31 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 1108,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.54\n\nOK (31 tests)"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 299,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.159\n\nOK (31 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 307,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.16\n\nOK (31 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 302,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.157\n\nOK (31 tests)"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 408,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.232\n\nOK (31 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 393,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.204\n\nOK (31 tests)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 406,
+          "output_tail": "JUnit version 4.13.2\nI...............................I\nTime: 0.243\n\nOK (31 tests)"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 1161,
+        "avg_ms": 1166,
+        "med_ms": 1161,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 1108,
+        "avg_ms": 1116,
+        "med_ms": 1112,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 299,
+        "avg_ms": 302,
+        "med_ms": 302,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 393,
+        "avg_ms": 402,
+        "med_ms": 406,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  },
+  {
+    "category": "Apache Commons Math (Numerical)",
+    "suite_name": "Kohonen Neural Network SOM",
+    "main_class": "org.apache.commons.math4.neuralnet.sofm.KohonenUpdateActionTest",
+    "runs": {
+      "cvm_default": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 729,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.118\n\nOK (1 test)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 730,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.117\n\nOK (1 test)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 733,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.121\n\nOK (1 test)"
+        }
+      ],
+      "cvm_fastboot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 696,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.135\n\nOK (1 test)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 694,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.134\n\nOK (1 test)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 682,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.13\n\nOK (1 test)"
+        }
+      ],
+      "hotspot": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 177,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.04\n\nOK (1 test)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 200,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.044\n\nOK (1 test)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 181,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.04\n\nOK (1 test)"
+        }
+      ],
+      "graalvm": [
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 212,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.043\n\nOK (1 test)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 226,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.044\n\nOK (1 test)"
+        },
+        {
+          "status": "PASS",
+          "rc": 0,
+          "ms": 209,
+          "output_tail": "JUnit version 4.13.2\n.\nTime: 0.042\n\nOK (1 test)"
+        }
+      ]
+    },
+    "summary": {
+      "cvm_default": {
+        "label": "CVM Default",
+        "all_pass": true,
+        "min_ms": 729,
+        "avg_ms": 730,
+        "med_ms": 730,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "cvm_fastboot": {
+        "label": "CVM Fast-Boot",
+        "all_pass": true,
+        "min_ms": 682,
+        "avg_ms": 690,
+        "med_ms": 694,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "hotspot": {
+        "label": "HotSpot 25",
+        "all_pass": true,
+        "min_ms": 177,
+        "avg_ms": 186,
+        "med_ms": 181,
+        "pass_count": 3,
+        "total_count": 3
+      },
+      "graalvm": {
+        "label": "GraalVM 25",
+        "all_pass": true,
+        "min_ms": 209,
+        "avg_ms": 215,
+        "med_ms": 212,
+        "pass_count": 3,
+        "total_count": 3
+      }
+    }
+  }
+]

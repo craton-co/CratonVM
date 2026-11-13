@@ -1,0 +1,6018 @@
+[
+  {
+    "idx": 1,
+    "class": "org.apache.commons.math4.core.jdkmath.JdkMathTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 670
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 163
+    },
+    "ratio": "4.11x"
+  },
+  {
+    "idx": 2,
+    "class": "org.apache.commons.math4.legacy.TestUtils",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 636
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 179
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 3,
+    "class": "org.apache.commons.math4.legacy.analysis.FunctionUtilsTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1223
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 350
+    },
+    "ratio": "3.49x"
+  },
+  {
+    "idx": 4,
+    "class": "org.apache.commons.math4.legacy.analysis.differentiation.DSCompilerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 758
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 220
+    },
+    "ratio": "3.45x"
+  },
+  {
+    "idx": 5,
+    "class": "org.apache.commons.math4.legacy.analysis.differentiation.DerivativeStructureTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2911
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 807
+    },
+    "ratio": "3.61x"
+  },
+  {
+    "idx": 6,
+    "class": "org.apache.commons.math4.legacy.analysis.differentiation.FiniteDifferencesDifferentiatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 844
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 257
+    },
+    "ratio": "3.28x"
+  },
+  {
+    "idx": 7,
+    "class": "org.apache.commons.math4.legacy.analysis.differentiation.GradientFunctionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 927
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 255
+    },
+    "ratio": "3.64x"
+  },
+  {
+    "idx": 8,
+    "class": "org.apache.commons.math4.legacy.analysis.differentiation.JacobianFunctionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 688
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 191
+    },
+    "ratio": "3.6x"
+  },
+  {
+    "idx": 9,
+    "class": "org.apache.commons.math4.legacy.analysis.differentiation.SparseGradientTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1914
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 425
+    },
+    "ratio": "4.5x"
+  },
+  {
+    "idx": 10,
+    "class": "org.apache.commons.math4.legacy.analysis.function.BivariateFunctionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 681
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 183
+    },
+    "ratio": "3.72x"
+  },
+  {
+    "idx": 11,
+    "class": "org.apache.commons.math4.legacy.analysis.function.GaussianTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 717
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 192
+    },
+    "ratio": "3.73x"
+  },
+  {
+    "idx": 12,
+    "class": "org.apache.commons.math4.legacy.analysis.function.HarmonicOscillatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 698
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 183
+    },
+    "ratio": "3.81x"
+  },
+  {
+    "idx": 13,
+    "class": "org.apache.commons.math4.legacy.analysis.function.LogisticTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 697
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 194
+    },
+    "ratio": "3.59x"
+  },
+  {
+    "idx": 14,
+    "class": "org.apache.commons.math4.legacy.analysis.function.LogitTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 807
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 232
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 15,
+    "class": "org.apache.commons.math4.legacy.analysis.function.SigmoidTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 674
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 196
+    },
+    "ratio": "3.44x"
+  },
+  {
+    "idx": 16,
+    "class": "org.apache.commons.math4.legacy.analysis.function.SincTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 897
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 346
+    },
+    "ratio": "2.59x"
+  },
+  {
+    "idx": 17,
+    "class": "org.apache.commons.math4.legacy.analysis.function.SqrtTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 658
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 181
+    },
+    "ratio": "3.64x"
+  },
+  {
+    "idx": 18,
+    "class": "org.apache.commons.math4.legacy.analysis.function.StepFunctionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 666
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 165
+    },
+    "ratio": "4.04x"
+  },
+  {
+    "idx": 19,
+    "class": "org.apache.commons.math4.legacy.analysis.function.UnivariateDifferentiableFunctionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 705
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 186
+    },
+    "ratio": "3.79x"
+  },
+  {
+    "idx": 20,
+    "class": "org.apache.commons.math4.legacy.analysis.function.UnivariateFunctionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 653
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 184
+    },
+    "ratio": "3.55x"
+  },
+  {
+    "idx": 21,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.IterativeLegendreGaussIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 8782
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 958
+    },
+    "ratio": "9.17x"
+  },
+  {
+    "idx": 22,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.MidPointIntegratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 691
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 205
+    },
+    "ratio": "3.37x"
+  },
+  {
+    "idx": 23,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.RombergIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 642
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 185
+    },
+    "ratio": "3.47x"
+  },
+  {
+    "idx": 24,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.SimpsonIntegratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 668
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 198
+    },
+    "ratio": "3.37x"
+  },
+  {
+    "idx": 25,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.TrapezoidIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 656
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 186
+    },
+    "ratio": "3.53x"
+  },
+  {
+    "idx": 26,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.gauss.BaseRuleFactoryTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2552
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 890
+    },
+    "ratio": "2.87x"
+  },
+  {
+    "idx": 27,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.gauss.GaussIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 662
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 166
+    },
+    "ratio": "3.99x"
+  },
+  {
+    "idx": 28,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.gauss.GaussianQuadratureAbstractTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 375
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 80
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 29,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.gauss.HermiteParametricTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1301
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 237
+    },
+    "ratio": "5.49x"
+  },
+  {
+    "idx": 30,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.gauss.HermiteTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 673
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 193
+    },
+    "ratio": "3.49x"
+  },
+  {
+    "idx": 31,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.gauss.LaguerreTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 766
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 224
+    },
+    "ratio": "3.42x"
+  },
+  {
+    "idx": 32,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreHighPrecisionParametricTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 4366
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 856
+    },
+    "ratio": "5.1x"
+  },
+  {
+    "idx": 33,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreHighPrecisionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 27236
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2952
+    },
+    "ratio": "9.23x"
+  },
+  {
+    "idx": 34,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreParametricTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 971
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 253
+    },
+    "ratio": "3.84x"
+  },
+  {
+    "idx": 35,
+    "class": "org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 708
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 205
+    },
+    "ratio": "3.45x"
+  },
+  {
+    "idx": 36,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.AkimaSplineInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 697
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 207
+    },
+    "ratio": "3.37x"
+  },
+  {
+    "idx": 37,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.BicubicInterpolatingFunctionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 777
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 241
+    },
+    "ratio": "3.22x"
+  },
+  {
+    "idx": 38,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.BicubicInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 836
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 215
+    },
+    "ratio": "3.89x"
+  },
+  {
+    "idx": 39,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.ClampedSplineInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 688
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 196
+    },
+    "ratio": "3.51x"
+  },
+  {
+    "idx": 40,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.DividedDifferenceInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 659
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 190
+    },
+    "ratio": "3.47x"
+  },
+  {
+    "idx": 41,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.FieldHermiteInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 3005
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 872
+    },
+    "ratio": "3.45x"
+  },
+  {
+    "idx": 42,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.HermiteInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 798
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 206
+    },
+    "ratio": "3.87x"
+  },
+  {
+    "idx": 43,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.LinearInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 655
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 173
+    },
+    "ratio": "3.79x"
+  },
+  {
+    "idx": 44,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.LoessInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 738
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 199
+    },
+    "ratio": "3.71x"
+  },
+  {
+    "idx": 45,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.MicrosphereProjectionInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 824
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 232
+    },
+    "ratio": "3.55x"
+  },
+  {
+    "idx": 46,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.NevilleInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 653
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 189
+    },
+    "ratio": "3.46x"
+  },
+  {
+    "idx": 47,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.PiecewiseBicubicSplineInterpolatingFunctionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 709
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 222
+    },
+    "ratio": "3.19x"
+  },
+  {
+    "idx": 48,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.PiecewiseBicubicSplineInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 765
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 224
+    },
+    "ratio": "3.42x"
+  },
+  {
+    "idx": 49,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.SplineInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 676
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 205
+    },
+    "ratio": "3.3x"
+  },
+  {
+    "idx": 50,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.TricubicInterpolatingFunctionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1037
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 337
+    },
+    "ratio": "3.08x"
+  },
+  {
+    "idx": 51,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.TricubicInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 682
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 194
+    },
+    "ratio": "3.52x"
+  },
+  {
+    "idx": 52,
+    "class": "org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 806
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 224
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 53,
+    "class": "org.apache.commons.math4.legacy.analysis.polynomials.PolynomialFunctionLagrangeFormTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 678
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 196
+    },
+    "ratio": "3.46x"
+  },
+  {
+    "idx": 54,
+    "class": "org.apache.commons.math4.legacy.analysis.polynomials.PolynomialFunctionNewtonFormTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 700
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 191
+    },
+    "ratio": "3.66x"
+  },
+  {
+    "idx": 55,
+    "class": "org.apache.commons.math4.legacy.analysis.polynomials.PolynomialFunctionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 693
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 180
+    },
+    "ratio": "3.85x"
+  },
+  {
+    "idx": 56,
+    "class": "org.apache.commons.math4.legacy.analysis.polynomials.PolynomialSplineFunctionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 641
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 161
+    },
+    "ratio": "3.98x"
+  },
+  {
+    "idx": 57,
+    "class": "org.apache.commons.math4.legacy.analysis.polynomials.PolynomialsUtilsTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 8266
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 641
+    },
+    "ratio": "12.9x"
+  },
+  {
+    "idx": 58,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.BaseSecantSolverAbstractTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 375
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 84
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 59,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.BisectionSolverTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 692
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 187
+    },
+    "ratio": "3.7x"
+  },
+  {
+    "idx": 60,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.BracketingNthOrderBrentSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 730
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 207
+    },
+    "ratio": "3.53x"
+  },
+  {
+    "idx": 61,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.BrentSolverTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 681
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 201
+    },
+    "ratio": "3.39x"
+  },
+  {
+    "idx": 62,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.FieldBracketingNthOrderBrentSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1827
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 712
+    },
+    "ratio": "2.57x"
+  },
+  {
+    "idx": 63,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.IllinoisSolverTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 669
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 190
+    },
+    "ratio": "3.52x"
+  },
+  {
+    "idx": 64,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.LaguerreSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 692
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 184
+    },
+    "ratio": "3.76x"
+  },
+  {
+    "idx": 65,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.MullerSolver2Test",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 667
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 186
+    },
+    "ratio": "3.59x"
+  },
+  {
+    "idx": 66,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.MullerSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 649
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 192
+    },
+    "ratio": "3.38x"
+  },
+  {
+    "idx": 67,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.NewtonRaphsonSolverTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 660
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 184
+    },
+    "ratio": "3.59x"
+  },
+  {
+    "idx": 68,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.PegasusSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 682
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 192
+    },
+    "ratio": "3.55x"
+  },
+  {
+    "idx": 69,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.RegulaFalsiSolverTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 741
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 197
+    },
+    "ratio": "3.76x"
+  },
+  {
+    "idx": 70,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.RiddersSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 689
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 184
+    },
+    "ratio": "3.74x"
+  },
+  {
+    "idx": 71,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.SecantSolverTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 697
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 187
+    },
+    "ratio": "3.73x"
+  },
+  {
+    "idx": 72,
+    "class": "org.apache.commons.math4.legacy.analysis.solvers.UnivariateSolverUtilsTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 691
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 191
+    },
+    "ratio": "3.62x"
+  },
+  {
+    "idx": 73,
+    "class": "org.apache.commons.math4.legacy.core.ExtendedFieldElementAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 360
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 78
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 74,
+    "class": "org.apache.commons.math4.legacy.core.IntegerSequenceTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 659
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 156
+    },
+    "ratio": "4.22x"
+  },
+  {
+    "idx": 75,
+    "class": "org.apache.commons.math4.legacy.core.MathArraysTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 712
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 190
+    },
+    "ratio": "3.75x"
+  },
+  {
+    "idx": 76,
+    "class": "org.apache.commons.math4.legacy.core.PairTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 652
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 159
+    },
+    "ratio": "4.1x"
+  },
+  {
+    "idx": 77,
+    "class": "org.apache.commons.math4.legacy.core.dfp.DfpDecTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 821
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 248
+    },
+    "ratio": "3.31x"
+  },
+  {
+    "idx": 78,
+    "class": "org.apache.commons.math4.legacy.core.dfp.DfpMathTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 818
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 259
+    },
+    "ratio": "3.16x"
+  },
+  {
+    "idx": 79,
+    "class": "org.apache.commons.math4.legacy.core.dfp.DfpTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2275
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 783
+    },
+    "ratio": "2.91x"
+  },
+  {
+    "idx": 80,
+    "class": "org.apache.commons.math4.legacy.core.jdkmath.AccurateMathStrictComparisonTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1641
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 235
+    },
+    "ratio": "6.98x"
+  },
+  {
+    "idx": 81,
+    "class": "org.apache.commons.math4.legacy.core.jdkmath.AccurateMathTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 15864
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 4577
+    },
+    "ratio": "3.47x"
+  },
+  {
+    "idx": 82,
+    "class": "org.apache.commons.math4.legacy.distribution.AbstractIntegerDistributionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 652
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 180
+    },
+    "ratio": "3.62x"
+  },
+  {
+    "idx": 83,
+    "class": "org.apache.commons.math4.legacy.distribution.EmpiricalDistributionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 22961
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1150
+    },
+    "ratio": "19.97x"
+  },
+  {
+    "idx": 84,
+    "class": "org.apache.commons.math4.legacy.distribution.EnumeratedIntegerDistributionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1788
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 237
+    },
+    "ratio": "7.54x"
+  },
+  {
+    "idx": 85,
+    "class": "org.apache.commons.math4.legacy.distribution.EnumeratedRealDistributionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1855
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 251
+    },
+    "ratio": "7.39x"
+  },
+  {
+    "idx": 86,
+    "class": "org.apache.commons.math4.legacy.distribution.IntegerDistributionAbstractTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 375
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 81
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 87,
+    "class": "org.apache.commons.math4.legacy.distribution.MixtureMultivariateNormalDistributionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 774
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 200
+    },
+    "ratio": "3.87x"
+  },
+  {
+    "idx": 88,
+    "class": "org.apache.commons.math4.legacy.distribution.MultivariateNormalDistributionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1073
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 313
+    },
+    "ratio": "3.43x"
+  },
+  {
+    "idx": 89,
+    "class": "org.apache.commons.math4.legacy.distribution.RealDistributionAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 374
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 83
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 90,
+    "class": "org.apache.commons.math4.legacy.distribution.fitting.MultivariateNormalMixtureExpectationMaximizationTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 904
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 238
+    },
+    "ratio": "3.8x"
+  },
+  {
+    "idx": 91,
+    "class": "org.apache.commons.math4.legacy.exception.DimensionMismatchExceptionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 649
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 164
+    },
+    "ratio": "3.96x"
+  },
+  {
+    "idx": 92,
+    "class": "org.apache.commons.math4.legacy.exception.MaxCountExceededExceptionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 651
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 158
+    },
+    "ratio": "4.12x"
+  },
+  {
+    "idx": 93,
+    "class": "org.apache.commons.math4.legacy.exception.NonMonotonicSequenceExceptionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 649
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 163
+    },
+    "ratio": "3.98x"
+  },
+  {
+    "idx": 94,
+    "class": "org.apache.commons.math4.legacy.exception.NotFiniteNumberExceptionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 643
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 160
+    },
+    "ratio": "4.02x"
+  },
+  {
+    "idx": 95,
+    "class": "org.apache.commons.math4.legacy.exception.NotPositiveExceptionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 643
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 155
+    },
+    "ratio": "4.15x"
+  },
+  {
+    "idx": 96,
+    "class": "org.apache.commons.math4.legacy.exception.NotStrictlyPositiveExceptionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 620
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 151
+    },
+    "ratio": "4.11x"
+  },
+  {
+    "idx": 97,
+    "class": "org.apache.commons.math4.legacy.exception.NullArgumentExceptionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 652
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 153
+    },
+    "ratio": "4.26x"
+  },
+  {
+    "idx": 98,
+    "class": "org.apache.commons.math4.legacy.exception.NumberIsTooLargeExceptionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 657
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 153
+    },
+    "ratio": "4.29x"
+  },
+  {
+    "idx": 99,
+    "class": "org.apache.commons.math4.legacy.exception.NumberIsTooSmallExceptionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 634
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 158
+    },
+    "ratio": "4.01x"
+  },
+  {
+    "idx": 100,
+    "class": "org.apache.commons.math4.legacy.exception.OutOfRangeExceptionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 630
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 154
+    },
+    "ratio": "4.09x"
+  },
+  {
+    "idx": 101,
+    "class": "org.apache.commons.math4.legacy.exception.TooManyEvaluationsExceptionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 922
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 189
+    },
+    "ratio": "4.88x"
+  },
+  {
+    "idx": 102,
+    "class": "org.apache.commons.math4.legacy.exception.util.ArgUtilsTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 620
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 154
+    },
+    "ratio": "4.03x"
+  },
+  {
+    "idx": 103,
+    "class": "org.apache.commons.math4.legacy.exception.util.ExceptionContextTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1053
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 198
+    },
+    "ratio": "5.32x"
+  },
+  {
+    "idx": 104,
+    "class": "org.apache.commons.math4.legacy.exception.util.LocalizedFormatsTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1043
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 217
+    },
+    "ratio": "4.81x"
+  },
+  {
+    "idx": 105,
+    "class": "org.apache.commons.math4.legacy.field.ExtendedFieldElementAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 387
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 82
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 106,
+    "class": "org.apache.commons.math4.legacy.field.linalg.FP64FieldDenseMatrixTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 786
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 210
+    },
+    "ratio": "3.74x"
+  },
+  {
+    "idx": 107,
+    "class": "org.apache.commons.math4.legacy.field.linalg.FieldLUDecompositionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 726
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 186
+    },
+    "ratio": "3.9x"
+  },
+  {
+    "idx": 108,
+    "class": "org.apache.commons.math4.legacy.filter.KalmanFilterTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 879
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 245
+    },
+    "ratio": "3.59x"
+  },
+  {
+    "idx": 109,
+    "class": "org.apache.commons.math4.legacy.fitting.GaussianCurveFitterTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1000
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 229
+    },
+    "ratio": "4.37x"
+  },
+  {
+    "idx": 110,
+    "class": "org.apache.commons.math4.legacy.fitting.HarmonicCurveFitterTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 831
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 215
+    },
+    "ratio": "3.87x"
+  },
+  {
+    "idx": 111,
+    "class": "org.apache.commons.math4.legacy.fitting.PolynomialCurveFitterTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2508
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 668
+    },
+    "ratio": "3.75x"
+  },
+  {
+    "idx": 112,
+    "class": "org.apache.commons.math4.legacy.fitting.SimpleCurveFitterTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 758
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 242
+    },
+    "ratio": "3.13x"
+  },
+  {
+    "idx": 113,
+    "class": "org.apache.commons.math4.legacy.fitting.WeightedObservedPointsTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 637
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 158
+    },
+    "ratio": "4.03x"
+  },
+  {
+    "idx": 114,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.AbstractLeastSquaresOptimizerAbstractTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 369
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 83
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 115,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.DifferentiatorVectorMultivariateJacobianFunctionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 831
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 231
+    },
+    "ratio": "3.6x"
+  },
+  {
+    "idx": 116,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.EvaluationRmsCheckerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 648
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 156
+    },
+    "ratio": "4.15x"
+  },
+  {
+    "idx": 117,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.EvaluationTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 868
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 243
+    },
+    "ratio": "3.57x"
+  },
+  {
+    "idx": 118,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.EvaluationTestValidation",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 971
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 261
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 119,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithCholeskyTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 967
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 254
+    },
+    "ratio": "3.81x"
+  },
+  {
+    "idx": 120,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithLUTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 939
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 228
+    },
+    "ratio": "4.12x"
+  },
+  {
+    "idx": 121,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithQRTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 967
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 234
+    },
+    "ratio": "4.13x"
+  },
+  {
+    "idx": 122,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithSVDTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1118
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 302
+    },
+    "ratio": "3.7x"
+  },
+  {
+    "idx": 123,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.LevenbergMarquardtOptimizerTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 1146
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 288
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 124,
+    "class": "org.apache.commons.math4.legacy.fitting.leastsquares.MinpackTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1001
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 286
+    },
+    "ratio": "3.5x"
+  },
+  {
+    "idx": 125,
+    "class": "org.apache.commons.math4.legacy.genetics.BinaryChromosomeTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 781
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 218
+    },
+    "ratio": "3.58x"
+  },
+  {
+    "idx": 126,
+    "class": "org.apache.commons.math4.legacy.genetics.BinaryMutationTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 775
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 221
+    },
+    "ratio": "3.51x"
+  },
+  {
+    "idx": 127,
+    "class": "org.apache.commons.math4.legacy.genetics.ChromosomeTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 692
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 162
+    },
+    "ratio": "4.27x"
+  },
+  {
+    "idx": 128,
+    "class": "org.apache.commons.math4.legacy.genetics.CycleCrossoverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 822
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 236
+    },
+    "ratio": "3.48x"
+  },
+  {
+    "idx": 129,
+    "class": "org.apache.commons.math4.legacy.genetics.ElitisticListPopulationTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 690
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 193
+    },
+    "ratio": "3.58x"
+  },
+  {
+    "idx": 130,
+    "class": "org.apache.commons.math4.legacy.genetics.FitnessCachingTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 802
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 236
+    },
+    "ratio": "3.4x"
+  },
+  {
+    "idx": 131,
+    "class": "org.apache.commons.math4.legacy.genetics.FixedElapsedTimeTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 3706
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 3196
+    },
+    "ratio": "1.16x"
+  },
+  {
+    "idx": 132,
+    "class": "org.apache.commons.math4.legacy.genetics.FixedGenerationCountTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 724
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 159
+    },
+    "ratio": "4.55x"
+  },
+  {
+    "idx": 133,
+    "class": "org.apache.commons.math4.legacy.genetics.GeneticAlgorithmTestBinary",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 865
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 236
+    },
+    "ratio": "3.67x"
+  },
+  {
+    "idx": 134,
+    "class": "org.apache.commons.math4.legacy.genetics.GeneticAlgorithmTestPermutations",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1163
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 266
+    },
+    "ratio": "4.37x"
+  },
+  {
+    "idx": 135,
+    "class": "org.apache.commons.math4.legacy.genetics.ListPopulationTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 834
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 203
+    },
+    "ratio": "4.11x"
+  },
+  {
+    "idx": 136,
+    "class": "org.apache.commons.math4.legacy.genetics.NPointCrossoverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 837
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 192
+    },
+    "ratio": "4.36x"
+  },
+  {
+    "idx": 137,
+    "class": "org.apache.commons.math4.legacy.genetics.OnePointCrossoverTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 762
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 195
+    },
+    "ratio": "3.91x"
+  },
+  {
+    "idx": 138,
+    "class": "org.apache.commons.math4.legacy.genetics.OrderedCrossoverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 792
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 227
+    },
+    "ratio": "3.49x"
+  },
+  {
+    "idx": 139,
+    "class": "org.apache.commons.math4.legacy.genetics.RandomKeyMutationTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 763
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 225
+    },
+    "ratio": "3.39x"
+  },
+  {
+    "idx": 140,
+    "class": "org.apache.commons.math4.legacy.genetics.RandomKeyTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 804
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 215
+    },
+    "ratio": "3.74x"
+  },
+  {
+    "idx": 141,
+    "class": "org.apache.commons.math4.legacy.genetics.TournamentSelectionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 761
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 208
+    },
+    "ratio": "3.66x"
+  },
+  {
+    "idx": 142,
+    "class": "org.apache.commons.math4.legacy.genetics.UniformCrossoverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1097
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 299
+    },
+    "ratio": "3.67x"
+  },
+  {
+    "idx": 143,
+    "class": "org.apache.commons.math4.legacy.linear.Array2DRowRealMatrixTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1052
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 239
+    },
+    "ratio": "4.4x"
+  },
+  {
+    "idx": 144,
+    "class": "org.apache.commons.math4.legacy.linear.ArrayFieldVectorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 972
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 295
+    },
+    "ratio": "3.29x"
+  },
+  {
+    "idx": 145,
+    "class": "org.apache.commons.math4.legacy.linear.ArrayRealVectorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1197
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 321
+    },
+    "ratio": "3.73x"
+  },
+  {
+    "idx": 146,
+    "class": "org.apache.commons.math4.legacy.linear.BiDiagonalTransformerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 769
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 219
+    },
+    "ratio": "3.51x"
+  },
+  {
+    "idx": 147,
+    "class": "org.apache.commons.math4.legacy.linear.BigRealFieldTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 743
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 207
+    },
+    "ratio": "3.59x"
+  },
+  {
+    "idx": 148,
+    "class": "org.apache.commons.math4.legacy.linear.BigRealTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 951
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 246
+    },
+    "ratio": "3.87x"
+  },
+  {
+    "idx": 149,
+    "class": "org.apache.commons.math4.legacy.linear.BlockFieldMatrixTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 7996
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2479
+    },
+    "ratio": "3.23x"
+  },
+  {
+    "idx": 150,
+    "class": "org.apache.commons.math4.legacy.linear.BlockRealMatrixTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1350
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 312
+    },
+    "ratio": "4.33x"
+  },
+  {
+    "idx": 151,
+    "class": "org.apache.commons.math4.legacy.linear.CholeskyDecompositionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 801
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 229
+    },
+    "ratio": "3.5x"
+  },
+  {
+    "idx": 152,
+    "class": "org.apache.commons.math4.legacy.linear.CholeskySolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 769
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 226
+    },
+    "ratio": "3.4x"
+  },
+  {
+    "idx": 153,
+    "class": "org.apache.commons.math4.legacy.linear.ConjugateGradientTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 971
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 244
+    },
+    "ratio": "3.98x"
+  },
+  {
+    "idx": 154,
+    "class": "org.apache.commons.math4.legacy.linear.DiagonalMatrixTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 835
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 205
+    },
+    "ratio": "4.07x"
+  },
+  {
+    "idx": 155,
+    "class": "org.apache.commons.math4.legacy.linear.EigenDecompositionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1306
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 398
+    },
+    "ratio": "3.28x"
+  },
+  {
+    "idx": 156,
+    "class": "org.apache.commons.math4.legacy.linear.EigenSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 776
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 208
+    },
+    "ratio": "3.73x"
+  },
+  {
+    "idx": 157,
+    "class": "org.apache.commons.math4.legacy.linear.FieldLUDecompositionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 982
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 305
+    },
+    "ratio": "3.22x"
+  },
+  {
+    "idx": 158,
+    "class": "org.apache.commons.math4.legacy.linear.FieldLUSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 825
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 320
+    },
+    "ratio": "2.58x"
+  },
+  {
+    "idx": 159,
+    "class": "org.apache.commons.math4.legacy.linear.FieldMatrixImplTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 4271
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1321
+    },
+    "ratio": "3.23x"
+  },
+  {
+    "idx": 160,
+    "class": "org.apache.commons.math4.legacy.linear.FrenchRealVectorFormatTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 821
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 183
+    },
+    "ratio": "4.49x"
+  },
+  {
+    "idx": 161,
+    "class": "org.apache.commons.math4.legacy.linear.HessenbergTransformerTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 905
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 272
+    },
+    "ratio": "3.33x"
+  },
+  {
+    "idx": 162,
+    "class": "org.apache.commons.math4.legacy.linear.LUDecompositionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 759
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 224
+    },
+    "ratio": "3.39x"
+  },
+  {
+    "idx": 163,
+    "class": "org.apache.commons.math4.legacy.linear.LUSolverTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 807
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 241
+    },
+    "ratio": "3.35x"
+  },
+  {
+    "idx": 164,
+    "class": "org.apache.commons.math4.legacy.linear.MatrixDimensionMismatchExceptionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 743
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 192
+    },
+    "ratio": "3.87x"
+  },
+  {
+    "idx": 165,
+    "class": "org.apache.commons.math4.legacy.linear.MatrixUtilsTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1696
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 388
+    },
+    "ratio": "4.37x"
+  },
+  {
+    "idx": 166,
+    "class": "org.apache.commons.math4.legacy.linear.OpenIntToDoubleHashMapTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1090
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 279
+    },
+    "ratio": "3.91x"
+  },
+  {
+    "idx": 167,
+    "class": "org.apache.commons.math4.legacy.linear.OpenIntToFieldTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1089
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 377
+    },
+    "ratio": "2.89x"
+  },
+  {
+    "idx": 168,
+    "class": "org.apache.commons.math4.legacy.linear.OpenMapRealMatrixTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 869
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 253
+    },
+    "ratio": "3.43x"
+  },
+  {
+    "idx": 169,
+    "class": "org.apache.commons.math4.legacy.linear.QRDecompositionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1047
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 299
+    },
+    "ratio": "3.5x"
+  },
+  {
+    "idx": 170,
+    "class": "org.apache.commons.math4.legacy.linear.QRSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1114
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 315
+    },
+    "ratio": "3.54x"
+  },
+  {
+    "idx": 171,
+    "class": "org.apache.commons.math4.legacy.linear.RRQRDecompositionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1148
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 308
+    },
+    "ratio": "3.73x"
+  },
+  {
+    "idx": 172,
+    "class": "org.apache.commons.math4.legacy.linear.RRQRSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1020
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 294
+    },
+    "ratio": "3.47x"
+  },
+  {
+    "idx": 173,
+    "class": "org.apache.commons.math4.legacy.linear.RealMatrixFormatAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 432
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 93
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 174,
+    "class": "org.apache.commons.math4.legacy.linear.RealMatrixFormatTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 958
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 231
+    },
+    "ratio": "4.15x"
+  },
+  {
+    "idx": 175,
+    "class": "org.apache.commons.math4.legacy.linear.RealVectorAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 393
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 84
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 176,
+    "class": "org.apache.commons.math4.legacy.linear.RealVectorFormatAbstractTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 475
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 87
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 177,
+    "class": "org.apache.commons.math4.legacy.linear.RealVectorFormatTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 883
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 212
+    },
+    "ratio": "4.17x"
+  },
+  {
+    "idx": 178,
+    "class": "org.apache.commons.math4.legacy.linear.RealVectorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1238
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 320
+    },
+    "ratio": "3.87x"
+  },
+  {
+    "idx": 179,
+    "class": "org.apache.commons.math4.legacy.linear.RectangularCholeskyDecompositionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 789
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 222
+    },
+    "ratio": "3.55x"
+  },
+  {
+    "idx": 180,
+    "class": "org.apache.commons.math4.legacy.linear.SchurTransformerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1053
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 309
+    },
+    "ratio": "3.41x"
+  },
+  {
+    "idx": 181,
+    "class": "org.apache.commons.math4.legacy.linear.SingularValueDecompositionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1198
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 305
+    },
+    "ratio": "3.93x"
+  },
+  {
+    "idx": 182,
+    "class": "org.apache.commons.math4.legacy.linear.SingularValueSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 852
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 232
+    },
+    "ratio": "3.67x"
+  },
+  {
+    "idx": 183,
+    "class": "org.apache.commons.math4.legacy.linear.SparseFieldMatrixTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1269
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 370
+    },
+    "ratio": "3.43x"
+  },
+  {
+    "idx": 184,
+    "class": "org.apache.commons.math4.legacy.linear.SparseFieldVectorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 966
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 346
+    },
+    "ratio": "2.79x"
+  },
+  {
+    "idx": 185,
+    "class": "org.apache.commons.math4.legacy.linear.SparseRealMatrixTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1072
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 277
+    },
+    "ratio": "3.87x"
+  },
+  {
+    "idx": 186,
+    "class": "org.apache.commons.math4.legacy.linear.SparseRealVectorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1446
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 368
+    },
+    "ratio": "3.93x"
+  },
+  {
+    "idx": 187,
+    "class": "org.apache.commons.math4.legacy.linear.SymmLQTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1182
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 312
+    },
+    "ratio": "3.79x"
+  },
+  {
+    "idx": 188,
+    "class": "org.apache.commons.math4.legacy.linear.TriDiagonalTransformerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 852
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 239
+    },
+    "ratio": "3.56x"
+  },
+  {
+    "idx": 189,
+    "class": "org.apache.commons.math4.legacy.linear.UnmodifiableArrayRealVectorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1212
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 285
+    },
+    "ratio": "4.25x"
+  },
+  {
+    "idx": 190,
+    "class": "org.apache.commons.math4.legacy.linear.UnmodifiableOpenMapRealVectorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1336
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 300
+    },
+    "ratio": "4.45x"
+  },
+  {
+    "idx": 191,
+    "class": "org.apache.commons.math4.legacy.linear.UnmodifiableRealVectorAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 431
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 91
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 192,
+    "class": "org.apache.commons.math4.legacy.ml.clustering.DBSCANClustererTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 827
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 247
+    },
+    "ratio": "3.35x"
+  },
+  {
+    "idx": 193,
+    "class": "org.apache.commons.math4.legacy.ml.clustering.ElkanKMeansPlusPlusClustererTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 881
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 271
+    },
+    "ratio": "3.25x"
+  },
+  {
+    "idx": 194,
+    "class": "org.apache.commons.math4.legacy.ml.clustering.FuzzyKMeansClustererTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 943
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 269
+    },
+    "ratio": "3.51x"
+  },
+  {
+    "idx": 195,
+    "class": "org.apache.commons.math4.legacy.ml.clustering.KMeansPlusPlusClustererTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1052
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 286
+    },
+    "ratio": "3.68x"
+  },
+  {
+    "idx": 196,
+    "class": "org.apache.commons.math4.legacy.ml.clustering.MiniBatchKMeansClustererTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 6496
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 415
+    },
+    "ratio": "15.65x"
+  },
+  {
+    "idx": 197,
+    "class": "org.apache.commons.math4.legacy.ml.clustering.MultiKMeansPlusPlusClustererTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 883
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 268
+    },
+    "ratio": "3.29x"
+  },
+  {
+    "idx": 198,
+    "class": "org.apache.commons.math4.legacy.ml.clustering.evaluation.CalinskiHarabaszTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1171
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 289
+    },
+    "ratio": "4.05x"
+  },
+  {
+    "idx": 199,
+    "class": "org.apache.commons.math4.legacy.ml.clustering.evaluation.SumOfClusterVariancesTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 764
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 236
+    },
+    "ratio": "3.24x"
+  },
+  {
+    "idx": 200,
+    "class": "org.apache.commons.math4.legacy.ml.distance.CanberraDistanceTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 789
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 247
+    },
+    "ratio": "3.19x"
+  },
+  {
+    "idx": 201,
+    "class": "org.apache.commons.math4.legacy.ml.distance.ChebyshevDistanceTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 711
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 221
+    },
+    "ratio": "3.22x"
+  },
+  {
+    "idx": 202,
+    "class": "org.apache.commons.math4.legacy.ml.distance.EarthMoversDistanceTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 787
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 231
+    },
+    "ratio": "3.41x"
+  },
+  {
+    "idx": 203,
+    "class": "org.apache.commons.math4.legacy.ml.distance.EuclideanDistanceTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 734
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 213
+    },
+    "ratio": "3.45x"
+  },
+  {
+    "idx": 204,
+    "class": "org.apache.commons.math4.legacy.ml.distance.ManhattanDistanceTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 782
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 221
+    },
+    "ratio": "3.54x"
+  },
+  {
+    "idx": 205,
+    "class": "org.apache.commons.math4.legacy.ode.ContinuousOutputFieldModelTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1230
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 328
+    },
+    "ratio": "3.75x"
+  },
+  {
+    "idx": 206,
+    "class": "org.apache.commons.math4.legacy.ode.ContinuousOutputModelTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1007
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 268
+    },
+    "ratio": "3.76x"
+  },
+  {
+    "idx": 207,
+    "class": "org.apache.commons.math4.legacy.ode.FieldExpandableODETest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 767
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 215
+    },
+    "ratio": "3.57x"
+  },
+  {
+    "idx": 208,
+    "class": "org.apache.commons.math4.legacy.ode.FirstOrderConverterTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 902
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 262
+    },
+    "ratio": "3.44x"
+  },
+  {
+    "idx": 209,
+    "class": "org.apache.commons.math4.legacy.ode.JacobianMatricesTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2539
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 668
+    },
+    "ratio": "3.8x"
+  },
+  {
+    "idx": 210,
+    "class": "org.apache.commons.math4.legacy.ode.TestFieldProblem1",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 795
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 228
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 211,
+    "class": "org.apache.commons.math4.legacy.ode.TestFieldProblem2",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 798
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 218
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 212,
+    "class": "org.apache.commons.math4.legacy.ode.TestFieldProblem3",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 648
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 197
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 213,
+    "class": "org.apache.commons.math4.legacy.ode.TestFieldProblem4",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 807
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 238
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 214,
+    "class": "org.apache.commons.math4.legacy.ode.TestFieldProblem5",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 1046
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 283
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 215,
+    "class": "org.apache.commons.math4.legacy.ode.TestFieldProblem6",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 773
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 187
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 216,
+    "class": "org.apache.commons.math4.legacy.ode.TestFieldProblemAbstract",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 436
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 96
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 217,
+    "class": "org.apache.commons.math4.legacy.ode.TestFieldProblemHandler",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 725
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 173
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 218,
+    "class": "org.apache.commons.math4.legacy.ode.TestProblem1",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 651
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 189
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 219,
+    "class": "org.apache.commons.math4.legacy.ode.TestProblem2",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 682
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 170
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 220,
+    "class": "org.apache.commons.math4.legacy.ode.TestProblem3",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 576
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 170
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 221,
+    "class": "org.apache.commons.math4.legacy.ode.TestProblem4",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 646
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 174
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 222,
+    "class": "org.apache.commons.math4.legacy.ode.TestProblem5",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 700
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 179
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 223,
+    "class": "org.apache.commons.math4.legacy.ode.TestProblem6",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 705
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 180
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 224,
+    "class": "org.apache.commons.math4.legacy.ode.TestProblemAbstract",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 408
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 89
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 225,
+    "class": "org.apache.commons.math4.legacy.ode.TestProblemHandler",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 704
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 194
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 226,
+    "class": "org.apache.commons.math4.legacy.ode.events.CloseEventsTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 839
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 270
+    },
+    "ratio": "3.11x"
+  },
+  {
+    "idx": 227,
+    "class": "org.apache.commons.math4.legacy.ode.events.EventFilterTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 956
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 288
+    },
+    "ratio": "3.32x"
+  },
+  {
+    "idx": 228,
+    "class": "org.apache.commons.math4.legacy.ode.events.EventStateTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 786
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 248
+    },
+    "ratio": "3.17x"
+  },
+  {
+    "idx": 229,
+    "class": "org.apache.commons.math4.legacy.ode.events.OverlappingEventsTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1117
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 272
+    },
+    "ratio": "4.11x"
+  },
+  {
+    "idx": 230,
+    "class": "org.apache.commons.math4.legacy.ode.events.ReappearingEventTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 771
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 231
+    },
+    "ratio": "3.34x"
+  },
+  {
+    "idx": 231,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.AbstractEmbeddedRungeKuttaFieldIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 417
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 92
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 232,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.AbstractRungeKuttaFieldIntegratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 409
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 90
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 233,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.AdamsBashforthFieldIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1201
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 300
+    },
+    "ratio": "4.0x"
+  },
+  {
+    "idx": 234,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.AdamsBashforthIntegratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1080
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 303
+    },
+    "ratio": "3.56x"
+  },
+  {
+    "idx": 235,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.AdamsFieldIntegratorAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 417
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 89
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 236,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.AdamsMoultonFieldIntegratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1342
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 348
+    },
+    "ratio": "3.86x"
+  },
+  {
+    "idx": 237,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.AdamsMoultonIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1039
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 280
+    },
+    "ratio": "3.71x"
+  },
+  {
+    "idx": 238,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.AdamsNordsieckTransformerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 800
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 227
+    },
+    "ratio": "3.52x"
+  },
+  {
+    "idx": 239,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungKuttaFieldStepInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 761
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 239
+    },
+    "ratio": "3.18x"
+  },
+  {
+    "idx": 240,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungeKuttaFieldIntegratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1975
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 616
+    },
+    "ratio": "3.21x"
+  },
+  {
+    "idx": 241,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungeKuttaIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1034
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 259
+    },
+    "ratio": "3.99x"
+  },
+  {
+    "idx": 242,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungeKuttaStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1208
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 301
+    },
+    "ratio": "4.01x"
+  },
+  {
+    "idx": 243,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.Decimal64Test",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1025
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 254
+    },
+    "ratio": "4.04x"
+  },
+  {
+    "idx": 244,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54FieldIntegratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1251
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 378
+    },
+    "ratio": "3.31x"
+  },
+  {
+    "idx": 245,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54FieldStepInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 785
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 205
+    },
+    "ratio": "3.83x"
+  },
+  {
+    "idx": 246,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54IntegratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 840
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 226
+    },
+    "ratio": "3.72x"
+  },
+  {
+    "idx": 247,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54StepInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1034
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 248
+    },
+    "ratio": "4.17x"
+  },
+  {
+    "idx": 248,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853FieldIntegratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1172
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 435
+    },
+    "ratio": "2.69x"
+  },
+  {
+    "idx": 249,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853FieldStepInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 795
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 219
+    },
+    "ratio": "3.63x"
+  },
+  {
+    "idx": 250,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853IntegratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 870
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 223
+    },
+    "ratio": "3.9x"
+  },
+  {
+    "idx": 251,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853StepInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1038
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 282
+    },
+    "ratio": "3.68x"
+  },
+  {
+    "idx": 252,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.EmbeddedRungeKuttaFieldIntegratorAbstractTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 394
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 86
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 253,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.EulerFieldIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1412
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 433
+    },
+    "ratio": "3.26x"
+  },
+  {
+    "idx": 254,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.EulerFieldStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 709
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 204
+    },
+    "ratio": "3.48x"
+  },
+  {
+    "idx": 255,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.EulerIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 870
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 254
+    },
+    "ratio": "3.43x"
+  },
+  {
+    "idx": 256,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.EulerStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1076
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 251
+    },
+    "ratio": "4.29x"
+  },
+  {
+    "idx": 257,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.GillFieldIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1867
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 603
+    },
+    "ratio": "3.1x"
+  },
+  {
+    "idx": 258,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.GillFieldStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 713
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 228
+    },
+    "ratio": "3.13x"
+  },
+  {
+    "idx": 259,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.GillIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 934
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 256
+    },
+    "ratio": "3.65x"
+  },
+  {
+    "idx": 260,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.GillStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1093
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 278
+    },
+    "ratio": "3.93x"
+  },
+  {
+    "idx": 261,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.GraggBulirschStoerIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1214
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 287
+    },
+    "ratio": "4.23x"
+  },
+  {
+    "idx": 262,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.GraggBulirschStoerStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1025
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 269
+    },
+    "ratio": "3.81x"
+  },
+  {
+    "idx": 263,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54FieldIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1124
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 521
+    },
+    "ratio": "2.16x"
+  },
+  {
+    "idx": 264,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54FieldStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 697
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 210
+    },
+    "ratio": "3.32x"
+  },
+  {
+    "idx": 265,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54IntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 865
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 245
+    },
+    "ratio": "3.53x"
+  },
+  {
+    "idx": 266,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54StepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1056
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 239
+    },
+    "ratio": "4.42x"
+  },
+  {
+    "idx": 267,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.LutherFieldIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2771
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 904
+    },
+    "ratio": "3.07x"
+  },
+  {
+    "idx": 268,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.LutherFieldStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 781
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 227
+    },
+    "ratio": "3.44x"
+  },
+  {
+    "idx": 269,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.LutherIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1073
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 313
+    },
+    "ratio": "3.43x"
+  },
+  {
+    "idx": 270,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.LutherStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1350
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 290
+    },
+    "ratio": "4.66x"
+  },
+  {
+    "idx": 271,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.MidpointFieldIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1788
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 714
+    },
+    "ratio": "2.5x"
+  },
+  {
+    "idx": 272,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.MidpointFieldStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1129
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 316
+    },
+    "ratio": "3.57x"
+  },
+  {
+    "idx": 273,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.MidpointIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1610
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 413
+    },
+    "ratio": "3.9x"
+  },
+  {
+    "idx": 274,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.MidpointStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2017
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 352
+    },
+    "ratio": "5.73x"
+  },
+  {
+    "idx": 275,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.RungeKuttaFieldIntegratorAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 785
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 233
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 276,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.RungeKuttaFieldStepInterpolatorAbstractTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 780
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 151
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 277,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesFieldIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 3049
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 731
+    },
+    "ratio": "4.17x"
+  },
+  {
+    "idx": 278,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesFieldStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 826
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 260
+    },
+    "ratio": "3.18x"
+  },
+  {
+    "idx": 279,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesIntegratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1057
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 317
+    },
+    "ratio": "3.33x"
+  },
+  {
+    "idx": 280,
+    "class": "org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 4362
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 334
+    },
+    "ratio": "13.06x"
+  },
+  {
+    "idx": 281,
+    "class": "org.apache.commons.math4.legacy.ode.sampling.DummyStepInterpolatorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 3105
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1035
+    },
+    "ratio": "3.0x"
+  },
+  {
+    "idx": 282,
+    "class": "org.apache.commons.math4.legacy.ode.sampling.NordsieckStepInterpolatorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 4108
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1196
+    },
+    "ratio": "3.43x"
+  },
+  {
+    "idx": 283,
+    "class": "org.apache.commons.math4.legacy.ode.sampling.StepInterpolatorTestUtils",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 1126
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 264
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 284,
+    "class": "org.apache.commons.math4.legacy.ode.sampling.StepNormalizerOutputOverlapTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 939
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 303
+    },
+    "ratio": "3.1x"
+  },
+  {
+    "idx": 285,
+    "class": "org.apache.commons.math4.legacy.ode.sampling.StepNormalizerOutputTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 855
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 265
+    },
+    "ratio": "3.23x"
+  },
+  {
+    "idx": 286,
+    "class": "org.apache.commons.math4.legacy.ode.sampling.StepNormalizerOutputTestBase",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 411
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 99
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 287,
+    "class": "org.apache.commons.math4.legacy.ode.sampling.StepNormalizerTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 847
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 251
+    },
+    "ratio": "3.37x"
+  },
+  {
+    "idx": 288,
+    "class": "org.apache.commons.math4.legacy.optim.BaseOptimizerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 750
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 199
+    },
+    "ratio": "3.77x"
+  },
+  {
+    "idx": 289,
+    "class": "org.apache.commons.math4.legacy.optim.PointValuePairTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 744
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 200
+    },
+    "ratio": "3.72x"
+  },
+  {
+    "idx": 290,
+    "class": "org.apache.commons.math4.legacy.optim.PointVectorValuePairTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 720
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 196
+    },
+    "ratio": "3.67x"
+  },
+  {
+    "idx": 291,
+    "class": "org.apache.commons.math4.legacy.optim.SimplePointCheckerTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 771
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 223
+    },
+    "ratio": "3.46x"
+  },
+  {
+    "idx": 292,
+    "class": "org.apache.commons.math4.legacy.optim.SimpleValueCheckerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 732
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 225
+    },
+    "ratio": "3.25x"
+  },
+  {
+    "idx": 293,
+    "class": "org.apache.commons.math4.legacy.optim.SimpleVectorValueCheckerTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 774
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 201
+    },
+    "ratio": "3.85x"
+  },
+  {
+    "idx": 294,
+    "class": "org.apache.commons.math4.legacy.optim.linear.SimplexSolverTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1304
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 333
+    },
+    "ratio": "3.92x"
+  },
+  {
+    "idx": 295,
+    "class": "org.apache.commons.math4.legacy.optim.linear.SimplexTableauTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 829
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 195
+    },
+    "ratio": "4.25x"
+  },
+  {
+    "idx": 296,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.MultiStartMultivariateOptimizerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 878
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 278
+    },
+    "ratio": "3.16x"
+  },
+  {
+    "idx": 297,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.MultivariateFunctionMappingAdapterTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 786
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 220
+    },
+    "ratio": "3.57x"
+  },
+  {
+    "idx": 298,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.MultivariateFunctionPenaltyAdapterTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 845
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 226
+    },
+    "ratio": "3.74x"
+  },
+  {
+    "idx": 299,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.TestFunction",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 646
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 171
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 300,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.gradient.NonLinearConjugateGradientOptimizerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 844
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 239
+    },
+    "ratio": "3.53x"
+  },
+  {
+    "idx": 301,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.BOBYQAOptimizerTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 7528
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2161
+    },
+    "ratio": "3.48x"
+  },
+  {
+    "idx": 302,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 12155
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2049
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 303,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.OptimTestUtils",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 1060
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 240
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 304,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.PowellOptimizerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1128
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 268
+    },
+    "ratio": "4.21x"
+  },
+  {
+    "idx": 305,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerMultiDirectionalTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1025
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 353
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 306,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerNelderMeadTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 1457
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 445
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 307,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 1280
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 273
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 308,
+    "class": "org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 909
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 211
+    },
+    "ratio": "4.31x"
+  },
+  {
+    "idx": 309,
+    "class": "org.apache.commons.math4.legacy.optim.univariate.BracketFinderTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 880
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 289
+    },
+    "ratio": "3.04x"
+  },
+  {
+    "idx": 310,
+    "class": "org.apache.commons.math4.legacy.optim.univariate.BrentOptimizerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1297
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 301
+    },
+    "ratio": "4.31x"
+  },
+  {
+    "idx": 311,
+    "class": "org.apache.commons.math4.legacy.optim.univariate.MultiStartUnivariateOptimizerTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1323
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 360
+    },
+    "ratio": "3.67x"
+  },
+  {
+    "idx": 312,
+    "class": "org.apache.commons.math4.legacy.optim.univariate.SimpleUnivariateValueCheckerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1120
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 293
+    },
+    "ratio": "3.82x"
+  },
+  {
+    "idx": 313,
+    "class": "org.apache.commons.math4.legacy.random.CorrelatedVectorFactoryTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1546
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 416
+    },
+    "ratio": "3.72x"
+  },
+  {
+    "idx": 314,
+    "class": "org.apache.commons.math4.legacy.random.HaltonSequenceGeneratorTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1142
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 279
+    },
+    "ratio": "4.09x"
+  },
+  {
+    "idx": 315,
+    "class": "org.apache.commons.math4.legacy.random.SobolSequenceGeneratorTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1691
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 402
+    },
+    "ratio": "4.21x"
+  },
+  {
+    "idx": 316,
+    "class": "org.apache.commons.math4.legacy.special.BesselJTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 945
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 251
+    },
+    "ratio": "3.76x"
+  },
+  {
+    "idx": 317,
+    "class": "org.apache.commons.math4.legacy.stat.CertifiedDataTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1079
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 267
+    },
+    "ratio": "4.04x"
+  },
+  {
+    "idx": 318,
+    "class": "org.apache.commons.math4.legacy.stat.FrequencyTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 838
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 203
+    },
+    "ratio": "4.13x"
+  },
+  {
+    "idx": 319,
+    "class": "org.apache.commons.math4.legacy.stat.StatUtilsTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 805
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 250
+    },
+    "ratio": "3.22x"
+  },
+  {
+    "idx": 320,
+    "class": "org.apache.commons.math4.legacy.stat.correlation.CovarianceTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1149
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 228
+    },
+    "ratio": "5.04x"
+  },
+  {
+    "idx": 321,
+    "class": "org.apache.commons.math4.legacy.stat.correlation.KendallsCorrelationTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 4639
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1813
+    },
+    "ratio": "2.56x"
+  },
+  {
+    "idx": 322,
+    "class": "org.apache.commons.math4.legacy.stat.correlation.PearsonsCorrelationTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2831
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 970
+    },
+    "ratio": "2.92x"
+  },
+  {
+    "idx": 323,
+    "class": "org.apache.commons.math4.legacy.stat.correlation.SpearmansRankCorrelationTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2870
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1074
+    },
+    "ratio": "2.67x"
+  },
+  {
+    "idx": 324,
+    "class": "org.apache.commons.math4.legacy.stat.correlation.StorelessCovarianceTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2664
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1046
+    },
+    "ratio": "2.55x"
+  },
+  {
+    "idx": 325,
+    "class": "org.apache.commons.math4.legacy.stat.data.CertifiedDataAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 705
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 136
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 326,
+    "class": "org.apache.commons.math4.legacy.stat.data.LewTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1076
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 435
+    },
+    "ratio": "2.47x"
+  },
+  {
+    "idx": 327,
+    "class": "org.apache.commons.math4.legacy.stat.data.LotteryTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 915
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 257
+    },
+    "ratio": "3.56x"
+  },
+  {
+    "idx": 328,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.AbstractUnivariateStatisticTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 725
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 196
+    },
+    "ratio": "3.7x"
+  },
+  {
+    "idx": 329,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.AggregateSummaryStatisticsTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 869
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 284
+    },
+    "ratio": "3.06x"
+  },
+  {
+    "idx": 330,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.DescriptiveStatisticsTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 911
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 260
+    },
+    "ratio": "3.5x"
+  },
+  {
+    "idx": 331,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.DoubleArrayAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 386
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 82
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 332,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.MultivariateSummaryStatisticsTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 829
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 253
+    },
+    "ratio": "3.28x"
+  },
+  {
+    "idx": 333,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.ResizableDoubleArrayTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 900
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 364
+    },
+    "ratio": "2.47x"
+  },
+  {
+    "idx": 334,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.StatisticalSummaryValuesTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 745
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 273
+    },
+    "ratio": "2.73x"
+  },
+  {
+    "idx": 335,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.StatisticsTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 800
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 204
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 336,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.StorelessUnivariateStatisticAbstractTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 410
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 84
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 337,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.SummaryStatisticsTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1208
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 248
+    },
+    "ratio": "4.87x"
+  },
+  {
+    "idx": 338,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.SynchronizedDescriptiveStatisticsTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1371
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 663
+    },
+    "ratio": "2.07x"
+  },
+  {
+    "idx": 339,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.SynchronizedMultivariateSummaryStatisticsTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 822
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 220
+    },
+    "ratio": "3.74x"
+  },
+  {
+    "idx": 340,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.SynchronizedSummaryStatisticsTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 782
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 239
+    },
+    "ratio": "3.27x"
+  },
+  {
+    "idx": 341,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.UnivariateStatisticAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 393
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 95
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 342,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.WeightedEvaluationAbstractTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 402
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 85
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 343,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.moment.SemiVarianceTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 858
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 178
+    },
+    "ratio": "4.82x"
+  },
+  {
+    "idx": 344,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.moment.VectorialCovarianceTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 777
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 202
+    },
+    "ratio": "3.85x"
+  },
+  {
+    "idx": 345,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.moment.VectorialMeanTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 680
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 177
+    },
+    "ratio": "3.84x"
+  },
+  {
+    "idx": 346,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.moment.WeightedMeanTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 737
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 176
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 347,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.moment.WeightedVarianceTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 733
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 180
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 348,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.rank.PSquarePercentileTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 22195
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 4332
+    },
+    "ratio": "5.12x"
+  },
+  {
+    "idx": 349,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.summary.WeightedProductTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 720
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 175
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 350,
+    "class": "org.apache.commons.math4.legacy.stat.descriptive.summary.WeightedSumTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 742
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 161
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 351,
+    "class": "org.apache.commons.math4.legacy.stat.regression.GLSMultipleLinearRegressionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 2086
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 414
+    },
+    "ratio": "5.04x"
+  },
+  {
+    "idx": 352,
+    "class": "org.apache.commons.math4.legacy.stat.regression.MillerUpdatingRegressionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 907
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 243
+    },
+    "ratio": "3.73x"
+  },
+  {
+    "idx": 353,
+    "class": "org.apache.commons.math4.legacy.stat.regression.MultipleLinearRegressionAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 386
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 78
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 354,
+    "class": "org.apache.commons.math4.legacy.stat.regression.OLSMultipleLinearRegressionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 930
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 260
+    },
+    "ratio": "3.58x"
+  },
+  {
+    "idx": 355,
+    "class": "org.apache.commons.math4.legacy.stat.regression.SimpleRegressionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 783
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 243
+    },
+    "ratio": "3.22x"
+  },
+  {
+    "idx": 356,
+    "class": "org.apache.commons.math4.legacy.util.ComplexFormatAbstractTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 389
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 84
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 357,
+    "class": "org.apache.commons.math4.legacy.util.ComplexFormatTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 919
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 219
+    },
+    "ratio": "4.2x"
+  },
+  {
+    "idx": 358,
+    "class": "org.apache.commons.math4.legacy.util.FrenchComplexFormatTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1019
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 248
+    },
+    "ratio": "4.11x"
+  },
+  {
+    "idx": 359,
+    "class": "org.apache.commons.math4.legacy.util.TestBean",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 635
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 180
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 360,
+    "class": "org.apache.commons.math4.neuralnet.MapRankingTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 971
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 236
+    },
+    "ratio": "4.11x"
+  },
+  {
+    "idx": 361,
+    "class": "org.apache.commons.math4.neuralnet.NetworkTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 853
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 256
+    },
+    "ratio": "3.33x"
+  },
+  {
+    "idx": 362,
+    "class": "org.apache.commons.math4.neuralnet.NeuronTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 784
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 205
+    },
+    "ratio": "3.82x"
+  },
+  {
+    "idx": 363,
+    "class": "org.apache.commons.math4.neuralnet.oned.NeuronStringTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 926
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 220
+    },
+    "ratio": "4.21x"
+  },
+  {
+    "idx": 364,
+    "class": "org.apache.commons.math4.neuralnet.sofm.KohonenUpdateActionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 860
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 257
+    },
+    "ratio": "3.35x"
+  },
+  {
+    "idx": 365,
+    "class": "org.apache.commons.math4.neuralnet.sofm.LearningFactorFunctionFactoryTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 890
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 223
+    },
+    "ratio": "3.99x"
+  },
+  {
+    "idx": 366,
+    "class": "org.apache.commons.math4.neuralnet.sofm.NeighbourhoodSizeFunctionFactoryTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 880
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 229
+    },
+    "ratio": "3.84x"
+  },
+  {
+    "idx": 367,
+    "class": "org.apache.commons.math4.neuralnet.sofm.util.ExponentialDecayFunctionTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 875
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 235
+    },
+    "ratio": "3.72x"
+  },
+  {
+    "idx": 368,
+    "class": "org.apache.commons.math4.neuralnet.sofm.util.QuasiSigmoidDecayFunctionTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 824
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 261
+    },
+    "ratio": "3.16x"
+  },
+  {
+    "idx": 369,
+    "class": "org.apache.commons.math4.neuralnet.twod.NeuronSquareMesh2DTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1005
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 250
+    },
+    "ratio": "4.02x"
+  },
+  {
+    "idx": 370,
+    "class": "org.apache.commons.math4.neuralnet.twod.util.LocationFinderTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 790
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 242
+    },
+    "ratio": "3.26x"
+  },
+  {
+    "idx": 371,
+    "class": "org.apache.commons.math4.transform.FastCosineTransformerTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 1134
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 253
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 372,
+    "class": "org.apache.commons.math4.transform.FastFourierTransformerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 1025
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 247
+    },
+    "ratio": "4.15x"
+  },
+  {
+    "idx": 373,
+    "class": "org.apache.commons.math4.transform.FastHadamardTransformerTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 831
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 202
+    },
+    "ratio": "4.11x"
+  },
+  {
+    "idx": 374,
+    "class": "org.apache.commons.math4.transform.FastSineTransformerTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 1310
+    },
+    "hotspot": {
+      "status": "FAIL",
+      "rc": 1,
+      "ms": 279
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 375,
+    "class": "org.apache.commons.math4.transform.RealTransformerAbstractTest",
+    "first_arm": "CVM",
+    "cvm": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 553
+    },
+    "hotspot": {
+      "status": "SKIP_ABSTRACT",
+      "rc": 0,
+      "ms": 142
+    },
+    "ratio": "-"
+  },
+  {
+    "idx": 376,
+    "class": "org.apache.commons.math4.transform.TransformUtilsTest",
+    "first_arm": "HotSpot",
+    "cvm": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 787
+    },
+    "hotspot": {
+      "status": "PASS",
+      "rc": 0,
+      "ms": 238
+    },
+    "ratio": "3.31x"
+  }
+]

@@ -1,0 +1,41 @@
+# jdk-baseline	2
+# kind	class
+# name	java.util.Base64$Encoder
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/util/Base64$Encoder.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	6
+# protected-methods	0
+# declared-methods	10
+# declared-fields	11
+# rows	25
+# columns	kind	name	descriptor	flags
+CLASS	java.util.Base64$Encoder		public
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	(Z[BIZ)V	private
+METHOD	encode	(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;	public
+METHOD	encode	([B)[B	public
+METHOD	encode	([B[B)I	public
+METHOD	encode0	([BII[B)I	private
+METHOD	encodeBlock	([BII[BIZ)V	private
+METHOD	encodeToString	([B)Ljava/lang/String;	public
+METHOD	encodedOutLength	(IZ)I	private,final
+METHOD	withoutPadding	()Ljava/util/Base64$Encoder;	public
+METHOD	wrap	(Ljava/io/OutputStream;)Ljava/io/OutputStream;	public
+FIELD	CRLF	[B	private,static,final
+FIELD	MIMELINEMAX	I	private,static,final
+FIELD	RFC2045	Ljava/util/Base64$Encoder;	static,final
+FIELD	RFC4648	Ljava/util/Base64$Encoder;	static,final
+FIELD	RFC4648_URLSAFE	Ljava/util/Base64$Encoder;	static,final
+FIELD	doPadding	Z	private,final
+FIELD	isURL	Z	private,final
+FIELD	linemax	I	private,final
+FIELD	newline	[B	private,final
+FIELD	toBase64	[C	private,static,final
+FIELD	toBase64URL	[C	private,static,final

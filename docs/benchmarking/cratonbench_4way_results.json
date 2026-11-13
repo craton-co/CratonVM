@@ -1,0 +1,471 @@
+{
+  "Arithmetic": [
+    {
+      "label": "1B",
+      "checksums": {
+        "cvm_default": "1250000001999999997",
+        "cvm_fastboot": "1250000001999999997",
+        "hotspot": "1250000001999999997",
+        "graalvm": "1250000001999999997"
+      },
+      "cvm_default": 1253,
+      "cvm_fastboot": 1256,
+      "hotspot": 1105,
+      "graalvm": 1079
+    },
+    {
+      "label": "1.5B",
+      "checksums": {
+        "cvm_default": "2812500002999999995",
+        "cvm_fastboot": "2812500002999999995",
+        "hotspot": "2812500002999999995",
+        "graalvm": "2812500002999999995"
+      },
+      "cvm_default": 1883,
+      "cvm_fastboot": 1880,
+      "hotspot": 1727,
+      "graalvm": 1614
+    },
+    {
+      "label": "2B",
+      "checksums": {
+        "cvm_default": "5000000003999999995",
+        "cvm_fastboot": "5000000003999999995",
+        "hotspot": "5000000003999999995",
+        "graalvm": "5000000003999999995"
+      },
+      "cvm_default": 2506,
+      "cvm_fastboot": 2507,
+      "hotspot": 2210,
+      "graalvm": 2147
+    },
+    {
+      "label": "2.4B",
+      "checksums": {
+        "cvm_default": "7200000004799999997",
+        "cvm_fastboot": "7200000004799999997",
+        "hotspot": "7200000004799999997",
+        "graalvm": "7200000004799999997"
+      },
+      "cvm_default": 3007,
+      "cvm_fastboot": 3009,
+      "hotspot": 2651,
+      "graalvm": 2578
+    },
+    {
+      "label": "3B",
+      "checksums": {
+        "cvm_default": "-7196744067709551622",
+        "cvm_fastboot": "-7196744067709551622",
+        "hotspot": "-7196744067709551622",
+        "graalvm": "-7196744067709551622"
+      },
+      "cvm_default": 3761,
+      "cvm_fastboot": 3761,
+      "hotspot": 3313,
+      "graalvm": 3222
+    }
+  ],
+  "Fibonacci": [
+    {
+      "label": "40",
+      "checksums": {
+        "cvm_default": "102334155",
+        "cvm_fastboot": "102334155",
+        "hotspot": "102334155",
+        "graalvm": "102334155"
+      },
+      "cvm_default": 68,
+      "cvm_fastboot": 67,
+      "hotspot": 255,
+      "graalvm": 180
+    },
+    {
+      "label": "42",
+      "checksums": {
+        "cvm_default": "267914296",
+        "cvm_fastboot": "267914296",
+        "hotspot": "267914296",
+        "graalvm": "267914296"
+      },
+      "cvm_default": 175,
+      "cvm_fastboot": 175,
+      "hotspot": 665,
+      "graalvm": 464
+    },
+    {
+      "label": "44",
+      "checksums": {
+        "cvm_default": "701408733",
+        "cvm_fastboot": "701408733",
+        "hotspot": "701408733",
+        "graalvm": "701408733"
+      },
+      "cvm_default": 456,
+      "cvm_fastboot": 456,
+      "hotspot": 1746,
+      "graalvm": 1215
+    },
+    {
+      "label": "46",
+      "checksums": {
+        "cvm_default": "1836311903",
+        "cvm_fastboot": "1836311903",
+        "hotspot": "1836311903",
+        "graalvm": "1836311903"
+      },
+      "cvm_default": 1195,
+      "cvm_fastboot": 1191,
+      "hotspot": 4562,
+      "graalvm": 3174
+    },
+    {
+      "label": "48",
+      "checksums": {
+        "cvm_default": "512559680",
+        "cvm_fastboot": "512559680",
+        "hotspot": "512559680",
+        "graalvm": "512559680"
+      },
+      "cvm_default": 3114,
+      "cvm_fastboot": 3112,
+      "hotspot": 11935,
+      "graalvm": 8229
+    }
+  ],
+  "Sieve": [
+    {
+      "label": "50K \u00d7 10K",
+      "checksums": {
+        "cvm_default": "5133",
+        "cvm_fastboot": "5133",
+        "hotspot": "5133",
+        "graalvm": "5133"
+      },
+      "cvm_default": 701,
+      "cvm_fastboot": 715,
+      "hotspot": 613,
+      "graalvm": 468
+    },
+    {
+      "label": "50K \u00d7 20K",
+      "checksums": {
+        "cvm_default": "5133",
+        "cvm_fastboot": "5133",
+        "hotspot": "5133",
+        "graalvm": "5133"
+      },
+      "cvm_default": 1409,
+      "cvm_fastboot": 1402,
+      "hotspot": 1121,
+      "graalvm": 859
+    },
+    {
+      "label": "100K \u00d7 20K",
+      "checksums": {
+        "cvm_default": "9592",
+        "cvm_fastboot": "9592",
+        "hotspot": "9592",
+        "graalvm": "9592"
+      },
+      "cvm_default": 3476,
+      "cvm_fastboot": 3487,
+      "hotspot": 2249,
+      "graalvm": 1612
+    },
+    {
+      "label": "100K \u00d7 40K",
+      "checksums": {
+        "cvm_default": "9592",
+        "cvm_fastboot": "9592",
+        "hotspot": "9592",
+        "graalvm": "9592"
+      },
+      "cvm_default": 6778,
+      "cvm_fastboot": 6768,
+      "hotspot": 6619,
+      "graalvm": 3152
+    },
+    {
+      "label": "100K \u00d7 60K",
+      "checksums": {
+        "cvm_default": "9592",
+        "cvm_fastboot": "9592",
+        "hotspot": "9592",
+        "graalvm": "9592"
+      },
+      "cvm_default": 10150,
+      "cvm_fastboot": 10210,
+      "hotspot": 9578,
+      "graalvm": 4633
+    }
+  ],
+  "Matrix": [
+    {
+      "label": "720x720",
+      "checksums": {
+        "cvm_default": "-123898080",
+        "cvm_fastboot": "-123898080",
+        "hotspot": "-123898080",
+        "graalvm": "-123898080"
+      },
+      "cvm_default": 462,
+      "cvm_fastboot": 460,
+      "hotspot": 454,
+      "graalvm": 470
+    },
+    {
+      "label": "960x960",
+      "checksums": {
+        "cvm_default": "-293991040",
+        "cvm_fastboot": "-293991040",
+        "hotspot": "-293991040",
+        "graalvm": "-293991040"
+      },
+      "cvm_default": 1057,
+      "cvm_fastboot": 1053,
+      "hotspot": 1063,
+      "graalvm": 1063
+    },
+    {
+      "label": "1280x1280",
+      "checksums": {
+        "cvm_default": "-697413120",
+        "cvm_fastboot": "-697413120",
+        "hotspot": "-697413120",
+        "graalvm": "-697413120"
+      },
+      "cvm_default": 2614,
+      "cvm_fastboot": 2569,
+      "hotspot": 2588,
+      "graalvm": 2586
+    },
+    {
+      "label": "1920x1920",
+      "checksums": {
+        "cvm_default": "1939356416",
+        "cvm_fastboot": "1939356416",
+        "hotspot": "1939356416",
+        "graalvm": "1939356416"
+      },
+      "cvm_default": 10630,
+      "cvm_fastboot": 10456,
+      "hotspot": 12432,
+      "graalvm": 10590
+    },
+    {
+      "label": "2560x2560",
+      "checksums": {
+        "cvm_default": "-1290886144",
+        "cvm_fastboot": "-1290886144",
+        "hotspot": "-1290886144",
+        "graalvm": "-1290886144"
+      },
+      "cvm_default": 66086,
+      "cvm_fastboot": 68055,
+      "hotspot": 62574,
+      "graalvm": 61061
+    }
+  ],
+  "Binary Trees": [
+    {
+      "label": "16",
+      "checksums": {
+        "cvm_default": "14985902",
+        "cvm_fastboot": "14985902",
+        "hotspot": "14985902",
+        "graalvm": "14985902"
+      },
+      "cvm_default": 322,
+      "cvm_fastboot": 324,
+      "hotspot": 140,
+      "graalvm": 132
+    },
+    {
+      "label": "18",
+      "checksums": {
+        "cvm_default": "68332206",
+        "cvm_fastboot": "68332206",
+        "hotspot": "68332206",
+        "graalvm": "68332206"
+      },
+      "cvm_default": 1453,
+      "cvm_fastboot": 1487,
+      "hotspot": 450,
+      "graalvm": 434
+    },
+    {
+      "label": "20",
+      "checksums": {
+        "cvm_default": "306883246",
+        "cvm_fastboot": "306883246",
+        "hotspot": "306883246",
+        "graalvm": "306883246"
+      },
+      "cvm_default": 6728,
+      "cvm_fastboot": 6448,
+      "hotspot": 1504,
+      "graalvm": 1572
+    },
+    {
+      "label": "22",
+      "checksums": {
+        "cvm_default": "1361750702",
+        "cvm_fastboot": "1361750702",
+        "hotspot": "1361750702",
+        "graalvm": "1361750702"
+      },
+      "cvm_default": 31076,
+      "cvm_fastboot": 28626,
+      "hotspot": 5951,
+      "graalvm": 6225
+    },
+    {
+      "label": "24",
+      "checksums": {
+        "cvm_default": "1688906414",
+        "cvm_fastboot": "1688906414",
+        "hotspot": "1688906414",
+        "graalvm": "1688906414"
+      },
+      "cvm_default": 141546,
+      "cvm_fastboot": 137968,
+      "hotspot": 24632,
+      "graalvm": 26012
+    }
+  ],
+  "HashMap": [
+    {
+      "label": "1M",
+      "checksums": {
+        "cvm_default": "999999000000",
+        "cvm_fastboot": "999999000000",
+        "hotspot": "999999000000",
+        "graalvm": "999999000000"
+      },
+      "cvm_default": 79,
+      "cvm_fastboot": 78,
+      "hotspot": 81,
+      "graalvm": 86
+    },
+    {
+      "label": "5M",
+      "checksums": {
+        "cvm_default": "24999995000000",
+        "cvm_fastboot": "24999995000000",
+        "hotspot": "24999995000000",
+        "graalvm": "24999995000000"
+      },
+      "cvm_default": 255,
+      "cvm_fastboot": 251,
+      "hotspot": 330,
+      "graalvm": 219
+    },
+    {
+      "label": "10M",
+      "checksums": {
+        "cvm_default": "99999990000000",
+        "cvm_fastboot": "99999990000000",
+        "hotspot": "99999990000000",
+        "graalvm": "99999990000000"
+      },
+      "cvm_default": 493,
+      "cvm_fastboot": 493,
+      "hotspot": 616,
+      "graalvm": 533
+    },
+    {
+      "label": "50M",
+      "checksums": {
+        "cvm_default": "2499999950000000",
+        "cvm_fastboot": "2499999950000000",
+        "hotspot": "2499999950000000",
+        "graalvm": "2499999950000000"
+      },
+      "cvm_default": 3802,
+      "cvm_fastboot": 3852,
+      "hotspot": 2987,
+      "graalvm": 2354
+    },
+    {
+      "label": "100M",
+      "checksums": {
+        "cvm_default": "9999999900000000",
+        "cvm_fastboot": "9999999900000000",
+        "hotspot": "9999999900000000",
+        "graalvm": "9999999900000000"
+      },
+      "cvm_default": 12557,
+      "cvm_fastboot": 12378,
+      "hotspot": 5640,
+      "graalvm": 4914
+    }
+  ],
+  "String / Regex": [
+    {
+      "label": "100K",
+      "checksums": {
+        "cvm_default": "5000050000",
+        "cvm_fastboot": "5000050000",
+        "hotspot": "5000050000",
+        "graalvm": "5000050000"
+      },
+      "cvm_default": 65,
+      "cvm_fastboot": 65,
+      "hotspot": 24,
+      "graalvm": 30
+    },
+    {
+      "label": "500K",
+      "checksums": {
+        "cvm_default": "125000250000",
+        "cvm_fastboot": "125000250000",
+        "hotspot": "125000250000",
+        "graalvm": "125000250000"
+      },
+      "cvm_default": 188,
+      "cvm_fastboot": 207,
+      "hotspot": 52,
+      "graalvm": 106
+    },
+    {
+      "label": "1M",
+      "checksums": {
+        "cvm_default": "500000500000",
+        "cvm_fastboot": "500000500000",
+        "hotspot": "500000500000",
+        "graalvm": "500000500000"
+      },
+      "cvm_default": 352,
+      "cvm_fastboot": 340,
+      "hotspot": 78,
+      "graalvm": 83
+    },
+    {
+      "label": "5M",
+      "checksums": {
+        "cvm_default": "12500002500000",
+        "cvm_fastboot": "12500002500000",
+        "hotspot": "12500002500000",
+        "graalvm": "12500002500000"
+      },
+      "cvm_default": 1645,
+      "cvm_fastboot": 1602,
+      "hotspot": 290,
+      "graalvm": 247
+    },
+    {
+      "label": "10M",
+      "checksums": {
+        "cvm_default": "50000005000000",
+        "cvm_fastboot": "50000005000000",
+        "hotspot": "50000005000000",
+        "graalvm": "50000005000000"
+      },
+      "cvm_default": 3066,
+      "cvm_fastboot": 3233,
+      "hotspot": 563,
+      "graalvm": 458
+    }
+  ]
+}
