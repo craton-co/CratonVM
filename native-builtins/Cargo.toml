@@ -185,7 +185,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 unicode-normalization = "0.1"
 # RA.4: streaming XML parser for JBoss Modules module.xml. `quick-xml` is a
 # pure-Rust, zero-alloc-friendly parser — no C toolchain dependencies.
-quick-xml = "0.31"
+quick-xml = "0.42"
 # WP5.2: real PKCS#12 parsing for sun.security.pkcs12.PKCS12KeyStore. The p12
 # crate provides PFX/SafeBag/CertBag DER parsing and PBE-decrypt of shrouded
 # private-key bags — the surface real-JDK exposes.
