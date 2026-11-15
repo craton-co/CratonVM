@@ -12,7 +12,7 @@ description = "Separately compiled cryptographic compatibility kernels for Crato
 [dependencies]
 cratonvm-types = { path = "../types", version = "0.3.0" }
 sha3 = "0.10"
-rsa = "0.9"
+rsa = "0.10"
 sha1 = { version = "0.10", features = ["oid", "compress"] }
 sha2 = { version = "0.10", features = ["oid", "compress"] }
 # SBR wave 5 (`jdk_intrinsics`): GHASH over the JDK's own GCM state, and
