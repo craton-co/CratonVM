@@ -1,0 +1,26 @@
+[package]
+name = "cratonvm-jit-opencl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Kernel-IR to OpenCL C rendering for CratonVM GPU offload"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["opencl", "gpu", "heterogeneous"]
+categories = ["compilers", "api-bindings"]
+# Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.
+publish = false
+
+[dependencies]
+cratonvm-jit-cuda = { path = "../jit-cuda", version = "0.3.0" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+
+[lints]
+workspace = true

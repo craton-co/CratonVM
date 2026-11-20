@@ -1,0 +1,99 @@
+# JCK (Java Compatibility Kit) conformance runner for CratonVM.
+#
+# This workflow is gated on the JCK_HOME environment variable. It will be
+# skipped entirely in environments where the JCK is not installed (e.g. public
+# CI without a JCK license). To enable, set JCK_HOME to the root of the
+# extracted JCK distribution in your repository secrets or runner environment.
+
+name: JCK Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  jck-run:
+    name: JCK Test Suite
+    runs-on: ubuntu-latest
+    if: env.JCK_HOME != ''
+    env:
+      JCK_HOME: ${{ secrets.JCK_HOME }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'oracle'
+          java-version: '25'
+
+      - name: Build CratonVM CLI
+        run: cargo build --release -p cratonvm-cli
+
+      - name: Verify JCK installation
+        run: |
+          echo "JCK_HOME=$JCK_HOME"
+          test -d "$JCK_HOME" || { echo "ERROR: JCK_HOME directory does not exist"; exit 1; }
+          test -f "$JCK_HOME/lib/javatest.jar" || { echo "ERROR: javatest.jar not found in JCK_HOME/lib"; exit 1; }
+          echo "JCK installation verified at $JCK_HOME"
+
+      - name: Configure JCK harness
+        run: |
+          CRATONVM_BIN="$(pwd)/target/release/cratonvm"
+          chmod +x "$CRATONVM_BIN"
+          # Substitute the VM path into the JCK interview configuration
+          sed "s|@CRATONVM_BIN@|$CRATONVM_BIN|g" ci/jck-config.jti > /tmp/jck-config.jti
+          echo "Configured JCK to use VM at: $CRATONVM_BIN"
+
+      - name: Run JCK tests
+        run: |
+          CRATONVM_BIN="$(pwd)/target/release/cratonvm"
+          java -jar "$JCK_HOME/lib/javatest.jar" \
+            -config /tmp/jck-config.jti \
+            -workdir /tmp/jck-work \
+            -set jck.priorStatus.needAction true \
+            -runtests
+        timeout-minutes: 120
+
+      - name: Run Rust-side JCK harness
+        run: cargo test --test jck_harness -- --ignored
+        env:
+          JCK_HOME: ${{ secrets.JCK_HOME }}
+
+      - name: Collect results
+        if: always()
+        run: |
+          # Generate failure report from the JavaTest work directory
+          if [ -d /tmp/jck-work ]; then
+            echo "JCK work directory contents:"
+            find /tmp/jck-work -name "*.jtr" | head -20
+            # Count pass/fail from .jtr files
+            TOTAL=$(find /tmp/jck-work -name "*.jtr" | wc -l)
+            PASSED=$(grep -rl "execStatus=Passed" /tmp/jck-work --include="*.jtr" 2>/dev/null | wc -l)
+            FAILED=$(grep -rl "execStatus=Failed" /tmp/jck-work --include="*.jtr" 2>/dev/null | wc -l)
+            ERRORS=$(grep -rl "execStatus=Error" /tmp/jck-work --include="*.jtr" 2>/dev/null | wc -l)
+            echo "Total: $TOTAL  Passed: $PASSED  Failed: $FAILED  Errors: $ERRORS"
+          fi
+
+      - name: Upload JCK results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jck-results
+          path: |
+            /tmp/jck-work/**/*.jtr
+            bench/jck-failures.json
+          retention-days: 30

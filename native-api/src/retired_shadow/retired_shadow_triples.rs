@@ -1,0 +1,3290 @@
+#[allow(unused_imports)]
+use super::*;
+
+// SPDX-License-Identifier: GPL-2.0-only WITH Classpath-exception-2.0
+// Copyright 2024-2026 Craton Software Company
+
+// Registrations RETIRED as contract §1.4 shadows: a native standing in front
+// of concrete JDK bytecode, one subsystem at a time.
+//
+// # The rule
+//
+// §1.4 says a native that shadows real bytecode should yield to it under
+// `--real-jdk`. The obvious disposition for the whole shadow population is
+// `SyntheticStub`, and that was implemented as a dispatch-time dial
+// (`CRATONVM_ENFORCE_NATIVE_SHADOW`) and MEASURED: arming it whole-VM takes
+// the strict corpus from **32 passed / 17 failed to 3 / 46**. The failures are
+// not dispatch faults — under `--real-jdk` the surviving bridges ARE the
+// object model for large parts of `java.base`, so yielding them hands real
+// code objects it cannot service.
+//
+// So the order is fixed and is not this file's choice: a class's state has to
+// become real before its shadow can be retired. What this file holds is the
+// subsystems where that has been **measured true**, triple by triple.
+//
+// # `java/util/logging` — retired 2026-08-11
+//
+// Measured on Azure linux, JDK 25.0.4+7, one binary, one workload, only the
+// dial differing:
+//
+// ```text
+//   SUITE=jdk-only CRATONVM_ARGS=--real-jdk bash regression-suite/run.sh
+//     baseline                                       23 passed / 4 failed
+//     CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/logging/  23 passed / 4 failed
+//   failing set unchanged: RJdkHandles RJdkReflect RJdkForkJoin RJdkJmx
+// ```
+//
+// Verdict-neutral is the acceptance criterion, not green: those four fail on
+// `dev` for reasons that have nothing to do with logging, and a change that
+// left them failing for a NEW reason would be a regression this comparison
+// catches.
+//
+// The first 84 triples below are every LIVE (`owns_slot`) `Bridge` registration on a
+// `java/util/logging/` receiver whose image target carries a `Code` attribute,
+// declared or inherited — i.e. exactly the rows the dial would yield. They are
+// re-tagged [`NativeKind::SyntheticStub`](crate::registry::NativeKind::SyntheticStub)
+// at registration, so `--real-jdk` refuses them and the real class runs, and
+// `--real-jdk` is unchanged (a `SyntheticStub` registers and dispatches
+// normally in `Compatible` mode).
+//
+// **One `java/util/logging/` bridge is deliberately NOT here**, and it is why
+// this list is per-TRIPLE rather than per-class or even per-(class, method).
+// `Logger.log` has eight registered overloads; seven shadow real bytecode and
+// are retired. The eighth is
+// `log(Ljava/util/logging/Level;Ljava/util/function/Supplier;Ljava/lang/Throwable;)V`,
+// which is not a JDK 25 signature at all — the real overload takes the
+// `Throwable` SECOND — so the census resolves it nowhere in the hierarchy and
+// there is no bytecode for it to yield to. Refusing it would replace a shadow
+// with an `UnsatisfiedLinkError`, which is the shape the 2026-08-10 wave hit
+// when four of 43 re-tagged receivers had to be held back.
+//
+// # `LogRecord`'s source pair — four more, retired 2026-08-12
+//
+// The wave above left `getSourceClassName`, `getSourceMethodName` and their
+// two setters live, because they were tagged `Intrinsic` and the census scores
+// `Bridge`. Re-tagging them `Bridge` on 2026-08-11 made the census REPORT them
+// (`bridge-ran-over-bytecode`) but retired nothing — retirement is this table,
+// and a category change alone is not an entry in it.
+//
+// What they were is the reason they have to go rather than improve. JDK 25:
+//
+// ```text
+//   getSourceClassName() { if (needToInferCaller) inferCaller(); return sourceClassName; }
+//   setSourceClassName(s) { this.sourceClassName = s; needToInferCaller = false; }
+// ```
+//
+// The shadow getters are that getter with the `inferCaller()` call deleted —
+// a bare field read — and the shadow setters are that setter with the
+// `needToInferCaller` clear deleted. So under `--real-jdk` the real
+// `inferCaller()` was never reached by anybody, and every
+// `logger.warning(...)` record reached `SimpleFormatter` with a null pair,
+// which that formatter renders as the LOGGER NAME.
+//
+// Measured, one binary, three arms (probes/SrcProbe3.java):
+//
+// ```text
+//                  explicit set/get   pair during publish   StackWalker frames
+//   HotSpot        A_CLASS/a_method   SrcProbe3/main        Logger.log, doLog, log, warning
+//   --real-jdk     A_CLASS/a_method   SrcProbe3/main        (chain is native: none)
+//   --real-jdk     A_CLASS/a_method   null/null             IDENTICAL to HotSpot
+// ```
+//
+// That rules out both of the causes the handoff proposed: the setters stick,
+// and our `StackWalker` hands `LogRecord$CallerFinder` exactly the frame list
+// HotSpot's walks. Nothing was broken except that the code which would have
+// CALLED them never ran.
+//
+// ## Necessary and NOT sufficient — read this before trusting a table entry
+//
+// Retiring these four was measured to take effect —
+// `CRATONVM_DBG_DROPPED_STUBS=1` prints `[JDK-ONLY-REFUSED]` for all four —
+// and the vector still failed. With the real lazy getter running, the flag it
+// consults was false: `needToInferCaller` is `true` on HotSpot and `false`
+// here on a fresh record, because a shadow CONSTRUCTOR never wrote it.
+//
+// `LogRecord.<init>(Level,String)` was already in the table below, and had
+// been INERT since the 2026-08-11 wave. The retag in
+// `NativeMethodRegistry::register` fires only on an effective category of
+// `Bridge`, and the triple's OTHER registration
+// (`native-builtins/src/phases_early.rs`) sat under an ambient `Intrinsic`.
+// Strict refused the `Bridge` one and the `Intrinsic` one owned the slot —
+// which is why retiring the `Bridge` one measured verdict-neutral.
+//
+// **An entry in this table is not evidence that a triple has no live native.**
+// It retires the registrations whose effective category is `Bridge`, and says
+// nothing about a second registration of the same triple under `Intrinsic`.
+// `getLevel`, `getMessage` and `getSequenceNumber` are in that position today.
+// Two instruments, and they answer different questions:
+// `CRATONVM_DBG_DROPPED_STUBS=1` lists REFUSALS, not surviving natives; the
+// census kind is what distinguishes them — `synthetic-native-registered` is a
+// refusal record, `native-shadows-bytecode` is a live dispatching shadow.
+// W7-56-infercaller-strict-RETIRED-20260917.md
+//
+// **All four or none.** Retiring only the getters would be a NEW defect:
+// the real getter would then honour `needToInferCaller`, which the surviving
+// shadow setter never clears, so an explicit `setSourceClassName("X")` would
+// be silently overwritten by the inferred caller on the next read. The two
+// halves are one state machine and only move together.
+//
+// `Compatible` is untouched, and not by argument: a `SyntheticStub` registers
+// and dispatches normally in `Compatible`, so all four natives still answer
+// there exactly as they did, over records the JUL bridge already stamped.
+// Retiring them in BOTH modes would have been a regression, and that is
+// measured too: probes/SrcProbe4.java runs `CallerFinder` at `inferCaller`'s
+// real depth and gets `EMPTY` under `--real-jdk`, because the native chain
+// leaves no `java.util.logging.Logger` frame to trip its latch. Compatible is
+// correct only via the eager stamp. W7-56-infercaller-strict-RETIRED-20260917.md
+//
+// # `java/io/PrintWriter` — measured retirable, HELD, and why the hold is not a doubt
+//
+// Seven `java/io/PrintWriter` triples (`<init>(Ljava/io/OutputStream;)V`,
+// `println` ×4, `write` ×2) were measured verdict-neutral in
+// W7-22-shadow-retirement-logging-and-time.md §2 — including the arm that
+// matters, a NATIVE-built receiver meeting retired methods — because
+// `native_printwriter_init_outputstream` chains into the real
+// `PrintWriter(OutputStream, boolean)` bytecode and leaves `lock`, `out`,
+// `charOut` and `textOut` populated. Its `java/io/PrintStream` sibling does
+// not, which is the whole verdict split between §2 and §3 of that record.
+//
+// **The reinstatement check has been run and comes back clean**, which is the
+// part a future lane should not have to redo. All seven registrations sit in
+// `register_printstream_fallback_natives`
+// (`native-builtins/src/logging_shims.rs`) between its
+// `set_category(NativeKind::Bridge)` and the matching restore, so the retag
+// below would fire on them. The only other registrar holding any of the seven
+// is in `register_synthetic_overrides` under an ambient `Intrinsic` — and that
+// function is `#[cfg(feature = "synthetic-jdk")]` and reached only from
+// `register_builtins` on the `use_synthetic_jdk` arm, so it registers nothing
+// on either shipping mode and cannot hand the triple back the way
+// `phases_early.rs` handed back `LogManager.getLogManager()`
+// (W7-25-jul-getlogger-regression.md §1).
+//
+// **What holds it is arithmetic on frozen artefacts, not the verdict.**
+// `java/io/Print*` is Compatible-visible, so seven rows moving
+// `Bridge` → `SyntheticStub` move `bridge_shadows_bytecode`
+// (`scripts/baselines/jdk-only-bridge-ratchet.json`), `BASELINE_SYNTHETIC_STUBS`
+// (`the native-registry census`, `SLACK = 0`) and the per-row kind
+// freeze (`scripts/baselines/jdk-only-kind-map-25-linux.tsv`). All three are
+// keyed `25/linux` and must be re-frozen from one real run on that platform in
+// the same commit as the seven entries. Adding the entries alone turns three
+// gates red for a change that is otherwise correct. **Land them together or
+// not at all.**
+//
+// **The ordered recipe is W7-22-shadow-retirement-logging-and-time.md §2.1** —
+// eight steps with the exact commands, including the two the arithmetic cannot
+// give you: `the native-registry census` now holds **two** baselines (`…_MANAGEMENT` and
+// `…_NO_MANAGEMENT`), each of which must be pasted from its own configuration's
+// printed recount line rather than derived as +7, and
+// `sh regression-suite/bridge-ratchet.sh --update-baseline --note "…"` re-freezes
+// the bridge ratchet AND the kind map from ONE census because they are two
+// readings of one measurement. On a non-Linux host both gate scripts exit **2**
+// ("REFUSING") rather than failing, so a Windows lane cannot even discover
+// whether it got the numbers right — which is why this is held rather than
+// attempted.
+//
+// Two edits, not one, and they only work together: the seven entries go in
+// SORTED position (`java/io/…` sorts before every `java/util/…` row, so at the
+// HEAD of the table) **and** [`triple_is_retired_shadow`]'s prefix
+// discriminator has to admit `java/io/Print`. An entry under a prefix the
+// discriminator rejects answers `false`, which reads as "not retired" and is
+// invisible; `every_entry_is_reachable_through_the_predicate` is the test that
+// catches exactly that.
+//
+// # `java/util` collections — retired 2026-08-12, EIGHT of 68 registrations
+//
+// A `--real-jdk --explain-jdk-only` run reported 226 `native-shadows-bytecode`
+// rows actually taken; 62 of them are `java.util` collections triples, 68
+// registrations by the frozen kind map. All 68 were adjudicated against the
+// rule this module's header states — *a class's state has to become real
+// before its shadow can be retired* — in
+// docs/feature-designs/native-dispatch-architecture.md. **Eight are
+// retirable. Sixty are not, and most of them never will be by this route.**
+//
+// The eight, at the HEAD of the table — every `java/util/A…` and `C…` key
+// sorts before `java/util/logging/`:
+//
+// ```text
+//   java/util/ArrayList        <init>          ()V
+//   java/util/ArrayList        <init>          (I)V                              [2 registrations]
+//   java/util/ArrayList        <init>          (Ljava/util/Collection;)V
+//   java/util/ArrayList        add             (Ljava/lang/Object;)Z
+//   java/util/ArrayList        clear           ()V
+//   java/util/Arrays$ArrayList iterator        ()Ljava/util/Iterator;
+//   java/util/Collections      synchronizedMap (Ljava/util/Map;)Ljava/util/Map;
+// ```
+//
+// **All seven are LIVE, not paper entries.** A census on an ordinary
+// collections workload
+// (`--real-jdk --explain-jdk-only --real-jdk-report`) reports every one of
+// them as an actually-taken `native-shadows-bytecode` row — the kind that
+// distinguishes a dispatching shadow from a mere refusal record. The
+// `LogRecord.<init>` inert-entry trap does not apply to any of them.
+//
+// **What this does NOT fix, stated because the campaign brief says it does.**
+// The `Collections.synchronizedList` data loss in
+// STUB-CENSUS-20260812.md §5.2 is attributed there to a
+// `Collections.synchronized*` identity stub. That stub was removed by
+// `e8a7caba4` (2026-07-01); both live registrars build the real wrapper
+// through the real constructor. Retiring `synchronizedMap` is
+// behaviour-preserving by construction and **fixes nothing** — the measured
+// loss has an unidentified cause. See P2-COLLECTIONS-SHADOWS §7.1.
+//
+// ## Why the other sixty are a different question, not a longer list
+//
+// `TreeMap`, `TreeSet`, `ArrayDeque`, `ConcurrentHashMap`, `Hashtable` and
+// `LinkedHashSet` keep their entries in **Rust side tables or fabricated
+// slots**, so retiring their shadows does not hand real bytecode a working
+// object — it hands it an empty one. `map_buckets_slot`'s doc in
+// `native-collections/src/lib.rs` states the whole family's position in one
+// sentence: *"It does not fault today only because the natives shadow every
+// reader."* Those are collections reclassifications, and no entry in this
+// table can substitute for one.
+//
+// `ArrayList` is the exception and is worth stating precisely, because it is
+// the only family in the slice whose §1.4 precondition is ALREADY MET:
+// `al_slots`, `al_mod_count_slot` and `al_itr_slots` resolve `elementData`,
+// `size`, `modCount`, `cursor`, `lastRet`, `expectedModCount` and `this$0`
+// **by name**, and `try_alloc_synthetic` loads the real
+// `java/util/ArrayList$Itr`. Both halves already read and write the fields the
+// JDK's own bytecode does. It is still mostly not retirable, and the reason is
+// not layout: `Map.values()` returns a `java/util/ArrayList` with its source
+// map stashed in a trailing capacity slot, so `size`/`isEmpty`/`get`/
+// `iterator`/`toArray` are the implementation of `values()` and retiring them
+// freezes every such view at its creation time — measured once already, against
+// H2's `TestAlter.testAlterTableDropIdentityColumn`, and recorded at
+// `vm/src/runtime/interpreter/native_override.rs:2448-2463`. The five
+// `ArrayList` triples above are the ones that touch no view.
+//
+// **One triple in the slice must NOT be retired for the opposite reason.**
+// `java/util/Arrays.copyOf([Ljava/lang/Object;I)` is load-bearing *for* real
+// bytecode: the real body allocates through
+// `Array.newInstance(original.getClass().getComponentType(), n)`, and its
+// 3-arg sibling's registration says of that same path *"Without this native
+// the call falls through to bytecode that dereferences unsupported
+// `arrayClass` reflection internals and NPEs"*
+// (`native-builtins/src/phases_early.rs:1031-1038`). Real `ArrayList.grow`,
+// `toArray` and `ArrayList(Collection)` all funnel through it — so the five
+// `ArrayList` retirements above DEPEND on it staying a `Bridge`.
+//
+// ## The acceptance measurement — taken 2026-08-12, one binary, five arms
+//
+// `CRATONVM_ENFORCE_NATIVE_SHADOW` takes a prefix list and yields on the same
+// §1.4 predicate a retirement uses, so it simulates this exact change with no
+// rebuild — the way the `java/util/logging/` wave was accepted. Windows host,
+// JDK 25.0.3, `SUITE=jdk-only CRATONVM_ARGS=--real-jdk bash regression-suite/run.sh`:
+//
+// ```text
+//   baseline (dial off)                         32 passed /  4 failed
+//   A  ArrayList,Arrays$ArrayList,Collections   32 passed /  4 failed   <- the eight
+//   B  List,Collection,Iterator (§2.2 doors)    32 passed /  4 failed
+//   C1 TreeMap,TreeSet                          10 passed / 51 failed   RED
+//   C2 ArrayDeque                               32 passed /  4 failed   see below
+//   C3 concurrent/ConcurrentHashMap             28 passed / 12 failed   RED
+//   failing set unchanged in A and B: RJdkProxyIface RJdkForeign RJdkEnumerations
+// ```
+//
+// Verdict-neutral is the criterion, not green: those three fail with the dial
+// off, for reasons that have nothing to do with collections.
+//
+// **C2 came back verdict-neutral, and that is the probe's reach, not a
+// refutation of §3.5.** The `RJdk*` corpus only pushes and pops a deque's
+// ENDS, and real `ArrayDeque.addLast`/`pollFirst` never call `delete(i)` — the
+// method whose two writers §3.5 names. A probe that does (40 `addLast`s, a
+// middle `remove(Object)`, `Iterator.remove`, then a drain) turns C2 red on
+// the same binary and the same dial:
+//
+// ```text
+//   size after 40 addLast  39 (want 40)      toArray length  34 (want 39)
+//   size after 4 It.remove 39 (want 35)      drained count   41 (want 35)
+//   pollFirst after reuse  null (want "z")
+// ```
+//
+// The same probe under arm A answers HotSpot-identically on every ArrayList,
+// `Arrays.asList` and `synchronizedMap` line, and turns `TreeMap.firstKey`
+// (wrong key), `TreeSet` (half its elements) and `ConcurrentHashMap.size`
+// (1 for a two-entry map) red under C1/C3.
+//
+// **The H2 corpus is the adjudicator for a Phase 2 retirement, and it moved
+// nothing.** 14 discovered classes, `--mode jdk-only`, dial off then dial at
+// arm A: every class that was adjudicated in both arms kept its verdict. The
+// one exception, `org.h2.test.db.TestBackup`, was re-run ABBA from a private
+// working directory and produced `MVStoreException: Chunk 2 not found` with
+// the dial **OFF** as well as on (OFF pass / ON fail / ON pass / OFF fail), so
+// it is a pre-existing flake in that class and not attributable to the change.
+// `TestCluster` also timed out in the corpus arm and passes in 161-183 s
+// standalone in BOTH arms — the corpus's `CV-TIMEOUT` is a wall-clock verdict
+// on a shared host, which is the one column that record's own header says is
+// non-metric.
+//
+// **Read arm A as an UPPER BOUND, not as this change.** The dial cannot go
+// finer than a class name, so it also yields `ArrayList.size`/`get`/`iterator`/
+// `stream`/`sort` — the `Map.values()`-entangled rows §3.2 holds back. A green
+// A is therefore strictly stronger evidence than these eight rows need; the
+// converse does not hold, and narrowing below a class name is the point at
+// which the table, not the dial, becomes the instrument.
+//
+// ## What the census says, and what it cannot say
+//
+// All seven triples are actually-taken `native-shadows-bytecode` rows on an
+// ordinary collections workload, so none of them is an inert entry.
+//
+// One measured consequence deserves its own line, because it confirms §3.3 by
+// experiment rather than by reading: arming arm A makes
+// `java/util/Arrays.copyOf([Ljava/lang/Object;I)` APPEAR in the taken-shadow
+// set, where the dial-off run does not reach it at all. That is real
+// `ArrayList.grow` funnelling through it the moment the native constructors
+// yield — the dependency that makes `Arrays.copyOf` a hard keep.
+//
+// Note what the per-run census does NOT distinguish: with the dial armed the
+// yielding row is still recorded `native-shadows-bytecode` (the record is
+// written on the yield path too), so the census cannot tell you whether the
+// dial engaged. The behavioural probe is the instrument for that. After this
+// table lands the rows change population for a different reason — a
+// `SyntheticStub` is refused at the door and never reaches step 1.
+//
+// ## What is NOT measured here, and must be re-frozen in the landing commit
+//
+// The `java/io/PrintWriter` hold above, verbatim: `java/util` is
+// Compatible-visible, so eight rows moving `Bridge` -> `SyntheticStub` move
+// `BASELINE_SYNTHETIC_STUBS_*` (`SLACK = 0`), `bridge_shadows_bytecode` and
+// the per-row kind freeze, all three keyed `25/linux`, all three re-frozen
+// from ONE Linux census in the SAME commit. Both baselines are ALREADY stale
+// and say so in their own bodies, so the predicted deltas (+8 on the stub
+// ratchet, -8 on four bridge counters, exactly eight kind-map rows) are deltas
+// on a base nobody has taken. The derivation is §4 of the P2 record; **it is a
+// diff to check, not a number to paste.** A ninth kind-map row is a finding.
+//
+// ## The door this table cannot close, and the inert-entry trap
+//
+// `register_interface_natives` registers the SAME native functions on
+// `java/util/List.iterator`, `java/util/Collection.iterator`,
+// `java/util/Set.iterator` and eight `java/util/Map` triples, and
+// `java/util/Iterator.{hasNext,next}` carry two `Bridge` registrations of their
+// own. This table retires TRIPLES, so retiring a concrete-class row leaves the
+// interface row registered and live. None of the eight above is an `iterator`
+// on a concrete collection, which is why they are the eight — but any later
+// wave that reaches for `HashSet.iterator` or `ArrayList.iterator` has to move
+// the interface rows in the same commit or measure as inert.
+//
+// And `Collections.synchronizedMap` is registered at FOUR sites, one of them
+// under an ambient `Intrinsic` (`native-builtins/src/phases_early.rs:158`).
+// Only the `Bridge` one is on today's boot path, so the retag fires — but the
+// retag in `NativeMethodRegistry::register`
+// fires only on an effective `Bridge`, so a boot-order change would make this
+// entry inert and silent. That is exactly what happened to
+// `LogRecord.<init>(Level,String)` for a day; see the source-pair section
+// above, and read the census kind rather than `CRATONVM_DBG_DROPPED_STUBS`.
+//
+// ## Widening the discriminator was half of it
+//
+// [`triple_is_retired_shadow`] used to answer `false` for anything outside
+// `java/util/logging/`. All seven keys are under `java/util/`, so ONE prefix
+// covers both populations, and the discriminator moved to `java/util/` in the
+// same edit — an entry added without that widening reads as "not retired" and
+// is invisible. `every_entry_is_reachable_through_the_predicate` is the test
+// that catches it, and
+// `the_held_collection_families_are_not_retired` is the one that says the
+// wider prefix admits sixty more families to a binary search without changing
+// any of their answers.
+//
+// # `ArrayList.get` / `size` — retired 2026-08-17, and why the hold was wrong
+//
+// G60-1 §5 N1 nominated these two on the grounds that the table "records no
+// reason" for holding them while retiring five of their siblings. The table did
+// record one, in `the_held_collection_families_are_not_retired` and in the §3.2
+// paragraph above: `Map.values()` is answered as a `java/util/ArrayList` with
+// its source map stashed in a trailing capacity slot, so `size`/`get`/
+// `iterator`/`toArray` ARE the view's implementation and retiring them freezes
+// every view at its creation time —
+// `vm/src/runtime/interpreter/native_override.rs`'s
+// `force_native_over_real_jdk_bytecode` still says exactly that, and cites H2
+// `TestAlter.testAlterTableDropIdentityColumn`.
+//
+// **Two things are wrong with that as a reason to hold a STRICT-mode
+// retirement, and one of them is structural.**
+//
+// *The structural one.* A retirement re-tags a registration `SyntheticStub`,
+// and a `SyntheticStub` registers and dispatches normally in `Compatible`. So
+// this table cannot change Compatible behaviour at all, and the H2 measurement
+// it cited is a Compatible-mode observation by necessity: `TestAlter` is a JDBC
+// test, `java.sql` is unloadable under `--real-jdk` today
+// (APP-READINESS-20260812.md §0, family A), so that vector cannot reach strict
+// mode to be broken by it. The hold imported a hazard from the one mode this
+// file provably does not touch.
+//
+// *The measured one.* No map family answers `values()` with a
+// `java/util/ArrayList` on this tree, in either mode. MEASURED on
+// `0010e134d` + this change, JDK 25.0.4+7 on Azure linux, four arms — HotSpot,
+// `--real-jdk`, `--real-jdk`, and `--real-jdk` with these two entries present
+// (probes/JdkOnlyValuesViewProbe.java, `carrier.*` lines). All eleven carriers
+// agree with HotSpot in all four arms:
+//
+// ```text
+//   HashMap.values()            java.util.HashMap$Values
+//   ConcurrentHashMap.values()  java.util.concurrent.ConcurrentHashMap$ValuesView
+//   TreeMap.values()            java.util.TreeMap$Values
+//   LinkedHashMap / Hashtable / Properties / EnumMap / IdentityHashMap /
+//   WeakHashMap / values() through the java.util.Map interface door
+//                               all the real JDK view class
+// ```
+//
+// Those are every receiver `native_map_values` is registered on
+// (`native-collections/src/lib.rs` ×3, `native-builtins/src/phases_early.rs`
+// ×3, plus the `java/util/Map` interface door), so this is the complete set and
+// not a sample. `values` is not on the force-native list, so real bytecode
+// answers it and the stashed-source-map carrier is unreachable through it.
+//
+// **The acceptance measurement, and note what instrument it needed.**
+// `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/ArrayList` — the dial the
+// 2026-08-12 wave was accepted with — turns this probe RED:
+// `values().iterator()` after a `put` throws `ConcurrentModificationException`
+// from real `ArrayList$Itr.checkForComodification`. That is the dial yielding
+// `iterator()` as well, because it cannot go finer than a class name, and it is
+// exactly the "read arm A as an UPPER BOUND" warning in §3.5 above coming due.
+// The per-triple instrument is this table, so the trial was built with these two
+// entries and nothing else: 42 checks, byte-identical to HotSpot, including
+// H2's own shape — a `ConcurrentHashMap.values()` captured before any entry
+// exists, read back with `size()` as the FIRST view method called after the
+// mutation, which is the one ordering that can tell a retired native from a live
+// one.
+//
+// ## The four this record first held back, and why the evidence was wrong
+//
+// `iterator`, `toArray` (both overloads), `isEmpty` and `contains` were held on
+// the strength of that `ConcurrentModificationException` — "the dial says at
+// least one of them is load-bearing". **It says no such thing, and the reason
+// is worth more than the four entries.**
+//
+// MEASURED 2026-08-17, one binary, three arms
+// (`probes/JdkOnlyValuesViewProbe.java`'s `carrier.*` lines, which did not
+// exist when the dial arm was first run): the eleven values-view carriers are
+// IDENTICAL in `--real-jdk`, `--real-jdk` and `--real-jdk` + the dial. Nothing
+// about the dial turns a view into an `ArrayList`. So where did a real
+// `ArrayList$Itr` come from?
+//
+// ```text
+//                           HotSpot                       CratonVM, EVERY mode
+//   values()                java.util.HashMap$Values      java.util.HashMap$Values
+//   values().iterator()     java.util.HashMap$ValueIterator   java.util.ArrayList$Itr
+//   keySet().iterator()     java.util.HashMap$KeyIterator     java.util.HashMap$KeyIterator
+// ```
+//
+// The view is real; its ITERATOR is not. `register_interface_natives` answers
+// `java/util/Collection.iterator` with a native that hands back an
+// `ArrayList$Itr` over a snapshot list, and that snapshot's `modCount` is not
+// the map's. Arm the dial and the real `ArrayList$Itr.next()` starts running
+// `checkForComodification` against it — hence the CME. The dial was measuring
+// **the interface door**, which this table's own "the door this table cannot
+// close" section warns about, and attributing it to
+// `java/util/ArrayList.iterator`.
+//
+// With the per-triple instrument instead — a trial binary carrying all five
+// registrations, `CRATONVM_DBG_DROPPED_STUBS=1` confirming each is
+// `[JDK-ONLY-REFUSED]` rather than inert:
+//
+// ```text
+//   probes/JdkOnlyValuesViewProbe.java, 67 checks   IDENTICAL to HotSpot
+//   --real-jdk  corpus   98 passed / 2 failed of 100   verdict-neutral
+//   SUITE=all   corpus   93 passed / 7 failed of 100   verdict-neutral
+// ```
+//
+// The probe's `four.*` section is written for exactly these five and exercises
+// them on three receiver shapes — a plain `ArrayList`, an `Arrays.asList` view
+// and the `java.util.List` interface door — including the two rows a native
+// that allocates rather than fills gets wrong without changing any length:
+// `toArray(new String[6])` on a 4-element list must be length 6 with a null
+// terminator at index 4, and a structural change during iteration must still
+// throw.
+//
+// **The interface-door defect the dial exposed is REAL and is not fixed here.**
+// `map.values().iterator()` is not fail-fast in either mode — a structural
+// modification mid-iteration throws `ConcurrentModificationException` on
+// HotSpot and nothing here. `Iterator.remove()` does write through, and
+// `keySet()`/`entrySet()` iterators are correct, so it is narrow. Filed as
+// `jdk-only/G63-1-the-values-view-iterator-is-not-fail-fast-20260817.md`;
+// retiring these five neither causes nor fixes it, measured both ways.
+//
+// # `Properties.getProperty` — asked, MEASURED, and NOT retired
+//
+// G60-1 §5 N2 asked whether this native is needed at all, and offered the
+// hypothesis that it backs `System.getProperties()` interop. It does, and this
+// is the mechanism. JDK 9 moved `Properties`' storage to a
+// `ConcurrentHashMap` field named `map`, and JDK 25's `getProperty` reads it
+// directly (`Properties.java:1145`). The `Properties` object
+// `System.getProperties()` returns here is VM-built and never gets that field,
+// so with the two overloads retired:
+//
+// ```text
+//   new Properties() + setProperty/load/put/remove/defaults   36 checks, HotSpot-identical
+//   System.getProperties().getProperty("java.home")           NullPointerException:
+//       Cannot invoke "java.util.concurrent.ConcurrentHashMap.get(Object)"
+//       because "this.map" is null      at java/util/Properties.getProperty
+// ```
+//
+// (probes/JdkOnlyPropsShadowProbe.java, trial build with both overloads in this
+// table.) So the answer to N2 is: the real bytecode IS correct on every axis
+// G55-1 fixed by hand — every ordinary `new Properties()` line above is
+// HotSpot-identical, because the real constructor initialises `map` — and it is
+// still not retirable, because one receiver in the VM is built without running
+// that constructor. **The precondition for retiring these two is that the
+// native which builds the system `Properties` initialise the real `map` field**
+// (or construct through the real constructor); it is not a property of
+// `getProperty` at all.
+//
+// Recording it here rather than fixing it: that native is on the boot path in
+// BOTH modes, and this file's rule is that a class's state has to become real
+// before its shadow can be retired. This is that precondition, named.
+//
+// # Why this is applied centrally
+//
+// Same reason as [`crate::no_image_receiver`]: the property is a MEASUREMENT
+// against an image, which no registration site can know, and the sites do not
+// reliably name themselves anyway — `registered_by` is a `#[track_caller]`
+// record, so a shared `with_category` helper attributes a `LogRecord` triple
+// to `native-io/src/nio_native.rs`. Four different files register these 84.
+//
+// A registration re-tagged here reports `kind_stated`: the kind WAS
+// adjudicated, by measurement rather than by an author.
+//
+// # What would invalidate this
+//
+// A `java/util/logging/` triple that stops carrying `Code` in a supported
+// image, or a strict-corpus run whose failing SET differs from the four above
+// with these retired. `regression-suite/bridge-ratchet.sh` scores the census
+// these rows leave, and `scripts/jdk-only-kind-map.py` freezes each row's kind,
+// so a silent drift in either direction fails a gate rather than a workload.
+
+// # Five STATELESS subsystems — retired 2026-08-19
+//
+// 227 triples, the largest wave so far and two and a half times the table it
+// joins. They were chosen by the dial and only then by the census, which is
+// the opposite of the order the first waves used and is the point.
+//
+// ## What was measured, and why the dial came first
+//
+// The module doc above records the whole-VM result: arming
+// `CRATONVM_ENFORCE_NATIVE_SHADOW` everywhere takes the strict corpus from 32
+// passed / 17 failed to 3 / 46, because under `--real-jdk` the surviving
+// bridges ARE the object model for large parts of `java.base`. That number is
+// a verdict on the WHOLE population, and it had been read as a verdict on
+// every part of it.
+//
+// It is not. Re-measured 2026-08-19, one prefix at a time, over the 36-vector
+// `--real-jdk` corpus, one binary, only the dial differing (baseline 36/36):
+//
+// ```text
+//   all                              1 / 36     <- the documented catastrophe
+//   jdk/internal/access/            22 / 36
+//   java/security/                  33 / 36
+//   java/net/  java/nio/channels/  sun/nio/ch/  34 / 36
+//   java/math/  javax/crypto/  javax/management/  javax/net/ssl/
+//     sun/security/ssl/  java/awt/image/  java/nio/file/   35 / 36
+//
+//   java/text/                      36 / 36  <- clean
+//   java/util/stream/               36 / 36  <- clean
+//   java/lang/module/               36 / 36  <- clean
+//   java/util/concurrent/atomic/    36 / 36  <- clean
+//   java/util/concurrent/locks/     36 / 36  <- clean
+//   java/lang/ref/                  36 / 36  <- clean HERE, and NOT clean
+//   sun/nio/fs/                     36 / 36  <- clean HERE, and NOT clean
+//
+//   all seven together              36 / 36  <- and they do not interact
+// ```
+//
+// **Running the seven together was a separate measurement, not an inference.**
+// Each prefix passing alone does not imply the union passes: a yielded
+// `Collectors` returning a real collector into a yielded `stream/` pipeline is
+// a pairing neither single run exercised.
+//
+// ## The screen passed two prefixes the ARM rejected — read that first
+//
+// `java/lang/ref/` and `sun/nio/fs/` are in the clean column above and are
+// **not** retired. All seven went into the table, `regression-suite/run.sh`
+// with `CRATONVM_ARGS=--real-jdk` was run over its 102 vectors, and it came
+// back **99 / 102** against a 102 / 102 baseline:
+//
+// ```text
+//   RFileTimes            plain.readAttributes.lastModified
+//                           HotSpot   2021-01-01T00:00:00Z
+//                           CratonVM  1601-01-02T20:42:25.920Z
+//   RClassUnloadSweep     payload.class.unloaded
+//   RClassUnloadSweepGen    HotSpot true / CratonVM false
+// ```
+//
+// Both diffs name their cause exactly. 1601 is the Windows FILETIME epoch:
+// real `WindowsFileAttributes` bytecode read its own `creationTime` /
+// `lastModifiedTime` fields and found them at zero, because the VM had been
+// answering from side state and never populated them. And a `Reference` that
+// yields to real bytecode stops reporting the clearing that
+// `RClassUnloadSweep` detects unloading by. Same shape both times, and the
+// same shape as every dirty prefix above: **the VM owns state that belongs to
+// the real object.**
+//
+// So the 36-vector screen is a filter, not a verdict — the corpus has no
+// file-attribute vector and no class-unloading vector, so for these two
+// subsystems it asked nothing and reported a pass. That is a population
+// narrower than the claim made from it, which is the same defect this session
+// found in the registry census's CI wiring (`G89-1` §4) and, before that, twice
+// inside the ratchet file itself. It is cheap to make and it is caught only by
+// running the wider thing.
+//
+// The five that survived the arm are retired. `java/lang/ref/` and
+// `sun/nio/fs/` are held, with their diffs above as the reason and as the
+// precondition for revisiting them: populate the real fields first, then
+// re-run the arm.
+//
+// ## Then the census, to say WHICH rows
+//
+// The dial yields at dispatch when bytecode is available; retirement drops the
+// registration outright. Those agree only for rows that HAVE bytecode, so the
+// table is the census-eligible subset and not everything under the prefixes.
+// Of 522 registrations on receivers under the seven, 512 `Bridge` and 10
+// `Intrinsic`:
+//
+// ```text
+//   255  census-eligible  bridge, owns_slot, class loaded, image target has
+//                       Code, and NOT ACC_NATIVE. 227 of them are retired
+//                       here; the 28 under `java/lang/ref/` (19) and
+//                       `sun/nio/fs/` (9) are held on the arm result above
+//   195  held           loaded, but the image target carries no Code — dropping
+//                       these replaces a shadow with an UnsatisfiedLinkError
+//    40  held           class never loaded in 36 vectors, so the census asked
+//                       no question. `class-not-loaded` is not a verdict
+//                       (G88-1); it is the absence of one
+//     7  held           genuinely ACC_NATIVE — §1.5 bridges, correct as they are
+//    10  held           Intrinsic, out of scope for a §1.4 shadow
+// ```
+//
+// The three "held" reasons are each a trap this project has already fallen
+// into once, which is why they are counted here rather than filtered silently.
+//
+// ## Why these seven and not others — the shape, stated so it can be refuted
+//
+// Every retained prefix is a subsystem whose objects carry their state in REAL
+// Java fields: atomics (`value`, `array`), `ModuleDescriptor` and its nested
+// `Exports`/`Opens`/`Provides`/`Requires` records, `Collectors`' returned
+// collector, `LockSupport`'s parked bit, `DecimalFormatSymbols`. Every
+// rejected one is a subsystem where the VM owns state on the object's behalf
+// — which is G88-1 §5's finding arrived at from the other direction, by
+// execution rather than by inspection.
+//
+// `java/lang/ref/` and `sun/nio/fs/` are the useful part of that claim,
+// because they LOOK stateless and are not. A `Reference` is four fields; a
+// `WindowsFileAttributes` is a handful of longs. Nothing about their shape
+// says the VM is answering for them — only running a vector that reads those
+// fields does.
+//
+// So treat the pattern as a place to look and never as a rule to apply. The
+// dial is cheap; run it, and then run the arm.
+//
+// ## What would invalidate this
+//
+// A vector added to the `--real-jdk` corpus that exercises one of these
+// subsystems differently, or a JDK image where one of the 255 stops carrying
+// `Code`. Both fail a gate rather than a workload: `the_stateless_table_is_sorted_and_unique`
+// and `every_stateless_entry_is_reachable` here,
+// `regression-suite/bridge-ratchet.sh` on the census, and
+// `scripts/jdk-only-kind-map.py` on each row's frozen kind.
+//
+// The 36-vector screen is the cheap discriminator that says which prefixes
+// deserve a 20-minute run. `regression-suite/run.sh` with
+// `CRATONVM_ARGS=--real-jdk` over 102 vectors is the acceptance test, it
+// rejected two of the seven the screen passed, and the commit that lands this
+// records both numbers.
+//
+// # `sun/nio/fs/WindowsFileAttributes` — eight of nine, 2026-08-20 (H2-1)
+//
+// **Status: UNVERIFIED. No binary carrying this change has been built or
+// run.** It is here rather than behind a switch because the alternative
+// proves nothing: a default-off knob makes the next arm run measure the old
+// behaviour. The revert is these eight rows, the `"sun/nio/fs/"` prefix, and
+// the four tests that name them — one commit, and
+// `docs/known-issues/jdk-only/H2-1-*` names it.
+//
+// `RFileTimes` rejected this prefix on 2026-08-19 with a diff that named its
+// own cause:
+//
+// ```text
+//   plain.readAttributes.lastModified
+//     HotSpot   2021-01-01T00:00:00Z
+//     CratonVM  1601-01-02T20:42:25.920Z
+// ```
+//
+// 1601-01-01 is the Windows FILETIME epoch, and the arithmetic closes exactly:
+// 1609459200000 (2021-01-01 in Unix millis) read as 100ns ticks since 1601 is
+// 160945.92 seconds, i.e. 1601-01-02T20:42:25.920Z. The VM was writing
+// Unix-epoch millis into `creationTime`/`lastAccessTime`/`lastWriteTime` and
+// reading them back the same way — self-consistent, and agreeing with nothing.
+// JDK 25 `java.base/sun/nio/fs/WindowsFileAttributes.java` reads them through
+// `toFileTime`, which adds `WINDOWS_EPOCH_IN_100NS = -116444736000000000L` and
+// scales by 100ns.
+//
+// `native-builtins/src/phases_late/nio_file.rs` now writes those three fields
+// in FILETIME (taking the raw values straight off `MetadataExt` where a real
+// file backs them), writes the real DOS attribute word into `fileAttrs` so
+// `isReadOnly`/`isHidden`/`isArchive`/`isSystem` bytecode has something to
+// test, and writes `reparseTag = IO_REPARSE_TAG_SYMLINK` for a link —
+// `isSymbolicLink()` compares the TAG and never looks at
+// `FILE_ATTRIBUTE_REPARSE_POINT`, so a carrier with only the bit read back as
+// `isOther()`.
+//
+// **`fileKey()` is the ninth and is HELD**, and not out of caution: the real
+// body is `return null;`. See
+// `the_held_windows_attribute_triple_is_not_retired`.
+//
+// # `java/lang/ref/` — NOT retired, and this is the measurement
+//
+// The other prefix the 2026-08-19 arm rejected stays whole, on evidence rather
+// than on the earlier failure. Its census-eligible set includes
+// `Reference.<init>` and the three subclass constructors, and those are not
+// shadows in this table's sense — they are the VM's only mutator-side call to
+// `NativeContext::discover_reference`. Source-verified 2026-08-20: every
+// caller of `discover_reference` outside the collectors' own tests lives in
+// `native-builtins`, and nothing in `gc/` scans the heap for
+// `java.lang.ref.Reference` instances. A reference whose constructor yields to
+// real bytecode is therefore never discovered, never cleared, and
+// `RClassUnloadSweep`'s `payload.class.unloaded` reads `false`. That is what
+// the arm saw, and no amount of field population changes it.
+//
+// Retiring only the accessors is not the escape hatch it looks like: three of
+// them carry VM work the real bytecode has no equivalent for —
+// `Reference.get()`'s SATB keep-alive, `SoftReference.get()`'s LRU touch, and
+// `Reference.enqueue()`'s `mark_reference_manually_enqueued` — each with a
+// named in-tree defect behind it.
+//
+// What DID move for `java/lang/ref/` on 2026-08-20 is the state, in
+// `native-builtins/src/reference.rs`: `ReferenceQueue.<init>` now creates the
+// real `lock` (a field initialiser, so only the constructor can supply it, and
+// every one of `enqueue`/`poll`/`remove` opens with `synchronized (lock)`),
+// and `Reference.queue` now holds `ReferenceQueue.NULL_QUEUE` where the real
+// constructor puts it instead of a raw null. Those are the preconditions a
+// later retirement would need; they are not the retirement.
+
+/// Every `(class, method, descriptor)` retired as a §1.4 shadow.
+///
+/// **Sorted, and binary-searched.** An out-of-order entry is not a style
+/// question: it makes the predicate answer `false` for a row that is in the
+/// table, which reads as "not retired" and is invisible. The test below
+/// asserts the ordering.
+pub(in crate::retired_shadow) static RETIRED_SHADOW_TRIPLES: &[(&str, &str, &str)] = &[
+    // `java/util` collections, retired 2026-08-12. Seven triples / EIGHT
+    // registrations — `<init>(I)V` is registered twice, in `native-builtins`
+    // and in `native-collections`, and a retirement moves both. These are the
+    // only rows of the 68-registration `java.util` slice whose §1.4
+    // precondition is met: `al_slots` / `al_mod_count_slot` / `al_itr_slots`
+    // resolve `elementData`, `size`, `modCount`, `cursor`, `lastRet`,
+    // `expectedModCount` and `this$0` BY NAME, and `try_alloc_synthetic` loads
+    // the real `java/util/ArrayList$Itr`. The other sixty are held: their state
+    // is in Rust side tables or fabricated slots, so retiring them answers an
+    // EMPTY collection over a populated one. See the module docs and
+    // docs/feature-designs/native-dispatch-architecture.md.
+    //
+    // NOT here, and load-bearing FOR these five: `java/util/Arrays.copyOf`.
+    // Real `ArrayList.grow`/`toArray`/`ArrayList(Collection)` funnel through
+    // it, so it stays a `Bridge` — these entries depend on that.
+    ("java/util/ArrayList", "<init>", "()V"),
+    ("java/util/ArrayList", "<init>", "(I)V"),
+    ("java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V"),
+    ("java/util/ArrayList", "add", "(Ljava/lang/Object;)Z"),
+    ("java/util/ArrayList", "clear", "()V"),
+    ("java/util/ArrayList", "contains", "(Ljava/lang/Object;)Z"),
+    // `contains`, `get`, `isEmpty`, `iterator`, `size` and both `toArray`
+    // overloads, retired 2026-08-17 — G60-1 §5 N1's two rows and the four its
+    // resolution then held back. All seven are ONE measurement: the probe is
+    // byte-identical to HotSpot with all of them refused, and the strict and
+    // Compatible corpora are verdict-neutral. See the G60-1 sections of this
+    // module's docs, including why the evidence that held four of them back was
+    // an artefact of the instrument. They were held in the 2026-08-12 wave because `Map.values()` was
+    // answered as an `ArrayList` with its source map stashed in a trailing
+    // capacity slot, making these two the view's implementation. **That is no
+    // longer what happens, and the hold also imported a Compatible-mode hazard
+    // into a strict-only decision.** See the G60-1 section of this module's
+    // docs for the four arms and the eleven carrier classes.
+    ("java/util/ArrayList", "get", "(I)Ljava/lang/Object;"),
+    ("java/util/ArrayList", "isEmpty", "()Z"),
+    ("java/util/ArrayList", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/ArrayList", "size", "()I"),
+    ("java/util/ArrayList", "toArray", "()[Ljava/lang/Object;"),
+    ("java/util/ArrayList", "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
+    ("java/util/Arrays$ArrayList", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/Collections", "synchronizedMap", "(Ljava/util/Map;)Ljava/util/Map;"),
+    // NOT here, and MEASURED not to be retirable: `java/util/Properties`'s two
+    // `getProperty` overloads, G60-1 §5 N2. Real JDK 25 `getProperty` reads
+    // `this.map`, the `ConcurrentHashMap` field added in JDK 9 — and the
+    // `Properties` object `System.getProperties()` hands back is VM-built and
+    // never has it, so retiring the reader turns
+    // `System.getProperties().getProperty("java.home")` into
+    // `NullPointerException: Cannot invoke "java.util.concurrent.ConcurrentHashMap.get(Object)"
+    // because "this.map" is null` at `Properties.java:1145`. Every ordinary
+    // `new Properties()` path is fine — the real constructor initialises `map` —
+    // so the native is load-bearing for exactly one receiver, which is the
+    // question N2 asked. See this module's G60-1 section.
+    ("java/util/logging/FileHandler", "<init>", "()V"),
+    ("java/util/logging/FileHandler", "<init>", "(Ljava/lang/String;)V"),
+    ("java/util/logging/FileHandler", "close", "()V"),
+    ("java/util/logging/FileHandler", "flush", "()V"),
+    ("java/util/logging/FileHandler", "publish", "(Ljava/util/logging/LogRecord;)V"),
+    ("java/util/logging/Handler", "<init>", "()V"),
+    ("java/util/logging/Handler", "getFormatter", "()Ljava/util/logging/Formatter;"),
+    ("java/util/logging/Handler", "getLevel", "()Ljava/util/logging/Level;"),
+    ("java/util/logging/Handler", "isLoggable", "(Ljava/util/logging/LogRecord;)Z"),
+    ("java/util/logging/Handler", "setFormatter", "(Ljava/util/logging/Formatter;)V"),
+    ("java/util/logging/Handler", "setLevel", "(Ljava/util/logging/Level;)V"),
+    ("java/util/logging/Level", "<clinit>", "()V"),
+    ("java/util/logging/Level", "<init>", "(Ljava/lang/String;I)V"),
+    ("java/util/logging/Level", "<init>", "(Ljava/lang/String;ILjava/lang/String;)V"),
+    ("java/util/logging/Level", "findLevel", "(Ljava/lang/String;)Ljava/util/logging/Level;"),
+    ("java/util/logging/Level", "getName", "()Ljava/lang/String;"),
+    ("java/util/logging/Level", "intValue", "()I"),
+    ("java/util/logging/Level", "parse", "(Ljava/lang/String;)Ljava/util/logging/Level;"),
+    ("java/util/logging/Level", "toString", "()Ljava/lang/String;"),
+    ("java/util/logging/LogManager", "<init>", "()V"),
+    ("java/util/logging/LogManager", "addConfigurationListener", "(Ljava/lang/Runnable;)Ljava/util/logging/LogManager;"),
+    ("java/util/logging/LogManager", "addLogger", "(Ljava/util/logging/Logger;)Z"),
+    ("java/util/logging/LogManager", "checkAccess", "()V"),
+    ("java/util/logging/LogManager", "getLogManager", "()Ljava/util/logging/LogManager;"),
+    ("java/util/logging/LogManager", "getLogger", "(Ljava/lang/String;)Ljava/util/logging/Logger;"),
+    ("java/util/logging/LogManager", "getLoggerNames", "()Ljava/util/Enumeration;"),
+    ("java/util/logging/LogManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
+    ("java/util/logging/LogManager", "readConfiguration", "()V"),
+    ("java/util/logging/LogManager", "readConfiguration", "(Ljava/io/InputStream;)V"),
+    ("java/util/logging/LogManager", "removeConfigurationListener", "(Ljava/lang/Runnable;)V"),
+    ("java/util/logging/LogManager", "reset", "()V"),
+    ("java/util/logging/LogManager", "updateConfiguration", "(Ljava/io/InputStream;Ljava/util/function/Function;)V"),
+    ("java/util/logging/LogManager", "updateConfiguration", "(Ljava/util/function/Function;)V"),
+    ("java/util/logging/LogRecord", "<init>", "(Ljava/util/logging/Level;Ljava/lang/String;)V"),
+    ("java/util/logging/LogRecord", "getLevel", "()Ljava/util/logging/Level;"),
+    ("java/util/logging/LogRecord", "getMessage", "()Ljava/lang/String;"),
+    ("java/util/logging/LogRecord", "getSequenceNumber", "()J"),
+    // The source pair, retired 2026-08-12 as a SET. See the "the source pair"
+    // section of this module's docs: the getters are the real getters with
+    // `inferCaller()` deleted, and the setters are the real setters with
+    // `needToInferCaller = false` deleted. Retiring either half alone is worse
+    // than retiring neither.
+    ("java/util/logging/LogRecord", "getSourceClassName", "()Ljava/lang/String;"),
+    ("java/util/logging/LogRecord", "getSourceMethodName", "()Ljava/lang/String;"),
+    ("java/util/logging/LogRecord", "setSourceClassName", "(Ljava/lang/String;)V"),
+    ("java/util/logging/LogRecord", "setSourceMethodName", "(Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "addHandler", "(Ljava/util/logging/Handler;)V"),
+    ("java/util/logging/Logger", "config", "(Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "config", "(Ljava/util/function/Supplier;)V"),
+    ("java/util/logging/Logger", "entering", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "exiting", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "fine", "(Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "fine", "(Ljava/util/function/Supplier;)V"),
+    ("java/util/logging/Logger", "finer", "(Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "finer", "(Ljava/util/function/Supplier;)V"),
+    ("java/util/logging/Logger", "finest", "(Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "finest", "(Ljava/util/function/Supplier;)V"),
+    ("java/util/logging/Logger", "getFilter", "()Ljava/util/logging/Filter;"),
+    ("java/util/logging/Logger", "getHandlers", "()[Ljava/util/logging/Handler;"),
+    ("java/util/logging/Logger", "getLevel", "()Ljava/util/logging/Level;"),
+    ("java/util/logging/Logger", "getLogger", "(Ljava/lang/String;)Ljava/util/logging/Logger;"),
+    ("java/util/logging/Logger", "getLogger", "(Ljava/lang/String;Ljava/lang/String;)Ljava/util/logging/Logger;"),
+    ("java/util/logging/Logger", "getName", "()Ljava/lang/String;"),
+    ("java/util/logging/Logger", "getParent", "()Ljava/util/logging/Logger;"),
+    ("java/util/logging/Logger", "getResourceBundle", "()Ljava/util/ResourceBundle;"),
+    ("java/util/logging/Logger", "getResourceBundleName", "()Ljava/lang/String;"),
+    ("java/util/logging/Logger", "getUseParentHandlers", "()Z"),
+    ("java/util/logging/Logger", "info", "(Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "info", "(Ljava/util/function/Supplier;)V"),
+    ("java/util/logging/Logger", "isLoggable", "(Ljava/util/logging/Level;)Z"),
+    ("java/util/logging/Logger", "log", "(Ljava/util/logging/Level;Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "log", "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/Object;)V"),
+    ("java/util/logging/Logger", "log", "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/Throwable;)V"),
+    ("java/util/logging/Logger", "log", "(Ljava/util/logging/Level;Ljava/lang/String;[Ljava/lang/Object;)V"),
+    ("java/util/logging/Logger", "log", "(Ljava/util/logging/Level;Ljava/lang/Throwable;Ljava/util/function/Supplier;)V"),
+    ("java/util/logging/Logger", "log", "(Ljava/util/logging/Level;Ljava/util/function/Supplier;)V"),
+    ("java/util/logging/Logger", "log", "(Ljava/util/logging/LogRecord;)V"),
+    ("java/util/logging/Logger", "logp", "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "logp", "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)V"),
+    ("java/util/logging/Logger", "removeHandler", "(Ljava/util/logging/Handler;)V"),
+    ("java/util/logging/Logger", "setFilter", "(Ljava/util/logging/Filter;)V"),
+    ("java/util/logging/Logger", "setLevel", "(Ljava/util/logging/Level;)V"),
+    ("java/util/logging/Logger", "setParent", "(Ljava/util/logging/Logger;)V"),
+    ("java/util/logging/Logger", "setUseParentHandlers", "(Z)V"),
+    ("java/util/logging/Logger", "severe", "(Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "severe", "(Ljava/util/function/Supplier;)V"),
+    ("java/util/logging/Logger", "throwing", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)V"),
+    ("java/util/logging/Logger", "warning", "(Ljava/lang/String;)V"),
+    ("java/util/logging/Logger", "warning", "(Ljava/util/function/Supplier;)V"),
+    ("java/util/logging/LoggingPermission", "<init>", "()V"),
+    ("java/util/logging/LoggingPermission", "<init>", "(Ljava/lang/String;)V"),
+    ("java/util/logging/LoggingPermission", "<init>", "(Ljava/lang/String;Ljava/lang/String;)V"),
+    ("java/util/logging/LoggingPermission", "getName", "()Ljava/lang/String;"),
+];
+
+/// The 2026-08-19 stateless-subsystem wave: 255 triples over seven prefixes.
+///
+/// A SECOND table rather than 255 entries merged into the first, for two
+/// reasons. The first table's entries carry per-block commentary explaining
+/// individual holdbacks (`Logger.log`'s eighth overload, `Arrays.copyOf` being
+/// load-bearing for the ArrayList five) that a global re-sort would scatter
+/// away from the rows they explain. And these 255 were adjudicated by a
+/// different method — the dial first, the census second — which is worth being
+/// able to see at a glance rather than reconstructing from dates.
+///
+/// **Sorted and binary-searched, exactly like its sibling**, and for the same
+/// reason: an out-of-order entry makes the predicate answer `false` for a row
+/// that is present, which reads as "not retired" and is invisible.
+pub(in crate::retired_shadow) static RETIRED_SHADOW_STATELESS_TRIPLES: &[(&str, &str, &str)] = &[
+    // java/lang/module/Configuration — 1
+    ("java/lang/module/Configuration", "modules", "()Ljava/util/Set;"),
+    // java/lang/module/ModuleDescriptor — 13
+    ("java/lang/module/ModuleDescriptor", "exports", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "isAutomatic", "()Z"),
+    ("java/lang/module/ModuleDescriptor", "isOpen", "()Z"),
+    ("java/lang/module/ModuleDescriptor", "mainClass", "()Ljava/util/Optional;"),
+    ("java/lang/module/ModuleDescriptor", "modifiers", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "name", "()Ljava/lang/String;"),
+    ("java/lang/module/ModuleDescriptor", "opens", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "packages", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "provides", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "rawVersion", "()Ljava/util/Optional;"),
+    ("java/lang/module/ModuleDescriptor", "requires", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "uses", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "version", "()Ljava/util/Optional;"),
+    // java/lang/module/ModuleDescriptor$Exports — 3
+    ("java/lang/module/ModuleDescriptor$Exports", "compareTo", "(Ljava/lang/Object;)I"),
+    ("java/lang/module/ModuleDescriptor$Exports", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/module/ModuleDescriptor$Exports", "hashCode", "()I"),
+    // java/lang/module/ModuleDescriptor$Opens — 3
+    ("java/lang/module/ModuleDescriptor$Opens", "compareTo", "(Ljava/lang/Object;)I"),
+    ("java/lang/module/ModuleDescriptor$Opens", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/module/ModuleDescriptor$Opens", "hashCode", "()I"),
+    // java/lang/module/ModuleDescriptor$Provides — 3
+    ("java/lang/module/ModuleDescriptor$Provides", "compareTo", "(Ljava/lang/Object;)I"),
+    ("java/lang/module/ModuleDescriptor$Provides", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/module/ModuleDescriptor$Provides", "hashCode", "()I"),
+    // java/lang/module/ModuleDescriptor$Requires — 3
+    ("java/lang/module/ModuleDescriptor$Requires", "compareTo", "(Ljava/lang/Object;)I"),
+    ("java/lang/module/ModuleDescriptor$Requires", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/module/ModuleDescriptor$Requires", "hashCode", "()I"),
+    // java/lang/module/ModuleFinder — 1
+    ("java/lang/module/ModuleFinder", "ofSystem", "()Ljava/lang/module/ModuleFinder;"),
+    // java/lang/module/ModuleReference — 1
+    ("java/lang/module/ModuleReference", "descriptor", "()Ljava/lang/module/ModuleDescriptor;"),
+    // java/text/DecimalFormatSymbols — 2
+    ("java/text/DecimalFormatSymbols", "getInstance", "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;"),
+    ("java/text/DecimalFormatSymbols", "initialize", "(Ljava/util/Locale;)V"),
+    // java/text/ParseException — 1
+    ("java/text/ParseException", "<init>", "(Ljava/lang/String;I)V"),
+    // java/util/concurrent/atomic/AtomicBoolean — 1
+    ("java/util/concurrent/atomic/AtomicBoolean", "<init>", "(Z)V"),
+    // java/util/concurrent/atomic/AtomicInteger — 17
+    ("java/util/concurrent/atomic/AtomicInteger", "<init>", "()V"),
+    ("java/util/concurrent/atomic/AtomicInteger", "<init>", "(I)V"),
+    ("java/util/concurrent/atomic/AtomicInteger", "addAndGet", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "compareAndSet", "(II)Z"),
+    ("java/util/concurrent/atomic/AtomicInteger", "decrementAndGet", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "get", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "getAndAdd", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "getAndDecrement", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "getAndIncrement", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "getAndSet", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "incrementAndGet", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "intValue", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "lazySet", "(I)V"),
+    ("java/util/concurrent/atomic/AtomicInteger", "longValue", "()J"),
+    ("java/util/concurrent/atomic/AtomicInteger", "set", "(I)V"),
+    ("java/util/concurrent/atomic/AtomicInteger", "toString", "()Ljava/lang/String;"),
+    ("java/util/concurrent/atomic/AtomicInteger", "weakCompareAndSet", "(II)Z"),
+    // java/util/concurrent/atomic/AtomicIntegerArray — 26
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "<init>", "(I)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "addAndGet", "(II)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "compareAndExchange", "(III)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "compareAndExchangeAcquire", "(III)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "compareAndExchangeRelease", "(III)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "compareAndSet", "(III)Z"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "decrementAndGet", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "get", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getAcquire", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getAndAdd", "(II)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getAndDecrement", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getAndIncrement", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getAndSet", "(II)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getOpaque", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getPlain", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "incrementAndGet", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "lazySet", "(II)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "length", "()I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "set", "(II)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "setOpaque", "(II)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "setPlain", "(II)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "setRelease", "(II)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "weakCompareAndSet", "(III)Z"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "weakCompareAndSetAcquire", "(III)Z"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "weakCompareAndSetPlain", "(III)Z"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "weakCompareAndSetRelease", "(III)Z"),
+    // java/util/concurrent/atomic/AtomicLong — 16
+    ("java/util/concurrent/atomic/AtomicLong", "<init>", "()V"),
+    ("java/util/concurrent/atomic/AtomicLong", "<init>", "(J)V"),
+    ("java/util/concurrent/atomic/AtomicLong", "addAndGet", "(J)J"),
+    ("java/util/concurrent/atomic/AtomicLong", "compareAndSet", "(JJ)Z"),
+    ("java/util/concurrent/atomic/AtomicLong", "decrementAndGet", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "get", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(J)J"),
+    ("java/util/concurrent/atomic/AtomicLong", "getAndDecrement", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "getAndIncrement", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "getAndSet", "(J)J"),
+    ("java/util/concurrent/atomic/AtomicLong", "incrementAndGet", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "intValue", "()I"),
+    ("java/util/concurrent/atomic/AtomicLong", "lazySet", "(J)V"),
+    ("java/util/concurrent/atomic/AtomicLong", "longValue", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "set", "(J)V"),
+    ("java/util/concurrent/atomic/AtomicLong", "weakCompareAndSet", "(JJ)Z"),
+    // java/util/concurrent/atomic/AtomicLongArray — 26
+    ("java/util/concurrent/atomic/AtomicLongArray", "<init>", "(I)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "addAndGet", "(IJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "compareAndExchange", "(IJJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "compareAndExchangeAcquire", "(IJJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "compareAndExchangeRelease", "(IJJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "compareAndSet", "(IJJ)Z"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "decrementAndGet", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "get", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getAcquire", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getAndAdd", "(IJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getAndDecrement", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getAndIncrement", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getAndSet", "(IJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getOpaque", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getPlain", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "incrementAndGet", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "lazySet", "(IJ)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "length", "()I"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "set", "(IJ)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "setOpaque", "(IJ)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "setPlain", "(IJ)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "setRelease", "(IJ)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "weakCompareAndSet", "(IJJ)Z"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "weakCompareAndSetAcquire", "(IJJ)Z"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "weakCompareAndSetPlain", "(IJJ)Z"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "weakCompareAndSetRelease", "(IJJ)Z"),
+    // java/util/concurrent/atomic/AtomicMarkableReference — 8
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "<init>", "(Ljava/lang/Object;Z)V"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "attemptMark", "(Ljava/lang/Object;Z)Z"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "compareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;ZZ)Z"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "get", "([Z)Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "getReference", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "isMarked", "()Z"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "set", "(Ljava/lang/Object;Z)V"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "weakCompareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;ZZ)Z"),
+    // java/util/concurrent/atomic/AtomicReference — 8
+    ("java/util/concurrent/atomic/AtomicReference", "<init>", "()V"),
+    ("java/util/concurrent/atomic/AtomicReference", "<init>", "(Ljava/lang/Object;)V"),
+    ("java/util/concurrent/atomic/AtomicReference", "compareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/atomic/AtomicReference", "get", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicReference", "getAndSet", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicReference", "lazySet", "(Ljava/lang/Object;)V"),
+    ("java/util/concurrent/atomic/AtomicReference", "set", "(Ljava/lang/Object;)V"),
+    ("java/util/concurrent/atomic/AtomicReference", "toString", "()Ljava/lang/String;"),
+    // java/util/concurrent/atomic/AtomicStampedReference — 8
+    ("java/util/concurrent/atomic/AtomicStampedReference", "<init>", "(Ljava/lang/Object;I)V"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "attemptStamp", "(Ljava/lang/Object;I)Z"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "compareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;II)Z"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "get", "([I)Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "getReference", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "getStamp", "()I"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "set", "(Ljava/lang/Object;I)V"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "weakCompareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;II)Z"),
+    // java/util/concurrent/atomic/DoubleAdder — 5
+    ("java/util/concurrent/atomic/DoubleAdder", "<init>", "()V"),
+    ("java/util/concurrent/atomic/DoubleAdder", "add", "(D)V"),
+    ("java/util/concurrent/atomic/DoubleAdder", "doubleValue", "()D"),
+    ("java/util/concurrent/atomic/DoubleAdder", "reset", "()V"),
+    ("java/util/concurrent/atomic/DoubleAdder", "sum", "()D"),
+    // java/util/concurrent/atomic/LongAdder — 10
+    ("java/util/concurrent/atomic/LongAdder", "<init>", "()V"),
+    ("java/util/concurrent/atomic/LongAdder", "add", "(J)V"),
+    ("java/util/concurrent/atomic/LongAdder", "decrement", "()V"),
+    ("java/util/concurrent/atomic/LongAdder", "increment", "()V"),
+    ("java/util/concurrent/atomic/LongAdder", "intValue", "()I"),
+    ("java/util/concurrent/atomic/LongAdder", "longValue", "()J"),
+    ("java/util/concurrent/atomic/LongAdder", "reset", "()V"),
+    ("java/util/concurrent/atomic/LongAdder", "sum", "()J"),
+    ("java/util/concurrent/atomic/LongAdder", "sumThenReset", "()J"),
+    ("java/util/concurrent/atomic/LongAdder", "toString", "()Ljava/lang/String;"),
+    // `java/util/concurrent/locks/AbstractOwnableSynchronizer.setExclusiveOwnerThread` was
+    // retired here and UN-RETIRED 2026-10-04: its native is the ownership index behind
+    // `ThreadInfo.getLockedSynchronizers()` (it performs the JDK body's one store and
+    // records the owner), so retiring it left every ownable-synchronizer list empty
+    // (Spring Boot's `ThreadDumpEndpointTests.dumpThreadsAsText`). It is registered
+    // `Intrinsic` in `native-builtins/src/jmx.rs`.
+    // java/util/concurrent/locks/AbstractQueuedLongSynchronizer — 3
+    ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "compareAndSetState", "(JJ)Z"),
+    ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "getState", "()J"),
+    ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "setState", "(J)V"),
+    // java/util/concurrent/locks/LockSupport — 7
+    ("java/util/concurrent/locks/LockSupport", "getBlocker", "(Ljava/lang/Thread;)Ljava/lang/Object;"),
+    ("java/util/concurrent/locks/LockSupport", "park", "()V"),
+    ("java/util/concurrent/locks/LockSupport", "park", "(Ljava/lang/Object;)V"),
+    ("java/util/concurrent/locks/LockSupport", "parkNanos", "(J)V"),
+    ("java/util/concurrent/locks/LockSupport", "parkNanos", "(Ljava/lang/Object;J)V"),
+    ("java/util/concurrent/locks/LockSupport", "parkUntil", "(Ljava/lang/Object;J)V"),
+    ("java/util/concurrent/locks/LockSupport", "unpark", "(Ljava/lang/Thread;)V"),
+    // java/util/stream/Collectors — 34
+    ("java/util/stream/Collectors", "averagingDouble", "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "averagingInt", "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "averagingLong", "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "collectingAndThen", "(Ljava/util/stream/Collector;Ljava/util/function/Function;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "counting", "()Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "filtering", "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "groupingBy", "(Ljava/util/function/Function;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "groupingBy", "(Ljava/util/function/Function;Ljava/util/function/Supplier;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "groupingBy", "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "joining", "()Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "joining", "(Ljava/lang/CharSequence;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "joining", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "mapping", "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "maxBy", "(Ljava/util/Comparator;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "minBy", "(Ljava/util/Comparator;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "partitioningBy", "(Ljava/util/function/Predicate;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "partitioningBy", "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summarizingDouble", "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summarizingInt", "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summarizingLong", "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summingDouble", "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summingInt", "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summingLong", "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "teeing", "(Ljava/util/stream/Collector;Ljava/util/stream/Collector;Ljava/util/function/BiFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toCollection", "(Ljava/util/function/Supplier;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toList", "()Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toMap", "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toMap", "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toMap", "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;Ljava/util/function/Supplier;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toSet", "()Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toUnmodifiableList", "()Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toUnmodifiableMap", "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toUnmodifiableMap", "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toUnmodifiableSet", "()Ljava/util/stream/Collector;"),
+    // java/util/stream/DoubleStream — 5
+    ("java/util/stream/DoubleStream", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/stream/DoubleStream", "of", "(D)Ljava/util/stream/DoubleStream;"),
+    ("java/util/stream/DoubleStream", "parallel", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/DoubleStream", "sequential", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/DoubleStream", "spliterator", "()Ljava/util/Spliterator;"),
+    // java/util/stream/IntStream — 7
+    ("java/util/stream/IntStream", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/stream/IntStream", "of", "(I)Ljava/util/stream/IntStream;"),
+    ("java/util/stream/IntStream", "parallel", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/IntStream", "range", "(II)Ljava/util/stream/IntStream;"),
+    ("java/util/stream/IntStream", "rangeClosed", "(II)Ljava/util/stream/IntStream;"),
+    ("java/util/stream/IntStream", "sequential", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/IntStream", "spliterator", "()Ljava/util/Spliterator;"),
+    // java/util/stream/LongStream — 7
+    ("java/util/stream/LongStream", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/stream/LongStream", "of", "(J)Ljava/util/stream/LongStream;"),
+    ("java/util/stream/LongStream", "parallel", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/LongStream", "range", "(JJ)Ljava/util/stream/LongStream;"),
+    ("java/util/stream/LongStream", "rangeClosed", "(JJ)Ljava/util/stream/LongStream;"),
+    ("java/util/stream/LongStream", "sequential", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/LongStream", "spliterator", "()Ljava/util/Spliterator;"),
+    // java/util/stream/ReferencePipeline — 2
+    ("java/util/stream/ReferencePipeline", "collect", "(Ljava/util/function/Supplier;Ljava/util/function/BiConsumer;Ljava/util/function/BiConsumer;)Ljava/lang/Object;"),
+    ("java/util/stream/ReferencePipeline", "collect", "(Ljava/util/stream/Collector;)Ljava/lang/Object;"),
+    // java/util/stream/Stream — 5
+    ("java/util/stream/Stream", "concat", "(Ljava/util/stream/Stream;Ljava/util/stream/Stream;)Ljava/util/stream/Stream;"),
+    ("java/util/stream/Stream", "empty", "()Ljava/util/stream/Stream;"),
+    ("java/util/stream/Stream", "of", "(Ljava/lang/Object;)Ljava/util/stream/Stream;"),
+    ("java/util/stream/Stream", "of", "([Ljava/lang/Object;)Ljava/util/stream/Stream;"),
+    ("java/util/stream/Stream", "toList", "()Ljava/util/List;"),
+    // sun/nio/fs/WindowsFileAttributes — 8 of the 9 the 2026-08-19 census
+    // found, added 2026-08-20 (H2-1). `fileKey` is the ninth and is HELD;
+    // see the header block for why, and `the_held_windows_attribute_triple_
+    // is_not_retired` for the pin.
+    ("sun/nio/fs/WindowsFileAttributes", "creationTime", "()Ljava/nio/file/attribute/FileTime;"),
+    ("sun/nio/fs/WindowsFileAttributes", "isDirectory", "()Z"),
+    ("sun/nio/fs/WindowsFileAttributes", "isOther", "()Z"),
+    ("sun/nio/fs/WindowsFileAttributes", "isRegularFile", "()Z"),
+    ("sun/nio/fs/WindowsFileAttributes", "isSymbolicLink", "()Z"),
+    ("sun/nio/fs/WindowsFileAttributes", "lastAccessTime", "()Ljava/nio/file/attribute/FileTime;"),
+    ("sun/nio/fs/WindowsFileAttributes", "lastModifiedTime", "()Ljava/nio/file/attribute/FileTime;"),
+    ("sun/nio/fs/WindowsFileAttributes", "size", "()J"),
+];
+
+/// Class-name prefixes any retired triple must fall under.
+///
+/// A cheap discriminator in front of two binary searches: almost no
+/// registration is under any of these, so the common case costs one failed
+/// prefix compare.
+///
+/// It is NOT the definition of what is retired — the tables are. A prefix here
+/// that no table entry uses retires nothing; a table entry outside every prefix
+/// here is UNREACHABLE and answers `false`, which is the silent failure
+/// `every_entry_is_reachable_through_the_predicate` and its sibling exist to
+/// catch.
+pub(in crate::retired_shadow) const RETIRED_SHADOW_PREFIXES: &[&str] = &[
+    // 2026-10-06, SBR5 lane jfr: the JFR boundary rows, by class name
+    // (`RETIRED_SHADOW_SBR5_JFR_TRIPLES`); the rest of `jdk.jfr` was never shadowed.
+    "jdk/jfr/AnnotationElement",
+    "jdk/jfr/Event",
+    "jdk/jfr/Recording",
+    "jdk/jfr/consumer/RecordingStream",
+    "jdk/jfr/internal/JDKEvents",
+    "jdk/jfr/internal/instrument/JDKEvents",
+    // 2026-09-11, lane 4 wave 2. The NARROW prefix, for the reason the
+    // `sun/nio/fs/` note below gives: `jdk/internal/foreign/` as a whole has
+    // nothing retirable under it. The segment, arena and session carriers are
+    // this VM's OWN allocation shape by a decision on record
+    // (`docs/feature-designs/native-dispatch-architecture.md`),
+    // laid out deliberately unlike the JDK's, so their real bodies must never
+    // run; only the LAYOUT carriers are minted on their real classes with
+    // their real fields. `RETIRED_SHADOW_L4_FFM_TRIPLES` retires 137 rows over
+    // the nine `ValueLayouts$Of*Impl` classes under this prefix, and nothing
+    // else under it is retired -- not the group layouts beside them, and not
+    // `varHandle` on these nine.
+    "jdk/internal/foreign/layout/",
+    // 2026-10-06, SBR round 4 lane SEGACC: the WHOLE package, now that the arena,
+    // session, segment and splitter rows (`RETIRED_SHADOW_SBR4_SEGACC_TRIPLES`)
+    // retire to the JDK's own classes; the table, not the prefix, decides.
+    "jdk/internal/foreign/",
+    // 2026-09-11, lane 4 wave 1. The two wide prefixes of the largest lane:
+    // 1,398 bucket-A/B shadows over 142 classes sit under them. Same rule as
+    // every prefix above -- this admits those packages to one extra binary
+    // search each, and `RETIRED_SHADOW_L4_TRIPLES` decides what is retired. It
+    // retires 140 rows over 10 classes; `jdk/internal/foreign` is deliberately
+    // NOT admitted, because nothing under it came through the funnel.
+    "java/io/",
+    "java/nio/",
+    "java/lang/module/",
+    "java/text/",
+    "java/util/",
+    // 2026-08-20, H2-1. Deliberately the NARROW prefix and not `sun/nio/`:
+    // `sun/nio/ch/` scored 34/36 on the 2026-08-19 dial sweep and nothing
+    // under it is retirable. `java/lang/ref/` is still absent on purpose —
+    // see the `sun/nio/fs/` block in this module's header.
+    "sun/nio/fs/",
+    // 2026-09-10, lane 2. `java/math/` cost one corpus vector of 36 on the
+    // 2026-08-19 package screen, which is why it was never admitted; re-taking
+    // that screen per CLASS rather than per package found the cost was
+    // `BigInteger`'s and named it — `RJdkSecurity`, on `2^127-1 must be
+    // prime`. See `RETIRED_SHADOW_L2_TRIPLES` for what that turned out to be.
+    // `java/lang/` is the wider of the two and admits the whole package tree to
+    // one extra binary search; the table decides what is retired, and it
+    // retires three rows under it.
+    "java/lang/",
+    "java/math/",
+    // 2026-08-30, Phase 2. **This narrows the note above rather than
+    // overruling it.** That note is a PACKAGE verdict from a package-scoped
+    // dial sweep, and it is still the right default: this lane's own
+    // whole-corpus run agrees that `sun/nio/ch/` as a whole is not retirable.
+    // What is retired under this prefix is ONE triple, measured on its own —
+    // see `RETIRED_SHADOW_PHASE2_TRIPLES`. A prefix admits a package to the
+    // binary search; the table decides what is retired, and it retires one row.
+    "sun/nio/ch/",
+    // 2026-09-10, the `--real-jdk` loader-and-bootstrap lane. The measurement
+    // is in
+    // `docs/feature-designs/native-dispatch-architecture.md`;
+    // the lane's own page retired with it.
+    // Two NARROW prefixes, for the reason the `sun/nio/ch/` note above gives: a
+    // prefix only admits a class to the binary search, and
+    // `RETIRED_SHADOW_L7_TRIPLES` retires exactly two rows under them. In
+    // particular `java/security/SecureClassLoader` is spelled out rather than
+    // `java/security/`, which is lane 6's whole prefix set and is NOT admitted
+    // here. `the_l7_prefixes_retire_only_the_two_measured_rows` is the guard.
+    //
+    // Lane 2's `java/lang/` above arrived in the SAME merge and subsumes
+    // `java/lang/ClassLoader` entirely. The entry stays anyway: it is what
+    // makes lane 7's two rows reachable on their own terms, and deleting it
+    // would silently hand that reachability to a prefix another lane owns and
+    // could re-narrow. A duplicate prefix costs one `starts_with` on a path
+    // that has already matched.
+    "java/lang/ClassLoader",
+    "java/security/SecureClassLoader",
+    // 2026-09-10, lane 5 (`java/util/concurrent/`, `jdk/internal/misc/`,
+    // `sun/misc/`, `java/lang/Thread*`, `jdk/internal/vm/`). `java/util/`
+    // above already admits `java/util/concurrent/`; these four are the rest of
+    // that lane's prefix set.
+    //
+    // Adding a prefix while its table is empty is PROVABLY INERT: the list is
+    // only an early-out in front of the binary searches, so a wider list plus
+    // an empty table answers `false` for exactly the same inputs. That is what
+    // makes it safe to land the prefixes and the table in one commit —
+    // `the_l5_prefixes_retire_nothing_on_their_own` is the guard that says so
+    // for every triple this lane declined.
+    "jdk/internal/misc/",
+    "jdk/internal/vm/",
+    "java/lang/Thread",
+    "sun/misc/",
+    // 2026-09-10, L1 wave 2. **This is L0's cell and L1 edited it**, because
+    // L0's skeleton commit (lane-0 §4: nine empty tables, nine chain arms,
+    // every lane's prefixes pre-added) never landed, and `java/time/` is in
+    // L1's declared prefix set in the ownership table. Adding a prefix is
+    // provably inert for every triple no table carries — the list is an
+    // early-out in front of the binary searches, so a wider list plus the
+    // same tables answers `true` for exactly the two `java/time/` rows this
+    // wave adds and `false` for everything else, as before.
+    "java/time/",
+    // 2026-09-10, lane T wave 1. The 62 throwable-family classes, spelled OUT
+    // rather than collapsed to `java/lang/`, `java/io/` and `java/net/`.
+    //
+    // Lane 0 §4 asks for "the narrowest prefix that covers your entry", and the
+    // reason is not tidiness: this list is a SECOND guard, deliberately
+    // redundant with the tables, and `a_prefix_alone_retires_nothing` asserts
+    // that `java/lang/ref/Reference.clear()V` is not admitted by it. A blanket
+    // `java/lang/` would keep that test green and delete the guard for the next
+    // reader. Class names ARE the narrowest prefixes here, and the entries
+    // already covered by `java/text/` and `java/util/` are not repeated.
+    //
+    // Cost: the predicate's early-out is a linear `starts_with` scan, so this
+    // takes it from 7 entries to 52 -- roughly 13k registrations x 52 failed
+    // prefix compares at boot, once.
+    "java/io/EOFException",
+    "java/io/FileNotFoundException",
+    "java/io/IOException",
+    "java/io/NotSerializableException",
+    "java/io/UncheckedIOException",
+    "java/io/UnsupportedEncodingException",
+    "java/lang/AbstractMethodError",
+    "java/lang/ArithmeticException",
+    "java/lang/ArrayIndexOutOfBoundsException",
+    "java/lang/AssertionError",
+    "java/lang/ClassCastException",
+    "java/lang/ClassNotFoundException",
+    "java/lang/CloneNotSupportedException",
+    "java/lang/Error",
+    "java/lang/Exception",
+    "java/lang/ExceptionInInitializerError",
+    "java/lang/IllegalAccessError",
+    "java/lang/IllegalAccessException",
+    "java/lang/IllegalArgumentException",
+    "java/lang/IllegalStateException",
+    "java/lang/IncompatibleClassChangeError",
+    "java/lang/IndexOutOfBoundsException",
+    "java/lang/InstantiationException",
+    "java/lang/InternalError",
+    "java/lang/InterruptedException",
+    "java/lang/LinkageError",
+    "java/lang/MatchException",
+    "java/lang/NegativeArraySizeException",
+    "java/lang/NoClassDefFoundError",
+    "java/lang/NoSuchFieldError",
+    "java/lang/NoSuchFieldException",
+    "java/lang/NoSuchMethodError",
+    "java/lang/NoSuchMethodException",
+    "java/lang/NullPointerException",
+    "java/lang/NumberFormatException",
+    "java/lang/OutOfMemoryError",
+    "java/lang/ReflectiveOperationException",
+    "java/lang/RuntimeException",
+    "java/lang/SecurityException",
+    "java/lang/StackOverflowError",
+    "java/lang/StringIndexOutOfBoundsException",
+    "java/lang/Throwable",
+    "java/lang/TypeNotPresentException",
+    "java/lang/UnsatisfiedLinkError",
+    "java/lang/UnsupportedOperationException",
+    "java/lang/VerifyError",
+    "java/lang/reflect/InaccessibleObjectException",
+    "java/lang/reflect/InvocationTargetException",
+    "java/net/MalformedURLException",
+    "java/net/UnknownHostException",
+    // 2026-09-11, L1 wave 5. NARROW, the way lane 7's two are and for the same
+    // reason: `sun/util/` is a large tree whose locale-provider half this lane
+    // has measured as NOT retirable (see `RETIRED_SHADOW_L1_ZI_TRIPLES`'s doc
+    // comment for the five `reached == 0` rows), and admitting the package
+    // would put every one of them one binary search from a future table.
+    // `the_zone_info_file_prefix_retires_only_the_two_measured_rows` is the
+    // guard.
+    "sun/util/calendar/ZoneInfoFile",
+    // 2026-09-11, L1 wave 6. Two more NARROW spellings, for the same reason
+    // the line above is narrow: the locale-provider tree's other half is
+    // MEASURED not retirable (`LocaleResources` +12 on 254 engagements,
+    // `CalendarDataUtility` +12 on 108 -- see
+    // `RETIRED_SHADOW_L1_LP_TRIPLES`), and a `sun/util/` prefix would put
+    // both one binary search from a future table.
+    "sun/util/locale/provider/JRELocaleProviderAdapter",
+    "sun/util/resources/LocaleData",
+    // 2026-09-12, L1 wave 9. NARROW again, for the third time and the same
+    // reason: `RETIRED_SHADOW_L1_DATE_TRIPLES` retires nine rows on
+    // `sun/util/calendar/ZoneInfo`, and the locale-provider half of
+    // `sun/util/` is still measured NOT retirable, so the package prefix is
+    // still the wrong instrument.
+    //
+    // This string SUBSUMES wave 5's `sun/util/calendar/ZoneInfoFile` above --
+    // the screen is `starts_with`, and `ZoneInfoFile` starts with `ZoneInfo`.
+    // Wave 5's line stays because deleting it would take its note with it and
+    // leave `the_zone_info_file_prefix_retires_only_the_two_measured_rows`
+    // guarding a string no longer in the file. Two entries, one of them
+    // redundant, is the cheaper of the two mistakes available here.
+    "sun/util/calendar/ZoneInfo",
+    // 2026-09-19, the `--real-jdk` throughput wave. NARROW, for the reason the
+    // `sun/util/` ones above are: `jdk/internal/util/` is a large tree
+    // (`ArraysSupport`, `Preconditions`, the `random` and `xml` packages) whose
+    // other members are `Intrinsic`s and bridges nobody has measured, and
+    // `RETIRED_SHADOW_JOTP_TRIPLES` retires exactly three rows under it. The
+    // guard is `the_jotp_wave_is_the_three_int_precondition_checks`.
+    "jdk/internal/util/Preconditions",
+    // 2026-09-11, lane L3 adds NO prefix of its own, and that is the merge
+    // resolution rather than an omission. This branch carried
+    // `java/lang/invoke/` and `java/lang/reflect/` for
+    // `RETIRED_SHADOW_L3_TRIPLES`; `dev` meanwhile added the broad
+    // `java/lang/`, which already admits every one of L3's 24 rows. Two
+    // narrower prefixes behind a wider one are dead weight, and the rule this
+    // module states is the NARROWEST list that covers the tables -- so they
+    // are dropped.
+    //
+    // Worth flagging to whoever owns `java/lang/`: a prefix that broad makes
+    // the TABLE the only guard, where a narrow list is a second one. Nothing
+    // is wrong today -- the tables still decide -- but
+    // `a_prefix_alone_retires_nothing` is weaker than it reads, and narrowing
+    // someone else's prefix is their call, not this lane's.
+    //
+    // L0 adds no prefix either, and the reason CHANGED on 2026-09-11 -- the
+    // sentence here used to say "its table is EMPTY (two corpus rounds
+    // withdrew all 54)", which was true of the withdrawal and is not true of
+    // wave 2. L0 now carries 19 rows: 15 on `java/lang/Class` and 4 on
+    // `java/lang/module/ModuleDescriptor$Version`. Both are already admitted,
+    // by `java/lang/` and `java/lang/module/` respectively, so the narrowest
+    // covering list still does not need an L0 entry. Same conclusion,
+    // different reason, and the old reason would have read as "this lane
+    // retired nothing".
+    // 2026-09-11, lane L6. The whole adjudication, all 1,414 rows of it, is in
+    // `docs/feature-designs/native-dispatch-architecture.md`.
+    //
+    // ONE prefix for a lane that owns nine, and deliberately the NARROW
+    // spelling: `java/net/` and not `java/`. Under it, TWO classes of the
+    // fourteen the wave tried.
+    //
+    // `javax/security/auth/x500/` was here through the fifth of six builds and
+    // is not here now: `X500Principal` alone breaks `RSslLiveSession`, because
+    // this VM fills that class's one declared `X500Name` slot with a String.
+    // Every other class the lane tried was measured out the same way, by a
+    // corpus vector rather than by a probe -- the table's header is the
+    // ladder, one row per build.
+    //
+    // The lane's other eight prefixes carry no table at all. Each was armed on
+    // the whole 125-probe tree and each either moved a probe AWAY from HotSpot
+    // (`javax/net/`, and the four security prefixes together) or never reached
+    // the dial (`sun/net/`, `jdk/net/`, `jdk/internal/net/`: 123 of 125 probes
+    // VACUOUS). Adding a prefix whose table is empty is provably inert, but it
+    // would read to the next lane as a claim that something under it was
+    // retired, and `the_lane_l6_security_and_tls_prefixes_are_not_admitted`
+    // exists to keep that claim from being made by accident.
+    "java/net/",
+    // 2026-09-24, the `URLClassLoader` family. ONE class spelled out, not
+    // `jdk/internal/loader/`: the built-in loaders beside it serve the VM's
+    // own application class path and stay native.
+    // `RETIRED_SHADOW_URLCLASSLOADER_TRIPLES` is what this admits.
+    "jdk/internal/loader/URLClassPath",
+    // 2026-09-28, round 13 wave 8 (lane shadow2). Three classes spelled out,
+    // not `java/beans/`: the `Introspector` / `PropertyDescriptor` /
+    // `FeatureDescriptor` natives beside them are forced for Spring and stay.
+    // `RETIRED_SHADOW_BEANS_CHANGE_SUPPORT_TRIPLES` is what these admit.
+    "java/beans/PropertyChangeEvent",
+    "java/beans/PropertyChangeSupport",
+    "java/beans/VetoableChangeSupport",
+    // 2026-09-29, round 14 wave 5 (lane compat5). Three classes spelled out,
+    // not `java/sql/`: the JDBC interfaces beside them are abstract targets
+    // with natives of their own. `RETIRED_SHADOW_SQL_DATETIME_TRIPLES` is what
+    // these admit (`java/sql/Time` also admits `Timestamp` by prefix).
+    "java/sql/Date",
+    "java/sql/Time",
+    "java/sql/Timestamp",
+    // 2026-09-30, round 15 wave 1 (lane shadow). Two classes spelled out, not
+    // `sun/reflect/`: the annotation factories beside them
+    // (`AnnotatedTypeFactory$*`) are forced natives
+    // (`is_typeuse_annotation_native_override`) and stay.
+    // `RETIRED_SHADOW_REFLECT_GENERICS_DELEGATE_TRIPLES` is what these admit.
+    "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl",
+    "sun/reflect/generics/reflectiveObjects/TypeVariableImpl",
+    // 2026-09-28, SBR wave 1 lane JCA. Six CLASS names, not `java/security/`,
+    // `javax/crypto/` or `sun/security/`: lane 6 measured those packages as a
+    // whole and `the_lane_l6_security_and_tls_prefixes_are_not_admitted` still
+    // holds that verdict. Under these six, `RETIRED_SHADOW_SBR_JCA_TRIPLES`
+    // retires 30 rows; `java/security/KeyPair` also admits `KeyPairGenerator`
+    // to the binary search, and the table holds that class back (see its doc
+    // comment), which `the_sbr_jca_wave_holds_the_provider_side_engines` asserts.
+    "java/security/KeyPair",
+    "java/security/Security",
+    "java/security/cert/CertificateFactory",
+    "javax/crypto/SecretKeyFactory",
+    "javax/crypto/spec/SecretKeySpec",
+    "sun/security/jca/GetInstance",
+    // 2026-09-28, SBR wave 1 lane JMX. ONE class spelled out, not
+    // `javax/management/`: the `MBeanServer` interface rows and the MXBean
+    // interface rows beside it bind abstract methods (no `Code` to yield to)
+    // and stay native. `RETIRED_SHADOW_SBR_JMX_TRIPLES` is what this admits.
+    "javax/management/ObjectName",
+    // 2026-09-29, SBR wave 2 lane JCA2. Class names again, for wave 1's reason
+    // (lane 6's package verdict). `java/security/KeyPair` above already admits
+    // `KeyPairGenerator`; `java/security/Provider` admits `Provider$Service`.
+    // `RETIRED_SHADOW_SBR_JCA2_TRIPLES` is what these admit; `javax/crypto/Cipher`
+    // is still NOT admitted (held: AES-GCM throughput in wave 1, per-object
+    // setup cost in wave 5).
+    "java/security/KeyFactory",
+    "java/security/Provider",
+    "java/security/Signature",
+    "sun/security/util/SignatureUtil",
+    // 2026-09-29, SBR wave 3 lane REFLECT. ONE class spelled out, not
+    // `jdk/internal/reflect/`: `Reflection` beside it is held
+    // (`ensureNativeAccess`, see the table) or ACC_NATIVE, and the rest of
+    // `ReflectionFactory` is the copy door, which is held.
+    "jdk/internal/reflect/ReflectionFactory",
+    // 2026-09-29, SBR wave 5 lane REFLMETA. `Reflection` spelled out, not
+    // `jdk/internal/reflect/`: the rest of `Reflection` is ACC_NATIVE
+    // (`getCallerClass`, `getClassAccessFlags`, `areNestMates`) and
+    // `ConstantPool` beside it is ACC_NATIVE too. Admits one row,
+    // `ensureNativeAccess` (declared on 25 only), in
+    // `RETIRED_SHADOW_SBR_REFLMETA_TRIPLES`.
+    "jdk/internal/reflect/Reflection",
+    // The four generic carriers, not `sun/reflect/`: the annotation parser
+    // under `sun/reflect/annotation/` is held with the annotation family.
+    // `RETIRED_SHADOW_SBR_REFLECT_TRIPLES` is what these two admit.
+    "sun/reflect/generics/reflectiveObjects/",
+    // 2026-09-29, SBR wave 4 lane LOCALE2. Two CLASS names, not `sun/util/`,
+    // for the reason every `sun/util/` line above gives: `CalendarDataUtility`
+    // beside them is still held. `RETIRED_SHADOW_SBR_LOCALE2_TRIPLES` is what
+    // these admit (`java/util/ResourceBundle` is already under `java/util/`).
+    "sun/util/locale/provider/LocaleResources",
+    "sun/util/resources/Bundles",
+    // 2026-09-29, SBR wave 4 lane SSL. Class names, never `javax/net/ssl/`,
+    // `sun/security/ssl/` or `javax/security/auth/x500/` whole: lane 6's
+    // package verdict (`the_lane_l6_security_and_tls_prefixes_are_not_admitted`)
+    // still holds, and the JSSE handshake half beside these is held.
+    // `RETIRED_SHADOW_SBR_SSL_TRIPLES` is what these admit.
+    "java/security/KeyStore",
+    "javax/net/ssl/SSLEngineResult",
+    "javax/security/auth/x500/X500Principal",
+    "sun/security/x509/X500Name",
+    // 2026-09-29, SBR wave 5 lane CRYPTOENG. ONE class name, for lane 6's
+    // package verdict again. It also admits `MessageDigestSpi` to the binary
+    // search (its rows are registered in no shipping mode and are not in the
+    // table). `javax/crypto/Cipher` and `javax/crypto/Mac` stay unadmitted:
+    // held for per-handshake setup cost (see the table).
+    // `RETIRED_SHADOW_SBR_CRYPTOENG_TRIPLES` is what this admits.
+    "java/security/MessageDigest",
+    // 2026-09-29, SBR wave 6 lane DISPATCH: the one class of the two engines
+    // wave 5 held whose native answers wrong (`Cipher`); `javax/crypto/Mac`
+    // stays unadmitted. Class name only (`the_lane_l6_security_and_tls_
+    // prefixes_are_not_admitted` keeps the package out).
+    // `RETIRED_SHADOW_SBR_DISPATCH_TRIPLES` is what this admits.
+    "javax/crypto/Cipher",
+    // 2026-09-30, SBR round 2 lane CALLER: the class name only (see
+    // `RETIRED_SHADOW_SBR2_CALLER_TRIPLES`), never `javax/crypto/`.
+    "javax/crypto/Mac",
+    // 2026-09-30, SBR round 2 wave 7 lane AWT: the CONCRETE `sun.management`
+    // impl rows (constructors, name/validity/type accessors and the
+    // `VMManagementImpl.is*Supported` readers). The native rows of the same
+    // classes (`getUsage0`, `getMemoryPools0`, ...) are ACC_NATIVE in JDK 25 and
+    // are not in the table. `RETIRED_SHADOW_SBR2_AWT_TRIPLES` is what this
+    // admits; `java/lang/management/ManagementFactory` is admitted by
+    // `java/lang/`.
+    "sun/management/",
+    // 2026-10-04, SBR round 3 lane awt: `Toolkit.getDefaultToolkit` and
+    // `GraphicsEnvironment.isHeadless` by CLASS name, so no sibling row of
+    // `java/awt/` is admitted by accident (`RETIRED_SHADOW_SBR3_AWT_TRIPLES`).
+    // 2026-10-06, SBR round 5 lane AWTJFR: class names only (`RETIRED_SHADOW_SBR5_AWTJFR_TRIPLES`).
+    "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+    "com/sun/imageio/plugins/png/PNGImageWriter",
+    "java/awt/Font",
+    "java/awt/image/BufferedImage",
+    "javax/imageio/ImageIO",
+    "sun/java2d/HeadlessGraphicsEnvironment",
+    "sun/java2d/SunGraphics2D",
+    "java/awt/Toolkit",
+    "java/awt/GraphicsEnvironment",
+    // 2026-10-05, SBR3 wave 2 lane UNSAFECAS: `createToolkit` by CLASS name; the
+    // sibling `getDefaultHeadlessProperty` / `getDefaultHeadlessMessage` /
+    // `hasDisplays0` rows are admitted by the prefix and not in the table
+    // (`RETIRED_SHADOW_SBR3_UNSAFECAS_TRIPLES`).
+    "sun/awt/PlatformGraphicsInfo",
+    // 2026-10-04, SBR3 lane awt: the two JFR type-lookup rows, by class name.
+    "jdk/jfr/internal/Type",
+    "jdk/jfr/internal/util/Utils",
+    // 2026-09-30, SBR2 wave 8 lane SMALL: the two MBean-introspector
+    // `getMethods` rows only (`RETIRED_SHADOW_SBR2_SMALL_TRIPLES`).
+    "com/sun/jmx/mbeanserver/",
+    // 2026-09-29, SBR wave 5 lane JSSE. Class names again, never the packages
+    // (`the_lane_l6_security_and_tls_prefixes_are_not_admitted`): the
+    // interfaces and `HttpsURLConnection` beside these stay native.
+    // `javax/net/ssl/SSLSocket` also admits `SSLSocketFactory`,
+    // `SSLServerSocket` admits `SSLServerSocketFactory`, and
+    // `sun/security/ssl/SSLSocketImpl` admits its two stream classes.
+    // `RETIRED_SHADOW_SBR_JSSE_TRIPLES` is what these admit.
+    "javax/net/ssl/KeyManagerFactory",
+    "javax/net/ssl/SSLContext",
+    "javax/net/ssl/SSLEngine",
+    "javax/net/ssl/SSLParameters",
+    "javax/net/ssl/SSLServerSocket",
+    "javax/net/ssl/SSLSocket",
+    "javax/net/ssl/TrustManagerFactory",
+    "sun/security/pkcs12/PKCS12KeyStore",
+    "sun/security/provider/JavaKeyStore",
+    "sun/security/ssl/KeyManagerFactoryImpl",
+    "sun/security/ssl/SSLEngineImpl",
+    "sun/security/ssl/SSLSocketImpl",
+    "sun/security/ssl/SunX509KeyManagerImpl",
+    "sun/security/ssl/TrustManagerFactoryImpl",
+    "sun/security/ssl/X509KeyManagerImpl",
+    "sun/security/ssl/X509TrustManagerImpl",
+    // 2026-09-29, SBR wave 5 lane HTTP. Two CLASS names, never `sun/net/` or
+    // `sun/net/www/` whole (lane 6's package verdict,
+    // `the_lane_l6_security_and_tls_prefixes_are_not_admitted`): the HTTPS
+    // carrier beside them is lane `jsse`'s, and the `com.sun.net.httpserver`
+    // server and the `jdk/internal/net/http` client are HELD, so no prefix
+    // admits them. `RETIRED_SHADOW_SBR_HTTP_TRIPLES` is what these admit
+    // (`java/net/HttpURLConnection` and `java/net/URLConnection` are already
+    // under `java/net/`).
+    "sun/net/www/protocol/http/HttpURLConnection",
+    "sun/net/www/protocol/jrt/JavaRuntimeURLConnection",
+    // 2026-09-29, SBR wave 6 lane HTTPSTACK. CLASS names, never `sun/net/`,
+    // `jdk/internal/net/` or `com/sun/net/` whole (lane 6's package verdict,
+    // `the_lane_l6_security_and_tls_prefixes_are_not_admitted`).
+    // `RETIRED_SHADOW_SBR_HTTPSTACK_TRIPLES` is what these admit
+    // (`java/net/http/` is under `java/net/`).
+    "com/sun/net/httpserver/HttpServer",
+    "javax/net/ssl/HttpsURLConnection",
+    "jdk/internal/net/http/Http1HeaderParser",
+    "jdk/internal/net/http/Http2ClientImpl",
+    "jdk/internal/net/http/HttpClientImpl",
+    "jdk/internal/net/http/HttpRequestImpl",
+    "jdk/internal/net/http/HttpResponseImpl",
+    "sun/net/httpserver/HttpContextImpl",
+    "sun/net/httpserver/HttpServerImpl",
+    "sun/net/spi/DefaultProxySelector",
+    "sun/net/www/protocol/https/HttpsURLConnectionImpl",
+    // 2026-09-29, SBR wave 6 lane TAIL. Two CLASS names, never `javax/crypto/`
+    // whole (lane 6's package verdict,
+    // `the_lane_l6_security_and_tls_prefixes_are_not_admitted`): `Cipher` and
+    // `Mac` beside them are held. `RETIRED_SHADOW_SBR_TAIL_TRIPLES` is what
+    // these admit (`java/lang/`, `java/nio/`, `java/util/` and
+    // `jdk/internal/misc/` already admit the rest).
+    "javax/crypto/KeyAgreement",
+    "javax/crypto/spec/IvParameterSpec",
+    // 2026-09-29, SBR wave 6 lane MODULE. CLASS names, never `java/security/`
+    // or `jdk/internal/{module,loader}/` whole (lane 6's package verdict,
+    // `the_lane_l6_security_and_tls_prefixes_are_not_admitted`);
+    // `java/lang/Module*`, `ClassLoader` and `Class` are already under
+    // `java/lang/`. `RETIRED_SHADOW_SBR_MODULE_TRIPLES` is what these admit.
+    "java/security/AccessControlContext",
+    "java/security/AccessController",
+    "java/security/CodeSource",
+    "java/security/ProtectionDomain",
+    "jdk/internal/loader/BootLoader",
+    "jdk/internal/module/Builder",
+    // 2026-09-30, SBR2 wave 7 lane MODULE: one CLASS name (never
+    // `jdk/internal/module/` whole). `RETIRED_SHADOW_SBR2_MODULE_TRIPLES`.
+    "jdk/internal/module/ModuleReferenceImpl",
+    // 2026-09-29, SBR wave 6 lane SYSTEM. Three CLASS names, never
+    // `jdk/internal/access/`, `jdk/internal/loader/` or `jdk/internal/logger/`
+    // whole (`jdk/internal/loader/URLClassPath` above is lane 7's, and the
+    // loaders proper are the `module` lane's): the table decides what is
+    // retired. `RETIRED_SHADOW_SBR_SYSTEM_TRIPLES` is what these admit.
+    "jdk/internal/access/SharedSecrets",
+    "jdk/internal/loader/BootLoader",
+    "jdk/internal/logger/DefaultLoggerFinder",
+    // 2026-09-30, SBR round 2 wave 7 lane TAIL. Five CLASS names, never
+    // `javax/crypto/spec/`, `jdk/internal/{constant,event,logger}/` or
+    // `sun/util/locale/provider/` whole. `RETIRED_SHADOW_SBR2_TAIL_TRIPLES` is what
+    // these admit (`java/io/`, `java/nio/`, `java/util/` and `jdk/internal/misc/`
+    // already admit the rest).
+    "javax/crypto/spec/GCMParameterSpec",
+    "jdk/internal/constant/ConstantUtils",
+    "jdk/internal/event/EventHelper",
+    "jdk/internal/logger/LazyLoggers",
+    "sun/util/locale/provider/CalendarDataUtility",
+    // 2026-09-30, SBR round 2 wave 8 lane SPRINGAPP. CLASS names only. The
+    // `org/` two are APPLICATION classes (Spring, jboss-logging): a registered
+    // native over an application class is a shadow like any other, and these
+    // are the only admissions in this list that are not JDK. See
+    // `RETIRED_SHADOW_SBR2_SPRINGAPP_APP_TRIPLES`.
+    "java/beans/Introspector",
+    "jdk/internal/module/SystemModuleFinders",
+    "org/jboss/logging/Slf4jLocationAwareLogger",
+    "org/jboss/logmanager/LogManager",
+    // 2026-10-09, Quarkus suite: the Agroal shim rows (`RETIRED_SHADOW_QUARKUS_AGROAL_TRIPLES`); class
+    // names only, `io/agroal/` as a whole is not admitted.
+    "io/agroal/api/AgroalDataSource",
+    "io/agroal/api/AgroalPropertiesReader",
+    "io/agroal/api/configuration/AgroalDataSourceConfigurationSupplier",
+    "io/agroal/api/configuration/supplier/AgroalDataSourceConfigurationSupplier",
+    "io/agroal/pool/ConnectionPool",
+    "io/agroal/pool/PoolHandler",
+    // 2026-10-10, Quarkus suite wave 1 (`RETIRED_SHADOW_QUARKUS_CONFIG_TRIPLES`).
+    "io/quarkus/runtime/configuration/LocaleConverter",
+    // 2026-10-09, Quarkus suite: CLASS names only (see `RETIRED_SHADOW_QUARKUS_LOG_TRIPLES`);
+    // `io/quarkus/` and `org/jboss/` as a whole are not admitted.
+    "io/quarkus/bootstrap/logging/QuarkusDelayedHandler",
+    "org/jboss/logging/JBossLogManagerLogger",
+    "org/jboss/logging/JDKLogger",
+    "org/jboss/logging/Log4j2Logger",
+    "org/jboss/logging/Log4jLogger",
+    "org/jboss/logging/Logger",
+    "org/jboss/logging/Slf4jLogger",
+    "org/jboss/logmanager/ExtHandler",
+    "org/jboss/logmanager/LogContext",
+    "org/jboss/logmanager/Logger",
+    "org/springframework/beans/GenericTypeAwarePropertyDescriptor",
+    "org/springframework/boot/SpringApplicationBannerPrinter",
+    "org/springframework/util/ClassUtils",
+    "org/springframework/util/ResourceUtils",
+    "sun/reflect/annotation/AnnotatedTypeFactory",
+    // 2026-10-02, round 16 wave 15 (lane shadow). CLASS names, never
+    // `javax/crypto/`, `com/sun/crypto/` or `sun/security/` whole (lane 6's
+    // package verdict, `the_lane_l6_security_and_tls_prefixes_are_not_admitted`).
+    // `javax/crypto/KEM` also admits its two nested handle classes; the
+    // `DomainKeyStore` name admits `DomainKeyStore$DKS`.
+    // `RETIRED_SHADOW_R16_KEYSTORE_SPI_TRIPLES` and `RETIRED_SHADOW_R16_KEM_TRIPLES`
+    // are what these admit.
+    "com/sun/crypto/provider/JceKeyStore",
+    "javax/crypto/KEM",
+    "sun/security/provider/DomainKeyStore",
+];
+
+/// The 2026-08-30 Phase 2 wave: ONE triple, and the size is the finding.
+///
+/// A THIRD table rather than an entry merged into either sibling, for the
+/// reason the second gives for existing: these were adjudicated by a different
+/// METHOD, and the method is the part worth being able to see at a glance.
+///
+/// # Why one
+///
+/// Phase 2 armed all 270 classes of the shadow surface, one at a time, and the
+/// dial called 236 of them retire-safe. Arming those 236 together fails **54 of
+/// 118 corpus vectors** and breaks **35 of 78 probe families**. So the sweep
+/// produces candidates, never verdicts, and each candidate has to earn its row
+/// against four preconditions:
+///
+///  1. the dial was ASKED — `enforcement_dial.reached > 0` for that scope, not
+///     a passing vector (146 of the 236 fail this: nothing on the class was
+///     ever called, so arming it changed nothing and read as the best possible
+///     result);
+///  2. the WHOLE probe tree, armed on that class alone, gets no worse anywhere
+///     — not just the family's own probe, which is the narrowest instrument in
+///     the building;
+///  3. the image target carries `Code` to yield to, so the retirement does not
+///     trade a shadow for an `UnsatisfiedLinkError`;
+///  4. the full corpus stays at its unarmed baseline.
+///
+/// `sun/nio/ch/FileChannelImpl` is the receiver that came through. Armed alone:
+///
+/// ```text
+///   L4Diag                      4 diffs from HotSpot -> 0        (9/9 yields)
+///   the other 77 probes         every delta exactly 0
+///   full corpus --real-jdk      118 passed, 0 failed = the unarmed baseline
+/// ```
+///
+/// The two rows it fixes are `FileChannel.truncate(-1)`'s message: this VM
+/// answered `Negative size: -1` where HotSpot answers `Negative size`. Retiring
+/// it lets the real JDK validation run, which is §1.4's remedy rather than
+/// maintaining message parity by hand in a native that should not be in front
+/// of that bytecode at all.
+///
+/// # The first entry written here was `open`, and it was INERT
+///
+/// Worth keeping, because it is precondition 4 failing in the one direction
+/// nobody expects. The dial arms a PREFIX, so "armed `sun/nio/ch/FileChannelImpl`
+/// fixes L4Diag" is a claim about every triple on that receiver. Choosing which
+/// one to retire then fell to precondition 4 — observed as `native-won` in the
+/// unarmed corpus — and the corpus offers exactly one such triple on that
+/// class, `open`. So `open` was retired, built, and measured: **L4Diag
+/// unchanged at 4 diffs, every other probe unchanged.** A whole build to move
+/// nothing.
+///
+/// The registry says why, in the column precondition 4 never consults. In an
+/// L4Diag run, `truncate(J)` has `invocations: 2` and `image_declaring_method.
+/// has_code: true`; `open` has `invocations: 0`. **The corpus never calls
+/// `FileChannel.truncate(-1)`; the probe does.** Filtering candidates by what
+/// the CORPUS dispatched therefore discards precisely the triple whose
+/// retirement the PROBE measured — the two preconditions were reading different
+/// workloads and only one of them was the workload the evidence came from.
+///
+/// So precondition 4 is really: **observed by the instrument that produced the
+/// improvement**, per triple, and the way to read it is `invocations > 0` in
+/// that instrument's own run — not membership in a corpus census.
+///
+/// # What did NOT come through, and it is the more useful half
+///
+/// `jdk/internal/foreign/ArenaImpl` was the other candidate, and it looked
+/// better: armed, `Arena.allocate()` returns the REAL
+/// `jdk.internal.foreign.NativeMemorySegmentImpl` instead of this VM's carrier,
+/// taking `AbstractReceiverSweep` from 12 diffs to 6. Precondition 2 killed it:
+///
+/// ```text
+///   FfmSegmentSweep   40 -> 181 diffs, and DIED at row 18 of 199
+///   FfmCarrierProbe    0 ->   6 diffs, and died at 104 of 106
+///   FfmMsgProbe        2 ->   7 diffs
+/// ```
+///
+/// The class NAME becomes right and the segment surface stops working, because
+/// the real implementation needs real state this VM does not keep. That is a
+/// second, independent confirmation of the FFM contract decision recorded in
+/// `docs/feature-designs/native-dispatch-architecture.md`:
+/// the carrier is this VM's own allocation shape, and matching the JDK's class
+/// name is not a thing to fix — not by fabricating a name, and not by
+/// retirement either.
+pub(in crate::retired_shadow) static RETIRED_SHADOW_PHASE2_TRIPLES: &[(&str, &str, &str)] = &[(
+    "sun/nio/ch/FileChannelImpl",
+    "truncate",
+    "(J)Ljava/nio/channels/FileChannel;",
+)];
+
+/// Lane L0's wave, 2026-09-10: `java.lang.Class`, `Module` and
+/// `ModuleDescriptor.Version` -- 54 triples of the lane's 104, with the other
+/// 50 accounted for below rather than left unexamined.
+///
+/// # The instrument, and why the aggregate number is the wrong one to read
+///
+/// `L0ClassModuleSurface.java`, 129 rows over the whole lane
+/// surface, measured three ways against HotSpot 25.0.3+9 -- unarmed, and with
+/// every native declining (`CRATONVM_ENFORCE_NATIVE_SHADOW=all`):
+///
+/// ```text
+/// unarmed   8 diff lines of 130     armed  58 diff lines of 130
+/// ```
+///
+/// Read as an aggregate that says "do not retire anything here", and it would
+/// be the wrong conclusion drawn from a true number. Per ROW:
+///
+/// ```text
+///  96  OK -> OK    the native is right and so is the bytecode  -> RETIRE
+///   4  BAD -> OK   the native is WRONG and yielding fixes it   -> RETIRE
+///  29  OK -> BAD   the native is right, yielding breaks it     -> HELD
+///   0  BAD -> BAD
+/// ```
+///
+/// The four unarmed diffs are exactly the `BAD -> OK` rows, so **every
+/// disagreement this VM has with HotSpot on lane 0's surface is one that
+/// retirement repairs.**
+///
+/// # What the four repairs are, because one is not a cosmetic
+///
+/// ```text
+/// Module.addExports("jdk.internal.misc", unnamed) on java.base
+///   HotSpot  threw java.lang.IllegalCallerException
+///   native   PERMITTED
+/// ModuleDescriptor.Version.parse("")
+///   HotSpot  IllegalArgumentException: Empty version string
+///   native   returned a Version   (validation skipped entirely)
+/// Version.compareTo x2
+///   native   NPE in JDK bytecode: "ts1 is null" -- `parse` built a Version
+///            whose internal lists were never filled
+/// ```
+///
+/// The first is an access-control check the native does not perform: only a
+/// module may widen its own exports, and this VM let an unnamed module widen
+/// `java.base`'s. The rest are the JDK's own argument validation, which is the
+/// surface a retirement usually buys.
+///
+/// # The 23 HELD triples, each with the row that held it
+///
+/// ```text
+/// Class.descriptorString        row 2      NPE: componentType field is null
+/// Class.getModifiers            rows 14-16 wrong FLAG BITS ("public
+///                                          synchronized" for Object; `static`
+///                                          lost on a nested interface)
+/// Class.getAnnotation*, isAnnotationPresent
+///                               rows 71-77 annotations come back EMPTY
+/// Class.newInstance             rows 87-88  cachedConstructor is null
+/// Module.getLayer               row 103     answers false where HotSpot is true
+/// Module.isExported x2          rows 108,110 answers false
+/// Module.isOpen x2              family of isExported -- see the note below
+/// ModuleLayer.boot/findModule/modules/configuration
+///                               rows 118-121 boot() yields null
+/// Class.getPackage, getResource, getResourceAsStream, Module.getResourceAsStream
+///                               rows 13,81-83,105  NoClassDefFoundError,
+///                                          `jdk/internal/loader/ClassLoaders`
+///                                          and `BuiltinClassLoader`
+/// ```
+///
+/// **`Module.isOpen` is held on a judgement, not a measurement, and that is
+/// deliberate.** Its two rows agree with HotSpot when yielded -- but they agree
+/// at `false`, which is also what a blanket yield returns for everything in
+/// this family, and its sibling `isExported` demonstrably breaks. An agreement
+/// that cannot be distinguished from the default answer is not evidence. It
+/// needs a receiver whose correct answer is `true`, which `java.base` does not
+/// provide to an unnamed module; until someone builds that fixture, held.
+///
+/// The last group is not this lane's to fix: the builtin class loader
+/// hierarchy does not link, which is lane L7's named blocker. Those four are
+/// held *pending L7*, not held on their own merits.
+///
+/// # The 27 not retired for want of an instrument
+///
+/// Precondition 4 is per-instrument and these have `invocations == 0` even in
+/// the probe written to reach them. Twelve cannot be called from Java at all --
+/// `Class.getClassLoader0`, `getEnumConstantsShared`, `reflectionData`,
+/// `newReflectionData`, `setSigners`, the three `Class$Atomic` CAS methods,
+/// `Class$ReflectionData.<init>` and the five `ClassFrameInfo` accessors are
+/// package-private plumbing called only from inside `java.lang.Class` and the
+/// stack walker. Eight are `Module.implAdd*`, reached only through
+/// `AccessibleObject` paths this probe does not take.
+///
+/// `ModuleDescriptor$Version.compareTo` and `ClassValue.remove` are the
+/// interesting two: the probe DOES exercise both, and both still count zero.
+/// The row-126 failure names `ts1`, a local in `Version.compareTo`'s own
+/// bytecode, so the JDK's method served the call and the registration was
+/// never dispatched -- an inert row, which is a finding rather than a
+/// retirement, and it is why the count is taken per triple and not per row.
+/// Lane L3 wave 1 -- core reflection's metadata accessors, 24 triples.
+///
+/// Measured 2026-09-10 with `L3ReflectInvokeSurface.java` (254
+/// rows, oracle HotSpot 25.0.3+9, deterministic across two runs) against a
+/// release build of the merged tree. Lane 3's population is **242** bucket-A/B
+/// rows over 35 classes, re-derived from a `--dump-native-registry` taken with
+/// `--explain-jdk-only` -- not the lane page's 251, which came from a different
+/// tree and counted rows lane T owns.
+///
+/// # The aggregate said "retire nothing" and it was wrong again
+///
+/// ```text
+/// d(hs,base) 68 diff lines   d(hs,armed) 224   delta +156
+///
+/// per ROW (254 rows)   OK -> OK   132   retire
+///                      BAD -> OK   10   yielding FIXES it -> retire
+///                      OK -> BAD   88   hold
+///                      BAD -> BAD  24   investigate
+/// ```
+///
+/// 142 of 254 rows are retirable behind a `delta` of +156. Same lesson as L0,
+/// four times the scale.
+///
+/// **The ten `BAD -> OK` rows are the reason to do this at all.** Yielding
+/// repairs the `Field`/`Method`/`Constructor` copy model
+/// (`getDeclaredField("x") == getDeclaredField("x")` is `true` here and `false`
+/// on HotSpot), and with it the `setAccessible` LEAK that follows from handing
+/// back the same object -- one `setAccessible(true)` currently grants access to
+/// every holder of that member. It also restores HotSpot's
+/// `IllegalAccessException` on `privateLookupIn(java.base)`, which is the
+/// documented one-directional residual in `lk_enforce_find_access`. A
+/// retirement that closes an access-control gap is worth more than one that
+/// deletes code.
+///
+/// # 24 of 242, and why the other 218 are not here
+///
+/// A row is not a triple, and this table only contains triples a row-to-triple
+/// mapping can justify: the probe tag names one method of one class, the census
+/// holds exactly ONE A/B triple for that name, `invocations > 0` in the probe's
+/// own run, and **every** row touching it is `OK -> OK` or `BAD -> OK`. 48
+/// (class, name) pairs were reached and rejected, each with its reason
+/// recorded; the four rules that did the rejecting:
+///
+/// * **`invocations == 0`** -- precondition 4, per triple, from the dump.
+/// * **held** -- any `OK -> BAD` row. 88 rows hold, 32 of them `Field`'s
+///   primitive accessors, which the same run explains: the
+///   descriptor-coercion census reports **105** field reads whose value
+///   contradicted the slot's descriptor and was DESTROYED. Ten more are the
+///   generic-signature family, where yielding erases
+///   `Map<String,List<T>>` to `Map` and `T` to `Number`.
+/// * **`BAD -> BAD`** -- the bytecode is wrong too, so "yielding is correct
+///   here" is false. This is what removed `Method.invoke` and
+///   `Constructor.newInstance`, which had looked like clean seven-row and
+///   five-row keeps until the non-nestmate rows 247 and 248 were attributed to
+///   them. Not a regression; not a justified retirement either.
+/// * **agreement at a DEFAULT value** -- L0 held `Module.isOpen` for this and
+///   it removed twelve entries here. The sharpest is `Field.setBoolean`, whose
+///   only row sets `z` to `false` and reads it back: yielded `getBoolean`
+///   answers `false` by default, and `Field.getBoolean` is PROVEN broken by
+///   row 15. Retiring `setBoolean` on `false == false` would be exactly the
+///   mistake the rule exists to prevent.
+///
+/// # What is NOT retired, structurally
+///
+/// The whole `java.lang.invoke` surface except three `MethodType` accessors.
+/// §4 of the lane page predicted `MemberName`/`MethodHandle` would be
+/// VM-coupled and the measurement agrees: 14 `MethodHandles` rows, 8
+/// `MethodHandle` rows and 5 `CallSite` rows hold or are wrong both ways, and
+/// the run's uninstantiable-receiver census names `MethodHandle` and
+/// `VarHandle` as abstract classes a native instantiates. Those rows need the
+/// reviewed-`Intrinsic` protocol or a repair, not a retirement.
+pub(in crate::retired_shadow) static RETIRED_SHADOW_L3_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/lang/invoke/MethodType", "parameterCount", "()I"),
+    (
+        "java/lang/invoke/MethodType",
+        "returnType",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/invoke/MethodType",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/lang/reflect/Constructor",
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Constructor",
+        "getExceptionTypes",
+        "()[Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Constructor",
+        "getGenericParameterTypes",
+        "()[Ljava/lang/reflect/Type;",
+    ),
+    ("java/lang/reflect/Constructor", "getModifiers", "()I"),
+    (
+        "java/lang/reflect/Constructor",
+        "getName",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/reflect/Constructor", "getParameterCount", "()I"),
+    (
+        "java/lang/reflect/Constructor",
+        "getParameterTypes",
+        "()[Ljava/lang/Class;",
+    ),
+    ("java/lang/reflect/Constructor", "isSynthetic", "()Z"),
+    ("java/lang/reflect/Constructor", "isVarArgs", "()Z"),
+    (
+        "java/lang/reflect/Field",
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+    ),
+    ("java/lang/reflect/Field", "getModifiers", "()I"),
+    ("java/lang/reflect/Field", "getName", "()Ljava/lang/String;"),
+    ("java/lang/reflect/Field", "getType", "()Ljava/lang/Class;"),
+    ("java/lang/reflect/Field", "isEnumConstant", "()Z"),
+    ("java/lang/reflect/Field", "isSynthetic", "()Z"),
+    // `Method.getAnnotatedReturnType()` was retired here on an A/B probe that
+    // never put a TYPE_USE annotation on a return type. UN-RETIRED 2026-09-18:
+    // the real body reads `getTypeAnnotationBytes0()` (null in this VM: there is
+    // no constant-pool accessor to decode `RuntimeVisibleTypeAnnotations`
+    // against), so under `--real-jdk` every JSpecify `@Nullable`/`@NonNull` on a
+    // return type read as unspecified (`NullnessTests`, five methods). The
+    // native is registered `Intrinsic` in `native-builtins/src/lib.rs`.
+    (
+        "java/lang/reflect/Method",
+        "getDeclaringClass",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getExceptionTypes",
+        "()[Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getGenericExceptionTypes",
+        "()[Ljava/lang/reflect/Type;",
+    ),
+    ("java/lang/reflect/Method", "getModifiers", "()I"),
+    (
+        "java/lang/reflect/Method",
+        "getName",
+        "()Ljava/lang/String;",
+    ),
+    ("java/lang/reflect/Method", "getParameterCount", "()I"),
+    (
+        "java/lang/reflect/Method",
+        "getParameterTypes",
+        "()[Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/reflect/Method",
+        "getReturnType",
+        "()Ljava/lang/Class;",
+    ),
+    ("java/lang/reflect/Method", "isBridge", "()Z"),
+    ("java/lang/reflect/Method", "isDefault", "()Z"),
+    ("java/lang/reflect/Method", "isSynthetic", "()Z"),
+    ("java/lang/reflect/Method", "isVarArgs", "()Z"),
+    ("java/lang/reflect/Method", "setAccessible", "(Z)V"),
+    (
+        "java/lang/reflect/Method",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+];
+
+/// # 54 became 38 became 29, in two corpus rounds
+///
+/// **Round 2.** With the first 16 withdrawn the arm went 97 -> **127 of 132**,
+/// and the five survivors were all mine: `RClassUnloadSweep`,
+/// `RClassUnloadSweepGen`, `RLoaderIdentity`, `RJdkModule`,
+/// `RServiceLoaderDoubleSource`. Through the harness, control 5/0 against
+/// current 0/5.
+///
+/// All nine `java/lang/Module` triples are withdrawn, and the reason is the
+/// SAME default-value trap a third time. The probe validated
+/// `Module.getName`, `getDescriptor`, `canRead` and `getClassLoader` only at
+/// their default answers -- an UNNAMED module's name (`null`), an unnamed
+/// module's descriptor (`null`), `canRead` in its TRUE direction, and
+/// "java.base's loader is null". **A retirement answering `null`/`true` for
+/// everything satisfies all four**, so all four read as agreements. The corpus
+/// asserts the other side of each, and eight discriminating rows added
+/// afterwards found `Module.getClassLoader` answering `false` for a
+/// PLATFORM-loaded module where HotSpot and the control binary both say
+/// `true`.
+///
+/// Seven of those eight new rows PASS, so `getName`, `getDescriptor`,
+/// `canRead` and `getPackages` are not individually disproven -- they are
+/// withdrawn as a family because the wave that admitted them cannot be trusted
+/// per triple, and a later wave can re-earn them one at a time with a
+/// discriminating row each. That is cheaper than shipping a third round.
+///
+/// **A methodological note on the A/B that nearly went wrong.** Run directly
+/// with `-cp regression-suite/build`, four of the five vectors failed on the
+/// CONTROL binary too and read as "not mine". They need a `--module-path` that
+/// `run.sh` supplies. Re-run through the harness, control scored 5/0. **An
+/// invocation that is not the harness's own is not a control** -- it would
+/// have dismissed four real regressions.
+///
+/// # 54 became 38: the DIAL is not a faithful simulator of a RETIREMENT
+///
+/// **This table shipped 16 triples the corpus disproved, and the reason is
+/// methodological rather than clerical.** Lane L0's wave was validated with
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` -- the shadow dial, which makes a native
+/// DECLINE at a dispatch door -- and never with the retirement itself, which
+/// refuses the REGISTRATION. Those are not the same experiment, and that run's
+/// own census said so in a line nobody read:
+///
+/// ```text
+/// [DIAL_DOOR_CENSUS] armed=true reached=3680 yielded=3593 leaked=87
+/// ```
+///
+/// **87 dispatches reached the dial and were not yielded.** A leaked row
+/// reports the NATIVE's answer while reading, in a three-arm diff, as "the
+/// bytecode is fine here". `Class.isArray` was one of them: the armed arm
+/// printed `true/false`, matching HotSpot exactly, and the real retirement
+/// answers `false/false`.
+///
+/// Re-measured with no dial anywhere -- control binary (pre-table) against
+/// retired binary against HotSpot, on the same 129-row probe:
+///
+/// ```text
+/// 117  OK -> OK      retirement safe
+///   4  BAD -> OK     retirement REPAIRS a disagreement
+///   8  OK -> BAD     retirement BREAKS a correct answer   <- shipped anyway
+/// ```
+///
+/// Those eight cost **35 of 132 vectors** on the `--real-jdk` corpus arm,
+/// which had been 132/0 on four consecutive earlier binaries (`p4`, `p7`,
+/// `p8`, `p9`). The arm is the only instrument that caught it, which is
+/// exactly why the landing protocol lists it and why it must not be skipped
+/// when a goal changes mid-wave -- this wave's arms were deferred when the
+/// session moved to lane L3, and that is how the eight got in.
+///
+/// ## The eight, and why they are really four causes
+///
+/// * **The array family is ONE bad triple with a cascade.** `componentType`
+///   was retired; this VM never fills the `componentType` FIELD (this table's
+///   own held list records `descriptorString` NPE-ing on exactly that); and
+///   JDK 22+ implements `isArray()` as `componentType != null`. So `isArray`
+///   answers `false`, and `getTypeName`/`getSimpleName`/`getCanonicalName`
+///   fall back to the internal form for arrays -- `[[I` where HotSpot says
+///   `int[][]`. Six triples withdrawn for one root cause.
+/// * **Generic and annotated signature resolution** raises
+///   `TypeNotPresentException` for a type that is plainly on the class path.
+///   Four triples.
+/// * **The reflection-data copy model** flips: `field copies not same` goes
+///   `true -> false`, so the VM stops handing out copies. Note the direction,
+///   because lane L3 measured the SAME defect from the other side and found
+///   that yielding REPAIRS copying for `Field`/`Method`/`Constructor`. Same
+///   mechanism, opposite sign, depending on which end owns the accessor.
+/// * **`Class.getClassLoader`** yields null for the application loader, and
+///   **`ClassValue.get`** loses a recomputation. One triple each.
+///
+/// `Module.getClassLoader` is NOT withdrawn: it measured `OK -> OK` on the
+/// no-dial arm and its row is not a default-value agreement.
+///
+/// ## What this means for the next wave, in one line
+///
+/// **A dial arm is a screening instrument, not evidence.** Score a retirement
+/// with two BINARIES -- one without the table, one with it -- and require
+/// `OK -> BAD == 0` before the corpus arm, not after. If a dial arm is used at
+/// all, read its `leaked` counter first: `leaked > 0` means some rows in that
+/// arm never yielded and cannot be cited.
+///
+/// ## Wave 2: the 19 the failing vectors never consult
+///
+/// The 54 were withdrawn as a block for one reason -- `OK -> BAD == 0` held on
+/// the probe and the corpus still lost five vectors, and nothing said WHICH of
+/// the 29 remaining rows did it. Bisecting 29 triples is a build per
+/// hypothesis, 65 minutes each.
+///
+/// The per-vector census answers a weaker question for free: **which of the 29
+/// does this vector dispatch at all?** A registration a vector never consults
+/// cannot be the row that broke it. Measured on `p16` (L0 empty, so all 29
+/// natives present and counted), the five vectors passing 5/0, all five
+/// reports written, `saturation: none`:
+///
+/// ```text
+/// RClassUnloadSweep           5 of 29        union = 10 triples
+/// RClassUnloadSweepGen        5 of 29        desiredAssertionStatus, forName x3,
+/// RJdkModule                  8 of 29        getConstructor, getDeclaredConstructor,
+/// RLoaderIdentity             6 of 29        getMethod, getPackageName,
+/// RServiceLoaderDoubleSource  6 of 29        isInterface, isPrimitive
+/// ```
+///
+/// All ten are class-loading or member-lookup plumbing, which is what a
+/// class-unload sweep and a two-source `ServiceLoader` lean on and what a
+/// 129-row probe over `java.lang.Class` does not reach. The **19** below are
+/// touched by none of the five.
+///
+/// ## Why that covers the corpus and not just five vectors
+///
+/// The round-1 arm -- binary `p14`, **38 rows**, the 19 among them -- scored
+/// **127 passed, 5 failed**. So the 19 are not a hypothesis about those 127:
+/// they were retired *during* that run and those 127 vectors passed anyway.
+/// The five that did not pass are the five attributed above, and none of them
+/// consults a row in the 19. `19 subset 29 subset 38`, so the two later
+/// withdrawals only removed rows from around them. The halves close over 132:
+///
+/// ```text
+/// 127 vectors   passed WITH these 19 retired            measured, p14
+///   5 vectors   failed, and dispatch none of the 19     measured, p16 census
+/// ```
+///
+/// That is why this wave is 19 and not a bisection: the bisection would
+/// identify which of the 10 is guilty, which is a question about re-adding
+/// them, not about shipping these.
+///
+/// What it does NOT cover, and what the arm on this binary is for: the table
+/// now ships alongside L1's, L2's and L3's, and individually-safe retirements
+/// can interact -- Phase 2's 236 dial-safe classes armed together broke 54 of
+/// 118 vectors. Every number above was measured with L0 alone.
+pub(in crate::retired_shadow) static RETIRED_SHADOW_L0_TRIPLES: &[(&str, &str, &str)] = &[
+    // WAVE 2, 2026-09-11. The 54-row wave was withdrawn whole because no
+    // instrument named the row; these 19 are the 29 that survived two
+    // probe rounds, minus the 10 that the five failing corpus vectors
+    // actually dispatch. Attribution is in the lane page's 7.2 and the
+    // 10 are pinned out by `the_l0_attributed_triples_are_not_retired`.
+    (
+        "java/lang/Class",
+        "asSubclass",
+        "(Ljava/lang/Class;)Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "cast",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/Class",
+        "getConstructors",
+        "()[Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredConstructors",
+        "()[Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getDeclaredMethods",
+        "()[Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingClass",
+        "()Ljava/lang/Class;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingConstructor",
+        "()Ljava/lang/reflect/Constructor;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnclosingMethod",
+        "()Ljava/lang/reflect/Method;",
+    ),
+    (
+        "java/lang/Class",
+        "getEnumConstants",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/lang/Class",
+        "getMethods",
+        "()[Ljava/lang/reflect/Method;",
+    ),
+    ("java/lang/Class", "getSigners", "()[Ljava/lang/Object;"),
+    (
+        "java/lang/Class",
+        "getTypeParameters",
+        "()[Ljava/lang/reflect/TypeVariable;",
+    ),
+    ("java/lang/Class", "isAnnotation", "()Z"),
+    ("java/lang/Class", "isEnum", "()Z"),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "hashCode",
+        "()I",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "parse",
+        "(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Version;",
+    ),
+    (
+        "java/lang/module/ModuleDescriptor$Version",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+];
+
+/// The 2026-09-09 Phase 3 wave: `ConcurrentHashMap` and `Properties`, as ONE
+/// retirement, because neither class is retirable alone.
+///
+/// 185 triples over eight classes — the largest table here and the first whose
+/// unit is a PAIR of classes. A fourth table rather than rows merged into
+/// `RETIRED_SHADOW_PHASE2_TRIPLES` for the reason that one gives for existing:
+/// these were adjudicated by a different method, and the method is the part
+/// worth seeing at a glance. Phase 2's method — arm one class, read the probe
+/// tree — cannot reach this verdict, and §"the dial is the wrong instrument
+/// here" below is why.
+///
+/// # The reversal
+///
+/// `java/util/concurrent/ConcurrentHashMap` was adjudicated NOT retirable on
+/// 2026-08-30 on `MapViewsShadowSweep` dying at row 261 of 302. `Properties`
+/// was called LOAD-BEARING in the same sweep, with seven failing corpus
+/// vectors. Armed as a pair on the pre-merge control binary
+/// `a3855b8c7febaf7e`:
+///
+/// ```text
+///                         CHM alone                 CHM + java/util/Properties
+///   MapViewsShadowSweep   53 diffs, DIED 261/302    0 diffs, 302/302
+///   ChmShadowSweep        0 over 28 671 yields      0 over 28 654 yields
+/// ```
+///
+/// JDK 9 moved `Properties`' storage into a `ConcurrentHashMap` field named
+/// `map`. So the two classes are one object graph, and arming either half is a
+/// SPLIT STORE in one direction or the other: real `Properties` bytecode over a
+/// native CHM, or real CHM bytecode under a `Properties` whose state is in a
+/// Rust side table. Both halves real is the only configuration that is
+/// consistent, and it is not a scope the 2026-08-30 sweep ever ran — it armed
+/// 270 classes one at a time and then 236 at once, and a PAIR is neither.
+///
+/// # The precondition, and it is a code change
+///
+/// The object `System.getProperties()` returns is VM-built and its `map` was
+/// **permanently null**, so the first real `Properties` body to run against it
+/// threw. `native-builtins/src/properties_sidetable.rs`'s `replace_real_map`,
+/// called from the `--real-jdk` arm of the `java/lang/System.getProperties`
+/// registration, is what makes this wave possible at all. The whole defect and
+/// its measurement are in
+/// `jdk-only/the-system-properties-real-map-is-null-and-it-blocks-the-chm-retirement-20260909-RETIRED-20260921.md`.
+///
+/// # The dial is the wrong instrument here
+///
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` declines at nine dispatch doors, and a
+/// call that ORIGINATES IN A NATIVE is not one of them. `replace_real_map`
+/// fills the map with `ctx.invoke_virtual(chm, "put", ..)`; armed, those `put`s
+/// still reach the native and return `Ok`, so the map the real bytecode then
+/// reads is EMPTY and nothing reports a failure. On one binary, one function:
+///
+/// ```text
+///   scope = java/util/Properties           SysPropsRealMapProbe  10/10 vs HotSpot
+///   scope = ..ConcurrentHashMap,Properties                        6 of 10 FALSE
+/// ```
+///
+/// A registration REFUSED at `register` has no native to reach, so the same
+/// `invoke_virtual` runs the real bytecode. That is a fourth difference from a
+/// real retirement on top of the three that page's §6 lists, and it cuts both
+/// ways: an armed run understates breakage for any class the VM calls into
+/// from a native, and overstates it for a fix like this one. **So this wave was
+/// measured on a trial binary carrying this table and could not have been
+/// accepted on a dial arm.**
+///
+/// # Preconditions 3 and 4, and the 35 rows that are here for coherence
+///
+/// Every row owns its registry slot, has effective kind `Bridge`, and has image
+/// `Code` to yield to. 150 of the 185 were dispatched (`invocations > 0`) by
+/// the eight probes that back the measurement, read from those probes' own
+/// `--dump-native-registry --explain-jdk-only` runs, which is what precondition
+/// 4 asks for.
+///
+/// It was 122 of 185 until `ChmBulkSweep.java` was written for this
+/// wave. The 63 undispatched rows were CHM's bulk/parallel surface —
+/// `reduceKeysToLong`, `searchEntries`, `forEachEntry` and their siblings, plus
+/// most of `EntrySetView`/`EntryIterator` — and no probe in the tree called any
+/// of them, so retiring them would have been a change no instrument could see.
+/// That probe is 60 rows chosen so the EMPTY answer and the right answer print
+/// differently, and it is byte-identical to HotSpot on both sides of this
+/// retirement. Seven of them are Java SERIALIZATION, because
+/// `native_chm_write_object`'s own registration comment names that as the
+/// hazard -- the real bodies walk the `table` field this VM's segmented layout
+/// never populated -- and this wave retires both serialization hooks. Nothing
+/// else in the probe tree round-trips a `ConcurrentHashMap`.
+///
+/// 35 rows still have no dispatch of their own and are retired on a structural
+/// argument that has to be stated rather than assumed. `native_chm_put`
+/// populates this VM's segmented store; the real `table` field it never touches
+/// is what real CHM bytecode walks. Retire the writers, leave a native reader
+/// standing, and that reader answers from a store nothing fills any more — an
+/// EMPTY iteration, silently, which is strictly worse than an unmeasured
+/// retirement. The 2026-08-30 bisect says the same from the other side: arming
+/// `ConcurrentHashMap$` (the nested classes only) killed `ChmShadowSweep` at row
+/// 13 of 208 where arming the whole class left it byte-identical, so **partial
+/// is the configuration with evidence against it.** The instrument for the
+/// remaining 35 is the full corpus in the landing protocol, not the probes.
+///
+/// # How the wave takes effect, and the way it could have been INERT
+///
+/// The re-tag makes `register_inner` refuse the registration under `--real-jdk`
+/// without inserting it, so the force-native interception path
+/// (`vm/src/runtime/interpreter/native_override.rs`, which lists
+/// `ConcurrentHashMap`'s `put`/`get`/`size`/`computeIfAbsent`/... explicitly)
+/// resolves no id and declines rather than raising §1.3. That is the good
+/// outcome and it is not the only possible one: a refusal is a RETIREMENT only
+/// when nothing already owns the triple, and
+/// `JdkOnlyViolation::SyntheticNativeRegistered` carries a `survivor` for the
+/// case where an earlier registration keeps serving — strict mode then runs
+/// THAT native instead of the bytecode the policy asked for, and every probe
+/// reads clean because nothing changed.
+///
+/// 53 of these triples are registered more than once (ordinals up to 3 in the
+/// kind-map baseline), so the question is live. Measured on the trial binary,
+/// `--real-jdk-report` carries **251 `synthetic-native-registered` refusals on
+/// these two prefixes and ZERO of them has a survivor.** Check that column
+/// before reading any probe row on a future wave: a green probe tree and an
+/// inert retirement look identical from the outside.
+///
+/// One registration is EXCLUDED for want of a target:
+/// `ConcurrentHashMap.reduceEntries(JLjava/util/function/BiFunction;)Ljava/lang/Object;`
+/// reports `image_declaring_method.declared: false` — the real erasure returns
+/// `Ljava/util/Map$Entry;`, so the descriptor matches no method in the image.
+/// It can never be dispatched and retiring it would trade a dead shadow for an
+/// `UnsatisfiedLinkError` if anything ever did reach it.
+pub(in crate::retired_shadow) static RETIRED_SHADOW_PHASE3_TRIPLES: &[(&str, &str, &str)] = &[
+    ("java/util/Properties", "<init>", "()V"),
+    (
+        "java/util/Properties",
+        "<init>",
+        "(Ljava/util/Properties;)V",
+    ),
+    ("java/util/Properties", "clear", "()V"),
+    ("java/util/Properties", "clone", "()Ljava/lang/Object;"),
+    (
+        "java/util/Properties",
+        "compute",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "computeIfPresent",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    ("java/util/Properties", "contains", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/Properties",
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Properties",
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Properties",
+        "elements",
+        "()Ljava/util/Enumeration;",
+    ),
+    ("java/util/Properties", "entrySet", "()Ljava/util/Set;"),
+    ("java/util/Properties", "equals", "(Ljava/lang/Object;)Z"),
+    (
+        "java/util/Properties",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+    ),
+    (
+        "java/util/Properties",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    (
+        "java/util/Properties",
+        "getProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+    ),
+    ("java/util/Properties", "hashCode", "()I"),
+    ("java/util/Properties", "isEmpty", "()Z"),
+    ("java/util/Properties", "keySet", "()Ljava/util/Set;"),
+    ("java/util/Properties", "keys", "()Ljava/util/Enumeration;"),
+    ("java/util/Properties", "load", "(Ljava/io/InputStream;)V"),
+    ("java/util/Properties", "load", "(Ljava/io/Reader;)V"),
+    (
+        "java/util/Properties",
+        "merge",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "propertyNames",
+        "()Ljava/util/Enumeration;",
+    ),
+    (
+        "java/util/Properties",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/Properties", "putAll", "(Ljava/util/Map;)V"),
+    (
+        "java/util/Properties",
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Properties",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/Properties",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/Properties",
+        "replaceAll",
+        "(Ljava/util/function/BiFunction;)V",
+    ),
+    (
+        "java/util/Properties",
+        "save",
+        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/Properties",
+        "setProperty",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+    ),
+    ("java/util/Properties", "size", "()I"),
+    (
+        "java/util/Properties",
+        "store",
+        "(Ljava/io/OutputStream;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/Properties",
+        "store",
+        "(Ljava/io/Writer;Ljava/lang/String;)V",
+    ),
+    (
+        "java/util/Properties",
+        "stringPropertyNames",
+        "()Ljava/util/Set;",
+    ),
+    ("java/util/Properties", "toString", "()Ljava/lang/String;"),
+    ("java/util/Properties", "values", "()Ljava/util/Collection;"),
+    ("java/util/concurrent/ConcurrentHashMap", "<init>", "()V"),
+    ("java/util/concurrent/ConcurrentHashMap", "<init>", "(I)V"),
+    ("java/util/concurrent/ConcurrentHashMap", "<init>", "(IFI)V"),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "<init>",
+        "(Ljava/util/Map;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "addCount",
+        "(JI)V",
+    ),
+    ("java/util/concurrent/ConcurrentHashMap", "clear", "()V"),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "compute",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "computeIfPresent",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "elements",
+        "()Ljava/util/Enumeration;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "entrySet",
+        "()Ljava/util/Set;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEach",
+        "(JLjava/util/function/BiConsumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEach",
+        "(JLjava/util/function/BiFunction;Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachEntry",
+        "(JLjava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachEntry",
+        "(JLjava/util/function/Function;Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachKey",
+        "(JLjava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachKey",
+        "(JLjava/util/function/Function;Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachValue",
+        "(JLjava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "forEachValue",
+        "(JLjava/util/function/Function;Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    ("java/util/concurrent/ConcurrentHashMap", "hashCode", "()I"),
+    ("java/util/concurrent/ConcurrentHashMap", "isEmpty", "()Z"),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "keySet",
+        "()Ljava/util/Set;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "keySet",
+        "()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "keySet",
+        "(Ljava/lang/Object;)Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "keys",
+        "()Ljava/util/Enumeration;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "mappingCount",
+        "()J",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "merge",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "newKeySet",
+        "()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "newKeySet",
+        "(I)Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "putAll",
+        "(Ljava/util/Map;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "readObject",
+        "(Ljava/io/ObjectInputStream;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduce",
+        "(JLjava/util/function/BiFunction;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceEntries",
+        "(JLjava/util/function/Function;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceEntriesToDouble",
+        "(JLjava/util/function/ToDoubleFunction;DLjava/util/function/DoubleBinaryOperator;)D",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceEntriesToInt",
+        "(JLjava/util/function/ToIntFunction;ILjava/util/function/IntBinaryOperator;)I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceEntriesToLong",
+        "(JLjava/util/function/ToLongFunction;JLjava/util/function/LongBinaryOperator;)J",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceKeys",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceKeys",
+        "(JLjava/util/function/Function;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceKeysToDouble",
+        "(JLjava/util/function/ToDoubleFunction;DLjava/util/function/DoubleBinaryOperator;)D",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceKeysToInt",
+        "(JLjava/util/function/ToIntFunction;ILjava/util/function/IntBinaryOperator;)I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceKeysToLong",
+        "(JLjava/util/function/ToLongFunction;JLjava/util/function/LongBinaryOperator;)J",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceToDouble",
+        "(JLjava/util/function/ToDoubleBiFunction;DLjava/util/function/DoubleBinaryOperator;)D",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceToInt",
+        "(JLjava/util/function/ToIntBiFunction;ILjava/util/function/IntBinaryOperator;)I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceToLong",
+        "(JLjava/util/function/ToLongBiFunction;JLjava/util/function/LongBinaryOperator;)J",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceValues",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceValues",
+        "(JLjava/util/function/Function;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceValuesToDouble",
+        "(JLjava/util/function/ToDoubleFunction;DLjava/util/function/DoubleBinaryOperator;)D",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceValuesToInt",
+        "(JLjava/util/function/ToIntFunction;ILjava/util/function/IntBinaryOperator;)I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "reduceValuesToLong",
+        "(JLjava/util/function/ToLongFunction;JLjava/util/function/LongBinaryOperator;)J",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "replaceAll",
+        "(Ljava/util/function/BiFunction;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "search",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "searchEntries",
+        "(JLjava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "searchKeys",
+        "(JLjava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "searchValues",
+        "(JLjava/util/function/Function;)Ljava/lang/Object;",
+    ),
+    ("java/util/concurrent/ConcurrentHashMap", "size", "()I"),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "values",
+        "()Ljava/util/Collection;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap",
+        "writeObject",
+        "(Ljava/io/ObjectOutputStream;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntryIterator",
+        "hasNext",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntryIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntryIterator",
+        "remove",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "add",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "clear",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "containsAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "hashCode",
+        "()I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "isEmpty",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "size",
+        "()I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$EntrySetView",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+        "hasMoreElements",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+        "hasNext",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+        "nextElement",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+        "remove",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "add",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "addAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "clear",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "containsAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "getMap",
+        "()Ljava/util/concurrent/ConcurrentHashMap;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "getMappedValue",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "hashCode",
+        "()I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "isEmpty",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "removeAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "size",
+        "()I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$KeySetView",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$MapEntry",
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+        "hasMoreElements",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+        "hasNext",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+        "next",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+        "nextElement",
+        "()Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+        "remove",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "clear",
+        "()V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "isEmpty",
+        "()Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "iterator",
+        "()Ljava/util/Iterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "size",
+        "()I",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "toArray",
+        "()[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    ),
+    (
+        "java/util/concurrent/ConcurrentHashMap$ValuesView",
+        "toString",
+        "()Ljava/lang/String;",
+    ),
+];
+

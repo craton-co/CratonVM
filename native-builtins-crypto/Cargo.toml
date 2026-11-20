@@ -1,0 +1,40 @@
+[package]
+name = "cratonvm-native-builtins-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Separately compiled cryptographic compatibility kernels for CratonVM"
+
+[dependencies]
+cratonvm-types = { path = "../types", version = "0.3.0" }
+sha3 = "0.10"
+rsa = { version = "0.10", features = ["pkcs1v15"] }
+sha1 = { version = "0.10", features = ["oid", "compress"] }
+sha2 = { version = "0.10", features = ["oid", "compress"] }
+# SBR wave 5 (`jdk_intrinsics`): GHASH over the JDK's own GCM state, and
+# Keccak-f[1600] for `SHA3.implCompress0`. Both already in the lock file
+# (via `aes-gcm` and `sha3`).
+ghash = "0.5"
+keccak = "0.1"
+
+[dev-dependencies]
+cratonvm-native-api = { path = "../native-api" }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+num-bigint = "0.4"
+sha1-next = { package = "sha1", version = "0.11", features = ["oid"] }
+aes = "0.8"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "avx512-hsm-probe"
+path = "src/bin/avx512_hsm_probe.rs"

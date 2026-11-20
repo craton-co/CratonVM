@@ -1,0 +1,35 @@
+[package]
+name = "cratonvm-native-builtins-jmx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+readme = "README.md"
+description = "JMX & java.lang.management native methods for CratonVM"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+management = []
+synthetic-jdk = []
+experimental-jmx = ["management"]
+
+[dependencies]
+libc = "0.2"
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+cratonvm-native-builtins = { path = "../native-builtins", version = "0.3.0" }
+parking_lot.workspace = true
+tracing.workspace = true
+rustc-hash.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+cratonvm-native-builtins = { path = "../native-builtins", version = "0.3.0", features = ["test-utils"] }

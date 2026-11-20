@@ -1,0 +1,4060 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Classpath-exception-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! VM-specific GC helpers.
+//!
+//! The core GC algorithm lives in the `cratonvm-gc` crate. This module
+//! provides the VM-specific `update_all_roots` function and re-exports
+//! the gc crate's types for backward compatibility.
+
+use std::collections::HashMap;
+
+// Re-export everything from the gc crate's gc module.
+pub use cratonvm_gc::gc::*;
+
+use crate::types::ObjectRef;
+#[cfg(test)]
+use crate::types::Value;
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size};
+
+/// Result of one VM metadata-unloading transaction.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ClassMetadataUnloadResult {
+    pub loaders_unloaded: usize,
+    pub classes_unloaded: usize,
+    pub jit_entries_retired: usize,
+    /// gen r5w3/unload7 — unloaded classes whose compact field layout was put
+    /// back after `ClassStore::remove` dropped it, because the transaction ran
+    /// under [`with_retained_unloaded_layouts`]. Always 0 outside it.
+    pub layouts_retained: usize,
+}
+
+std::thread_local! {
+    /// gen r5w3/unload7 — see [`with_retained_unloaded_layouts`]. Per thread and
+    /// scoped (restored on exit), so it can only ever describe the transaction
+    /// the caller is running on this thread.
+    static RETAIN_UNLOADED_LAYOUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// gen r5w3/unload7 — run `f` with [`unload_dead_class_metadata`] KEEPING the
+/// compact field layout of every class it unloads registered.
+///
+/// # Why a transaction would need to
+///
+/// `ClassStore::remove` unregisters an unloaded class's compact layout
+/// (`cratonvm_types::unregister_class_layout`), and a compact object's SIZE is
+/// read from that layout (`object_instance_size` answers
+/// `IMPLAUSIBLE_BODY_SIZE` once it is gone). Every stop-the-world caller frees
+/// the class's dead instances in the SAME pause, before the transaction, so no
+/// instance outlives its layout. The generational CONCURRENT cycle cannot: its
+/// remark decides the verdict and unloads, and its sweep frees the dead
+/// instances LATER, walking the old generation with
+/// `OldGen::walk_objects_from` — which sizes every object it steps over. The
+/// first dead compact instance of an unloaded class would break that walk
+/// (`RegionScan::Break`), leaving it and everything after it in its region
+/// unswept, and every later walk (the next cycle's object-start set, a young
+/// pause's dirty-card scan, a compaction) would break at the same place. An
+/// instance promoted after the cycle's initial mark is not even eligible for
+/// this sweep and waits for the NEXT old collection.
+///
+/// So under this scope the transaction puts each unloaded class's current
+/// layout back. It is inert data: the class id is a tombstone that is never
+/// reissued and no longer resolves to a class, so nothing can allocate against
+/// it; the layout only lets a walker size the dead instances the sweep frees.
+/// The cost is the layout's memory (a few hundred bytes per unloaded class)
+/// until a later concurrent cycle's census proves no instance of the class is
+/// left and [`release_retained_layouts`] unregisters it (gen r5w4/conc8; the
+/// rule is on `ConcurrentGcState::note_layouts_retained`,
+/// `docs/feature-designs/generative-gc-architecture.md`).
+pub fn with_retained_unloaded_layouts<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RETAIN_UNLOADED_LAYOUTS.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(RETAIN_UNLOADED_LAYOUTS.with(|c| c.replace(true)));
+    f()
+}
+
+/// gen r5w3/unload7 — the layouts [`with_retained_unloaded_layouts`] saves: the
+/// current compact layout of each class about to be unloaded. Empty outside
+/// the scope.
+fn save_layouts_to_retain(
+    dead_ids: &[crate::classloading::ClassId],
+) -> Vec<(u32, std::sync::Arc<cratonvm_types::CompactLayout>)> {
+    if !RETAIN_UNLOADED_LAYOUTS.with(std::cell::Cell::get) {
+        return Vec::new();
+    }
+    dead_ids
+        .iter()
+        .filter_map(|id| cratonvm_types::class_layout(id.as_u32()).map(|l| (id.as_u32(), l)))
+        .collect()
+}
+
+/// gen r5w3/unload7 — put back the saved layout of every class the transaction
+/// actually removed (`gone`) whose slot is now empty. Returns the ids put
+/// back (gen r5w4/conc8: the ids, not only their count, so the caller can
+/// hand them to the release census). The slot's domain stamp survives
+/// `unregister_class_layout` by design, so the store that owned it may
+/// publish into it again.
+fn restore_retained_layouts(
+    domain: u32,
+    gone: &rustc_hash::FxHashSet<crate::classloading::ClassId>,
+    saved: Vec<(u32, std::sync::Arc<cratonvm_types::CompactLayout>)>,
+) -> Vec<u32> {
+    let mut restored = Vec::new();
+    for (id, layout) in saved {
+        if gone.contains(&crate::classloading::ClassId::new(id))
+            && cratonvm_types::class_layout(id).is_none()
+        {
+            cratonvm_types::register_class_layout(domain, id, std::sync::Arc::clone(&layout));
+            // gen r5w4/conc8: counted (and later released) only if the
+            // registration took: `register_class_layout` silently refuses a
+            // slot another `ClassStore`'s domain owns.
+            if cratonvm_types::class_layout(id)
+                .is_some_and(|now| std::sync::Arc::ptr_eq(&now, &layout))
+            {
+                restored.push(id);
+            }
+        }
+    }
+    restored
+}
+
+/// gen r5w4/conc8 — unregister the retained layouts a complete census released
+/// (`ConcurrentGcState::take_releasable_layouts`; the rule is on
+/// `ConcurrentGcState::note_layouts_retained`). Under the class manager's WRITE
+/// lock, as `ClassStore::remove` unregisters, and only for an id that is still
+/// out of the store and still has a layout (class ids are never reissued, so
+/// the first test is belt and braces). Returns how many it unregistered.
+///
+/// The registry is process-wide and slot-indexed and `unregister_class_layout`
+/// takes no domain, so with several `ClassStore`s a slot this VM gave up could
+/// hold another store's layout. gcd d1/c: each id is released only if THIS
+/// VM's store owns the slot (`ClassStore::owns_layout_slot`, which is `true`
+/// for every id in a process that has only ever had one store, every
+/// production embedding: the rule before, byte for byte). A slot the store
+/// cannot prove its own keeps its layout, the safe direction; that replaces
+/// the whole-process `single_layout_domain` gate, which kept every retained
+/// layout of a multi-store process for good.
+///
+/// `docs/feature-designs/generative-gc-architecture.md`,
+/// `docs/feature-designs/generative-gc-architecture.md`.
+pub fn release_retained_layouts(shared: &crate::vm::SharedVm, ids: &[u32]) -> usize {
+    if ids.is_empty() {
+        return 0;
+    }
+    let cm = shared.classes.class_manager_write();
+    let mut released = 0usize;
+    for &id in ids {
+        if cm
+            .get_loader_id(crate::classloading::ClassId::new(id))
+            .is_none()
+            && cratonvm_types::class_layout(id).is_some()
+            && cm.class_store().owns_layout_slot(id)
+        {
+            cratonvm_types::unregister_class_layout(id);
+            released += 1;
+        }
+    }
+    drop(cm);
+    released
+}
+
+/// Complete the metadata half of class-loader unloading after GC has proved
+/// the defining loader objects unreachable.
+///
+/// ClassIds remain monotonic tombstones. Every VM-owned cache is either
+/// invalidated by exact ClassId or conservatively flushed when it lacks an
+/// ownership index.
+pub fn unload_dead_class_metadata(
+    shared: &crate::vm::SharedVm,
+    dead_class_hints: &[u32],
+) -> ClassMetadataUnloadResult {
+    use crate::classloading::{ClassId, ClassLoaderId};
+    use rustc_hash::FxHashSet;
+
+    if dead_class_hints.is_empty() {
+        return ClassMetadataUnloadResult::default();
+    }
+
+    // gc-common w11-e: the hints split three ways. A class in a user
+    // namespace is unloaded below. A class no longer in the store is gone
+    // already. A class still in the store under a BUILT-IN namespace (a user
+    // loader's class defined into a shared namespace, which the transaction
+    // does not unload) stays loaded, and so keeps its fail-closed orphan
+    // marker: the marker is what hides it from
+    // every live loader now that its defining loader is dead
+    // (`classloader::cid_visible_mirror`). Every exit forgets the markers of
+    // exactly the hints whose class is no longer in the store
+    // (`hints_no_longer_loaded`). The two early exits used to forget every
+    // hint's marker, and the main path only the unloaded ids, so such a
+    // class's visibility depended on what else died in the same collection.
+    // See `docs/feature-designs/real-jdk-mode.md`.
+    let (dead_ids, gone_before): (Vec<ClassId>, Vec<u32>) = {
+        let cm = shared.classes.class_manager.read();
+        // gc-common w18-d: the same question `unload_user_classes` asks. A
+        // class of a user namespace, or a HIDDEN class of any namespace (a
+        // non-strong hidden class unloads with its mirror; see
+        // `ClassManager::unloads_on_hint`).
+        let dead_ids: Vec<ClassId> = dead_class_hints
+            .iter()
+            .map(|id| ClassId::new(*id))
+            .filter(|id| cm.unloads_on_hint(*id))
+            .collect();
+        let gone_before = hints_no_longer_loaded(dead_class_hints, |id| {
+            cm.get_loader_id(ClassId::new(id)).is_some()
+        });
+        (dead_ids, gone_before)
+    };
+    if dead_ids.is_empty() {
+        cratonvm_native_builtins::classloader::forget_unloaded_classes(
+            &shared.loader_identity,
+            &gone_before,
+        );
+        return ClassMetadataUnloadResult::default();
+    }
+
+    let (unloaded, ids, gone_hints, emptied_namespaces, layouts_retained) = {
+        let mut cm = shared.classes.class_manager_write();
+        // gen r5w3/unload7: see `with_retained_unloaded_layouts`. Empty (and
+        // no lock taken) outside that scope.
+        let saved_layouts = save_layouts_to_retain(&dead_ids);
+        // zt t29/cb (perf-counter page item 1): the model bytes of the
+        // classes about to go, sized while they are still in the store.
+        let unloading_bytes = crate::runtime::perf_data_file::class_bytes_cumulative_enabled()
+            .then(|| crate::vm::vm_init::class_model_bytes_of(&cm, &dead_ids));
+        let unloaded = cm.unload_user_classes(&dead_ids);
+        // zt t29/cb: `sun.cls.unloadedBytes` grows by the classes removed,
+        // under the same write lock as the removal (the perf sampler sizes
+        // the live classes under the read lock: `loadedBytes = live +
+        // unloaded` never goes back).
+        if let Some(sizes) = unloading_bytes {
+            let removed: FxHashSet<ClassId> = unloaded.iter().map(|class| class.id).collect();
+            let bytes = sizes
+                .iter()
+                .filter(|(id, _)| removed.contains(id))
+                .fold(0u64, |sum, &(_, b)| sum.saturating_add(b));
+            cm.note_unloaded_class_bytes(bytes);
+        }
+        // Judged under the same write lock as the removal: every unloaded id
+        // is a hint, so this covers them, plus any hint that was gone already.
+        let gone_hints = hints_no_longer_loaded(dead_class_hints, |id| {
+            cm.get_loader_id(ClassId::new(id)).is_some()
+        });
+        // gc-common w11-e: the user namespaces this unload left with no class.
+        let emptied_namespaces: FxHashSet<ClassLoaderId> = unloaded
+            .iter()
+            .map(|class| class.loader_id)
+            .filter(|loader| !cm.user_namespace_has_classes(*loader))
+            .collect();
+        let gone: FxHashSet<ClassId> = unloaded.iter().map(|class| class.id).collect();
+        if !gone.is_empty() {
+            // The symbolic and reflective resolution caches, evicted while the
+            // manager's write lock still covers the removal, so no resolver
+            // sees a class gone from the store while its records remain.
+            // `unload_user_classes` used to do this through the classloading
+            // crate's per-class `fire_resolution_invalidate_hook`, which swept
+            // both caches once PER CLASS and in every live VM (gc-common w8-e,
+            // `docs/feature-designs/real-jdk-mode.md`).
+            // Same lock order as that hook: manager, then each cache.
+            //
+            // The resolution-cache records matter for GC safety, not only
+            // memory. Their constant values are loader-conditional roots
+            // (`roots.rs` step 13). Once the loader pins of these classes are
+            // removed, a record left behind would be reported as an
+            // unconditional root for an object this collection reclaimed.
+            crate::runtime::interpreter::bump_resolution_epoch_in(shared);
+            shared
+                .classes
+                .resolution_cache
+                .write()
+                .forget_classes(|id| gone.contains(&id));
+            // One sweep for the whole set, this VM's only (gc-common w9-e: the
+            // per-class `invalidate_class` loop swept the cache once per class).
+            shared.classes.link_resolver.invalidate_classes(&gone);
+        }
+        // gen r5w3/unload7: still under the manager's write lock, so no
+        // resolver can observe a removed class with or without its layout in
+        // between; the layout only ever serves a walker sizing dead instances.
+        let layouts_retained =
+            restore_retained_layouts(cm.class_store().layout_domain(), &gone, saved_layouts);
+        (
+            unloaded,
+            gone,
+            gone_hints,
+            emptied_namespaces,
+            layouts_retained,
+        )
+    };
+    // gen r5w4/conc8: the retained ids wait on this VM's concurrent state for
+    // the census that releases them (`release_retained_layouts`). Empty outside
+    // `with_retained_unloaded_layouts`, so every stop-the-world caller is as
+    // before. After the manager's lock is released: the state's lock is a leaf.
+    shared
+        .mem
+        .concurrent_gc_state
+        .note_layouts_retained(&layouts_retained);
+    let layouts_retained = layouts_retained.len();
+    if unloaded.is_empty() {
+        cratonvm_native_builtins::classloader::forget_unloaded_classes(
+            &shared.loader_identity,
+            &gone_hints,
+        );
+        return ClassMetadataUnloadResult::default();
+    }
+
+    // gen r5w5/conc9: `-Xlog:class+unload` and JFR `jdk.ClassUnload`, one per
+    // class, from the one transaction every collector runs.
+    report_unloaded_classes(shared, &unloaded);
+
+    // gc-common w18-d: a hidden class of a built-in namespace unloads without
+    // its (permanent) loader.
+    let loaders_unloaded = unloaded
+        .iter()
+        .map(|class| class.loader_id)
+        .filter(|loader| matches!(loader, ClassLoaderId::UserDefined(_)))
+        .collect::<FxHashSet<_>>()
+        .len();
+    let raw_ids: Vec<u32> = unloaded.iter().map(|class| class.id.as_u32()).collect();
+
+    {
+        // Withdraw the lock-free publication together with the block, under
+        // the same WRITE lock every publish holds; otherwise the index keeps
+        // serving a block the root scan no longer visits
+        // (`StaticsIndex::unpublish`).
+        let mut statics = shared.classes.statics.write();
+        statics.retain(|id, _| !ids.contains(id));
+        for &id in &ids {
+            shared.classes.statics_index.unpublish(id);
+        }
+    }
+    shared
+        .classes
+        .class_locks
+        .write()
+        .retain(|id, _| !ids.contains(id));
+    shared
+        .classes
+        .field_descriptor_cache
+        .write()
+        .retain(|(id, _), _| !ids.contains(id));
+    // The per-(class, cp index) resolution records went above, under the
+    // manager's write lock.
+    shared
+        .classes
+        .class_init_waiters
+        .lock()
+        .retain(|id, _| !ids.contains(id));
+    // JIT round 20 wave 12 (lane qLam, W15L5-7): a removed row's lock-free
+    // hit bit is cleared under the same write guard.
+    shared.classes.lambda_proxies.write().retain(|id, _| {
+        let keep = !ids.contains(id);
+        if !keep {
+            shared.classes.forget_lambda_proxy_hit(*id);
+        }
+        keep
+    });
+    // `lambda_proxy_hosts`, `lambda_impl_owner_memo` (gc-common w2-b) and the
+    // zero-capture singleton rows of every proxy whose host class unloads.
+    crate::runtime::invokedynamic::forget_unloaded_lambda_proxy_rows(shared, &ids);
+    // gc-common w2-b: one more ClassId-keyed memoizer no unload path touched.
+    // `proxy_method_cache` holds a `Method` per (`$ProxyN`, name, descriptor):
+    // a row for an unloaded proxy class would keep its dead `Method` address
+    // (remapped onto unrelated objects by `update_all_roots` §6a) forever.
+    shared
+        .classes
+        .proxy_method_cache
+        .write()
+        .retain(|(id, _, _), _| !ids.contains(id));
+    // JIT round 16 wave 15 (lane mhapp): the bound `MethodType` table's
+    // class-keyed rows name classes by `ClassId`; a row naming an unloaded
+    // class goes, so a later class given that id is never served it.
+    shared
+        .classes
+        .bound_method_types
+        .forget_classes(&|id| ids.contains(&ClassId::new(id)));
+    // JIT round 22 wave 2, lane runtime (review `r22-review-w2-findings-FIXED-20261020.md`
+    // item 2): the static-init race log's per-class rows and the linked
+    // reflective calls' adapter rows name classes by id too.
+    crate::runtime::interpreter::jit_bridge::static_init_log_forget_classes(shared, &|id| {
+        ids.contains(&ClassId::new(id))
+    });
+    // j27 wave 2 (lane VHCOMP): a static constant-`VarHandle` cell naming an
+    // unloaded class (its handle's holder or its static's) is cleared, so no
+    // compiled site writes a block a later class may reuse.
+    shared
+        .jit
+        .vh_static_cells
+        .forget_classes(&|id| ids.contains(&ClassId::new(id)));
+    crate::jit::helpers::reflect_link_forget_classes(shared, &|id| {
+        ids.contains(&ClassId::new(id))
+    });
+    shared.jit.reflect_link_ids.invalidate_invoke_cache();
+
+    {
+        // gc-common w10-f: the removed mirrors used to be collected into a
+        // Vec for `classloader::forget_unloaded_class_mirrors`, which swept
+        // a mirror-keyed `classData` side table. That table is gone
+        // (`classData` lives in the mirror's own `Class.classData` field
+        // now), so the mirrors are simply dropped.
+        let mut mirrors = shared.classes.class_mirrors.write();
+        for id in &ids {
+            mirrors.remove(id);
+            // nio20 L3 (NIO19-5): compiled `getClass()` must not keep
+            // answering a dead mirror, nor hand it to a class that later
+            // reuses the id. Under the same WRITE lock as every writer.
+            shared.classes.getclass_mirror_words.forget(*id);
+            shared.classes.class_meta_words.forget(*id);
+            shared.classes.mirror_fast_table.bump_epoch();
+            // JIT round 21 proposal ATOMICS21-5: and the compiled
+            // static-atomic entries naming the class.
+            shared.jit.unsafe_inline.forget_static_class(id.as_u32());
+        }
+    }
+    shared
+        .classes
+        .class_mirrors_reverse
+        .write()
+        .retain(|_, id| !ids.contains(id));
+    // zt t9/cl5: the `Class.getName()` memo rows of the unloaded classes, and
+    // the global roots that kept their names alive (see
+    // [`release_unloaded_class_name_memo`]).
+    release_unloaded_class_name_memo(shared, &raw_ids);
+
+    {
+        // Second writer of the initiating-resolution memo; advance the
+        // resolution generation so the interpreter's resolved-field site cache
+        // treats its entries as stale (see
+        // `runtime::interpreter::constants`'s `RESOLUTION_EPOCH`).
+        crate::runtime::interpreter::bump_resolution_epoch_in(shared);
+        let mut cache = shared.classes.initiating_resolution_cache.write();
+        cache.retain(|loader, entries| {
+            // gc-common w11-e: a namespace with no class left can never be a
+            // referencing class's loader again (namespace ids are not
+            // reused), so its whole map goes. It used to keep every row that
+            // named a still-loaded class (JDK and library classes that the
+            // dead loader resolved) for the life of the VM: one map, up to
+            // `INITIATING_RESOLUTION_CACHE_CAP` rows, per redeploy.
+            if emptied_namespaces.contains(loader) {
+                return false;
+            }
+            entries.retain(|_, id| !ids.contains(id));
+            !entries.is_empty()
+        });
+    }
+    // The JVMS §5.3 initiating-loader records (`--real-jdk`, interpreter round
+    // i1 wave 38, lane L5): a row naming an unloaded class, and a namespace
+    // left with no class, go as the memo's do. Empty under `--compatible`.
+    {
+        let mut records = shared.classes.initiating_records.write();
+        if !records.is_empty() {
+            records.retain(|loader, entries| {
+                if emptied_namespaces.contains(loader) {
+                    return false;
+                }
+                entries.retain(|_, id| !ids.contains(id));
+                !entries.is_empty()
+            });
+        }
+    }
+    // The JDK classes a loader initiated, for `getInitiatedClasses`
+    // (interpreter round i1 wave 46, lane L5): the same rule. Empty unless a
+    // start-up agent armed it.
+    {
+        let mut initiated = shared.classes.jdk_names_initiated.write();
+        if !initiated.is_empty() {
+            initiated.retain(|loader, set| {
+                if emptied_namespaces.contains(loader) {
+                    return false;
+                }
+                set.retain(|id| !ids.contains(id));
+                !set.is_empty()
+            });
+        }
+    }
+    // The resolved class-entry table (interpreter round i1 wave 47, lane L5):
+    // an unloaded referencing class's rows, and every row naming an unloaded
+    // class. Empty unless `CRATONVM_RESOLVED_ENTRY_TABLE` is on.
+    {
+        let mut entries = shared.classes.resolved_class_entries.write();
+        if !entries.is_empty() {
+            entries.retain(|referencing, row| {
+                if ids.contains(referencing) {
+                    return false;
+                }
+                if let Some(set) = row {
+                    set.retain(|id| !ids.contains(id));
+                }
+                true
+            });
+        }
+    }
+    // The per-loader verdict beside the memo goes with the namespace too
+    // (interpreter round i1 wave 28, lane L5).
+    if !emptied_namespaces.is_empty() {
+        shared
+            .classes
+            .loader_global_name_transparency
+            .write()
+            .retain(|loader, _| !emptied_namespaces.contains(loader));
+        // JIT round 23 wave 6: so do the loader's link verdicts.
+        shared
+            .classes
+            .loader_link_verdicts
+            .write()
+            .retain(|loader, _| !emptied_namespaces.contains(loader));
+    }
+
+    // These caches are pure memoizers. A conservative clear is preferable to
+    // retaining a value that mentions an unloaded class through an indirect
+    // target not represented in its key.
+    //
+    // ARCH-2026-07-26 (request CR-LR-1 of
+    // `stackwalk-and-vtable.md`): this used to
+    // call `invalidate_all()`, which takes THREE write locks — but two of them
+    // guard `SharedResolutionState::global_methods` / `global_fields`, whose
+    // only writers (`cache_method` / `cache_field`) have no production callers,
+    // so those maps are always empty here. Re-verified on this tree: the sole
+    // external consumers of `shared_resolution` are this line and the
+    // interpreter's `promoted_*` paths. `invalidate_promoted()` clears exactly
+    // the live cache, and — more importantly — stops this call site implying
+    // that the other two maps are live.
+    shared.classes.shared_resolution.invalidate_promoted();
+    shared.classes.osc_cache.remove_classes(&ids);
+    // Loader-conditional roots like the OSC cache above: a dead loader's
+    // cached `CallSite`s were not marked, so their rows must go now.
+    crate::runtime::invokedynamic::forget_unloaded_generic_indy_sites(shared.vm_identity, &ids);
+    // gc-common w8-e: the `ClassValue` memo cache, the one loader-conditional
+    // deferral whose rows no unload path removed (`forget_unloaded_classvalue_entries`
+    // had no caller since it was written). A value cached for an unloaded
+    // class was deferred to the dead loader's `metadata_pin`
+    // (`phases_late::gc_scan_classvalue_cache_roots`), so this collection did
+    // not mark it. Left behind, the row names a reclaimed object, and with the
+    // class's loader pin gone the next root scan no longer defers it: it
+    // pushes that address as an unconditional ROOT.
+    cratonvm_native_builtins::phases_late::forget_unloaded_classvalue_entries(
+        shared.vm_identity,
+        &raw_ids,
+    );
+
+    let mut jit_entries_retired = 0;
+    {
+        // PERF (ARCH-2026-07-26, request CR-VT-1 of
+        // `stackwalk-and-vtable.md`).
+        // `unload_class` calls `invalidate_class`, which sweeps EVERY slot of
+        // EVERY vtable in the VM — so a per-class loop here costs
+        // O(unloaded x all_classes x slots_per_class) under the manager write
+        // lock: for a few hundred unloaded classes in a VM holding tens of
+        // thousands, hundreds of millions of slot visits at a moment when every
+        // dispatching thread is waiting on this lock. `unload_classes` does one
+        // sweep for the whole batch and is proven equivalent to the loop by
+        // `vtable::tests::unload_classes_matches_a_loop_of_unload_class`.
+        let dead: Vec<u64> = unloaded.iter().map(|c| c.id.as_u32() as u64).collect();
+        let mut vtables = shared.classes.vtable_manager.write();
+        vtables.unload_classes(&dead);
+    }
+    // gci i12/ul F3: one class-store walk, only under the switch.
+    let live_namesakes = {
+        LiveNamesakes::capture(shared, unloaded.iter().map(|class| &*class.name))
+    };
+    {
+        // gc-common w36-c: ONE sweep per JIT table for the whole unloaded set.
+        // This was a per-class loop of four whole-table calls (the tiered
+        // manager's also swept its VM's verdict sets), O(unloaded x table
+        // size) inside the pause. Each batch form is proven equivalent to a
+        // loop of its per-class form by a `*_matches_a_loop_of_*` test in
+        // `jit/`; see
+        // `docs/feature-designs/real-jdk-mode.md`.
+        let classes = crate::jit::UnloadedClassSet::new(
+            unloaded.iter().map(|class| (class.id, &*class.name)),
+        );
+        // gci i12/ul F3 (`CRATONVM_JIT_UNLOAD_KEEPS_LIVE_NAMESAKES`, default
+        // OFF): the name-keyed JIT tables spare what a LIVE class of the same
+        // name (a redeploy's new loader) still owns. See [`LiveNamesakes`].
+        let live_pred = |declaring: crate::classloading::ClassId, name: &str| {
+            live_namesakes.body_sees_live(declaring, name)
+        };
+        let classes = if live_namesakes.is_armed() {
+            classes.with_live_namesakes(&live_pred)
+        } else {
+            classes
+        };
+        // The name-keyed rows (deopt log, de-specs; the skip set below) are
+        // shared by every same-named class: kept while any namesake lives.
+        let jit_names: FxHashSet<&str> = classes
+            .names()
+            .iter()
+            .copied()
+            .filter(|name| !live_namesakes.has_live(name))
+            .collect();
+        let class_ids: FxHashSet<u32> = raw_ids.iter().copied().collect();
+        for &id in &raw_ids {
+            // O(1): swaps one slot.
+            shared.jit.jit_alloc_class_cache.invalidate(id);
+        }
+        shared.jit.profile_store.invalidate_classes(&class_ids);
+        crate::runtime::frozen_pages::invalidate_classes(shared, &class_ids);
+        // j27 wave 7 (lane T1L2): the condy-handle members keyed by an
+        // unloaded holder (a hidden lambda proxy) would otherwise fill
+        // `MH_CONDY_MEMBERS_MAX` for the VM's life.
+        crate::runtime::interpreter::jit_bridge::retire_mh_condy_members_of_unloaded(
+            shared, &class_ids,
+        );
+        shared.jit.tiered_manager.invalidate_classes(&classes);
+        shared.jit.deopt_log.lock().clear_classes(&jit_names);
+        // gc-common w36-c: the per-bci de-speculations had no unload eviction
+        // (one row per de-spec'd method of every unloaded class, for the life
+        // of the VM). Forgetting one only re-enables a guard.
+        shared.jit.despec_registry.forget_classes(&jit_names);
+        jit_entries_retired += shared.jit.jit_cache.invalidate_unloaded_classes(&classes);
+        // Round 13 wave 4 (lane mega3, `r13w2-mega-dead-loader-selectors-patch`):
+        // the megamorphic table's selectors are keyed on the CALLER's loader,
+        // so a loader this unload left with no class keys no future site; its
+        // selectors go, or loader churn fills `MEGA_DISPATCH_SELECTOR_CAP`
+        // and every new megamorphic site stays unbound for the VM's life.
+        // `CRATONVM_JIT_MEGA_FORGET_DEAD_LOADERS=0` keeps them.
+        let dead_loaders: FxHashSet<u32> = emptied_namespaces
+            .iter()
+            .filter(|loader| matches!(loader, ClassLoaderId::UserDefined(_)))
+            .map(|loader| loader.to_native_id())
+            .collect();
+        if !dead_loaders.is_empty() {
+            shared
+                .jit
+                .jit_cache
+                .forget_dead_loader_selectors(&|id| dead_loaders.contains(&id));
+        }
+    }
+    // The multianewarray per-site plans are keyed by a class id and hold
+    // component class ids, so a plan can name an unloaded class. Class ids
+    // are NOT reused (`ClassStore::add` appends; `remove` leaves a
+    // tombstone), so such a plan cannot alias a newer class. It is dropped so
+    // no site keeps serving a tombstoned id. gc-common w10-f: only THIS VM's
+    // plans that name an unloaded class; this used to clear every VM's plans.
+    crate::runtime::interpreter::invalidate_multianewarray_plans_naming(
+        shared.vm_identity,
+        &|id| ids.contains(&id),
+    );
+    {
+        // One name set instead of a scan of `unloaded` per skip-set row
+        // (O(rows x unloaded) under the write lock, inside the pause).
+        // gci i12/ul F3: a seal a live namesake still owns stays (the set is
+        // keyed by name; `LiveNamesakes::has_live` is false off the switch).
+        let names: FxHashSet<&str> = unloaded
+            .iter()
+            .map(|class| &*class.name)
+            .filter(|name| !live_namesakes.has_live(name))
+            .collect();
+        shared
+            .jit
+            .jit_skip_set
+            .write()
+            .retain(|(class_name, _, _)| !names.contains(&**class_name));
+    }
+    // gc-common w9-e: the method-entry gate's positive memo
+    // (`JitRealm::jit_gate_pass`) is keyed by `ClassId` and had no unload
+    // eviction, so every compiled-eligible method of every unloaded class kept
+    // its row (and two interned name `Arc`s) for the life of the VM. Ids are
+    // not reused, so a row could never be read again: this is a leak, not a
+    // stale answer, and it grows with every redeploy.
+    shared
+        .jit
+        .jit_gate_pass
+        .write()
+        .retain(|(id, _, _), _| !ids.contains(id));
+    // t1 wave 3, lane X: the optimizing OSR memo (accepted bodies with their
+    // callee pins, and refusals) is `ClassId`-keyed too and never published
+    // through `JitCache`, so `invalidate_unloaded_classes` above missed it.
+    {
+        let unloaded_ids: FxHashSet<u32> = raw_ids.iter().copied().collect();
+        shared
+            .jit
+            .bridge
+            .forget_osr_optimizing_of_unloaded(&|id| unloaded_ids.contains(&id));
+    }
+    // Interpreter round i3 wave 79, lane L7: the execute re-entry records
+    // (`JitRealm::execute_reentry_records`, `ClassId`-keyed, each holding the
+    // class file's code view) go with their class, for the same reason.
+    shared
+        .jit
+        .execute_reentry_records
+        .write()
+        .retain(|(id, _), _| !ids.contains(id));
+    shared
+        .jit
+        .execute_entry_records
+        .write()
+        .retain(|(id, _), _| !ids.contains(id));
+    shared.classes.stack_trace_source_files.write().retain(|id, _| !ids.contains(id));
+    // Interpreter round i6 wave 115, lane L7: the execute method-index memo
+    // (`JitRealm::execute_method_index`, `ClassId`-keyed) goes too.
+    shared
+        .jit
+        .execute_method_index
+        .write()
+        .retain(|(id, _), _| !ids.contains(id));
+    // Interpreter round i6 wave 123, lane L3 (wave-118 review of
+    // `i14-L3-proposal-class-scoped-redefinition-invalidation`): the last
+    // installed retransform file of each class
+    // (`ClassRealm::installed_retransform_files`, `ClassId`-keyed, filled only
+    // under `CRATONVM_REDEFINE_IDENTICAL_FAST_PATH`) goes with its class. Ids
+    // are not reused, so a row left behind was a leak, never a stale answer.
+    shared
+        .classes
+        .installed_retransform_files
+        .lock()
+        .retain(|id, _| !ids.contains(id));
+    // JIT round 21 wave 14, lane finalize: the finalizer bar's per-class
+    // refusal memo (`JitRealm::finalizer_bar_refusals`) goes with its class.
+    shared
+        .jit
+        .finalizer_bar_refusals
+        .write()
+        .retain(|id, _| !ids.contains(id));
+    // JIT round 22 wave 1, lane review: a dead class's "Could not initialize
+    // class" row (`ClassRealm::class_init_errors`) goes with it, and the
+    // strong global handle on its saved `ExceptionInInitializerError`
+    // (`RecordedClassInitError::saved_cause`, round 21 wave 26) is released,
+    // as HotSpot's `InstanceKlass::clean_initialization_error_table` drops an
+    // unloaded class's entry. Before, the handle kept that object alive for
+    // the life of the VM. The handles are released after the rows lock drops
+    // (the two locks are never held together, as in `save_init_error_cause`).
+    let released_init_error_causes: Vec<crate::native::jni::JObject> = {
+        let mut rows = shared.classes.class_init_errors.lock();
+        let mut released = Vec::new();
+        rows.retain(|id, row| {
+            if !ids.contains(id) {
+                return true;
+            }
+            if let Some(handle) = row.saved_cause.take() {
+                released.push(handle);
+            }
+            false
+        });
+        released
+    };
+    if !released_init_error_causes.is_empty() {
+        let mut refs = shared.natives.jni_global_refs.lock();
+        for handle in released_init_error_causes {
+            let _ = refs.remove(handle);
+        }
+    }
+
+    // `gone_hints` holds every id in `raw_ids`, plus any hint whose class was
+    // already out of the store. A hint still loaded keeps its marker.
+    cratonvm_native_builtins::classloader::forget_unloaded_classes(&shared.loader_identity, &gone_hints);
+    // The generated-`$ProxyN` cache holds `ClassId`s on BOTH sides of its
+    // rows and nothing else invalidates it, so its rows outlive the classes
+    // they name. A `$ProxyN` unloaded with its loader was handed straight back
+    // out of that cache on the next `Proxy.newProxyInstance` with the same
+    // (loader-namespace, interfaces) key, and the instance was allocated
+    // against a `ClassId` this function had already removed from the class
+    // store — after which its class resolves to nothing and the cast at the
+    // call site fails with `ClassCastException: ? cannot be cast to …`.
+    //
+    // Deliberately here on the ONLY path that actually removed classes, not
+    // inside `forget_unloaded_classes`: the two early exits above call that
+    // helper on paths where nothing was unloaded, and purging valid rows
+    // there would just churn a fresh `$ProxyN` per collection for classes
+    // that are still perfectly alive.
+    cratonvm_native_builtins::forget_unloaded_proxy_classes(shared.vm_identity, &raw_ids);
+    // gc-common w31-a: this VM's defined-`Package` rows built for the unloaded
+    // classes (rode `forget_unloaded_proxy_classes` until interpreter round i5
+    // wave 105 moved the memo into the VM's loader-identity tables).
+    cratonvm_native_builtins::lang_class::forget_unloaded_defined_packages(
+        &shared.loader_identity,
+        &raw_ids,
+    );
+    // ...and the level below it: the annotation-proxy cache holds INSTANCES of
+    // those generated `$ProxyN` classes, keyed by holder class id, and is
+    // itself a GC root — so the collector keeps each cached proxy alive while
+    // nothing keeps its class alive. A proxy whose class was just unloaded is
+    // handed straight back out of that cache by the next
+    // `getDeclaredAnnotations()`, and resolving its class throws
+    // `NoClassDefFoundError: jdk/proxyN/$ProxyM`. Spring's `AnnotationsScanner`
+    // catches that and returns NO annotations, so every `@AutoConfiguration` /
+    // `@Conditional` / `@Bean` on the holder silently disappears — see
+    // `lang_class::forget_unloaded_annotation_proxies` for the suite failure
+    // this reproduced as. Same placement rationale as the call above: only on
+    // the path that actually unloaded classes.
+    let dead_set: FxHashSet<u32> = raw_ids.iter().copied().collect();
+    // JIT round 21 wave 21, lane innerclasses: this VM's reflection-door rows
+    // that name an unloaded class (the JVMS 5.4.3 outer-resolution failures,
+    // the spoof verdicts).
+    cratonvm_native_builtins::lang_class::forget_unloaded_reflect_door_rows(
+        shared.natives.native_methods.reflect_door_cache_slot(),
+        &|id| dead_set.contains(&id),
+    );
+    let annotation_proxies_dropped =
+        cratonvm_native_builtins::lang_class::forget_unloaded_annotation_proxies(
+            shared.vm_identity,
+            &dead_set,
+            &|obj| {
+                shared
+                    .mem
+                    .heap
+                    .is_object_address(obj.as_ptr() as usize)
+                    .map(|valid| shared.mem.heap.class_id_of(valid).as_u32())
+            },
+        );
+    // gc-common w3-b: the `Class$Atomic` reflection slots
+    // (`reflectionData` / `annotationType` / `annotationData`) of every
+    // unloaded class. Their values were pinned to the dead loader, not rooted
+    // (`native_roots.rs` `class-atomic-slots`), so they were not marked and a
+    // surviving row would name a reclaimed object. Values are not consulted
+    // here (`|_| true`): the reconcile-time prune owns that half.
+    cratonvm_native_builtins::prune_class_atomic_side_store(
+        shared.vm_identity,
+        &|id| dead_set.contains(&id),
+        &|_| true,
+    );
+    if annotation_proxies_dropped != 0
+        && false
+    {
+        eprintln!(
+            "[DBG_MIRRORPIN] dropped {annotation_proxies_dropped} annotation-proxy cache row(s) whose class or holder was unloaded"
+        );
+    }
+    // gci i12/ul F4: `ClassLoadingMXBean.getUnloadedClassCount` counts what
+    // `getLoadedClassCount` counts (`ClassManager::loaded_instance_class_count`),
+    // HotSpot's InstanceKlasses: not the array classes that unload with their
+    // element (F2). Stubs never unload. So total = loaded + unloaded stays
+    // coherent.
+    shared
+        .debug
+        .diagnostic_counters
+        .classes_unloaded
+        .fetch_add(
+            count_reported_unloads(&unloaded) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+    ClassMetadataUnloadResult {
+        loaders_unloaded,
+        classes_unloaded: unloaded.len(),
+        jit_entries_retired,
+        layouts_retained,
+    }
+}
+
+/// zt t9/cl5: `CRATONVM_ZGC_UNLOAD_CLASS_NAME_MEMO` (default ON, `=0` kill;
+/// read once per unload transaction that removed classes, no `static`).
+const UNLOAD_CLASS_NAME_MEMO_FLAG: &str = "CRATONVM_ZGC_UNLOAD_CLASS_NAME_MEMO";
+
+/// zt t9/cl5: does the unload transaction release the `Class.getName()` memo
+/// rows of the classes it removed? Unless the `=0` kill says no.
+///
+/// g1gen/c4: on every collector (it was ZGC only, the round's scope). The memo
+/// row is a JNI global root whatever the collector, so on G1 and
+/// Generational an unloaded class's row and both its names stayed behind just
+/// as on ZGC.
+fn unload_releases_class_name_memo() -> bool {
+    cratonvm_types::flags::runtime_flag_default_on(UNLOAD_CLASS_NAME_MEMO_FLAG)
+}
+
+/// zt t9/cl5 (`zgc-zt8cl4-dead-loader-classes-hold-143-bytes-each-FIXED-20261019.md`):
+/// drop the `Class.getName()` memo rows of the classes this transaction
+/// unloaded and release their JNI global roots.
+///
+/// The memo (`CRATONVM_CLASS_GET_NAME_MEMO`, JIT round 20 wave 18) keeps, per
+/// class, a GLOBAL ROOT of an `Object[2]` holding the mirror's internal-name
+/// String and the interned binary name
+/// (`cratonvm_native_builtins::lang_class::take_unloaded_class_name_memo_rows`).
+/// No unload path removed a row, and the JDK's `ClassLoader.postDefineClass`
+/// calls `getPackageName()` -> `getName()` for every class `defineClass`
+/// defines, so each such class left one `Object[]` and two Strings behind
+/// after it unloaded. The t8b census of `Zt7ClClassNames 40 1000 3 histo`
+/// (ZGC, both modes) showed exactly that: 40002 classes unloaded, `Class`
+/// 1194 instances, but `String` 87531 / `[B` 87628 / `Object[]` 41289 where
+/// HotSpot has 5613 / 5709 / 1976, at 143 bytes per define.
+///
+/// Inside the pause, after the collection: a released root stops rooting at
+/// the NEXT collection, which then reclaims the row (and the names, unless the
+/// interned-string pool still holds them: the binary name stays pooled on ZGC
+/// while `CRATONVM_ZGC_WEAK_STRING_TABLE` is opt-in). Not Java-visible: the
+/// rows of a class nobody can name again can never be read.
+fn release_unloaded_class_name_memo(shared: &crate::vm::SharedVm, raw_ids: &[u32]) -> usize {
+    if raw_ids.is_empty() || !unload_releases_class_name_memo() {
+        return 0;
+    }
+    let handles = cratonvm_native_builtins::lang_class::take_unloaded_class_name_memo_rows(
+        shared.natives.native_methods.reflect_door_cache_slot(),
+        raw_ids,
+    );
+    if handles.is_empty() {
+        return 0;
+    }
+    let mut refs = shared.natives.jni_global_refs.lock();
+    handles
+        .into_iter()
+        .filter(|&handle| refs.remove(handle as crate::native::jni::JObject))
+        .count()
+}
+
+/// gen r5w5/conc9 — report every class [`unload_dead_class_metadata`] unloaded,
+/// as HotSpot does (`gengc-r5w3-unload7-proposal-class-unload-events-and-log`):
+///
+/// * `-Xlog:class+unload` (info): `unloading class <external name> <id>` per
+///   class. HotSpot prints the `Klass*` after the name; the class id stands in
+///   for it here, in the same `0x%016x` shape.
+/// * JFR `jdk.ClassUnload` per class while a recording runs, with the defining
+///   loader's taxonomy name (`bootstrap` / `platform` / `app` / `user`). The
+///   recorder is taken with `try_lock`: the transaction runs inside pauses,
+///   where a peer frozen in compiled code may hold it (the GC phase rows'
+///   rule, `gc_events::gen_cycle_jfr_row`); a busy recorder drops the rows.
+///
+/// Before this, "did that collection unload my loader?" was answerable only by
+/// the `[GC] conc_unload:` census or a heap dump. Off both switches: one
+/// log-level test and one relaxed load per transaction that unloaded anything.
+/// gci i12/ul F2/F4: is an unloaded class one HotSpot reports? HotSpot logs
+/// `unloading class`, posts `jdk.ClassUnload` and counts
+/// `notify_class_unloaded` for InstanceKlasses only; an array class
+/// (`[...`, unloaded with its element since F2) is none of those.
+fn reported_unload(class: &cratonvm_classloading::UnloadedClass) -> bool {
+    !class.name.starts_with('[')
+}
+
+
+
+/// gci i12/ul F3 (`gci-i12ul-class-unloading-and-side-tables-on-g1-review-findings-RETIRED-UNFIXED-20261018`):
+/// the live classes that share a name with a class this transaction unloaded.
+///
+/// The JIT's unload hooks match by NAME (`CompiledMethod::inlined_methods`
+/// records an inlinee as `(class, method, descriptor)` strings; the skip set,
+/// the de-spec registry and the deopt log are name-keyed). After a redeploy
+/// the OLD loader's `p/X` unloads while the NEW loader's `p/X` is live, and
+/// every one of the new application's compiled bodies that inlined its own
+/// `p/X` was withdrawn. With this captured:
+///
+/// * a body whose declaring class's own loader defines a live class of the
+///   inlined name keeps that name ([`Self::body_sees_live`]): the body
+///   resolved the name in its own namespace, and a live loader cannot reach
+///   the dead one (a delegation edge would have kept it alive);
+/// * a name-keyed row stays while any live class has the name
+///   ([`Self::has_live`]).
+///
+/// Captured after the class manager's write lock is released (the unloaded
+/// classes are out of the store, so every class of such a name is live); the
+/// predicates then take no lock, as the JIT cache's walk requires. Empty (and
+/// every answer `false`, the old behaviour) off the switch.
+#[derive(Default)]
+struct LiveNamesakes {
+    /// Unloaded name -> the loaders that define a LIVE class of that name.
+    definers: rustc_hash::FxHashMap<String, LoaderSet>,
+    /// Live class id -> its loader, for the classes of those loaders.
+    loader_of: rustc_hash::FxHashMap<u32, crate::classloading::ClassLoaderId>,
+    armed: bool,
+}
+
+/// gci i12/ul F3: a set of loader namespaces.
+type LoaderSet = rustc_hash::FxHashSet<crate::classloading::ClassLoaderId>;
+
+impl LiveNamesakes {
+    fn capture<'n>(shared: &crate::vm::SharedVm, names: impl Iterator<Item = &'n str>) -> Self {
+        let names: rustc_hash::FxHashSet<&str> = names.collect();
+        let cm = shared.classes.class_manager.read();
+        let mut definers: rustc_hash::FxHashMap<String, LoaderSet> =
+            rustc_hash::FxHashMap::default();
+        for class in cm.class_store.iter() {
+            if names.contains(&*class.name) {
+                definers
+                    .entry(class.name.to_string())
+                    .or_default()
+                    .insert(class.loader_id);
+            }
+        }
+        let loaders: LoaderSet = definers.values().flatten().copied().collect();
+        let loader_of = if loaders.is_empty() {
+            rustc_hash::FxHashMap::default()
+        } else {
+            cm.class_store
+                .iter()
+                .filter(|class| loaders.contains(&class.loader_id))
+                .map(|class| (class.id.as_u32(), class.loader_id))
+                .collect()
+        };
+        Self {
+            definers,
+            loader_of,
+            armed: true,
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Does a body declared by `declaring` see a LIVE class named `name` in
+    /// its own loader?
+    fn body_sees_live(&self, declaring: crate::classloading::ClassId, name: &str) -> bool {
+        match (self.loader_of.get(&declaring.as_u32()), self.definers.get(name)) {
+            (Some(loader), Some(definers)) => definers.contains(loader),
+            _ => false,
+        }
+    }
+
+    /// Does any live class have this (unloaded) name?
+    fn has_live(&self, name: &str) -> bool {
+        self.definers.contains_key(name)
+    }
+}
+
+/// gci i12/ul F4: how many of `unloaded` [`reported_unload`] counts.
+fn count_reported_unloads(unloaded: &[cratonvm_classloading::UnloadedClass]) -> usize {
+    unloaded.iter().filter(|class| reported_unload(class)).count()
+}
+
+fn report_unloaded_classes(
+    shared: &crate::vm::SharedVm,
+    unloaded: &[cratonvm_classloading::UnloadedClass],
+) {
+    use crate::runtime::unified_logging::{
+        is_unified_logging_enabled, log_unified, LogLevel, LogTag,
+    };
+    // gci i12/ul F2: the JVMTI extension event below still sees every class
+    // (JDI drops array `ReferenceType`s on it too); the log and JFR see only
+    // what HotSpot reports.
+    let all = unloaded;
+    let unloaded: Vec<&cratonvm_classloading::UnloadedClass> =
+        all.iter().filter(|class| reported_unload(class)).collect();
+    if is_unified_logging_enabled(&[LogTag::ClassUnload], LogLevel::Info) {
+        for class in &unloaded {
+            log_unified(
+                &[LogTag::ClassUnload],
+                LogLevel::Info,
+                &format!(
+                    "unloading class {} {:#018x}",
+                    // gci i11/cl: HotSpot's `external_name()` keeps a hidden
+                    // class's `/0x..` suffix (`p.Main$$Lambda/0x..`); a plain
+                    // `/` -> `.` turned it into `.0x..`.
+                    crate::runtime::unified_logging::class_load_external_name(&class.name, true),
+                    class.id.as_u32()
+                ),
+            );
+        }
+    }
+    // Interpreter round i2 wave 63, lane L1: the C JVMTI table's
+    // `ClassUnload` extension event, posted later by its service thread.
+    #[cfg(feature = "experimental-debug")]
+    if shared
+        .debug
+        .debugger_gates
+        .native_event_armed(crate::debug::NativeEvent::ClassUnload)
+    {
+        let names: Vec<&str> = all.iter().map(|c| &*c.name).collect();
+        crate::jvmti::native_env::note_unloaded_classes(shared, &names);
+    }
+    // SBR5 lane jfr: the real JFR backend's jdk.ClassUnload. gci i12/ul F5:
+    // with the class's defining loader, and non-blocking inside the pause.
+    if cratonvm_native_builtins_jfr::jfr_vm_events::any_recording() {
+        for class in &unloaded {
+            cratonvm_native_builtins_jfr::jfr_vm_more::class_unloaded(
+                shared.vm_identity,
+                &class.name,
+                class.loader_id.to_native_id() as i32,
+            );
+        }
+    }
+    if !cratonvm_jfr::is_enabled() {
+        return;
+    }
+    let Some(mut recorder) = shared.debug.flight_recorder.try_lock() else {
+        return;
+    };
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    for class in &unloaded {
+        let loader = match class.loader_id {
+            crate::classloading::ClassLoaderId::Bootstrap => "bootstrap",
+            crate::classloading::ClassLoaderId::Extension => "platform",
+            crate::classloading::ClassLoaderId::Application => "app",
+            crate::classloading::ClassLoaderId::UserDefined(_) => "user",
+        };
+        cratonvm_jfr::builtin::emit_class_unload_event_arc(
+            &mut recorder,
+            std::sync::Arc::clone(&class.name),
+            loader,
+            now_ns,
+        );
+    }
+}
+
+/// The unload hints whose class is no longer in the store, which are the only
+/// hints whose orphan markers [`unload_dead_class_metadata`] may forget
+/// (gc-common w11-e). A marker is removed only with its class
+/// (`classloader::orphaned_defining_loader_classes`). A hint whose class is
+/// still loaded, under a built-in namespace or in a user namespace that the
+/// transaction did not remove, keeps its marker on every exit.
+fn hints_no_longer_loaded(hints: &[u32], is_loaded: impl Fn(u32) -> bool) -> Vec<u32> {
+    hints.iter().copied().filter(|&id| !is_loaded(id)).collect()
+}
+
+/// The class-name prefix `CRATONVM_DBG_MIRRORPIN_WHY` explains (zt t9/cl5):
+/// unset or an off-word is `None`; a plain on-word (`1`, `true`, `on`, `yes`)
+/// Any non-boolean value is the internal-name prefix itself (`zt7cl/`, `com/example/`).
+fn mirrorpin_why_prefix(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "0" | "false" | "off" | "no" | "1" | "true" | "on" | "yes" => None,
+        _ => Some(value.replace('.', "/")),
+    }
+}
+
+/// Post-GC reconciliation of the class-mirror cache (companion to
+/// `roots.rs` step 6, which stops unconditionally rooting a user-defined
+/// class's `java.lang.Class` mirror once `CRATONVM_LOADER_UNLOAD` is on —
+/// see that comment for the full rationale). A mirror that did not survive
+/// this collection must be dropped from `SharedVm::class_mirrors` /
+/// `class_mirrors_reverse` here, BEFORE `update_all_roots`' own step 6/14
+/// remap runs over the map — otherwise the cache would keep a stale
+/// `ObjectRef` pointing at memory the collector already reclaimed or moved,
+/// and the next `getClass()` on that class id would hand back a dangling
+/// reference instead of lazily recreating the mirror.
+///
+/// `is_marked(addr)` MUST be the same survivor predicate reference
+/// processing uses this cycle (mirrors `gc_reconcile_defining_loaders`),
+/// so a mirror is pruned exactly when a weak/phantom reference to it would
+/// be cleared. Safe to call unconditionally (including with
+/// `CRATONVM_LOADER_UNLOAD=0`): every entry is still rooted in that mode, so
+/// `is_marked` is always true and nothing is pruned.
+pub fn reconcile_class_mirrors(
+    shared: &crate::vm::SharedVm,
+    is_marked: &dyn Fn(usize) -> bool,
+    cycle_roots: Option<&[ObjectRef]>,
+) {
+    let dbg = false;
+    let mut mirrors = shared.classes.class_mirrors.write();
+    if dbg {
+        let cm = shared.classes.class_manager.read();
+        for (&class_id, obj_ref) in mirrors.iter() {
+            let name = cm
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
+            let addr = obj_ref.as_ptr() as usize;
+            eprintln!(
+                "[DBG_MIRRORPIN] reconcile class={:?} cid={:?} mirror_addr={:#x} is_marked={}",
+                name,
+                class_id,
+                addr,
+                is_marked(addr)
+            );
+        }
+        // TEMP-DIAG: for a still-marked JSP mirror, name the chain that is
+        // keeping it alive. "Still marked" alone cannot distinguish a direct
+        // root from a live heap edge, and this test has been closed three times
+        // on the direct-root half of that fork.
+        // zt t9/cl5: the value names the class-name prefix to explain
+        // (`zt7cl/`); a plain on-word keeps the old JSP prefix.
+        let why_value = Err::<String, std::env::VarError>(std::env::VarError::NotPresent).ok();
+        if let Some(why_prefix) = mirrorpin_why_prefix(why_value.as_deref()) {
+            for (&class_id, obj_ref) in mirrors.iter() {
+                let name = cm
+                    .get_class(class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                if !name.starts_with(why_prefix.as_str()) {
+                    continue;
+                }
+                let addr = obj_ref.as_ptr() as usize;
+                // WHICH ARM of the survivor verdict says "live"? Every rooting
+                // lever is inert and the object has no referrer, no instance
+                // and no root, so the live possibility is that the mirror is
+                // genuinely dead and the VERDICT is wrong.
+                let (old_alloc, young_surv, region) = shared.mem.heap.liveness_arms(addr);
+                eprintln!(
+                    "[MIRRORWHY] {name} mirror={addr:#x} is_marked={} region={region} \
+                     old_gen_allocated={old_alloc} young_survivor={young_surv}",
+                    is_marked(addr)
+                );
+                if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+                    &shared.loader_identity,
+                    class_id.as_u32(),
+                ) {
+                    let la = loader.as_ptr() as usize;
+                    let (lo, ly, lr) = shared.mem.heap.liveness_arms(la);
+                    eprintln!(
+                        "[MIRRORWHY] {name} loader={la:#x} is_marked={} region={lr} \
+                         old_gen_allocated={lo} young_survivor={ly}",
+                        is_marked(la)
+                    );
+                }
+                if !is_marked(addr) {
+                    continue;
+                }
+                // `root_held_paths` stops a branch only at a zero-referrer
+                // node — a genuine GC root and a side-table-propagated
+                // object (mirror_pin/loader_pin/metadata_pin/an overlay
+                // owner edge) both have zero heap referrers and land in the
+                // exact same bucket, so a "no heap referrer, root=<not-a-
+                // direct-root>" line can never tell them apart: it is what
+                // BOTH a legitimately-live control loader and a wrongly-
+                // retained one print. `cycle_roots` is this collection's
+                // OWN root vector (the one actually handed to the marker,
+                // threaded down from the `collect_roots` call site that
+                // started this cycle) -- checking membership in it directly
+                // is the one predicate that can actually say which of the
+                // two this is.
+                let real_root_addrs: std::collections::HashSet<usize> = cycle_roots
+                    .map(|roots| roots.iter().map(|r| r.as_ptr() as usize).collect())
+                    .unwrap_or_default();
+                let is_real_root = |a: usize| real_root_addrs.contains(&a);
+                let render = |paths: &Vec<Vec<(usize, u32)>>, tag: &str| {
+                    eprintln!("[MIRRORWHY] {name} {tag} root_held_paths={}", paths.len());
+                    for path in paths.iter().take(8) {
+                        let rendered: Vec<String> = path
+                            .iter()
+                            .map(|&(a, cid)| {
+                                let n = cm
+                                    .get_class(cratonvm_types::ClassId::new(cid))
+                                    .map(|c| c.name.to_string())
+                                    .unwrap_or_else(|| format!("cid{cid}"));
+                                format!("{n}@{a:#x}")
+                            })
+                            .collect();
+                        // Name the ROOT SOURCE that put the head of this path
+                        // in the root set (`CRATONVM_DBG_ROOT_SOURCE=1`).
+                        // Without it the path says what holds the object and
+                        // stops exactly where the answer is: a head with no
+                        // parent is a root, and "which root" is the whole
+                        // question. `<not-a-direct-root>` used to be printed
+                        // for BOTH a genuine root this table doesn't name (a
+                        // thread frame, a static field, a class mirror/lock)
+                        // AND a side-table-propagated object with no heap
+                        // referrer at all — `verified_root` below (this
+                        // cycle's actual root vector, not an inference) is
+                        // what tells those apart.
+                        let head_addr = path.first().map(|&(a, _)| a);
+                        let verified_root = head_addr.is_some_and(is_real_root);
+                        let src = head_addr
+                            .and_then(crate::memory::native_roots::root_source_of)
+                            .unwrap_or(if verified_root {
+                                "<root-not-named-by-VM_ROOT_SOURCES>"
+                            } else {
+                                "<NOT-A-ROOT-no-heap-referrer>"
+                            });
+                        eprintln!(
+                            "[MIRRORWHY]   [root={src} verified_root={verified_root}] {}",
+                            rendered.join(" -> ")
+                        );
+                    }
+                };
+                render(
+                    &shared
+                        .mem
+                        .heap
+                        .retention_paths(addr, &is_real_root, 200_000, 8),
+                    &format!("mirror={addr:#x}"),
+                );
+                // The mirror has no heap referrer; it is marked because
+                // `mirror_pin` propagates from its LOADER. So the real
+                // question is what keeps the LOADER alive.
+                if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+                    &shared.loader_identity,
+                    class_id.as_u32(),
+                ) {
+                    let laddr = loader.as_ptr() as usize;
+                    eprintln!(
+                        "[MIRRORWHY] {name} loader={laddr:#x} loader_marked={}",
+                        is_marked(laddr)
+                    );
+                    render(
+                        &shared
+                            .mem
+                            .heap
+                            .retention_paths(laddr, &is_real_root, 200_000, 8),
+                        &format!("loader={laddr:#x}"),
+                    );
+                } else {
+                    eprintln!("[MIRRORWHY] {name} loader=NONE (defining_loader_for pruned)");
+                }
+                // The mirror/loader having no heap referrer is EXPECTED and
+                // says nothing: instance->class is the header's class_id, not
+                // a ref slot, and instance->loader is `loader_pin`, a side
+                // table. Both are invisible to a ref-slot walk. What actually
+                // pins the loader is a live INSTANCE of one of its classes, so
+                // enumerate those and say who holds them.
+                let mut live_instances: Vec<(usize, u32)> = Vec::new();
+                for (obj_ptr, _size) in shared.mem.heap.walk_objects() {
+                    // SAFETY: walk_objects yields live object starts.
+                    let cid = unsafe { &*(obj_ptr as *const cratonvm_gc::ObjectHeader) }
+                        .class_id
+                        .as_u32();
+                    // THIS VM's row: the VM-less answer can name another
+                    // live VM's loader at a colliding id (gc-common w5-b).
+                    if cratonvm_types::loader_pin::loader_pin_addr_for_vm(shared.vm_identity, cid)
+                        == cratonvm_native_builtins::classloader::defining_loader_for(
+                            &shared.loader_identity,
+                            class_id.as_u32(),
+                        )
+                        .map(|l| l.as_ptr() as usize)
+                    {
+                        live_instances.push((obj_ptr as usize, cid));
+                    }
+                }
+                eprintln!(
+                    "[MIRRORWHY] {name} live_instances_of_this_loader={}",
+                    live_instances.len()
+                );
+                // Zero live instances does not mean "nothing propagates to
+                // it": the owner-based collection-overlay edge (fixed this
+                // session, `external_roots_for_owner`) is invisible to both
+                // `retention_paths`'s heap-field-only reverse walk AND to
+                // the live-instance enumeration above, because it is a
+                // native side-table edge, not a Java object field. Ask
+                // directly whether the mirror/loader address is currently
+                // an ELEMENT of any overlay-backed collection at all — the
+                // unconditional scan sees every element regardless of which
+                // owner (if any) is still alive, so a hit here says "some
+                // overlay holds this," not yet "and that owner is live,"
+                // but it is the one thing neither check above can rule out.
+                let mut all_overlay_elems: Vec<crate::types::ObjectRef> = Vec::new();
+                cratonvm_gc::external_roots::scan_external_roots(&mut all_overlay_elems);
+                let mirror_in_overlay = all_overlay_elems
+                    .iter()
+                    .any(|r| r.as_ptr() as usize == addr);
+                eprintln!(
+                    "[MIRRORWHY] {name} mirror_is_overlay_element={mirror_in_overlay} \
+                     total_overlay_elements={}",
+                    all_overlay_elems.len()
+                );
+                if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+                    &shared.loader_identity,
+                    class_id.as_u32(),
+                ) {
+                    let laddr = loader.as_ptr() as usize;
+                    let loader_in_overlay = all_overlay_elems
+                        .iter()
+                        .any(|r| r.as_ptr() as usize == laddr);
+                    eprintln!("[MIRRORWHY] {name} loader_is_overlay_element={loader_in_overlay}");
+                }
+                for &(iaddr, icid) in live_instances.iter().take(4) {
+                    let iname = cm
+                        .get_class(cratonvm_types::ClassId::new(icid))
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| format!("cid{icid}"));
+                    render(
+                        &shared
+                            .mem
+                            .heap
+                            .retention_paths(iaddr, &is_real_root, 200_000, 4),
+                        &format!("instance {iname}@{iaddr:#x}"),
+                    );
+                }
+            }
+        }
+    }
+    let mut dropped: Vec<ObjectRef> = Vec::new();
+    let mut dropped_source_files = Vec::new();
+    shared.classes.mirror_fast_table.bump_epoch();
+    let getclass_words = &shared.classes.getclass_mirror_words;
+    mirrors.retain(|class_id, obj_ref| {
+        let keep = is_marked(obj_ref.as_ptr() as usize);
+        if !keep {
+            dropped.push(*obj_ref);
+            dropped_source_files.push(*class_id);
+            // nio20 L3 (NIO19-5): the compiled-`getClass()` word goes with
+            // the mirror, under the same WRITE lock.
+            getclass_words.forget(*class_id);
+            // JIT round 21 proposal ATOMICS21-5: and the compiled
+            // static-atomic entries proved by that mirror (a recreated
+            // mirror publishes them again).
+            shared
+                .jit
+                .unsafe_inline
+                .forget_static_class(class_id.as_u32());
+        }
+        keep
+    });
+    // Forward lock released BEFORE the reverse one is taken: every other site
+    // orders the two forward-then-reverse, and holding both is not needed.
+    drop(mirrors);
+    // A Class-mirror cache must leave with the mirror, even when the class
+    // metadata's unload transaction has not run yet. Otherwise the next scan
+    // can resurrect an unmarked filename through a stale row.
+    if !dropped_source_files.is_empty() {
+        let mut files = shared.classes.stack_trace_source_files.write();
+        for id in dropped_source_files { files.remove(&id); }
+    }
+    prune_reverse_mirrors(shared, &dropped);
+    prune_proxy_method_cache(shared, is_marked);
+    prune_loader_conditional_native_side_tables(shared, is_marked);
+}
+
+/// Drop the rows of the loader-conditional NATIVE side tables whose value did
+/// not survive this collection (gc-common w3-b): the `Class$Atomic` reflection
+/// slots and the annotation-proxy cache (with its child-root rows).
+///
+/// Both are now pinned to their owner class's loader rather than rooted
+/// (`native_roots.rs` `class-atomic-slots` / `annotation-proxies`), so a value
+/// can die with that loader, and — exactly as for `prune_proxy_method_cache`
+/// above — a row must never outlive its value, even on a cycle that unloads
+/// nothing: `update_all_roots` would "remap" the reclaimed address onto
+/// whatever the allocator put there next, and the next `reflectionData()` /
+/// `getAnnotation()` would serve it. Both tables are memoizers, so a dropped
+/// row is rebuilt by the next query. Runs with no VM lock held (the native
+/// tables take only their own `VmScoped` locks), before `update_all_roots`, on
+/// the same PRE-remap survivor predicate as the mirror prune.
+pub(crate) fn prune_loader_conditional_native_side_tables(
+    shared: &crate::vm::SharedVm,
+    is_marked: &dyn Fn(usize) -> bool,
+) {
+    let atomic = cratonvm_native_builtins::prune_class_atomic_side_store(
+        shared.vm_identity,
+        &|_| false,
+        is_marked,
+    );
+    let annotations = cratonvm_native_builtins::lang_class::prune_dead_annotation_proxies(
+        shared.vm_identity,
+        is_marked,
+    );
+    if (atomic != 0 || annotations != 0)
+        && false
+    {
+        eprintln!(
+            "[DBG_MIRRORPIN] pruned {atomic} Class$Atomic slot(s) and {annotations} \
+             annotation-proxy row(s) whose value did not survive"
+        );
+    }
+}
+
+/// Drop the `proxy_method_cache` rows whose cached `Method` did not survive
+/// this collection (gc-common w2-b).
+///
+/// Since `roots.rs` step 6b stopped rooting a user-loader proxy's `Method`
+/// outright (it is pinned to the proxy class's defining loader instead), the
+/// value can die with that loader. `unload_dead_class_metadata` drops the rows
+/// of every class it unloads, but a row must never outlive its value even on a
+/// cycle that unloads nothing: `update_all_roots` §6a would otherwise
+/// "remap" the reclaimed address onto whatever the allocator put there next,
+/// and a later dispatch would hand that object to an `InvocationHandler` as
+/// its `Method`. The cache is a memoizer — a dropped row is rebuilt by the next
+/// dispatch — so pruning is always safe. Same survivor predicate as the mirror
+/// prune above; takes the cache's write lock only after `class_mirrors` was
+/// released.
+pub(crate) fn prune_proxy_method_cache(
+    shared: &crate::vm::SharedVm,
+    is_marked: &dyn Fn(usize) -> bool,
+) {
+    let mut cache = shared.classes.proxy_method_cache.write();
+    if cache.is_empty() {
+        return;
+    }
+    cache.retain(|_, method| is_marked(method.as_ptr() as usize));
+}
+
+/// Drop the `class_mirrors_reverse` rows of mirrors [`reconcile_class_mirrors`]
+/// just pruned from the forward map.
+///
+/// # Why the reverse map needs its own prune
+///
+/// `reconcile_class_mirrors` dropped dead mirrors from `class_mirrors` only and
+/// its doc said "from `class_mirrors` / `class_mirrors_reverse`". The reverse
+/// rows were cleaned up only incidentally, by `update_all_roots` step 14
+/// rebuilding the whole map — and step 14 runs only on a RELOCATING cycle,
+/// after the empty-`pointer_map` early return. Every non-moving cycle (ZGC's
+/// sweep fallback, the Generational non-moving young sweep, G1's remark-time
+/// reconciliation) therefore left the dead mirror's address keyed to its
+/// `ClassId`, and `class_id_from_mirror` answered that `ClassId` for whatever
+/// object the allocator placed at the reclaimed address next — an ordinary
+/// object read as a `java.lang.Class` of an unrelated class.
+pub(crate) fn prune_reverse_mirrors(shared: &crate::vm::SharedVm, dropped: &[ObjectRef]) {
+    if dropped.is_empty() {
+        return;
+    }
+    let mut reverse = shared.classes.class_mirrors_reverse.write();
+    for mirror in dropped {
+        reverse.remove(mirror);
+    }
+}
+
+/// Rebuild `cratonvm_types::mirror_pin`'s (loader address -> defined mirror
+/// addresses) registry from the authoritative, just-pruned `class_mirrors`
+/// cache and the defining-loader side-table, so the GC marker's mirror_pin
+/// checks (`gen_heap.rs`, see `vm::memory::roots` step 6) see current
+/// addresses on the next collection.
+///
+/// Call this AFTER `reconcile_class_mirrors` and
+/// `gc_reconcile_defining_loaders` have both run this cycle. Cheap to call
+/// unconditionally: bounded by `class_mirrors.len()`, each entry a single
+/// `defining_loader_for` hash lookup that returns `None` (skipped) for every
+/// built-in-loader class — the overwhelmingly common case.
+pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &cratonvm_types::PointerMap) {
+    let class_mirrors = shared.classes.class_mirrors.read();
+    let mut entries: Vec<(usize, usize)> = Vec::new();
+    for (&class_id, mirror_ref) in class_mirrors.iter() {
+        if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+            &shared.loader_identity,
+            class_id.as_u32(),
+        ) {
+            let old_mirror_addr = mirror_ref.as_ptr() as usize;
+            let mirror_addr = pointer_map
+                .get(&old_mirror_addr)
+                .copied()
+                .unwrap_or(old_mirror_addr);
+            entries.push((loader.as_ptr() as usize, mirror_addr));
+        }
+    }
+    drop(class_mirrors);
+    // gc-common w18-a: nothing to publish and nothing ever published (the
+    // registry's generation is still 0, which its doc defines as "nothing has
+    // ever been registered", so the store is empty) -- the common case of a
+    // program with no user-defined class loader. `replace_mirror_pins` would
+    // take the registry's write lock and bump its generation on every pause of
+    // every VM anyway, breaking that "0" contract after the first collection
+    // and invalidating ZGC's concurrent root-filter snapshot
+    // (`zgc/mark_roots.rs` `is_current`) for a change that did not happen.
+    if entries.is_empty() && cratonvm_types::mirror_pin::generation() == 0 {
+        return;
+    }
+    cratonvm_types::mirror_pin::replace_mirror_pins(shared.vm_identity, &entries);
+}
+
+// ALTRACE (julgc-rootscan investigation 20260721): env-gated helpers shared
+// across the vm crate for the deterministic GC-stress corruption hunt.
+pub(crate) fn altrace_enabled_vm() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| false)}
+
+/// The address set `collect_roots` produced for the collection now running.
+///
+/// `CRATONVM_DBG_ROOT_REMAP_AUDIT` only. The post-GC verifiers can say a frame
+/// slot named an object the cycle did not copy; they cannot say whether the
+/// scan had handed that slot to the collector, and the two verdicts have
+/// nothing in common. "The scan would root it" (re-running the frame's own scan
+/// afterwards) is a proxy that answers about the frame as it is NOW; this
+/// answers about the list the collector was actually given.
+static ROOT_SET_SNAPSHOT: parking_lot::Mutex<Option<rustc_hash::FxHashSet<usize>>> =
+    parking_lot::Mutex::new(None);
+
+/// Record the root set a collection is about to mark from.
+pub fn note_root_set(roots: &[ObjectRef]) {
+    if !false {
+        return;
+    }
+    let set: rustc_hash::FxHashSet<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+    *ROOT_SET_SNAPSHOT.lock() = Some(set);
+}
+
+/// `Some(true|false)` when the snapshot is armed and populated, `None` when it
+/// is not -- so a report can say "not measured" rather than "absent".
+pub fn root_set_contains(addr: usize) -> Option<bool> {
+    ROOT_SET_SNAPSHOT.lock().as_ref().map(|s| s.contains(&addr))
+}
+
+pub(crate) fn watch_addr() -> Option<usize> {
+    use std::sync::OnceLock;
+    static W: OnceLock<Option<usize>> = OnceLock::new();
+    *W.get_or_init(|| {
+        Err::<String, std::env::VarError>(std::env::VarError::NotPresent)
+            .ok()
+            .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    })
+}
+
+// GCPART (stw-residual-close 20260722): env-gated ring of the last few
+// relocation pointer maps. A stale-ref capture probes it to distinguish
+// "this address WAS relocated at epoch E to X but the holding slot missed
+// the remap" from "never relocated in any recent cycle (root-scan miss /
+// young-space reuse)". Gate: CRATONVM_DBG_GCPART; debug-only.
+pub(crate) fn gcpart_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| false)}
+
+#[allow(clippy::type_complexity)]
+fn gcpart_ring() -> &'static std::sync::Mutex<Vec<(u64, cratonvm_types::PointerMap)>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, cratonvm_types::PointerMap)>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+pub(crate) fn gcpart_record(epoch: u64, map: &cratonvm_types::PointerMap) {
+    if !gcpart_enabled() || map.is_empty() {
+        return;
+    }
+    if let Ok(mut ring) = gcpart_ring().lock() {
+        if ring.len() >= 8 {
+            ring.remove(0);
+        }
+        ring.push((epoch, map.clone()));
+    }
+}
+
+/// For each recorded recent map, oldest first: (epoch, moved_to-if-key,
+/// map_len, appears-as-destination).
+#[allow(clippy::type_complexity)]
+pub(crate) fn gcpart_probe(addr: usize) -> Vec<(u64, Option<usize>, usize, bool)> {
+    if !gcpart_enabled() {
+        return Vec::new();
+    }
+    match gcpart_ring().lock() {
+        Ok(ring) => ring
+            .iter()
+            .map(|(e, m)| {
+                (
+                    *e,
+                    m.get(&addr).copied(),
+                    m.len(),
+                    m.values().any(|&v| v == addr),
+                )
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub(crate) fn remap_handle_slots(
+    slots: &mut [Option<ObjectRef>],
+    pointer_map: &cratonvm_types::PointerMap,
+) -> usize {
+    let mut rewritten = 0;
+    for slot in slots.iter_mut().flatten() {
+        let old_addr = slot.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            // SAFETY: relocation maps contain live, aligned object addresses.
+            *slot = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
+/// Post-move half of root section §10: the per-thread **single-slot** object
+/// references. Returns how many were relocated.
+///
+/// Each of these is one `Option<ObjectRef>` field on `JvmThread` in which some
+/// subsystem parks a live reference between two bytecodes, with nothing else in
+/// the heap keeping it reachable. Every slot listed here MUST also be pushed by
+/// the matching scan in `memory/roots.rs` §10 — a slot with only one of the two
+/// halves is either a collected object (scan missing) or a from-space address
+/// handed back to running code (remap missing), and both surface far away from
+/// here. Factored out of [`update_all_roots`] so the pairing is unit-testable
+/// without standing up a VM, exactly like [`remap_handle_slots`].
+///
+/// `jit_pending_exception` is the newest member and the reason this exists: it
+/// spent its life as a `Cell<Option<ObjectRef>>` inside the `JIT_SIGNALS`
+/// `thread_local!` in `jit/helpers.rs`, where neither half could reach it — TLS
+/// belongs to the mutator, and every `VM_ROOT_SOURCES` callback runs on the
+/// collector. See `jit-signals-root-gap.md`.
+///
+/// Production paths no longer call this directly: `update_all_roots` forwards
+/// the three slots through [`remap_thread_off_frame_refs`] (with every other
+/// off-frame family) and then remaps the deopt stash on its own, so the slots
+/// are never rewritten twice. Kept as the one-call pairing of the two halves
+/// for callers that own both and nothing else (and for the unit tests below).
+#[cfg(test)]
+pub(crate) fn remap_thread_object_slots(
+    thread: &mut crate::threading::jvm_thread::JvmThread,
+    pointer_map: &cratonvm_types::PointerMap,
+) -> usize {
+    let rewritten = remap_thread_single_slots(thread, pointer_map);
+    // The remap half for the JIT's stashed deopt / exceptional frames. The scan
+    // half is in `roots.rs` §10 and the two must land together — the visitor
+    // carries a debug assertion that this thread scanned at least once whenever
+    // there is anything to remap, precisely so the half-wiring that shipped
+    // once already trips instead of going quiet.
+    cratonvm_jit::deopt::remap_stashed_deopt_objects(|addr| {
+        pointer_map.get(&(addr as usize)).map(|&to| to as u64)
+    });
+    rewritten
+}
+
+/// Rewrite one `ObjectRef` through `pointer_map`; `true` when it moved.
+#[inline]
+fn remap_one(obj_ref: &mut ObjectRef, pointer_map: &cratonvm_types::PointerMap) -> bool {
+    let old_addr = obj_ref.as_ptr() as usize;
+    if let Some(&new_addr) = pointer_map.get(&old_addr) {
+        debug_assert!(new_addr != 0, "GC pointer map contains null address");
+        // SAFETY: relocation maps contain live, aligned object addresses.
+        *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        true
+    } else {
+        false
+    }
+}
+
+/// The three per-thread single-slot references of root section §10, WITHOUT
+/// the JIT deopt stash.
+///
+/// Split out of `remap_thread_object_slots` (now test-only) so the shared
+/// off-frame list ([`remap_thread_off_frame_refs`]) can forward these three
+/// slots while each per-thread path pairs the deopt stash's remap with its OWN
+/// scan of it: `update_all_roots` (scan: `collect_roots` §10), the safepoint
+/// resume `interpreter::apply_pointer_map_to_thread` (scan:
+/// `update_root_snapshot`, since gc-common w2-g) and both blocked-wake paths
+/// (scan: `deposit_root_snapshot_inner`). `remap_stashed_deopt_objects`
+/// debug-asserts that pairing (see
+/// `docs/feature-designs/deopt-osr.md`).
+pub(crate) fn remap_thread_single_slots(
+    thread: &mut crate::threading::jvm_thread::JvmThread,
+    pointer_map: &cratonvm_types::PointerMap,
+) -> usize {
+    let mut rewritten = 0;
+    for slot in [
+        &mut thread.java_thread_obj,
+        &mut thread.jit_pending_exception,
+        &mut thread.uncaught_exception_pending,
+    ] {
+        if let Some(obj_ref) = slot.as_mut() {
+            if remap_one(obj_ref, pointer_map) {
+                rewritten += 1;
+            }
+        }
+    }
+    rewritten
+}
+
+/// Post-move fixup of EVERY per-thread reference that lives outside the
+/// interpreter frames, JNI local frames, JIT frames and shadow stack: the one
+/// list the per-thread remap paths share.
+///
+/// # Why one function
+///
+/// Each thread's off-frame references were forwarded by four hand-maintained
+/// lists — `update_all_roots` (the initiator), `apply_pointer_map_to_thread`
+/// (a peer parked at the safepoint), `check_post_block_gc_refs` (a blocked
+/// peer's wake) and `apply_pending_blocked_fixups` (the leaked-region
+/// fallback) — and the four had drifted apart. Measured by reading them side
+/// by side on 2026-09-23:
+///
+/// * `native_alloc_pool` was forwarded by the three PEER paths and NOT by the
+///   initiator, whose scan (`collect_roots`) did not root it either. The pool
+///   holds up to 2047 pre-allocated old-generation objects the owning thread
+///   will hand to native callbacks, so an old-generation collection initiated
+///   by the owner freed every one of them and the pool then served freed
+///   blocks — two live objects on one address.
+/// * `jit_pending_exception` and `uncaught_exception_pending` were forwarded
+///   by the initiator ONLY. `uncaught_exception_pending` is set by the launcher
+///   and held while `run_shutdown_hooks` sleeps in a blocking region joining
+///   hook THREADS — so the collection that matters there is always initiated
+///   by a hook thread, i.e. a peer.
+///
+/// A new `ObjectRef`-bearing `JvmThread` field belongs HERE and in
+/// `roots::push_off_frame_thread_roots` (its scan half), so it cannot be wired
+/// into one path and missed by the other three. Returns the number of
+/// references rewritten.
+///
+/// Does NOT touch: interpreter frames, JIT frames/register images, the shadow
+/// stack, JNI local refs, `root_snapshot`, `rs_cache` or the JIT deopt stash —
+/// each of those has path-specific rules and stays with its caller.
+pub(crate) fn remap_thread_off_frame_refs(
+    thread: &mut crate::threading::jvm_thread::JvmThread,
+    pointer_map: &cratonvm_types::PointerMap,
+) -> usize {
+    if pointer_map.is_empty() {
+        return 0;
+    }
+    let mut rewritten = remap_thread_single_slots(thread, pointer_map);
+    for val in &mut thread.printed {
+        if let crate::types::Value::Object(Some(o)) = val {
+            if remap_one(o, pointer_map) {
+                rewritten += 1;
+            }
+        }
+    }
+    for obj_ref in thread
+        .native_pin_roots
+        .iter_mut()
+        .chain(thread.native_alloc_pool.iter_mut())
+    {
+        if remap_one(obj_ref, pointer_map) {
+            rewritten += 1;
+        }
+    }
+    rewritten += remap_handle_slots(&mut thread.handle_slots, pointer_map);
+    if let Some(obj_ref) = thread.native_pending_return.as_mut() {
+        if remap_one(obj_ref, pointer_map) {
+            rewritten += 1;
+        }
+    }
+    // The two JIT memo caches. Every present entry is a root on every path
+    // (`roots::push_off_frame_thread_roots`), so its objects are live and
+    // must be followed here; the owner additionally empties both caches at
+    // its first probe or publish after this pause
+    // (`roots::validate_jit_memo_caches`), so a hit never depends on this
+    // forwarding having run on every path.
+    for entry in &mut thread.jit_hashmap_string_node_cache {
+        for obj_ref in [&mut entry.map, &mut entry.node] {
+            if remap_one(obj_ref, pointer_map) {
+                rewritten += 1;
+            }
+        }
+        if let Some(key_object) = entry.key_object.as_mut() {
+            if remap_one(key_object, pointer_map) {
+                rewritten += 1;
+            }
+        }
+    }
+    for entry in &mut thread.string_case_cache {
+        for obj_ref in [&mut entry.source, &mut entry.first, &mut entry.second] {
+            if remap_one(obj_ref, pointer_map) {
+                rewritten += 1;
+            }
+        }
+        if let Some(locale) = entry.locale.as_mut() {
+            if remap_one(locale, pointer_map) {
+                rewritten += 1;
+            }
+        }
+    }
+    // Scoped-value bindings (JEP 446): the KEY as well as the value.
+    for (_key_id, key_ref, val) in &mut thread.scoped_values {
+        if let Some(obj_ref) = key_ref.as_mut() {
+            if remap_one(obj_ref, pointer_map) {
+                rewritten += 1;
+            }
+        }
+        if let crate::types::Value::Object(Some(o)) = val {
+            if remap_one(o, pointer_map) {
+                rewritten += 1;
+            }
+        }
+    }
+    rewritten
+}
+
+/// Forward a thread's deposited `root_snapshot` through `pointer_map`.
+///
+/// The initiator does this for its own snapshot (`update_all_roots` §11) and
+/// `fold_pointer_map_into_blocked` does it for every blocked thread. A peer
+/// PARKED at the safepoint did not: its frames were forwarded on resume while
+/// its snapshot kept the pre-move addresses until its next deposit. Every
+/// ordinary collection re-deposits first, but a peer that resumes into
+/// compiled code and never polls again is later FROZEN by the cross-thread
+/// takeover, which marks (and, under G1, pins) from exactly this stale
+/// snapshot — handing the collector addresses the previous cycle vacated.
+pub(crate) fn remap_root_snapshot(
+    thread: &crate::threading::jvm_thread::JvmThread,
+    pointer_map: &cratonvm_types::PointerMap,
+) -> usize {
+    if pointer_map.is_empty() {
+        return 0;
+    }
+    let mut rewritten = 0;
+    let mut snapshot = thread.root_snapshot.lock();
+    for obj_ref in snapshot.iter_mut() {
+        if remap_one(obj_ref, pointer_map) {
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
+/// Re-key `class_mirrors_reverse` for the mirrors a collection moved, instead
+/// of clearing and rebuilding the whole map on every relocating cycle.
+///
+/// `moved` holds `(class_id, old_addr, new_addr)` for every forward-map entry
+/// the same cycle rewrote. ALL old keys are removed before ANY new key is
+/// inserted: under a sliding compactor the pointer map routinely contains
+/// `A -> B` and `B -> C` (a survivor slides into space a predecessor vacated),
+/// so interleaving remove/insert per entry would let the second entry's remove
+/// delete the first entry's freshly inserted key.
+///
+/// Returns `false` when the result does not have `expected_len` entries — the
+/// reverse map had drifted from the forward map — so the caller can fall back
+/// to the full rebuild, which is what every cycle did before.
+pub(crate) fn rekey_reverse_mirrors<S: std::hash::BuildHasher>(
+    reverse: &mut std::collections::HashMap<ObjectRef, crate::classloading::ClassId, S>,
+    moved: &[(crate::classloading::ClassId, usize, usize)],
+    expected_len: usize,
+) -> bool {
+    for &(_, old_addr, _) in moved {
+        // SAFETY: used only as a hash key, never dereferenced.
+        reverse.remove(&unsafe { ObjectRef::from_raw(old_addr as *mut u8) });
+    }
+    for &(class_id, _, new_addr) in moved {
+        // SAFETY: a relocation-map destination; used only as a key.
+        reverse.insert(
+            unsafe { ObjectRef::from_raw(new_addr as *mut u8) },
+            class_id,
+        );
+    }
+    reverse.len() == expected_len
+}
+
+/// Remap the proxy-dispatch `Method` cache
+/// (`SharedVm::classes::proxy_method_cache`) through a relocation map.
+///
+/// This is the remap half of `memory/roots.rs` §6b. That section pushes every
+/// cached `Method` as an unconditional root, so the object is kept alive and —
+/// under a MOVING collector — evacuated to a new address. Nothing then wrote
+/// the new address back into the cache: the map is keyed by
+/// `(proxy class, name, descriptor)` and its VALUES are raw `ObjectRef`s, so
+/// the next dispatch for that key served a from-space pointer to running Java
+/// code. Reading `Method.name` off reset from-space memory yields `0`, and
+/// `Method.getName()` returns `null` — which javac's String-switch lowering
+/// (`astore <localN>; aload <localN>; invokevirtual String.hashCode()`) turns
+/// into `NullPointerException: Cannot invoke "String.hashCode()" because
+/// "<localN>" is null` inside any `InvocationHandler` that branches on the
+/// method name. Spring's `SynthesizedMergedAnnotationInvocationHandler.invoke`
+/// is exactly that shape, which is how this reached
+/// `FlywayAutoConfigurationTests` / `IntegrationAutoConfigurationTests` under
+/// `-XX:+UseGenerationalGC` while ZGC (non-moving) and G1 stayed green.
+///
+/// A scan with no matching remap is the standing hazard this file already
+/// names above `remap_thread_object_slots`; `proxy_method_cache` was the one
+/// `shared.*` side table in `roots.rs` that had only the scan half. Factored
+/// out so the pairing is unit-testable without standing up a VM, exactly like
+/// [`remap_handle_slots`]. Returns the number of entries rewritten.
+pub(crate) fn remap_proxy_method_cache<K, S: std::hash::BuildHasher>(
+    cache: &mut std::collections::HashMap<K, ObjectRef, S>,
+    pointer_map: &cratonvm_types::PointerMap,
+) -> usize {
+    let mut rewritten = 0;
+    for obj_ref in cache.values_mut() {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            // SAFETY: relocation maps contain live, aligned object addresses.
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
+// ---------------------------------------------------------------------------
+// `update_all_roots` census -- CRATONVM_DBG_ROOTFIXUP=1
+// ---------------------------------------------------------------------------
+
+/// Calls, pointer-map entries seen, and nanoseconds spent in
+/// [`update_all_roots`].
+///
+/// # The question this exists to answer
+///
+/// Roots are carried as VALUES, so a relocating collector cannot fix one in
+/// place: it builds a `PointerMap` with an entry per moved object and the VM
+/// re-walks the whole root surface afterwards to patch through it -- this
+/// function, plus roughly thirty-five hand-written `gc_update_*` / `remap_*`
+/// companions. The standing proposal is to carry roots as SLOTS so the
+/// collector writes the new address through them and this walk disappears.
+///
+/// That proposal is worth what this walk costs, and until now nobody had the
+/// number. `rootprof` prints a line only when a single call exceeds 20 ms,
+/// which answers "is there a pathological one" and not "what share of the
+/// collector's pause is this" -- a thousand 1 ms fix-ups are a second of pause
+/// and produce no output at all.
+///
+/// The pair with `pointer_map` entries is what separates the two shapes the
+/// cost could have: time proportional to the MAP (the walk is dominated by
+/// hash probes on a large relocation set, which slots would delete) versus
+/// time proportional to the ROOT SURFACE (the walk is dominated by visiting
+/// slots that mostly do not move, which slots would also delete but for a
+/// different reason and with a different fix).
+static ROOTFIXUP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROOTFIXUP_MAP_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROOTFIXUP_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn rootfixup_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| false)}
+
+/// `(calls, pointer_map_entries, nanos)` -- see [`ROOTFIXUP_CALLS`].
+pub fn root_fixup_census() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        ROOTFIXUP_CALLS.load(Ordering::Relaxed),
+        ROOTFIXUP_MAP_ENTRIES.load(Ordering::Relaxed),
+        ROOTFIXUP_NANOS.load(Ordering::Relaxed),
+    )
+}
+
+/// Re-key and sweep THIS VM's pending inherited-`ThreadLocal` buckets
+/// (`phases_early::tl_inherited_pending`) and release the JNI global roots of
+/// every bucket whose child `Thread` did not survive the collection.
+///
+/// A `Thread` constructed under an `InheritableThreadLocal` context and never
+/// started used to keep every inherited value a GC root for the life of the
+/// process: its bucket was released only by the child's first `ThreadLocal`
+/// access or by its death path, and an unstarted thread runs neither
+/// (`docs/feature-designs/real-jdk-mode.md`,
+/// gc-common w5-b). HotSpot's inherited map is a field of the `Thread`, so it
+/// dies with it; this is that, for a side table.
+///
+/// Liveness is `survived`, over the PRE-remap address: the
+/// `addr_keyed::survived_in_place` verdict every address-keyed sweep driven
+/// from here uses. Inside the pause (`update_all_roots`) the caller passes its
+/// once-per-pause `addr_keyed::InPlaceVerdict`; outside one
+/// (`addr_keyed::sweep_address_keyed_tables`) the per-address form, since
+/// mutators may allocate there (gc-common w18-a: the per-address form made a
+/// Generational pause pay one young free-list copy-and-sort per dead child).
+/// The handles are released after the native table's lock is dropped, against
+/// this VM's own global-ref table (the bucket was keyed by this VM's identity).
+///
+/// Also driven, with an empty map, by `addr_keyed::sweep_address_keyed_tables`
+/// after the reclamations outside a pause (the Generational concurrent old-gen
+/// sweep, G1's remark cleanup).
+pub(crate) fn sweep_inherited_thread_local_buckets(
+    shared: &crate::vm::SharedVm,
+    pointer_map: &cratonvm_types::PointerMap,
+    survived: &dyn Fn(usize) -> bool,
+) {
+    let handles = cratonvm_native_builtins::phases_early::remap_and_sweep_inherited_tl_buckets(
+        shared.vm_identity,
+        pointer_map,
+        survived,
+    );
+    if handles.is_empty() {
+        return;
+    }
+    let mut globals = shared.natives.jni_global_refs.lock();
+    for handle in handles {
+        let _ = globals.remove(handle as crate::native::jni::JObject);
+    }
+}
+
+/// Update all root locations in the VM state after a GC collection: this
+/// thread's frames (locals and operand stacks) and off-frame references, static
+/// fields, class locks, the interned-string pool, the mirror caches, JNI
+/// globals, the native-root registry and the blocked threads' snapshots, each
+/// rewritten through `pointer_map` wherever it names an object the collection
+/// moved.
+///
+/// Called once per stop-the-world collection, by `run_collection_pause`, after
+/// reference processing and before `complete_gc` releases the world. The
+/// address-keyed side tables it sweeps before its empty-map early return
+/// (smuggled `long`s, Throwable back-traces, inherited-`ThreadLocal` buckets,
+/// the GPU input cache) run on non-moving cycles too.
+///
+/// (gc-common w18-a: this doc used to sit as two orphaned fragments, one above
+/// `altrace_enabled_vm` and one above the `ROOTFIXUP_CALLS` static, where
+/// rustdoc glued them onto the wrong items and left this function
+/// undocumented.)
+///
+/// `relocation_targets` is this pause's one destination set over
+/// `pointer_map` (`addr_keyed::RelocationTargets::for_pause`, built by
+/// `run_collection_pause` and shared with `process_references_after_gc` and
+/// the JNI weak-global sweep: gci i22/dr, P2/dr).
+pub fn update_all_roots(
+    shared: &crate::vm::SharedVm,
+    thread: &mut crate::threading::jvm_thread::JvmThread,
+    pointer_map: &cratonvm_types::PointerMap,
+    relocation_targets: &crate::memory::addr_keyed::RelocationTargets<'_>,
+) {
+    shared.jit.reflect_link_ids.invalidate_invoke_cache();
+    debug_assert!(
+        relocation_targets.lent_for(pointer_map),
+        "update_all_roots: the relocation set was built over another pointer map"
+    );
+    // Refresh the semispace geometry the handle-free dead-reference predicate
+    // reads (`gen_heap::dead_young_ref_reason_global`). This is the one
+    // function every collection path calls, and it runs after the swap, so the
+    // ranges it publishes describe the heap the mutator is about to resume on.
+    shared.mem.heap.publish_young_geometry();
+    let __fx_guard = rootfixup_census_on().then(|| {
+        struct C(std::time::Instant, usize);
+        impl Drop for C {
+            fn drop(&mut self) {
+                use std::sync::atomic::Ordering;
+                ROOTFIXUP_CALLS.fetch_add(1, Ordering::Relaxed);
+                ROOTFIXUP_MAP_ENTRIES.fetch_add(self.1 as u64, Ordering::Relaxed);
+                ROOTFIXUP_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        }
+        C(std::time::Instant::now(), pointer_map.len())
+    });
+    let _ = &__fx_guard;
+    let __rp_guard = crate::memory::native_roots::rootprof::on().then(|| {
+        struct G(std::time::Instant, usize);
+        impl Drop for G {
+            fn drop(&mut self) {
+                let ns = self.0.elapsed().as_nanos();
+                if ns >= 20_000_000 {
+                    eprintln!(
+                        "[rootprof] update_all_roots took {}ms pointer_map={}",
+                        ns / 1_000_000,
+                        self.1
+                    );
+                }
+            }
+        }
+        G(std::time::Instant::now(), pointer_map.len())
+    });
+    let _ = &__rp_guard;
+    if false {
+        eprintln!(
+            "[PRECISE] update_all_roots called, pointer_map.len()={}",
+            pointer_map.len()
+        );
+    }
+    // Lever #3 (bug 04): keep this thread's rootsnap frozen-frame cache valid
+    // across this collection (remap relocated cached roots + re-tag the gen).
+    // Done BEFORE the empty-map early return so a non-relocating sweep also keeps
+    // the cache rather than forcing a full rebuild. Opt-in/default-OFF + no-op
+    // unless the rootsnap cache is enabled. See `remap_rs_cache_after_gc`.
+    crate::runtime::interpreter::remap_rs_cache_after_gc(thread, pointer_map, &shared.mem.heap);
+    // gc-common w18-a (the w16-x follow-up): ONE reclaimed-hole verdict for the
+    // in-pause sweeps below, not one young free-list copy-and-sort per dead
+    // row. This runs inside the pause (`run_collection_pause`, before
+    // `complete_gc`) and nothing below allocates on the heap, so the verdict
+    // cannot go stale. Taken lazily: free when every row is live. See
+    // `addr_keyed::InPlaceVerdict`. Every in-pause sweep below takes it
+    // (`applied/handoff-w18a-in-pause-sweeps-take-the-in-place-verdict.md`).
+    // gcd d10/r: with this pause's relocations, so a row keyed at an address a
+    // slide re-issued to another survivor is dropped with its dead object
+    // instead of passing to that survivor (`addr_keyed::RelocationTargets`).
+    // gci i22/dr: over the pause's ONE destination set, the one
+    // `process_references_after_gc` and the JNI weak sweep already consulted
+    // (built at most once per pause; same answers as `capture_after`).
+    let in_place = crate::memory::addr_keyed::InPlaceVerdict::capture_with(
+        &shared.mem.heap,
+        relocation_targets,
+    );
+    // Long-smuggle mint registry: relocate registered handles through this
+    // cycle's pointer map and drop entries whose referent died. BEFORE the
+    // empty-map early return so non-relocating sweeps still sweep dead
+    // entries (a reclaimed address must not stay registered — a future
+    // primitive long colliding with the reused address would otherwise pass
+    // the rewrite gate).
+    crate::memory::smuggled_longs::remap_and_sweep_with(pointer_map, &shared.mem.heap, &|addr| {
+        in_place.survived(addr)
+    });
+    // Throwable backtraces are VM-wide, non-owning side data. Keep the stored
+    // object handle in sync with a move and prune traces for collected
+    // throwables before any early return for a non-relocating sweep.
+    shared
+        .remap_and_sweep_throwable_stack_traces_with(pointer_map, &|addr| in_place.survived(addr));
+    // Pending inherited-`ThreadLocal` buckets, keyed by the child `Thread`'s
+    // address: re-key a moved child, release a dead one's values. Same
+    // placement rationale -- a `Thread` constructed and never started dies on
+    // non-moving cycles too, and its bucket's values are JNI global roots that
+    // nothing else would ever release.
+    sweep_inherited_thread_local_buckets(shared, pointer_map, &|addr| in_place.survived(addr));
+    // gci i14/ve (`CRATONVM_GC_VT_PARKED_MIRROR_KEYED`, default ON since 2026-10-17): the parked
+    // JDK continuations this pause's gather keyed by their mirrors. A mirror
+    // that did not survive retires its entry HERE, inside the pause and
+    // before the blocked fold / mirror remap below read its words (some may
+    // be freed). Empty list (every pause without the switch): one lock.
+    let _ = shared
+        .threads
+        .thread_registry
+        .sweep_mirror_keyed_parked(pointer_map, &|addr| in_place.survived(addr));
+    // GPU input-residency cache: an `ObjectRef`-keyed table of device
+    // buffers that survives across kernel submissions. Same placement
+    // rationale as the two above — the sweep half must run on a
+    // non-relocating collection as well, or a dead array's key stays in
+    // the map and the next array allocated onto its reclaimed address
+    // gets served that array's device buffer. Not a root source: see
+    // `memory::addr_keyed`.
+    #[cfg(feature = "gpu-offload")]
+    crate::runtime::offload::input_cache::remap_and_sweep(
+        shared.vm_identity,
+        pointer_map,
+        &shared.mem.heap,
+    );
+    // The inflated-monitor index (round 12 wave 2, lane lock; page
+    // `r12w1-lock-monitor-index-never-pruned-under-moving-collectors`): the
+    // Generational and G1 collections hand `MonitorCleanup` a relocation map
+    // but no dead set, so `remap_after_gc` (which the collector already ran)
+    // had to keep every dead object's monitor forever. Same verdict, same
+    // window. ZGC is left out: it hands the table an exact dead set
+    // (`MonitorCleanup::prune_dead`) inside the collection.
+    if shared.mem.heap.is_generational() || shared.mem.heap.is_g1() {
+        let _ = shared
+            .threads
+            .monitors
+            .prune_stale_after_gc(&|addr| in_place.survived(addr));
+    }
+    // gcg g2/w: the interned-String table under `CRATONVM_GC_WEAK_STRING_TABLE`
+    // (Generational only; a no-op otherwise). Drops the entries whose String
+    // died, over PRE-remap addresses, before step 5 below remaps the rest.
+    // BEFORE the empty-map early return: a non-moving pause kills Strings too.
+    crate::memory::string_table::sweep_after_pause(shared, pointer_map, &|addr| {
+        in_place.survived(addr)
+    });
+    // The last in-pause verdict above; the window closes here.
+    drop(in_place);
+    if false {
+        eprintln!(
+            "[altrace GC] count={} moved={} tid={}",
+            shared.mem.heap.collection_count(),
+            pointer_map.len(),
+            thread.thread_id.0
+        );
+    }
+    if pointer_map.is_empty() {
+        return;
+    }
+    gcpart_record(shared.mem.heap.collection_count(), pointer_map);
+    // Every relocating cycle, counted unconditionally: it is the denominator
+    // for `gc_quiescence::last_pointer_map_applied`, which says whether a
+    // thread holding a stale reference had ever been handed the map it is
+    // missing. See `RELOCATING_CYCLES`.
+    cratonvm_gc::gc_quiescence::RELOCATING_CYCLES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // `CRATONVM_DBG_VACATED_FRAMES` — remember what this collection moved
+    // objects away FROM, so the next safepoint's frame audit can name any slot
+    // still holding one. No-op unless the flag is set.
+    cratonvm_gc::gc_quiescence::record_vacated(pointer_map, shared.mem.heap.collection_count());
+    // The class-discriminated HISTORY ledger, whose only producer was ZGC's
+    // `relocate_stw` until 2026-09-08. The exact ledger above forgets an
+    // address the instant the allocator re-issues it -- and that is precisely
+    // when a stale holder becomes visible, because until re-issue it reads a
+    // zeroed corpse and nothing looks wrong. The two windows do not overlap,
+    // which is why `stale_use_verdict` reported zero on every failing
+    // generational run: it had no history to read.
+    //
+    // The BindableTests moving-young failure is exactly the shape this ledger
+    // discriminates -- `ServiceLoader$LazyClassPathLookupIterator.parse`
+    // invoking `openStream()` on a receiver that reads back as a
+    // `java.util.Hashtable` because the address was re-served.
+    if cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+        let classed: Vec<(usize, usize, u32)> = pointer_map
+            .iter()
+            .map(|(from, to)| {
+                // SAFETY: `to` is a post-copy object base this collection just
+                // wrote; its header is mapped.
+                let at = unsafe { ObjectRef::from_raw(*to as *mut u8) };
+                (*from, *to, shared.mem.heap.class_id_of(at).as_u32())
+            })
+            .collect();
+        cratonvm_gc::gc_quiescence::record_moved_history(&classed);
+    }
+    crate::runtime::interpreter::remap_trace_push(
+        shared,
+        thread,
+        "initiator",
+        &format!("map={}", pointer_map.len()),
+    );
+
+    // JNI local references (INT-2): rewrite THIS thread's `JNI_LOCAL_FRAMES`
+    // handles through the pointer map. The scan half
+    // (`jni::collect_local_ref_roots`, roots.rs) has always kept the objects
+    // alive, so a moving collection RELOCATES them — but this matching remap
+    // half had no production caller (only a #[cfg(test)] one), leaving every
+    // JNI local a dangling from-space pointer after any moving GC. The
+    // storage is thread-local, so this covers the GC-initiating thread; the
+    // safepoint-resume and blocked-wake paths call it for their own threads
+    // (`apply_pointer_map_to_thread` / `check_post_block_gc`).
+    crate::native::jni::update_local_refs_after_gc(pointer_map);
+
+    // BUG-03 trace (gated CRATONVM_DBG_BUG03): per-GC coverage for main (tid 0).
+    // Logs, at each relocating GC, whether main's Thread mirror moves THIS GC and
+    // who the initiator is + main's blocked state — to find the GC where the mirror
+    // moves but main's frames are not remapped (the concurrent-spawn stale-`parent`
+    // root cause). Read the mirror's CURRENT (pre-step-21) registry address.
+    if false {
+        let epoch = shared.mem.heap.collection_count();
+        let main_old = shared
+            .threads
+            .thread_registry
+            .java_thread_obj(crate::threading::jvm_thread::ThreadId(0))
+            .map(|o| o.as_ptr() as usize)
+            .unwrap_or(0);
+        let moves = main_old != 0 && pointer_map.contains_key(&main_old);
+        let blocked = shared
+            .threads
+            .thread_registry
+            .dump_blocked_states()
+            .into_iter()
+            .find(|(tid, _, _)| *tid == 0)
+            .map(|(_, b, _)| b)
+            .unwrap_or(false);
+        eprintln!(
+            "[BUG03-gc] e{} initiator=tid{} main_mirror=0x{:x} moves_this_gc={} main_blocked={}",
+            epoch, thread.thread_id.0, main_old, moves, blocked
+        );
+        // On a move where main is the initiator, dump main's frame stack +
+        // whether any frame slot still holds the OLD mirror addr (which SHOULD be
+        // remapped here). Pinpoints whether `parent` is in a scanned frame (tag/
+        // slot bug) or absent (held in a native/Rust transient).
+        if moves && thread.thread_id.0 == 0 {
+            use std::fmt::Write as _;
+            let mut s = String::new();
+            for f in thread.frames.iter().rev().take(6) {
+                let _ = write!(s, " {}.{}", f.class_name(), f.method_name());
+            }
+            eprintln!("[BUG03-gc]   main frames (top-first):{}", s);
+            // Locate the OLD mirror addr in main's frames — the slot that SHOULD be
+            // remapped here. If found in a LONG/DOUBLE-kind slot, that is the
+            // mis-tagged object ref the kind-gated remap skips.
+            for (fi, f) in thread.frames.iter().enumerate() {
+                if let Some(loc) = f.dbg_locate_addr(main_old) {
+                    eprintln!(
+                        "[BUG03-gc]   FOUND main_mirror old=0x{:x} in frame#{} {}.{} @ {}",
+                        main_old,
+                        fi,
+                        f.class_name(),
+                        f.method_name(),
+                        loc
+                    );
+                }
+            }
+        }
+        // EVERY GC (main): trace slot 7 value + pc for each Thread.<init> frame, to
+        // see `parent`'s trajectory (when it diverges from the field) regardless of
+        // in-map status.
+        if thread.thread_id.0 == 0 {
+            for (fi, f) in thread.frames.iter().enumerate() {
+                if f.method_name() == "<init>"
+                    && f.class_name() == "java/lang/Thread"
+                    && f.locals_len() > 7
+                {
+                    let s7 = match f.get_local(7) {
+                        crate::types::Value::Object(Some(o)) => {
+                            let a = o.as_ptr() as usize;
+                            format!("obj=0x{:x} in_map={}", a, pointer_map.contains_key(&a))
+                        }
+                        crate::types::Value::Object(None) => "null".to_string(),
+                        other => format!("{other:?}"),
+                    };
+                    eprintln!(
+                        "[BUG03-l7] e{} frame#{} Thread.<init> pc={} local7={} stack:{}",
+                        epoch,
+                        fi,
+                        f.pc,
+                        s7,
+                        f.dbg_stack_dump()
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(w) = watch_addr() {
+        let fwd = pointer_map.get(&w).copied();
+        let back = pointer_map
+            .iter()
+            .find_map(|(k, v)| (*v == w).then_some(*k));
+        eprintln!(
+            "[watch] GC#{} addr=0x{w:x} moved_to={fwd:x?} moved_from={back:x?}",
+            shared.mem.heap.collection_count()
+        );
+    }
+    // 1. Thread frames — locals and operand stacks (SoA layout)
+    // See `JvmThread::last_heal_collection`.
+    thread.last_heal_collection = shared.mem.heap.collection_count();
+    for frame in &mut thread.frames {
+        // `update_local_refs` + `stack.update_object_refs`; the VM's type maps
+        // feed only the precise-oop-map shadow (twin of `collect_roots`'
+        // `scan_local_objects_mapped`).
+        frame.update_frame_refs_mapped(pointer_map, &shared.mem.heap, &shared.classes.type_maps);
+        // Forward the synchronized-method monitor object too. A `synchronized`
+        // method records the object it locked on entry in `monitor_on_exit` and
+        // releases it on frame-pop. If a GC during the method body relocates
+        // that object (its locals/operand-stack copies are forwarded above, and
+        // the monitor table is remapped by the collector), a stale
+        // `monitor_on_exit` would make the implicit `monitorexit` target the
+        // old address — surfacing as "thread does not own the monitor"
+        // (observed in BouncyCastle's synchronized `X9ECParametersHolder.
+        // getParameters` / `X9ECPoint.getPoint`, which allocate inside the
+        // locked region). Keep it consistent with the relocated object.
+        if let Some(ref mut obj_ref) = frame.monitor_on_exit {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        // And its block monitors (`Frame::held_monitors`, wave 23 lane L7):
+        // `monitorexit` finds its entry by address, so a stale one would be a
+        // false `IllegalMonitorStateException`. Rooted in `collect_roots` §1.
+        frame
+            .held_monitors
+            .remap_with(|a| pointer_map.get(&a).copied());
+    }
+
+    // DIAGNOSTIC-ONLY (cceres3): initiator-side counterpart of the
+    // ARRIVE-STALE / WAKE-STALE frame verifiers.
+    if false {
+        for (fi, fr) in thread.frames.iter().enumerate() {
+            for li in 0..fr.locals_len() {
+                if let crate::types::Value::Object(Some(o)) = fr.get_local(li as u16) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = shared.mem.heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] INITIATOR-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
+            }
+            for si in 0..fr.stack.len() {
+                if let crate::types::Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = shared.mem.heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] INITIATOR-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Stage 3 (precise oop maps) — relocate oop slots of active JIT frames on
+    // this thread, the JIT analogue of the interpreter-frame remap above. Inert
+    // unless CRATONVM_PRECISE_JIT_MAPS compiled the frame (sp_id_slot_off != 0);
+    // it is the piece that lets a moving collector run while JIT frames are live
+    // (see precise-jit-stack-maps-design.md, Stage 3).
+    crate::jit::conservative_roots::remap_active_jit_frames(
+        pointer_map,
+        &crate::jit::conservative_roots::shadow_owned_slots(&thread.shadow_stack),
+    );
+    crate::jit::conservative_roots::remap_register_image_words(pointer_map, Some(shared));
+
+    // Shadow-stack precise remap (CRATONVM_SHADOW_STACK) — the rewritable
+    // counterpart to the marking scan in roots.rs. Every pushed slot is a known
+    // oop, so relocating it via `pointer_map` is unconditionally safe (no
+    // is-it-really-a-pointer ambiguity, unlike the conservative JIT scan). After
+    // the call returns, JIT codegen reloads each oop from its (now-updated) slot,
+    // so a moved object's new address flows back into the compiled code's
+    // registers. This is what makes the moving collector correct under JIT.
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        let _rewritten = thread.shadow_stack.remap(pointer_map);
+        if crate::runtime::env_cache::dbg_shadow() && _rewritten > 0 {
+            eprintln!(
+                "[SHADOW] remap: depth={} rewritten={}",
+                thread.shadow_stack.depth(),
+                _rewritten
+            );
+        }
+    }
+    // gcg g5/og: after the shadow-stack remap, which owns the slots
+    // `remap_active_jit_frames` skips (`shadow_owned_slots`); before it,
+    // those map-named slots read as stale (`in_map=true`).
+    crate::jit::conservative_roots::report_stale_after_remap(pointer_map, Some(shared));
+
+    // Every off-frame per-thread reference, through the ONE list the four
+    // per-thread remap paths share (native pins, handle slots, the native
+    // allocation pool, the in-flight native return, the JIT HashMap node cache,
+    // the ASCII case cache, printed values, scoped-value bindings and the four
+    // §10 single slots). See `remap_thread_off_frame_refs` for the drift this
+    // replaced — `native_alloc_pool` was not forwarded on THIS path at all.
+    // Sections 4, 10 (single slots) and 12 below are covered here and must
+    // not be re-applied: under a sliding compactor the map chains (`A->B`,
+    // `B->C`), and a second application moves a reference past its object.
+    remap_thread_off_frame_refs(thread, pointer_map);
+
+    // 2. Static fields
+    //
+    // SLOTS FIRST. `collect_roots` already visited every static of every class
+    // a few microseconds ago and knows exactly which slots hold an object; a
+    // `StaticsBlock` is a leaked `Box<[Value]>` whose base is stable for the
+    // life of the VM, so those slot addresses are still valid here even if the
+    // owning map has rehashed. Walking them is the same work this loop did,
+    // minus a second sweep of every primitive slot in the process and minus
+    // taking the `statics` WRITE lock across all of it.
+    //
+    // See `memory::roots::STATIC_REF_SLOTS` for why this exists beyond the
+    // saving: it is the first place in this VM where a root is carried as a
+    // SLOT rather than a value, which is the shape that would let a relocating
+    // collector fix roots in place and retire the `PointerMap` and its ~35
+    // hand-written remap companions.
+    //
+    // The take is what makes it safe: an `update_all_roots` not preceded by a
+    // scan on this thread gets `None` and falls through to the full walk below,
+    // so a stale list cannot be applied. `CRATONVM_GC_STATIC_ROOT_SLOTS=0`
+    // forces that path in one binary.
+    match crate::memory::roots::take_static_ref_slots(shared.vm_identity) {
+        Some(slots) => {
+            // The `statics` lock is deliberately NOT taken. These are raw
+            // addresses into leaked blocks the map does not own the storage of,
+            // and this runs stop-the-world with every mutator parked -- the same
+            // conditions under which the scan read them.
+            let covered = slots.len();
+            // Only under the verifier: the recorded addresses, so a slot the
+            // re-walk flags can be classified rather than merely counted. See
+            // the two-way split below.
+            let covered_addrs: Option<std::collections::HashSet<usize>> =
+                false
+                    .then(|| slots.iter().copied().collect());
+            for addr in slots {
+                // SAFETY: recorded by `collect_roots` earlier in THIS pause as
+                // the address of a `Value` slot inside a leaked `StaticsBlock`.
+                // Such a block is never freed (`grow_to` leaves the old one
+                // allocated on purpose), so the pointer cannot dangle, and no
+                // mutator is running to write it concurrently.
+                // zt t32 (section 4): per word, as every static reader and
+                // writer is (`StaticsBlock::load_cell` / `store_cell`).
+                unsafe {
+                    cratonvm_gc::gc::update_value_ref_atomic(
+                        addr as *mut cratonvm_types::Value,
+                        pointer_map,
+                    )
+                };
+            }
+            // `CRATONVM_DBG_STATIC_SLOT_VERIFY=1` -- re-walk every static the
+            // slow way and report any slot the recorded list did not cover.
+            //
+            // A missed slot here is not a wrong number, it is a live static
+            // field left pointing at a vacated address: a use-after-free that
+            // surfaces arbitrarily far from this function. The set the scan
+            // records and the set this loop would have visited must be equal,
+            // and the only way to know that on a real workload rather than in a
+            // unit test is to run both and diff them -- the same shape
+            // `CRATONVM_DBG_ROOTSNAP_VERIFY` uses for the frozen-frame cache.
+            if let Some(covered_addrs) = covered_addrs {
+                let mut missed = 0usize;
+                let mut chained = 0usize;
+                let mut first_unrecorded: Option<(u32, usize)> = None;
+                let mut statics = shared.classes.statics.write();
+                for (&class_id, fields) in statics.iter_mut() {
+                    for (idx, val) in fields.iter_mut().enumerate() {
+                        // A slot that still resolves through the map after the
+                        // recorded walk is one of TWO things, and they call for
+                        // opposite fixes -- which is why this counts them apart
+                        // rather than reporting a single `missed`.
+                        //
+                        // CHAINED: the slot IS in the recorded list, was already
+                        // patched, and its NEW address is itself a key. The
+                        // premise this arm used to assert -- "the new address is
+                        // not itself a key" -- holds for one Cheney semi-space
+                        // pair and fails for a COMPOSED map, where a young
+                        // object promoted into the old generation can then be
+                        // slid by the same cycle's old-gen compaction, so a
+                        // to-space value is a from-space key. Re-applying the
+                        // map there would move the reference a second time, past
+                        // where the object actually is. Nothing is wrong with
+                        // the recorded list in this case; the VERIFIER was.
+                        //
+                        // UNRECORDED: the slot is not in the list at all. That
+                        // one is the real defect -- a live static field left
+                        // pointing at a vacated address.
+                        if let cratonvm_types::Value::Object(Some(o)) = *val {
+                            if pointer_map.get(&(o.as_ptr() as usize)).is_some() {
+                                let slot_addr = val as *const cratonvm_types::Value as usize;
+                                if covered_addrs.contains(&slot_addr) {
+                                    chained += 1;
+                                } else {
+                                    missed += 1;
+                                    if first_unrecorded.is_none() {
+                                        first_unrecorded = Some((class_id.as_u32(), idx));
+                                    }
+                                    // SAFETY: a live cell of this block.
+                                    unsafe {
+                                        cratonvm_gc::gc::update_value_ref_atomic(
+                                            val as *mut cratonvm_types::Value,
+                                            pointer_map,
+                                        )
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((cid, idx)) = first_unrecorded {
+                    eprintln!(
+                        "[static-slot-verify] first unrecorded slot: class_id={cid} index={idx}"
+                    );
+                }
+                // The SHAPE, not just the failures. A verifier that prints only
+                // when it finds something cannot distinguish "covered
+                // everything" from "the fast path never ran" -- and on this
+                // path the second one is the likelier way to get a silent zero,
+                // because `take_static_ref_slots` returns `None` whenever the
+                // scan recorded nothing and this whole arm is skipped. Printing
+                // the covered count alongside the miss count is what makes a
+                // zero mean something.
+                eprintln!(
+                    "[static-slot-verify] covered={covered} missed={missed} chained={chained} moved={moved} (covered = slots the scan recorded; missed = slots it did NOT record that still resolve; chained = recorded slots whose NEW address is itself a key in a composed map; moved = entries in this collection's pointer map)",
+                    moved = pointer_map.len(),
+                );
+            }
+        }
+        None => {
+            crate::memory::roots::note_static_slot_fallback();
+            let mut statics = shared.classes.statics.write();
+            for fields in statics.values_mut() {
+                for val in fields.iter_mut() {
+                    // SAFETY: a live cell of this block (zt t32: per word).
+                    unsafe {
+                        cratonvm_gc::gc::update_value_ref_atomic(
+                            val as *mut cratonvm_types::Value,
+                            pointer_map,
+                        )
+                    };
+                }
+            }
+        }
+    }
+
+    // 3. Class lock objects
+    {
+        let mut class_locks = shared.classes.class_locks.write();
+        for obj_ref in class_locks.values_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                // Safety: new_addr was produced by the GC's pointer map and
+                // should point into the to-space. The debug_assert verifies
+                // this during development.
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
+    // 3b. Class-mirror decoded SourceFile Strings (roots.rs 6c).
+    {
+        let mut files = shared.classes.stack_trace_source_files.write();
+        for row in files.values_mut() {
+            if let Some(object) = &mut row.string {
+                if let Some(&new_addr) = pointer_map.get(&(object.as_ptr() as usize)) {
+                    debug_assert_ne!(new_addr, 0);
+                    // SAFETY: the collector supplied the live forwarded address.
+                    *object = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+    }
+
+    // 4. Thread printed values — forwarded by `remap_thread_off_frame_refs`
+    //    above; deliberately not re-applied here.
+
+    // 5. Interned string pool
+    //
+    // gci i25/st2: the same walk, or -- under `CRATONVM_GC_STRING_TABLE_FUNNEL`,
+    // when this pause's `sweep_after_pause` above judged only the young-entry
+    // list -- only the listed entries that pause moved
+    // (`string_table::remap_pool_after_pause`).
+    crate::memory::string_table::remap_pool_after_pause(shared, pointer_map);
+
+    // 6. Class mirror cache
+    //
+    // The `(class_id, old, new)` triples are kept for step 14, which re-keys
+    // ONLY the moved entries of the reverse map instead of clearing and
+    // re-inserting every mirror in the VM on every relocating cycle.
+    let mut moved_mirrors: Vec<(crate::classloading::ClassId, usize, usize)> = Vec::new();
+    let forward_mirror_count;
+    {
+        let mut class_mirrors = shared.classes.class_mirrors.write();
+        forward_mirror_count = class_mirrors.len();
+        for (&class_id, obj_ref) in class_mirrors.iter_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                // Safety: new_addr was produced by the GC's pointer map and
+                // should point into the to-space. The debug_assert verifies
+                // this during development.
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                moved_mirrors.push((class_id, old_addr, new_addr));
+                // nio20 L3 (NIO19-5): the compiled-`getClass()` word follows
+                // its mirror, under this WRITE lock with every mutator parked.
+                shared.classes.mirror_fast_table.bump_epoch();
+                shared
+                    .classes
+                    .getclass_mirror_words
+                    .rekey(class_id, old_addr, new_addr);
+            }
+        }
+        // JIT round 21 proposal ATOMICS21-5: the compiled static-atomic
+        // entries' weak mirror words follow their mirrors the same way,
+        // still under this WRITE lock (their publisher reads the mirror
+        // under the read lock).
+        shared
+            .jit
+            .unsafe_inline
+            .remap_static_mirrors(&|old| pointer_map.get(&old).copied());
+    }
+
+    // 6a. Cached proxy-dispatch `Method` objects — the remap half of the
+    //     unconditional root scan in `roots.rs` §6b. See
+    //     [`remap_proxy_method_cache`] for why a rooted-but-unremapped entry
+    //     hands running Java a from-space `Method` whose `name` reads null.
+    {
+        let mut proxy_methods = shared.classes.proxy_method_cache.write();
+        remap_proxy_method_cache(&mut proxy_methods, pointer_map);
+    }
+
+    // 6b. VarHandle permanent roots (B-J) — remap the registry entries so the
+    //     canonical VarHandle ref tracks the object across a move (the holder
+    //     `static final` slot is remapped via the `statics` block above using
+    //     the same pointer-map entry, now that the VarHandle is traced/copied).
+    //     gc-common w29-d: `values_mut` walks every object of every same-hash
+    //     bucket (`heap_realm::VarHandleRoots`).
+    {
+        let mut var_handle_roots = shared.mem.var_handle_roots.write();
+        for obj_ref in var_handle_roots.values_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
+    // 6c. Pre-allocated singleton OutOfMemoryError. The root scan keeps it
+    //     ALIVE (memory/roots.rs step 8c), but the holder is a bare
+    //     `SharedVm` field no other remap step covers — without this, the
+    //     first relocating GC that moves the singleton leaves
+    //     `shared.mem.singleton_oom` dangling, and a later true OOM throws a
+    //     reclaimed/zeroed object that surfaces as the unreadable
+    //     `Exception in thread "main" unknown` (observed deterministically on
+    //     the SteadyChurn recreation under sustained G1 churn).
+    {
+        let mut oom = shared.mem.singleton_oom.write();
+        if let Some(ref mut obj_ref) = *oom {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+    // gcd d2/j: the per-message preallocated errors, rooted beside the
+    // singleton by step 8c and held by the same bare `SharedVm` field shape.
+    {
+        let mut kinds = shared.mem.preallocated_oome.write();
+        for obj_ref in kinds.values_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                // SAFETY: the pointer map's values are the collector's new
+                // addresses of live objects, as for the singleton above.
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
+    // 6d. Cached "main" java.lang.ThreadGroup singleton
+    //     (`SharedVm::main_thread_group`). The root scan keeps it ALIVE
+    //     (memory/roots.rs step 8d), but — exactly like `singleton_oom`
+    //     just above — the cache is a bare `SharedVm` field that no other
+    //     remap step covers, so without this a moving GC that relocates the
+    //     group after it is published leaves the cache pointing at
+    //     from-space. Every later reader of the cache (including
+    //     `get_or_create_main_thread_group`'s own fast path, and
+    //     `build_thread_field_holder`'s use of its return value) then hands
+    //     out a dangling `ObjectRef`, which crashes the next
+    //     `FieldHolder.<init>` field-setter that stores it into
+    //     `holder.group` (`is_forwarded`/`get_header:1558`, confirmed live
+    //     on a `cratonvm-aio-dispatch-N` thread). try_write mirrors the
+    //     system-streams convention below: `get_or_create_main_thread_group`
+    //     only ever holds the write lock for the single final-store
+    //     assignment (never across an allocation), so a locked slot here
+    //     means that store is mid-flight and its value is about to be
+    //     overwritten anyway.
+    {
+        if let Some(mut tg) = shared.threads.main_thread_group.try_write() {
+            if let Some(ref mut obj_ref) = *tg {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+    }
+
+    // 7. System streams (System.out, System.err)
+    // 7. System streams (System.out, System.err, System.in)
+    //
+    // try_write, NOT write: the singleton initializers (e.g.
+    // `ensure_system_stdin_object`) hold the WRITE guard across allocating
+    // calls, and an allocation-triggered GC on that same thread would
+    // self-deadlock on the non-reentrant RwLock (mirrors the try_read in
+    // roots.rs step 7). A locked slot is mid-initialization: it holds None
+    // (populated only at the end, from a pinned — hence already remapped —
+    // local), so there is nothing to remap.
+    {
+        if let Some(mut out) = shared.system_out.try_write() {
+            if let Some(ref mut obj_ref) = *out {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    // Safety: new_addr was produced by the GC's pointer map and
+                    // should point into the to-space. The debug_assert verifies
+                    // this during development.
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+        if let Some(mut err) = shared.system_err.try_write() {
+            if let Some(ref mut obj_ref) = *err {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    // Safety: new_addr was produced by the GC's pointer map and
+                    // should point into the to-space. The debug_assert verifies
+                    // this during development.
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+        // gcstress residual face fix — remap `system_in` too (it was missing
+        // from this step AND from the roots.rs scan while out/err had both,
+        // so the cached System.in went stale on the first moving GC).
+        if let Some(mut sin) = shared.system_in.try_write() {
+            if let Some(ref mut obj_ref) = *sin {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    // Safety: same contract as out/err above.
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+    }
+
+    // 8. Primitive type Class mirrors
+    {
+        let mut prim_mirrors = shared.classes.primitive_mirrors.write();
+        for obj_ref in prim_mirrors.values_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                // Safety: new_addr was produced by the GC's pointer map and
+                // should point into the to-space. The debug_assert verifies
+                // this during development.
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
+    // 8a. Canonical java.lang.Module mirrors (companion to root scan in
+    //     roots.rs section 8a).
+    {
+        let mut module_mirrors = shared.classes.module_mirrors.write();
+        for obj_ref in module_mirrors.values_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
+    // 9. JNI global references — update stored ObjectRefs inside each Box<ObjectRef>.
+    {
+        shared
+            .natives
+            .jni_global_refs
+            .lock()
+            .update_after_gc(pointer_map);
+    }
+
+    // 9a and 15-22. Paired post-move half of the VM/native root inventory.
+    // The historical notes below document the individual registered sources.
+    crate::memory::native_roots::remap_all_roots(shared, pointer_map);
+
+    // 9a. Native upcall table — rewrite each live slot's callback `target` to its
+    //     post-relocation address so the legacy `pe_upcall_invoke` dispatch path
+    //     does not read a stale pointer after a moving collection (root scan in
+    //     roots.rs section 9a).
+    // 9b. NIO selector side-table — the `sun.nio.ch.SelectionKeyImpl` registry
+    // (nio_selector `sk_table` + per-selector key state) stores raw channel /
+    // selector / attachment / key ObjectRefs. Without remapping them after a
+    // moving collection, `SelectionKey.channel()` returns a stale (relocated)
+    // channel, and the Apache NIO reactor closing that session then dereferences
+    // a moved-away object → `monitorenter ... null` on its `closeLock` and the
+    // reactor worker dies (ES testManyAsyncRequests under burst load). The helper
+    // early-returns when nothing moved (non-moving GC).
+
+    // 10. Per-thread ObjectRef slots — java_thread_obj, jit_pending_exception,
+    //     uncaught_exception_pending. Paired with the scan in `roots.rs` §4/§10; each
+    //     of these is a single `Option<ObjectRef>` field that some subsystem
+    //     parks a live reference in between two bytecodes, so it must be BOTH
+    //     pushed as a root there and rewritten here. The three single slots were
+    //     forwarded by `remap_thread_off_frame_refs` above, so only the JIT
+    //     deopt stash (`remap_thread_object_slots`' other half) is left — calling
+    //     `remap_thread_object_slots` itself would apply the map to those three
+    //     slots a SECOND time.
+    cratonvm_jit::deopt::remap_stashed_deopt_objects(|addr| {
+        pointer_map.get(&(addr as usize)).map(|&to| to as u64)
+    });
+
+    // 11. Root snapshot
+    remap_root_snapshot(thread, pointer_map);
+
+    // 12. Scoped value bindings (JEP 446) — key AND value, forwarded by
+    //     `remap_thread_off_frame_refs` above; deliberately not re-applied.
+
+    // 13. Resolution cache — CONSTANT_Dynamic values may hold ObjectRefs
+    {
+        let mut cache = shared.classes.resolution_cache.write();
+        cache.update_condy_refs(pointer_map);
+    }
+
+    // 14. Class mirrors reverse map — re-key the entries step 6 moved.
+    //
+    // This used to `clear()` the map and re-insert EVERY mirror on every
+    // relocating cycle: O(loaded classes) hash inserts inside the pause, on a
+    // map that on a Spring-sized application holds tens of thousands of
+    // entries of which a young collection typically moves a handful.
+    //
+    // The incremental form is exact as long as the reverse map mirrors the
+    // forward one, which its three writers maintain (`get_or_create_class_mirror`
+    // inserts both, `unload_dead_class_metadata` prunes both, and
+    // `reconcile_class_mirrors` now prunes both). The length check is the
+    // drift detector: on any mismatch this falls back to the full rebuild the
+    // old code always did, so a drift can cost a pause but never a stale key.
+    //
+    // Lock order is forward-then-reverse everywhere (`get_or_create_class_mirror`
+    // holds the forward write lock while it inserts into the reverse map), so
+    // the fallback drops the reverse guard before taking the forward one.
+    if !moved_mirrors.is_empty() {
+        let consistent = {
+            let mut reverse = shared.classes.class_mirrors_reverse.write();
+            rekey_reverse_mirrors(&mut *reverse, &moved_mirrors, forward_mirror_count)
+        };
+        if !consistent {
+            let class_mirrors = shared.classes.class_mirrors.read();
+            let mut reverse = shared.classes.class_mirrors_reverse.write();
+            reverse.clear();
+            for (&class_id, obj_ref) in class_mirrors.iter() {
+                reverse.insert(*obj_ref, class_id);
+            }
+        }
+    }
+
+    // 15. Round-9 CRIT GC-correctness fix: re-point the process-global
+    //     Integer.valueOf / Boolean.TRUE/FALSE caches living in
+    //     `native-builtins/src/lang_math.rs`. They are reported as roots
+    //     by `roots.rs` step 15, so the cached objects survive GC — but
+    //     under a moving collector their addresses change and we must
+    //     remap them here, otherwise the next cache lookup returns a
+    //     stale pointer.
+
+    // 15a. Unsafe / Class$Atomic synthetic-offset side stores (scanned in
+    //      `roots.rs` step 15a). A moving collection relocates the stored refs
+    //      and selective promotion may tenure them; repoint them here so the
+    //      next side-store load/CAS sees the live address instead of a dangling
+    //      one. See `gc_scan_unsafe_side_store_roots`. Runs as the
+    //      `unsafe-side-store` / `class-atomic-slots` rows of
+    //      `native_roots::remap_all_roots`, each over THIS VM's rows only.
+
+    // 16. Round-9 perf + GC fix: re-point the process-global LambdaMetafactory
+    //     CallSite cache living in `native-builtins/src/lang_invoke.rs`.
+    //     Same scan/update contract as the Integer.valueOf cache.
+
+    // 16a. Re-point the zero-capture lambda proxy singleton cache
+    //      (scanned in `roots.rs` step 16a). Same scan/update contract as
+    //      the Integer.valueOf cache.
+
+    // 17. Overlay-backed collections (LinkedList / LinkedHashMap / TreeMap /
+    //     TreeSet) keep their backing arrays + nodes in process-global Rust
+    //     side-tables. Their roots are scanned in `roots.rs` step 17; repoint
+    //     the stored ObjectRefs to their relocated addresses here.
+
+    // 18. Singleton built-in class loaders (app / platform) cached in
+    //     process-global mutexes in `native-builtins/src/classloader.rs`.
+    //     Scanned as roots in `roots.rs` step 18; repoint the stored ObjectRefs
+    //     to their relocated addresses here so `getClassLoader()` keeps
+    //     returning the live loader after a moving GC (fixes the intermittent
+    //     stale-ClassLoader → `String.loadClass` cryptoProvider failure).
+
+    // 18a. Process-global `System.getenv()` / `System.getProperties()`
+    //      singletons (companion to roots.rs step 18a). Repoint the cached
+    //      Map/Properties ObjectRefs to their relocated addresses so the next
+    //      `getenv()`/`getProperties()` returns the live object after a move.
+
+    // 18b. Process-global Locale caches (companion to roots.rs step 18b).
+    //      Repoint the cached default Locale + synthetic Locale side-table keys
+    //      to their relocated addresses so `Locale.getDefault()` keeps returning
+    //      the live object after a moving GC (fixes the intermittent stale
+    //      Locale → SIGSEGV).
+
+    // 18c. `java.lang.ClassValue` memoization cache (companion to roots.rs
+    //      step 18c). Repoint cached `computeValue(Class)` results to their
+    //      relocated addresses so `ClassValue.get()` keeps returning the live
+    //      object after a moving GC.
+
+    // 19. JBoss MSC container-held service objects (the `Service` instance,
+    //     synthetic `ServiceController` mirror, child `ServiceTarget`, in-flight
+    //     `StartContext`) cached in a process-global side-table in
+    //     `native-builtins/src/jboss_msc.rs`. Scanned as roots in `roots.rs`
+    //     step 19; repoint the stored ObjectRefs to their relocated addresses
+    //     here so the container can safely invoke `start()`/`stop()` on the held
+    //     service after a moving GC.
+
+    // 19b. logmanager.rs cached LogManager / Logger / LogContext singletons and
+    //      the attachments table (Round-4 B4) — repoint the stored addresses to
+    //      their relocated locations after a moving GC. Scanned as roots in
+    //      `roots.rs` step 19b.
+
+    // 19c. Class-level annotation-proxy identity cache in
+    //      `native-builtins/src/lang_class.rs` (per-class `getAnnotation` /
+    //      `getDeclaredAnnotations` proxies). Scanned as roots in `roots.rs`
+    //      step 20; repoint the stored ObjectRefs to their relocated addresses
+    //      after a moving GC so cached annotation instances stay live.
+
+    // 19d. Synthetic `com.sun.net.httpserver` server registry handler refs
+    //      (`native-builtins/src/net_phase_e.rs`). Scanned as roots in `roots.rs`;
+    //      re-point the stored `HttpHandler` ObjectRefs to their relocated
+    //      addresses after a moving GC so the per-request dispatcher invokes the
+    //      live handler instead of a vacated from-space slot (else
+    //      `NoSuchMethodError: java/lang/Object.handle` storm under GC pressure).
+
+    // Process-global InetAddress side table (companion to roots.rs, right
+    // after the re10 handler scan). Repoint the mirror's (hostName,
+    // ipAddress) entry to its relocated key after a moving GC so
+    // getHostAddress()/getAddress()/toString() keep resolving the real
+    // address instead of falling back to "0.0.0.0".
+
+    //      ScheduledThreadPoolExecutor pending runnables + XNIO IoFuture
+    //      notifier/attachment/result refs: relocate the stored ObjectRefs after
+    //      a moving GC so the pump / future-settle invokes the live object, not a
+    //      vacated from-space slot. Root-scan companions in `roots.rs`; the NIO
+    //      sk_table remap is wired separately above (`sk_table_update_after_gc`).
+    // FFM/Panama upcall targets (Step 5 GAP C) — rewrite the leaked upcall
+    // userdata's `target` in place so the trampoline dispatches to the moved
+    // object; scan companion `panama::gc_scan_upcall_target_roots` in `roots.rs`.
+    // TLS SSLContext TrustManager[] objects; scan companion
+    // `t27_tls::gc_scan_tls_ctx_trust_manager_roots` in `roots.rs`.
+    // TLS SSLContext KeyManager[] objects (client-cert resolver); scan
+    // companion `t27_tls::gc_scan_tls_ctx_key_manager_roots` in `roots.rs`.
+    // Process-wide default SSLContext; scan companion
+    // `t27_tls::gc_scan_default_ssl_context_root` in `roots.rs`.
+
+    // ForkJoinTask done/result side-table; scan companion
+    // `phases_early::gc_scan_forkjoin_roots` in `roots.rs`.
+
+    // 20. Blocked-thread root maintenance (the H2 TestScript stale-receiver
+    //     SEGV fix). Threads parked in a blocking native (Object.wait /
+    //     Thread.join / LockSupport.park / ReferenceQueue.remove) are
+    //     excluded from the STW barrier and cannot apply this pointer map
+    //     themselves; without this step their deposited root_snapshot goes
+    //     stale after the first missed moving GC (and the NEXT collection
+    //     then evacuates garbage through the stale addresses — a heap
+    //     corruptor), and their frames resume with recycled from-space
+    //     addresses. The fold remaps each blocked thread's snapshot in
+    //     place and composes this map into its pending wake-time frame
+    //     fixup (applied in `check_post_block_gc`).
+    shared
+        .threads
+        .thread_registry
+        .fold_pointer_map_into_blocked_audited(pointer_map, Some(&shared.mem.heap));
+    // Rewrite precise native deposits before resume releases their claims.
+    for addr in shared
+        .threads
+        .thread_registry
+        .precise_lazy_claimed_thread_addrs()
+    {
+        // SAFETY: the claim freezes interpreter state. Entry excludes JNI
+        // and deopt TLS; any compiled/shadow holders were pinned from a whole
+        // band/window before this deposit was admitted. Only exact managed
+        // fields are rewritten here; the pinned machine/shadow frames stay put.
+        let peer = unsafe { &mut *(addr as *mut crate::threading::jvm_thread::JvmThread) };
+        for frame in peer.frames.iter_mut() {
+            frame.update_frame_refs_mapped(
+                pointer_map,
+                &shared.mem.heap,
+                &shared.classes.type_maps,
+            );
+            if let Some(object) = frame.monitor_on_exit.as_mut() {
+                remap_one(object, pointer_map);
+            }
+            frame
+                .held_monitors
+                .remap_with(|a| pointer_map.get(&a).copied());
+        }
+        remap_thread_off_frame_refs(peer, pointer_map);
+        remap_root_snapshot(peer, pointer_map);
+        peer.rs_cache.clear();
+        peer.rs_cache_gen = 0;
+        peer.last_heal_collection = shared.mem.heap.collection_count();
+    }
+
+    // 21. Registry java.lang.Thread mirrors + the unpark(Thread) reverse
+    //     index (keyed by mirror address). Scanned as roots in roots.rs
+    //     step 10b; without the remap the registry serves stale mirrors
+    //     back into bytecode and `LockSupport.unpark(Thread)` lookups by
+    //     the relocated address silently miss (lost wakeups).
+    shared
+        .threads
+        .thread_registry
+        .update_thread_objs_after_gc(pointer_map);
+
+    // 22. Uniform native-root registry — the post-move companion to
+    //     `roots.rs` step 21, driven above via `native_roots::remap_all_roots`.
+    //     Fans out over `native_roots::VM_ROOT_SOURCES`, repointing each held
+    //     ObjectRef through `pointer_map`. Each remap self-guards the empty
+    //     (non-moving) map, and each receives the OWNING `SharedVm` so one VM's
+    //     fixup cannot rewrite another VM's entries.
+
+    // Post-GC verification: check that no frame refs still point to relocated addresses.
+    verify_no_stale_refs(thread, pointer_map, Some(&shared.mem.heap));
+    // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /
+    // reclaimed reference fields in OTHER objects (not just this thread's
+    // frames) — where the residual ClassLoader/Locale stale-ref actually lives.
+    verify_heap_object_fields(shared, pointer_map);
+    // THE SCAN INVENTORY AND THE REMAP INVENTORY ARE TWO LISTS
+    // (`CRATONVM_DBG_ROOT_REMAP_AUDIT=1`).
+    //
+    // `roots.rs` decides what the collector MARKS from; `native_roots.rs`
+    // decides what gets REWRITTEN afterwards. A side table present in the first
+    // and missing from the second keeps its object alive and then keeps naming
+    // the address the collector moved it away from — which is the exact
+    // signature the H2 MVStore-writer residual has left after the heap slots
+    // and both frame-remap sites were verified complete.
+    //
+    // So ask directly: re-run the scan and look for an address this collection
+    // moved. Destinations are excluded for the reason the frame verifier
+    // excludes them — a survivor slides INTO a vacated address, and a root
+    // legitimately naming that survivor is not a finding.
+    //
+    // `CRATONVM_DBG_ROOT_SOURCE=1` alongside this names WHICH source, which is
+    // the fix's address.
+    if false {
+        let destinations: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
+        // gci i6/pn (conc10): which exemption let each finding's object leave
+        // the non-moving sweep's pin set (`prp` / `movable`), taken BEFORE the
+        // re-scan; `unrecorded` on a moving cycle or another backend.
+        let exemptions = cratonvm_gc::gen_heap::take_young_root_exemptions();
+        // gci i6/mv: the re-scan's band census. A VERIFIABLE band word the
+        // frame's active oop map does not name, in a region the JIT's
+        // dataflow models, is DEAD -- that is one arm of the movable claim
+        // (`conservative_roots::publish_validated_band_word`), and the
+        // reason nothing rewrites it (`remap_one_jit_frame` rewrites the
+        // map's slots only). The band scan still ROOTS it, so on a cycle
+        // that honoured the claim the re-scan below roots it again and, until
+        // gci i6/mv, every such word was a finding (the `exempt_by="movable"`
+        // lines of vi6-pn: `gci-i6pn-remap-audit-finding-on-proven-cycles-
+        // is-not-precise-root-promotion-20261011.md`). The census records,
+        // for this re-scan only, which rooted band words are map-dead; an
+        // address is skipped only when EVERY occurrence of it in `after` is
+        // one (`BandRootCensus::only_map_dead`), and it is still printed as a
+        // `[root-remap-audit] map-dead` line, so nothing is hidden. What the
+        // audit no longer checks is the deadness claim itself; that claim is
+        // the coverage proof's (`band_slot_is_verifiable_with_map`), and
+        // `CRATONVM_GC_NO_BAND_MAP_LIVENESS=1` withdraws it.
+        cratonvm_gc::gc_quiescence::arm_band_root_census();
+        let after = crate::memory::roots::collect_roots(shared, thread);
+        let census = cratonvm_gc::gc_quiescence::take_band_root_census();
+        // Occurrences in `after` of each vacated address (destinations
+        // excluded, as below): the census's counts are compared with these.
+        let mut occurrences: rustc_hash::FxHashMap<usize, u32> =
+            rustc_hash::FxHashMap::default();
+        for r in after.iter() {
+            let a = r.as_ptr() as usize;
+            if !destinations.contains(&a) && pointer_map.get(&a).is_some() {
+                *occurrences.entry(a).or_insert(0) += 1;
+            }
+        }
+        let mut dead_skipped = 0usize;
+        let mut dead_addresses: rustc_hash::FxHashSet<usize> =
+            rustc_hash::FxHashSet::default();
+        // ENGAGEMENT, for the reason this whole block exists: the audit only
+        // speaks when it finds something, so a run that printed nothing covered
+        // both "no scanned root names a vacated address" and "the audit never
+        // ran on a moving cycle" (an empty `pointer_map`, a misspelled flag, a
+        // collector that took another path). `root_remap_audit_stats` is the
+        // denominator; see the `[GC] root_remap_audit:` summary line.
+        root_remap_audit::CYCLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        root_remap_audit::ROOTS_RESCANNED
+            .fetch_add(after.len(), std::sync::atomic::Ordering::Relaxed);
+        root_remap_audit::MOVED_ENTRIES
+            .fetch_add(pointer_map.len(), std::sync::atomic::Ordering::Relaxed);
+        let mut reported = 0usize;
+        for (index, r) in after.iter().enumerate() {
+            let a = r.as_ptr() as usize;
+            if destinations.contains(&a) {
+                continue;
+            }
+            if let Some(&new) = pointer_map.get(&a) {
+                let seen = occurrences.get(&a).copied().unwrap_or(0);
+                if census.as_ref().is_some_and(|c| c.only_map_dead(a, seen)) {
+                    dead_skipped += 1;
+                    if dead_addresses.insert(a) && dead_addresses.len() <= 8 {
+                        eprintln!(
+                            "[root-remap-audit] map-dead obj={a:#x} moved_to={new:#x} words={seen} \
+                             scan_section=\"{}\" exempt_by={} -- named only by band words the \
+                             active oop map proves dead; not a finding",
+                            crate::memory::roots::scan_section_of(index),
+                            cratonvm_gc::gen_heap::young_root_exemption_label(
+                                exemptions.as_ref(),
+                                a,
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                reported += 1;
+                if reported <= 8 {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{a:#x}"),
+                        moved_to = format!("{new:#x}"),
+                        source = crate::memory::native_roots::root_source_of(a)
+                            .unwrap_or("<not-attributed>"),
+                        // Which SECTION of the scan produced it. `root_source_of`
+                        // only covers the uniform native-root registry; this
+                        // covers the other forty.
+                        scan_section = crate::memory::roots::scan_section_of(index),
+                        exempt_by = cratonvm_gc::gen_heap::young_root_exemption_label(
+                            exemptions.as_ref(),
+                            a,
+                        ),
+                        // gci i6/mv: how many of the address's occurrences
+                        // the band census saw, and how many of those the
+                        // active map proves dead (`band_map_dead < occurrences`
+                        // is what made this a finding).
+                        occurrences = seen,
+                        band_rooted = census.as_ref().map_or(0, |c| c.rooted(a)),
+                        band_map_dead = census.as_ref().map_or(0, |c| c.map_dead(a)),
+                        "a ROOT this collection just scanned still names the address it moved the object away from — the scan inventory contains a source the remap inventory does not."
+                    );
+                }
+            }
+        }
+        root_remap_audit::UNREMAPPED.fetch_add(reported, std::sync::atomic::Ordering::Relaxed);
+        if dead_skipped > 0 {
+            eprintln!(
+                "[root-remap-audit] cycle map_dead_skipped={dead_skipped} addresses={} \
+                 (not counted in UNREMAPPED)",
+                dead_addresses.len()
+            );
+        }
+        if reported > 0 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                unremapped_roots = reported,
+                scanned = after.len(),
+                map = pointer_map.len(),
+                "root remap audit: that many scanned roots were left naming a vacated address"
+            );
+        }
+    }
+}
+
+/// Engagement counters for `CRATONVM_DBG_ROOT_REMAP_AUDIT=1`.
+///
+/// The audit reports only when it FINDS something, and it reports through
+/// `tracing::error!`, so silence is ambiguous in exactly the way this repo
+/// keeps paying for: it covers a clean answer and an audit that never ran. A
+/// zero `UNREMAPPED` is worth quoting only beside a non-zero `CYCLES`.
+pub mod root_remap_audit {
+    use std::sync::atomic::AtomicUsize;
+    /// Moving cycles on which the audit re-ran the root scan. The denominator.
+    pub static CYCLES: AtomicUsize = AtomicUsize::new(0);
+    /// Roots re-scanned across those cycles.
+    pub static ROOTS_RESCANNED: AtomicUsize = AtomicUsize::new(0);
+    /// `pointer_map` entries those cycles carried — i.e. objects that MOVED.
+    /// A run with `CYCLES > 0` and `MOVED_ENTRIES = 0` audited only
+    /// non-moving cycles and proves nothing.
+    pub static MOVED_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    /// Scanned roots left naming an address the same cycle vacated.
+    pub static UNREMAPPED: AtomicUsize = AtomicUsize::new(0);
+}
+
+/// `(cycles, roots_rescanned, moved_entries, unremapped)` for the root-remap
+/// audit. See [`root_remap_audit`].
+pub fn root_remap_audit_stats() -> (usize, usize, usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        root_remap_audit::CYCLES.load(Relaxed),
+        root_remap_audit::ROOTS_RESCANNED.load(Relaxed),
+        root_remap_audit::MOVED_ENTRIES.load(Relaxed),
+        root_remap_audit::UNREMAPPED.load(Relaxed),
+    )
+}
+
+/// Opt-in young-object size validator (`CRATONVM_DBG_VALIDATE_NEW=1`). Walks
+/// every live plain object and compares its header `num_slots` (and
+/// `array_length`) against the authoritative `num_total_fields` for its class
+/// (what the interpreter allocates with). A mismatch is the smoking gun for a
+/// JIT `new` that wrote a wrong-size/typed header (the JUnitCore.main miscompile
+/// → heap-walk desync). Reports the FIRST offenders in address order (the
+/// earliest is the root; later entries may be walk-desync garbage). Call after
+/// each GC so it fires on the non-moving (JIT-active) sweep path too.
+pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
+    use cratonvm_types::{ObjectHeader, ObjectKind};
+
+    if !false {
+        return;
+    }
+    let heap = &shared.mem.heap;
+    let cm = shared.classes.class_manager.read();
+    // One-shot: dump the class_id -> (name, num_total_fields) table for the
+    // low class_ids that show up in the JUnitCore-corruption walks (6, 12, 34,
+    // 36, ...), so the corrupted object types can be identified by name.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DUMPED: AtomicBool = AtomicBool::new(false);
+        if !DUMPED.swap(true, Ordering::Relaxed) {
+            for raw in 0u32..64 {
+                let id = cratonvm_types::ClassId::new(raw);
+                if let Some(c) = cm.get_class(id) {
+                    eprintln!(
+                        "[classid] {} -> {} (num_total_fields={})",
+                        raw, c.name, c.num_total_fields,
+                    );
+                }
+            }
+        }
+    }
+    let mut reported = 0usize;
+    const CAP: usize = 25;
+    for (ptr, _size) in heap.walk_objects() {
+        if reported >= CAP {
+            break;
+        }
+        let hdr = unsafe { &*(ptr as *const ObjectHeader) };
+        if hdr.kind() != ObjectKind::Object {
+            continue;
+        }
+        let cid = hdr.class_id;
+        let actual = hdr.num_slots() as usize;
+        let arrlen = hdr.array_length();
+        match cm.get_class(cid) {
+            Some(c) => {
+                if actual != c.num_total_fields || arrlen != 0 {
+                    eprintln!(
+                        "[young-validate] BAD {} (cid={}) num_slots={} EXPECTED={} array_length={} @0x{:x}",
+                        c.name, cid.as_u32(), actual, c.num_total_fields, arrlen, ptr as usize,
+                    );
+                    reported += 1;
+                }
+            }
+            None => {
+                eprintln!(
+                    "[young-validate] BAD <unknown class> cid={} num_slots={} array_length={} @0x{:x}",
+                    cid.as_u32(), actual, arrlen, ptr as usize,
+                );
+                reported += 1;
+            }
+        }
+    }
+}
+
+/// Which region of the generational heap an address falls in, for the
+/// heap-stale report.
+///
+/// The distinction that matters there is ACTIVE vs INACTIVE semispace: an
+/// address in the inactive one is memory the last cycle emptied, so a live
+/// field naming it is a reference the collector dropped; an address in the
+/// ACTIVE one is memory that cycle copied INTO, so a zeroed header there is a
+/// destination the collector reserved and never filled. Those are opposite
+/// bugs and they print identically without this.
+fn heap_region_name(heap: &cratonvm_gc::vm_heap::VmHeap, addr: usize) -> &'static str {
+    if addr == 0 {
+        return "null";
+    }
+    let in_inactive = heap
+        .young_inactive_semispace_range()
+        .is_some_and(|(lo, hi)| addr >= lo && addr < hi);
+    if in_inactive {
+        return "young INACTIVE semispace (emptied)";
+    }
+    if heap.is_in_young_addr(addr) {
+        return "young ACTIVE semispace";
+    }
+    if heap.is_heap_addr(addr).is_some() {
+        // `is_in_young_addr` is false on G1 and ZGC by design, so only the
+        // Generational heap has an "old gen" to name here (w2-e item 9: every
+        // G1/ZGC address used to be labelled "old gen").
+        return if heap.is_generational() {
+            "old gen"
+        } else if heap.is_g1() {
+            "G1 region"
+        } else {
+            "ZGC arena"
+        };
+    }
+    "off-heap"
+}
+
+/// Opt-in deep heap-stale verifier (`CRATONVM_DBG_HEAP_STALE=1`). After a
+/// moving GC, walks EVERY live plain object and checks each reference field for
+/// a dangling target — the proven method for pinning the residual intermittent
+/// stale-ref (e.g. a `ClassLoader` field that later derefs as a `String`,
+/// surfacing as `String.loadClass` / "Not able to load any cryptoProvider").
+///
+/// Flags three signatures:
+///   (a) target address still a KEY in `pointer_map` → the field was NOT
+///       forwarded (the copier / old→young remembered-set missed this referrer
+///       edge) — the most actionable signal;
+///   (b) target is not a live heap address (points into the reset young
+///       from-space) → the target was reclaimed and its slot freed;
+///   (c) target has an all-zero (reclaimed) header.
+///
+/// Reports the referrer class + field index so the missing barrier/root edge
+/// can be pinned. Output is capped per GC to avoid flooding. Reference arrays
+/// are intentionally skipped here (already covered by the resurrection-drain
+/// remembered-set fix); this pass targets plain object fields.
+pub fn verify_heap_object_fields(
+    shared: &crate::vm::SharedVm,
+    pointer_map: &cratonvm_types::PointerMap,
+) {
+    verify_heap_object_fields_phase(shared, pointer_map, "post-gc");
+}
+
+/// PRE-collection half of [`verify_heap_object_fields`], and the reason the
+/// pair exists.
+///
+/// The post-GC pass alone cannot say WHEN a field went stale. A generational
+/// young collection alternates its two semispaces, so a dead address in
+/// semispace A is reported on every cycle that empties A and on no other — and
+/// the same report is produced by "cycle N dropped this referent" and by "the
+/// field has held a dead address since cycle N-20 and nobody noticed". Those
+/// have opposite fixes.
+///
+/// Running the identical walk BEFORE the collection separates them outright:
+///
+/// * clean pre-GC, stale post-GC — THIS collection dropped the referent;
+/// * already stale pre-GC — the field was written stale, or an earlier
+///   collection dropped it, and the mutator is where to look.
+///
+/// Both halves print their phase, so one run answers it.
+pub fn verify_heap_object_fields_pre_gc(shared: &crate::vm::SharedVm) {
+    if !false {
+        return;
+    }
+    let empty = cratonvm_types::PointerMap::new();
+    verify_heap_object_fields_phase(shared, &empty, "PRE-gc");
+}
+
+fn verify_heap_object_fields_phase(
+    shared: &crate::vm::SharedVm,
+    pointer_map: &cratonvm_types::PointerMap,
+    phase: &str,
+) {
+    use crate::types::Value;
+    use cratonvm_types::{
+        ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE,
+        REF_ELEMENT_SIZE,
+    };
+
+    if !false {
+        return;
+    }
+    let heap = &shared.mem.heap;
+    let class_name = |cid: cratonvm_types::ClassId| -> String {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(cid)
+            .map(|c| c.name.to_string())
+            .unwrap_or_else(|| format!("cid#{}", cid.as_u32()))
+    };
+    let mut reported = 0usize;
+    // Distinct (referrer class, slot, reason) triples already reported THIS
+    // collection. Without it one repeated pair burns the whole cap and hides
+    // every other referrer: on BindableTests under GC stress a single
+    // `java/lang/Module field[0]` accounted for 2272 of 2280 lines, and nothing
+    // else in the heap was ever reachable by this pass.
+    let mut seen: std::collections::HashSet<(u32, usize, &'static str)> =
+        std::collections::HashSet::new();
+    const CAP: usize = 200;
+    // Recycled-destination filter — the same ambiguity `verify_no_stale_refs`
+    // documents at length, which this pass was missing.
+    //
+    // An address that is BOTH a key and a value in `pointer_map` was vacated by
+    // one object and handed out again as the DESTINATION of another. A slot the
+    // remap rewrote correctly then points at a map KEY, so the `contains_key`
+    // test below reports it as UN-FORWARDED even though it is a fresh, correct
+    // reference to that address's NEW occupant.
+    //
+    // On the major-GC path this is not a rare corner: `pointer_map` is the
+    // composition of the young map with `OldGen::compact`'s, and a SLIDING
+    // compactor moves survivors DOWN into space its predecessors just vacated —
+    // so key∩value overlap is the normal case, not the exception. Reporting it
+    // manufactured a "the collector leaves reference fields un-forwarded"
+    // finding out of a correctly-collected heap. Build the destination set once
+    // (this whole pass is already an opt-in full heap walk).
+    let destinations: std::collections::HashSet<usize> = pointer_map.values().copied().collect();
+    // Classify a reference target. Returns Some(reason) if it is dangling
+    // (un-forwarded / off-heap / zeroed = wrongly reclaimed by the sweep).
+    let classify = |addr: usize| -> Option<&'static str> {
+        if addr == 0 {
+            return None;
+        }
+        if pointer_map.contains_key(&addr) && !destinations.contains(&addr) {
+            return Some("UN-FORWARDED");
+        }
+        if heap.is_heap_addr(addr).is_none() {
+            return Some("OFF-HEAP(reclaimed)");
+        }
+        // The inactive semispace holds no live object BY CONSTRUCTION, so a
+        // field naming it is dangling whether or not the wipe has run yet.
+        // Tested BEFORE the zero-header arm on purpose: the wipe is what makes
+        // the header zero, so reading staleness off the header dates the
+        // finding to when the memory was cleared rather than to when the
+        // reference died. This arm needs no such inference, which is what makes
+        // the PRE-gc phase able to answer at all.
+        if heap
+            .young_inactive_semispace_range()
+            .is_some_and(|(lo, hi)| addr >= lo && addr < hi)
+        {
+            return Some("DANGLING(inactive-semispace)");
+        }
+        let h = unsafe { &*(addr as *const ObjectHeader) };
+        if h.class_id.as_u32() == 0
+            && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
+            && h.num_slots() == 0
+            && h.array_length() == 0
+        {
+            return Some("ZEROED(reclaimed)");
+        }
+        None
+    };
+    for (ptr, _size) in heap.walk_objects() {
+        if reported >= CAP {
+            break;
+        }
+        let hdr = unsafe { &*(ptr as *const ObjectHeader) };
+        let r_cid = hdr.class_id;
+        if hdr.kind() == ObjectKind::Object {
+            let referrer = unsafe { ObjectRef::from_raw(ptr) };
+            let nf = heap.num_fields(referrer);
+            for i in 0..nf {
+                if let Value::Object(Some(target)) = heap.get_field(referrer, i) {
+                    if let Some(reason) = classify(target.as_ptr() as usize) {
+                        if seen.insert((r_cid.as_u32(), i, reason)) {
+                            eprintln!(
+                                "[heap-stale][{}] {} OBJ {} field[{}] -> 0x{:x} (referrer 0x{:x})",
+                                phase,
+                                reason,
+                                class_name(r_cid),
+                                i,
+                                target.as_ptr() as usize,
+                                ptr as usize,
+                            );
+                            // WHO WROTE IT. A stale field is either a slot the
+                            // collector never rewrote, or one it rewrote to an
+                            // address it then failed to fill. `dest=true` is the
+                            // second: THIS cycle's map names that address as a
+                            // copy destination, so the rewrite was the
+                            // collector's and the destination is what is wrong.
+                            // Without this line the two are indistinguishable
+                            // and the reader guesses (BindableTests
+                            // `java/lang/Module field[0]`, 2026-09-09).
+                            eprintln!(
+                                "[heap-stale] ^ target_is_this_cycles_destination={} sources_forwarded_here={:?} target_region={} referrer_region={}",
+                                destinations.contains(&(target.as_ptr() as usize)),
+                                pointer_map
+                                    .iter()
+                                    .filter(|(_, v)| **v == target.as_ptr() as usize)
+                                    .map(|(k, _)| format!("0x{k:x}"))
+                                    .take(4)
+                                    .collect::<Vec<_>>(),
+                                heap_region_name(heap, target.as_ptr() as usize),
+                                heap_region_name(heap, ptr as usize),
+                            );
+                            reported += 1;
+                            if reported >= CAP {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if hdr.kind() == ObjectKind::Array
+            && hdr.element_type() == ArrayElementType::Reference
+        {
+            // Reference array (Object[]): elements are 8-byte compact pointers.
+            let len = hdr.array_length() as usize;
+            for i in 0..len {
+                let s_ptr =
+                    unsafe { (ptr as *const u8).add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
+                let raw = unsafe { read_ref_slot(s_ptr) } as usize;
+                if let Some(reason) = classify(raw) {
+                    // Arrays dedupe on the CLASS and the reason only: the index
+                    // is data, and a 4096-element array with one dangling slot
+                    // must not read as 4096 distinct findings.
+                    if seen.insert((r_cid.as_u32(), usize::MAX, reason)) {
+                        eprintln!(
+                            "[heap-stale][{}] {} ARR {}[{}] -> 0x{:x} (referrer 0x{:x})",
+                            phase,
+                            reason,
+                            class_name(r_cid),
+                            i,
+                            raw,
+                            ptr as usize,
+                        );
+                        reported += 1;
+                        if reported >= CAP {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if reported > 0 {
+        eprintln!(
+            "[heap-stale][{}] ^ {} distinct stale (class, slot, reason) triple(s) at collection {} (pointer_map size={})",
+            phase,
+            reported,
+            heap.collection_count(),
+            pointer_map.len(),
+        );
+    }
+}
+
+/// Opt-in (`CRATONVM_DBG_HEAP_STALE=1`) audit of the collection-overlay SIDE
+/// TABLES — the one place every other verifier is blind to.
+///
+/// `verify_heap_object_fields` walks Java objects and `verify_no_stale_refs`
+/// walks thread frames; an overlay-backed collection whose backing was
+/// reclaimed is neither, so it shows up in neither. That blind spot is where
+/// the reclaimed-`LinkedHashMap$Node` / `TreeMap size 0` family lives.
+///
+/// Deliberately called from the GC epilogue in `interpreter.rs` rather than
+/// from `verify_heap_object_fields`: the latter runs only from
+/// `update_all_roots`, which EARLY-RETURNS on an empty `pointer_map` — i.e.
+/// never on the non-moving sweep, which is exactly the path a `System.gc()`
+/// takes (`explicit_full_gc`) and exactly where `ROverlaySystemGcStress` fails.
+/// A verifier that cannot run on the failing path is worse than none.
+///
+/// The classifier here is deliberately NOT `is_addr_live` — that is a range
+/// check, so a freed old-gen block reads as live. It reports the two
+/// unambiguous signatures instead: off-heap, and an all-zero header.
+pub fn audit_overlay_refs(shared: &crate::vm::SharedVm) {
+    use cratonvm_types::ObjectHeader;
+
+    if !false {
+        return;
+    }
+    let heap = &shared.mem.heap;
+    let classify = |addr: usize| -> Option<&'static str> {
+        if heap.is_heap_addr(addr).is_none() {
+            return Some("OFF-HEAP(reclaimed)");
+        }
+        // SAFETY: `is_heap_addr` placed `addr` inside a mapped heap region, so
+        // the header bytes are readable.
+        let h = unsafe { &*(addr as *const ObjectHeader) };
+        if h.class_id.as_u32() == 0
+            && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
+            && h.num_slots() == 0
+            && h.array_length() == 0
+        {
+            return Some("ZEROED(reclaimed)");
+        }
+        None
+    };
+    let mut reported = 0usize;
+    const CAP: usize = 40;
+    cratonvm_native_collections::gc_audit_overlay_refs(&classify, &mut |reason, table, addr| {
+        if reported < CAP {
+            eprintln!("[overlay-stale] {reason} {table} -> 0x{addr:x}");
+        }
+        reported += 1;
+    });
+    if reported > 0 {
+        eprintln!("[overlay-stale] ^ {reported} dangling overlay ref(s) after this GC");
+    }
+}
+
+/// The evacuator's verdict on `addr` for the reports below: THIS VM's
+/// Generational heap's refusal ledger (`GenerationalHeap::forward_refusal_reason`),
+/// `None` on the other backends and without a heap. gcd d3/m (2026-09-27):
+/// the ledger is per heap; it was a process static any other Generational
+/// VM's moving cycle could clear before this verifier read it.
+fn forward_refusal_verdict(
+    heap: Option<&crate::memory::VmHeap>,
+    addr: usize,
+) -> Option<&'static str> {
+    heap.and_then(|h| h.gen_forward_refusal_reason(addr))
+}
+
+/// Post-GC verification: warns if any thread frame local or operand stack value
+/// still holds an ObjectRef whose address appears in the pointer_map (i.e. was
+/// supposed to be relocated), OR points to zeroed-out memory (i.e. was garbage
+/// collected because it wasn't in the root set).
+///
+/// Recycled-destination exception (the SpinPollMark `-Xmx80m` OOM-pressure
+/// false alarm, 2026-07-11): under the G1 evacuation-failure retry
+/// (`retry_after_evacuation_failure`), a drain pass allocates its to-space
+/// from regions the FIRST pass just evacuated and freed — so a first-pass
+/// FROM-address (a pointer_map key) can be handed out again as a drain
+/// DESTINATION (a pointer_map value) for a *different* object. A slot the
+/// remap correctly rewrote to such a recycled destination still matches a
+/// key, but it is a fresh, correct reference to the address's NEW occupant,
+/// not a missed remap (`CRATONVM_DBG_BUG03` traces show the slot being
+/// rewritten `old → recycled` in the very pause that would flag `recycled`).
+/// Such addresses are therefore skipped; with `CRATONVM_GC_VERIFY_STALE=1`
+/// they are reported separately as benign. The same ambiguity is inherent
+/// to the heavy STALE-DEST scan below — a value-and-key address cannot be
+/// classified as "intermediate hop" vs "recycled epoch" from the map alone.
+///
+/// Returns the number of genuine (non-recycled) stale reports, for tests.
+fn verify_no_stale_refs(
+    thread: &crate::threading::jvm_thread::JvmThread,
+    pointer_map: &cratonvm_types::PointerMap,
+    heap: Option<&crate::memory::VmHeap>,
+) -> usize {
+    use crate::types::Value;
+    use cratonvm_types::ObjectHeader;
+
+    let mut genuine_reports = 0usize;
+    // THE OTHER HALF OF THE INVARIANT: a slot naming a from-space address the
+    // pointer map does NOT contain.
+    //
+    // Everything else in this function asks "did the remap rewrite every slot
+    // whose object MOVED". That question cannot see the opposite failure: an
+    // object that was never copied at all because the root scan missed the slot
+    // holding it. After a Cheney cycle the inactive semispace holds nothing
+    // live, so a live frame slot naming an address inside it is proof that the
+    // collection reclaimed an object a frame still held -- and this is the last
+    // moment at which the frame, method, pc and slot are all in hand. Every
+    // reader-side reporter downstream sees only an address and a failed
+    // dispatch, an unbounded number of collections later.
+    //
+    // Live-filtered, because a DEAD local naming a reclaimed object is the
+    // collector working as designed -- that is precisely what the per-bci
+    // liveness filter is for. Operand-stack slots are always live.
+    //
+    // Found the BindableTests residual this way: a `java.util.function.Supplier`
+    // in `DisplayNameUtils.determineDisplayNameForMethod` local[0].
+    let inactive_young: Option<(usize, usize)> =
+        heap.and_then(|h| h.young_inactive_semispace_range());
+    let mut reclaimed_reports = 0usize;
+    // Cap for the ACTIVE-semispace arm, counted separately from
+    // `reclaimed_reports` so one noisy face cannot starve the other.
+    let mut dead_ref_reports = 0usize;
+    // Lazily-built set of this pause's destination addresses (map VALUES),
+    // used to recognise recycled destinations. Built only when a candidate
+    // stale slot is actually found, so the common (clean) path pays nothing.
+    let mut destinations: Option<std::collections::HashSet<usize>> = None;
+
+    // Allow opt-in heavy diagnostic that walks every Object slot and checks
+    // for a zeroed header (class_id=0 && identity_hash_code=0 && num_slots=0).
+    // Such a slot is the in-memory signature of the heavy-trees bug: a
+    // pointer at an address inside the just-reset young-from semispace.
+    let heavy = Err::<String, std::env::VarError>(std::env::VarError::NotPresent)
+        .ok()
+        .as_deref()
+        == Some("1");
+
+    // Build the set of "stale destination addresses" — addresses that appear
+    // as VALUES in pointer_map but ALSO as KEYS. These are intermediate
+    // forwarding points: minor GC promoted an object to addr A, then major
+    // GC compacted A to B. A slot still pointing at A is silently stale —
+    // the header check above might NOT trigger (A could be overwritten by
+    // a slid object's data), but the slot is wrong.
+    let stale_destinations: std::collections::HashSet<usize> = if heavy {
+        pointer_map
+            .values()
+            // A genuine intermediate point is an address that something moved TO
+            // and that was THEN relocated elsewhere. A self-forward (`k -> k`)
+            // makes `k` both a value and a key but represents NO movement, so
+            // exclude it (`pointer_map[v] != v`) to avoid a false STALE-DEST flag.
+            .filter(|v| pointer_map.get(v).is_some_and(|nv| nv != *v))
+            .copied()
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    for (fi, frame) in thread.frames.iter().enumerate() {
+        let cname = frame.class_name();
+        let mname = frame.method_name();
+        // The frame's own per-bci liveness mask, for the RECLAIMED-WHILE-HELD
+        // arm: a DEAD local naming a reclaimed object is the filter working.
+        let live_mask = frame.live_locals_mask_here();
+        // Check locals
+        for li in 0..frame.locals_len() {
+            let val = frame.get_local(li as u16);
+            if let Value::Object(Some(obj_ref)) = val {
+                let addr = obj_ref.as_ptr() as usize;
+                // A `key == value` entry is a SELF-FORWARD (evacuation failure:
+                // the object stayed in place because to-space was exhausted), so
+                // a slot pointing at it is correct, not stale. Only flag entries
+                // that actually relocated the object.
+                if let Some(&new_addr) = pointer_map.get(&addr) {
+                    if new_addr != addr {
+                        let dests = destinations
+                            .get_or_insert_with(|| pointer_map.values().copied().collect());
+                        if dests.contains(&addr) {
+                            // Recycled destination — correctly-rewritten slot
+                            // (see fn doc). Benign; report only under the
+                            // heavy opt-in flag.
+                            if heavy {
+                                eprintln!(
+                                    "POST-GC RECYCLED-DEST LOCAL (benign): frame[{}] {}.{} \
+                                     local[{}] holds 0x{:x} — a drain-pass destination that \
+                                     is also an earlier-pass key (-> 0x{:x})",
+                                    fi, cname, mname, li, addr, new_addr,
+                                );
+                            }
+                        } else {
+                            genuine_reports += 1;
+                            eprintln!(
+                                "POST-GC STALE LOCAL: frame[{}] {}.{} local[{}] still points to \
+                                 relocated addr 0x{:x} (should be 0x{:x})",
+                                fi, cname, mname, li, addr, new_addr,
+                            );
+                        }
+                    }
+                }
+                // The ACTIVE-semispace half of the same question, and it is
+                // not covered by the arm below.
+                //
+                // That arm tests membership of the INACTIVE semispace, which a
+                // dead young address only satisfies on the cycles that empty
+                // ITS semispace — the pair alternates, so a slot that went bad
+                // in the other one reads as ordinary young memory here and is
+                // reported by nothing. `dead_young_ref_reason` closes it: an
+                // address in the ACTIVE semispace whose header words are zero
+                // is unallocated memory (past the frontier, a swept block, or a
+                // carved-but-unhanded-out TLAB chunk), and a live frame slot
+                // naming it is dangling on THIS cycle, whichever semispace it
+                // died in.
+                //
+                // Added 2026-09-09: without it the BindableTests residual's
+                // first report was 2 398 collections after the reference went
+                // bad, which is what made it look like the LAST cycle's fault.
+                if let Some(h) = heap {
+                    let live = live_mask.is_live(li);
+                    if live && dead_ref_reports < 8 {
+                        if let Some("ZERO-HEADER-IN-YOUNG") = h.dead_young_ref_reason(addr) {
+                            dead_ref_reports += 1;
+                            genuine_reports += 1;
+                            eprintln!(
+                                "POST-GC DEAD-YOUNG-REF LOCAL: frame[{}] {}.{} local[{}] pc={} holds 0x{:x}, which is inside the ACTIVE young semispace but reads as unallocated (zero header) — the slot names no live object. collection={} evacuator_verdict={:?}",
+                                fi,
+                                cname,
+                                mname,
+                                li,
+                                frame.pc,
+                                addr,
+                                h.collection_count(),
+                                forward_refusal_verdict(Some(h), addr),
+                            );
+                        }
+                    }
+                }
+                if let Some((lo, hi)) = inactive_young {
+                    let live = live_mask.is_live(li);
+                    if live
+                        && addr >= lo
+                        && addr < hi
+                        && !pointer_map.contains_key(&addr)
+                        && reclaimed_reports < 8
+                    {
+                        reclaimed_reports += 1;
+                        genuine_reports += 1;
+                        // WHY the scan skipped it, since `scan_local_objects`
+                        // has exactly two ways to drop a LIVE object local:
+                        // the `local_kinds` LONG/DOUBLE gate, and the
+                        // `is_heap_addr` screen. They have completely
+                        // different fixes, and neither is the liveness
+                        // filter this arm has already excluded.
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD LOCAL: frame[{}] {}.{} local[{}] pc={} \
+                             holds 0x{:x}, inside the semispace this cycle emptied, and the \
+                             pointer map has no entry for it -- the object was NOT copied, so \
+                             this slot was not in the root set. local_kind={} in_heap={} \
+                             collection={}",
+                            fi,
+                            cname,
+                            mname,
+                            li,
+                            frame.pc,
+                            addr,
+                            frame.local_kind_at(li),
+                            heap.map(|h| h.is_heap_addr(addr).is_some())
+                                .unwrap_or(false),
+                            heap.map(|h| h.collection_count()).unwrap_or(0),
+                        );
+                        // AND WHETHER THE COLLECTOR WAS GIVEN IT. Armed by
+                        // `CRATONVM_DBG_ROOT_REMAP_AUDIT`; `None` prints as
+                        // "not measured" rather than as an absence.
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ in_root_set={:?}",
+                            root_set_contains(addr),
+                        );
+                        // WHICH OF THE TWO OPPOSITE DEFECTS THIS IS. The
+                        // headline above says "the object was NOT copied", and
+                        // that sentence has two readings with opposite fixes:
+                        // the collector reclaimed a live object a frame still
+                        // held, or the frame held an address that was never a
+                        // live object start. Only the evacuator can tell them
+                        // apart, and it already decided — `forward_refusal_reason`
+                        // is that decision, kept for exactly this reader.
+                        match forward_refusal_verdict(heap, addr) {
+                            Some(reason) => eprintln!(
+                                "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ evacuator_verdict=REFUSED ({reason}) -- the collector was handed this address and declined it, so nothing live was reclaimed here: the SLOT is wrong, and the write that put this value in it is the defect",
+                            ),
+                            None => eprintln!(
+                                "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ evacuator_verdict=NEVER-OFFERED -- the evacuator was never asked about this address, so the root scan is the place to look",
+                            ),
+                        }
+                        // AND WHETHER THE SCAN WOULD PRODUCE IT AT ALL. Re-run
+                        // the frame's own root scan -- the very call `roots.rs`
+                        // step 1 makes -- and look for the address. TRUE means
+                        // the root set contained this slot and the collection
+                        // dropped the object anyway, which is a marking or
+                        // copying fault, not a scanning one. FALSE means the
+                        // scan is the place to look, and `local_kind` /
+                        // `in_heap` above say which of its two filters did it.
+                        if let Some(h) = heap {
+                            let mut probe: Vec<ObjectRef> = Vec::new();
+                            frame.scan_local_objects(&mut probe, h);
+                            eprintln!(
+                                "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ scan_would_root={} \
+                                 (frame's own scan yields {} roots)",
+                                probe.iter().any(|r| r.as_ptr() as usize == addr),
+                                probe.len(),
+                            );
+                        }
+                    }
+                }
+                if heavy && addr != 0 {
+                    if stale_destinations.contains(&addr) {
+                        eprintln!(
+                            "POST-GC STALE-DEST LOCAL: frame[{}] {}.{} local[{}] pc={} \
+                             points to intermediate addr 0x{:x} which was further relocated to 0x{:x}",
+                            fi, cname, mname, li, frame.pc,
+                            addr, pointer_map[&addr],
+                        );
+                    }
+                    // SAFETY: read-only probe of an aligned address; if the
+                    // slot is corrupt we'll see it in the diagnostic. This is
+                    // an opt-in debug path.
+                    let h = unsafe { &*(addr as *const ObjectHeader) };
+                    if h.class_id.as_u32() == 0
+                        && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
+                        && h.num_slots() == 0
+                        && h.array_length() == 0
+                    {
+                        eprintln!(
+                            "POST-GC ZERO-HEADER LOCAL: frame[{}] {}.{} local[{}] pc={} \
+                             points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
+                            fi,
+                            cname,
+                            mname,
+                            li,
+                            frame.pc,
+                            addr,
+                            h.kind(),
+                            h.gc_flags(),
+                        );
+                    }
+                }
+            }
+        }
+        // Check stack
+        for si in 0..frame.stack.len() {
+            let val = frame.stack.get_value(si);
+            if let Value::Object(Some(obj_ref)) = val {
+                let addr = obj_ref.as_ptr() as usize;
+                // Skip self-forwards (`key == value`): the object did not move,
+                // so this slot is correct (see the locals check above).
+                if let Some(&new_addr) = pointer_map.get(&addr) {
+                    if new_addr != addr {
+                        let dests = destinations
+                            .get_or_insert_with(|| pointer_map.values().copied().collect());
+                        if dests.contains(&addr) {
+                            // Recycled destination — benign (see fn doc).
+                            if heavy {
+                                eprintln!(
+                                    "POST-GC RECYCLED-DEST STACK (benign): frame[{}] {}.{} \
+                                     stack[{}] holds 0x{:x} — a drain-pass destination that \
+                                     is also an earlier-pass key (-> 0x{:x})",
+                                    fi, cname, mname, si, addr, new_addr,
+                                );
+                            }
+                        } else {
+                            genuine_reports += 1;
+                            eprintln!(
+                                "POST-GC STALE STACK: frame[{}] {}.{} stack[{}] still points to \
+                                 relocated addr 0x{:x} (should be 0x{:x})",
+                                fi, cname, mname, si, addr, new_addr,
+                            );
+                        }
+                    }
+                }
+                // ACTIVE-semispace half — see the matching arm on locals.
+                // Operand-stack slots are always live, so there is no mask to
+                // consult here.
+                if let Some(h) = heap {
+                    if dead_ref_reports < 8 {
+                        if let Some("ZERO-HEADER-IN-YOUNG") = h.dead_young_ref_reason(addr) {
+                            dead_ref_reports += 1;
+                            genuine_reports += 1;
+                            eprintln!(
+                                "POST-GC DEAD-YOUNG-REF STACK: frame[{}] {}.{} stack[{}] pc={} holds 0x{:x}, which is inside the ACTIVE young semispace but reads as unallocated (zero header) — the slot names no live object. collection={} evacuator_verdict={:?}",
+                                fi,
+                                cname,
+                                mname,
+                                si,
+                                frame.pc,
+                                addr,
+                                h.collection_count(),
+                                forward_refusal_verdict(Some(h), addr),
+                            );
+                        }
+                    }
+                }
+                if let Some((lo, hi)) = inactive_young {
+                    if addr >= lo
+                        && addr < hi
+                        && !pointer_map.contains_key(&addr)
+                        && reclaimed_reports < 8
+                    {
+                        reclaimed_reports += 1;
+                        genuine_reports += 1;
+                        eprintln!(
+                            "POST-GC RECLAIMED-WHILE-HELD STACK: frame[{}] {}.{} stack[{}] pc={} \
+                             holds 0x{:x}, inside the semispace this cycle emptied, and the \
+                             pointer map has no entry for it -- the object was NOT copied, so \
+                             this slot was not in the root set. in_heap={} collection={}",
+                            fi,
+                            cname,
+                            mname,
+                            si,
+                            frame.pc,
+                            addr,
+                            heap.map(|h| h.is_heap_addr(addr).is_some())
+                                .unwrap_or(false),
+                            heap.map(|h| h.collection_count()).unwrap_or(0),
+                        );
+                    }
+                }
+                if heavy && addr != 0 {
+                    if stale_destinations.contains(&addr) {
+                        eprintln!(
+                            "POST-GC STALE-DEST STACK: frame[{}] {}.{} stack[{}] pc={} \
+                             points to intermediate addr 0x{:x} which was further relocated to 0x{:x}",
+                            fi, cname, mname, si, frame.pc,
+                            addr, pointer_map[&addr],
+                        );
+                    }
+                    // SAFETY: see locals comment above.
+                    let h = unsafe { &*(addr as *const ObjectHeader) };
+                    if h.class_id.as_u32() == 0
+                        && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
+                        && h.num_slots() == 0
+                        && h.array_length() == 0
+                    {
+                        eprintln!(
+                            "POST-GC ZERO-HEADER STACK: frame[{}] {}.{} stack[{}] pc={} \
+                             points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
+                            fi,
+                            cname,
+                            mname,
+                            si,
+                            frame.pc,
+                            addr,
+                            h.kind(),
+                            h.gc_flags(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    genuine_reports
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests;
+
+
+
+/// gci i12/ul F2/F4: what the unload log, JFR and the unloaded count report.
+#[cfg(test)]
+mod gci_i12_ul_reported_unload_tests;
+
+/// zt t9/cl5: the unload transaction releases the `Class.getName()` memo rows
+/// of the classes it removed (`release_unloaded_class_name_memo`).
+#[cfg(test)]
+mod zt9cl5_class_name_memo_release_tests;

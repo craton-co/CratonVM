@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "_comment": "Copy to cratonbench-<host>.json and measure. EVERY phase starts placeholder:true on purpose - a half-finished baseline must refuse to gate anything rather than gate on zeros. See README.md.",
+  "host": "REPLACE-ME",
+  "cpu_model": "REPLACE-ME",
+  "vm_flags": "-Xmx8g",
+  "cpu_pinned": "REPLACE-ME",
+  "phases": {
+    "arithmetic": {
+      "baseline_ms": 0,
+      "checksum": "5000000003999999995",
+      "status": "placeholder",
+      "placeholder": true,
+      "evidence": "NOT MEASURED under docs/benchmarking/methodology.md",
+      "measured_utc": "",
+      "run_id": ""
+    },
+    "fib": {
+      "baseline_ms": 0,
+      "checksum": "701408733",
+      "status": "placeholder",
+      "placeholder": true,
+      "evidence": "NOT MEASURED under docs/benchmarking/methodology.md",
+      "measured_utc": "",
+      "run_id": ""
+    },
+    "sieve": {
+      "baseline_ms": 0,
+      "checksum": "9592",
+      "status": "placeholder",
+      "placeholder": true,
+      "evidence": "NOT MEASURED under docs/benchmarking/methodology.md",
+      "measured_utc": "",
+      "run_id": ""
+    },
+    "matrix": {
+      "baseline_ms": 0,
+      "checksum": "173943680",
+      "status": "placeholder",
+      "placeholder": true,
+      "evidence": "NOT MEASURED under docs/benchmarking/methodology.md",
+      "measured_utc": "",
+      "run_id": ""
+    },
+    "hashmap": {
+      "baseline_ms": 0,
+      "checksum": "1549999915000000",
+      "status": "placeholder",
+      "placeholder": true,
+      "evidence": "NOT MEASURED under docs/benchmarking/methodology.md",
+      "measured_utc": "",
+      "run_id": ""
+    },
+    "stringregex": {
+      "baseline_ms": 0,
+      "checksum": "5000050000",
+      "status": "placeholder",
+      "placeholder": true,
+      "evidence": "NOT MEASURED under docs/benchmarking/methodology.md",
+      "measured_utc": "",
+      "run_id": ""
+    },
+    "bintrees": {
+      "baseline_ms": 0,
+      "checksum": "68332206",
+      "status": "placeholder",
+      "placeholder": true,
+      "evidence": "NOT MEASURED under docs/benchmarking/methodology.md",
+      "measured_utc": "",
+      "run_id": ""
+    }
+  }
+}

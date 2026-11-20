@@ -1,0 +1,62 @@
+name: Published HotSpot comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      apps_root:
+        description: Prebuilt application fixtures directory on the benchmark runner
+        required: true
+        default: /root/CVM/apps
+
+jobs:
+  compare:
+    runs-on: [self-hosted, linux, cratonvm-perf]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Check table coverage
+        run: python3 -m unittest tools/bench/test_published_ci.py
+      - name: Build release VM
+        id: build
+        run: cargo build --release -p cratonvm-cli
+      - name: Compare published CPU and cold-start tables
+        if: always() && steps.build.outcome == 'success'
+        run: >
+          python3 tools/bench/run-published-ci.py
+          --vm "$PWD/target/release/cratonvm"
+          --jdk "$JAVA_HOME"
+          --output "$RUNNER_TEMP/published-cpu-cold"
+          --cpu 2
+          --reps 3
+      - name: Compare experimental matrix and flat-map table
+        if: always() && steps.build.outcome == 'success'
+        run: >
+          python3 tools/probes/matrix-hashmap-simd/run.py
+          "$PWD/target/release/cratonvm"
+          --work-dir "$RUNNER_TEMP/published-variants"
+          --cpu 2
+          --rounds 3
+      - name: Compare application performance table
+        if: always() && steps.build.outcome == 'success'
+        env:
+          CV_BIN: ${{ github.workspace }}/target/release/cratonvm
+          APPS_ROOT: ${{ inputs.apps_root }}
+          OUT: ${{ runner.temp }}/published-apps
+        run: JDK_HOME="$JAVA_HOME" bash tools/bench/apps/run-apps-benches-interleaved.sh
+      - name: Upload raw samples and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-hotspot-comparison
+          path: |
+            ${{ runner.temp }}/published-cpu-cold
+            ${{ runner.temp }}/published-apps
+            ${{ runner.temp }}/published-variants
+            !${{ runner.temp }}/published-apps/work/**
+            !${{ runner.temp }}/published-apps/classes/**
+          retention-days: 30

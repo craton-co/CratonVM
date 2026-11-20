@@ -1,0 +1,38 @@
+# jdk-baseline	2
+# kind	class
+# name	java.lang.management.RuntimeMXBean
+# module	java.management
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.management/java/lang/management/RuntimeMXBean.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	17
+# protected-methods	0
+# declared-methods	17
+# declared-fields	0
+# rows	22
+# columns	kind	name	descriptor	flags
+CLASS	java.lang.management.RuntimeMXBean		public,interface,abstract
+EXTENDS	java.lang.Object		
+IMPLEMENTS	java.lang.management.PlatformManagedObject		
+SUPERTYPE	java.lang.Object		
+SUPERTYPE	java.lang.management.PlatformManagedObject		
+METHOD	getBootClassPath	()Ljava/lang/String;	public,abstract
+METHOD	getClassPath	()Ljava/lang/String;	public,abstract
+METHOD	getInputArguments	()Ljava/util/List;	public,abstract
+METHOD	getLibraryPath	()Ljava/lang/String;	public,abstract
+METHOD	getManagementSpecVersion	()Ljava/lang/String;	public,abstract
+METHOD	getName	()Ljava/lang/String;	public,abstract
+METHOD	getPid	()J	public
+METHOD	getSpecName	()Ljava/lang/String;	public,abstract
+METHOD	getSpecVendor	()Ljava/lang/String;	public,abstract
+METHOD	getSpecVersion	()Ljava/lang/String;	public,abstract
+METHOD	getStartTime	()J	public,abstract
+METHOD	getSystemProperties	()Ljava/util/Map;	public,abstract
+METHOD	getUptime	()J	public,abstract
+METHOD	getVmName	()Ljava/lang/String;	public,abstract
+METHOD	getVmVendor	()Ljava/lang/String;	public,abstract
+METHOD	getVmVersion	()Ljava/lang/String;	public,abstract
+METHOD	isBootClassPathSupported	()Z	public,abstract

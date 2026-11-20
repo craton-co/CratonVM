@@ -1,0 +1,63 @@
+name: OpCostRows instruction budget gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: Measurement scale (full or quick)
+        required: false
+        default: 'full'
+      reps:
+        description: Repetitions per (collector, mode, row) cell
+        required: false
+        default: '3'
+      parity_ceiling:
+        description: Max allowed CratonVM/origin-dev ratio on parity rows
+        required: false
+        default: '1.05'
+  workflow_call:
+
+jobs:
+  op-cost-budget:
+    name: OpCostRows instruction budgets and phase-1 parity
+    runs-on: [self-hosted, linux, cratonvm-perf]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build release VM
+        id: build
+        run: cargo build --release -p cratonvm-cli
+
+      - name: Validate OpCostRows budget table
+        if: steps.build.outcome == 'success'
+        run: python3 scripts/op-cost-budget.py --mode validate-table
+
+      - name: Run OpCostRows instruction budget check
+        if: steps.build.outcome == 'success'
+        run: >
+          bash scripts/check-op-cost-budget.sh
+          --exe "$PWD/target/release/cratonvm"
+          --java-home "$JAVA_HOME"
+          --scale "${{ github.event.inputs.scale || 'full' }}"
+          --reps "${{ github.event.inputs.reps || '3' }}"
+          --parity-ceiling "${{ github.event.inputs.parity_ceiling || '1.05' }}"
+
+      - name: Verify phase-1 parity rows against origin/dev baseline
+        if: always() && steps.build.outcome == 'success'
+        run: >
+          python3 scripts/op-cost-budget.py
+          --mode verify-parity
+          --cratonvm "$PWD/target/release/cratonvm"
+          --java-home "$JAVA_HOME"
+          --scale "${{ github.event.inputs.scale || 'full' }}"
+          --reps "${{ github.event.inputs.reps || '3' }}"
+          --parity-ceiling "${{ github.event.inputs.parity_ceiling || '1.05' }}"

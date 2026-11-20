@@ -1,0 +1,27 @@
+[package]
+name = "cratonvm-native-builtins-security"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Separately compiled JDK security and SunEC native pack for CratonVM"
+
+[dependencies]
+cratonvm-native-builtins-crypto = { path = "../native-builtins-crypto", version = "0.3.0" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+num-bigint = "0.4"
+num-traits = "0.2"
+p256 = "0.14"
+p384 = "0.14"
+p521 = "0.14"
+
+[lints]
+workspace = true

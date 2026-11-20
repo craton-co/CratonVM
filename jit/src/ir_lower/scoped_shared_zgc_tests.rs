@@ -1,0 +1,19 @@
+use super::*;
+
+unsafe extern "C" fn session_fields(_ctx: i64, which: i64) -> i64 {
+    match which {
+        WELL_KNOWN_SESSION_SHARED => 0x7fff_0101,
+        WELL_KNOWN_SESSION_CONFINED => 0x7fff_0102,
+        WELL_KNOWN_SESSION_MODEL => 0x7fff_0103,
+        WELL_KNOWN_SESSION_SHARED_STATE_SLOT
+        | WELL_KNOWN_SESSION_CONFINED_STATE_SLOT
+        | WELL_KNOWN_SESSION_MODEL_STATE_SLOT => 1,
+        WELL_KNOWN_SESSION_SHARED_OWNER_SLOT
+        | WELL_KNOWN_SESSION_CONFINED_OWNER_SLOT
+        | WELL_KNOWN_SESSION_MODEL_OWNER_SLOT => 2,
+        WELL_KNOWN_THREAD_JAVA_OBJ_OFFSET => 9,
+        WELL_KNOWN_FFM_ACCESS_WORD_TLS_DISP => 17,
+        _ => 0,
+    }
+}
+

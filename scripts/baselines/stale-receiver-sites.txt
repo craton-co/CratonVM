@@ -1,0 +1,26 @@
+# stale-receiver audit baseline — scripts/stale-receiver-audit.py
+# Exact reviewed textual matches, not accepted stale-reference defects.
+# Keep the allocation-success and caller-control-flow arguments with each row.
+depth=6
+# Checks allocate only while returning Err, which their callers propagate.
+# The optional minting owner check can create a mirror only on a non-owner
+# thread: an owner already has its mirror, so that mint also returns Err.
+pe_segment_check_scope 24
+pe_real_session_check 2
+# The reported later use belongs to a different registration callback.
+pe_session_check_open 1
+# The metadata-only resolver callback is conflated with other resolve functions.
+p67_session_mark_noncloseable 3
+# IOException construction occurs only on Err; each caller uses ? before reuse.
+sd_ensure_open 3
+# The first branch returns immediately after backfill; the reported use is in
+# the mutually exclusive allocating branch of native_bos_init_size.
+backfill_close_lock 1
+# The apparent later use is inside a continued diagnostic string literal.
+# The helper allocates only on Err, propagated by the handshake callback.
+new13_enforce_endpoint_identification 1
+# The two calls are mutually exclusive match arms in close_upcall_arena.
+p67_close_vm_arena 1
+# The reported loader_obj is a new if-let binding, not the pre-sizing local.
+# The caller resolves its pinned loader again after allocations.
+presize_loader_classes 1

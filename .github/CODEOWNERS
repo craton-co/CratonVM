@@ -1,0 +1,41 @@
+# Default owners for all files
+* @craton-co/cratonvm-maintainers
+
+# Crate-specific ownership (all 25 workspace crates)
+/reader/ @craton-co/cratonvm-maintainers
+/types/ @craton-co/cratonvm-maintainers
+/native-api/ @craton-co/cratonvm-maintainers
+/native-collections/ @craton-co/cratonvm-maintainers
+/native-io/ @craton-co/cratonvm-maintainers
+/native-builtins/ @craton-co/cratonvm-maintainers
+/native-builtins-jfr/ @craton-co/cratonvm-maintainers
+/native-builtins-jmx/ @craton-co/cratonvm-maintainers
+/native-builtins-crypto/ @craton-co/cratonvm-maintainers
+/native-builtins-security/ @craton-co/cratonvm-maintainers
+/native-awt/ @craton-co/cratonvm-maintainers
+/jit-api/ @craton-co/cratonvm-maintainers
+/jit/ @craton-co/cratonvm-maintainers
+/jit-aarch64/ @craton-co/cratonvm-maintainers
+/jit-cuda/ @craton-co/cratonvm-maintainers
+/jit-hip/ @craton-co/cratonvm-maintainers
+/jit-opencl/ @craton-co/cratonvm-maintainers
+/cuda-bridge/ @craton-co/cratonvm-maintainers
+/classloading/ @craton-co/cratonvm-maintainers
+/craton-gpu4j/ @craton-co/cratonvm-maintainers
+/gc-core/ @craton-co/cratonvm-maintainers
+/gc-gen/ @craton-co/cratonvm-maintainers
+/gc-g1/ @craton-co/cratonvm-maintainers
+/gc-zgc/ @craton-co/cratonvm-maintainers
+/gc/ @craton-co/cratonvm-maintainers
+/jfr/ @craton-co/cratonvm-maintainers
+/vm/ @craton-co/cratonvm-maintainers
+/vm-cli/ @craton-co/cratonvm-maintainers
+/libcratonvm/ @craton-co/cratonvm-maintainers
+/cratonvm-embed/ @craton-co/cratonvm-maintainers
+/tools/difftest/ @craton-co/cratonvm-maintainers
+
+# Documentation, tooling, scripts, and CI
+/docs/ @craton-co/cratonvm-maintainers
+/scripts/ @craton-co/cratonvm-maintainers
+/tools/ @craton-co/cratonvm-maintainers
+/.github/ @craton-co/cratonvm-maintainers

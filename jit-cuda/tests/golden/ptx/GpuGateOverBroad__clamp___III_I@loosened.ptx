@@ -1,0 +1,38 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry GpuGateOverBroad__clamp___III_I(
+    .param .s32 p0,
+    .param .s32 p1,
+    .param .s32 p2,
+    .param .u64 ret_ptr,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<4>;
+    .reg .u64 %rd<1>;
+    .reg .s32 %r<8>;
+    .reg .pred %p<2>;
+
+    ld.param.s32 %r0, [p0];
+    ld.param.s32 %r1, [p1];
+    ld.param.s32 %r2, [p2];
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r3, %ru3;
+    ld.param.s32 %r4, [tid_base];
+    add.s32 %r5, %r3, %r4;
+    setp.lt.s32 %p0, %r2, %r0;
+    selp.s32 %r6, %r2, %r0, %p0;
+    setp.gt.s32 %p1, %r1, %r6;
+    selp.s32 %r7, %r1, %r6, %p1;
+    ld.param.u64 %rd0, [ret_ptr];
+    st.global.s32 [%rd0], %r7;
+    bra L_done;
+L_done:
+    ret;
+}
+

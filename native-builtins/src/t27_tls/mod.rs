@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Classpath-exception-2.0
+// Copyright 2024-2026 Craton Software Company
+
+// =============================================================================
+// T2.7 — javax.net.ssl.* real TLS delta
+// -----------------------------------------------------------------------------
+// This module layers the server-side TLS story on top of the NEW-13 client
+// path that already lives in `phases_late::register_p68_ssl` (and is backed by
+// `native-tls` + `servlet::s2_tls_connect`). rustls 0.23 with the `ring`
+// provider gives us three things that native-tls 0.2 does not expose:
+//
+//   * a server-side TLS state machine we can drive ourselves (`SSLServerSocket`)
+//   * `ClientHello::server_name` inspection for SNI dispatch (T2.7.10)
+//   * `ServerConfig::alpn_protocols` / `negotiated_alpn` for real ALPN (T2.7.11)
+//   * TLS 1.3 session tickets (T2.7.13) — enabled by default on rustls
+//   * pluggable `ClientCertVerifier` for mTLS (T2.7.12)
+//
+// The rustls configuration here uses TLS 1.2+ ciphersuites only, enforces
+// hostname verification on the client side, and builds a `WebPkiServerVerifier`
+// seeded with the system trust store (via `rustls-native-certs` 0.8). No
+// insecure paths are compiled in.
+//
+// Security posture
+// ----------------
+//  * Client path defaults: WebPKI verifier + system roots + SNI on.
+//  * Server path defaults: TLS 1.3 preferred, TLS 1.2 fallback, session
+//    resumption via rustls default session storage, NEED_CLIENT_AUTH honored
+//    via `WebPkiClientVerifier` when the Java-side caller asks for it.
+//  * Private keys loaded from PKCS#12 keystores are held only in the
+//    server registry entry; they never leak into the Java heap.
+//  * All PEM parsing uses `rustls-pki-types` (which rejects malformed blocks
+//    loudly rather than truncating silently).
+//  * Handshake failures surface as `IOException` with the rustls error text
+//    — never as panics, never as silent successes.
+//
+// Registry and identifier spaces
+// ------------------------------
+// Plain `TcpListener` ids live in `servlet::SocketRegistry.listeners`. The
+// rustls-backed `SSLServerSocket` path stores its own `TlsServerListenerEntry`
+// (containing the `TcpListener`, the `Arc<ServerConfig>`, and a nullable
+// `ClientCertVerifier` reference) in this module's own `ServerRegistry`. The
+// two id spaces are disjoint because the Java objects are distinguishable
+// classes (`java.net.ServerSocket` vs `javax.net.ssl.SSLServerSocket`) and
+// their native methods never cross over.
+// =============================================================================
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+
+#[cfg(unix)]
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+#[cfg(unix)]
+use openssl::{pkey::PKey, x509::X509};
+use parking_lot::Mutex;
+use rustls::client::{ClientConnection, ResolvesClientCert};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::server::{ClientHello, ResolvesServerCert, ServerConnection, WebPkiClientVerifier};
+use rustls::sign::CertifiedKey;
+use rustls::{ClientConfig, RootCertStore, ServerConfig, SignatureScheme, StreamOwned};
+
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::RuntimeError;
+use cratonvm_types::{ObjectRef, Value};
+
+use cratonvm_native_io::eintr::EintrIo;
+
+use crate::lang_misc::{w19e_root_value, w19e_rooted_value};
+use crate::servlet;
+use crate::try_alloc_concurrent_synthetic;
+use cratonvm_types::error::MethodCallFailed;
+// -----------------------------------------------------------------------------
+// Test cert/key fixtures
+// -----------------------------------------------------------------------------
+//
+// SECURITY (HIGH): the offline-generated PEM material used by the
+// T2.7.16–.19 integration tests is *intentionally* gated behind `cfg(test)`
+// so that release binaries cannot accidentally serve a publicly-known
+// private key. Code paths that previously consumed `SERVER_CRT_PEM` /
+// `SERVER_KEY_PEM` in release builds now go through `runtime_tls_identity()`
+// and fail closed (`IllegalStateException`) when no real identity has been
+// installed via the keystore configuration path. The `t27_certs/` directory
+// on disk is only read by `include_str!` at *compile time* in test builds.
+//
+// Trust material (the `CA` cert used to validate the test peer in the
+// loopback handshake) is also gated — there is no reason to ship the
+// test CA in a release artifact.
+
+#[cfg(test)]
+mod test_fixtures;
+// -----------------------------------------------------------------------------
+// Unit tests — loopback, SNI, mTLS, ALPN
+// -----------------------------------------------------------------------------
+
+/// An EC server identity generated by `java.security.KeyPairGenerator("EC")`
+/// must build a rustls signing key.
+///
+/// The JDK emits PKCS#8 whose inner SEC1 `ECPrivateKey` carries neither
+/// `parameters [0]` nor `publicKey [1]` — 67 bytes for P-256, byte-identical on
+/// HotSpot and CratonVM (verified against JDK 25). `ring` can only build an
+/// `EcdsaKeyPair` from a PKCS#8 that HAS the public key, and reports the refusal
+/// as the generic "failed to parse private key as RSA, ECDSA, or EdDSA" — so
+/// every JDK-generated EC server identity was unusable, and netty's
+/// `Http2MultiplexTransportTest.testFireChannelReadAfterHandshakeSuccess_JDK`
+/// hung forever waiting on a handshake that could never complete.
+///
+/// Both halves are pinned: that the stripped shape is genuinely rejected
+/// WITHOUT the repair (so removing the splice fails this module, rather than
+/// leaving a test that cannot fail), and that it is accepted with it.
+#[cfg(test)]
+mod ec_pkcs8_v1_identity_tests;
+
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod session_phase_tests;
+/// gc-common w9-b (`common-w8a-forkjoin-and-tls-root-rows-stay-process-global`):
+/// the `tls` root row's tables and slots belong to the VM that wrote them.
+#[cfg(test)]
+mod w9b_tls_vm_isolation_tests;
+
+/// gc-common w10-e (`common-w9v-https-url-connection-defaults-are-one-per-
+/// process`): `HttpsURLConnection`'s default TLS policy, its per-connection
+/// captures and the byte-only `SSLContext` / engine tables belong to the VM
+/// that wrote them.
+#[cfg(test)]
+mod w10e_huc_defaults_vm_isolation_tests;
+
+/// gc-common w11-a: the runtime server identity is one per VM
+/// (`common-w10e-runtime-tls-identity-is-one-per-process`), a freshly minted
+/// engine never inherits a collected one's state
+/// (`common-w10e-sslengine-state-is-never-evicted`), and one engine's lock
+/// does not stall another's records
+/// (`common-w10e-sslengine-records-serialize-on-one-process-wide-lock`).
+#[cfg(test)]
+mod w11a_tls_engine_and_identity_tests;
+
+/// gc-common w12-a: TLS rows whose lifetime is one Java object's are swept
+/// with it (`common-w11a-tls-session-objects-are-rooted-for-the-life-of-the-vm`,
+/// `common-w10e-sslengine-state-is-never-evicted`,
+/// `common-w11a-sslparameters-alpn-side-table-grows-and-serves-reused-hashes`).
+///
+/// Every test uses its own VM identities, so the process-wide tables it
+/// shares with parallel tests never see its rows judged by another test.
+#[cfg(test)]
+mod w12a_tls_weak_owner_tests;
+
+/// gc-common w13-a (`common-w12a-sslcontext-keyed-tls-rows-outlive-their-context`):
+/// an `SSLContext`'s rows go once the context AND its last key holder -- an
+/// engine, an `HttpsURLConnection` capture, a parked socket -- are gone, and
+/// not a collection earlier.
+///
+/// Every test uses its own VM identities (the process-wide tables are shared
+/// with parallel tests) and tears them down in a guard.
+#[cfg(test)]
+mod w13a_ssl_context_rows_tests;
+
+// gc-common w14-b: the rustls registry records the VM of every row, and a
+// VM's teardown closes exactly its own rows
+// (`common-w13d-rustls-and-plain-socket-registries-outlive-their-vm`). Each
+// test uses private VM identities: the registry is shared by every test in
+// this binary, and they run in parallel.
+#[cfg(test)]
+mod rustls_socket_teardown_tests;
+
+#[cfg(test)]
+mod w20e_tls_relocation_tests;
+
+/// gc-common w26-b (`common-w25a-t27-tls-engine-rows-merge-live-identity-hash-colliders`):
+/// the engine / socket / session / `SSLParameters` / `HttpsURLConnection`
+/// rows are keyed by the object's weak lock key, so two LIVE objects of one VM
+/// that share an identity hash keep separate state, minting one never wipes
+/// the other, a freed key takes its rows with it, and two VMs stay apart.
+///
+/// The mock's identity hash is the address truncated to `i32`, so addresses
+/// 4 GiB apart share it (as two live objects of one heap can once the hash
+/// counter wraps). Every test uses private VM identities (the lock-key
+/// registry and these tables are process-wide and shared with parallel tests)
+/// and its guard forgets only those.
+#[cfg(test)]
+mod w26b_tls_object_key_tests;
+
+/// gcg g2/e — `gc_drop_tls_rows_in_spans` (the concurrent sweep's per-slice
+/// range test, `common-w26c-proposal-sub-linear-freed-span-drops` item 2)
+/// drops exactly what `gc_sweep_tls_rows` drops for the same range predicate.
+#[cfg(test)]
+mod gcg_g2e_tls_span_drop_tests;
+
+/// gci i23/ep (`common-w14d-proposal-ephemeron-native-side-tables`, switch
+/// `CRATONVM_GEN_SIDE_ROW_EPHEMERON`, read in `vm/src/memory/native_roots.rs`):
+/// [`gc_scan_tls_ctx_roots_ephemeron`]. A context-keyed manager is pinned to
+/// its `SSLContext` only while nothing else reads the key's rows (the
+/// condition under which the sweep that finds the context dead drops them);
+/// otherwise it is rooted, and refusing every deferral reports exactly the
+/// plain scans' roots. Own VM identities and addresses (`0xE23E_*`).
+#[cfg(test)]
+mod i23ep_tls_ephemeron_tests;
+
+mod runtime_tls_identity;
+#[allow(unused_imports)]
+pub use runtime_tls_identity::*;
+#[allow(unused_imports)]
+use runtime_tls_identity::*;
+mod cipher_provider_for;
+#[allow(unused_imports)]
+pub use cipher_provider_for::*;
+#[allow(unused_imports)]
+use cipher_provider_for::*;
+mod register_self_test;
+#[allow(unused_imports)]
+pub use register_self_test::*;
+#[allow(unused_imports)]
+use register_self_test::*;
+mod engine_session_for;
+#[allow(unused_imports)]
+pub use engine_session_for::*;
+#[allow(unused_imports)]
+use engine_session_for::*;
+mod release_manager_state_candidates;
+#[allow(unused_imports)]
+pub use release_manager_state_candidates::*;
+#[allow(unused_imports)]
+use release_manager_state_candidates::*;

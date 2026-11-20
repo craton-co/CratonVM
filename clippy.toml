@@ -1,0 +1,9 @@
+# Clippy configuration for CratonVM
+# See https://doc.rust-lang.org/clippy/lint_configuration.html
+
+# MSRV — clippy uses this to avoid suggesting features unavailable on older toolchains.
+# Match the workspace floor and the production atomic APIs stabilized in Rust 1.95.
+msrv = "1.95"
+
+# Allow slightly complex types in the JIT and GC crates
+type-complexity-threshold = 300

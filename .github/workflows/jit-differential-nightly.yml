@@ -1,0 +1,458 @@
+name: JIT differential (nightly)
+
+# The slow half of docs/testing/jit-differential.md. The PR lane
+# (`difftest-jit-paths` in ci.yml) gates the six seed programs across the
+# execution-path modes on a debug build; this runs the bytecode differential
+# fuzzer over a FIXED seed range on a release build, across stress axes the PR
+# lane cannot afford, and runs the path gate over the ~200-program generated
+# opcode corpus.
+#
+# Every job compares CratonVM against ITSELF — the interpreter (`nojit`) is the
+# oracle — so no HotSpot run and no ledger row is involved. JDK 25 is installed
+# only because the build and the launcher's boot image need it.
+#
+# The seed range is fixed on purpose: a red night must be reproducible on the
+# next night and locally with the same command. Widen it with
+# workflow_dispatch rather than by rotating seeds by date.
+#
+# THAT RULE IS ABOUT THIS FILE, NOT ABOUT THE PROJECT. Its cost is that this
+# lane's coverage is a constant: night 400 runs exactly the 400 programs night
+# 1 ran. The search for NEW divergences is a different lane with a different
+# contract — `jit-differential-explore.yml`, which rotates its seed window by
+# UTC date, gates nothing, and reports by opening an issue. It is allowed to
+# rotate because it blocks no merge and because it prints the exact command
+# that replays any given night. Do not import that behaviour here, and do not
+# delete this lane in favour of it: a gate and a search are not substitutes.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seed_start:
+        description: 'First fuzz-jit seed'
+        required: false
+        default: '1'
+      count:
+        description: 'Seeds per axis'
+        required: false
+        default: '400'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # IR verifier lanes (jit/src/ir_verify.rs). Off by default in a release
+  # build; a rejection is a silent fallback to the single-pass backend unless
+  # CRATONVM_DBG_IR_COMPILES makes `ir_verify_reject` print it, which is what
+  # `--fail-on-ir-verify-reject` looks for.
+  CRATONVM_JIT_VERIFY_IR: '1'
+  CRATONVM_JIT_VERIFY_TYPES: '1'
+  CRATONVM_JIT_VERIFY_FRAME_STATES: '1'
+  CRATONVM_JIT_VERIFY_MEMORY_CHAIN: '1'
+  CRATONVM_JIT_VERIFY_ARENA_ORDER: '1'
+  CRATONVM_DBG_IR_COMPILES: '1'
+
+jobs:
+  fuzz-jit:
+    name: fuzz-jit (${{ matrix.axis }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The execution paths, plus the moving young-gen collector.
+          # `CRATONVM_JIT_HELPER_PANICS_FATAL=1` on this axis and on
+          # `gc-stress`: `--extra-env` reaches the non-reference modes only,
+          # so `nojit` stays the oracle it was and every JIT mode aborts at
+          # the first CONTAINED helper panic instead of carrying on with the
+          # helper's failure sentinel. Without it those two axes scored a
+          # wrong answer produced by a contained panic exactly the same as a
+          # right one, because they gate on stdout, a checksum and the exit
+          # code and a contained panic changes none of the three.
+          - axis: default
+            modes: nojit,direct-emit,ir-jit,osr-eager,forced-deopt,moving-gc
+            extra: '--extra-env CRATONVM_JIT_HELPER_PANICS_FATAL=1'
+          # Every JIT mode under a GC every 64 KiB allocated. The reference
+          # runs without it (extra env is applied to non-reference modes only).
+          - axis: gc-stress
+            modes: nojit,direct-emit,ir-jit,osr-eager,forced-deopt,moving-gc
+            extra: '--extra-env CRATONVM_DBG_GC_STRESS=65536 --extra-env CRATONVM_JIT_HELPER_PANICS_FATAL=1'
+          # Eager deopt layered on the modes that do not already set it
+          # (`forced-deopt` does, so it is not repeated here).
+          - axis: deopt-eager
+            modes: nojit,direct-emit,ir-jit,osr-eager,moving-gc
+            extra: '--extra-env CRATONVM_DEOPT_EAGER=1 --extra-env CRATONVM_DEOPT_REAL=1 --extra-env CRATONVM_DEOPT_VERIFY=1'
+          # Major-49 classes: no StackMapTable, so the verifier takes the
+          # type-inference path and the decoded interpreter joins the matrix.
+          - axis: classfile-49
+            modes: nojit,interp-decoded,ir-jit,osr-eager,forced-deopt
+            extra: '--class-version 49'
+          # Code-cache exhaustion. Before this axis `CRATONVM_JIT_CODE_CACHE_MAX_MB`
+          # had ZERO references outside its own implementation and five doc
+          # files: no test, no CI step, no regression probe. The path it governs
+          # is the one that must stay CORRECT — not merely slower — when the VM
+          # is under memory pressure: `compile_gate::admit` refusing new
+          # compilations while OSR trampolines and deopt stubs, which `admit`
+          # does NOT gate, keep allocating `ExecutableBuffer`s against the same
+          # cap, plus the retirement-queue drain-and-retry in
+          # `jit_code_cache_at_capacity`.
+          #
+          # `=1` so the cap is hit almost immediately and the run spends its
+          # time in the degraded regime rather than reaching it at the end. The
+          # interpreter is still the oracle, so what this asserts is the only
+          # thing that matters: refusing to compile changes speed, not answers.
+          - axis: code-cache-1mb
+            modes: nojit,direct-emit,ir-jit,osr-eager,forced-deopt
+            extra: '--extra-env CRATONVM_JIT_CODE_CACHE_MAX_MB=1'
+          # The same cap with RT-8's cold-body sweeper ON (it needs the entry
+          # counter, its only usage signal). The plain axis above proves that
+          # REFUSING to compile changes no answer; this one proves that
+          # WITHDRAWING compiled bodies mid-run does not either -- a swept body
+          # is demoted, its callers' dispatch caches release it, and the method
+          # recompiles when it goes hot again. First soaked 2026-09-18
+          # (`NOTES-abi8.md`, RT-8), which found four defects that together
+          # kept the sweeper from ever freeing a byte.
+          - axis: code-cache-1mb-sweep
+            modes: nojit,direct-emit,ir-jit,osr-eager,forced-deopt
+            extra: '--extra-env CRATONVM_JIT_CODE_CACHE_MAX_MB=1 --extra-env CRATONVM_JIT=code-cache-sweep,entry-counter'
+          # Linear-scan register allocation. `metrics.rs` reports the IR
+          # pipeline's spill and reload counts as `NotMeasured` on every default
+          # compile because `CRATONVM_JIT_IR_LINEAR_SCAN` is off — i.e. the one
+          # pipeline stage whose entire output is register assignment runs
+          # almost nowhere, and the corpus that would find a wrong assignment
+          # never reaches it.
+          #
+          # Paired with real deopt on purpose: a mis-assigned register is most
+          # visible where the interpreter frame is reconstructed FROM the
+          # allocation, which is the deopt path.
+          - axis: regalloc-pressure
+            modes: nojit,ir-jit,osr-eager,forced-deopt
+            extra: '--extra-env CRATONVM_JIT_IR_LINEAR_SCAN=1 --extra-env CRATONVM_DEOPT_REAL=1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: jit-differential-nightly
+
+      - name: Set up JDK 25 (build and boot image)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build cratonvm + difftest (release)
+        run: cargo build --release -p cratonvm-cli -p cratonvm-difftest
+
+      - name: Run the bytecode differential fuzzer
+        shell: bash
+        env:
+          CRATONVM_BIN: target/release/cratonvm
+          SEED_START: ${{ github.event.inputs.seed_start || '1' }}
+          SEED_COUNT: ${{ github.event.inputs.count || '400' }}
+          MODES: ${{ matrix.modes }}
+          EXTRA: ${{ matrix.extra }}
+          AXIS: ${{ matrix.axis }}
+        run: |
+          set -euo pipefail
+          case "$SEED_START$SEED_COUNT" in
+            *[!0-9]*) echo "seed_start and count must be integers"; exit 2 ;;
+          esac
+          # $EXTRA is intentionally unquoted: it is a fixed flag list from the
+          # matrix above, never user input.
+          # shellcheck disable=SC2086
+          target/release/cratonvm-difftest fuzz-jit \
+            --seed "$SEED_START" --count "$SEED_COUNT" \
+            --modes "$MODES" $EXTRA \
+            --fail-on-ir-verify-reject \
+            --out "target/jitfuzz-failures/$AXIS"
+
+      - name: Upload failing programs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jitfuzz-failures-${{ matrix.axis }}
+          path: target/jitfuzz-failures
+          if-no-files-found: ignore
+
+  path-gate-opcodes:
+    name: path-gate (generated opcode corpus)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: jit-differential-nightly
+
+      - name: Set up JDK 25 (javac for the corpus, build and boot image)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build cratonvm + difftest (release)
+        run: cargo build --release -p cratonvm-cli -p cratonvm-difftest
+
+      - name: Generate the opcode corpus
+        run: target/release/cratonvm-difftest gen-opcodes --out target/difftest-opcodes
+
+      - name: Path gate over the opcode corpus
+        env:
+          CRATONVM_BIN: target/release/cratonvm
+        run: |
+          target/release/cratonvm-difftest path-gate \
+            --corpus target/difftest-opcodes \
+            --known difftest/path-gate-known.json \
+            --fail-on-ir-verify-reject
+
+      # GC stress exported for the whole step applies to EVERY mode, the
+      # reference included (it is not a mode knob, so the runner does not
+      # clear it): the comparison is interpreter-under-stress against
+      # each JIT path under the same stress.
+      - name: Path gate over the seeds under GC stress
+        if: always()
+        env:
+          CRATONVM_BIN: target/release/cratonvm
+          CRATONVM_DBG_GC_STRESS: '65536'
+        run: |
+          target/release/cratonvm-difftest path-gate \
+            --corpus difftest/seeds \
+            --known difftest/path-gate-known.json \
+            --fail-on-ir-verify-reject
+
+      # `difftest/regression/` is where a minimized repro lands — `min` writes
+      # there by default (difftest/src/main.rs) and difftest/src/lib.rs calls it
+      # the home of the minimal repro — and until this step existed NO WORKFLOW
+      # READ IT. A directory that every doc calls the regression corpus and that
+      # nothing ever runs is a corpus in name only; `ExceptionId.java` has sat
+      # there unexecuted since it was shrunk.
+      #
+      # This is where the explore lane's confirmed findings are promoted to
+      # (`jit-differential-explore.yml`, "WHAT THE OPERATOR DOES WITH A
+      # CONFIRMED FINDING"). `harness::discover_programs` takes `.class` as
+      # well as `.java`, so a bytecode-only `fuzz-jit` repro belongs here
+      # unchanged.
+      #
+      # FLAT FILES ONLY. `discover_programs` is a single `read_dir` with no
+      # recursion, so a repro filed as `difftest/regression/<short-name>/X.class`
+      # — the per-repro-directory layout sketched in
+      # docs/feature-designs/differential-fuzzer.md §3.3 — is skipped by this
+      # step WITHOUT A WORD. A corpus that silently ignores half its members is
+      # worse than one that is not run, because it reports green.
+      #
+      # `--known` is the exception path, not the route. §3.1 of the same design
+      # defines this directory as "every confirmed-then-FIXED divergence", so
+      # the normal promotion arrives with its fix and is green on the day it
+      # lands. A repro that has to land BEFORE its fix — a bisect aid, a shared
+      # reproduction — is by construction red, and needs a
+      # `difftest/path-gate-known.json` entry naming its issue or it pins this
+      # job. `path-gate` reports a listed split that now agrees as RESOLVED,
+      # which is the signal to delete the entry; deleting it is what converts
+      # the repro into a gate.
+      #
+      # NO `--fail-on-ir-verify-reject` HERE, and that is not an oversight.
+      # `--known` excuses a `(program, mode)` split; it has no entry shape for a
+      # verifier rejection. A promoted repro that also trips the IR verifier
+      # would therefore pin this job red with no way to acknowledge it, which is
+      # exactly the failure the known-splits file exists to prevent. The
+      # rejection is still PRINTED (CRATONVM_DBG_IR_COMPILES is exported for the
+      # workflow) and `path-gate` still reports it — it just does not gate.
+      #
+      # Remaining limit, stated: this makes promoted repros run NIGHTLY, not
+      # per-PR. `ci.yml`'s `difftest-jit-paths` reads `difftest/seeds`, and
+      # adding `difftest/regression` there is a ci.yml change that also has to
+      # reckon with `difftest-gate` judging the same directory against HotSpot.
+      - name: Path gate over the promoted regression repros
+        if: always()
+        env:
+          CRATONVM_BIN: target/release/cratonvm
+        run: |
+          target/release/cratonvm-difftest path-gate \
+            --corpus difftest/regression \
+            --known difftest/path-gate-known.json
+
+  # ---------------------------------------------------------------------
+  # The two safety nets that had no sensor.
+  #
+  # 1. CONTAINED HELPER PANICS. `vm/src/jit/helper_guard.rs` catches a panic
+  #    crossing an `extern "C"` helper boundary rather than letting it abort,
+  #    which is right — but a contained panic is a SILENT WRONG ANSWER:
+  #    `jit_instanceof` returns 0 ("not an instance"), `jit_bastore` drops the
+  #    store, `jit_aastore` drops the store and stashes an `InternalError` that
+  #    is delivered at the next pending-exception drain rather than at the
+  #    faulting instruction. The counter behind it (`jit_helper_panic_count`)
+  #    had exactly one consumer: the crash handler. Nothing in `cargo test`, in
+  #    the difftest gate or in any benchmark read it, and the fuzz lanes gate on
+  #    stdout/checksum/exit code — stderr is not a gated dimension there, and
+  #    `fuzz-jit` only echoes a child's stderr for a program that ALREADY
+  #    failed. So a run that produced wrong results FOR THE CONTAINED REASON
+  #    scored the same as one that did not.
+  #
+  # 2. UNQUEUED CODE FREES. `published_code_free_audit().1` is called a
+  #    must-be-zero invariant by three documents. Its only consumer was a unit
+  #    test asserting the counter CAN increment — the opposite direction.
+  #
+  # This job is the missing sensor for both, and it is deliberately NOT a
+  # difftest job: it runs the VM with its stderr going straight to the log, so
+  # the guard's own `[jit-helper-panic]` line and the code-free tracer's
+  # `published=true authorised=false` line are visible and greppable. It gates.
+  #
+  # It is cheap (a handful of small programs) because its value is not coverage
+  # — the fuzz axes above supply that — but the fact that any of them tripping
+  # now turns a green night red.
+  #
+  # BOTH VM-SIDE HALVES HAVE NOW LANDED and are armed in the run step's `env`
+  # below: `CRATONVM_JIT_HELPER_PANICS_FATAL=1` aborts on the FIRST contained
+  # panic, and `CRATONVM_JIT_ASSERT_CODE_FREE_AUDIT=1` makes the VM fail at
+  # shutdown when `published_code_free_audit().1` is non-zero. The greps are
+  # kept and still gate: they are the EVIDENCE — the helper's name, the
+  # dropping owner's backtrace — and they also cover the case the VM-side
+  # checks cannot, which is a child that died before reaching either.
+  # ---------------------------------------------------------------------
+  jit-runtime-sensors:
+    name: jit runtime sensors (helper panics, code-free audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: jit-differential-nightly
+
+      - name: Set up JDK 25 (javac for the seeds, build and boot image)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build cratonvm (release)
+        run: cargo build --release -p cratonvm-cli
+
+      - name: Compile the seed and regression corpora
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/sensor-classes
+          javac -d target/sensor-classes difftest/seeds/*.java
+          # `difftest/regression` holds promoted repros and may contain
+          # `.class` files with no source: compile any sources, copy the rest.
+          shopt -s nullglob
+          srcs=(difftest/regression/*.java)
+          if [ ${#srcs[@]} -gt 0 ]; then
+            javac -d target/sensor-classes "${srcs[@]}"
+          fi
+          classes=(difftest/regression/*.class)
+          if [ ${#classes[@]} -gt 0 ]; then
+            cp "${classes[@]}" target/sensor-classes/
+          fi
+          ls -1 target/sensor-classes
+
+      - name: Run every program under the JIT with the runtime tracers on
+        shell: bash
+        env:
+          # Names the release site of every executable buffer AND flags any
+          # published body released outside the retirement queue as
+          # `published=true authorised=false` (jit/src/lib.rs::record_code_free).
+          CRATONVM_DBG_JIT_CODE_FREE: '1'
+          # Drives the reclamation path this job watches: metrics reporting
+          # keeps tier-ups and invalidations visible, and both are what put
+          # artifacts on the retirement queue.
+          CRATONVM_JIT_METRICS: '1'
+          # RT-2's VM-side half, which landed after this job did. The grep
+          # below still runs and is still the DIAGNOSTIC — it names the
+          # dropping owner and its backtrace — but this makes the VM itself
+          # fail at shutdown rather than leaving the verdict to a pattern
+          # match over a log that a future change to the tracer's wording
+          # would silently defeat.
+          CRATONVM_JIT_ASSERT_CODE_FREE_AUDIT: '1'
+          # RT-1's VM-side half. The grep below sees only the FIRST panic per
+          # distinct helper, because that is all the guard prints; this aborts
+          # at the first one of any kind, in the process that caused it, with
+          # the panicking helper still on the stack. Both are kept: the abort
+          # is the verdict, the log line is the evidence.
+          CRATONVM_JIT_HELPER_PANICS_FATAL: '1'
+        run: |
+          set -uo pipefail
+          mkdir -p target/sensor-logs
+          log=target/sensor-logs/run.log
+          : > "$log"
+          rc_all=0
+          for cls in target/sensor-classes/*.class; do
+            # Inner classes carry no `main`; their outer class runs them.
+            case "$cls" in *'$'*) continue ;; esac
+            name="$(basename "$cls" .class)"
+            echo "=== $name ===" | tee -a "$log"
+            # stderr merged into stdout ON PURPOSE: the two markers this job
+            # gates on are written to stderr by the VM.
+            timeout 300 target/release/cratonvm \
+              -cp target/sensor-classes "$name" >>"$log" 2>&1
+            rc=$?
+            echo "--- $name exit $rc ---" | tee -a "$log"
+            if [ "$rc" -ne 0 ]; then rc_all=1; fi
+          done
+          echo "program exit status rollup: $rc_all" | tee -a "$log"
+          exit "$rc_all"
+
+      - name: Gate on contained helper panics and unqueued code frees
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          log=target/sensor-logs/run.log
+          if [ ! -f "$log" ]; then
+            echo "no run log - the run step did not start"
+            exit 1
+          fi
+          panics=$(grep -c 'jit-helper-panic' "$log" || true)
+          unqueued=$(grep -c 'published=true authorised=false' "$log" || true)
+          {
+            echo "JIT runtime sensor summary for ${GITHUB_SHA:-unknown}"
+            echo "contained helper panics         -> $panics"
+            echo "published bodies freed unqueued -> $unqueued"
+          } | tee target/sensor-logs/summary.txt
+          fail=0
+          if [ "$panics" != "0" ]; then
+            echo ""
+            echo "A JIT runtime helper PANICKED and the panic was contained."
+            echo "A contained panic is not a crash, it is a wrong answer: the"
+            echo "helper returned its sentinel, so a store was dropped, an"
+            echo "instanceof answered 0, or an InternalError was stashed for a"
+            echo "later drain. The helper name is on the line below. Fix the"
+            echo "panic; containment is the backstop, not the contract."
+            grep 'jit-helper-panic' "$log" | head -n 20
+            fail=1
+          fi
+          if [ "$unqueued" != "0" ]; then
+            echo ""
+            echo "A PUBLISHED compiled body was unmapped without passing"
+            echo "through the retirement queue. This is the invariant"
+            echo "docs/jit/code-cache-lifecycle.md calls must-be-zero: some"
+            echo "owner of an Arc<CompiledMethod> drops it directly instead of"
+            echo "deferring it, and a thread executing inside that body at the"
+            echo "moment of the drop executes unmapped memory. The backtrace"
+            echo "below names the dropping owner."
+            grep -A 25 'published=true authorised=false' "$log" | head -n 60
+            fail=1
+          fi
+          exit "$fail"
+
+      - name: Upload sensor logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jit-runtime-sensors
+          path: target/sensor-logs/
+          if-no-files-found: warn
