@@ -1,0 +1,40 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry FloatRemainder__dremScalar___DD_D(
+    .param .f64 p0,
+    .param .f64 p1,
+    .param .u64 ret_ptr,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<4>;
+    .reg .u64 %rd<1>;
+    .reg .s32 %r<3>;
+    .reg .f64 %fd<8>;
+    .reg .pred %p<1>;
+
+    ld.param.f64 %fd0, [p0];
+    ld.param.f64 %fd1, [p1];
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r0, %ru3;
+    ld.param.s32 %r1, [tid_base];
+    add.s32 %r2, %r0, %r1;
+    div.rn.f64 %fd2, %fd0, %fd1;
+    cvt.rzi.f64.f64 %fd3, %fd2;
+    neg.f64 %fd4, %fd3;
+    fma.rn.f64 %fd5, %fd4, %fd1, %fd0;
+    abs.f64 %fd6, %fd1;
+    setp.eq.f64 %p0, %fd6, 0d7FF0000000000000;
+    selp.f64 %fd7, %fd0, %fd5, %p0;
+    ld.param.u64 %rd0, [ret_ptr];
+    st.global.f64 [%rd0], %fd7;
+    bra L_done;
+L_done:
+    ret;
+}
+

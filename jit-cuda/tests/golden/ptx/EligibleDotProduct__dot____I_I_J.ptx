@@ -1,0 +1,91 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry EligibleDotProduct__dot____I_I_J(
+    .param .u64 p0_ptr,
+    .param .s32 p0_len,
+    .param .u64 p1_ptr,
+    .param .s32 p1_len,
+    .param .u64 ret_ptr,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<26>;
+    .reg .u64 %rd<6>;
+    .reg .s32 %r<8>;
+    .reg .s64 %rl<11>;
+    .reg .pred %p<5>;
+
+    ld.param.u64 %rd0, [p0_ptr];
+    ld.param.s32 %r0, [p0_len];
+    ld.param.u64 %rd1, [p1_ptr];
+    ld.param.s32 %r1, [p1_len];
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r2, %ru3;
+    ld.param.s32 %r3, [tid_base];
+    add.s32 %r4, %r2, %r3;
+    mov.s64 %rl0, 0;
+    mov.s32 %r5, 0;
+    setp.ge.u32 %p0, %r4, %r0;
+    @%p0 bra L_reduce_zero;
+    setp.lt.s32 %p1, %r1, %r0;
+    @%p1 bra L_bounds_fail;
+    mad.wide.s32 %rd2, %r4, 4, %rd0;
+    ld.global.s32 %r6, [%rd2];
+    cvt.s64.s32 %rl2, %r6;
+    mad.wide.s32 %rd3, %r4, 4, %rd1;
+    ld.global.s32 %r7, [%rd3];
+    cvt.s64.s32 %rl3, %r7;
+    mul.lo.s64 %rl4, %rl2, %rl3;
+    add.s64 %rl5, %rl0, %rl4;
+    mov.s64 %rl1, %rl5;
+    bra L_reduce;
+L_reduce_zero:
+    mov.s64 %rl1, 0;
+L_reduce:
+    mov.b64 {%ru4, %ru5}, %rl1;
+    shfl.sync.down.b32 %ru6, %ru4, 16, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %ru7, %ru5, 16, 0x1f, 0xffffffff;
+    mov.b64 %rl6, {%ru6, %ru7};
+    add.s64 %rl1, %rl1, %rl6;
+    mov.b64 {%ru8, %ru9}, %rl1;
+    shfl.sync.down.b32 %ru10, %ru8, 8, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %ru11, %ru9, 8, 0x1f, 0xffffffff;
+    mov.b64 %rl7, {%ru10, %ru11};
+    add.s64 %rl1, %rl1, %rl7;
+    mov.b64 {%ru12, %ru13}, %rl1;
+    shfl.sync.down.b32 %ru14, %ru12, 4, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %ru15, %ru13, 4, 0x1f, 0xffffffff;
+    mov.b64 %rl8, {%ru14, %ru15};
+    add.s64 %rl1, %rl1, %rl8;
+    mov.b64 {%ru16, %ru17}, %rl1;
+    shfl.sync.down.b32 %ru18, %ru16, 2, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %ru19, %ru17, 2, 0x1f, 0xffffffff;
+    mov.b64 %rl9, {%ru18, %ru19};
+    add.s64 %rl1, %rl1, %rl9;
+    mov.b64 {%ru20, %ru21}, %rl1;
+    shfl.sync.down.b32 %ru22, %ru20, 1, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %ru23, %ru21, 1, 0x1f, 0xffffffff;
+    mov.b64 %rl10, {%ru22, %ru23};
+    add.s64 %rl1, %rl1, %rl10;
+L_reduce_atomic:
+    mov.u32 %ru24, %laneid;
+    setp.eq.u32 %p2, %ru24, 0;
+    setp.ne.s64 %p3, %rl1, 0;
+    and.pred %p4, %p2, %p3;
+    ld.param.u64 %rd4, [ret_ptr];
+    @%p4 red.global.add.u64 [%rd4], %rl1;
+L_reduce_done:
+L_done:
+    ret;
+L_bounds_fail:
+    ld.param.u64 %rd5, [failure_flag];
+    mov.u32 %ru25, 1;
+    st.global.u32 [%rd5], %ru25;
+    ret;
+}
+

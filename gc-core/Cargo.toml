@@ -1,0 +1,31 @@
+[package]
+name = "cratonvm-gc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+readme = "README.md"
+description = "Core GC primitives, heap geometry, safepoints, and barriers for CratonVM"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
+cratonvm-cuda-bridge = { path = "../cuda-bridge", version = "0.3.0", optional = true }
+parking_lot.workspace = true
+tracing.workspace = true
+rustc-hash.workspace = true
+
+[features]
+default = []
+gpu-offload = ["dep:cratonvm-cuda-bridge"]
+lilliput-prototype = []
+test-hooks = []
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry NonCanonicalLoops__start5Loop____I_V(
+    .param .u64 p0_ptr,
+    .param .s32 p0_len,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<4>;
+    .reg .u64 %rd<2>;
+    .reg .s32 %r<7>;
+    .reg .pred %p<1>;
+
+    ld.param.u64 %rd0, [p0_ptr];
+    ld.param.s32 %r0, [p0_len];
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r1, %ru3;
+    ld.param.s32 %r2, [tid_base];
+    add.s32 %r3, %r1, %r2;
+    add.s32 %r4, %r3, 5;
+    mov.s32 %r5, 5;
+    setp.ge.u32 %p0, %r4, %r0;
+    @%p0 bra L_done;
+    mov.s32 %r6, 0;
+    mad.wide.s32 %rd1, %r4, 4, %rd0;
+    st.global.s32 [%rd1], %r6;
+    bra L_done;
+L_done:
+    ret;
+}
+

@@ -1,0 +1,372 @@
+// SPDX-License-Identifier: GPL-2.0-only WITH Classpath-exception-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! WP4.5 — Scheduled-task pump for `ScheduledThreadPoolExecutor`.
+//!
+//! The native side cannot use the OS-thread approach the JDK uses because
+//! `NativeContext` is not `Send` — a real worker thread cannot
+//! `invoke_virtual` Java methods. Instead, we register periodic tasks
+//! here at submission time and let the *current* native context drive the
+//! pump every time control passes through `Thread.sleep` or
+//! `awaitTermination`. For the WP4.5 acceptance probe (which does
+//! `scheduleAtFixedRate(...) → Thread.sleep(250) → cancel(); shutdown();
+//! awaitTermination(2,SECONDS)`), this fires the runnable the correct
+//! number of times: ~5 ticks during the 250ms `Thread.sleep`.
+//!
+//! The registry is process-wide and indexed by a u64 id; the
+//! `ScheduledFuture` synthetic object stores that id in its second slot
+//! so `cancel(false)` flips the cancelled flag.
+//!
+//! See also `vm/src/threading/scheduled.rs` for a parallel pure-Rust
+//! state machine that vm-internal benchmarks can exercise without going
+//! through native dispatch.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+
+use parking_lot::Mutex;
+
+use cratonvm_native_api::NativeContext;
+use cratonvm_types::{ObjectRef, Value};
+
+/// One periodic registration. `runnable_ptr` is the raw `ObjectRef`
+/// pointer kept as an `AtomicUsize` so the registration is `Send`+`Sync`
+/// *and* relocatable: the runnable is a live Java object that a moving
+/// GC may compact, so the pointer is published as a GC root via
+/// [`gc_scan_scheduled_roots`] and rewritten in place by
+/// [`gc_update_scheduled_refs`] after every relocation. The pump always
+/// reads the *current* value before reconstructing the `ObjectRef`, so
+/// it can never invoke a stale or freed object.
+pub struct ScheduledTask {
+    pub id: u64,
+    /// Raw `ObjectRef` pointer of the runnable, as a relocatable GC root.
+    /// `0` means "no runnable" (used by unit tests / synthetic tasks).
+    pub runnable_ptr: AtomicUsize,
+    pub start: Instant,
+    pub initial_delay_ms: u64,
+    pub period_ms: u64,
+    /// Number of fires already acknowledged (incremented by the pump
+    /// after `Runnable.run()` returns).
+    pub fired: AtomicU64,
+    pub cancelled: AtomicBool,
+    /// `true` for `scheduleWithFixedDelay` — start the next period from
+    /// the END of the previous run rather than the start.
+    pub fixed_delay: bool,
+    /// Last fire timestamp — used by fixed-delay scheduling.
+    pub last_fire: Mutex<Option<Instant>>,
+    /// The `vm_identity` of the VM whose runnable this is, or
+    /// [`SCHEDULED_UNSCOPED_VM`] for a task registered without one (the
+    /// legacy [`ScheduledRegistry::register`]). Only the owning VM pumps the
+    /// task and roots / remaps its runnable (gc-common w8-a, row
+    /// `scheduled-pump`); an unscoped task keeps the old process-wide
+    /// behaviour.
+    pub vm: usize,
+}
+
+/// [`ScheduledTask::vm`] of a task registered with no VM identity. Pumped by
+/// every VM and rooted by every VM's collection, exactly as every task was
+/// before the registry was VM-scoped. No real `vm_identity` is `usize::MAX`
+/// (they count from 1).
+pub const SCHEDULED_UNSCOPED_VM: usize = usize::MAX;
+
+impl ScheduledTask {
+    /// Whether VM `vm` pumps this task and its collections root and remap
+    /// the runnable.
+    pub fn belongs_to(&self, vm: usize) -> bool {
+        self.vm == vm || self.vm == SCHEDULED_UNSCOPED_VM
+    }
+}
+
+impl ScheduledTask {
+    /// Returns how many ticks should have fired by `now` based on the
+    /// configured policy. Bounded by `period_ms == 0` → one tick max.
+    pub fn due_ticks(&self, now: Instant) -> u64 {
+        if self.cancelled.load(Ordering::Acquire) {
+            return self.fired.load(Ordering::Acquire);
+        }
+        let elapsed_ms = now.saturating_duration_since(self.start).as_millis() as u64;
+        if elapsed_ms < self.initial_delay_ms {
+            return 0;
+        }
+        let after_delay = elapsed_ms - self.initial_delay_ms;
+        if self.period_ms == 0 {
+            return 1;
+        }
+        if self.fixed_delay {
+            // Fixed-delay: only the *next* tick is due if `period_ms` has
+            // passed since the last fire. We can't anticipate >1 fire.
+            let last = *self.last_fire.lock();
+            let already = self.fired.load(Ordering::Acquire);
+            match last {
+                None => 1, // first tick is due (we already passed initial_delay)
+                Some(last_t) => {
+                    let since_last = now.saturating_duration_since(last_t).as_millis() as u64;
+                    already + if since_last >= self.period_ms { 1 } else { 0 }
+                }
+            }
+        } else {
+            // Fixed-rate: accumulate ticks based on wall-clock.
+            1 + after_delay / self.period_ms
+        }
+    }
+
+    pub fn cancel(&self) -> bool {
+        !self.cancelled.swap(true, Ordering::AcqRel)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+pub struct ScheduledRegistry {
+    next_id: AtomicU64,
+    tasks: Mutex<Vec<Arc<ScheduledTask>>>,
+}
+
+impl ScheduledRegistry {
+    pub fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            tasks: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Register a task with NO VM identity ([`SCHEDULED_UNSCOPED_VM`]): every
+    /// VM pumps it and roots it. Kept only until the three callers in
+    /// `phases_late/concurrent.rs` move to [`Self::register_in_vm`]
+    /// (`docs/feature-designs/native-dispatch-architecture.md`).
+    pub fn register(
+        &self,
+        runnable: ObjectRef,
+        initial_delay_ms: u64,
+        period_ms: u64,
+        fixed_delay: bool,
+    ) -> Arc<ScheduledTask> {
+        self.register_in_vm(
+            SCHEDULED_UNSCOPED_VM,
+            runnable,
+            initial_delay_ms,
+            period_ms,
+            fixed_delay,
+        )
+    }
+
+    /// Register a task of VM `vm` (`ctx.vm_identity()`): only that VM's
+    /// [`Self::pump`] fires it, and only its collections root and remap the
+    /// runnable (gc-common w8-a).
+    pub fn register_in_vm(
+        &self,
+        vm: usize,
+        runnable: ObjectRef,
+        initial_delay_ms: u64,
+        period_ms: u64,
+        fixed_delay: bool,
+    ) -> Arc<ScheduledTask> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let task = Arc::new(ScheduledTask {
+            id,
+            runnable_ptr: AtomicUsize::new(runnable.as_ptr() as usize),
+            start: Instant::now(),
+            initial_delay_ms,
+            period_ms,
+            fired: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            fixed_delay,
+            last_fire: Mutex::new(None),
+            vm,
+        });
+        let mut tasks = self.tasks.lock();
+        tasks.push(task.clone());
+        task
+    }
+
+    /// Look up a task by id (for `ScheduledFuture.cancel`).
+    pub fn find(&self, id: u64) -> Option<Arc<ScheduledTask>> {
+        let tasks = self.tasks.lock();
+        tasks.iter().find(|t| t.id == id).cloned()
+    }
+
+    /// Does the pump hold a live task of VM `vm` (or an unscoped one)
+    /// (interpreter round i1 wave 49, lane L1)? A sleeping caller leaves its
+    /// blocking region to [`Self::pump`] only then; one lock, no heap.
+    pub fn has_tasks_for(&self, vm: usize) -> bool {
+        self.tasks
+            .lock()
+            .iter()
+            .any(|t| t.belongs_to(vm) && !t.is_cancelled())
+    }
+
+    /// Drive the pump. For each live task, fire `runnable.run()` exactly
+    /// the number of times it has accrued since the last pump call.
+    /// Sleeping callers should poll this in a chunked loop so periodic
+    /// tasks get dispatched on time even within a long `Thread.sleep`.
+    ///
+    /// Only `ctx`'s VM's tasks (and unscoped ones): another VM's runnable is an
+    /// object in another heap, and invoking it here ran that VM's Java code on
+    /// this VM's thread (gc-common w8-a).
+    pub fn pump(&self, ctx: &mut dyn NativeContext) {
+        let vm = ctx.vm_identity();
+        let tasks_snapshot: Vec<_> = {
+            let tasks = self.tasks.lock();
+            tasks.iter().filter(|t| t.belongs_to(vm)).cloned().collect()
+        };
+        for task in tasks_snapshot {
+            if task.is_cancelled() {
+                continue;
+            }
+            let now = Instant::now();
+            let due = task.due_ticks(now);
+            let fired = task.fired.load(Ordering::Acquire);
+            if due <= fired {
+                continue;
+            }
+            let to_fire = (due - fired).min(64); // safety cap per pump
+                                                 // Reconstruct the runnable ObjectRef from the stored raw
+                                                 // pointer. We read the *current* value (it may have been
+                                                 // remapped by `gc_update_scheduled_refs` after a moving GC)
+                                                 // and the pointer is kept live across collections by
+                                                 // `gc_scan_scheduled_roots`, so it is neither stale nor
+                                                 // freed.
+            let runnable_ptr = task.runnable_ptr.load(Ordering::Acquire) as *mut u8;
+            if runnable_ptr.is_null() {
+                continue;
+            }
+            let mut runnable = unsafe { ObjectRef::from_raw(runnable_ptr) };
+            let pin_base = ctx.pin_native_root(runnable);
+            for _ in 0..to_fire {
+                if task.is_cancelled() {
+                    break;
+                }
+                runnable = ctx.read_native_pin(pin_base, runnable);
+                let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+                runnable = ctx.read_native_pin(pin_base, runnable);
+                task.runnable_ptr
+                    .store(runnable.as_ptr() as usize, Ordering::Release);
+                task.fired.fetch_add(1, Ordering::AcqRel);
+                if task.fixed_delay {
+                    *task.last_fire.lock() = Some(Instant::now());
+                }
+            }
+            ctx.unpin_native_roots(pin_base);
+        }
+    }
+
+    /// Number of live (non-cancelled) tasks.
+    pub fn live_count(&self) -> usize {
+        let tasks = self.tasks.lock();
+        tasks.iter().filter(|t| !t.is_cancelled()).count()
+    }
+
+    /// Cancel EVERY task in the process, whichever VM registered it. The one
+    /// production caller (`ScheduledThreadPoolExecutor.shutdownNow` in
+    /// `phases_late/concurrent.rs`) should use [`Self::cancel_all_in_vm`]
+    /// instead; see
+    /// `docs/feature-designs/native-dispatch-architecture.md`.
+    pub fn cancel_all(&self) {
+        let tasks = self.tasks.lock();
+        for t in tasks.iter() {
+            t.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// Cancel the tasks VM `vm` registered (and unscoped ones, which every VM
+    /// shares). Another VM's tasks are untouched (gc-common w8-a).
+    pub fn cancel_all_in_vm(&self, vm: usize) {
+        let tasks = self.tasks.lock();
+        for t in tasks.iter().filter(|t| t.belongs_to(vm)) {
+            t.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// Per-VM teardown: cancel and drop every task VM `vm` registered.
+    /// Unscoped tasks are left alone. Idempotent.
+    pub fn forget_vm(&self, vm: usize) {
+        let mut tasks = self.tasks.lock();
+        tasks.retain(|t| {
+            if t.vm != vm {
+                return true;
+            }
+            t.cancelled.store(true, Ordering::Release);
+            false
+        });
+    }
+
+    /// Drop tasks that are cancelled or one-shot-completed so the registry
+    /// does not grow without bound across long-running probes.
+    pub fn gc(&self) {
+        let mut tasks = self.tasks.lock();
+        tasks.retain(|t| {
+            if t.is_cancelled() {
+                return false;
+            }
+            if t.period_ms == 0 && t.fired.load(Ordering::Acquire) >= 1 {
+                return false;
+            }
+            true
+        });
+    }
+}
+
+impl Default for ScheduledRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Process-wide singleton.
+pub fn registry() -> &'static ScheduledRegistry {
+    static REG: OnceLock<ScheduledRegistry> = OnceLock::new();
+    REG.get_or_init(ScheduledRegistry::default)
+}
+
+/// GC root scan: push every live scheduled runnable into `roots` so a
+/// moving collector keeps it alive and records it for relocation.
+///
+/// Called by the VM's root-scan phase. Locks the process-wide registry
+/// and emits one `ObjectRef` per task whose `runnable_ptr` is non-null.
+/// `parking_lot::Mutex` does not poison, so a panicking holder cannot
+/// make us skip a root; a GC must never miss a live root. Only `vm`'s tasks
+/// and unscoped ones ([`ScheduledTask::belongs_to`], gc-common w8-a).
+pub fn gc_scan_scheduled_roots(vm: usize, roots: &mut Vec<ObjectRef>) {
+    let tasks = registry().tasks.lock();
+    for task in tasks.iter().filter(|t| t.belongs_to(vm)) {
+        let ptr = task.runnable_ptr.load(Ordering::Acquire);
+        if ptr == 0 {
+            continue;
+        }
+        // SAFETY: `ptr` is the raw address of a live Java object that the
+        // registry is keeping reachable; reconstructing the `ObjectRef`
+        // hands it to the collector as a root.
+        let obj = unsafe { ObjectRef::from_raw(ptr as *mut u8) };
+        roots.push(obj);
+    }
+}
+
+/// GC remap: after a moving collection relocates objects, rewrite each
+/// stored `runnable_ptr` from its old address to the new one.
+///
+/// `map` maps old raw address → new raw address. For each task whose
+/// current `runnable_ptr` appears in `map`, the pointer is updated in
+/// place; tasks not present in `map` (and null pointers) are left
+/// untouched. Locks the process-wide registry; `parking_lot::Mutex`
+/// does not poison.
+pub fn gc_update_scheduled_refs(vm: usize, map: &cratonvm_types::PointerMap) {
+    if map.is_empty() {
+        return;
+    }
+    let tasks = registry().tasks.lock();
+    for task in tasks.iter().filter(|t| t.belongs_to(vm)) {
+        let old = task.runnable_ptr.load(Ordering::Acquire);
+        if old == 0 {
+            continue;
+        }
+        if let Some(&new) = map.get(&old) {
+            task.runnable_ptr.store(new, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

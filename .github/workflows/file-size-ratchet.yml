@@ -1,0 +1,18 @@
+name: File Size & Test Hygiene Ratchet
+
+on:
+  pull_request:
+    paths:
+      - '**/*.rs'
+  push:
+    branches: [main, dev]
+    paths:
+      - '**/*.rs'
+
+jobs:
+  file-size-ratchet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p cratonvm-types --test file_size_and_tests_ratchet

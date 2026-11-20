@@ -1,0 +1,297 @@
+# Cross-platform compile coverage.
+#
+# WHY THIS EXISTS
+# ---------------
+# ci.yml builds and tests on `ubuntu-latest` and `windows-latest` only. Every
+# claim this project makes about portability outside those two runners is
+# currently unverified: docs/PLATFORMS.md describes macOS and AArch64, and
+# nothing compiles either.
+#
+# The gap is not hypothetical for this codebase specifically:
+#   * The JIT emits x86-64 machine code directly. Anything AArch64 either
+#     compiles behind `#[cfg(target_arch = "x86_64")]` guards or does not
+#     compile at all -- and today no job knows which.
+#   * `.cargo/config.toml` pins `-C target-feature=+sse4.2,+pclmulqdq` under a
+#     `cfg(target_arch = "x86_64")` block, and a `/STACK:16777216` link arg
+#     under `cfg(target_os = "windows")`. Neither has ever been exercised on a
+#     third platform, so a mistake in the cfg predicates is invisible.
+#   * macOS differs from Linux in exactly the areas this VM lives in: W^X
+#     enforcement on executable mappings (MAP_JIT / pthread_jit_write_protect),
+#     Mach thread suspension for stop-the-world, and dyld symbol lookup for the
+#     native shims.
+#
+# EVERY NEW LEG IS `continue-on-error: true` ON PURPOSE
+# -----------------------------------------------------
+# These platforms have never compiled here, so they start red by construction.
+# Landing them as blocking would stop all merges on day one for defects that
+# predate this workflow; landing them as advisory converts "unknown" into "a
+# measured, visible error list" immediately, which is the whole point.
+#
+# HOW TO PROMOTE A LEG (do this per leg, not all at once):
+#   1. drive that leg's error list to zero,
+#   2. delete its `continue-on-error: true` line and this paragraph's mention
+#      of it,
+#   3. add the leg to the branch-protection required checks.
+# Do NOT promote a leg by deleting the leg.
+#
+# COMPILE COVERAGE, NOT BEHAVIOURAL COVERAGE. These legs run `cargo check`, not
+# `cargo test`: a passing leg proves the configuration builds, not that the VM
+# executes Java correctly there. Running the suite on a new platform is a
+# separate, later step, and claiming otherwise would be exactly the kind of
+# unverified portability claim this workflow exists to stop.
+
+name: Cross-platform
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: cross-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------
+  # macOS: x86-64 (macos-13) and arm64 (macos-14 / Apple silicon).
+  # Both legs in one matrix so the two architectures' error lists are
+  # directly comparable -- an error that appears on macos-14 but not
+  # macos-13 is an AArch64 problem, not a macOS problem, and vice versa.
+  # ---------------------------------------------------------------------
+  macos:
+    name: macOS ${{ matrix.arch }} (${{ matrix.os }}) compile
+    runs-on: ${{ matrix.os }}
+    # BRINGING UP TO GREEN -- see the header. Advisory until macOS compiles.
+    continue-on-error: true
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            arch: x86-64
+          - os: macos-14
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `vm/build.rs` compiles Java fixtures with `javac`, so even `cargo check`
+      # wants a JDK on PATH; without it the fixture classes are silently skipped
+      # and the test targets check against stale expectations.
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Show host toolchain
+        run: |
+          uname -a
+          rustc -Vv
+          cargo -V
+          sysctl -n machdep.cpu.brand_string || true
+
+      # `--all-targets`: the lib/bin scope alone would miss test modules and
+      # examples, which is where half of a portability break usually lives (the
+      # `synthetic-jdk` incident recorded in ci.yml is the precedent).
+      - name: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets
+
+      # Second, narrower signal. The workspace check above can fail on ONE crate
+      # and tell you nothing about the rest; these three are the crates whose
+      # portability actually matters first, and they are worth a separate line
+      # in the log even when the workspace check is red.
+      - name: cargo check (parser/metadata core -- expected portable)
+        run: cargo check -p cratonvm-reader -p cratonvm-types --all-targets
+
+      - name: cargo check (JIT -- x86-64 codegen, expected to need cfg work)
+        run: cargo check -p cratonvm-jit-api -p cratonvm-jit --all-targets
+
+  # ---------------------------------------------------------------------
+  # Linux AArch64, cross-compiled from an x86-64 runner.
+  # `cargo check` does not link, so this needs only the std for the target
+  # plus a cross C toolchain for any dependency that runs `cc` (mimalloc,
+  # which `cratonvm-cli` enables by default, is the one that does).
+  # ---------------------------------------------------------------------
+  linux-aarch64-cross:
+    name: Linux AArch64 cross-compile
+    runs-on: ubuntu-latest
+    # BRINGING UP TO GREEN -- see the header.
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust with the aarch64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the cross C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # Build scripts still run on the HOST, so `CC` stays the host compiler;
+      # only the target-prefixed variables point at the cross toolchain.
+      - name: cargo check --target aarch64-unknown-linux-gnu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo check --workspace --all-targets --target aarch64-unknown-linux-gnu
+
+      # Narrow probe with the same purpose as the macOS one: even when the
+      # workspace check is red, knowing whether the *parser/metadata* half is
+      # architecture-clean is the fact that decides how big the port is.
+      - name: cargo check (parser/metadata core) --target aarch64-unknown-linux-gnu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: >
+          cargo check -p cratonvm-reader -p cratonvm-types --all-targets
+          --target aarch64-unknown-linux-gnu
+
+  # ---------------------------------------------------------------------
+  # Linux AArch64, NATIVELY. GitHub's public `ubuntu-24.04-arm` runners make
+  # this practical without QEMU or `cross`: a native runner is faster than
+  # user-mode emulation and, unlike `cross`, exercises the real page size,
+  # the real W^X behaviour and the real atomics.
+  #
+  # If that runner label is ever unavailable to this repository the job fails
+  # at scheduling time -- which is why it is advisory and separate from the
+  # cross-compile leg above, so losing the runner does not also lose the
+  # cross-compile signal.
+  #
+  # QEMU / `cross` alternative, if the hosted ARM runner goes away:
+  #     cargo install cross --git https://github.com/cross-rs/cross
+  #     cross check --workspace --all-targets --target aarch64-unknown-linux-gnu
+  # (docker+binfmt based; correct but several times slower, and the emulated
+  # CPU does not model the memory ordering this VM's lock-free paths depend on,
+  # so it is a compile signal only -- never run the concurrency tests under it
+  # and treat a pass as meaningless.)
+  # ---------------------------------------------------------------------
+  linux-aarch64-native:
+    name: Linux AArch64 native compile
+    runs-on: ubuntu-24.04-arm
+    # BRINGING UP TO GREEN -- see the header.
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Show host toolchain
+        run: |
+          uname -a
+          rustc -Vv
+          grep -m1 -E '^Features' /proc/cpuinfo || true
+          getconf PAGESIZE
+
+      - name: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets
+
+      # The one place a native ARM runner earns its keep over the cross leg:
+      # these crates have no x86-specific code and their tests can actually
+      # RUN here, so a green line proves behaviour and not just compilation.
+      - name: cargo test (parser/metadata core)
+        run: cargo test -p cratonvm-reader -p cratonvm-types --lib
+
+  # ---------------------------------------------------------------------
+  # Windows C-ABI smoke test.
+  #
+  # `publish-libcratonvm` in ci.yml builds the cdylib/staticlib and uploads
+  # them, but nothing checks that the artifact's export table matches the
+  # committed header. A renamed or `#[no_mangle]`-dropped symbol therefore
+  # ships as a green build and fails at the embedder's link step instead of
+  # ours. This leg links the repository's own C example against the import
+  # library, which is the same question asked at the right time.
+  #
+  # Link, do not run: executing the example would boot a VM and need a JDK
+  # image, which is a runtime test, not an ABI test.
+  # ---------------------------------------------------------------------
+  windows-abi-smoke:
+    name: Windows C-ABI smoke (export table vs header)
+    runs-on: windows-latest
+    # BRINGING UP TO GREEN -- see the header. The export/header agreement has
+    # never been checked, so this may find pre-existing drift.
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build libcratonvm (release cdylib + staticlib + import lib)
+        run: cargo build --release -p libcratonvm
+
+      # `scripts/find-vcvars.bat` is the repository's existing, edition-agnostic
+      # MSVC discovery (vswhere first, common install paths as fallback). Reusing
+      # it means CI and a developer box locate the same toolchain.
+      - name: Verify exports and link the C example
+        shell: cmd
+        run: |
+          call "%GITHUB_WORKSPACE%\scripts\find-vcvars.bat" || exit /b 1
+          call "%VCVARS64%" >nul || exit /b 1
+          echo === dumpbin /EXPORTS libcratonvm.dll ===
+          dumpbin /EXPORTS target\release\libcratonvm.dll > exports.txt || exit /b 1
+          type exports.txt
+          for %%S in (
+            cratonvm_create
+            cratonvm_destroy
+            cratonvm_load_class
+            cratonvm_invoke_static
+            cratonvm_invoke_virtual
+            cratonvm_new_string
+            cratonvm_string_utf8
+            cratonvm_free_string
+            cratonvm_release_ref
+          ) do (
+            findstr /C:"%%S" exports.txt >nul || (
+              echo ::error::libcratonvm.dll does not export %%S, but include\cratonvm.h declares it
+              exit /b 1
+            )
+          )
+          echo === linking libcratonvm\examples\embed_smoke.c against the import lib ===
+          cl /nologo /W3 /I libcratonvm\include libcratonvm\examples\embed_smoke.c ^
+             /Fe:embed_smoke.exe /link target\release\libcratonvm.dll.lib || exit /b 1
+          echo OK: header, export table and import library agree.
+
+      - name: Upload the export table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-abi-exports
+          path: exports.txt
+          if-no-files-found: warn

@@ -1,0 +1,90 @@
+name: EJBCA baseline smoke (WP0.5)
+
+# Nightly-and-on-PR harness built by WP0.5 of the WildFly/EJBCA roadmap.
+# Runs bench/wildfly/{stage,run,diff}-*.sh in sequence; a drift against
+# bench/wildfly/bench-baseline.json fails the job so either:
+#   (a) the PR author updates the baseline in the same commit as a fix, OR
+#   (b) the triage team files a regression bug.
+#
+# Keep this minimal. Heavier WildFly/EJBCA deploys will get their own jobs
+# (Wave 17 / 18). The role here is catching earliest-possible regressions
+# on basic Java startup (today: WP0.1 println NPE).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bench/wildfly/**'
+      - 'apps/ejbca_min_fixture/**'
+      - 'vm/**'
+      - 'native-io/**'
+      - 'native-builtins/**'
+      - 'classloading/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'bench/wildfly/**'
+      - 'apps/ejbca_min_fixture/**'
+      - 'vm/**'
+      - 'native-io/**'
+      - 'native-builtins/**'
+      - 'classloading/**'
+  schedule:
+    # Nightly at 03:17 UTC — off-peak, doesn't collide with other .wf.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  ejbca-smoke:
+    name: EJBCA baseline smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cratonvm (release)
+        run: cargo build --release -p cratonvm-cli
+
+      - name: Install jq (for diff-baseline.sh robust parsing)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Stage EJBCA minimum fixture
+        run: bash bench/wildfly/stage-ejbca-min.sh
+
+      - name: Run under cratonvm
+        run: bash bench/wildfly/run-under-cratonvm.sh
+
+      - name: Diff against baseline
+        id: diff
+        run: bash bench/wildfly/diff-baseline.sh
+
+      - name: Upload artefacts on drift
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ejbca-smoke-last-run
+          path: |
+            bench/wildfly/last-run.stdout.log
+            bench/wildfly/last-run.stderr.log
+            bench/wildfly/last-run.rc
+            bench/wildfly/last-run.meta.json
+            bench/wildfly/staged/compile.log
+          retention-days: 14
+          if-no-files-found: ignore

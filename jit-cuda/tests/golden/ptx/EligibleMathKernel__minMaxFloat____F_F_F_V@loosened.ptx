@@ -1,0 +1,85 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry EligibleMathKernel__minMaxFloat____F_F_F_V(
+    .param .u64 p0_ptr,
+    .param .s32 p0_len,
+    .param .u64 p1_ptr,
+    .param .s32 p1_len,
+    .param .u64 p2_ptr,
+    .param .s32 p2_len,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<11>;
+    .reg .u64 %rd<9>;
+    .reg .s32 %r<7>;
+    .reg .f32 %f<13>;
+    .reg .pred %p<13>;
+
+    ld.param.u64 %rd0, [p0_ptr];
+    ld.param.s32 %r0, [p0_len];
+    ld.param.u64 %rd1, [p1_ptr];
+    ld.param.s32 %r1, [p1_len];
+    ld.param.u64 %rd2, [p2_ptr];
+    ld.param.s32 %r2, [p2_len];
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r3, %ru3;
+    ld.param.s32 %r4, [tid_base];
+    add.s32 %r5, %r3, %r4;
+    mov.s32 %r6, 0;
+    setp.ge.u32 %p0, %r5, %r0;
+    @%p0 bra L_done;
+    setp.lt.s32 %p1, %r1, %r0;
+    @%p1 bra L_bounds_fail;
+    setp.lt.s32 %p12, %r2, %r0;
+    @%p12 bra L_bounds_fail;
+    mad.wide.s32 %rd3, %r5, 4, %rd0;
+    ld.global.f32 %f0, [%rd3];
+    mad.wide.s32 %rd4, %r5, 4, %rd1;
+    ld.global.f32 %f1, [%rd4];
+    setp.nan.f32 %p2, %f0, %f0;
+    setp.le.f32 %p6, %f0, %f1;
+    selp.f32 %f2, %f0, %f1, %p6;
+    setp.eq.f32 %p3, %f0, 0f00000000;
+    setp.eq.f32 %p4, %f1, 0f00000000;
+    and.pred %p5, %p3, %p4;
+    mov.b32 %ru4, %f0;
+    mov.b32 %ru5, %f1;
+    or.b32 %ru6, %ru4, %ru5;
+    mov.b32 %f3, %ru6;
+    selp.f32 %f4, %f3, %f2, %p5;
+    selp.f32 %f5, %f0, %f4, %p2;
+    mad.wide.s32 %rd5, %r5, 4, %rd0;
+    ld.global.f32 %f6, [%rd5];
+    mad.wide.s32 %rd6, %r5, 4, %rd1;
+    ld.global.f32 %f7, [%rd6];
+    setp.nan.f32 %p7, %f6, %f6;
+    setp.ge.f32 %p11, %f6, %f7;
+    selp.f32 %f8, %f6, %f7, %p11;
+    setp.eq.f32 %p8, %f6, 0f00000000;
+    setp.eq.f32 %p9, %f7, 0f00000000;
+    and.pred %p10, %p8, %p9;
+    mov.b32 %ru7, %f6;
+    mov.b32 %ru8, %f7;
+    and.b32 %ru9, %ru7, %ru8;
+    mov.b32 %f9, %ru9;
+    selp.f32 %f10, %f9, %f8, %p10;
+    selp.f32 %f11, %f6, %f10, %p7;
+    add.rn.f32 %f12, %f5, %f11;
+    mad.wide.s32 %rd7, %r5, 4, %rd2;
+    st.global.f32 [%rd7], %f12;
+    bra L_done;
+L_done:
+    ret;
+L_bounds_fail:
+    ld.param.u64 %rd8, [failure_flag];
+    mov.u32 %ru10, 1;
+    st.global.u32 [%rd8], %ru10;
+    ret;
+}
+

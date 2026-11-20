@@ -1,0 +1,91 @@
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry GpuForwardRefKernel__scale____I_I_V(
+    .param .u64 p0_ptr,
+    .param .s32 p0_len,
+    .param .u64 p1_ptr,
+    .param .s32 p1_len,
+    .param .u64 failure_flag,
+    .param .s32 tid_base
+) {
+    .reg .u32 %ru<5>;
+    .reg .u64 %rd<5>;
+    .reg .s32 %r<51>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd0, [p0_ptr];
+    ld.param.s32 %r0, [p0_len];
+    ld.param.u64 %rd1, [p1_ptr];
+    ld.param.s32 %r1, [p1_len];
+    mov.u32 %ru0, %ctaid.x;
+    mov.u32 %ru1, %ntid.x;
+    mov.u32 %ru2, %tid.x;
+    mad.lo.u32 %ru3, %ru0, %ru1, %ru2;
+    mov.b32 %r2, %ru3;
+    ld.param.s32 %r3, [tid_base];
+    add.s32 %r4, %r2, %r3;
+    mov.s32 %r5, 0;
+    setp.ge.u32 %p0, %r4, %r1;
+    @%p0 bra L_done;
+    setp.lt.s32 %p1, %r0, %r1;
+    @%p1 bra L_bounds_fail;
+    mad.wide.s32 %rd2, %r4, 4, %rd0;
+    ld.global.s32 %r6, [%rd2];
+    mov.s32 %r7, 3;
+    mul.lo.s32 %r8, %r6, %r7;
+    mov.s32 %r9, 7;
+    sub.s32 %r10, %r8, %r9;
+    mov.s32 %r11, 5;
+    mul.lo.s32 %r12, %r10, %r11;
+    mov.s32 %r13, 11;
+    add.s32 %r14, %r12, %r13;
+    mul.lo.s32 %r15, %r14, %r9;
+    mov.s32 %r16, 13;
+    sub.s32 %r17, %r15, %r16;
+    mul.lo.s32 %r18, %r17, %r13;
+    mov.s32 %r19, 17;
+    add.s32 %r20, %r18, %r19;
+    mul.lo.s32 %r21, %r20, %r16;
+    mov.s32 %r22, 19;
+    sub.s32 %r23, %r21, %r22;
+    mul.lo.s32 %r24, %r23, %r19;
+    mov.s32 %r25, 23;
+    add.s32 %r26, %r24, %r25;
+    mul.lo.s32 %r27, %r26, %r22;
+    mov.s32 %r28, 29;
+    sub.s32 %r29, %r27, %r28;
+    mul.lo.s32 %r30, %r29, %r25;
+    mov.s32 %r31, 31;
+    add.s32 %r32, %r30, %r31;
+    mov.s32 %r33, 3;
+    mul.lo.s32 %r34, %r32, %r33;
+    sub.s32 %r35, %r34, %r9;
+    mov.s32 %r36, 5;
+    mul.lo.s32 %r37, %r35, %r36;
+    add.s32 %r38, %r37, %r13;
+    mul.lo.s32 %r39, %r38, %r9;
+    sub.s32 %r40, %r39, %r16;
+    mul.lo.s32 %r41, %r40, %r13;
+    add.s32 %r42, %r41, %r19;
+    mul.lo.s32 %r43, %r42, %r16;
+    sub.s32 %r44, %r43, %r22;
+    mul.lo.s32 %r45, %r44, %r19;
+    add.s32 %r46, %r45, %r25;
+    mul.lo.s32 %r47, %r46, %r22;
+    sub.s32 %r48, %r47, %r28;
+    mul.lo.s32 %r49, %r48, %r25;
+    add.s32 %r50, %r49, %r31;
+    mad.wide.s32 %rd3, %r4, 4, %rd1;
+    st.global.s32 [%rd3], %r50;
+    bra L_done;
+L_done:
+    ret;
+L_bounds_fail:
+    ld.param.u64 %rd4, [failure_flag];
+    mov.u32 %ru4, 1;
+    st.global.u32 [%rd4], %ru4;
+    ret;
+}
+
