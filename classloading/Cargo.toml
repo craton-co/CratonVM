@@ -123,7 +123,7 @@ elliptic-curve = { version = "0.14", features = ["alloc", "pkcs8", "sec1"] }
 mimalloc = { version = "0.1.52", default-features = false }
 
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Kernel", "Win32_System_Diagnostics_Debug", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Kernel", "Win32_System_Diagnostics_Debug", "Win32_System_Threading"] }
 
 [lints]
 workspace = true
