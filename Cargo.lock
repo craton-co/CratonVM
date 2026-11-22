@@ -194,7 +194,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash",
+ "rustc-hash 1.1.0",
  "shlex 1.3.0",
  "syn 2.0.119",
  "which",
@@ -654,7 +654,7 @@ dependencies = [
  "p384",
  "parking_lot",
  "rsa 0.9.10",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "sha1 0.10.7",
  "sha2 0.10.9",
  "spki 0.8.1",
@@ -735,7 +735,7 @@ dependencies = [
  "loom",
  "parking_lot",
  "proptest",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "syn 2.0.119",
  "tracing",
 ]
@@ -748,7 +748,7 @@ dependencies = [
  "cratonvm-jfr",
  "cratonvm-types",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "tracing",
 ]
 
@@ -760,7 +760,7 @@ dependencies = [
  "cratonvm-jfr",
  "cratonvm-types",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "tracing",
 ]
 
@@ -772,7 +772,7 @@ dependencies = [
  "cratonvm-jfr",
  "cratonvm-types",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "tracing",
 ]
 
@@ -784,7 +784,7 @@ dependencies = [
  "cratonvm-jfr",
  "cratonvm-types",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "tracing",
 ]
 
@@ -798,7 +798,7 @@ version = "0.3.0"
 dependencies = [
  "cratonvm-types",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "smallvec",
  "tracing",
 ]
@@ -816,7 +816,7 @@ dependencies = [
  "cratonvm-types",
  "iced-x86",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "tracing",
 ]
 
@@ -870,7 +870,7 @@ dependencies = [
  "libc",
  "native-tls",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "socket2",
  "tracing",
 ]
@@ -890,7 +890,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "tracing",
  "ttf-parser 0.21.1",
  "windows",
@@ -943,7 +943,7 @@ dependencies = [
  "quick-xml",
  "regex",
  "rusqlite",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
@@ -993,7 +993,7 @@ dependencies = [
  "cratonvm-reader",
  "cratonvm-types",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "tracing",
 ]
 
@@ -1006,7 +1006,7 @@ dependencies = [
  "cratonvm-types",
  "libc",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "tracing",
 ]
 
@@ -1031,7 +1031,7 @@ dependencies = [
  "cratonvm-native-api",
  "cratonvm-types",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
 ]
 
 [[package]]
@@ -1045,7 +1045,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "regex",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "tempfile",
  "tracing",
  "zip",
@@ -1059,7 +1059,7 @@ dependencies = [
  "cesu8",
  "cratonvm-types",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "strum",
  "thiserror",
  "tracing",
@@ -1074,7 +1074,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "proptest",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "thiserror",
 ]
 
@@ -1111,7 +1111,7 @@ dependencies = [
  "memchr",
  "parking_lot",
  "regex",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "serde",
  "serde_json",
  "smallvec",
@@ -3189,6 +3189,12 @@ name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustc_version"
