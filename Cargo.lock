@@ -635,7 +635,7 @@ dependencies = [
 name = "cratonvm-classloading"
 version = "0.3.0"
 dependencies = [
- "const-oid 0.9.6",
+ "const-oid 0.10.3",
  "cratonvm-jfr",
  "cratonvm-native-api",
  "cratonvm-reader",
