@@ -175,7 +175,7 @@ cbc = { version = "0.1", features = ["std"] }
 # PBEWithMD5AndTripleDES (com.sun.crypto.provider.KeyProtector), not the JKS
 # KeyProtector this VM's own JCEKS writer uses. `des` is the RustCrypto sibling
 # of the `aes` crate above, same `cipher`/`cbc` trait family.
-des = "0.8"
+des = "0.9"
 md-5 = "0.10"
 hmac = "0.12"
 subtle = "2"
