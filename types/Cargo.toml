@@ -21,7 +21,7 @@ thiserror.workspace = true
 # short ASCII strings (class names, descriptors) that dominate class loading.
 parking_lot.workspace = true
 rustc-hash.workspace = true
-hashbrown = "0.14"
+hashbrown = "0.17"
 
 # Boot image loader (`boot_image`): mmap, dl_iterate_phdr, sysconf.
 [target.'cfg(unix)'.dependencies]
